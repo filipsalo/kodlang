@@ -22,7 +22,7 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
 )
 
 FunctionDeclaration = collections.namedtuple(
-    "FunctionDeclaration", ["name", "params", "body", "return_type"]
+    "FunctionDeclaration", ["name", "params", "body", "return_type", "extern"]
 )
 FunctionCall = collections.namedtuple("FunctionCall", ["callee", "args"])
 FunctionParam = collections.namedtuple("FunctionParam", ["name", "type"])
@@ -84,7 +84,7 @@ class Parser:
             if statement := self.parse_statement():
                 body.append(statement)
         self.consume(CloseCurly)
-        return FunctionDeclaration(name, params, body, return_type)
+        return FunctionDeclaration(name, params, body, return_type, False)
 
     def parse_expression(self):
         """Parse an expression."""
@@ -116,7 +116,7 @@ class Parser:
         self.consume(CloseParen)
         self.consume(Arrow)
         return_type = self.consume(Identifier).value
-        return FunctionDeclaration(name, params, [], return_type)
+        return FunctionDeclaration(name, params, [], return_type, True)
 
     def parse_statement(self):
         """Parse a statement."""
