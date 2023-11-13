@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 """Simple interpreter for the Kod language"""
 
-import os
-
-from kod.parser import FunctionDeclaration, FunctionCall, VariableExpr
+from kod.parser import (
+    FunctionDeclaration,
+    ExternalFunctionDeclaration,
+    FunctionCall,
+    VariableExpr,
+)
 
 externals = {
     "strlen": len,
@@ -58,7 +61,7 @@ class Interpreter:
         for param, arg in zip(func.params, args):
             value = self.lookup(arg) if isinstance(arg, VariableExpr) else arg
             self.stack[-1][param.name] = value
-        if not func.body:
+        if isinstance(func, ExternalFunctionDeclaration):
             externals[func.name](*args)
         for statement in func.body:
             self.execute_statement(statement)

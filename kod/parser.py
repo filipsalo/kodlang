@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 """A parser for the Kod lanuage"""
 
-import collections
-
 from kod.tokens import (  # pylint: disable=no-name-in-module
     EOF,
     EOL,
@@ -21,12 +19,41 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
     Func,
 )
 
-FunctionDeclaration = collections.namedtuple(
-    "FunctionDeclaration", ["name", "params", "body", "return_type", "extern"]
-)
-FunctionCall = collections.namedtuple("FunctionCall", ["callee", "args"])
-FunctionParam = collections.namedtuple("FunctionParam", ["name", "type"])
-VariableExpr = collections.namedtuple("VariableExpr", ["name"])
+
+class FunctionDeclaration:
+    """A function declaration."""
+    external = False
+
+    def __init__(self, name, params, body, return_type):
+        self.name = name
+        self.params = params
+        self.body = body
+        self.return_type = return_type
+
+
+class ExternalFunctionDeclaration(FunctionDeclaration):
+    """An external function declaration."""
+    external = True
+
+
+class FunctionCall:
+    """A function call."""
+    def __init__(self, callee, args):
+        self.callee = callee
+        self.args = args
+
+
+class FunctionParam:
+    """A function parameter."""
+    def __init__(self, name, type_):
+        self.name = name
+        self.type = type_
+
+
+class VariableExpr:
+    """A variable expression."""
+    def __init__(self, name):
+        self.name = name
 
 
 class Parser:
@@ -84,7 +111,7 @@ class Parser:
             if statement := self.parse_statement():
                 body.append(statement)
         self.consume(CloseCurly)
-        return FunctionDeclaration(name, params, body, return_type, False)
+        return FunctionDeclaration(name, params, body, return_type)
 
     def parse_expression(self):
         """Parse an expression."""
@@ -116,7 +143,7 @@ class Parser:
         self.consume(CloseParen)
         self.consume(Arrow)
         return_type = self.consume(Identifier).value
-        return FunctionDeclaration(name, params, [], return_type, True)
+        return ExternalFunctionDeclaration(name, params, [], return_type)
 
     def parse_statement(self):
         """Parse a statement."""
