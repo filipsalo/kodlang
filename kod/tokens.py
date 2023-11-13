@@ -5,6 +5,7 @@ from enum import Enum, global_enum, auto
 
 class Token:
     """A token in the Kod language."""
+
     def __init__(self, value=None):
         self.value = value
 
@@ -15,6 +16,7 @@ class Token:
 @global_enum
 class TokenType(Enum):
     """An enumeration of token types."""
+
     @staticmethod
     def _generate_next_value_(name, start, count, last_values):
         return type(name, (Token,), {})

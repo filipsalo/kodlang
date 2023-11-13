@@ -22,6 +22,7 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
 
 class FunctionDeclaration:
     """A function declaration."""
+
     external = False
 
     def __init__(self, name, params, body, return_type):
@@ -33,11 +34,13 @@ class FunctionDeclaration:
 
 class ExternalFunctionDeclaration(FunctionDeclaration):
     """An external function declaration."""
+
     external = True
 
 
 class FunctionCall:
     """A function call."""
+
     def __init__(self, callee, args):
         self.callee = callee
         self.args = args
@@ -45,6 +48,7 @@ class FunctionCall:
 
 class FunctionParam:
     """A function parameter."""
+
     def __init__(self, name, type_):
         self.name = name
         self.type = type_
@@ -52,12 +56,14 @@ class FunctionParam:
 
 class VariableExpr:
     """A variable expression."""
+
     def __init__(self, name):
         self.name = name
 
 
 class Parser:
     """A parser for the kod language."""
+
     def __init__(self, tokens):
         self.tokens = tokens
         self.pos = 0

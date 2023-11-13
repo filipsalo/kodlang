@@ -8,14 +8,12 @@ from kod.parser import (
     VariableExpr,
 )
 
-externals = {
-    "strlen": len,
-    "write": lambda fd, s, n: print(s)
-}
+externals = {"strlen": len, "write": lambda fd, s, n: print(s)}
 
 
 class Interpreter:
     """Simple interpreter for the Kod language"""
+
     def __init__(self, prog):
         self.prog = prog
         self.stack = [{}]
@@ -41,9 +39,9 @@ class Interpreter:
     def resolve_names(self, args):
         """Resolve variable names to values"""
         return [
-            self.lookup(arg.name)
-            if isinstance(arg, VariableExpr) else arg
-            for arg in args]
+            self.lookup(arg.name) if isinstance(arg, VariableExpr) else arg
+            for arg in args
+        ]
 
     def execute_statement(self, statement):
         """Execute a statement"""

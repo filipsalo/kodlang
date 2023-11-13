@@ -26,6 +26,7 @@ KEYWORDS = ["func", "extern"]
 
 class Lexer:
     """A lexer for the kod language."""
+
     def __init__(self, source):
         self.source = source
         self.pos = 0
@@ -46,7 +47,7 @@ class Lexer:
         return self.pos == len(self.source)
 
     def consume(self, char):
-        """Consume the next character, or raise ValueError if it doesn't match."""
+        """Consume the next character, or raise ValueError if it doesn't match"""
         if self.peek() != char:
             raise ValueError(f"Expected {char}, got {self.peek()!r}")
         self.pos += 1
@@ -58,14 +59,14 @@ class Lexer:
         while self.peek() != '"':
             self.pos += 1
         self.consume('"')
-        return QuotedString(self.source[start: self.pos - 1])
+        return QuotedString(self.source[start : self.pos - 1])
 
     def lex_number(self):
         """Lex a number."""
         start = self.pos
         while self.peek() in "0123456789":
             self.pos += 1
-        return LiteralNumber(int(self.source[start: self.pos]))
+        return LiteralNumber(int(self.source[start : self.pos]))
 
     def lex_single_char(self, token_type):
         """Lex a single character token."""
@@ -81,7 +82,7 @@ class Lexer:
         start = self.pos
         while self.peek().isalnum() or self.peek() == "_":
             self.pos += 1
-        match value := self.source[start: self.pos]:
+        match value := self.source[start : self.pos]:
             case "extern":
                 return Extern(value)
             case "func":
@@ -97,7 +98,7 @@ class Lexer:
         start = self.pos
         while self.peek() != "\n":
             self.pos += 1
-        return Comment(self.source[start: self.pos])
+        return Comment(self.source[start : self.pos])
 
     def lex_arrow(self):
         """Lex an arrow (->)."""
@@ -138,7 +139,7 @@ class Lexer:
                         yield self.lex_arrow()
                     case '"':
                         yield self.lex_string()
-                    case '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9':
+                    case ("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"):
                         yield self.lex_number()
                     case "/":
                         yield self.lex_comment()
@@ -151,7 +152,10 @@ class Lexer:
             e.line = line_number
             e.col = column_number
             lines = self.source.split("\n")
-            for n, line in enumerate(lines[max(0, line_number - 3): line_number + 3], max(0, line_number - 2)):
+            for n, line in enumerate(
+                lines[max(0, line_number - 3) : line_number + 3],
+                max(0, line_number - 2),
+            ):
                 e.excerpt += f"{n:3d}: {line}\n"
                 if n == line_number:
                     e.excerpt += f"     {' ' * (column_number - 1)}^\n"
