@@ -13,8 +13,10 @@ from kod.exceptions import KodSyntaxError
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("-r", "--run", action="store_true")
-    parser.add_argument("file", type=argparse.FileType("r"))
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("file", type=argparse.FileType("r"))
     args = parser.parse_args()
 
     src = args.file.read()
@@ -25,12 +27,9 @@ def main():
         return 1
     prog = Parser(tokens).parse()
 
-    if args.run:
+    if args.command == "run":
         Interpreter(prog).run()
         return 0
-
-    print("usage: kod --run FILE")
-    return 1
 
 
 sys.exit(main())
