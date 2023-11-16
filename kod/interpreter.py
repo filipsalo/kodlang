@@ -8,7 +8,7 @@ from kod.parser import (
     VariableExpr,
 )
 
-externals = {"strlen": len, "write": lambda fd, s, n: print(s)}
+externals = {"puts": print}
 
 
 class Interpreter:
