@@ -4,6 +4,7 @@
 import sys
 import argparse
 
+from kod.compiler import Compiler
 from kod.interpreter import Interpreter
 from kod.lexer import Lexer
 from kod.parser import Parser
@@ -15,8 +16,13 @@ def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=argparse.FileType("r"))
+
+    build_parser = subparsers.add_parser("build")
+    build_parser.add_argument("file", type=argparse.FileType("r"))
+
     args = parser.parse_args()
 
     src = args.file.read()
@@ -30,6 +36,8 @@ def main():
     if args.command == "run":
         Interpreter(prog).run()
         return 0
+    elif args.command == "build":
+        Compiler(prog).compile()
 
 
 sys.exit(main())
