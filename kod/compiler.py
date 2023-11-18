@@ -2,7 +2,13 @@
 """An assembler for the Kod language."""
 
 import sys
-from kod.parser import ExternalFunctionDeclaration, FunctionDeclaration, FunctionCall, VariableExpr
+from kod.parser import (
+    ExternalFunctionDeclaration,
+    FunctionDeclaration,
+    FunctionCall,
+    Name,
+    StringLiteral,
+)
 
 
 class StringConstant:
@@ -36,15 +42,15 @@ class Compiler:
         """Return a string constant for the given string"""
         if not label:
             label = f"s${len(self.strings)}"
-        if s not in self.strings:
-            self.strings[s] = StringConstant(label, s)
-        return self.strings[s]
+        if s.value not in self.strings:
+            self.strings[s.value] = StringConstant(label, s.value)
+        return self.strings[s.value]
 
     def compile(self):
         """Compile the program to assembly"""
         self.emit(".text")
         self.emit(".globl", "_main")
-        for statement in self.program:
+        for statement in self.program.body:
             if isinstance(statement, ExternalFunctionDeclaration):
                 pass
             elif isinstance(statement, FunctionDeclaration):
@@ -73,7 +79,7 @@ class Compiler:
             "int64": 8,
             "str": 8,
         }
-        return sum(sizes[param.type] for param in params)
+        return sum(sizes[param.type.id] for param in params)
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
@@ -112,24 +118,24 @@ class Compiler:
     def compile_function_call(self, func):
         """Compile a function call to assembly"""
         self.prepare_args(func.args)
-        print(f"\tcallq\t_{func.callee.name}", file=self.output)
+        print(f"\tcallq\t_{func.callee.id}", file=self.output)
 
     def calculate_stack_offset(self, arg, args):
         """Calculate the stack offset for a variable"""
         stack_offset = 0
         for _arg in reversed(args):
             stack_offset += 8
-            if _arg.name == arg.name:
+            if _arg.id == arg.id:
                 break
         return stack_offset
 
     def prepare_args(self, args):
         """Prepare arguments for a function call"""
         for i, arg in enumerate(args):
-            if isinstance(arg, str):
+            if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
                 self.emit("leaq", f"{arg.label}(%rip)", f"%{self._argregs[i]}")
-            elif isinstance(arg, VariableExpr):
+            elif isinstance(arg, Name):
                 stack_offset = self.calculate_stack_offset(arg, args)
                 self.emit("movq", f"-{stack_offset}(%rbp)", f"%{self._argregs[i]}")
             else:

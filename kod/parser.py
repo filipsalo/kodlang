@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """A parser for the Kod lanuage"""
 
+import dataclasses
+
 from kod.tokens import (  # pylint: disable=no-name-in-module
     EOF,
     EOL,
@@ -20,45 +22,64 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
 )
 
 
-class FunctionDeclaration:
-    """A function declaration."""
-
-    external = False
-
-    def __init__(self, name, params, body, return_type):
-        self.name = name
-        self.params = params
-        self.body = body
-        self.return_type = return_type
+class ASTNode:
+    """An AST node."""
 
 
-class ExternalFunctionDeclaration(FunctionDeclaration):
-    """An external function declaration."""
-
-    external = True
-
-
-class FunctionCall:
-    """A function call."""
-
-    def __init__(self, callee, args):
-        self.callee = callee
-        self.args = args
+@dataclasses.dataclass
+class StringLiteral(ASTNode):
+    """A string literal."""
+    value: str
 
 
-class FunctionParam:
-    """A function parameter."""
-
-    def __init__(self, name, type_):
-        self.name = name
-        self.type = type_
+@dataclasses.dataclass
+class Name(ASTNode):
+    """A name."""
+    id: str
 
 
-class VariableExpr:
+@dataclasses.dataclass
+class VariableExpr(ASTNode):
     """A variable expression."""
+    name: str
 
-    def __init__(self, name):
-        self.name = name
+
+@dataclasses.dataclass
+class FunctionParam(ASTNode):
+    """A function parameter."""
+    name: str
+    type: str
+
+
+@dataclasses.dataclass
+class FunctionCall(ASTNode):
+    """A function call."""
+    callee: ASTNode
+    args: list[ASTNode]
+
+
+@dataclasses.dataclass
+class FunctionDeclaration(ASTNode):
+    """A function declaration."""
+    name: str
+    params: list[FunctionParam]
+    body: list[ASTNode]
+    return_type: str
+
+
+@dataclasses.dataclass
+class ExternalFunctionDeclaration(ASTNode):
+    """An external function declaration."""
+    name: str
+    params: list[FunctionParam]
+    body: list[ASTNode]
+    return_type: str
+
+
+@dataclasses.dataclass
+class Module(ASTNode):
+    """A module."""
+    body: list[ExternalFunctionDeclaration | FunctionDeclaration]
 
 
 class Parser:
@@ -83,7 +104,12 @@ class Parser:
     def parse_token(self, token_type):
         """Parse the next token, or raise ValueError if it doesn't match."""
         token = self.consume(token_type)
-        return token.value
+        match token_type.value:
+            case Identifier.value:
+                return Name(token.value)
+            case QuotedString.value:
+                return StringLiteral(token.value)
+        raise ValueError(f"Unexpected token {token_type}")
 
     def parse_param(self):
         """Parse a function parameter."""
@@ -125,8 +151,7 @@ class Parser:
             return self.parse_token(QuotedString)
         if self.peek(LiteralNumber):
             return self.parse_token(LiteralNumber)
-        name_lookup = self.parse_token(Identifier)
-        name = VariableExpr(name_lookup)
+        name = self.parse_token(Identifier)
         if self.peek(OpenParen):
             self.consume(OpenParen)
             args = []
@@ -177,7 +202,7 @@ class Parser:
 
     def parse(self):
         """Parse the program."""
-        return list(self)
+        return Module(list(self))
 
     def __iter__(self):
         while True:

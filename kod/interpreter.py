@@ -6,6 +6,8 @@ from kod.parser import (
     ExternalFunctionDeclaration,
     FunctionCall,
     VariableExpr,
+    StringLiteral,
+    Name,
 )
 
 externals = {"puts": print}
@@ -20,20 +22,22 @@ class Interpreter:
 
     def run(self):
         """Run the program"""
-        for statement in self.prog:
-            if isinstance(statement, FunctionDeclaration):
+        for statement in self.prog.body:
+            if isinstance(statement, (FunctionDeclaration, ExternalFunctionDeclaration)):
                 self.stack[-1][statement.name] = statement
-                # print('stack', self.stack)
             else:
                 raise ValueError(f"Unexpected statement {statement}")
-        main = self.lookup("main")
+        main = self.lookup(Name("main"))
         self.call_function(main)
 
     def lookup(self, variable):
         """Look up a variable in the stack"""
         for frame in reversed(self.stack):
-            if variable in frame:
-                return frame[variable]
+            if variable.id in frame:
+                value = frame[variable.id]
+                if isinstance(value, StringLiteral):
+                    value = value.value
+                return value
         raise ValueError(f"Unknown variable {variable!r}")
 
     def resolve_names(self, args):
@@ -46,7 +50,7 @@ class Interpreter:
     def execute_statement(self, statement):
         """Execute a statement"""
         if isinstance(statement, FunctionCall):
-            func = self.lookup(statement.callee.name)
+            func = self.lookup(statement.callee)
             args = self.resolve_names(statement.args)
             self.call_function(func, args)
         else:
@@ -54,13 +58,14 @@ class Interpreter:
 
     def call_function(self, func, args=()):
         """Call a function"""
-        self.stack.append({})
         # Map args to params
-        for param, arg in zip(func.params, args):
-            value = self.lookup(arg) if isinstance(arg, VariableExpr) else arg
-            self.stack[-1][param.name] = value
+        args = {
+            param.name.id: self.lookup(arg) if isinstance(arg, Name) else arg
+            for param, arg in zip(func.params, args)
+        }
         if isinstance(func, ExternalFunctionDeclaration):
-            externals[func.name](*args)
+            externals[func.name](*args.values())
         for statement in func.body:
+            self.stack.append(args)
             self.execute_statement(statement)
         self.stack.pop()
