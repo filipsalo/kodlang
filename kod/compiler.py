@@ -74,21 +74,20 @@ class Compiler:
         self.leave_stack_frame(func)
 
     def _get_stack_frame_size(self, params):
-        sizes = {
-            "int32": 4,
-            "int64": 8,
-            "str": 8,
-        }
-        return sum(sizes[param.type.id] for param in params)
+        return sum(param.type.width for param in params)
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
         self.emit("pushq", "%rbp")
         self.emit("movq", "%rsp", "%rbp")
-        if stack_frame_size := self._get_stack_frame_size(func.params):
-            self.emit("subq", f"${stack_frame_size}", "%rsp")
-            for i, _param in enumerate(func.params):
-                self.emit("movq", f"%{self._argregs[i]}", f"-{(i+1) * 8}(%rbp)")
+        if not func.params:
+            return
+        stack_frame_size = self._get_stack_frame_size(func.params)
+        self.emit("subq", f"${stack_frame_size}", "%rsp")
+        offset = 0
+        for i, param in enumerate(func.params):
+            offset -= param.type.width
+            self.emit("movq", f"%{self._argregs[i]}", f"{offset}(%rbp)")
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""

@@ -20,6 +20,7 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
     Extern,
     Func,
 )
+from kod.types import BUILTIN_TYPES
 
 
 class ASTNode:
@@ -111,11 +112,18 @@ class Parser:
                 return StringLiteral(token.value)
         raise ValueError(f"Unexpected token {token_type}")
 
+    def parse_type(self):
+        """Parse a type."""
+        param_type = self.parse_token(Identifier)
+        if param_type.id not in BUILTIN_TYPES:
+            raise ValueError(f"Unexpected type {param_type.id}")
+        return BUILTIN_TYPES[param_type.id]
+
     def parse_param(self):
         """Parse a function parameter."""
         name = self.parse_token(Identifier)
         self.consume(Colon)
-        param_type = self.parse_token(Identifier)
+        param_type = self.parse_type()
         return FunctionParam(name, param_type)
 
     def parse_param_list(self):
@@ -137,7 +145,7 @@ class Parser:
             params = self.parse_param_list()
         self.consume(CloseParen)
         self.consume(Arrow)
-        return_type = self.consume(Identifier).value
+        return_type = self.parse_type()
         self.consume(OpenCurly)
         while not self.peek(CloseCurly):
             if statement := self.parse_statement():
@@ -173,7 +181,7 @@ class Parser:
         params = self.parse_param_list()
         self.consume(CloseParen)
         self.consume(Arrow)
-        return_type = self.consume(Identifier).value
+        return_type = self.parse_type()
         return ExternalFunctionDeclaration(name, params, [], return_type)
 
     def parse_statement(self):
