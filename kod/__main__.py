@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """I am the Kod language."""
 
-import sys
 import argparse
+import pprint
+import sys
 
 from kod.compiler import Compiler
 from kod.interpreter import Interpreter
@@ -20,6 +21,9 @@ def main():
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=argparse.FileType("r"))
 
+    parse_parser = subparsers.add_parser("parse")
+    parse_parser.add_argument("file", type=argparse.FileType("r"))
+
     build_parser = subparsers.add_parser("build")
     build_parser.add_argument("file", type=argparse.FileType("r"))
 
@@ -33,11 +37,13 @@ def main():
         return 1
     prog = Parser(tokens).parse()
 
-    if args.command == "run":
-        Interpreter(prog).run()
-        return 0
-    elif args.command == "build":
-        Compiler(prog).compile()
+    match args.command:
+        case "run":
+            Interpreter(prog).run()
+        case "build":
+            Compiler(prog).compile()
+        case "parse":
+            pprint.pprint(prog)
 
 
 sys.exit(main())
