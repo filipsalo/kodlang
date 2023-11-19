@@ -85,9 +85,9 @@ class Compiler:
         stack_frame_size = self._get_stack_frame_size(func.params)
         self.emit("subq", f"${stack_frame_size}", "%rsp")
         offset = 0
-        for i, param in enumerate(func.params):
+        for param, register in zip(func.params, self._argregs):
             offset -= param.type.width
-            self.emit("movq", f"%{self._argregs[i]}", f"{offset}(%rbp)")
+            self.emit("movq", f"%{register}", f"{offset}(%rbp)")
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
@@ -130,12 +130,12 @@ class Compiler:
 
     def prepare_args(self, args):
         """Prepare arguments for a function call"""
-        for i, arg in enumerate(args):
+        for arg, register in zip(args, self._argregs):
             if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
-                self.emit("leaq", f"{arg.label}(%rip)", f"%{self._argregs[i]}")
+                self.emit("leaq", f"{arg.label}(%rip)", f"%{register}")
             elif isinstance(arg, Name):
                 stack_offset = self.calculate_stack_offset(arg, args)
-                self.emit("movq", f"-{stack_offset}(%rbp)", f"%{self._argregs[i]}")
+                self.emit("movq", f"-{stack_offset}(%rbp)", f"%{register}")
             else:
-                self.emit("movq", f"${arg}", f"%{self._argregs[i]}")
+                self.emit("movq", f"${arg}", f"%{register}")
