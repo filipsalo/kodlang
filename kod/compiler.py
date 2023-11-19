@@ -36,6 +36,7 @@ class Compiler:
     def __init__(self, program, output=sys.stdout):
         self.program = program
         self.output = output
+        self.functions = {}
         self.strings = {}
 
     def literal_string(self, s, label=None):
@@ -52,7 +53,7 @@ class Compiler:
         self.emit(".globl", "_main")
         for statement in self.program.body:
             if isinstance(statement, ExternalFunctionDeclaration):
-                pass
+                self.functions[statement.name] = statement
             elif isinstance(statement, FunctionDeclaration):
                 self.compile_function(statement)
             else:
@@ -72,6 +73,7 @@ class Compiler:
             else:
                 raise ValueError(f"Unexpected statement {statement}")
         self.leave_stack_frame(func)
+        self.functions[func.name] = func
 
     def _get_stack_frame_size(self, params):
         return sum(param.type.width for param in params)
@@ -80,8 +82,11 @@ class Compiler:
         """Emit the prologue for a function"""
         self.emit("pushq", "%rbp")
         self.emit("movq", "%rsp", "%rbp")
-        if not func.params:
-            return
+        if func.params:
+            self.move_args_to_stack(func)
+
+    def move_args_to_stack(self, func):
+        """Move arguments from registers to the stack"""
         stack_frame_size = self._get_stack_frame_size(func.params)
         self.emit("subq", f"${stack_frame_size}", "%rsp")
         offset = 0
@@ -114,28 +119,21 @@ class Compiler:
             print(f"\t# {comment}", end="", file=self.output)
         print(file=self.output)
 
-    def compile_function_call(self, func):
+    def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
-        self.prepare_args(func.args)
-        print(f"\tcallq\t_{func.callee.id}", file=self.output)
+        func = self.functions[func_call.callee.id]
+        self.prepare_args(func, func_call.args)
+        print(f"\tcallq\t_{func.name}", file=self.output)
 
-    def calculate_stack_offset(self, arg, args):
-        """Calculate the stack offset for a variable"""
-        stack_offset = 0
-        for _arg in reversed(args):
-            stack_offset += 8
-            if _arg.id == arg.id:
-                break
-        return stack_offset
-
-    def prepare_args(self, args):
+    def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
-        for arg, register in zip(args, self._argregs):
+        offset = 0
+        for param, arg, register in zip(func.params, args, self._argregs):
+            offset -= param.type.width
             if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
                 self.emit("leaq", f"{arg.label}(%rip)", f"%{register}")
             elif isinstance(arg, Name):
-                stack_offset = self.calculate_stack_offset(arg, args)
-                self.emit("movq", f"-{stack_offset}(%rbp)", f"%{register}")
+                self.emit("movq", f"{offset}(%rbp)", f"%{register}")
             else:
                 self.emit("movq", f"${arg}", f"%{register}")
