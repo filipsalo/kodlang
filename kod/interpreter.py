@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Simple interpreter for the Kod language"""
 
-from kod.parser import (
+from kod.ast import (
     FunctionDeclaration,
     ExternalFunctionDeclaration,
     FunctionCall,
