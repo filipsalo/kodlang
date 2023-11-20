@@ -6,7 +6,7 @@ from kod.parser import (
     ExternalFunctionDeclaration,
     FunctionDeclaration,
     FunctionCall,
-    Name,
+    Variable,
     StringLiteral,
 )
 
@@ -133,7 +133,7 @@ class Compiler:
             if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
                 self.emit("leaq", f"{arg.label}(%rip)", f"%{register}")
-            elif isinstance(arg, Name):
+            elif isinstance(arg, Variable):
                 self.emit("movq", f"{offset}(%rbp)", f"%{register}")
             else:
                 self.emit("movq", f"${arg}", f"%{register}")

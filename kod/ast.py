@@ -2,6 +2,8 @@
 
 import dataclasses
 
+from kod.types import Type
+
 
 class ASTNode:
     """An AST node."""
@@ -11,18 +13,14 @@ class ASTNode:
 class StringLiteral(ASTNode):
     """A string literal."""
     value: str
+    type: Type
 
 
 @dataclasses.dataclass
-class Name(ASTNode):
+class Variable(ASTNode):
     """A name."""
     id: str
-
-
-@dataclasses.dataclass
-class VariableExpr(ASTNode):
-    """A variable expression."""
-    name: str
+    type: Type
 
 
 @dataclasses.dataclass

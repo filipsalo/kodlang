@@ -5,9 +5,8 @@ from kod.ast import (
     FunctionDeclaration,
     ExternalFunctionDeclaration,
     FunctionCall,
-    VariableExpr,
     StringLiteral,
-    Name,
+    Variable,
 )
 
 externals = {"puts": print}
@@ -27,7 +26,7 @@ class Interpreter:
                 self.stack[-1][statement.name] = statement
             else:
                 raise ValueError(f"Unexpected statement {statement}")
-        main = self.lookup(Name("main"))
+        main = self.lookup(Variable("main", None))
         self.call_function(main)
 
     def lookup(self, variable):
@@ -43,7 +42,7 @@ class Interpreter:
     def resolve_names(self, args):
         """Resolve variable names to values"""
         return [
-            self.lookup(arg.name) if isinstance(arg, VariableExpr) else arg
+            self.lookup(arg) if isinstance(arg, Variable) else arg
             for arg in args
         ]
 
@@ -60,7 +59,7 @@ class Interpreter:
         """Call a function"""
         # Map args to params
         args = {
-            param.name.id: self.lookup(arg) if isinstance(arg, Name) else arg
+            param.name.id: self.lookup(arg) if isinstance(arg, Variable) else arg
             for param, arg in zip(func.params, args)
         }
         if isinstance(func, ExternalFunctionDeclaration):

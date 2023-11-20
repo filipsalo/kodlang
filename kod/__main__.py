@@ -9,6 +9,7 @@ from kod.compiler import Compiler
 from kod.interpreter import Interpreter
 from kod.lexer import Lexer
 from kod.parser import Parser
+from kod.typechecker import TypeChecker
 from kod.exceptions import KodSyntaxError
 
 
@@ -36,6 +37,7 @@ def main():
         print(e)
         return 1
     prog = Parser(tokens).parse()
+    TypeChecker().check_module(prog)
 
     match args.command:
         case "run":

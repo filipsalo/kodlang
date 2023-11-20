@@ -7,7 +7,7 @@ from kod.ast import (
     FunctionCall,
     FunctionParam,
     Module,
-    Name,
+    Variable,
     StringLiteral,
 )
 from kod.tokens import (  # pylint: disable=no-name-in-module
@@ -54,9 +54,9 @@ class Parser:
         token = self.consume(token_type)
         match token_type.value:
             case Identifier.value:
-                return Name(token.value)
+                return Variable(token.value, None)
             case QuotedString.value:
-                return StringLiteral(token.value)
+                return StringLiteral(token.value, BUILTIN_TYPES["str"])
         raise ValueError(f"Unexpected token {token_type}")
 
     def parse_type(self):
