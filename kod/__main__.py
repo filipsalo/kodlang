@@ -2,7 +2,10 @@
 """I am the Kod language."""
 
 import argparse
+import io
+from pathlib import Path
 import pprint
+import subprocess
 import sys
 
 from kod.compiler import Compiler
@@ -43,7 +46,23 @@ def main():
         case "run":
             Interpreter(prog).run()
         case "build":
-            Compiler(prog).compile()
+            asm = io.StringIO()
+            Compiler(prog, asm).compile()
+            object_file = (Path("build") / Path(args.file.name).stem).with_suffix(".o")
+            executable = object_file.with_suffix("")
+            subprocess.run([
+                "as",
+                "-o", object_file,
+                "-"
+            ], input=asm.getvalue().encode("ascii"), check=True)
+            subprocess.run([
+                "ld",
+                "-macosx_version_min", "13.1",
+                "-lc",
+                "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+                "-o", executable,
+                object_file
+            ], check=True)
         case "parse":
             pprint.pprint(prog)
 
