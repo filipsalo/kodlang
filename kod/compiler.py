@@ -80,25 +80,25 @@ class Compiler:
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
-        self.emit("pushq", "%rbp")
-        self.emit("movq", "%rsp", "%rbp")
+        self.push("%rbp")
+        self.mov("%rsp", "%rbp")
         if func.params:
             self.move_args_to_stack(func)
 
     def move_args_to_stack(self, func):
         """Move arguments from registers to the stack"""
         stack_frame_size = self._get_stack_frame_size(func.params)
-        self.emit("subq", f"${stack_frame_size}", "%rsp")
+        self.sub(f"${stack_frame_size}", "%rsp")
         offset = 0
         for param, register in zip(func.params, self._argregs):
             offset -= param.type.width
-            self.emit("movq", f"%{register}", f"{offset}(%rbp)")
+            self.mov(f"%{register}", f"{offset}(%rbp)", size=param.type.width)
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
         if stack_frame_size := self._get_stack_frame_size(func.params):
-            self.emit("addq", f"${stack_frame_size}", "%rsp")
-        self.emit("popq", "%rbp")
+            self.add(f"${stack_frame_size}", "%rsp")
+        self.pop("%rbp")
         self.emit("ret")
 
     def emit_comment(self, comment):
@@ -123,7 +123,7 @@ class Compiler:
         """Compile a function call to assembly"""
         func = self.functions[func_call.callee.id]
         self.prepare_args(func, func_call.args)
-        print(f"\tcallq\t_{func.name}", file=self.output)
+        self.emit("callq", f"_{func.name}")
 
     def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
@@ -132,8 +132,37 @@ class Compiler:
             offset -= param.type.width
             if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
-                self.emit("leaq", f"{arg.label}(%rip)", f"%{register}")
+                self.lea(f"{arg.label}(%rip)", f"%{register}")
             elif isinstance(arg, Variable):
-                self.emit("movq", f"{offset}(%rbp)", f"%{register}")
+                self.mov(f"{offset}(%rbp)", f"%{register}")
             else:
-                self.emit("movq", f"${arg}", f"%{register}")
+                self.mov(f"${arg}", f"%{register}")
+
+    def emit_sized(self, op, size, *args, comment=None):
+        """Emit an instruction with a size suffix"""
+        size = {8: "q", 4: "l", 2: "w", 1: "b"}[size]
+        self.emit(f"{op}{size}", *args, comment=comment)
+
+    def mov(self, src, dest, size=8, comment=None):
+        """Move a value"""
+        self.emit_sized("mov", size, src, dest, comment=comment)
+
+    def lea(self, src, dest, size=8, comment=None):
+        """Load the effective address"""
+        self.emit_sized("lea", size, src, dest, comment=comment)
+
+    def push(self, src, size=8, comment=None):
+        """Push a value onto the stack"""
+        self.emit_sized("push", size, src, comment=comment)
+
+    def pop(self, dest, size=8, comment=None):
+        """Pop a value from the stack"""
+        self.emit_sized("pop", size, dest, comment=comment)
+
+    def sub(self, src, dest, size=8, comment=None):
+        """Subtract a value from another value"""
+        self.emit_sized("sub", size, src, dest, comment=comment)
+
+    def add(self, src, dest, size=8, comment=None):
+        """Add a value to another value"""""
+        self.emit_sized("add", size, src, dest, comment=comment)
