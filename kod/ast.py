@@ -5,6 +5,23 @@ import dataclasses
 from kod.types import Type
 
 
+def dump(node, indent=""):
+    """Dump the AST node."""
+
+    print(f"{indent}{node.__class__.__name__}(")
+    for field in dataclasses.fields(node):
+        value = getattr(node, field.name)
+        if isinstance(value, list) and len(value) > 0:
+            newindent = indent + "    "
+            print(f"{newindent}{field.name}=[")
+            for item in value:
+                dump(item, newindent + "    ")
+            print(f"{newindent}],")
+        else:
+            print(f"{indent + '    '}{field.name}={value!r},")
+    print(f"{indent}),")
+
+
 class ASTNode:
     """An AST node."""
 

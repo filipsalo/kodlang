@@ -4,7 +4,6 @@
 import argparse
 import io
 from pathlib import Path
-import pprint
 import subprocess
 import sys
 
@@ -14,6 +13,7 @@ from kod.lexer import Lexer
 from kod.parser import Parser
 from kod.typechecker import TypeChecker
 from kod.exceptions import KodSyntaxError
+import kod.ast as ast
 
 
 def main():
@@ -64,7 +64,7 @@ def main():
                 object_file
             ], check=True)
         case "parse":
-            pprint.pprint(prog)
+            ast.dump(prog)
 
 
 sys.exit(main())
