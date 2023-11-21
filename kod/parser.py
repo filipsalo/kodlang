@@ -5,7 +5,6 @@ from kod.ast import (
     ExternalFunctionDeclaration,
     FunctionDeclaration,
     FunctionCall,
-    FunctionParam,
     Module,
     Variable,
     StringLiteral,
@@ -68,10 +67,10 @@ class Parser:
 
     def parse_param(self):
         """Parse a function parameter."""
-        name = self.parse_token(Identifier)
+        variable = self.parse_token(Identifier)
         self.consume(Colon)
-        param_type = self.parse_type()
-        return FunctionParam(name, param_type)
+        variable.type = self.parse_type()
+        return variable
 
     def parse_param_list(self):
         """Parse a list of function parameters."""

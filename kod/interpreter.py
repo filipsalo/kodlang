@@ -59,7 +59,7 @@ class Interpreter:
         """Call a function"""
         # Map args to params
         args = {
-            param.name.id: self.lookup(arg) if isinstance(arg, Variable) else arg
+            param.id: self.lookup(arg) if isinstance(arg, Variable) else arg
             for param, arg in zip(func.params, args)
         }
         if isinstance(func, ExternalFunctionDeclaration):
