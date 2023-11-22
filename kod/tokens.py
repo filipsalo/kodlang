@@ -1,13 +1,23 @@
 #!/usr/bin/env python
 
+import dataclasses
 from enum import Enum, global_enum, auto
+from typing import Optional
 
 
+@dataclasses.dataclass
+class Position:
+    """A position in a source file."""
+    filename: str
+    line: int
+    column: int
+
+
+@dataclasses.dataclass
 class Token:
     """A token in the Kod language."""
-
-    def __init__(self, value=None):
-        self.value = value
+    value: str
+    position: Position
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.value!r})"

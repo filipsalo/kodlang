@@ -55,7 +55,7 @@ class Parser:
             case Identifier.value:
                 return Variable(token.value, None)
             case QuotedString.value:
-                return StringLiteral(token.value, BUILTIN_TYPES["str"])
+                return StringLiteral(token.value.strip("\""), BUILTIN_TYPES["str"])
         raise ValueError(f"Unexpected token {token_type}")
 
     def parse_type(self):
