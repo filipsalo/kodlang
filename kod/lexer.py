@@ -2,7 +2,7 @@
 """A lexer for the kod language."""
 
 from kod.exceptions import KodSyntaxError
-from kod.tokens import (  # pylint: disable=no-name-in-module
+from kod.tokens import (
     EOF,
     EOL,
     Identifier,

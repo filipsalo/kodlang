@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 
 import dataclasses
-from enum import Enum, global_enum, auto
-from typing import Optional
 
 
 @dataclasses.dataclass
@@ -23,33 +21,86 @@ class Token:
         return f"{self.__class__.__name__}({self.value!r})"
 
 
-@global_enum
-class TokenType(Enum):
-    """An enumeration of token types."""
+@dataclasses.dataclass
+class EOF(Token):
+    """The end of the file."""
 
-    @staticmethod
-    def _generate_next_value_(name, start, count, last_values):
-        return type(name, (Token,), {})
 
-    def __call__(self, *args, **kwargs):
-        return self.value(*args, **kwargs)
+@dataclasses.dataclass
+class EOL(Token):
+    """A newline."""
 
-    EOF = auto()
-    EOL = auto()
-    Identifier = auto()
-    OpenParen = auto()
-    CloseParen = auto()
-    OpenCurly = auto()
-    CloseCurly = auto()
-    Dot = auto()
-    Colon = auto()
-    Comma = auto()
-    QuotedString = auto()
-    LiteralNumber = auto()
-    Comment = auto()
-    Arrow = auto()
-    Variable = auto()
 
-    # Keywords
-    Extern = auto()
-    Func = auto()
+@dataclasses.dataclass
+class Identifier(Token):
+    """An identifier."""
+
+
+@dataclasses.dataclass
+class OpenParen(Token):
+    """An open parenthesis."""
+
+
+@dataclasses.dataclass
+class CloseParen(Token):
+    """A close parenthesis."""
+
+
+@dataclasses.dataclass
+class OpenCurly(Token):
+    """An open curly brace."""
+
+
+@dataclasses.dataclass
+class CloseCurly(Token):
+    """A close curly brace."""
+
+
+@dataclasses.dataclass
+class Dot(Token):
+    """A dot."""
+
+
+@dataclasses.dataclass
+class Colon(Token):
+    """A colon."""
+
+
+@dataclasses.dataclass
+class Comma(Token):
+    """A comma."""
+
+
+@dataclasses.dataclass
+class QuotedString(Token):
+    """A quoted string."""
+
+
+@dataclasses.dataclass
+class LiteralNumber(Token):
+    """A literal number."""
+
+
+@dataclasses.dataclass
+class Comment(Token):
+    """A comment."""
+
+
+@dataclasses.dataclass
+class Arrow(Token):
+    """An arrow."""
+
+
+@dataclasses.dataclass
+class Variable(Token):
+    """A variable."""
+
+
+@dataclasses.dataclass
+class Extern(Token):
+    """An extern function declaration."""
+
+
+@dataclasses.dataclass
+class Func(Token):
+    """A function declaration."""

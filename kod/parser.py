@@ -43,7 +43,7 @@ class Parser:
     def consume(self, token_type):
         """Consume the next token, or raise ValueError if it doesn't match."""
         token = self.peek()
-        if not isinstance(token, token_type.value):
+        if not isinstance(token, token_type):
             raise ValueError(f"Expected {token_type}, got {token}")
         self.pos += 1
         return token
@@ -51,10 +51,10 @@ class Parser:
     def parse_token(self, token_type):
         """Parse the next token, or raise ValueError if it doesn't match."""
         token = self.consume(token_type)
-        match token_type.value:
-            case Identifier.value:
+        match token:
+            case Identifier():
                 return Variable(token.value, None)
-            case QuotedString.value:
+            case QuotedString():
                 return StringLiteral(token.value.strip("\""), BUILTIN_TYPES["str"])
         raise ValueError(f"Unexpected token {token_type}")
 
@@ -132,16 +132,16 @@ class Parser:
 
     def parse_statement(self):
         """Parse a statement."""
-        match type(self.peek()):
-            case Extern.value:
+        match self.peek():
+            case Extern():
                 return self.parse_external()
-            case Func.value:
+            case Func():
                 return self.parse_func()
-            case Identifier.value:
+            case Identifier():
                 return self.parse_expression()
-            case Comment.value:
+            case Comment():
                 self.consume(Comment)
-            case EOL.value:
+            case EOL():
                 self.consume(EOL)
                 return
             case _:
@@ -151,7 +151,7 @@ class Parser:
         """Return the next token, or raise ValueError if it doesn't match."""
         token = self.tokens[self.pos]
         if token_type is not None:
-            return isinstance(token, token_type.value)
+            return isinstance(token, token_type)
         return token
 
     def parse(self):
