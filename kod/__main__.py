@@ -29,6 +29,7 @@ def main():
     parse_parser.add_argument("file", type=argparse.FileType("r"))
 
     build_parser = subparsers.add_parser("build")
+    build_parser.add_argument("-S", dest="output_assembly", action="store_true")
     build_parser.add_argument("file", type=argparse.FileType("r"))
 
     args = parser.parse_args()
@@ -48,6 +49,9 @@ def main():
         case "build":
             asm = io.StringIO()
             Compiler(prog, asm).compile()
+            if args.output_assembly:
+                print(asm.getvalue())
+                return 0
             object_file = (Path("build") / Path(args.file.name).stem).with_suffix(".o")
             executable = object_file.with_suffix("")
             subprocess.run([
