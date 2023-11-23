@@ -11,8 +11,8 @@ class TypeChecker:
     def check_module(self, module):
         """Check a module for type errors."""
         for node in module.body:
-            match type(node):
-                case ast.FunctionDeclaration | ast.ExternalFunctionDeclaration:
+            match node:
+                case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = [
                         param.type for param in node.params
                     ]
@@ -21,13 +21,13 @@ class TypeChecker:
 
     def check_statement(self, node):
         """Check a statement for type errors."""
-        match type(node):
-            case ast.FunctionCall:
+        match node:
+            case ast.FunctionCall():
                 self.check_function_call(node)
-            case ast.FunctionDeclaration:
+            case ast.FunctionDeclaration():
                 for statement in node.body:
                     self.check_statement(statement)
-            case ast.ExternalFunctionDeclaration:
+            case ast.ExternalFunctionDeclaration():
                 pass
             case _:
                 raise ValueError(f"Don't know how typ type check a {type(node)}")
