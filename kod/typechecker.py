@@ -29,6 +29,8 @@ class TypeChecker:
                     self.check_statement(statement)
             case ast.ExternalFunctionDeclaration():
                 pass
+            case ast.VariableDeclaration():
+                pass
             case _:
                 raise ValueError(f"Don't know how typ type check a {type(node)}")
 

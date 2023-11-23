@@ -7,6 +7,7 @@ from kod.ast import (
     FunctionCall,
     StringLiteral,
     Variable,
+    VariableDeclaration,
 )
 
 externals = {"puts": print}
@@ -48,12 +49,15 @@ class Interpreter:
 
     def execute_statement(self, statement):
         """Execute a statement"""
-        if isinstance(statement, FunctionCall):
-            func = self.lookup(statement.callee)
-            args = self.resolve_names(statement.args)
-            self.call_function(func, args)
-        else:
-            raise ValueError(f"Unexpected statement {statement}")
+        match statement:
+            case FunctionCall(callee, args):
+                func = self.lookup(callee)
+                args = self.resolve_names(args)
+                self.call_function(func, args)
+            case VariableDeclaration(variable, value):
+                self.stack[-1][variable.id] = value
+            case _:
+                raise ValueError(f"Unexpected statement {statement}")
 
     def call_function(self, func, args=()):
         """Call a function"""

@@ -104,3 +104,13 @@ class Extern(Token):
 @dataclasses.dataclass
 class Func(Token):
     """A function declaration."""
+
+
+@dataclasses.dataclass
+class Let(Token):
+    """A let statement."""
+
+
+@dataclasses.dataclass
+class Equals(Token):
+    """An equals sign."""

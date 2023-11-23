@@ -8,6 +8,7 @@ from kod.ast import (
     Module,
     Variable,
     StringLiteral,
+    VariableDeclaration,
 )
 from kod.tokens import (  # pylint: disable=no-name-in-module
     EOF,
@@ -25,6 +26,8 @@ from kod.tokens import (  # pylint: disable=no-name-in-module
     Arrow,
     Extern,
     Func,
+    Let,
+    Equals,
 )
 from kod.types import BUILTIN_TYPES
 
@@ -35,6 +38,7 @@ class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
         self.pos = 0
+        self.stack = []
 
     def eof(self):
         """Return True if at EOF."""
@@ -93,11 +97,13 @@ class Parser:
         self.consume(Arrow)
         return_type = self.parse_type()
         self.consume(OpenCurly)
+        self.stack.append({param.id: param for param in params})
         while not self.peek(CloseCurly):
             if statement := self.parse_statement():
                 body.append(statement)
         self.consume(CloseCurly)
-        return FunctionDeclaration(name, params, body, return_type)
+        variables = self.stack.pop().values()
+        return FunctionDeclaration(name, params, body, return_type, variables)
 
     def parse_expression(self):
         """Parse an expression."""
@@ -130,9 +136,21 @@ class Parser:
         return_type = self.parse_type()
         return ExternalFunctionDeclaration(name, params, [], return_type)
 
+    def parse_variable_declaration(self):
+        """Parse a variable declaration."""
+        self.consume(Let)
+        variable = self.parse_token(Identifier)
+        self.stack[-1][variable.id] = variable
+        self.consume(Equals)
+        value = self.parse_expression()
+        variable.type = value.type
+        return VariableDeclaration(variable, value)
+
     def parse_statement(self):
         """Parse a statement."""
         match self.peek():
+            case Let():
+                return self.parse_variable_declaration()
             case Extern():
                 return self.parse_external()
             case Func():

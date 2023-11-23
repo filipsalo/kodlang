@@ -8,6 +8,7 @@ from kod.parser import (
     FunctionCall,
     Variable,
     StringLiteral,
+    VariableDeclaration,
 )
 
 
@@ -38,6 +39,7 @@ class Compiler:
         self.output = output
         self.functions = {}
         self.strings = {}
+        self.stack = []
 
     def literal_string(self, s, label=None):
         """Return a string constant for the given string"""
@@ -67,28 +69,43 @@ class Compiler:
         """Compile a function to assembly"""
         print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
+        self.stack.append({variable.id: variable for variable in func.variables})
         for statement in func.body:
-            if isinstance(statement, FunctionCall):
-                self.compile_function_call(statement)
-            else:
-                raise ValueError(f"Unexpected statement {statement}")
+            match statement:
+                case FunctionCall():
+                    self.compile_function_call(statement)
+                case VariableDeclaration():
+                    self.compile_variable_declaration(statement.variable, statement.value)
+                case _:
+                    raise ValueError(f"Unexpected statement {statement}")
+        self.stack.pop()
         self.leave_stack_frame(func)
         self.functions[func.name] = func
 
-    def _get_stack_frame_size(self, params):
-        return sum(param.type.width for param in params)
+    def _get_stack_frame_size(self, func):
+        return sum(variable.type.width for variable in func.variables)
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
         self.push("%rbp")
         self.mov("%rsp", "%rbp")
-        if func.params:
-            self.move_args_to_stack(func)
+        if stack_frame_size := self._get_stack_frame_size(func):
+            self.sub(f"${stack_frame_size}", "%rsp")
+            if func.params:
+                self.move_args_to_stack(func)
+
+    def compile_variable_declaration(self, variable, value):
+        """Compile a variable declaration to assembly"""
+        if isinstance(value, StringLiteral):
+            value = self.literal_string(value)
+            offset = self.get_variable_offset(variable)
+            self.lea(f"{value.label}(%rip)", "%rax")
+            self.mov("%rax", f"{offset}(%rbp)")
+        else:
+            raise ValueError(f"Unexpected variable value {variable.value}")
 
     def move_args_to_stack(self, func):
         """Move arguments from registers to the stack"""
-        stack_frame_size = self._get_stack_frame_size(func.params)
-        self.sub(f"${stack_frame_size}", "%rsp")
         offset = 0
         for param, register in zip(func.params, self._argregs):
             offset -= param.type.width
@@ -96,14 +113,10 @@ class Compiler:
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
-        if stack_frame_size := self._get_stack_frame_size(func.params):
+        if stack_frame_size := self._get_stack_frame_size(func):
             self.add(f"${stack_frame_size}", "%rsp")
         self.pop("%rbp")
         self.emit("ret")
-
-    def emit_comment(self, comment):
-        """Emit a comment"""
-        self.emit("##", comment)
 
     def emit_label(self, label):
         """Emit a label"""
@@ -115,7 +128,7 @@ class Compiler:
         if args:
             args = ", ".join(str(arg) for arg in args)
             print(f"\t{args}", end="", file=self.output)
-        if comment:
+        if comment and self.comments:
             print(f"\t# {comment}", end="", file=self.output)
         print(file=self.output)
 
@@ -134,9 +147,20 @@ class Compiler:
                 arg = self.literal_string(arg)
                 self.lea(f"{arg.label}(%rip)", f"%{register}")
             elif isinstance(arg, Variable):
-                self.mov(f"{offset}(%rbp)", f"%{register}")
+                offset = self.get_variable_offset(arg)
+                if offset:
+                    self.mov(f"{offset}(%rbp)", f"%{register}")
             else:
                 self.mov(f"${arg}", f"%{register}")
+
+    def get_variable_offset(self, variable):
+        """Get the offset of a variable in the stack frame"""
+        offset = 0
+        for var in self.stack[-1].values():
+            offset -= var.type.width
+            if var.id == variable.id:
+                return offset
+        raise ValueError(f"Unknown variable {variable!r}")
 
     def emit_sized(self, op, size, *args, comment=None):
         """Emit an instruction with a size suffix"""

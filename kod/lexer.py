@@ -19,6 +19,8 @@ from kod.tokens import (
     Arrow,
     Extern,
     Func,
+    Let,
+    Equals,
     Position,
 )
 
@@ -99,6 +101,8 @@ class Lexer:
         while self.peek().isalnum() or self.peek() == "_":
             self.pos += 1
         match self.buffered():
+            case "let":
+                return self.build(Let)
             case "extern":
                 return self.build(Extern)
             case "func":
@@ -150,6 +154,8 @@ class Lexer:
                         yield self.lex_single_char(Colon)
                     case ",":
                         yield self.lex_single_char(Comma)
+                    case "=":
+                        yield self.lex_single_char(Equals)
                     case "-":
                         yield self.lex_arrow()
                     case '"':

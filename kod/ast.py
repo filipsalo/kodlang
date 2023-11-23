@@ -61,6 +61,7 @@ class FunctionDeclaration(ASTNode):
     params: list[FunctionParam]
     body: list[ASTNode]
     return_type: str
+    variables: list[Variable]
 
 
 @dataclasses.dataclass
@@ -76,3 +77,10 @@ class ExternalFunctionDeclaration(ASTNode):
 class Module(ASTNode):
     """A module."""
     body: list[ExternalFunctionDeclaration | FunctionDeclaration]
+
+
+@dataclasses.dataclass
+class VariableDeclaration(ASTNode):
+    """An assignment."""
+    variable: Variable
+    value: ASTNode
