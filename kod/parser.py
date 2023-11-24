@@ -9,6 +9,7 @@ from kod.ast import (
     Variable,
     StringLiteral,
     VariableDeclaration,
+    Assignment,
 )
 from kod.tokens import (  # pylint: disable=no-name-in-module
     EOF,
@@ -122,6 +123,11 @@ class Parser:
                     args.append(self.parse_expression())
             self.consume(CloseParen)
             return FunctionCall(name, args)
+        elif self.peek(Equals):
+            self.consume(Equals)
+            value = self.parse_expression()
+            assert name.id in self.stack[-1], f"Undeclared variable {name.id}"
+            return Assignment(name, value)
         return name
 
     def parse_external(self):

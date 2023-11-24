@@ -84,3 +84,10 @@ class VariableDeclaration(ASTNode):
     """An assignment."""
     variable: Variable
     value: ASTNode
+
+
+@dataclasses.dataclass
+class Assignment(ASTNode):
+    """An assignment."""
+    variable: Variable
+    value: ASTNode

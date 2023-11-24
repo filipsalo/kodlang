@@ -31,8 +31,10 @@ class TypeChecker:
                 pass
             case ast.VariableDeclaration():
                 pass
+            case ast.Assignment():
+                pass
             case _:
-                raise ValueError(f"Don't know how typ type check a {type(node)}")
+                raise ValueError(f"Don't know how to type check a {type(node)}")
 
     def check_function_call(self, node):
         """Check a function call for type errors."""

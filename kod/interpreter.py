@@ -8,6 +8,7 @@ from kod.ast import (
     StringLiteral,
     Variable,
     VariableDeclaration,
+    Assignment,
 )
 
 externals = {"puts": print}
@@ -55,6 +56,8 @@ class Interpreter:
                 args = self.resolve_names(args)
                 self.call_function(func, args)
             case VariableDeclaration(variable, value):
+                self.stack[-1][variable.id] = value
+            case Assignment(variable, value):
                 self.stack[-1][variable.id] = value
             case _:
                 raise ValueError(f"Unexpected statement {statement}")

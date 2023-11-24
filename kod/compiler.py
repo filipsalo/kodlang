@@ -9,6 +9,7 @@ from kod.parser import (
     Variable,
     StringLiteral,
     VariableDeclaration,
+    Assignment,
 )
 
 
@@ -54,12 +55,13 @@ class Compiler:
         self.emit(".text")
         self.emit(".globl", "_main")
         for statement in self.program.body:
-            if isinstance(statement, ExternalFunctionDeclaration):
-                self.functions[statement.name] = statement
-            elif isinstance(statement, FunctionDeclaration):
-                self.compile_function(statement)
-            else:
-                raise ValueError(f"Unexpected statement {statement}")
+            match statement:
+                case ExternalFunctionDeclaration(name):
+                    self.functions[name] = statement
+                case FunctionDeclaration():
+                    self.compile_function(statement)
+                case _:
+                    raise ValueError(f"Unexpected statement {statement}")
         self.emit(".data")
         for string in self.strings.values():
             print(f"{string.label}:", file=self.output)
@@ -74,8 +76,10 @@ class Compiler:
             match statement:
                 case FunctionCall():
                     self.compile_function_call(statement)
-                case VariableDeclaration():
-                    self.compile_variable_declaration(statement.variable, statement.value)
+                case VariableDeclaration(variable, value):
+                    self.compile_variable_declaration(variable, value)
+                case Assignment(variable, value):
+                    self.compile_variable_declaration(variable, value)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
         self.stack.pop()
@@ -96,6 +100,16 @@ class Compiler:
 
     def compile_variable_declaration(self, variable, value):
         """Compile a variable declaration to assembly"""
+        if isinstance(value, StringLiteral):
+            value = self.literal_string(value)
+            offset = self.get_variable_offset(variable)
+            self.lea(f"{value.label}(%rip)", "%rax")
+            self.mov("%rax", f"{offset}(%rbp)")
+        else:
+            raise ValueError(f"Unexpected variable value {variable.value}")
+
+    def compile_assignment(self, variable, value):
+        """Compile an assignment to assembly"""
         if isinstance(value, StringLiteral):
             value = self.literal_string(value)
             offset = self.get_variable_offset(variable)
