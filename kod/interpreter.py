@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Simple interpreter for the Kod language"""
 
+import ctypes
+
 from kod.ast import (
     FunctionDeclaration,
     ExternalFunctionDeclaration,
@@ -11,7 +13,7 @@ from kod.ast import (
     Assignment,
 )
 
-externals = {"puts": print}
+libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
 
 class Interpreter:
@@ -64,14 +66,15 @@ class Interpreter:
 
     def call_function(self, func, args=()):
         """Call a function"""
+        if isinstance(func, ExternalFunctionDeclaration):
+            return getattr(libc, func.name)(*args)
+
         # Map args to params
         args = {
             param.id: self.lookup(arg) if isinstance(arg, Variable) else arg
             for param, arg in zip(func.params, args)
         }
-        if isinstance(func, ExternalFunctionDeclaration):
-            externals[func.name](*args.values())
+        self.stack.append(args)
         for statement in func.body:
-            self.stack.append(args)
             self.execute_statement(statement)
         self.stack.pop()

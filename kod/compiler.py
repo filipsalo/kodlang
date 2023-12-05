@@ -65,7 +65,7 @@ class Compiler:
         self.emit(".data")
         for string in self.strings.values():
             print(f"{string.label}:", file=self.output)
-            print(f'\t.asciz "{string.value}"', file=self.output)
+            print(f'\t.asciz "{string.value.decode()}"', file=self.output)
 
     def compile_function(self, func):
         """Compile a function to assembly"""
