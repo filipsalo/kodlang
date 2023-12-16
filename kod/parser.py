@@ -5,6 +5,7 @@ from kod.ast import (
     Assignment,
     ExternalFunctionDeclaration,
     FunctionCall,
+    FunctionCallParam,
     FunctionDeclaration,
     FunctionParam,
     Module,
@@ -12,24 +13,25 @@ from kod.ast import (
     Variable,
     VariableDeclaration,
 )
-from kod.tokens import (  # pylint: disable=no-name-in-module
-    EOF,
-    EOL,
-    Identifier,
-    OpenParen,
-    CloseParen,
-    OpenCurly,
+from kod.tokens import (
+    Anon,
+    Arrow,
     CloseCurly,
+    CloseParen,
     Colon,
     Comma,
-    QuotedString,
-    LiteralNumber,
     Comment,
-    Arrow,
+    EOF,
+    EOL,
+    Equals,
     Extern,
     Func,
+    Identifier,
     Let,
-    Equals,
+    LiteralNumber,
+    OpenCurly,
+    OpenParen,
+    QuotedString,
 )
 from kod.types import BUILTIN_TYPES
 
@@ -73,10 +75,14 @@ class Parser:
 
     def parse_param(self):
         """Parse a function parameter."""
+        anonymous = False
+        if self.peek(Anon):
+            anonymous = True
+            self.consume(Anon)
         variable = self.parse_token(Identifier)
         self.consume(Colon)
         variable.type = self.parse_type()
-        return FunctionParam(variable)
+        return FunctionParam(variable, anonymous)
 
     def parse_param_list(self):
         """Parse a list of function parameters."""
@@ -118,7 +124,17 @@ class Parser:
             self.consume(OpenParen)
             args = []
             while not self.peek(CloseParen):
-                args.append(self.parse_expression())
+                label = None
+                if self.peek(Identifier):
+                    expr = self.parse_token(Identifier)
+                    if self.peek(Colon):
+                        label = expr
+                        self.consume(Colon)
+                        expr = self.parse_expression()
+                else:
+                    expr = self.parse_expression()
+                arg = FunctionCallParam(label, expr)
+                args.append(arg)
                 while self.peek(Comma):
                     self.consume(Comma)
                     args.append(self.parse_expression())

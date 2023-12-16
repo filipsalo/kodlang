@@ -3,28 +3,27 @@
 
 from kod.exceptions import KodSyntaxError
 from kod.tokens import (
-    EOF,
-    EOL,
-    Identifier,
-    OpenParen,
-    CloseParen,
-    OpenCurly,
+    Anon,
+    Arrow,
     CloseCurly,
-    Dot,
+    CloseParen,
     Colon,
     Comma,
-    QuotedString,
-    LiteralNumber,
     Comment,
-    Arrow,
+    Dot,
+    EOF,
+    EOL,
+    Equals,
     Extern,
     Func,
+    Identifier,
     Let,
-    Equals,
+    LiteralNumber,
+    OpenCurly,
+    OpenParen,
     Position,
+    QuotedString,
 )
-
-KEYWORDS = ["func", "extern"]
 
 
 class Lexer:
@@ -97,7 +96,6 @@ class Lexer:
         """Lex an identifier."""
         if not (self.peek().isalpha() or self.peek() == "_"):
             raise KodSyntaxError(f"Lexer expected identifier, got {self.peek()!r}")
-        assert self.peek().isalpha() or self.peek() == "_"
         while self.peek().isalnum() or self.peek() == "_":
             self.pos += 1
         match self.buffered():
@@ -107,6 +105,8 @@ class Lexer:
                 return self.build(Extern)
             case "func":
                 return self.build(Func)
+            case "anon":
+                return self.build(Anon)
             case _:
                 return self.build(Identifier)
 

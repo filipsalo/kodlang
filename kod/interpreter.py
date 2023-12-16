@@ -51,7 +51,7 @@ class Interpreter:
     def resolve_names(self, args):
         """Resolve variable names to values"""
         return [
-            self.lookup(arg) if isinstance(arg, Variable) else arg
+            self.lookup(arg.expression) if isinstance(arg.expression, Variable) else arg.expression
             for arg in args
         ]
 

@@ -44,6 +44,14 @@ class Variable(ASTNode):
 class FunctionParam(ASTNode):
     """A function parameter."""
     variable: Variable
+    anonymous: bool
+
+
+@dataclasses.dataclass
+class FunctionCallParam(ASTNode):
+    """A function parameter."""
+    label: Variable
+    expression: ASTNode
 
 
 @dataclasses.dataclass

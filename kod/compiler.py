@@ -2,14 +2,15 @@
 """An assembler for the Kod language."""
 
 import sys
+
 from kod.parser import (
-    ExternalFunctionDeclaration,
-    FunctionDeclaration,
-    FunctionCall,
-    Variable,
-    StringLiteral,
-    VariableDeclaration,
     Assignment,
+    ExternalFunctionDeclaration,
+    FunctionCall,
+    FunctionDeclaration,
+    StringLiteral,
+    Variable,
+    VariableDeclaration,
 )
 
 
@@ -164,15 +165,15 @@ class Compiler:
         offset = 0
         for param, arg, register in zip(func.params, args, self._argregs):
             offset -= param.variable.type.width
-            if isinstance(arg, StringLiteral):
-                arg = self.literal_string(arg)
+            if isinstance(arg.expression, StringLiteral):
+                arg = self.literal_string(arg.expression)
                 self.lea(f"{arg.label}(%rip)", f"%{register}")
-            elif isinstance(arg, Variable):
-                offset = self.get_variable_offset(arg)
+            elif isinstance(arg.expression, Variable):
+                offset = self.get_variable_offset(arg.expression)
                 if offset:
                     self.mov(f"{offset}(%rbp)", f"%{register}")
             else:
-                self.mov(f"${arg}", f"%{register}")
+                self.mov(f"${arg.expression}", f"%{register}")
 
     def get_variable_offset(self, variable):
         """Get the offset of a variable in the stack frame"""

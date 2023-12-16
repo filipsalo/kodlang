@@ -112,5 +112,10 @@ class Let(Token):
 
 
 @dataclasses.dataclass
+class Anon(Token):
+    """An anon specifier."""
+
+
+@dataclasses.dataclass
 class Equals(Token):
     """An equals sign."""
