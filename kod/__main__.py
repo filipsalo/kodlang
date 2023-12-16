@@ -22,14 +22,19 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
+    run_parser = subparsers.add_parser("interpret")
+    run_parser.add_argument("file", type=argparse.FileType("r"))
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=argparse.FileType("r"))
 
     parse_parser = subparsers.add_parser("parse")
     parse_parser.add_argument("file", type=argparse.FileType("r"))
 
+    build_parser = subparsers.add_parser("compile")
+    build_parser.add_argument("file", type=argparse.FileType("r"))
+
     build_parser = subparsers.add_parser("build")
-    build_parser.add_argument("-S", dest="output_assembly", action="store_true")
     build_parser.add_argument("file", type=argparse.FileType("r"))
 
     args = parser.parse_args()
@@ -44,14 +49,17 @@ def main():
     TypeChecker().check_module(prog)
 
     match args.command:
-        case "run":
+        case "interpret":
             Interpreter(prog).run()
-        case "build":
+        case "compile":
             asm = io.StringIO()
             Compiler(prog, asm).compile()
             if args.output_assembly:
                 print(asm.getvalue())
                 return 0
+        case "build" | "run":
+            asm = io.StringIO()
+            Compiler(prog, asm).compile()
             object_file = (Path("build") / Path(args.file.name).stem).with_suffix(".o")
             executable = object_file.with_suffix("")
             subprocess.run([
@@ -67,6 +75,9 @@ def main():
                 "-o", executable,
                 object_file
             ], check=True)
+            if args.command == "run":
+                result = subprocess.run(executable, check=False)
+                return result.returncode
         case "parse":
             ast.dump(prog)
 
