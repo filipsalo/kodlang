@@ -135,6 +135,7 @@ class Compiler:
         """Emit the epilogue for a function"""
         if stack_frame_size := self._get_stack_frame_size(func):
             self.add(f"${stack_frame_size}", "%rsp")
+        self.mov("$0", "%rax")
         self.pop("%rbp")
         self.emit("ret")
 
