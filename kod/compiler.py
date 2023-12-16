@@ -128,8 +128,8 @@ class Compiler:
         """Move arguments from registers to the stack"""
         offset = 0
         for param, register in zip(func.params, self._argregs):
-            offset -= param.type.width
-            self.mov(f"%{register}", f"{offset}(%rbp)", size=param.type.width)
+            offset -= param.variable.type.width
+            self.mov(f"%{register}", f"{offset}(%rbp)", size=param.variable.type.width)
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
@@ -163,7 +163,7 @@ class Compiler:
         """Prepare arguments for a function call"""
         offset = 0
         for param, arg, register in zip(func.params, args, self._argregs):
-            offset -= param.type.width
+            offset -= param.variable.type.width
             if isinstance(arg, StringLiteral):
                 arg = self.literal_string(arg)
                 self.lea(f"{arg.label}(%rip)", f"%{register}")

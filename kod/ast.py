@@ -43,8 +43,7 @@ class Variable(ASTNode):
 @dataclasses.dataclass
 class FunctionParam(ASTNode):
     """A function parameter."""
-    name: str
-    type: str
+    variable: Variable
 
 
 @dataclasses.dataclass

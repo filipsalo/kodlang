@@ -2,14 +2,15 @@
 """A parser for the Kod lanuage"""
 
 from kod.ast import (
-    ExternalFunctionDeclaration,
-    FunctionDeclaration,
-    FunctionCall,
-    Module,
-    Variable,
-    StringLiteral,
-    VariableDeclaration,
     Assignment,
+    ExternalFunctionDeclaration,
+    FunctionCall,
+    FunctionDeclaration,
+    FunctionParam,
+    Module,
+    StringLiteral,
+    Variable,
+    VariableDeclaration,
 )
 from kod.tokens import (  # pylint: disable=no-name-in-module
     EOF,
@@ -75,7 +76,7 @@ class Parser:
         variable = self.parse_token(Identifier)
         self.consume(Colon)
         variable.type = self.parse_type()
-        return variable
+        return FunctionParam(variable)
 
     def parse_param_list(self):
         """Parse a list of function parameters."""
@@ -98,7 +99,7 @@ class Parser:
         self.consume(Arrow)
         return_type = self.parse_type()
         self.consume(OpenCurly)
-        self.stack.append({param.id: param for param in params})
+        self.stack.append({param.variable.id: param.variable for param in params})
         while not self.peek(CloseCurly):
             if statement := self.parse_statement():
                 body.append(statement)

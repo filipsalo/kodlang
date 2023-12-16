@@ -76,7 +76,7 @@ class Interpreter:
 
         # Map args to params
         args = {
-            param.id: self.lookup(arg) if isinstance(arg, Variable) else arg
+            param.variable.id: self.lookup(arg) if isinstance(arg, Variable) else arg
             for param, arg in zip(func.params, args)
         }
         self.stack.append(args)

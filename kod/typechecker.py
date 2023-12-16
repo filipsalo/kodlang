@@ -21,7 +21,7 @@ class TypeChecker:
             match node:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = [
-                        param.type for param in node.params
+                        param.variable.type for param in node.params
                     ]
         for statement in module.body:
             self.check_statement(statement)
