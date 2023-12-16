@@ -4,7 +4,6 @@ Kod is a toy language that compiles to x86 machine code for macOS.
 
 ## Example
 
-
 ```go
 // hello.kod
 
@@ -28,8 +27,8 @@ func main() -> int32 {
 Hello, world!
 ```
 
-
 ### Output the AST
+
 ```shell
 # python -m kod parse hello.kod
 ```
