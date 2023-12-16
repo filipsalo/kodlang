@@ -2,15 +2,12 @@
 """I am the Kod language."""
 
 import argparse
-import io
 from pathlib import Path
 import subprocess
 import sys
 
-from kod.compiler import Compiler
+from kod.builder import Builder, FileWrapper
 from kod.interpreter import Interpreter
-from kod.lexer import Lexer
-from kod.parser import Parser
 from kod.typechecker import TypeChecker
 from kod.exceptions import KodSyntaxError
 import kod.ast as ast
@@ -22,64 +19,45 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
-    run_parser = subparsers.add_parser("interpret")
-    run_parser.add_argument("file", type=argparse.FileType("r"))
+    interpret_parser = subparsers.add_parser("interpret")
+    interpret_parser.add_argument("file", type=FileWrapper)
 
     run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("file", type=argparse.FileType("r"))
+    run_parser.add_argument("file", type=FileWrapper)
 
     parse_parser = subparsers.add_parser("parse")
-    parse_parser.add_argument("file", type=argparse.FileType("r"))
+    parse_parser.add_argument("file", type=FileWrapper)
 
-    build_parser = subparsers.add_parser("compile")
-    build_parser.add_argument("file", type=argparse.FileType("r"))
+    compile_parser = subparsers.add_parser("compile")
+    compile_parser.add_argument("file", type=FileWrapper)
 
     build_parser = subparsers.add_parser("build")
-    build_parser.add_argument("file", type=argparse.FileType("r"))
+    build_parser.add_argument("file", type=FileWrapper)
 
     args = parser.parse_args()
 
-    src = args.file.read()
     try:
-        tokens = Lexer(src).lex()
-    except KodSyntaxError as e:
-        print(e)
+        bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
+        program = bob.parse_program(args.file)
+    except KodSyntaxError as err:
+        print(err, file=sys.stderr)
         return 1
-    prog = Parser(tokens).parse()
-    TypeChecker().check_module(prog)
+
+    TypeChecker(program).check()
 
     match args.command:
         case "interpret":
-            Interpreter(prog).run()
+            Interpreter(program).run()
         case "compile":
-            asm = io.StringIO()
-            Compiler(prog, asm).compile()
-            if args.output_assembly:
-                print(asm.getvalue())
-                return 0
+            print(bob.compile_module("__main"))
+            return 0
         case "build" | "run":
-            asm = io.StringIO()
-            Compiler(prog, asm).compile()
-            object_file = (Path("build") / Path(args.file.name).stem).with_suffix(".o")
-            executable = object_file.with_suffix("")
-            subprocess.run([
-                "as",
-                "-o", object_file,
-                "-"
-            ], input=asm.getvalue().encode("ascii"), check=True)
-            subprocess.run([
-                "ld",
-                "-macosx_version_min", "13.1",
-                "-lc",
-                "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-                "-o", executable,
-                object_file
-            ], check=True)
+            executable = bob.build_executable(Path("./main"))
             if args.command == "run":
                 result = subprocess.run(executable, check=False)
                 return result.returncode
         case "parse":
-            ast.dump(prog)
+            ast.dump(program.get_module("__main").ast)
 
 
 sys.exit(main())

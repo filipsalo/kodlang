@@ -8,9 +8,7 @@ import unittest
 from functools import partial
 from pathlib import Path
 
-from kod.compiler import Compiler
-from kod.lexer import Lexer
-from kod.parser import Parser
+from kod.builder import Builder, FileWrapper
 
 
 def run_interpreted(source):
@@ -27,10 +25,10 @@ def run_interpreted(source):
 
 def compile_to_assembly(source):
     """Compile a program to assembly."""
-    tokens = Lexer(source).lex()
-    prog = Parser(tokens).parse()
-    Compiler(prog, output := io.StringIO()).compile()
-    return output.getvalue()
+    bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
+    file_wrapper = FileWrapper("-", io.StringIO(source))
+    bob.parse_program(file_wrapper)
+    return bob.compile_module("__main")
 
 
 def make_tests(path):

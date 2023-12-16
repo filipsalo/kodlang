@@ -35,8 +35,9 @@ class Compiler:
 
     _argregs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 
-    def __init__(self, program, output=sys.stdout):
-        self.program = program
+    def __init__(self, module, builtins, output=sys.stdout):
+        self.module = module
+        self.builtins = builtins
         self.output = output
         self.functions = {}
         self.strings = {}
@@ -53,8 +54,12 @@ class Compiler:
     def compile(self):
         """Compile the program to assembly"""
         self.emit(".text")
-        self.emit(".globl", "_main")
-        for statement in self.program.body:
+        for statement in self.builtins.ast.body:
+            match statement:
+                case ExternalFunctionDeclaration(name) | FunctionDeclaration(name):
+                    self.functions[name] = statement
+
+        for statement in self.module.ast.body:
             match statement:
                 case ExternalFunctionDeclaration(name):
                     self.functions[name] = statement
@@ -69,6 +74,7 @@ class Compiler:
 
     def compile_function(self, func):
         """Compile a function to assembly"""
+        self.emit(".globl", f"_{func.name}")
         print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
         self.stack.append({variable.id: variable for variable in func.variables})

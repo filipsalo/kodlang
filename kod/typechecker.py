@@ -5,12 +5,19 @@ from kod import ast
 
 class TypeChecker:
     """A typechecker for the kod language."""
-    def __init__(self):
+    def __init__(self, program):
+        self.program = program
         self.function_types = {}
+
+    def check(self):
+        """Check the program for type errors."""
+        for module in self.program:
+            self.check_module(module.ast)
 
     def check_module(self, module):
         """Check a module for type errors."""
-        for node in module.body:
+        builtins = self.program.get_module("builtins")
+        for node in module.body + builtins.ast.body:
             match node:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = [

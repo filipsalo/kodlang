@@ -19,17 +19,22 @@ libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 class Interpreter:
     """Simple interpreter for the Kod language"""
 
-    def __init__(self, prog):
-        self.prog = prog
+    def __init__(self, program):
+        self.program = program
         self.stack = [{}]
+
+    def get_builtins(self):
+        """Return a dictionary of builtins"""
 
     def run(self):
         """Run the program"""
-        for statement in self.prog.body:
-            if isinstance(statement, (FunctionDeclaration, ExternalFunctionDeclaration)):
-                self.stack[-1][statement.name] = statement
-            else:
-                raise ValueError(f"Unexpected statement {statement}")
+        for default_module in ["builtins", "__main"]:
+            module = self.program.get_module(default_module)
+            for statement in module.ast.body:
+                if isinstance(statement, (FunctionDeclaration, ExternalFunctionDeclaration)):
+                    self.stack[-1][statement.name] = statement
+                else:
+                    raise ValueError(f"Unexpected statement {statement}")
         main = self.lookup(Variable("main", None))
         self.call_function(main)
 
