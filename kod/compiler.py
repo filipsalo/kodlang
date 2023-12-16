@@ -148,7 +148,7 @@ class Compiler:
         if args:
             args = ", ".join(str(arg) for arg in args)
             print(f"\t{args}", end="", file=self.output)
-        if comment and self.comments:
+        if comment:
             print(f"\t# {comment}", end="", file=self.output)
         print(file=self.output)
 
