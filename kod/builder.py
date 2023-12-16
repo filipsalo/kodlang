@@ -50,7 +50,8 @@ class Builder:
 
     def parse_module(self, name, file_wrapper: FileWrapper):
         """Parse a module."""
-        source = file_wrapper.open(encoding="utf8").read()
+        with file_wrapper.open(encoding="utf8") as f:
+            source = f.read()
         tokens = Lexer(source).lex()
         ast = Parser(tokens).parse()
         return Module(name, file_wrapper.path, ast)
