@@ -2,20 +2,14 @@
 
 import dataclasses
 
-
-@dataclasses.dataclass
-class Position:
-    """A position in a source file."""
-    filename: str
-    line: int
-    column: int
+from kod.span import Span
 
 
 @dataclasses.dataclass
 class Token:
     """A token in the Kod language."""
     value: str
-    position: Position
+    span: Span
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.value!r})"

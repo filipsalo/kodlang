@@ -2,6 +2,7 @@
 """A lexer for the kod language."""
 
 from kod.exceptions import KodSyntaxError
+from kod.span import Span
 from kod.tokens import (
     Anon,
     Arrow,
@@ -21,7 +22,6 @@ from kod.tokens import (
     LiteralNumber,
     OpenCurly,
     OpenParen,
-    Position,
     QuotedString,
 )
 
@@ -43,20 +43,7 @@ class Lexer:
 
     def error(self, msg):
         """Raise a syntax error."""
-        err = KodSyntaxError(msg)
-        line_number = self.source.count("\n", 0, self.pos) + 1
-        line_start = self.source.rfind("\n", 0, self.pos) + 1
-        column_number = self.pos - line_start + 1
-        err.line = line_number
-        err.col = column_number
-        lines = self.source.split("\n")
-        for n, line in enumerate(
-            lines[max(0, line_number - 3) : line_number + 3],
-            max(0, line_number - 2),
-        ):
-            err.excerpt += f"{n:3d}: {line}\n"
-            if n == line_number:
-                err.excerpt += f"     {' ' * (column_number - 1)}^\n"
+        err = KodSyntaxError(msg, Span(self.filename, self.pos, self.pos + 1))
         return err
 
     def skip_whitespace(self):
@@ -82,11 +69,7 @@ class Lexer:
     def build(self, token_type):
         """Build a token."""
         value = self.source[self.start : self.pos]
-        position = Position(
-            self.filename,
-            self.start,
-            self.pos,
-        )
+        position = Span(self.filename, self.start, self.pos)
         self.start = self.pos
         return token_type(value, position)
 

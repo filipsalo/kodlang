@@ -35,7 +35,7 @@ class Interpreter:
                     self.stack[-1][statement.name] = statement
                 else:
                     raise ValueError(f"Unexpected statement {statement}")
-        main = self.lookup(Variable("main", None))
+        main = self.lookup(Variable("main", None, None))
         self.call_function(main)
 
     def lookup(self, variable):

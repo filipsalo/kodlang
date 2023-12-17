@@ -2,6 +2,8 @@
 
 from kod import ast
 
+from kod.exceptions import KodSyntaxError
+
 
 class TypeChecker:
     """A typechecker for the kod language."""
@@ -56,13 +58,14 @@ class TypeChecker:
     def verify_arguments(self, function_name, arguments):
         """Verify that the given arguments match the expected types."""
         if function_name not in self.function_types:
-            raise ValueError(f"Function '{function_name}' not found")
+            raise KodSyntaxError(f"Function '{function_name}' not found", function_name.span)
 
         params = self.function_types[function_name]
 
         if len(arguments) != len(params):
-            raise ValueError(
-                f"Expected {len(params)} arguments, but got {len(arguments)}"
+            raise KodSyntaxError(
+                f"Expected {len(params)} arguments, but got {len(arguments)}",
+                arguments[0].span | arguments[-1].span,
             )
 
         for arg, param in zip(arguments, params):
@@ -71,9 +74,15 @@ class TypeChecker:
                     f"Expected argument '{param.variable.id}' to be labeled"
                 )
             if isinstance(arg.expression, ast.Variable):
+                if arg.expression.id not in self.stack[-1]:
+                    raise KodSyntaxError(
+                        f"Variable '{arg.expression.id}' not found",
+                        arg.span,
+                    )
                 arg_type = self.stack[-1][arg.expression.id].type
                 if arg_type != param.variable.type:
-                    raise TypeError(
+                    raise KodSyntaxError(
                         f"Expected argument of type '{param.variable.type.name}', "
-                        f"but got '{arg.expression.type}'"
+                        f"but got '{arg.expression.type}'",
+                        arg.span,
                     )

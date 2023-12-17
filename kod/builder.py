@@ -52,7 +52,7 @@ class Builder:
         """Parse a module."""
         with file_wrapper.open(encoding="utf8") as f:
             source = f.read()
-        tokens = Lexer(source).lex()
+        tokens = Lexer(source, file_wrapper.path).lex()
         ast = Parser(tokens).parse()
         return Module(name, file_wrapper.path, ast)
 
