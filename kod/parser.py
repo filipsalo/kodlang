@@ -152,6 +152,40 @@ class Parser:
             variables = self.stack.pop().values()
         return ParsedFunctionDeclaration(name, params, body, return_type, variables, span)
 
+    def parse_call_param(self):
+        """Parse a function call parameter."""
+        label = None
+        with self.span() as span:
+            if self.peek(Identifier):
+                expr = self.parse_token(Identifier)
+                if self.peek(Colon):
+                    label = expr
+                    self.consume(Colon)
+                    expr = self.parse_expression()
+            else:
+                expr = self.parse_expression()
+        return ParsedFunctionCallParam(label, expr, span)
+
+    def parse_call_param_list(self):
+        """Parse a list of function parameters."""
+        with self.span() as span:
+            params = [self.parse_call_param()]
+            while self.peek(Comma):
+                self.consume(Comma)
+                params.append(self.parse_call_param())
+        return ParsedFunctionCallParamList(params, span)
+
+    def parse_call(self, callee):
+        """Parse a function call."""
+        with self.span() as span:
+            self.consume(OpenParen)
+            if not self.peek(CloseParen):
+                args = self.parse_call_param_list()
+            else:
+                args = []
+            self.consume(CloseParen)
+        return ParsedFunctionCall(callee, args, span)
+
     def parse_expression(self):
         """Parse an expression."""
         if self.peek(QuotedString):
@@ -161,34 +195,11 @@ class Parser:
         with self.span() as expr_span:
             name = self.parse_token(Identifier)
             if self.peek(OpenParen):
-                self.consume(OpenParen)
-                args = []
-                with self.span() as param_list_span:
-                    while not self.peek(CloseParen):
-                        label = None
-                        with self.span() as arg_span:
-                            if self.peek(Identifier):
-                                expr = self.parse_token(Identifier)
-                                if self.peek(Colon):
-                                    label = expr
-                                    self.consume(Colon)
-                                    expr = self.parse_expression()
-                            else:
-                                expr = self.parse_expression()
-                        arg = ParsedFunctionCallParam(label, expr, arg_span)
-                        args.append(arg)
-                        while self.peek(Comma):
-                            self.consume(Comma)
-                            args.append(self.parse_expression())
-                self.consume(CloseParen)
-                param_list = ParsedFunctionCallParamList(args, param_list_span)
-                return ParsedFunctionCall(name, param_list, expr_span)
+                return self.parse_call(name)
             elif self.peek(Equals):
                 # fixme: this is a statement, not an expression
                 self.consume(Equals)
                 value = self.parse_expression()
-                # if name.id not in self.stack[-1]:
-                #     raise self.error(f"Undeclared variable {name.id}", name.span)
                 return ParsedAssignment(name, value, expr_span)
         return name
 
