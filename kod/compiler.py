@@ -3,14 +3,14 @@
 
 import sys
 
-from kod.parser import (
-    Assignment,
-    ExternalFunctionDeclaration,
-    FunctionCall,
-    FunctionDeclaration,
-    StringLiteral,
-    Variable,
-    VariableDeclaration,
+from kod.ast import (
+    ParsedAssignment,
+    ParsedExternalFunctionDeclaration,
+    ParsedFunctionCall,
+    ParsedFunctionDeclaration,
+    ParsedStringLiteral,
+    ParsedVariable,
+    ParsedVariableDeclaration,
 )
 
 
@@ -55,16 +55,16 @@ class Compiler:
     def compile(self):
         """Compile the program to assembly"""
         self.emit(".text")
-        for statement in self.builtins.ast.body:
+        for statement in self.builtins.body:
             match statement:
-                case ExternalFunctionDeclaration(name) | FunctionDeclaration(name):
+                case ParsedExternalFunctionDeclaration(name) | ParsedFunctionDeclaration(name):
                     self.functions[name] = statement
 
-        for statement in self.module.ast.body:
+        for statement in self.module.body:
             match statement:
-                case ExternalFunctionDeclaration(name):
+                case ParsedExternalFunctionDeclaration(name):
                     self.functions[name] = statement
-                case FunctionDeclaration():
+                case ParsedFunctionDeclaration():
                     self.compile_function(statement)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
@@ -81,11 +81,11 @@ class Compiler:
         self.stack.append({variable.id: variable for variable in func.variables})
         for statement in func.body:
             match statement:
-                case FunctionCall():
+                case ParsedFunctionCall():
                     self.compile_function_call(statement)
-                case VariableDeclaration(variable, value):
+                case ParsedVariableDeclaration(variable, value):
                     self.compile_variable_declaration(variable, value)
-                case Assignment(variable, value):
+                case ParsedAssignment(variable, value):
                     self.compile_variable_declaration(variable, value)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
@@ -107,7 +107,7 @@ class Compiler:
 
     def compile_variable_declaration(self, variable, value):
         """Compile a variable declaration to assembly"""
-        if isinstance(value, StringLiteral):
+        if isinstance(value, ParsedStringLiteral):
             value = self.literal_string(value)
             offset = self.get_variable_offset(variable)
             self.lea(f"{value.label}(%rip)", "%rax")
@@ -117,7 +117,7 @@ class Compiler:
 
     def compile_assignment(self, variable, value):
         """Compile an assignment to assembly"""
-        if isinstance(value, StringLiteral):
+        if isinstance(value, ParsedStringLiteral):
             value = self.literal_string(value)
             offset = self.get_variable_offset(variable)
             self.lea(f"{value.label}(%rip)", "%rax")
@@ -165,10 +165,10 @@ class Compiler:
         offset = 0
         for param, arg, register in zip(func.params, args, self._argregs):
             offset -= param.variable.type.width
-            if isinstance(arg.expression, StringLiteral):
+            if isinstance(arg.expression, ParsedStringLiteral):
                 arg = self.literal_string(arg.expression)
                 self.lea(f"{arg.label}(%rip)", f"%{register}")
-            elif isinstance(arg.expression, Variable):
+            elif isinstance(arg.expression, ParsedVariable):
                 offset = self.get_variable_offset(arg.expression)
                 if offset:
                     self.mov(f"{offset}(%rbp)", f"%{register}")

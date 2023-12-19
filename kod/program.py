@@ -1,21 +1,21 @@
 from pathlib import Path
 
 
-class Module:
+class BuildModule:
     """A module is a collection of functions."""
-    def __init__(self, name: str, path: Path, ast):
-        self.name = name
-        self.source_path = path
-        self.ast = ast
+    def __init__(self, module):
+        self.module = module
+        self.name = module.name
+        self.source_path = module.path
         self.asm_path = Path(self.mangled_name()).with_suffix(".s")
         self.object_path = Path(self.mangled_name()).with_suffix(".o")
 
     def __repr__(self):
-        return f"<Module {self.name}>"
+        return f"<BuildModule {self.module.name}>"
 
     def mangled_name(self):
         """Return the mangled name of the module."""
-        return f"_{self.name.replace('/', '$')}"
+        return f"_{self.module.name.replace('/', '$')}"
 
 
 class Program:

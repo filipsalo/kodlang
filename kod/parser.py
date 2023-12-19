@@ -3,18 +3,19 @@
 
 from contextlib import contextmanager
 from kod.ast import (
-    Assignment,
-    ExternalFunctionDeclaration,
-    FunctionCall,
-    FunctionCallParam,
-    FunctionCallParamList,
-    FunctionDeclaration,
-    FunctionParam,
-    FunctionParamList,
-    Module,
-    StringLiteral,
-    Variable,
-    VariableDeclaration,
+    ParsedAssignment,
+    ParsedExternalFunctionDeclaration,
+    ParsedFunctionCall,
+    ParsedFunctionCallParam,
+    ParsedFunctionCallParamList,
+    ParsedFunctionDeclaration,
+    ParsedFunctionParam,
+    ParsedFunctionParamList,
+    ParsedImport,
+    ParsedModule,
+    ParsedStringLiteral,
+    ParsedVariable,
+    ParsedVariableDeclaration,
 )
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
@@ -26,12 +27,14 @@ from kod.tokens import (
     Colon,
     Comma,
     Comment,
+    Dot,
     EOF,
     EOL,
     Equals,
     Extern,
     Func,
     Identifier,
+    Import,
     Let,
     LiteralNumber,
     OpenCurly,
@@ -44,10 +47,12 @@ from kod.types import BUILTIN_TYPES
 class Parser:
     """A parser for the kod language."""
 
-    def __init__(self, tokens):
+    def __init__(self, tokens, path, module_name):
         self.tokens = tokens
+        self.path = path
+        self.module_name = module_name
         self.pos = 0
-        self.stack = []
+        self.stack = [{}]
         self.spans = []
 
     def eof(self):
@@ -85,10 +90,17 @@ class Parser:
         token = self.consume(token_type)
         match token:
             case Identifier():
-                return Variable(token.value, None, span=token.span)
-            case QuotedString():
-                return StringLiteral(token.value.strip("\"").encode('utf8'), BUILTIN_TYPES["str"], span=token.span)
+                return ParsedVariable(token.value, None, span=token.span)
         raise self.error(f"Unexpected token {token_type}", token.span)
+
+    def parse_quoted_string(self):
+        """Parse a quoted string."""
+        token = self.consume(QuotedString)
+        return ParsedStringLiteral(
+            token.value.strip("\"").encode('utf8'),
+            BUILTIN_TYPES["str"],
+            span=token.span
+        )
 
     def parse_type(self):
         """Parse a type."""
@@ -107,7 +119,7 @@ class Parser:
             variable = self.parse_token(Identifier)
             self.consume(Colon)
             variable.type = self.parse_type()
-        return FunctionParam(variable, anonymous, span)
+        return ParsedFunctionParam(variable, anonymous, span)
 
     def parse_param_list(self):
         """Parse a list of function parameters."""
@@ -116,7 +128,7 @@ class Parser:
             while self.peek(Comma):
                 self.consume(Comma)
                 params.append(self.parse_param())
-        return FunctionParamList(params, span)
+        return ParsedFunctionParamList(params, span)
 
     def parse_func(self):
         """Parse a function declaration."""
@@ -138,12 +150,12 @@ class Parser:
                     body.append(statement)
             self.consume(CloseCurly)
             variables = self.stack.pop().values()
-        return FunctionDeclaration(name, params, body, return_type, variables, span)
+        return ParsedFunctionDeclaration(name, params, body, return_type, variables, span)
 
     def parse_expression(self):
         """Parse an expression."""
         if self.peek(QuotedString):
-            return self.parse_token(QuotedString)
+            return self.parse_quoted_string()
         if self.peek(LiteralNumber):
             return self.parse_token(LiteralNumber)
         with self.span() as expr_span:
@@ -163,20 +175,21 @@ class Parser:
                                     expr = self.parse_expression()
                             else:
                                 expr = self.parse_expression()
-                        arg = FunctionCallParam(label, expr, arg_span)
+                        arg = ParsedFunctionCallParam(label, expr, arg_span)
                         args.append(arg)
                         while self.peek(Comma):
                             self.consume(Comma)
                             args.append(self.parse_expression())
-                    self.consume(CloseParen)
-                param_list = FunctionCallParamList(args, param_list_span)
-                return FunctionCall(name, param_list, expr_span)
+                self.consume(CloseParen)
+                param_list = ParsedFunctionCallParamList(args, param_list_span)
+                return ParsedFunctionCall(name, param_list, expr_span)
             elif self.peek(Equals):
+                # fixme: this is a statement, not an expression
                 self.consume(Equals)
                 value = self.parse_expression()
-                if name.id not in self.stack[-1]:
-                    raise self.error(f"Undeclared variable {name.id}", name.span)
-                return Assignment(name, value, expr_span)
+                # if name.id not in self.stack[-1]:
+                #     raise self.error(f"Undeclared variable {name.id}", name.span)
+                return ParsedAssignment(name, value, expr_span)
         return name
 
     def parse_external(self):
@@ -190,7 +203,7 @@ class Parser:
             self.consume(CloseParen)
             self.consume(Arrow)
             return_type = self.parse_type()
-        return ExternalFunctionDeclaration(name, params, [], return_type, span)
+        return ParsedExternalFunctionDeclaration(name, params, [], return_type, span)
 
     def parse_variable_declaration(self):
         """Parse a variable declaration."""
@@ -201,11 +214,20 @@ class Parser:
             self.consume(Equals)
             value = self.parse_expression()
             variable.type = value.type
-        return VariableDeclaration(variable, value, span)
+        return ParsedVariableDeclaration(variable, value, span)
+
+    def parse_import(self):
+        """Parse an import statement."""
+        with self.span() as span:
+            self.consume(Import)
+            module_name = self.parse_quoted_string()
+        return ParsedImport(module_name, span)
 
     def parse_statement(self):
         """Parse a statement."""
         match self.peek():
+            case Import():
+                return self.parse_import()
             case Let():
                 return self.parse_variable_declaration()
             case Extern():
@@ -233,7 +255,7 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        return Module(statements, span)
+        return ParsedModule(self.path, self.module_name, statements, span)
 
     def __iter__(self):
         while True:

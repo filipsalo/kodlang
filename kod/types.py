@@ -1,9 +1,18 @@
 """Built-in types for Kod."""
 
-from collections import namedtuple
+
+import dataclasses
 
 
-Type = namedtuple("Type", ["name", "width"])
+@dataclasses.dataclass
+class Type:
+    """A type in Kod."""
+    name: str
+    width: int
+
+    def __repr__(self):
+        return f"<Type {self.name} ({self.width})>"
+
 
 # The types in Kod
 Int64 = Type("int64", 8)

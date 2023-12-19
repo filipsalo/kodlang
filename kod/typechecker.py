@@ -22,7 +22,7 @@ class TypeChecker:
         builtins = self.program.get_module("builtins")
         for node in module.body + builtins.ast.body:
             match node:
-                case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
+                case ast.ParsedFunctionDeclaration() | ast.ParsedExternalFunctionDeclaration():
                     self.function_types[node.name] = node.params
         for statement in module.body:
             self.check_statement(statement)
@@ -30,17 +30,17 @@ class TypeChecker:
     def check_statement(self, node):
         """Check a statement for type errors."""
         match node:
-            case ast.FunctionCall():
+            case ast.ParsedFunctionCall():
                 self.check_function_call(node)
-            case ast.FunctionDeclaration():
+            case ast.ParsedFunctionDeclaration():
                 self.stack.append({param.variable.id: param.variable for param in node.params})
                 for statement in node.body:
                     self.check_statement(statement)
-            case ast.ExternalFunctionDeclaration():
+            case ast.ParsedExternalFunctionDeclaration():
                 pass
-            case ast.VariableDeclaration(node):
+            case ast.ParsedVariableDeclaration(node):
                 self.check_variable_declaration(node)
-            case ast.Assignment():
+            case ast.ParsedAssignment():
                 pass
             case _:
                 raise ValueError(f"Don't know how to type check a {type(node)}")
@@ -73,7 +73,7 @@ class TypeChecker:
                 raise ValueError(
                     f"Expected argument '{param.variable.id}' to be labeled"
                 )
-            if isinstance(arg.expression, ast.Variable):
+            if isinstance(arg.expression, ast.ParsedVariable):
                 if arg.expression.id not in self.stack[-1]:
                     raise KodSyntaxError(
                         f"Variable '{arg.expression.id}' not found",

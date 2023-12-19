@@ -26,9 +26,9 @@ def run_interpreted(source):
 def compile_to_assembly(source):
     """Compile a program to assembly."""
     bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
-    file_wrapper = FileWrapper("-", io.StringIO(source))
+    file_wrapper = FileWrapper("main.kod", io.StringIO(source))
     bob.parse_program(file_wrapper)
-    return bob.compile_module("__main")
+    return bob.compile_module("main")
 
 
 def make_tests(path):

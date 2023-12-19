@@ -6,6 +6,7 @@ from kod.span import Span
 from kod.tokens import (
     Anon,
     Arrow,
+    CloseBracket,
     CloseCurly,
     CloseParen,
     Colon,
@@ -18,8 +19,10 @@ from kod.tokens import (
     Extern,
     Func,
     Identifier,
+    Import,
     Let,
     LiteralNumber,
+    OpenBracket,
     OpenCurly,
     OpenParen,
     QuotedString,
@@ -100,6 +103,8 @@ class Lexer:
         while self.peek().isalnum() or self.peek() == "_":
             self.pos += 1
         match self.buffered():
+            case "import":
+                return self.build(Import)
             case "let":
                 return self.build(Let)
             case "extern":
@@ -148,6 +153,10 @@ class Lexer:
                     yield self.lex_single_char(OpenCurly)
                 case "}":
                     yield self.lex_single_char(CloseCurly)
+                case "[":
+                    yield self.lex_single_char(OpenBracket)
+                case "]":
+                    yield self.lex_single_char(CloseBracket)
                 case ".":
                     yield self.lex_single_char(Dot)
                 case ":":

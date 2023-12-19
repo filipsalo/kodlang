@@ -51,6 +51,16 @@ class CloseCurly(Token):
 
 
 @dataclasses.dataclass
+class OpenBracket(Token):
+    """An open bracket."""
+
+
+@dataclasses.dataclass
+class CloseBracket(Token):
+    """A close backet."""
+
+
+@dataclasses.dataclass
 class Dot(Token):
     """A dot."""
 
@@ -108,6 +118,11 @@ class Let(Token):
 @dataclasses.dataclass
 class Anon(Token):
     """An anon specifier."""
+
+
+@dataclasses.dataclass
+class Import(Token):
+    """An import token"""
 
 
 @dataclasses.dataclass

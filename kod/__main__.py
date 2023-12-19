@@ -43,13 +43,12 @@ def main():
         print(err, file=sys.stderr)
         return 1
 
-    TypeChecker(program).check()
-
     match args.command:
         case "interpret":
-            Interpreter(program).run()
+            entry_module = args.file.path.stem
+            Interpreter(program).run(entry_module)
         case "compile":
-            print(bob.compile_module("__main"))
+            print(bob.compile_module("main"))
             return 0
         case "build" | "run":
             executable = bob.build_executable(Path("./main"))
@@ -57,7 +56,7 @@ def main():
                 result = subprocess.run(executable, check=False)
                 return result.returncode
         case "parse":
-            ast.dump(program.get_module("__main").ast)
+            ast.dump(program.get_module("main").ast)
 
 
 sys.exit(main())

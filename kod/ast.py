@@ -1,6 +1,7 @@
 """Abstract syntax tree."""
 
 import dataclasses
+from pathlib import Path
 
 from kod.span import Span
 from kod.types import Type
@@ -27,8 +28,9 @@ def dump(node, indent=""):
 class ASTNode:
     """An AST node."""
 
+
 @dataclasses.dataclass
-class StringLiteral(ASTNode):
+class ParsedStringLiteral(ASTNode):
     """A string literal."""
     value: str
     type: Type
@@ -36,7 +38,7 @@ class StringLiteral(ASTNode):
 
 
 @dataclasses.dataclass
-class Variable(ASTNode):
+class ParsedVariable(ASTNode):
     """A name."""
     id: str
     type: Type
@@ -44,17 +46,17 @@ class Variable(ASTNode):
 
 
 @dataclasses.dataclass
-class FunctionParam(ASTNode):
+class ParsedFunctionParam(ASTNode):
     """A function parameter."""
-    variable: Variable
+    variable: ParsedVariable
     anonymous: bool
     span: Span
 
 
 @dataclasses.dataclass
-class FunctionParamList(ASTNode):
+class ParsedFunctionParamList(ASTNode):
     """A function parameter list."""
-    params: list[FunctionParam]
+    params: list[ParsedFunctionParam]
     span: Span
 
     def __iter__(self):
@@ -63,18 +65,19 @@ class FunctionParamList(ASTNode):
     def __len__(self):
         return len(self.params)
 
+
 @dataclasses.dataclass
-class FunctionCallParam(ASTNode):
+class ParsedFunctionCallParam(ASTNode):
     """A function parameter."""
-    label: Variable
+    label: ParsedVariable
     expression: ASTNode
     span: Span
 
 
 @dataclasses.dataclass
-class FunctionCallParamList(ASTNode):
+class ParsedFunctionCallParamList(ASTNode):
     """A function parameter list."""
-    params: list[FunctionCallParam]
+    params: list[ParsedFunctionCallParam]
     span: Span
 
     def __iter__(self):
@@ -83,8 +86,9 @@ class FunctionCallParamList(ASTNode):
     def __len__(self):
         return len(self.params)
 
+
 @dataclasses.dataclass
-class FunctionCall(ASTNode):
+class ParsedFunctionCall(ASTNode):
     """A function call."""
     callee: ASTNode
     args: list[ASTNode]
@@ -92,44 +96,53 @@ class FunctionCall(ASTNode):
 
 
 @dataclasses.dataclass
-class FunctionDeclaration(ASTNode):
+class ParsedFunctionDeclaration(ASTNode):
     """A function declaration."""
     name: str
-    params: FunctionParamList
+    params: ParsedFunctionParamList
     body: list[ASTNode]
     return_type: str
-    variables: list[Variable]
+    variables: list[ParsedVariable]
     span: Span
 
 
 @dataclasses.dataclass
-class ExternalFunctionDeclaration(ASTNode):
+class ParsedImport(ASTNode):
+    """An import statement."""
+    module_name: str
+    span: Span
+
+
+@dataclasses.dataclass
+class ParsedExternalFunctionDeclaration(ASTNode):
     """An external function declaration."""
     name: str
-    params: FunctionParamList
+    params: ParsedFunctionParamList
     body: list[ASTNode]
     return_type: str
     span: Span
 
 
 @dataclasses.dataclass
-class Module(ASTNode):
+class ParsedVariableDeclaration(ASTNode):
+    """An assignment."""
+    variable: ParsedVariable
+    value: ASTNode
+    span: Span
+
+
+@dataclasses.dataclass
+class ParsedAssignment(ASTNode):
+    """An assignment."""
+    variable: ParsedVariable
+    value: ASTNode
+    span: Span
+
+
+@dataclasses.dataclass
+class ParsedModule(ASTNode):
     """A module."""
-    body: list[ExternalFunctionDeclaration | FunctionDeclaration]
-    span: Span
-
-
-@dataclasses.dataclass
-class VariableDeclaration(ASTNode):
-    """An assignment."""
-    variable: Variable
-    value: ASTNode
-    span: Span
-
-
-@dataclasses.dataclass
-class Assignment(ASTNode):
-    """An assignment."""
-    variable: Variable
-    value: ASTNode
+    path : Path
+    name: str
+    body: list[ParsedImport | ParsedExternalFunctionDeclaration | ParsedFunctionDeclaration | ParsedVariableDeclaration | ParsedAssignment]
     span: Span
