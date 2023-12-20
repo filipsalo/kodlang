@@ -361,3 +361,20 @@ class ParsedModule(ASTNode):
     body: list[ParsedImport | ParsedExternalFunctionDeclaration | ParsedFunctionDeclaration | ParsedVariableDeclaration | ParsedAssignment]
     names: dict
     span: Span
+
+
+@dataclasses.dataclass
+class ParsedReturn(ASTNode):
+    """A return statement."""
+    expression: ParsedExpression
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse an import statement."""
+        with parser.span() as span:
+            parser.consume(tokens.Return)
+            expression = ParsedExpression.parse(parser)
+        return cls(expression, span)
+
+

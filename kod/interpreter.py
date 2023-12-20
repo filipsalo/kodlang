@@ -2,8 +2,10 @@
 """Simple interpreter for the Kod language"""
 
 import ctypes
-from functools import partial
 import sys
+
+from functools import partial
+
 from kod import tokens
 
 from kod.ast import (
@@ -16,6 +18,7 @@ from kod.ast import (
     ParsedImport,
     ParsedIntegerLiteral,
     ParsedName,
+    ParsedReturn,
     ParsedStringLiteral,
     ParsedVariable,
     ParsedVariableDeclaration,
@@ -23,6 +26,12 @@ from kod.ast import (
 )
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
+
+
+class ReturnValue(Exception):
+    """Return from a function"""
+    def __init__(self, value):
+        self.value = value
 
 
 class Interpreter:
@@ -43,7 +52,8 @@ class Interpreter:
         entry_module = self.program.get_module(entry_module).module
         main = self.lookup(entry_module, "main")
         argv = [arg.encode("utf8") for arg in argv]
-        self.call_function(entry_module, main, [argv])
+        exit_code = self.call_function(entry_module, main, [argv])
+        sys.exit(exit_code)
 
     def lookup(self, module, name):
         """Look up a variable in the stack"""
@@ -93,6 +103,9 @@ class Interpreter:
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
+            case ParsedReturn(expression):
+                value = self.evaluate_expression(module, expression)
+                raise ReturnValue(value)
             case ParsedImport(module_name):
                 name = module_name.value.decode("ascii")
                 module.names[name.lstrip("./")] = self.program.get_module(name).module
@@ -133,6 +146,10 @@ class Interpreter:
             for param, arg in zip(func.params, args)
         }
         self.stack.append(args)
-        for statement in func.body:
-            self.execute_statement(func.module, statement)
-        self.stack.pop()
+        try:
+            for statement in func.body:
+                self.execute_statement(func.module, statement)
+        except ReturnValue as return_value:
+            return return_value.value
+        finally:
+            self.stack.pop()

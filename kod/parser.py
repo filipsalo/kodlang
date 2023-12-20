@@ -8,6 +8,7 @@ from kod.ast import (
     ParsedFunctionDeclaration,
     ParsedImport,
     ParsedModule,
+    ParsedReturn,
     ParsedVariable,
     ParsedVariableDeclaration,
 )
@@ -24,6 +25,7 @@ from kod.tokens import (
     Import,
     Let,
     OpenBracket,
+    Return,
 )
 from kod.types import BUILTIN_TYPES, ArrayType
 
@@ -87,6 +89,8 @@ class Parser:
         match self.peek():
             case Import():
                 return ParsedImport.parse(self)
+            case Return():
+                return ParsedReturn.parse(self)
             case Let():
                 return ParsedVariableDeclaration.parse(self)
             case Extern():

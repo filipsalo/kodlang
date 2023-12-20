@@ -137,3 +137,8 @@ class Anon(Token):
 @dataclasses.dataclass
 class Import(Token):
     """An import token"""
+
+
+@dataclasses.dataclass
+class Return(Token):
+    """A return token"""

@@ -25,6 +25,7 @@ from kod.tokens import (
     OpenBracket,
     OpenCurly,
     OpenParen,
+    Return,
     StringLiteral,
 )
 
@@ -113,6 +114,8 @@ class Lexer:
                 return self.build(Func)
             case "anon":
                 return self.build(Anon)
+            case "return":
+                return self.build(Return)
             case _:
                 return self.build(Identifier)
 
