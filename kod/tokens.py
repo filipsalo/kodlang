@@ -22,6 +22,29 @@ class BinaryOperator(Token):
 
 
 @dataclasses.dataclass
+class OpenBracket(BinaryOperator):
+    """An open bracket."""
+    precedence = 2
+
+@dataclasses.dataclass
+class OpenParen(BinaryOperator):
+    """An open parenthesis."""
+    precedence = 2
+
+
+@dataclasses.dataclass
+class Dot(BinaryOperator):
+    """A dot."""
+    precedence = 2
+
+
+@dataclasses.dataclass
+class Equals(BinaryOperator):
+    """An equals sign."""
+    precedence = 1
+
+
+@dataclasses.dataclass
 class EOF(Token):
     """The end of the file."""
 
@@ -35,11 +58,6 @@ class EOL(Token):
 class Identifier(Token):
     """An identifier."""
 
-
-@dataclasses.dataclass
-class OpenParen(BinaryOperator):
-    """An open parenthesis."""
-    precedence = 2
 
 @dataclasses.dataclass
 class CloseParen(Token):
@@ -57,19 +75,8 @@ class CloseCurly(Token):
 
 
 @dataclasses.dataclass
-class OpenBracket(Token):
-    """An open bracket."""
-
-
-@dataclasses.dataclass
 class CloseBracket(Token):
     """A close backet."""
-
-
-@dataclasses.dataclass
-class Dot(BinaryOperator):
-    """A dot."""
-    precedence = 2
 
 
 @dataclasses.dataclass
@@ -83,12 +90,12 @@ class Comma(Token):
 
 
 @dataclasses.dataclass
-class QuotedString(Token):
+class StringLiteral(Token):
     """A quoted string."""
 
 
 @dataclasses.dataclass
-class LiteralNumber(Token):
+class IntegerLiteral(Token):
     """A literal number."""
 
 
@@ -130,9 +137,3 @@ class Anon(Token):
 @dataclasses.dataclass
 class Import(Token):
     """An import token"""
-
-
-@dataclasses.dataclass
-class Equals(BinaryOperator):
-    """An equals sign."""
-    precedence = 1

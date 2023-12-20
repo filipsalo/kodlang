@@ -14,6 +14,7 @@ from kod.ast import (
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
+    CloseBracket,
     Comment,
     EOF,
     EOL,
@@ -22,6 +23,7 @@ from kod.tokens import (
     Identifier,
     Import,
     Let,
+    OpenBracket,
 )
 from kod.types import BUILTIN_TYPES, ArrayType
 
@@ -70,6 +72,11 @@ class Parser:
 
     def parse_type(self):
         """Parse a type."""
+        if self.peek(OpenBracket):
+            self.consume(OpenBracket)
+            item_type = self.parse_type()
+            self.consume(CloseBracket)
+            return ArrayType(item_type)
         param_type = ParsedVariable.parse(self)
         if param_type.id not in BUILTIN_TYPES:
             raise self.error(f"Unexpected type {param_type.id}", param_type.span)

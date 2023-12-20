@@ -3,6 +3,7 @@
 
 import ctypes
 from functools import partial
+import sys
 from kod import tokens
 
 from kod.ast import (
@@ -13,6 +14,7 @@ from kod.ast import (
     ParsedExternalFunctionDeclaration,
     ParsedFunctionCall,
     ParsedImport,
+    ParsedIntegerLiteral,
     ParsedName,
     ParsedStringLiteral,
     ParsedVariable,
@@ -31,7 +33,7 @@ class Interpreter:
         self.stack = [{}]
         self.builtins_module = self.program.get_module("builtins").module
 
-    def run(self, entry_module="main"):
+    def run(self, entry_module="main", argv=()):
         """Run the program"""
         for module in self.program.modules.values():
             # fixme: these shouldn't be buildmodules
@@ -40,7 +42,8 @@ class Interpreter:
                 self.execute_statement(module, statement)
         entry_module = self.program.get_module(entry_module).module
         main = self.lookup(entry_module, "main")
-        self.call_function(entry_module, main)
+        argv = [arg.encode("utf8") for arg in argv]
+        self.call_function(entry_module, main, [argv])
 
     def lookup(self, module, name):
         """Look up a variable in the stack"""
@@ -67,13 +70,18 @@ class Interpreter:
         """Resolve an expression"""
         match expression:
             case BinaryOperator(lhs, op, rhs):
-                if isinstance(op, tokens.Dot):
-                    lhs = self.evaluate_expression(module, lhs, as_lvalue)
-                    return lhs.names[rhs.value.id]
+                match op:
+                    case tokens.Dot():
+                        lhs = self.evaluate_expression(module, lhs, as_lvalue)
+                        return lhs.names[rhs.value.id]
+                    case tokens.OpenBracket():
+                        lhs = self.evaluate_expression(module, lhs)
+                        rhs = self.evaluate_expression(module, rhs.value)
+                        return lhs[rhs]
                 raise ValueError(f"Don't know how to evaluate binary operator {op}")
             case ParsedName() | ParsedVariable() as name:
                 return name if as_lvalue else self.lookup(module, name)
-            case ParsedStringLiteral(value):
+            case ParsedStringLiteral(value) | ParsedIntegerLiteral(value):
                 return value
             case ParsedExpression(value):
                 return self.evaluate_expression(module, value, as_lvalue)

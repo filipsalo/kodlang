@@ -21,6 +21,7 @@ def main():
 
     interpret_parser = subparsers.add_parser("interpret")
     interpret_parser.add_argument("file", type=FileWrapper)
+    interpret_parser.add_argument('args', nargs='*')
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=FileWrapper)
@@ -47,7 +48,8 @@ def main():
 
     match args.command:
         case "interpret":
-            Interpreter(program).run(entry_module)
+            argv = [str(args.file.path)] + args.args
+            Interpreter(program).run(entry_module, argv)
         case "compile":
             print(bob.compile_module(entry_module))
             return 0

@@ -21,11 +21,11 @@ from kod.tokens import (
     Identifier,
     Import,
     Let,
-    LiteralNumber,
+    IntegerLiteral,
     OpenBracket,
     OpenCurly,
     OpenParen,
-    QuotedString,
+    StringLiteral,
 )
 
 
@@ -82,13 +82,13 @@ class Lexer:
         while self.peek() != '"':
             self.pos += 1
         self.consume('"')
-        return self.build(QuotedString)
+        return self.build(StringLiteral)
 
     def lex_number(self):
         """Lex a number."""
         while self.peek() in "0123456789":
             self.pos += 1
-        return self.build(LiteralNumber)
+        return self.build(IntegerLiteral)
 
     def lex_single_char(self, token_type):
         """Lex a single character token."""

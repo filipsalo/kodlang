@@ -28,3 +28,15 @@ BUILTIN_TYPES = {
     "bool": Boolean,
     "None": None_,
 }
+
+
+@dataclasses.dataclass
+class ArrayType(Type):
+    """An array type."""
+
+    def __init__(self, item_type):
+        super().__init__(f"[{item_type.name}]", 8)
+        self.item_type = item_type
+
+    def __repr__(self):
+        return f"<Type {self.name} ({self.width})>"

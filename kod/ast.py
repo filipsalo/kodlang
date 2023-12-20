@@ -39,12 +39,27 @@ class ParsedStringLiteral(ASTNode):
     @classmethod
     def parse(cls, parser):
         """Parse a string literal."""
-        token = parser.consume(tokens.QuotedString)
+        token = parser.consume(tokens.StringLiteral)
         return cls(
             token.value.strip("\"").encode('utf8'),
             BUILTIN_TYPES["str"],
             span=token.span
         )
+
+
+@dataclasses.dataclass
+class ParsedIntegerLiteral(ASTNode):
+    """An integerliteral."""
+    value: int
+    type: Type
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse an integer literal."""
+        token = parser.consume(tokens.IntegerLiteral)
+        return cls(int(token.value), BUILTIN_TYPES["int64"], span=token.span)
+
 
 
 @dataclasses.dataclass
@@ -134,13 +149,10 @@ class ParsedFunctionCallParam(ASTNode):
         """Parse a function call parameter."""
         with parser.span() as span:
             label = None
-            if parser.peek(tokens.Identifier):
-                expr = ParsedVariable.parse(parser)
-                if parser.peek(tokens.Colon):
-                    label = expr
-                    parser.consume(tokens.Colon)
-                    expr = ParsedExpression.parse(parser)
-            else:
+            expr = ParsedExpression.parse(parser)
+            if parser.peek(tokens.Colon):
+                label = expr
+                parser.consume(tokens.Colon)
                 expr = ParsedExpression.parse(parser)
         return cls(label, expr, span)
 
@@ -295,8 +307,10 @@ class ParsedExpression(ASTNode):
                     parser.consume(tokens.OpenParen)
                     value = ParsedExpression.parse(parser, 1)
                     parser.consume(tokens.CloseParen)
-                case tokens.QuotedString():
+                case tokens.StringLiteral():
                     value = ParsedStringLiteral.parse(parser)
+                case tokens.IntegerLiteral():
+                    value = ParsedIntegerLiteral.parse(parser)
                 case tokens.Identifier():
                     value = ParsedName.parse(parser)
                 case _:
@@ -316,6 +330,11 @@ class ParsedExpression(ASTNode):
                 if isinstance(op, tokens.OpenParen):
                     rhs = ParsedFunctionCallParamList.parse(parser)
                     lhs = ParsedFunctionCall(lhs, rhs, span)
+                elif isinstance(op, tokens.OpenBracket):
+                    parser.consume(tokens.OpenBracket)
+                    rhs = ParsedExpression.parse(parser)
+                    parser.consume(tokens.CloseBracket)
+                    lhs = BinaryOperator(lhs, op, rhs, span)
                 else:
                     parser.consume(type(op))
                     rhs = cls.parse(parser, op.precedence + op.left_associative)
