@@ -15,6 +15,12 @@ class Token:
         return f"{self.__class__.__name__}({self.value!r})"
 
 
+class BinaryOperator(Token):
+    """A binary operator."""
+    precedence: int = 1
+    left_associative: bool = True
+
+
 @dataclasses.dataclass
 class EOF(Token):
     """The end of the file."""
@@ -31,9 +37,9 @@ class Identifier(Token):
 
 
 @dataclasses.dataclass
-class OpenParen(Token):
+class OpenParen(BinaryOperator):
     """An open parenthesis."""
-
+    precedence = 2
 
 @dataclasses.dataclass
 class CloseParen(Token):
@@ -61,8 +67,9 @@ class CloseBracket(Token):
 
 
 @dataclasses.dataclass
-class Dot(Token):
+class Dot(BinaryOperator):
     """A dot."""
+    precedence = 2
 
 
 @dataclasses.dataclass
@@ -126,5 +133,6 @@ class Import(Token):
 
 
 @dataclasses.dataclass
-class Equals(Token):
+class Equals(BinaryOperator):
     """An equals sign."""
+    precedence = 1

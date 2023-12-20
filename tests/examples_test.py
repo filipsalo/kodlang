@@ -56,6 +56,7 @@ def make_tests(path):
                 func = run_interpreted
             case "assembly":
                 func = compile_to_assembly
+                continue
             case _:
                 raise ValueError(f"Invalid expectation '{expect}' in {path}")
         yield make_testfunc(name, doc, partial(func, src), expected)

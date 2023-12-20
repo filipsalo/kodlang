@@ -2,12 +2,18 @@
 """Simple interpreter for the Kod language"""
 
 import ctypes
+from functools import partial
+from kod import tokens
 
 from kod.ast import (
+    BinaryOperator,
+    ParsedFunctionCallParam,
     ParsedFunctionDeclaration,
+    ParsedExpression,
     ParsedExternalFunctionDeclaration,
     ParsedFunctionCall,
     ParsedImport,
+    ParsedName,
     ParsedStringLiteral,
     ParsedVariable,
     ParsedVariableDeclaration,
@@ -23,66 +29,78 @@ class Interpreter:
     def __init__(self, program):
         self.program = program
         self.stack = [{}]
-
-    def get_builtins(self):
-        """Return a dictionary of builtins"""
+        self.builtins_module = self.program.get_module("builtins").module
 
     def run(self, entry_module="main"):
         """Run the program"""
-        for default_module in ["builtins", entry_module]:
-            module = self.program.get_module(default_module).module
+        for module in self.program.modules.values():
+            # fixme: these shouldn't be buildmodules
+            module = module.module
             for statement in module.body:
-                if isinstance(statement, (ParsedFunctionDeclaration, ParsedExternalFunctionDeclaration)):
-                    self.stack[-1][statement.name] = statement
-                elif isinstance(statement, ParsedImport):
-                    name = statement.module_name.value.decode("ascii")
-                    self.stack[0][name] = self.program.get_module(name).module
-                elif isinstance(statement, ParsedVariableDeclaration):
-                    self.stack[-1][statement.variable.id] = statement.value
-                else:
-                    raise ValueError(f"Unexpected statement {statement}")
+                self.execute_statement(module, statement)
+        entry_module = self.program.get_module(entry_module).module
         main = self.lookup(entry_module, "main")
         self.call_function(entry_module, main)
 
     def lookup(self, module, name):
         """Look up a variable in the stack"""
-        if isinstance(name, ParsedVariable):
-            name = name.id
-        for frame in self.stack[-1], self.stack[0]:
+        match name:
+            case ParsedVariable() | ParsedName():
+                name = name.id
+        for frame in self.stack[-1], module.names, self.builtins_module.names:
             if name in frame:
                 value = frame[name]
                 if isinstance(value, ParsedStringLiteral):
                     value = value.value
                 return value
-        for statement in module:
-            if isinstance(statement, (ParsedExternalFunctionDeclaration, ParsedFunctionDeclaration)):
-                if statement.name == name:
-                    return statement
-            if isinstance(statement, ParsedVariableDeclaration):
-                if statement.variable.id == name:
-                    return statement.value
+        for statement in module.body:
+            match statement:
+                case ParsedExternalFunctionDeclaration() | ParsedFunctionDeclaration() as func:
+                    if func.name == name:
+                        return statement
+                case ParsedVariableDeclaration(variable, value):
+                    if variable.id == name:
+                        return value
         raise ValueError(f"Unknown name {name!r}")
 
-    def resolve_names(self, module, args):
-        """Resolve variable names to values"""
-        return [
-            self.lookup(module, arg.expression)
-            if isinstance(arg.expression, ParsedVariable)
-            else arg.expression
-            for arg in args
-        ]
+    def evaluate_expression(self, module, expression, as_lvalue=False):
+        """Resolve an expression"""
+        match expression:
+            case BinaryOperator(lhs, op, rhs):
+                if isinstance(op, tokens.Dot):
+                    lhs = self.evaluate_expression(module, lhs, as_lvalue)
+                    return lhs.names[rhs.value.id]
+                raise ValueError(f"Don't know how to evaluate binary operator {op}")
+            case ParsedName() | ParsedVariable() as name:
+                return name if as_lvalue else self.lookup(module, name)
+            case ParsedStringLiteral(value):
+                return value
+            case ParsedExpression(value):
+                return self.evaluate_expression(module, value, as_lvalue)
+            case ParsedFunctionCallParam() as param:
+                return self.evaluate_expression(module, param.expression, as_lvalue)
+            case _:
+                raise ValueError(f"Don't know how to evaluate expression {expression!r}")
 
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
-            case ParsedFunctionCall(callee, args):
-                func = self.lookup(module, callee)
-                args = self.resolve_names(module, args)
-                self.call_function(module, func, args)
+            case ParsedImport(module_name):
+                name = module_name.value.decode("ascii")
+                module.names[name.lstrip("./")] = self.program.get_module(name).module
+            case ParsedFunctionDeclaration(name) | ParsedExternalFunctionDeclaration(name):
+                module.names[name] = statement
+                statement.module = module
+            case ParsedFunctionCall():
+                callee = self.evaluate_expression(module, statement.callee)
+                args = list(map(partial(self.evaluate_expression, module), statement.args))
+                self.call_function(module, callee, args)
             case ParsedVariableDeclaration(variable, value):
-                self.stack[-1][variable.id] = value
-            case ParsedAssignment(variable, value):
-                self.stack[-1][variable.id] = value
+                lhs = self.evaluate_expression(module, variable, as_lvalue=True)
+                module.names[lhs.id] = self.evaluate_expression(module, value.value)
+            case ParsedAssignment(lhs, rhs):
+                lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
+                module.names[lhs.id] = self.evaluate_expression(module, rhs.value)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
@@ -98,5 +116,5 @@ class Interpreter:
         }
         self.stack.append(args)
         for statement in func.body:
-            self.execute_statement(module, statement)
+            self.execute_statement(func.module, statement)
         self.stack.pop()
