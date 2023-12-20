@@ -112,9 +112,19 @@ class Interpreter:
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
+    def c_type(self, type):
+        """Convert a Kod type to a C type"""
+        if type == "str":
+            return ctypes.c_char_p
+        if type == "int":
+            return ctypes.c_int
+        raise ValueError(f"Unknown type {type!r}")
+
     def call_function(self, module, func, args=()):
         """Call a function"""
         if isinstance(func, ParsedExternalFunctionDeclaration):
+            c_func = getattr(libc, func.name)
+            c_func.argtypes = [self.c_type(p.variable.type.name) for p in func.params]
             return getattr(libc, func.name)(*args)
 
         # Map args to params
