@@ -119,10 +119,10 @@ class Interpreter:
             case ast.ParsedAssignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
                 module.names[lhs.id] = self.evaluate_expression(module, rhs.value)
-            case ast.ParsedIfStatement(condition, body):
-                if self.evaluate_expression(module, condition).to_bool().value is True:
-                    for statement in body:
-                        self.execute_statement(module, statement)
+            case ast.ParsedIfStatement(condition, true_branch, false_branch):
+                matched = self.evaluate_expression(module, condition).to_bool().value is True
+                for statement in true_branch if matched else false_branch:
+                    self.execute_statement(module, statement)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 

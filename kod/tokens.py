@@ -157,5 +157,10 @@ class If(Token):
 
 
 @dataclasses.dataclass
+class Else(Token):
+    """An else token"""
+
+
+@dataclasses.dataclass
 class BooleanLiteral(Token):
     """A true/false token"""

@@ -16,6 +16,7 @@ from kod.tokens import (
     Dot,
     EOF,
     EOL,
+    Else,
     Equals,
     Extern,
     Func,
@@ -40,6 +41,7 @@ KEYWORDS = {
     "anon": Anon,
     "return": Return,
     "if": If,
+    "else": Else,
     "true": BooleanLiteral,
     "false": BooleanLiteral,
 }
