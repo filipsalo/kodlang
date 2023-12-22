@@ -30,6 +30,16 @@ from kod.tokens import (
     StringLiteral,
 )
 
+KEYWORDS = {
+    "import": Import,
+    "let": Let,
+    "extern": Extern,
+    "func": Func,
+    "anon": Anon,
+    "return": Return,
+    "if": If,
+}
+
 
 class Lexer:
     """A lexer for the kod language."""
@@ -104,21 +114,9 @@ class Lexer:
             raise self.error(f"Lexer expected identifier, got {self.peek()!r}")
         while self.peek().isalnum() or self.peek() == "_":
             self.pos += 1
-        match self.buffered():
-            case "import":
-                return self.build(Import)
-            case "let":
-                return self.build(Let)
-            case "extern":
-                return self.build(Extern)
-            case "func":
-                return self.build(Func)
-            case "anon":
-                return self.build(Anon)
-            case "return":
-                return self.build(Return)
-            case _:
-                return self.build(Identifier)
+        if keyword_token_type := KEYWORDS.get(self.buffered()):
+            return self.build(keyword_token_type)
+        return self.build(Identifier)
 
     def lex_comment(self):
         """Lex a comment."""
