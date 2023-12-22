@@ -6,24 +6,7 @@ import sys
 
 from functools import partial
 
-from kod import tokens
-
-from kod.ast import (
-    BinaryOperator,
-    ParsedFunctionCallParam,
-    ParsedFunctionDeclaration,
-    ParsedExpression,
-    ParsedExternalFunctionDeclaration,
-    ParsedFunctionCall,
-    ParsedImport,
-    ParsedIntegerLiteral,
-    ParsedName,
-    ParsedReturn,
-    ParsedStringLiteral,
-    ParsedVariable,
-    ParsedVariableDeclaration,
-    ParsedAssignment,
-)
+from kod import ast, tokens, types
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
@@ -42,36 +25,38 @@ class Interpreter:
         self.stack = [{}]
         self.builtins_module = self.program.get_module("builtins").module
 
-    def run(self, entry_module="main", argv=()):
+    def run(self, entry_module_name="main", argv=()):
         """Run the program"""
         for module in self.program.modules.values():
             # fixme: these shouldn't be buildmodules
             module = module.module
             for statement in module.body:
                 self.execute_statement(module, statement)
-        entry_module = self.program.get_module(entry_module).module
-        main = self.lookup(entry_module, "main")
-        argv = [arg.encode("utf8") for arg in argv]
-        exit_code = self.call_function(entry_module, main, [argv])
-        sys.exit(exit_code)
+        entry_module_name = self.program.get_module(entry_module_name).module
+        main = self.lookup(entry_module_name, "main")
+        string_array = types.ArrayType.make(types.String)
+        argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
+        exit_code = self.call_function(entry_module_name, main, [argv])
+        sys.exit(exit_code.value)
 
     def lookup(self, module, name):
         """Look up a variable in the stack"""
         match name:
-            case ParsedVariable() | ParsedName():
+            case ast.ParsedVariable() | ast.ParsedName():
                 name = name.id
         for frame in self.stack[-1], module.names, self.builtins_module.names:
             if name in frame:
                 value = frame[name]
-                if isinstance(value, ParsedStringLiteral):
+                if isinstance(value, ast.ParsedStringLiteral):
                     value = value.value
                 return value
         for statement in module.body:
             match statement:
-                case ParsedExternalFunctionDeclaration() | ParsedFunctionDeclaration() as func:
+                case (ast.ParsedExternalFunctionDeclaration()
+                      | ast.ParsedFunctionDeclaration()) as func:
                     if func.name == name:
                         return statement
-                case ParsedVariableDeclaration(variable, value):
+                case ast.ParsedVariableDeclaration(variable, value):
                     if variable.id == name:
                         return value
         raise ValueError(f"Unknown name {name!r}")
@@ -79,7 +64,7 @@ class Interpreter:
     def evaluate_expression(self, module, expression, as_lvalue=False):
         """Resolve an expression"""
         match expression:
-            case BinaryOperator(lhs, op, rhs):
+            case ast.BinaryOperator(lhs, op, rhs):
                 match op:
                     case tokens.Dot():
                         lhs = self.evaluate_expression(module, lhs, as_lvalue)
@@ -87,15 +72,15 @@ class Interpreter:
                     case tokens.OpenBracket():
                         lhs = self.evaluate_expression(module, lhs)
                         rhs = self.evaluate_expression(module, rhs.value)
-                        return lhs[rhs]
+                        return lhs.op_index(rhs)
                 raise ValueError(f"Don't know how to evaluate binary operator {op}")
-            case ParsedName() | ParsedVariable() as name:
+            case ast.ParsedName() | ast.ParsedVariable() as name:
                 return name if as_lvalue else self.lookup(module, name)
-            case ParsedStringLiteral(value) | ParsedIntegerLiteral(value):
+            case ast.ParsedStringLiteral(value) | ast.ParsedIntegerLiteral(value):
                 return value
-            case ParsedExpression(value):
+            case ast.ParsedExpression(value):
                 return self.evaluate_expression(module, value, as_lvalue)
-            case ParsedFunctionCallParam() as param:
+            case ast.ParsedFunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
             case _:
                 raise ValueError(f"Don't know how to evaluate expression {expression!r}")
@@ -103,46 +88,51 @@ class Interpreter:
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
-            case ParsedReturn(expression):
+            case ast.ParsedReturn(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
-            case ParsedImport(module_name):
-                name = module_name.value.decode("ascii")
+            case ast.ParsedImport(module_name):
+                name = module_name.value.to_py_str()
                 module.names[name.lstrip("./")] = self.program.get_module(name).module
-            case ParsedFunctionDeclaration(name) | ParsedExternalFunctionDeclaration(name):
+            case ast.ParsedFunctionDeclaration(name) | ast.ParsedExternalFunctionDeclaration(name):
                 module.names[name] = statement
                 statement.module = module
-            case ParsedFunctionCall():
+            case ast.ParsedFunctionCall():
                 callee = self.evaluate_expression(module, statement.callee)
                 args = list(map(partial(self.evaluate_expression, module), statement.args))
                 self.call_function(module, callee, args)
-            case ParsedVariableDeclaration(variable, value):
+            case ast.ParsedVariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 module.names[lhs.id] = self.evaluate_expression(module, value.value)
-            case ParsedAssignment(lhs, rhs):
+            case ast.ParsedAssignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
                 module.names[lhs.id] = self.evaluate_expression(module, rhs.value)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
-    def c_type(self, type):
+    def c_type(self, type_):
         """Convert a Kod type to a C type"""
-        if type == "str":
+        if type_ is types.String:
             return ctypes.c_char_p
-        if type == "int":
+        if type_ is types.Int64:
             return ctypes.c_int
-        raise ValueError(f"Unknown type {type!r}")
+        raise ValueError(f"Unknown type {type_!r}")
 
     def call_function(self, module, func, args=()):
         """Call a function"""
-        if isinstance(func, ParsedExternalFunctionDeclaration):
+        if isinstance(func, ast.ParsedExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)
-            c_func.argtypes = [self.c_type(p.variable.type.name) for p in func.params]
+            c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
+            args = [arg.value for arg in args]
             return getattr(libc, func.name)(*args)
 
         # Map args to params
         args = {
-            param.variable.id: self.lookup(module, arg) if isinstance(arg, ParsedVariable) else arg
+            param.variable.id: (
+                self.lookup(module, arg)
+                if isinstance(arg, ast.ParsedVariable)
+                else arg
+            )
             for param, arg in zip(func.params, args)
         }
         self.stack.append(args)

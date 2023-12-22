@@ -2,16 +2,7 @@
 """A parser for the Kod lanuage"""
 
 from contextlib import contextmanager
-from kod.ast import (
-    ParsedExpression,
-    ParsedExternalFunctionDeclaration,
-    ParsedFunctionDeclaration,
-    ParsedImport,
-    ParsedModule,
-    ParsedReturn,
-    ParsedVariable,
-    ParsedVariableDeclaration,
-)
+from kod import ast, types
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
@@ -27,7 +18,6 @@ from kod.tokens import (
     OpenBracket,
     Return,
 )
-from kod.types import BUILTIN_TYPES, ArrayType
 
 
 class Parser:
@@ -77,34 +67,33 @@ class Parser:
             self.consume(OpenBracket)
             item_type = self.parse_type()
             self.consume(CloseBracket)
-            return ArrayType(item_type)
-        param_type = ParsedVariable.parse(self)
-        if param_type.id not in BUILTIN_TYPES:
-            raise self.error(f"Unexpected type {param_type.id}", param_type.span)
-        return BUILTIN_TYPES[param_type.id]
+            return types.ArrayType.make(item_type)
+        param_type = ast.ParsedName.parse(self)
+        return types.Type.from_name(param_type.id)
 
     def parse_statement(self):
         """Parse a statement."""
+        stmt = None
         match self.peek():
             case Import():
-                return ParsedImport.parse(self)
+                stmt = ast.ParsedImport.parse(self)
             case Return():
-                return ParsedReturn.parse(self)
+                stmt = ast.ParsedReturn.parse(self)
             case Let():
-                return ParsedVariableDeclaration.parse(self)
+                stmt = ast.ParsedVariableDeclaration.parse(self)
             case Extern():
-                return ParsedExternalFunctionDeclaration.parse(self)
+                stmt = ast.ParsedExternalFunctionDeclaration.parse(self)
             case Func():
-                return ParsedFunctionDeclaration.parse(self)
+                stmt = ast.ParsedFunctionDeclaration.parse(self)
             case Identifier():
-                return ParsedExpression.parse(self)
+                stmt = ast.ParsedExpression.parse(self)
             case Comment():
                 self.consume(Comment)
             case EOL():
                 self.consume(EOL)
-                return
             case _:
                 raise self.error(f"Unexpected token {self.peek()}")
+        return stmt
 
     def peek(self, token_type=None):
         """Return the next token, or raise ValueError if it doesn't match."""
@@ -117,7 +106,7 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        return ParsedModule(self.path, self.module_name, statements, {}, span)
+        return ast.ParsedModule(self.path, self.module_name, statements, {}, span)
 
     def __iter__(self):
         while True:

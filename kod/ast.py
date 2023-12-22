@@ -2,10 +2,9 @@
 
 import dataclasses
 from pathlib import Path
-from kod import tokens
+from kod import tokens, types
 
 from kod.span import Span
-from kod.types import Type, BUILTIN_TYPES
 
 
 def dump(node, indent=""):
@@ -32,41 +31,37 @@ class ASTNode:
 @dataclasses.dataclass
 class ParsedStringLiteral(ASTNode):
     """A string literal."""
-    value: str
-    type: Type
+    value: types.String
     span: Span
 
     @classmethod
     def parse(cls, parser):
         """Parse a string literal."""
         token = parser.consume(tokens.StringLiteral)
-        return cls(
-            token.value.strip("\"").encode('utf8'),
-            BUILTIN_TYPES["str"],
-            span=token.span
-        )
+        bytes_ = token.value.strip("\"").encode('utf8')
+        value = types.String(bytes_)
+        return cls(value, span=token.span)
 
 
 @dataclasses.dataclass
 class ParsedIntegerLiteral(ASTNode):
     """An integerliteral."""
-    value: int
-    type: Type
+    value: types.Int64
     span: Span
 
     @classmethod
     def parse(cls, parser):
         """Parse an integer literal."""
         token = parser.consume(tokens.IntegerLiteral)
-        return cls(int(token.value), BUILTIN_TYPES["int64"], span=token.span)
-
+        value = types.Int64(int(token.value))
+        return cls(value, span=token.span)
 
 
 @dataclasses.dataclass
 class ParsedVariable(ASTNode):
     """A name."""
     id: str
-    type: Type
+    type: types.Type
     span: Span
 
     @classmethod
@@ -140,7 +135,7 @@ class ParsedFunctionParamList(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionCallParam(ASTNode):
     """A function parameter."""
-    label: ParsedVariable
+    label: ParsedName
     expression: ASTNode
     span: Span
 
@@ -151,7 +146,7 @@ class ParsedFunctionCallParam(ASTNode):
             label = None
             expr = ParsedExpression.parse(parser)
             if parser.peek(tokens.Colon):
-                label = expr
+                label = ParsedName(expr, expr.span)
                 parser.consume(tokens.Colon)
                 expr = ParsedExpression.parse(parser)
         return cls(label, expr, span)
@@ -375,5 +370,3 @@ class ParsedReturn(ASTNode):
             parser.consume(tokens.Return)
             expression = ParsedExpression.parse(parser)
         return cls(expression, span)
-
-

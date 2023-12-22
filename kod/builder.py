@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 from pathlib import Path
-from kod.ast import ParsedImport
+from kod import ast
 
 from kod.compiler import Compiler
 from kod.lexer import Lexer
@@ -22,7 +22,7 @@ class FileWrapper:
         self.path = Path(path)
         self.file = file
 
-    def open(self, *args, **kwargs):
+    def open(self, *args, **kwargs) -> io.TextIOWrapper:
         """Open the file."""
         if self.file:
             return self.file
@@ -39,7 +39,7 @@ class Builder:
         self.program = Program()
         self.parse_builtins()
 
-    def parse_builtins(self):
+    def parse_builtins(self) -> None:
         """Parse the builtins module."""
         builtins = self.parse_module("builtins", self.resolve_name("builtins", self.root_path))
         self.program.add_module(builtins)
@@ -51,35 +51,35 @@ class Builder:
         path = (root_path / module_name).with_suffix(".kod")
         return FileWrapper(path)
 
-    def parse_program(self, file_wrapper: FileWrapper):
+    def parse_program(self, file_wrapper: FileWrapper) -> Program:
         """Parse the program starting at `main_path`."""
         main = self.parse_module(file_wrapper.path.stem, file_wrapper)
         self.program.add_module(main)
         return self.program
 
-    def parse_module(self, name, file_wrapper: FileWrapper):
+    def parse_module(self, name: str, file_wrapper: FileWrapper) -> BuildModule:
         """Parse a module."""
         with file_wrapper.open(encoding="utf8") as f:
             source = f.read()
         tokens = Lexer(source, file_wrapper.path).lex()
         module = Parser(tokens, file_wrapper.path, name).parse()
         for import_ in self.get_imports(module):
-            name = import_.module_name.value.decode("ascii")
+            name = import_.module_name.value.to_py_str()
             if name not in self.program.modules:
                 import_path = self.resolve_name(name, file_wrapper.path.parent)
                 import_module = self.parse_module(name, import_path)
                 self.program.add_module(import_module)
         return BuildModule(module)
 
-    def get_imports(self, module):
+    def get_imports(self, module) -> list[ast.ParsedImport]:
         """Get the imports of a module."""
         imports = []
         for statement in module.body:
-            if isinstance(statement, ParsedImport):
+            if isinstance(statement, ast.ParsedImport):
                 imports.append(statement)
         return imports
 
-    def compile_module(self, name):
+    def compile_module(self, name: str) -> str:
         """Compile a module."""
         build_module = self.program.modules[name]
         builtins = self.program.modules["builtins"]
@@ -87,7 +87,7 @@ class Builder:
         Compiler(build_module.module, builtins.module, output).compile()
         return output.getvalue()
 
-    def build_module(self, name):
+    def build_module(self, name: str) -> None:
         """Build a module."""
         module = self.program.get_module(name)
         asm = self.compile_module(name)
@@ -99,7 +99,7 @@ class Builder:
             "-"
         ], input=asm.encode("ascii"), check=True)
 
-    def build_executable(self, path):
+    def build_executable(self, path: Path) -> Path:
         """Build an executable."""
         for module in self.program:
             self.build_module(module.name)
