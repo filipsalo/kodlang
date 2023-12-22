@@ -6,6 +6,7 @@ from kod import ast, types
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
+    BooleanLiteral,
     CloseBracket,
     Comment,
     EOF,
@@ -13,6 +14,7 @@ from kod.tokens import (
     Extern,
     Func,
     Identifier,
+    If,
     Import,
     Let,
     OpenBracket,
@@ -75,10 +77,14 @@ class Parser:
         """Parse a statement."""
         stmt = None
         match self.peek():
+            case BooleanLiteral():
+                stmt = ast.ParsedBooleanLiteral.parse(self)
             case Import():
                 stmt = ast.ParsedImport.parse(self)
             case Return():
                 stmt = ast.ParsedReturn.parse(self)
+            case If():
+                stmt = ast.ParsedIfStatement.parse(self)
             case Let():
                 stmt = ast.ParsedVariableDeclaration.parse(self)
             case Extern():

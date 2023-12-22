@@ -30,6 +30,16 @@ class Int64(Type):
     width = 8
 
 
+class Bool(Type):
+    """A boolean."""
+    name = "bool"
+    width = 1
+
+    def to_bool(self):
+        """Return the value as a Kod boolean."""
+        return self
+
+
 class String(Type):
     """A UTF-8 string."""
     name = "str"

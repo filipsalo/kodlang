@@ -31,6 +31,7 @@ class ASTNode:
 @dataclasses.dataclass
 class ParsedStringLiteral(ASTNode):
     """A string literal."""
+
     value: types.String
     span: Span
 
@@ -38,7 +39,7 @@ class ParsedStringLiteral(ASTNode):
     def parse(cls, parser):
         """Parse a string literal."""
         token = parser.consume(tokens.StringLiteral)
-        bytes_ = token.value.strip("\"").encode('utf8')
+        bytes_ = token.value.strip('"').encode("utf8")
         value = types.String(bytes_)
         return cls(value, span=token.span)
 
@@ -46,6 +47,7 @@ class ParsedStringLiteral(ASTNode):
 @dataclasses.dataclass
 class ParsedIntegerLiteral(ASTNode):
     """An integerliteral."""
+
     value: types.Int64
     span: Span
 
@@ -58,8 +60,24 @@ class ParsedIntegerLiteral(ASTNode):
 
 
 @dataclasses.dataclass
+class ParsedBooleanLiteral(ASTNode):
+    """An integerliteral."""
+
+    value: types.Bool
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse an integer literal."""
+        token = parser.consume(tokens.BooleanLiteral)
+        value = types.Bool(token.value == 'true')
+        return cls(value, span=token.span)
+
+
+@dataclasses.dataclass
 class ParsedVariable(ASTNode):
     """A name."""
+
     id: str
     type: types.Type
     span: Span
@@ -74,6 +92,7 @@ class ParsedVariable(ASTNode):
 @dataclasses.dataclass
 class ParsedName(ASTNode):
     """A name."""
+
     id: str
     span: Span
 
@@ -87,6 +106,7 @@ class ParsedName(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionParam(ASTNode):
     """A function parameter."""
+
     variable: ParsedVariable
     anonymous: bool
     span: Span
@@ -108,6 +128,7 @@ class ParsedFunctionParam(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionParamList(ASTNode):
     """A function parameter list."""
+
     params: list[ParsedFunctionParam]
     span: Span
 
@@ -135,6 +156,7 @@ class ParsedFunctionParamList(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionCallParam(ASTNode):
     """A function parameter."""
+
     label: ParsedName
     expression: ASTNode
     span: Span
@@ -155,6 +177,7 @@ class ParsedFunctionCallParam(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionCallParamList(ASTNode):
     """A function parameter list."""
+
     params: list[ParsedFunctionCallParam]
     span: Span
 
@@ -182,6 +205,7 @@ class ParsedFunctionCallParamList(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionCall(ASTNode):
     """A function call."""
+
     callee: ASTNode
     args: list[ASTNode]
     span: Span
@@ -190,6 +214,7 @@ class ParsedFunctionCall(ASTNode):
 @dataclasses.dataclass
 class ParsedFunctionDeclaration(ASTNode):
     """A function declaration."""
+
     name: str
     params: ParsedFunctionParamList
     body: list[ASTNode]
@@ -223,6 +248,7 @@ class ParsedFunctionDeclaration(ASTNode):
 @dataclasses.dataclass
 class ParsedImport(ASTNode):
     """An import statement."""
+
     module_name: str
     span: Span
 
@@ -238,6 +264,7 @@ class ParsedImport(ASTNode):
 @dataclasses.dataclass
 class ParsedExternalFunctionDeclaration(ASTNode):
     """An external function declaration."""
+
     name: str
     params: ParsedFunctionParamList
     body: list[ASTNode]
@@ -260,6 +287,7 @@ class ParsedExternalFunctionDeclaration(ASTNode):
 @dataclasses.dataclass
 class ParsedVariableDeclaration(ASTNode):
     """An assignment."""
+
     variable: ParsedVariable
     value: ASTNode
     span: Span
@@ -280,6 +308,7 @@ class ParsedVariableDeclaration(ASTNode):
 @dataclasses.dataclass
 class BinaryOperator(ASTNode):
     """A binary operator."""
+
     lhs: ASTNode
     op: tokens.Token
     rhs: ASTNode
@@ -289,6 +318,7 @@ class BinaryOperator(ASTNode):
 @dataclasses.dataclass
 class ParsedExpression(ASTNode):
     """An expression."""
+
     value: ASTNode
     span: Span
 
@@ -305,6 +335,8 @@ class ParsedExpression(ASTNode):
                     value = ParsedStringLiteral.parse(parser)
                 case tokens.IntegerLiteral():
                     value = ParsedIntegerLiteral.parse(parser)
+                case tokens.BooleanLiteral():
+                    value = ParsedBooleanLiteral.parse(parser)
                 case tokens.Identifier():
                     value = ParsedName.parse(parser)
                 case _:
@@ -319,7 +351,10 @@ class ParsedExpression(ASTNode):
             lhs = cls.parse_lhs(parser)
             while True:
                 op = parser.peek()
-                if not isinstance(op, tokens.BinaryOperator) or op.precedence < precedence:
+                if (
+                    not isinstance(op, tokens.BinaryOperator)
+                    or op.precedence < precedence
+                ):
                     break
                 if isinstance(op, tokens.OpenParen):
                     rhs = ParsedFunctionCallParamList.parse(parser)
@@ -342,17 +377,28 @@ class ParsedExpression(ASTNode):
 @dataclasses.dataclass
 class ParsedAssignment(ASTNode):
     """An assignment."""
+
     lhs: ParsedExpression
     rhs: ParsedExpression
     span: Span
 
 
+Statement = (
+    ParsedImport
+    | ParsedExternalFunctionDeclaration
+    | ParsedFunctionDeclaration
+    | ParsedVariableDeclaration
+    | ParsedAssignment
+)
+
+
 @dataclasses.dataclass
 class ParsedModule(ASTNode):
     """A module."""
-    path : Path
+
+    path: Path
     name: str
-    body: list[ParsedImport | ParsedExternalFunctionDeclaration | ParsedFunctionDeclaration | ParsedVariableDeclaration | ParsedAssignment]
+    body: list[Statement]
     names: dict
     span: Span
 
@@ -360,6 +406,7 @@ class ParsedModule(ASTNode):
 @dataclasses.dataclass
 class ParsedReturn(ASTNode):
     """A return statement."""
+
     expression: ParsedExpression
     span: Span
 
@@ -370,3 +417,26 @@ class ParsedReturn(ASTNode):
             parser.consume(tokens.Return)
             expression = ParsedExpression.parse(parser)
         return cls(expression, span)
+
+
+@dataclasses.dataclass
+class ParsedIfStatement(ASTNode):
+    """An if statement."""
+
+    condition: ParsedExpression
+    body: list[Statement]
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse an if statement."""
+        with parser.span() as span:
+            parser.consume(tokens.If)
+            condition = ParsedExpression.parse(parser)
+            parser.consume(tokens.OpenCurly)
+            body = []
+            while not parser.peek(tokens.CloseCurly):
+                if statement := parser.parse_statement():
+                    body.append(statement)
+            parser.consume(tokens.CloseCurly)
+        return cls(condition, body, span)

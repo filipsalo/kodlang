@@ -6,6 +6,7 @@ from kod.span import Span
 from kod.tokens import (
     Anon,
     Arrow,
+    BooleanLiteral,
     CloseBracket,
     CloseCurly,
     CloseParen,
@@ -19,6 +20,7 @@ from kod.tokens import (
     Extern,
     Func,
     Identifier,
+    If,
     Import,
     Let,
     IntegerLiteral,
@@ -38,6 +40,8 @@ KEYWORDS = {
     "anon": Anon,
     "return": Return,
     "if": If,
+    "true": BooleanLiteral,
+    "false": BooleanLiteral,
 }
 
 

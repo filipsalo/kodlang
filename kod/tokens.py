@@ -149,3 +149,13 @@ class Import(Token):
 @dataclasses.dataclass
 class Return(Token):
     """A return token"""
+
+
+@dataclasses.dataclass
+class If(Token):
+    """An if token"""
+
+
+@dataclasses.dataclass
+class BooleanLiteral(Token):
+    """A true/false token"""

@@ -84,7 +84,11 @@ class Interpreter:
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
             case ast.ParsedName() | ast.ParsedVariable() as name:
                 return name if as_lvalue else self.lookup(module, name)
-            case ast.ParsedStringLiteral(value) | ast.ParsedIntegerLiteral(value):
+            case ast.ParsedStringLiteral(value):
+                return value
+            case ast.ParsedIntegerLiteral(value):
+                return value
+            case ast.ParsedBooleanLiteral(value):
                 return value
             case ast.ParsedExpression(value):
                 return self.evaluate_expression(module, value, as_lvalue)
@@ -115,6 +119,10 @@ class Interpreter:
             case ast.ParsedAssignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
                 module.names[lhs.id] = self.evaluate_expression(module, rhs.value)
+            case ast.ParsedIfStatement(condition, body):
+                if self.evaluate_expression(module, condition).to_bool().value is True:
+                    for statement in body:
+                        self.execute_statement(module, statement)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
