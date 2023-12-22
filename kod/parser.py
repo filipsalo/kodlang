@@ -69,7 +69,6 @@ class Parser:
         self.pos += 1
         if self.spans:
             self.spans[-1] |= token.span
-        # print('consume', token)
         return token
 
     def parse_type(self):

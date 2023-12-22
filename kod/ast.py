@@ -300,7 +300,6 @@ class ParsedExpression(ASTNode):
     @classmethod
     def parse_lhs(cls, parser):
         """Parse the left hand side of an expression."""
-        # print(parser.peek())
         with parser.span() as span:
             match parser.peek():
                 case tokens.OpenParen():
