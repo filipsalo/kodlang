@@ -12,6 +12,7 @@ from kod.tokens import (
     EOF,
     EOL,
     Extern,
+    For,
     Func,
     Identifier,
     If,
@@ -85,6 +86,8 @@ class Parser:
                 stmt = ast.ParsedReturn.parse(self)
             case If():
                 stmt = ast.ParsedIfStatement.parse(self)
+            case For():
+                stmt = ast.ParsedForStatement.parse(self)
             case Let():
                 stmt = ast.ParsedVariableDeclaration.parse(self)
             case Extern():

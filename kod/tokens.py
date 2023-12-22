@@ -46,9 +46,27 @@ class Plus(BinaryOperator):
 
 
 @dataclasses.dataclass
+class Minus(BinaryOperator):
+    """A minus sign."""
+    precedence = 15
+
+
+@dataclasses.dataclass
 class Equals(BinaryOperator):
     """An equals sign."""
     precedence = 10
+
+
+@dataclasses.dataclass
+class LessThan(BinaryOperator):
+    """An equals sign."""
+    precedence = 12
+
+
+@dataclasses.dataclass
+class GreaterThan(BinaryOperator):
+    """An equals sign."""
+    precedence = 12
 
 
 @dataclasses.dataclass
@@ -159,6 +177,11 @@ class If(Token):
 @dataclasses.dataclass
 class Else(Token):
     """An else token"""
+
+
+@dataclasses.dataclass
+class For(Token):
+    """A for token"""
 
 
 @dataclasses.dataclass

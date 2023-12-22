@@ -37,6 +37,18 @@ class Int64(Type):
         """Add two integers."""
         return Int64(self.value + other.value)
 
+    def op_minus(self, other):
+        """Add two integers."""
+        return Int64(self.value - other.value)
+
+    def op_lt(self, other):
+        """Compare two integers."""
+        return Bool(self.value < other.value)
+
+    def op_gt(self, other):
+        """Compare two integers."""
+        return Bool(self.value > other.value)
+
 
 class Bool(Type):
     """A boolean."""

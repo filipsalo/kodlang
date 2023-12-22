@@ -19,12 +19,16 @@ from kod.tokens import (
     Else,
     Equals,
     Extern,
+    For,
     Func,
+    GreaterThan,
     Identifier,
     If,
     Import,
+    LessThan,
     Let,
     IntegerLiteral,
+    Minus,
     OpenBracket,
     OpenCurly,
     OpenParen,
@@ -44,6 +48,7 @@ KEYWORDS = {
     "else": Else,
     "true": BooleanLiteral,
     "false": BooleanLiteral,
+    "for": For,
 }
 
 
@@ -134,11 +139,13 @@ class Lexer:
             self.pos += 1
         return self.build(Comment)
 
-    def lex_arrow(self):
-        """Lex an arrow (->)."""
+    def lex_arrow_or_minus(self):
+        """Lex an arrow (->) or a lone minus (-)."""
         self.consume("-")
-        self.consume(">")
-        return self.build(Arrow)
+        if self.peek() == ">":
+            self.consume(">")
+            return self.build(Arrow)
+        return self.build(Minus)
 
     def lex(self):
         """Lex the source code into tokens."""
@@ -175,8 +182,12 @@ class Lexer:
                     yield self.lex_single_char(Equals)
                 case "+":
                     yield self.lex_single_char(Plus)
+                case "<":
+                    yield self.lex_single_char(LessThan)
+                case ">":
+                    yield self.lex_single_char(GreaterThan)
                 case "-":
-                    yield self.lex_arrow()
+                    yield self.lex_arrow_or_minus()
                 case '"':
                     yield self.lex_string()
                 case ("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"):

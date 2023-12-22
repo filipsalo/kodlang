@@ -70,13 +70,21 @@ class Interpreter:
                     return lhs.names[rhs.value.id]
                 return getattr(lhs, rhs.value.id)
             case tokens.OpenBracket():
-                lhs = self.evaluate_expression(module, lhs)
-                rhs = self.evaluate_expression(module, rhs.value)
-                return lhs.op_index(rhs)
+                op_func_name = "op_index"
             case tokens.Plus():
-                lhs = self.evaluate_expression(module, lhs)
-                rhs = self.evaluate_expression(module, rhs)
-                return lhs.op_plus(rhs)
+                op_func_name = "op_plus"
+            case tokens.Minus():
+                op_func_name = "op_minus"
+            case tokens.LessThan():
+                op_func_name = "op_lt"
+            case tokens.GreaterThan():
+                op_func_name = "op_gt"
+            case _:
+                raise ValueError(f"Don't know how to evaluate binary operator {op}")
+        lhs = self.evaluate_expression(module, lhs)
+        if op_func := getattr(lhs, op_func_name):
+            rhs = self.evaluate_expression(module, rhs)
+            return op_func(rhs)
         raise ValueError(f"Don't know how to evaluate binary operator {op}")
 
     def evaluate_expression(self, module, expression, as_lvalue=False):
@@ -129,6 +137,10 @@ class Interpreter:
                 matched = self.evaluate_expression(module, condition).to_bool().value is True
                 for statement in true_branch if matched else false_branch:
                     self.execute_statement(module, statement)
+            case ast.ParsedForStatement(condition, body):
+                while self.evaluate_expression(module, condition).to_bool().value is True:
+                    for stmt in body:
+                        self.execute_statement(module, stmt)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 

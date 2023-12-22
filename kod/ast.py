@@ -456,3 +456,26 @@ class ParsedIfStatement(ASTNode):
                         false_branch.append(statement)
                 parser.consume(tokens.CloseCurly)
         return cls(condition, true_branch, false_branch, span)
+
+
+@dataclasses.dataclass
+class ParsedForStatement(ASTNode):
+    """An if statement."""
+
+    condition: ParsedExpression
+    body: list[Statement]
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse an if statement."""
+        body = []
+        with parser.span() as span:
+            parser.consume(tokens.For)
+            condition = ParsedExpression.parse(parser)
+            parser.consume(tokens.OpenCurly)
+            while not parser.peek(tokens.CloseCurly):
+                if statement := parser.parse_statement():
+                    body.append(statement)
+            parser.consume(tokens.CloseCurly)
+        return cls(condition, body, span)
