@@ -39,6 +39,10 @@ class String(Type):
         """Return the value as a Python string."""
         return self.value.decode("utf8")
 
+    def op_plus(self, other):
+        """Concatenate two strings."""
+        return String(self.value + other.value)
+
 
 None_ = object()
 

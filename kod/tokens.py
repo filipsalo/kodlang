@@ -24,24 +24,31 @@ class BinaryOperator(Token):
 @dataclasses.dataclass
 class OpenBracket(BinaryOperator):
     """An open bracket."""
-    precedence = 2
+    precedence = 20
+
 
 @dataclasses.dataclass
 class OpenParen(BinaryOperator):
     """An open parenthesis."""
-    precedence = 2
+    precedence = 20
 
 
 @dataclasses.dataclass
 class Dot(BinaryOperator):
     """A dot."""
-    precedence = 2
+    precedence = 20
+
+
+@dataclasses.dataclass
+class Plus(BinaryOperator):
+    """A plus sign."""
+    precedence = 15
 
 
 @dataclasses.dataclass
 class Equals(BinaryOperator):
     """An equals sign."""
-    precedence = 1
+    precedence = 10
 
 
 @dataclasses.dataclass

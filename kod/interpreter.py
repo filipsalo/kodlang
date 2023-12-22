@@ -61,19 +61,27 @@ class Interpreter:
                         return value
         raise ValueError(f"Unknown name {name!r}")
 
+    def evaluate_binary_operator(self, module, op, lhs, rhs, as_lvalue=False):
+        """Evaluate a binary operator"""
+        match op:
+            case tokens.Dot():
+                lhs = self.evaluate_expression(module, lhs, as_lvalue)
+                return lhs.names[rhs.value.id]
+            case tokens.OpenBracket():
+                lhs = self.evaluate_expression(module, lhs)
+                rhs = self.evaluate_expression(module, rhs.value)
+                return lhs.op_index(rhs)
+            case tokens.Plus():
+                lhs = self.evaluate_expression(module, lhs)
+                rhs = self.evaluate_expression(module, rhs)
+                return lhs.op_plus(rhs)
+        raise ValueError(f"Don't know how to evaluate binary operator {op}")
+
     def evaluate_expression(self, module, expression, as_lvalue=False):
         """Resolve an expression"""
         match expression:
             case ast.BinaryOperator(lhs, op, rhs):
-                match op:
-                    case tokens.Dot():
-                        lhs = self.evaluate_expression(module, lhs, as_lvalue)
-                        return lhs.names[rhs.value.id]
-                    case tokens.OpenBracket():
-                        lhs = self.evaluate_expression(module, lhs)
-                        rhs = self.evaluate_expression(module, rhs.value)
-                        return lhs.op_index(rhs)
-                raise ValueError(f"Don't know how to evaluate binary operator {op}")
+                return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
             case ast.ParsedName() | ast.ParsedVariable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.ParsedStringLiteral(value) | ast.ParsedIntegerLiteral(value):

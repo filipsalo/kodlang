@@ -25,6 +25,7 @@ from kod.tokens import (
     OpenBracket,
     OpenCurly,
     OpenParen,
+    Plus,
     Return,
     StringLiteral,
 )
@@ -168,6 +169,8 @@ class Lexer:
                     yield self.lex_single_char(Comma)
                 case "=":
                     yield self.lex_single_char(Equals)
+                case "+":
+                    yield self.lex_single_char(Plus)
                 case "-":
                     yield self.lex_arrow()
                 case '"':
