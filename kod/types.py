@@ -33,6 +33,10 @@ class Int64(Type):
         """Return the value as a Kod string."""
         return String(str(self.value).encode("utf8"))
 
+    def op_plus(self, other):
+        """Add two integers."""
+        return Int64(self.value + other.value)
+
 
 class Bool(Type):
     """A boolean."""

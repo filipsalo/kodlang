@@ -82,6 +82,8 @@ class Interpreter:
     def evaluate_expression(self, module, expression, as_lvalue=False):
         """Resolve an expression"""
         match expression:
+            case types.Type() as instance:
+                return instance
             case ast.BinaryOperator(lhs, op, rhs):
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
             case ast.ParsedName() | ast.ParsedVariable() as name:
@@ -117,10 +119,12 @@ class Interpreter:
                 self.call_function(module, callee, args)
             case ast.ParsedVariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
-                module.names[lhs.id] = self.evaluate_expression(module, value.value)
+                value = self.evaluate_expression(module, value)
+                module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.ParsedAssignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
-                module.names[lhs.id] = self.evaluate_expression(module, rhs.value)
+                rhs = self.evaluate_expression(module, rhs)
+                module.names[lhs.id] = self.evaluate_expression(module, rhs)
             case ast.ParsedIfStatement(condition, true_branch, false_branch):
                 matched = self.evaluate_expression(module, condition).to_bool().value is True
                 for statement in true_branch if matched else false_branch:
