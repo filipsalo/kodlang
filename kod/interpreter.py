@@ -66,7 +66,9 @@ class Interpreter:
         match op:
             case tokens.Dot():
                 lhs = self.evaluate_expression(module, lhs, as_lvalue)
-                return lhs.names[rhs.value.id]
+                if isinstance(lhs, ast.ParsedModule):
+                    return lhs.names[rhs.value.id]
+                return getattr(lhs, rhs.value.id)
             case tokens.OpenBracket():
                 lhs = self.evaluate_expression(module, lhs)
                 rhs = self.evaluate_expression(module, rhs.value)
@@ -94,6 +96,10 @@ class Interpreter:
                 return self.evaluate_expression(module, value, as_lvalue)
             case ast.ParsedFunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
+            case ast.ParsedFunctionCall(callee, args):
+                func = self.evaluate_expression(module, callee)
+                args = [self.evaluate_expression(module, arg) for arg in args]
+                return self.call_function(module, func, *args)
             case _:
                 raise ValueError(f"Don't know how to evaluate expression {expression!r}")
 
@@ -136,6 +142,8 @@ class Interpreter:
 
     def call_function(self, module, func, args=()):
         """Call a function"""
+        if callable(func):
+            return func(*args)
         if isinstance(func, ast.ParsedExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]

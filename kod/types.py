@@ -29,6 +29,10 @@ class Int64(Type):
     name = "int64"
     width = 8
 
+    def to_str(self):
+        """Return the value as a Kod string."""
+        return String(str(self.value).encode("utf8"))
+
 
 class Bool(Type):
     """A boolean."""
@@ -48,6 +52,10 @@ class String(Type):
     def to_py_str(self):
         """Return the value as a Python string."""
         return self.value.decode("utf8")
+
+    def to_str(self):
+        """Return the value as a Kod string."""
+        return self
 
     def op_plus(self, other):
         """Concatenate two strings."""
