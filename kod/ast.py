@@ -29,7 +29,14 @@ class ASTNode:
 
 
 @dataclasses.dataclass
-class ParsedStringLiteral(ASTNode):
+class Literal:
+    """A literal."""
+    value: any
+    span: Span
+
+
+@dataclasses.dataclass
+class ParsedStringLiteral(ASTNode, Literal):
     """A string literal."""
 
     value: types.String
@@ -45,7 +52,7 @@ class ParsedStringLiteral(ASTNode):
 
 
 @dataclasses.dataclass
-class ParsedIntegerLiteral(ASTNode):
+class ParsedIntegerLiteral(ASTNode, Literal):
     """An integerliteral."""
 
     value: types.Int64
@@ -60,7 +67,7 @@ class ParsedIntegerLiteral(ASTNode):
 
 
 @dataclasses.dataclass
-class ParsedBooleanLiteral(ASTNode):
+class ParsedBooleanLiteral(ASTNode, Literal):
     """An integerliteral."""
 
     value: types.Bool

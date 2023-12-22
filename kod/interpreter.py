@@ -86,11 +86,7 @@ class Interpreter:
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
             case ast.ParsedName() | ast.ParsedVariable() as name:
                 return name if as_lvalue else self.lookup(module, name)
-            case ast.ParsedStringLiteral(value):
-                return value
-            case ast.ParsedIntegerLiteral(value):
-                return value
-            case ast.ParsedBooleanLiteral(value):
+            case ast.Literal(value):
                 return value
             case ast.ParsedExpression(value):
                 return self.evaluate_expression(module, value, as_lvalue)
