@@ -2,6 +2,7 @@
 """Simple interpreter for the Kod language"""
 
 import ctypes
+import dataclasses
 import sys
 
 from functools import partial
@@ -90,6 +91,8 @@ class Interpreter:
     def evaluate_expression(self, module, expression, as_lvalue=False):
         """Resolve an expression"""
         match expression:
+            case type() if issubclass(expression, types.Type):
+                return expression
             case types.Type() as instance:
                 return instance
             case ast.BinaryOperator(lhs, op, rhs):
@@ -105,7 +108,7 @@ class Interpreter:
             case ast.ParsedFunctionCall(callee, args):
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
-                return self.call_function(module, func, *args)
+                return self.call_function(module, func, args)
             case _:
                 raise ValueError(f"Don't know how to evaluate expression {expression!r}")
 
@@ -126,6 +129,10 @@ class Interpreter:
                 args = list(map(partial(self.evaluate_expression, module), statement.args))
                 self.call_function(module, callee, args)
             case ast.ParsedVariableDeclaration(variable, value):
+                lhs = self.evaluate_expression(module, variable, as_lvalue=True)
+                value = self.evaluate_expression(module, value)
+                module.names[lhs.id] = self.evaluate_expression(module, value)
+            case ast.ParsedTypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
                 module.names[lhs.id] = self.evaluate_expression(module, value)
@@ -155,6 +162,9 @@ class Interpreter:
     def call_function(self, module, func, args=()):
         """Call a function"""
         if callable(func):
+            if isinstance(func, type) and issubclass(func, types.StructType):
+                arg_names = [field.name for field in dataclasses.fields(func)]
+                return func(**{name: value for name, value in zip(arg_names, args)})
             return func(*args)
         if isinstance(func, ast.ParsedExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)

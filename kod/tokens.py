@@ -187,3 +187,13 @@ class For(Token):
 @dataclasses.dataclass
 class BooleanLiteral(Token):
     """A true/false token"""
+
+
+@dataclasses.dataclass
+class Type(Token):
+    """A type token"""
+
+
+@dataclasses.dataclass
+class Struct(Token):
+    """A struct token"""

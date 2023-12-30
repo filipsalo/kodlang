@@ -35,6 +35,8 @@ from kod.tokens import (
     Plus,
     Return,
     StringLiteral,
+    Struct,
+    Type,
 )
 
 KEYWORDS = {
@@ -49,6 +51,8 @@ KEYWORDS = {
     "true": BooleanLiteral,
     "false": BooleanLiteral,
     "for": For,
+    "struct": Struct,
+    "type": Type,
 }
 
 

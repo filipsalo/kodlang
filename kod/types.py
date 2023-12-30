@@ -2,13 +2,15 @@
 
 
 from abc import ABC
+import dataclasses
+from typing import Any, Self
 
 
 class Type:
     """A type in Kod."""
     name = "Type"
 
-    def __init__(self, value):
+    def __init__(self, value: Any):
         self.value = value
 
     def __repr__(self):
@@ -22,32 +24,6 @@ class Type:
             case "str": return String
             case "none": return None_
         raise ValueError(f"Unknown type {name!r}")
-
-
-class Int64(Type):
-    """A 64-bit integer."""
-    name = "int64"
-    width = 8
-
-    def to_str(self):
-        """Return the value as a Kod string."""
-        return String(str(self.value).encode("utf8"))
-
-    def op_plus(self, other):
-        """Add two integers."""
-        return Int64(self.value + other.value)
-
-    def op_minus(self, other):
-        """Add two integers."""
-        return Int64(self.value - other.value)
-
-    def op_lt(self, other):
-        """Compare two integers."""
-        return Bool(self.value < other.value)
-
-    def op_gt(self, other):
-        """Compare two integers."""
-        return Bool(self.value > other.value)
 
 
 class Bool(Type):
@@ -78,6 +54,32 @@ class String(Type):
         return String(self.value + other.value)
 
 
+class Int64(Type):
+    """A 64-bit integer."""
+    name = "int64"
+    width = 8
+
+    def to_str(self) -> String:
+        """Return the value as a Kod string."""
+        return String(str(self.value).encode("utf8"))
+
+    def op_plus(self, other: Self) -> Self:
+        """Add two integers."""
+        return Int64(self.value + other.value)
+
+    def op_minus(self, other: Self) -> Self:
+        """Add two integers."""
+        return Int64(self.value - other.value)
+
+    def op_lt(self, other: Self) -> Bool:
+        """Compare two integers."""
+        return Bool(self.value < other.value)
+
+    def op_gt(self, other: Self) -> Bool:
+        """Compare two integers."""
+        return Bool(self.value > other.value)
+
+
 None_ = object()
 
 
@@ -106,6 +108,26 @@ class ArrayType(Type, ABC):
     def _subclass__repr__(subclass_instance):
         return f"<{subclass_instance.__class__.__name__} {subclass_instance.value!r}>"
 
-    def op_index(self, index):
+    def op_index(self, index: Type):
         """Index into the array."""
         return self.value[index.value]
+
+
+class StructType(Type, ABC):
+    """A struct type."""
+
+    @classmethod
+    def make(cls, name, fields):
+        """Make a struct type."""
+        data_class = dataclasses.make_dataclass(
+            name,
+            [(field.id, field.type) for field in fields],
+            bases=(cls,),
+            namespace={"__repr__": cls._subclass__repr__},
+            kw_only=True,
+        )
+        return data_class
+
+    @staticmethod
+    def _subclass__repr__(subclass_instance):
+        return f"<{subclass_instance.__class__.__name__} {subclass_instance.value!r}>"

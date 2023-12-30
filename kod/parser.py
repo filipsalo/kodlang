@@ -8,6 +8,8 @@ from kod.span import Span
 from kod.tokens import (
     BooleanLiteral,
     CloseBracket,
+    CloseCurly,
+    Comma,
     Comment,
     EOF,
     EOL,
@@ -19,7 +21,10 @@ from kod.tokens import (
     Import,
     Let,
     OpenBracket,
+    OpenCurly,
     Return,
+    Struct,
+    Type,
 )
 
 
@@ -64,9 +69,22 @@ class Parser:
             self.spans[-1] |= token.span
         return token
 
-    def parse_type(self):
+    def parse_type(self, name=None):
         """Parse a type."""
-        if self.peek(OpenBracket):
+        if self.peek(Struct):
+            self.consume(Struct)
+            self.consume(OpenCurly)
+            fields = []
+            while not self.peek(CloseCurly):
+                if self.peek(EOL):
+                    self.consume(EOL)
+                    continue
+                fields.append(ast.ParsedVariable.parse(self))
+            if self.peek(EOL):
+                self.consume(EOL)
+            self.consume(CloseCurly)
+            return types.StructType.make(name, fields)
+        elif self.peek(OpenBracket):
             self.consume(OpenBracket)
             item_type = self.parse_type()
             self.consume(CloseBracket)
@@ -90,6 +108,8 @@ class Parser:
                 stmt = ast.ParsedForStatement.parse(self)
             case Let():
                 stmt = ast.ParsedVariableDeclaration.parse(self)
+            case Type():
+                stmt = ast.ParsedTypeDeclaration.parse(self)
             case Extern():
                 stmt = ast.ParsedExternalFunctionDeclaration.parse(self)
             case Func():

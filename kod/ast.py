@@ -4,6 +4,7 @@ import dataclasses
 from pathlib import Path
 from kod import tokens, types
 
+from kod.parser import Parser
 from kod.span import Span
 
 
@@ -92,8 +93,12 @@ class ParsedVariable(ASTNode):
     @classmethod
     def parse(cls, parser):
         """Parse a variable."""
+        type_ = None
         token = parser.consume(tokens.Identifier)
-        return cls(token.value, None, span=token.span)
+        if parser.peek(tokens.Colon):
+            parser.consume(tokens.Colon)
+            type_ = parser.parse_type()
+        return cls(token.value, type_, span=token.span)
 
 
 @dataclasses.dataclass
@@ -127,8 +132,6 @@ class ParsedFunctionParam(ASTNode):
                 parser.consume(tokens.Anon)
                 anonymous = True
             variable = ParsedVariable.parse(parser)
-            parser.consume(tokens.Colon)
-            variable.type = parser.parse_type()
         return cls(variable, anonymous, span)
 
 
@@ -479,3 +482,44 @@ class ParsedForStatement(ASTNode):
                     body.append(statement)
             parser.consume(tokens.CloseCurly)
         return cls(condition, body, span)
+
+
+@dataclasses.dataclass
+class ParsedTypeDeclaration(ASTNode):
+    """A type declaration."""
+
+    name: ParsedName
+    type: types.Type
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser):
+        """Parse a type declaration."""
+        with parser.span() as span:
+            parser.consume(tokens.Type)
+            name = ParsedName.parse(parser)
+            parser.consume(tokens.Equals)
+            type_ = parser.parse_type(name.id)
+        return cls(name, type_, span)
+
+
+@dataclasses.dataclass
+class ParsedStruct(ASTNode):
+    """A struct."""
+
+    name: str
+    fields: list[ParsedVariable]
+    span: Span
+
+    @classmethod
+    def parse(cls, parser):
+        """Parse a struct."""
+        with parser.span() as span:
+            parser.consume(tokens.Struct)
+            name = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.OpenCurly)
+            fields = []
+            while not parser.peek(tokens.CloseCurly):
+                fields.append(ParsedVariable.parse(parser))
+            parser.consume(tokens.CloseCurly)
+        return cls(name, fields, span)
