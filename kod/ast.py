@@ -95,8 +95,7 @@ class ParsedVariable(ASTNode):
         """Parse a variable."""
         type_ = None
         token = parser.consume(tokens.Identifier)
-        if parser.peek(tokens.Colon):
-            parser.consume(tokens.Colon)
+        if parser.try_consume(tokens.Colon):
             type_ = parser.parse_type()
         return cls(token.value, type_, span=token.span)
 
@@ -128,8 +127,7 @@ class ParsedFunctionParam(ASTNode):
         """Parse a function parameter."""
         with parser.span() as span:
             anonymous = False
-            if parser.peek(tokens.Anon):
-                parser.consume(tokens.Anon)
+            if parser.try_consume(tokens.Anon):
                 anonymous = True
             variable = ParsedVariable.parse(parser)
         return cls(variable, anonymous, span)
@@ -154,12 +152,11 @@ class ParsedFunctionParamList(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.OpenParen)
             params = []
-            while not parser.peek(tokens.CloseParen):
+            while not parser.try_consume(tokens.CloseParen):
                 params.append(ParsedFunctionParam.parse(parser))
-                if not parser.peek(tokens.Comma):
+                if not parser.try_consume(tokens.Comma):
+                    parser.consume(tokens.CloseParen)
                     break
-                parser.consume(tokens.Comma)
-            parser.consume(tokens.CloseParen)
         return cls(params, span)
 
 
@@ -177,9 +174,8 @@ class ParsedFunctionCallParam(ASTNode):
         with parser.span() as span:
             label = None
             expr = ParsedExpression.parse(parser)
-            if parser.peek(tokens.Colon):
+            if parser.try_consume(tokens.Colon):
                 label = ParsedName(expr, expr.span)
-                parser.consume(tokens.Colon)
                 expr = ParsedExpression.parse(parser)
         return cls(label, expr, span)
 
@@ -203,12 +199,11 @@ class ParsedFunctionCallParamList(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.OpenParen)
             params = []
-            while not parser.peek(tokens.CloseParen):
+            while not parser.try_consume(tokens.CloseParen):
                 params.append(ParsedFunctionCallParam.parse(parser))
-                if not parser.peek(tokens.Comma):
+                if not parser.try_consume(tokens.Comma):
+                    parser.consume(tokens.CloseParen)
                     break
-                parser.consume(tokens.Comma)
-            parser.consume(tokens.CloseParen)
         return cls(params, span)
 
 
@@ -244,12 +239,11 @@ class ParsedFunctionDeclaration(ASTNode):
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
-            while not parser.peek(tokens.CloseCurly):
+            while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
                     body.append(statement)
                 if isinstance(statement, ParsedVariableDeclaration):
                     variables[statement.variable.id] = statement.variable
-            parser.consume(tokens.CloseCurly)
         node = cls(name, params, body, return_type, variables, span)
         # parser.stack[-1][name] = node
         return node
@@ -447,17 +441,14 @@ class ParsedIfStatement(ASTNode):
             parser.consume(tokens.If)
             condition = ParsedExpression.parse(parser)
             parser.consume(tokens.OpenCurly)
-            while not parser.peek(tokens.CloseCurly):
+            while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
                     true_branch.append(statement)
-            parser.consume(tokens.CloseCurly)
-            if parser.peek(tokens.Else):
-                parser.consume(tokens.Else)
+            if parser.try_consume(tokens.Else):
                 parser.consume(tokens.OpenCurly)
-                while not parser.peek(tokens.CloseCurly):
+                while not parser.try_consume(tokens.CloseCurly):
                     if statement := parser.parse_statement():
                         false_branch.append(statement)
-                parser.consume(tokens.CloseCurly)
         return cls(condition, true_branch, false_branch, span)
 
 
@@ -477,10 +468,9 @@ class ParsedForStatement(ASTNode):
             parser.consume(tokens.For)
             condition = ParsedExpression.parse(parser)
             parser.consume(tokens.OpenCurly)
-            while not parser.peek(tokens.CloseCurly):
+            while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
                     body.append(statement)
-            parser.consume(tokens.CloseCurly)
         return cls(condition, body, span)
 
 
@@ -519,7 +509,6 @@ class ParsedStruct(ASTNode):
             name = parser.consume(tokens.Identifier).value
             parser.consume(tokens.OpenCurly)
             fields = []
-            while not parser.peek(tokens.CloseCurly):
+            while not parser.try_consume(tokens.CloseCurly):
                 fields.append(ParsedVariable.parse(parser))
-            parser.consume(tokens.CloseCurly)
         return cls(name, fields, span)

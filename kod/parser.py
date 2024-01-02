@@ -59,6 +59,12 @@ class Parser:
         err = KodSyntaxError(msg, span or self.peek().span)
         return err
 
+    def try_consume(self, token_type):
+        """Consume the next token if it matches, otherwise return None."""
+        if not self.peek(token_type):
+            return None
+        return self.consume(token_type)
+
     def consume(self, token_type):
         """Consume the next token, or raise ValueError if it doesn't match."""
         token = self.peek()
@@ -71,21 +77,16 @@ class Parser:
 
     def parse_type(self, name=None):
         """Parse a type."""
-        if self.peek(Struct):
-            self.consume(Struct)
+        if self.try_consume(Struct):
             self.consume(OpenCurly)
             fields = []
-            while not self.peek(CloseCurly):
-                if self.peek(EOL):
-                    self.consume(EOL)
+            while not self.try_consume(CloseCurly):
+                if self.try_consume(EOL):
                     continue
                 fields.append(ast.ParsedVariable.parse(self))
-            if self.peek(EOL):
-                self.consume(EOL)
-            self.consume(CloseCurly)
+            self.try_consume(EOL)
             return types.StructType.make(name, fields)
-        elif self.peek(OpenBracket):
-            self.consume(OpenBracket)
+        elif self.try_consume(OpenBracket):
             item_type = self.parse_type()
             self.consume(CloseBracket)
             return types.ArrayType.make(item_type)
