@@ -329,23 +329,22 @@ class ParsedExpression(ASTNode):
     @classmethod
     def parse_lhs(cls, parser):
         """Parse the left hand side of an expression."""
-        with parser.span() as span:
-            match parser.peek():
-                case tokens.OpenParen():
-                    parser.consume(tokens.OpenParen)
-                    value = ParsedExpression.parse(parser, 1)
-                    parser.consume(tokens.CloseParen)
-                case tokens.StringLiteral():
-                    value = ParsedStringLiteral.parse(parser)
-                case tokens.IntegerLiteral():
-                    value = ParsedIntegerLiteral.parse(parser)
-                case tokens.BooleanLiteral():
-                    value = ParsedBooleanLiteral.parse(parser)
-                case tokens.Identifier():
-                    value = ParsedName.parse(parser)
-                case _:
-                    raise parser.error(f"Expected an expression: {parser.peek()}")
-        return cls(value, span)
+        match parser.peek():
+            case tokens.OpenParen():
+                parser.consume(tokens.OpenParen)
+                value = ParsedExpression.parse(parser, 1)
+                parser.consume(tokens.CloseParen)
+            case tokens.StringLiteral():
+                value = ParsedStringLiteral.parse(parser)
+            case tokens.IntegerLiteral():
+                value = ParsedIntegerLiteral.parse(parser)
+            case tokens.BooleanLiteral():
+                value = ParsedBooleanLiteral.parse(parser)
+            case tokens.Identifier():
+                value = ParsedName.parse(parser)
+            case _:
+                raise parser.error(f"Expected an expression: {parser.peek()}")
+        return value
 
     @classmethod
     def parse(cls, parser, precedence=0):

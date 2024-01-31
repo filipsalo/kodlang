@@ -95,6 +95,7 @@ class Builder:
         object_file = Path("build") / module.object_path
         subprocess.run([
             "as",
+            "-target", "arm64-apple-darwin",
             "-o", object_file,
             "-"
         ], input=asm.encode("ascii"), check=True)
@@ -106,7 +107,7 @@ class Builder:
         executable = Path("build") / path
         subprocess.run([
             "ld",
-            "-macosx_version_min", "13.1",
+            "-macos_version_min", "14",
             "-lc",
             "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
             "-o", executable,

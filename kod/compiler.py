@@ -3,13 +3,17 @@
 
 import sys
 
+from kod import tokens
 from kod.ast import (
+    BinaryOperator,
     ParsedAssignment,
     ParsedExternalFunctionDeclaration,
     ParsedFunctionCall,
     ParsedFunctionDeclaration,
+    ParsedIntegerLiteral,
+    ParsedName,
+    ParsedReturn,
     ParsedStringLiteral,
-    ParsedVariable,
     ParsedVariableDeclaration,
 )
 
@@ -34,7 +38,7 @@ class CompiledFunction:
 class Compiler:
     """An assembler for the Kod language."""
 
-    _argregs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+    _argregs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
 
     def __init__(self, module, builtins, output=sys.stdout):
         self.module = module
@@ -68,17 +72,18 @@ class Compiler:
                     self.compile_function(statement)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
-        self.emit(".data")
+        self.emit("\n.data")
         for string in self.strings.values():
             print(f"{string.label}:", file=self.output)
-            print(f'\t.asciz "{string.value.decode()}"', file=self.output)
+            print(f'\t.asciz "{string.value.value.decode()}"', file=self.output)
 
     def compile_function(self, func):
         """Compile a function to assembly"""
         self.emit(".globl", f"_{func.name}")
         print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
-        self.stack.append({variable.id: variable for variable in func.variables})
+        self.stack.append({variable.id: variable for variable in func.variables.values()})
+        return_value = None
         for statement in func.body:
             match statement:
                 case ParsedFunctionCall():
@@ -87,41 +92,36 @@ class Compiler:
                     self.compile_variable_declaration(variable, value)
                 case ParsedAssignment(variable, value):
                     self.compile_variable_declaration(variable, value)
+                case ParsedReturn(value):
+                    return_value = value
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
         self.stack.pop()
-        self.leave_stack_frame(func)
+        self.leave_stack_frame(func, return_value)
         self.functions[func.name] = func
 
     def _get_stack_frame_size(self, func):
-        return sum(variable.type.width for variable in func.variables)
+        size = sum(variable.type.width for variable in func.variables.values())
+        size += 16 - size % 16
+        return size
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
-        self.push("%rbp")
-        self.mov("%rsp", "%rbp")
-        if stack_frame_size := self._get_stack_frame_size(func):
-            self.sub(f"${stack_frame_size}", "%rsp")
-            if func.params:
-                self.move_args_to_stack(func)
+        stack_frame_size = self._get_stack_frame_size(func)
+        self.emit("sub", "sp", "sp", f"#{stack_frame_size + 16}")
+        self.emit("stp", "x29", "x30", f"[sp, #{stack_frame_size}]")
+        self.emit("add", "x29", "sp", f"#{stack_frame_size}")
+        if func.params:
+            self.move_args_to_stack(func)
 
     def compile_variable_declaration(self, variable, value):
         """Compile a variable declaration to assembly"""
         if isinstance(value, ParsedStringLiteral):
             value = self.literal_string(value)
             offset = self.get_variable_offset(variable)
-            self.lea(f"{value.label}(%rip)", "%rax")
-            self.mov("%rax", f"{offset}(%rbp)")
-        else:
-            raise ValueError(f"Unexpected variable value {variable.value}")
-
-    def compile_assignment(self, variable, value):
-        """Compile an assignment to assembly"""
-        if isinstance(value, ParsedStringLiteral):
-            value = self.literal_string(value)
-            offset = self.get_variable_offset(variable)
-            self.lea(f"{value.label}(%rip)", "%rax")
-            self.mov("%rax", f"{offset}(%rbp)")
+            self.emit("adrp", "x19", f"{value.label}@PAGE")
+            self.emit("add", "x19", "x19", f"{value.label}@PAGEOFF")
+            self.emit("str", "x19", f"[x29, #{offset}]")
         else:
             raise ValueError(f"Unexpected variable value {variable.value}")
 
@@ -130,14 +130,17 @@ class Compiler:
         offset = 0
         for param, register in zip(func.params, self._argregs):
             offset -= param.variable.type.width
-            self.mov(f"%{register}", f"{offset}(%rbp)", size=param.variable.type.width)
+            self.emit("str", register, f"[x29, #{offset}]")
 
-    def leave_stack_frame(self, func):
+    def leave_stack_frame(self, func, return_value):
         """Emit the epilogue for a function"""
-        if stack_frame_size := self._get_stack_frame_size(func):
-            self.add(f"${stack_frame_size}", "%rsp")
-        self.mov("$0", "%rax")
-        self.pop("%rbp")
+        if return_value is None:
+            self.mov("w0", "#0")
+        else:
+            self.emit("mov", "x0", f"#{return_value.value.value}")
+        stack_frame_size = self._get_stack_frame_size(func)
+        self.emit("ldp", "x29", "x30", f"[sp, #{stack_frame_size}]")
+        self.emit("add", "sp", "sp", f"#{stack_frame_size + 16}")
         self.emit("ret")
 
     def emit_label(self, label):
@@ -156,9 +159,13 @@ class Compiler:
 
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
-        func = self.functions[func_call.callee.id]
+        match func_call.callee:
+            case ParsedName(id_):
+                func = self.functions[id_]
+            case _:
+                raise ValueError(f"Unexpected function call {func_call.callee}")
         self.prepare_args(func, func_call.args)
-        self.emit("callq", f"_{func.name}")
+        self.emit("bl", f"_{func.name}")
 
     def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
@@ -167,11 +174,17 @@ class Compiler:
             offset -= param.variable.type.width
             if isinstance(arg.expression, ParsedStringLiteral):
                 arg = self.literal_string(arg.expression)
-                self.lea(f"{arg.label}(%rip)", f"%{register}")
-            elif isinstance(arg.expression, ParsedVariable):
+                self.emit("adrp", register, f"{arg.label}@PAGE")
+                self.emit("add", register, register, f"{arg.label}@PAGEOFF")
+            elif isinstance(arg.expression, ParsedIntegerLiteral):
+                self.emit("mov", register, f"#{arg.expression.value.value}")
+            elif isinstance(arg.expression, ParsedName):
                 offset = self.get_variable_offset(arg.expression)
                 if offset:
-                    self.mov(f"{offset}(%rbp)", f"%{register}")
+                    self.emit("ldr", register, f"[x29, #{offset}]")
+            elif isinstance(arg.expression, ParsedFunctionCall):
+                self.compile_function_call(arg.expression)
+                self.mov("x0", {register})
             else:
                 self.mov(f"${arg.expression}", f"%{register}")
 
@@ -184,31 +197,6 @@ class Compiler:
                 return offset
         raise ValueError(f"Unknown variable {variable!r}")
 
-    def emit_sized(self, op, size, *args, comment=None):
-        """Emit an instruction with a size suffix"""
-        size = {8: "q", 4: "l", 2: "w", 1: "b"}[size]
-        self.emit(f"{op}{size}", *args, comment=comment)
-
-    def mov(self, src, dest, size=8, comment=None):
+    def mov(self, dest, src):
         """Move a value"""
-        self.emit_sized("mov", size, src, dest, comment=comment)
-
-    def lea(self, src, dest, size=8, comment=None):
-        """Load the effective address"""
-        self.emit_sized("lea", size, src, dest, comment=comment)
-
-    def push(self, src, size=8, comment=None):
-        """Push a value onto the stack"""
-        self.emit_sized("push", size, src, comment=comment)
-
-    def pop(self, dest, size=8, comment=None):
-        """Pop a value from the stack"""
-        self.emit_sized("pop", size, dest, comment=comment)
-
-    def sub(self, src, dest, size=8, comment=None):
-        """Subtract a value from another value"""
-        self.emit_sized("sub", size, src, dest, comment=comment)
-
-    def add(self, src, dest, size=8, comment=None):
-        """Add a value to another value"""""
-        self.emit_sized("add", size, src, dest, comment=comment)
+        self.emit("mov", dest, src)

@@ -9,7 +9,6 @@ from kod.tokens import (
     BooleanLiteral,
     CloseBracket,
     CloseCurly,
-    Comma,
     Comment,
     EOF,
     EOL,

@@ -68,8 +68,8 @@ class Interpreter:
             case tokens.Dot():
                 lhs = self.evaluate_expression(module, lhs, as_lvalue)
                 if isinstance(lhs, ast.ParsedModule):
-                    return lhs.names[rhs.value.id]
-                return getattr(lhs, rhs.value.id)
+                    return lhs.names[rhs.id]
+                return getattr(lhs, rhs.id)
             case tokens.OpenBracket():
                 op_func_name = "op_index"
             case tokens.Plus():
