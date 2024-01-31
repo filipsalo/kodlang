@@ -38,7 +38,7 @@ class Interpreter:
         string_array = types.ArrayType.make(types.String)
         argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
         exit_code = self.call_function(entry_module_name, main, [argv])
-        sys.exit(exit_code.value)
+        sys.exit(exit_code.value if exit_code else 0)
 
     def lookup(self, module, name):
         """Look up a variable in the stack"""
