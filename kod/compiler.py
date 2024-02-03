@@ -36,6 +36,9 @@ class CompiledFunction:
         self.locals = []
 
 
+RETURN_VALUE = object()
+
+
 class Compiler:
     """An assembler for the Kod language."""
 
@@ -83,27 +86,32 @@ class Compiler:
             print(f"{string.label}:", file=self.output)
             print(f'\t.asciz "{string.value.value.decode()}"', file=self.output)
 
+    def compile_statement(self, statement):
+        """Compile a statement to assembly"""
+        match statement:
+            case ParsedFunctionCall():
+                self.compile_function_call(statement)
+            case ParsedVariableDeclaration(variable, value):
+                self.compile_variable_declaration(variable, value)
+            case ParsedAssignment(variable, value):
+                self.compile_variable_declaration(variable, value)
+            case ParsedReturn(value):
+                self.stack[-1][RETURN_VALUE] = value
+            case ParsedIfStatement(condition, true_branch, false_branch):
+                self.compile_if_statement(condition, true_branch, false_branch)
+            case _:
+                raise ValueError(f"Unexpected statement {statement}")
+
     def compile_function(self, func):
         """Compile a function to assembly"""
         self.emit(".globl", f"_{func.name}")
         print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
         self.stack.append({variable.id: variable for variable in func.variables.values()})
-        return_value = None
         for statement in func.body:
-            match statement:
-                case ParsedFunctionCall():
-                    self.compile_function_call(statement)
-                case ParsedVariableDeclaration(variable, value):
-                    self.compile_variable_declaration(variable, value)
-                case ParsedAssignment(variable, value):
-                    self.compile_variable_declaration(variable, value)
-                case ParsedReturn(value):
-                    return_value = value
-                case _:
-                    raise ValueError(f"Unexpected statement {statement}")
+            self.compile_statement(statement)
+        self.leave_stack_frame(func)
         self.stack.pop()
-        self.leave_stack_frame(func, return_value)
         self.functions[func.name] = func
 
     def _get_stack_frame_size(self, func):
@@ -138,8 +146,9 @@ class Compiler:
             offset -= param.variable.type.width
             self.emit("str", register, f"[x29, #{offset}]")
 
-    def leave_stack_frame(self, func, return_value):
+    def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
+        return_value = self.stack[-1].get(RETURN_VALUE)
         if return_value is None:
             self.mov("w0", "#0")
         else:
