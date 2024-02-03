@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """An assembler for the Kod language."""
 
+import collections
 import sys
 
 from kod import tokens
@@ -47,12 +48,17 @@ class Compiler:
         self.functions = {}
         self.strings = {}
         self.stack = []
+        self.label_counters = collections.defaultdict(int)
 
-    def literal_string(self, s, label=None):
+    def create_label(self, base_name):
+        """Create a label"""
+        self.label_counters[base_name] += 1
+        return f"{base_name}${self.label_counters[base_name]}"
+
+    def literal_string(self, s):
         """Return a string constant for the given string"""
-        if not label:
-            label = f"s${len(self.strings)}"
         if s.value not in self.strings:
+            label = self.create_label("str")
             self.strings[s.value] = StringConstant(label, s.value)
         return self.strings[s.value]
 
