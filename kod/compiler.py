@@ -27,15 +27,6 @@ class StringConstant:
         self.value = value
 
 
-class CompiledFunction:
-    """A compiled function"""
-
-    def __init__(self, name, params):
-        self.name = name
-        self.params = params
-        self.locals = []
-
-
 RETURN_VALUE = object()
 
 
