@@ -121,8 +121,8 @@ class Compiler:
         """Emit the prologue for a function"""
         stack_frame_size = self._get_stack_frame_size(func)
         self.emit("sub", "sp", "sp", f"#{stack_frame_size + 16}")
-        self.emit("stp", "x29", "x30", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "x29", "sp", f"#{stack_frame_size}")
+        self.emit("stp", "fp", "lr", f"[sp, #{stack_frame_size}]")
+        self.emit("add", "fp", "sp", f"#{stack_frame_size}")
         self.stack.append({variable.id: variable for variable in func.variables.values()})
         if func.params:
             self.move_args_to_stack(func)
@@ -132,7 +132,7 @@ class Compiler:
         offset = 0
         for param, register in zip(func.params, self._argregs):
             offset -= param.variable.type.width
-            self.emit("str", register, f"[x29, #{offset}]")
+            self.emit("str", register, f"[fp, #{offset}]")
 
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
@@ -143,7 +143,7 @@ class Compiler:
         else:
             self.emit("mov", "x0", f"#{return_value.value.value}")
         stack_frame_size = self._get_stack_frame_size(func)
-        self.emit("ldp", "x29", "x30", f"[sp, #{stack_frame_size}]")
+        self.emit("ldp", "fp", "lr", f"[sp, #{stack_frame_size}]")
         self.emit("add", "sp", "sp", f"#{stack_frame_size + 16}")
         self.emit("ret")
 
@@ -171,7 +171,7 @@ class Compiler:
             offset = self.get_variable_offset(variable)
             self.emit("adrp", "x19", f"{value.label}@PAGE")
             self.emit("add", "x19", "x19", f"{value.label}@PAGEOFF")
-            self.emit("str", "x19", f"[x29, #{offset}]")
+            self.emit("str", "x19", f"[fp, #{offset}]")
         else:
             raise ValueError(f"Unexpected variable value {variable.value}")
 
@@ -213,7 +213,7 @@ class Compiler:
             elif isinstance(arg.expression, ParsedName):
                 offset = self.get_variable_offset(arg.expression)
                 if offset:
-                    self.emit("ldr", register, f"[x29, #{offset}]")
+                    self.emit("ldr", register, f"[fp, #{offset}]")
             elif isinstance(arg.expression, ParsedFunctionCall):
                 self.compile_function_call(arg.expression)
                 self.mov("x0", {register})
