@@ -107,11 +107,9 @@ class Compiler:
         self.emit(".globl", f"_{func.name}")
         print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
-        self.stack.append({variable.id: variable for variable in func.variables.values()})
         for statement in func.body:
             self.compile_statement(statement)
         self.leave_stack_frame(func)
-        self.stack.pop()
         self.functions[func.name] = func
 
     def _get_stack_frame_size(self, func):
@@ -125,8 +123,29 @@ class Compiler:
         self.emit("sub", "sp", "sp", f"#{stack_frame_size + 16}")
         self.emit("stp", "x29", "x30", f"[sp, #{stack_frame_size}]")
         self.emit("add", "x29", "sp", f"#{stack_frame_size}")
+        self.stack.append({variable.id: variable for variable in func.variables.values()})
         if func.params:
             self.move_args_to_stack(func)
+
+    def move_args_to_stack(self, func):
+        """Move arguments from registers to the stack"""
+        offset = 0
+        for param, register in zip(func.params, self._argregs):
+            offset -= param.variable.type.width
+            self.emit("str", register, f"[x29, #{offset}]")
+
+    def leave_stack_frame(self, func):
+        """Emit the epilogue for a function"""
+        return_value = self.stack[-1].get(RETURN_VALUE)
+        self.stack.pop()
+        if return_value is None:
+            self.mov("w0", "#0")
+        else:
+            self.emit("mov", "x0", f"#{return_value.value.value}")
+        stack_frame_size = self._get_stack_frame_size(func)
+        self.emit("ldp", "x29", "x30", f"[sp, #{stack_frame_size}]")
+        self.emit("add", "sp", "sp", f"#{stack_frame_size + 16}")
+        self.emit("ret")
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
@@ -155,25 +174,6 @@ class Compiler:
             self.emit("str", "x19", f"[x29, #{offset}]")
         else:
             raise ValueError(f"Unexpected variable value {variable.value}")
-
-    def move_args_to_stack(self, func):
-        """Move arguments from registers to the stack"""
-        offset = 0
-        for param, register in zip(func.params, self._argregs):
-            offset -= param.variable.type.width
-            self.emit("str", register, f"[x29, #{offset}]")
-
-    def leave_stack_frame(self, func):
-        """Emit the epilogue for a function"""
-        return_value = self.stack[-1].get(RETURN_VALUE)
-        if return_value is None:
-            self.mov("w0", "#0")
-        else:
-            self.emit("mov", "x0", f"#{return_value.value.value}")
-        stack_frame_size = self._get_stack_frame_size(func)
-        self.emit("ldp", "x29", "x30", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "sp", "sp", f"#{stack_frame_size + 16}")
-        self.emit("ret")
 
     def emit_label(self, label):
         """Emit a label"""
