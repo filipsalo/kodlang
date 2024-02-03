@@ -30,6 +30,22 @@ class StringConstant:
 RETURN_VALUE = object()
 
 
+class Label:
+    """A label"""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __getattr__(self, name):
+        return Label(f"{self.name}${name}")
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return f"Label({self.name!r})"
+
+
 class Compiler:
     """An assembler for the Kod language."""
 
@@ -47,7 +63,7 @@ class Compiler:
     def create_label(self, base_name):
         """Create a label"""
         self.label_counters[base_name] += 1
-        return f"{base_name}${self.label_counters[base_name]}"
+        return Label(f"{base_name}${self.label_counters[base_name]}")
 
     def literal_string(self, s):
         """Return a string constant for the given string"""
@@ -141,19 +157,17 @@ class Compiler:
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
         assert isinstance(condition, ParsedBooleanLiteral)
-        label_base = self.create_label("if")
-        false_label = f"{label_base}$false"
-        end_label = f"{label_base}$end"
+        label = self.create_label("if")
         self.emit("mov", "w0", f"#{int(condition.value.value)}")
         self.emit("cmp", "w0", "#0")
-        self.emit("beq", false_label)
+        self.emit("beq", label.false)
         for statement in true_branch:
             self.compile_statement(statement)
-        self.emit("b", end_label)
-        self.emit_label(false_label)
+        self.emit("b", label.end)
+        self.emit_label(label.false)
         for statement in false_branch:
             self.compile_statement(statement)
-        self.emit_label(end_label)
+        self.emit_label(label.end)
 
     def compile_variable_declaration(self, variable, value):
         """Compile a variable declaration to assembly"""
