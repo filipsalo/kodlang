@@ -174,9 +174,9 @@ class Compiler:
         if isinstance(value, ParsedStringLiteral):
             value = self.literal_string(value)
             offset = self.get_variable_offset(variable)
-            self.emit("adrp", "x19", f"{value.label}@PAGE")
-            self.emit("add", "x19", "x19", f"{value.label}@PAGEOFF")
-            self.emit("str", "x19", f"[fp, #{offset}]")
+            self.emit("adrp", "x9", f"{value.label}@PAGE")
+            self.emit("add", "x9", "x9", f"{value.label}@PAGEOFF")
+            self.emit("str", "x9", f"[fp, #{offset}]")
         else:
             raise ValueError(f"Unexpected variable value {variable.value}")
 
