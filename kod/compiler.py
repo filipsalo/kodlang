@@ -4,13 +4,13 @@
 import collections
 import sys
 
-from kod import tokens
 from kod.ast import (
-    BinaryOperator,
     ParsedAssignment,
+    ParsedBooleanLiteral,
     ParsedExternalFunctionDeclaration,
     ParsedFunctionCall,
     ParsedFunctionDeclaration,
+    ParsedIfStatement,
     ParsedIntegerLiteral,
     ParsedName,
     ParsedReturn,
@@ -127,6 +127,23 @@ class Compiler:
         self.emit("add", "x29", "sp", f"#{stack_frame_size}")
         if func.params:
             self.move_args_to_stack(func)
+
+    def compile_if_statement(self, condition, true_branch, false_branch):
+        """Compile an if statement to assembly"""
+        assert isinstance(condition, ParsedBooleanLiteral)
+        label_base = self.create_label("if")
+        false_label = f"{label_base}$false"
+        end_label = f"{label_base}$end"
+        self.emit("mov", "w0", f"#{int(condition.value.value)}")
+        self.emit("cmp", "w0", "#0")
+        self.emit("beq", false_label)
+        for statement in true_branch:
+            self.compile_statement(statement)
+        self.emit("b", end_label)
+        self.emit_label(false_label)
+        for statement in false_branch:
+            self.compile_statement(statement)
+        self.emit_label(end_label)
 
     def compile_variable_declaration(self, variable, value):
         """Compile a variable declaration to assembly"""
