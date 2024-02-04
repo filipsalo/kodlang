@@ -46,6 +46,13 @@ class Label:
         return f"Label({self.name!r})"
 
 
+class Imm(int):
+    """An immediate value"""
+
+    def __str__(self):
+        return f"#{int(self)}"
+
+
 class Compiler:
     """An assembler for the Kod language."""
 
@@ -127,9 +134,9 @@ class Compiler:
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
         stack_frame_size = self._get_stack_frame_size(func)
-        self.emit("sub", "sp", "sp", f"#{stack_frame_size + 16}")
+        self.emit("sub", "sp", "sp", Imm(stack_frame_size + 16))
         self.emit("stp", "fp", "lr", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "fp", "sp", f"#{stack_frame_size}")
+        self.emit("add", "fp", "sp", Imm(stack_frame_size))
         self.stack.append({variable.id: variable for variable in func.variables.values()})
         if func.params:
             self.move_args_to_stack(func)
@@ -146,20 +153,20 @@ class Compiler:
         return_value = self.stack[-1].get(RETURN_VALUE)
         self.stack.pop()
         if return_value is None:
-            self.mov("w0", "#0")
+            self.mov("w0", Imm(0))
         else:
-            self.emit("mov", "x0", f"#{return_value.value.value}")
+            self.emit("mov", "x0", Imm(return_value.value.value))
         stack_frame_size = self._get_stack_frame_size(func)
         self.emit("ldp", "fp", "lr", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "sp", "sp", f"#{stack_frame_size + 16}")
+        self.emit("add", "sp", "sp", Imm(stack_frame_size + 16))
         self.emit("ret")
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
         assert isinstance(condition, ParsedBooleanLiteral)
         label = self.create_label("if")
-        self.emit("mov", "w0", f"#{int(condition.value.value)}")
-        self.emit("cmp", "w0", "#0")
+        self.emit("mov", "w0", Imm(condition.value.value))
+        self.emit("cmp", "w0", Imm(0))
         self.emit("beq", label.false)
         for statement in true_branch:
             self.compile_statement(statement)
@@ -214,7 +221,7 @@ class Compiler:
                 self.emit("adrp", register, f"{arg.label}@PAGE")
                 self.emit("add", register, register, f"{arg.label}@PAGEOFF")
             elif isinstance(arg.expression, ParsedIntegerLiteral):
-                self.emit("mov", register, f"#{arg.expression.value.value}")
+                self.emit("mov", register, Imm(arg.expression.value.value))
             elif isinstance(arg.expression, ParsedName):
                 offset = self.get_variable_offset(arg.expression)
                 if offset:
