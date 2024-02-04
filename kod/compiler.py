@@ -216,21 +216,22 @@ class Compiler:
         offset = 0
         for param, arg, register in zip(func.params, args, self._argregs):
             offset -= param.variable.type.width
-            if isinstance(arg.expression, ParsedStringLiteral):
-                arg = self.literal_string(arg.expression)
-                self.emit("adrp", register, f"{arg.label}@PAGE")
-                self.emit("add", register, register, f"{arg.label}@PAGEOFF")
-            elif isinstance(arg.expression, ParsedIntegerLiteral):
-                self.emit("mov", register, Imm(arg.expression.value.value))
-            elif isinstance(arg.expression, ParsedName):
-                offset = self.get_variable_offset(arg.expression)
-                if offset:
-                    self.emit("ldr", register, f"[fp, #{offset}]")
-            elif isinstance(arg.expression, ParsedFunctionCall):
-                self.compile_function_call(arg.expression)
-                self.mov("x0", {register})
-            else:
-                self.mov(f"${arg.expression}", f"%{register}")
+            match arg.expression:
+                case ParsedStringLiteral() as literal:
+                    arg = self.literal_string(literal)
+                    self.emit("adrp", register, f"{arg.label}@PAGE")
+                    self.emit("add", register, register, f"{arg.label}@PAGEOFF")
+                case ParsedIntegerLiteral(value):
+                    self.emit("mov", register, Imm(value.value))
+                case ParsedName() as variable:
+                    offset = self.get_variable_offset(variable)
+                    if offset:
+                        self.emit("ldr", register, f"[fp, #{offset}]")
+                case ParsedFunctionCall() as call:
+                    self.compile_function_call(call)
+                    self.mov("x0", {register})
+                case _:
+                    raise ValueError(f"Unexpected argument {arg}")
 
     def get_variable_offset(self, variable):
         """Get the offset of a variable in the stack frame"""
