@@ -29,9 +29,6 @@ class StringConstant:
         self.value = value
 
 
-RETURN_VALUE = object()
-
-
 class Label:
     """A label"""
 
@@ -53,6 +50,38 @@ class Imm(int):
 
     def __str__(self):
         return f"#{int(self)}"
+
+
+class StackFrame:
+    """A stack frame"""
+
+    def __init__(self, variables):
+        self.variables = {variable.id: variable for variable in variables}
+        self.return_value = None
+
+    def declare_variable(self, variable):
+        """Declare a variable"""
+        self.variables[variable.id] = variable
+
+    def get_variable_address(self, variable):
+        """Get the offset of a variable in the stack frame"""
+        offset = 0
+        for var in self.variables.values():
+            offset -= var.type.width
+            if var.id == variable.id:
+                break
+        else:
+            raise ValueError(f"Unknown variable {variable!r}")
+        return f"[fp, #{offset}]" if offset else "[fp]"
+
+    def size(self):
+        """Return the size of the stack frame"""
+        return sum(variable.type.width for variable in self.variables.values())
+
+    def aligned_size(self):
+        """Return the aligned size of the stack frame"""
+        size = self.size()
+        return size + 16 - size % 16
 
 
 class Compiler:
@@ -112,7 +141,7 @@ class Compiler:
             case ParsedAssignment(variable, value):
                 self.compile_variable_declaration(variable, value)
             case ParsedReturn(value):
-                self.stack[-1][RETURN_VALUE] = value
+                self.stack[-1].return_value = value
             case ParsedIfStatement(condition, true_branch, false_branch):
                 self.compile_if_statement(condition, true_branch, false_branch)
             case _:
@@ -125,21 +154,16 @@ class Compiler:
         self.enter_stack_frame(func)
         for statement in func.body:
             self.compile_statement(statement)
-        self.leave_stack_frame(func)
+        self.leave_stack_frame()
         self.functions[func.name] = func
-
-    def _get_stack_frame_size(self, func):
-        size = sum(variable.type.width for variable in func.variables.values())
-        size += 16 - size % 16
-        return size
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
-        stack_frame_size = self._get_stack_frame_size(func)
-        self.emit("sub", "sp", "sp", Imm(stack_frame_size + 16))
-        self.emit("stp", "fp", "lr", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "fp", "sp", Imm(stack_frame_size))
-        self.stack.append({variable.id: variable for variable in func.variables.values()})
+        frame = StackFrame(func.variables.values())
+        self.stack.append(frame)
+        self.emit("sub", "sp", "sp", Imm(frame.aligned_size() + 16))
+        self.emit("stp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
+        self.emit("add", "fp", "sp", Imm(frame.aligned_size()))
         if func.params:
             self.move_args_to_stack(func)
 
@@ -150,19 +174,18 @@ class Compiler:
             offset -= param.variable.type.width
             self.emit("str", register, f"[fp, #{offset}]")
 
-    def leave_stack_frame(self, func):
+    def leave_stack_frame(self):
         """Emit the epilogue for a function"""
-        return_value = self.stack[-1].get(RETURN_VALUE)
+        return_value = self.stack[-1].return_value
         if return_value is None:
             self.mov("w0", Imm(0))
         else:
             addr = self.compile_expression(return_value)
             self.mov("x0", addr)
-        stack_frame_size = self._get_stack_frame_size(func)
-        self.emit("ldp", "fp", "lr", f"[sp, #{stack_frame_size}]")
-        self.emit("add", "sp", "sp", Imm(stack_frame_size + 16))
+        frame = self.stack.pop()
+        self.emit("ldp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
+        self.emit("add", "sp", "sp", Imm(frame.aligned_size() + 16))
         self.emit("ret")
-        self.stack.pop()
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
@@ -181,12 +204,12 @@ class Compiler:
 
     def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
-        offset = self.get_variable_offset(variable)
+        address = self.stack[-1].get_variable_address(variable)
         register = self.compile_expression(expression)
         if isinstance(register, (Imm, str)):
             self.emit("mov", "x9", register)
             register = "x9"
-        self.emit("str", register, f"[fp, #{offset}]")
+        self.emit("str", register, address)
 
     def compile_expression(self, expression):
         """Parse an expression"""
@@ -198,8 +221,7 @@ class Compiler:
         elif isinstance(expression, ParsedIntegerLiteral):
             return Imm(expression.value.value)
         elif isinstance(expression, ParsedName):
-            offset = self.get_variable_offset(expression)
-            return f"[fp, #{offset}]"
+            return self.stack[-1].get_variable_address(expression)
         elif isinstance(expression, ParsedFunctionCall):
             return self.compile_function_call(expression)
         elif isinstance(expression, BinaryOperator):
@@ -257,23 +279,13 @@ class Compiler:
                 case ParsedIntegerLiteral(value):
                     self.emit("mov", register, Imm(value.value))
                 case ParsedName() as variable:
-                    offset = self.get_variable_offset(variable)
-                    if offset:
-                        self.emit("ldr", register, f"[fp, #{offset}]")
+                    address = self.stack[-1].get_variable_address(variable)
+                    self.emit("ldr", register, address)
                 case ParsedFunctionCall() as call:
                     self.compile_function_call(call)
                     self.mov("x0", {register})
                 case _:
                     raise ValueError(f"Unexpected argument {arg}")
-
-    def get_variable_offset(self, variable):
-        """Get the offset of a variable in the stack frame"""
-        offset = 0
-        for var in self.stack[-1].values():
-            offset -= var.type.width
-            if var.id == variable.id:
-                return offset
-        raise ValueError(f"Unknown variable {variable!r}")
 
     def mov(self, dest, src):
         """Move a value"""
