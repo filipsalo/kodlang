@@ -5,6 +5,7 @@ import collections
 import sys
 
 from kod.ast import (
+    BinaryOperator,
     ParsedAssignment,
     ParsedBooleanLiteral,
     ParsedExternalFunctionDeclaration,
@@ -17,6 +18,7 @@ from kod.ast import (
     ParsedStringLiteral,
     ParsedVariableDeclaration,
 )
+from kod.tokens import Plus
 
 
 class StringConstant:
@@ -151,15 +153,16 @@ class Compiler:
     def leave_stack_frame(self, func):
         """Emit the epilogue for a function"""
         return_value = self.stack[-1].get(RETURN_VALUE)
-        self.stack.pop()
         if return_value is None:
             self.mov("w0", Imm(0))
         else:
-            self.emit("mov", "x0", Imm(return_value.value.value))
+            addr = self.compile_expression(return_value)
+            self.mov("x0", addr)
         stack_frame_size = self._get_stack_frame_size(func)
         self.emit("ldp", "fp", "lr", f"[sp, #{stack_frame_size}]")
         self.emit("add", "sp", "sp", Imm(stack_frame_size + 16))
         self.emit("ret")
+        self.stack.pop()
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
@@ -176,16 +179,45 @@ class Compiler:
             self.compile_statement(statement)
         self.emit_label(label.end)
 
-    def compile_variable_declaration(self, variable, value):
+    def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
-        if isinstance(value, ParsedStringLiteral):
-            value = self.literal_string(value)
-            offset = self.get_variable_offset(variable)
+        offset = self.get_variable_offset(variable)
+        register = self.compile_expression(expression)
+        if isinstance(register, (Imm, str)):
+            self.emit("mov", "x9", register)
+            register = "x9"
+        self.emit("str", register, f"[fp, #{offset}]")
+
+    def compile_expression(self, expression):
+        """Parse an expression"""
+        if isinstance(expression, ParsedStringLiteral):
+            value = self.literal_string(expression)
             self.emit("adrp", "x9", f"{value.label}@PAGE")
             self.emit("add", "x9", "x9", f"{value.label}@PAGEOFF")
-            self.emit("str", "x9", f"[fp, #{offset}]")
+            return "x9"
+        elif isinstance(expression, ParsedIntegerLiteral):
+            return Imm(expression.value.value)
+        elif isinstance(expression, ParsedName):
+            offset = self.get_variable_offset(expression)
+            return f"[fp, #{offset}]"
+        elif isinstance(expression, ParsedFunctionCall):
+            return self.compile_function_call(expression)
+        elif isinstance(expression, BinaryOperator):
+            return self.compile_binary_operator(expression)
         else:
-            raise ValueError(f"Unexpected variable value {variable.value}")
+            raise ValueError(f"Unexpected expression {expression}")
+
+    def compile_binary_operator(self, expression):
+        """Compile a binary operator to assembly"""
+        left = self.compile_expression(expression.lhs)
+        right = self.compile_expression(expression.rhs)
+        if isinstance(expression.op, Plus):
+            self.mov("x10", left)
+            self.mov("x11", right)
+            self.emit("add", "x10", "x10", "x11")
+            return "x10"
+        else:
+            raise ValueError(f"Unknown operator: {expression.op}")
 
     def emit_label(self, label):
         """Emit a label"""
@@ -210,6 +242,7 @@ class Compiler:
                 raise ValueError(f"Unexpected function call {func_call.callee}")
         self.prepare_args(func, func_call.args)
         self.emit("bl", f"_{func.name}")
+        return "x0"
 
     def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
@@ -244,4 +277,7 @@ class Compiler:
 
     def mov(self, dest, src):
         """Move a value"""
-        self.emit("mov", dest, src)
+        if isinstance(src, str) and src.startswith("["):
+            self.emit("ldr", dest, src)
+        else:
+            self.emit("mov", dest, src)
