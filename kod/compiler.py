@@ -55,6 +55,8 @@ class Imm(int):
 class StackFrame:
     """A stack frame"""
 
+    registers = ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"]
+
     def __init__(self, variables):
         self.variables = {variable.id: variable for variable in variables}
         self.return_value = None
@@ -82,6 +84,14 @@ class StackFrame:
         """Return the aligned size of the stack frame"""
         size = self.size()
         return size + 16 - size % 16
+
+    def allocate_register(self):
+        """Allocate a register"""
+        return self.registers.pop(0)
+
+    def release_register(self, register):
+        """Release a register"""
+        self.registers.append(register)
 
 
 class Compiler:
@@ -191,8 +201,10 @@ class Compiler:
         """Compile an if statement to assembly"""
         assert isinstance(condition, ParsedBooleanLiteral)
         label = self.create_label("if")
-        self.emit("mov", "w0", Imm(condition.value.value))
-        self.emit("cmp", "w0", Imm(0))
+        register = self.stack[-1].allocate_register()
+        self.emit("mov", register, Imm(condition.value.value))
+        self.emit("cmp", register, Imm(0))
+        self.stack[-1].release_register(register)
         self.emit("beq", label.false)
         for statement in true_branch:
             self.compile_statement(statement)
@@ -204,20 +216,24 @@ class Compiler:
 
     def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
-        address = self.stack[-1].get_variable_address(variable)
-        register = self.compile_expression(expression)
-        if isinstance(register, (Imm, str)):
-            self.emit("mov", "x9", register)
-            register = "x9"
-        self.emit("str", register, address)
+        destination = self.stack[-1].get_variable_address(variable)
+        address = self.compile_expression(expression)
+        if isinstance(address, (Imm, str)):
+            register = self.stack[-1].allocate_register()
+            self.emit("mov", register, address)
+            self.emit("str", register, destination)
+            self.stack[-1].release_register(register)
+        else:
+            self.emit("str", address, destination)
 
     def compile_expression(self, expression):
         """Parse an expression"""
         if isinstance(expression, ParsedStringLiteral):
             value = self.literal_string(expression)
-            self.emit("adrp", "x9", f"{value.label}@PAGE")
-            self.emit("add", "x9", "x9", f"{value.label}@PAGEOFF")
-            return "x9"
+            register = self.stack[-1].allocate_register()
+            self.emit("adrp", register, f"{value.label}@PAGE")
+            self.emit("add", register, register, f"{value.label}@PAGEOFF")
+            return register
         elif isinstance(expression, ParsedIntegerLiteral):
             return Imm(expression.value.value)
         elif isinstance(expression, ParsedName):
@@ -234,10 +250,13 @@ class Compiler:
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
         if isinstance(expression.op, Plus):
-            self.mov("x10", left)
-            self.mov("x11", right)
-            self.emit("add", "x10", "x10", "x11")
-            return "x10"
+            lhs_register = self.stack[-1].allocate_register()
+            rhs_register = self.stack[-1].allocate_register()
+            self.mov(lhs_register, left)
+            self.mov(rhs_register, right)
+            self.emit("add", lhs_register, lhs_register, rhs_register)
+            self.stack[-1].release_register(rhs_register)
+            return lhs_register
         else:
             raise ValueError(f"Unknown operator: {expression.op}")
 
