@@ -109,7 +109,9 @@ class Lexer:
         while self.peek() != '"':
             self.pos += 1
         self.consume('"')
-        return self.build(StringLiteral)
+        string = self.build(StringLiteral)
+        string.value = string.value.encode().decode('unicode-escape')
+        return string
 
     def lex_number(self):
         """Lex a number."""
