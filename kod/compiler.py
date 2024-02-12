@@ -265,61 +265,24 @@ class Compiler:
 
     def compile_binary_operator(self, expression):
         """Compile a binary operator to assembly"""
+        if not isinstance(expression.op, (Plus, Minus, Slash, Star, LessThan, GreaterThan)):
+            raise ValueError(f"Unknown operator: {expression.op}")
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
         try:
-            if isinstance(expression.op, Plus):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
-                self.emit("add", lhs_register, lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                return lhs_register
-            elif isinstance(expression.op, Minus):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
-                self.emit("sub", lhs_register, lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                return lhs_register
-            elif isinstance(expression.op, Star):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
-                self.emit("mul", lhs_register, lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                return lhs_register
-            elif isinstance(expression.op, LessThan):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
+            lhs_register = self.stack[-1].allocate_register()
+            rhs_register = self.stack[-1].allocate_register()
+            self.mov(lhs_register, left)
+            self.mov(rhs_register, right)
+            if isinstance(expression.op, (LessThan, GreaterThan)):
                 self.emit("cmp", lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                self.emit("cset", lhs_register, "lt")
-                return lhs_register
-            elif isinstance(expression.op, GreaterThan):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
-                self.emit("cmp", lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                self.emit("cset", lhs_register, "gt")
-                return lhs_register
-            elif isinstance(expression.op, Slash):
-                lhs_register = self.stack[-1].allocate_register()
-                rhs_register = self.stack[-1].allocate_register()
-                self.mov(lhs_register, left)
-                self.mov(rhs_register, right)
-                self.emit("sdiv", lhs_register, lhs_register, rhs_register)
-                self.stack[-1].release_register(rhs_register)
-                return lhs_register
+                op = {LessThan: "lt", GreaterThan: "gt"}[type(expression.op)]
+                self.emit("cset", lhs_register, op)
             else:
-                raise ValueError(f"Unknown operator: {expression.op}")
+                op = {Plus: "add", Minus: "sub", Slash: "sdiv", Star: "mul"}[type(expression.op)]
+                self.emit(op, lhs_register, lhs_register, rhs_register)
+            self.stack[-1].release_register(rhs_register)
+            return lhs_register
         finally:
             if isinstance(left, str) and left[0] == "x":
                 self.stack[-1].release_register(left)
