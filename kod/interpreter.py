@@ -40,6 +40,17 @@ class Interpreter:
         exit_code = self.call_function(entry_module_name, main, [argv])
         sys.exit(exit_code.value if exit_code else 0)
 
+    def assign(self, module, name, value):
+        """Assign a value to a variable"""
+        match name:
+            case ast.ParsedVariable() | ast.ParsedName():
+                name = name.id
+        for frame in self.stack[-1], module.names, self.builtins_module.names:
+            if name in frame:
+                frame[name] = value
+                return
+        raise ValueError(f"Unknown name {name!r}")
+
     def lookup(self, module, name):
         """Look up a variable in the stack"""
         match name:
@@ -51,15 +62,6 @@ class Interpreter:
                 if isinstance(value, ast.ParsedStringLiteral):
                     value = value.value
                 return value
-        for statement in module.body:
-            match statement:
-                case (ast.ParsedExternalFunctionDeclaration()
-                      | ast.ParsedFunctionDeclaration()) as func:
-                    if func.name == name:
-                        return statement
-                case ast.ParsedVariableDeclaration(variable, value):
-                    if variable.id == name:
-                        return value
         raise ValueError(f"Unknown name {name!r}")
 
     def evaluate_binary_operator(self, module, op, lhs, rhs, as_lvalue=False):
@@ -80,6 +82,12 @@ class Interpreter:
                 op_func_name = "op_lt"
             case tokens.GreaterThan():
                 op_func_name = "op_gt"
+            case tokens.Percent():
+                op_func_name = "op_mod"
+            case tokens.Slash():
+                op_func_name = "op_div"
+            case tokens.Star():
+                op_func_name = "op_mul"
             case _:
                 raise ValueError(f"Don't know how to evaluate binary operator {op}")
         lhs = self.evaluate_expression(module, lhs)
@@ -131,7 +139,7 @@ class Interpreter:
             case ast.ParsedVariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
-                module.names[lhs.id] = self.evaluate_expression(module, value)
+                self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
             case ast.ParsedTypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
@@ -139,7 +147,7 @@ class Interpreter:
             case ast.ParsedAssignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
                 rhs = self.evaluate_expression(module, rhs)
-                module.names[lhs.id] = self.evaluate_expression(module, rhs)
+                self.assign(module, lhs.id, rhs)
             case ast.ParsedIfStatement(condition, true_branch, false_branch):
                 matched = self.evaluate_expression(module, condition).to_bool().value is True
                 for statement in true_branch if matched else false_branch:
@@ -168,7 +176,10 @@ class Interpreter:
             return func(*args)
         if isinstance(func, ast.ParsedExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)
-            c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
+            c_func.argtypes = [
+                self.c_type(p.variable.type)
+                for p in func.params
+            ]
             args = [arg.value for arg in args]
             return getattr(libc, func.name)(*args)
 

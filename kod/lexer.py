@@ -32,8 +32,11 @@ from kod.tokens import (
     OpenBracket,
     OpenCurly,
     OpenParen,
+    Percent,
     Plus,
     Return,
+    Slash,
+    Star,
     StringLiteral,
     Struct,
     Type,
@@ -135,15 +138,17 @@ class Lexer:
             return self.build(keyword_token_type)
         return self.build(Identifier)
 
-    def lex_comment(self):
+    def lex_slash_or_comment(self):
         """Lex a comment."""
         self.consume("/")
-        self.consume("/")
-        while self.peek() in (" ", "\t"):
-            self.pos += 1
-        while self.peek() != "\n":
-            self.pos += 1
-        return self.build(Comment)
+        if self.peek() == "/":
+            self.consume("/")
+            while self.peek() in (" ", "\t"):
+                self.pos += 1
+            while self.peek() != "\n":
+                self.pos += 1
+            return self.build(Comment)
+        return self.build(Slash)
 
     def lex_arrow_or_minus(self):
         """Lex an arrow (->) or a lone minus (-)."""
@@ -188,6 +193,10 @@ class Lexer:
                     yield self.lex_single_char(Equals)
                 case "+":
                     yield self.lex_single_char(Plus)
+                case "%":
+                    yield self.lex_single_char(Percent)
+                case "*":
+                    yield self.lex_single_char(Star)
                 case "<":
                     yield self.lex_single_char(LessThan)
                 case ">":
@@ -199,6 +208,6 @@ class Lexer:
                 case ("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"):
                     yield self.lex_number()
                 case "/":
-                    yield self.lex_comment()
+                    yield self.lex_slash_or_comment()
                 case _:
                     yield self.lex_identifier()

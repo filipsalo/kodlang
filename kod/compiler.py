@@ -9,6 +9,7 @@ from kod.ast import (
     ParsedAssignment,
     ParsedBooleanLiteral,
     ParsedExternalFunctionDeclaration,
+    ParsedForStatement,
     ParsedFunctionCall,
     ParsedFunctionDeclaration,
     ParsedIfStatement,
@@ -18,7 +19,7 @@ from kod.ast import (
     ParsedStringLiteral,
     ParsedVariableDeclaration,
 )
-from kod.tokens import Plus
+from kod.tokens import GreaterThan, LessThan, Minus, Plus, Slash, Star
 
 
 class StringConstant:
@@ -55,11 +56,14 @@ class Imm(int):
 class StackFrame:
     """A stack frame"""
 
-    registers = ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"]
-
     def __init__(self, variables):
         self.variables = {variable.id: variable for variable in variables}
         self.return_value = None
+        self.registers = [
+            "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+            # todo: handle the below as non-volatile
+            "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+        ]
 
     def declare_variable(self, variable):
         """Declare a variable"""
@@ -91,7 +95,7 @@ class StackFrame:
 
     def release_register(self, register):
         """Release a register"""
-        self.registers.append(register)
+        self.registers.insert(0, register)
 
 
 class Compiler:
@@ -154,6 +158,8 @@ class Compiler:
                 self.stack[-1].return_value = value
             case ParsedIfStatement(condition, true_branch, false_branch):
                 self.compile_if_statement(condition, true_branch, false_branch)
+            case ParsedForStatement(condition, body):
+                self.compile_for_statement(condition, body)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
@@ -197,12 +203,24 @@ class Compiler:
         self.emit("add", "sp", "sp", Imm(frame.aligned_size() + 16))
         self.emit("ret")
 
+    def compile_for_statement(self, condition, body):
+        """Compile a for statement to assembly"""
+        label = self.create_label("for")
+        self.emit_label(label.start)
+        register = self.compile_expression(condition)
+        self.emit("cmp", register, Imm(0))
+        self.emit("beq", label.end)
+        for statement in body:
+            self.compile_statement(statement)
+        self.emit("b", label.start)
+        self.emit_label(label.end)
+
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
         assert isinstance(condition, ParsedBooleanLiteral)
         label = self.create_label("if")
         register = self.stack[-1].allocate_register()
-        self.emit("mov", register, Imm(condition.value.value))
+        self.mov(register, Imm(condition.value.value))
         self.emit("cmp", register, Imm(0))
         self.stack[-1].release_register(register)
         self.emit("beq", label.false)
@@ -220,7 +238,7 @@ class Compiler:
         address = self.compile_expression(expression)
         if isinstance(address, (Imm, str)):
             register = self.stack[-1].allocate_register()
-            self.emit("mov", register, address)
+            self.mov(register, address)
             self.emit("str", register, destination)
             self.stack[-1].release_register(register)
         else:
@@ -249,16 +267,64 @@ class Compiler:
         """Compile a binary operator to assembly"""
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
-        if isinstance(expression.op, Plus):
-            lhs_register = self.stack[-1].allocate_register()
-            rhs_register = self.stack[-1].allocate_register()
-            self.mov(lhs_register, left)
-            self.mov(rhs_register, right)
-            self.emit("add", lhs_register, lhs_register, rhs_register)
-            self.stack[-1].release_register(rhs_register)
-            return lhs_register
-        else:
-            raise ValueError(f"Unknown operator: {expression.op}")
+        try:
+            if isinstance(expression.op, Plus):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("add", lhs_register, lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                return lhs_register
+            elif isinstance(expression.op, Minus):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("sub", lhs_register, lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                return lhs_register
+            elif isinstance(expression.op, Star):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("mul", lhs_register, lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                return lhs_register
+            elif isinstance(expression.op, LessThan):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("cmp", lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                self.emit("cset", lhs_register, "lt")
+                return lhs_register
+            elif isinstance(expression.op, GreaterThan):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("cmp", lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                self.emit("cset", lhs_register, "gt")
+                return lhs_register
+            elif isinstance(expression.op, Slash):
+                lhs_register = self.stack[-1].allocate_register()
+                rhs_register = self.stack[-1].allocate_register()
+                self.mov(lhs_register, left)
+                self.mov(rhs_register, right)
+                self.emit("sdiv", lhs_register, lhs_register, rhs_register)
+                self.stack[-1].release_register(rhs_register)
+                return lhs_register
+            else:
+                raise ValueError(f"Unknown operator: {expression.op}")
+        finally:
+            if isinstance(left, str) and left[0] == "x":
+                self.stack[-1].release_register(left)
+            if isinstance(right, str) and right[0] == "x":
+                self.stack[-1].release_register(right)
 
     def emit_label(self, label):
         """Emit a label"""
@@ -288,23 +354,10 @@ class Compiler:
     def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
         offset = 0
-        for param, arg, register in zip(func.params, args, self._argregs):
+        for param, arg, arg_register in zip(func.params, args, self._argregs):
             offset -= param.variable.type.width
-            match arg.expression:
-                case ParsedStringLiteral() as literal:
-                    arg = self.literal_string(literal)
-                    self.emit("adrp", register, f"{arg.label}@PAGE")
-                    self.emit("add", register, register, f"{arg.label}@PAGEOFF")
-                case ParsedIntegerLiteral(value):
-                    self.emit("mov", register, Imm(value.value))
-                case ParsedName() as variable:
-                    address = self.stack[-1].get_variable_address(variable)
-                    self.emit("ldr", register, address)
-                case ParsedFunctionCall() as call:
-                    self.compile_function_call(call)
-                    self.mov("x0", {register})
-                case _:
-                    raise ValueError(f"Unexpected argument {arg}")
+            register = self.compile_expression(arg.expression)
+            self.mov(arg_register, register)
 
     def mov(self, dest, src):
         """Move a value"""

@@ -79,6 +79,18 @@ class Int64(Type):
         """Compare two integers."""
         return Bool(self.value > other.value)
 
+    def op_mod(self, other: Self) -> Self:
+        """Modulo two integers."""
+        return Int64(self.value % other.value)
+
+    def op_div(self, other: Self) -> Self:
+        """Divide two integers."""
+        return Int64(self.value // other.value)
+
+    def op_mul(self, other: Self) -> Self:
+        """Multiply two integers."""
+        return Int64(self.value * other.value)
+
 
 None_ = object()
 

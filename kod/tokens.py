@@ -40,6 +40,24 @@ class Dot(BinaryOperator):
 
 
 @dataclasses.dataclass
+class Percent(BinaryOperator):
+    """A percent sign."""
+    precedence = 16
+
+
+@dataclasses.dataclass
+class Slash(BinaryOperator):
+    """A slash."""
+    precedence = 16
+
+
+@dataclasses.dataclass
+class Star(BinaryOperator):
+    """A star."""
+    precedence = 16
+
+
+@dataclasses.dataclass
 class Plus(BinaryOperator):
     """A plus sign."""
     precedence = 15
