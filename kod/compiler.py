@@ -217,10 +217,10 @@ class Compiler:
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""
-        assert isinstance(condition, ParsedBooleanLiteral)
         label = self.create_label("if")
         register = self.stack[-1].allocate_register()
-        self.mov(register, Imm(condition.value.value))
+        value = self.compile_expression(condition)
+        self.mov(register, value)
         self.emit("cmp", register, Imm(0))
         self.stack[-1].release_register(register)
         self.emit("beq", label.false)
@@ -253,6 +253,8 @@ class Compiler:
             self.emit("add", register, register, f"{value.label}@PAGEOFF")
             return register
         elif isinstance(expression, ParsedIntegerLiteral):
+            return Imm(expression.value.value)
+        elif isinstance(expression, ParsedBooleanLiteral):
             return Imm(expression.value.value)
         elif isinstance(expression, ParsedName):
             return self.stack[-1].get_variable_address(expression)
