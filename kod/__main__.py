@@ -25,6 +25,7 @@ def main():
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=FileWrapper)
+    run_parser.add_argument('args', nargs='*')
 
     parse_parser = subparsers.add_parser("parse")
     parse_parser.add_argument("file", type=FileWrapper)
@@ -56,7 +57,7 @@ def main():
         case "build" | "run":
             executable = bob.build_executable(Path("./main"))
             if args.command == "run":
-                result = subprocess.run(executable, check=False)
+                result = subprocess.run([executable, *args.args], check=False)
                 return result.returncode
         case "parse":
             ast.dump(program.get_module(entry_module).module)
