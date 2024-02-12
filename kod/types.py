@@ -41,6 +41,12 @@ class String(Type):
     name = "str"
     width = 8
 
+    def __eq__(self, other):
+        return self.value == other.value
+
+    def __hash__(self):
+        return hash(repr(self))
+
     def to_py_str(self):
         """Return the value as a Python string."""
         return self.value.decode("utf8")
