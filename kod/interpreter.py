@@ -45,7 +45,7 @@ class Interpreter:
         match name:
             case ast.ParsedVariable() | ast.ParsedName():
                 name = name.id
-        for frame in self.stack[-1], module.names, self.builtins_module.names:
+        for frame in self.stack[-1], module.names:
             if name in frame:
                 frame[name] = value
                 return
@@ -139,7 +139,10 @@ class Interpreter:
             case ast.ParsedVariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
-                self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
+                if len(self.stack) > 1:
+                    self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
+                else:
+                    module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.ParsedTypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
