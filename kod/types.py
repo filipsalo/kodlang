@@ -77,6 +77,10 @@ class Int64(Type):
         """Add two integers."""
         return Int64(self.value - other.value)
 
+    def op_eq(self, other: Self) -> Bool:
+        """Compare two integers."""
+        return Bool(self.value == other.value)
+
     def op_lt(self, other: Self) -> Bool:
         """Compare two integers."""
         return Bool(self.value < other.value)

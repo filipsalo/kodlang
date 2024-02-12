@@ -19,7 +19,7 @@ from kod.ast import (
     ParsedStringLiteral,
     ParsedVariableDeclaration,
 )
-from kod.tokens import GreaterThan, LessThan, Minus, Plus, Slash, Star
+from kod.tokens import EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
 
 
 class StringConstant:
@@ -265,7 +265,8 @@ class Compiler:
 
     def compile_binary_operator(self, expression):
         """Compile a binary operator to assembly"""
-        if not isinstance(expression.op, (Plus, Minus, Slash, Star, LessThan, GreaterThan)):
+        optypes = (Plus, Minus, Slash, Star, LessThan, GreaterThan, EqualEqual)
+        if not isinstance(expression.op, optypes):
             raise ValueError(f"Unknown operator: {expression.op}")
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
@@ -274,9 +275,9 @@ class Compiler:
             rhs_register = self.stack[-1].allocate_register()
             self.mov(lhs_register, left)
             self.mov(rhs_register, right)
-            if isinstance(expression.op, (LessThan, GreaterThan)):
+            if isinstance(expression.op, (LessThan, GreaterThan, EqualEqual)):
                 self.emit("cmp", lhs_register, rhs_register)
-                op = {LessThan: "lt", GreaterThan: "gt"}[type(expression.op)]
+                op = {LessThan: "lt", GreaterThan: "gt", EqualEqual: "eq"}[type(expression.op)]
                 self.emit("cset", lhs_register, op)
             else:
                 op = {Plus: "add", Minus: "sub", Slash: "sdiv", Star: "mul"}[type(expression.op)]

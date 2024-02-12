@@ -303,7 +303,7 @@ class ParsedVariableDeclaration(ASTNode):
             parser.consume(tokens.Let)
             variable = ParsedVariable.parse(parser)
             parser.stack[-1][variable.id] = variable
-            parser.consume(tokens.Equals)
+            parser.consume(tokens.Equal)
             value = ParsedExpression.parse(parser)
             # variable.type = value.type
         return cls(variable, value, span)
@@ -370,7 +370,7 @@ class ParsedExpression(ASTNode):
                 else:
                     parser.consume(type(op))
                     rhs = cls.parse(parser, op.precedence + op.left_associative)
-                    if isinstance(op, tokens.Equals):
+                    if isinstance(op, tokens.Equal):
                         lhs = ParsedAssignment(lhs, rhs, span)
                     else:
                         lhs = BinaryOperator(lhs, op, rhs, span)
@@ -487,7 +487,7 @@ class ParsedTypeDeclaration(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.Type)
             name = ParsedName.parse(parser)
-            parser.consume(tokens.Equals)
+            parser.consume(tokens.Equal)
             type_ = parser.parse_type(name.id)
         return cls(name, type_, span)
 

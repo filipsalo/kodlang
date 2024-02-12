@@ -70,9 +70,15 @@ class Minus(BinaryOperator):
 
 
 @dataclasses.dataclass
-class Equals(BinaryOperator):
+class Equal(BinaryOperator):
     """An equals sign."""
     precedence = 10
+
+
+@dataclasses.dataclass
+class EqualEqual(BinaryOperator):
+    """Two equals signs."""
+    precedence = 12
 
 
 @dataclasses.dataclass

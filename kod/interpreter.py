@@ -82,6 +82,8 @@ class Interpreter:
                 op_func_name = "op_lt"
             case tokens.GreaterThan():
                 op_func_name = "op_gt"
+            case tokens.EqualEqual():
+                op_func_name = "op_eq"
             case tokens.Percent():
                 op_func_name = "op_mod"
             case tokens.Slash():

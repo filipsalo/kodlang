@@ -17,7 +17,8 @@ from kod.tokens import (
     EOF,
     EOL,
     Else,
-    Equals,
+    Equal,
+    EqualEqual,
     Extern,
     For,
     Func,
@@ -158,6 +159,14 @@ class Lexer:
             return self.build(Arrow)
         return self.build(Minus)
 
+    def lex_equals(self):
+        """Lex an equals sign or two."""
+        self.consume("=")
+        if self.peek() == "=":
+            self.consume("=")
+            return self.build(EqualEqual)
+        return self.build(Equal)
+
     def lex(self):
         """Lex the source code into tokens."""
         return list(self)
@@ -190,7 +199,7 @@ class Lexer:
                 case ",":
                     yield self.lex_single_char(Comma)
                 case "=":
-                    yield self.lex_single_char(Equals)
+                    yield self.lex_equals()
                 case "+":
                     yield self.lex_single_char(Plus)
                 case "%":
