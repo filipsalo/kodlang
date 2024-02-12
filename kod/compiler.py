@@ -56,8 +56,9 @@ class Imm(int):
 class StackFrame:
     """A stack frame"""
 
-    def __init__(self, variables):
+    def __init__(self, variables, end_label):
         self.variables = {variable.id: variable for variable in variables}
+        self.end_label = end_label
         self.return_value = None
         self.registers = [
             "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
@@ -156,6 +157,7 @@ class Compiler:
                 self.compile_variable_declaration(variable, value)
             case ParsedReturn(value):
                 self.stack[-1].return_value = value
+                self.emit("b", self.stack[-1].end_label)
             case ParsedIfStatement(condition, true_branch, false_branch):
                 self.compile_if_statement(condition, true_branch, false_branch)
             case ParsedForStatement(condition, body):
@@ -165,8 +167,6 @@ class Compiler:
 
     def compile_function(self, func):
         """Compile a function to assembly"""
-        self.emit(".globl", f"_{func.name}")
-        print(f"_{func.name}:", file=self.output)
         self.enter_stack_frame(func)
         for statement in func.body:
             self.compile_statement(statement)
@@ -175,7 +175,9 @@ class Compiler:
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
-        frame = StackFrame(func.variables.values())
+        self.emit(".globl", f"_{func.name}")
+        print(f"_{func.name}:", file=self.output)
+        frame = StackFrame(func.variables.values(), f"_{func.name}$end")
         self.stack.append(frame)
         self.emit("sub", "sp", "sp", Imm(frame.aligned_size() + 16))
         self.emit("stp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
@@ -192,7 +194,9 @@ class Compiler:
 
     def leave_stack_frame(self):
         """Emit the epilogue for a function"""
+        label = self.stack[-1].end_label
         return_value = self.stack[-1].return_value
+        print(f"{label}:", file=self.output)
         if return_value is None:
             self.mov("w0", Imm(0))
         else:
