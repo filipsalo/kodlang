@@ -113,6 +113,11 @@ class Compiler:
         self.stack = []
         self.label_counters = collections.defaultdict(int)
 
+    def create_global_label(self, base_name):
+        """Create a global label"""
+        parts = ["", *self.module.path.parent.parts, self.module.path.stem, base_name]
+        return Label("$".join(parts))
+
     def create_label(self, base_name):
         """Create a label"""
         self.label_counters[base_name] += 1
@@ -175,9 +180,10 @@ class Compiler:
 
     def enter_stack_frame(self, func):
         """Emit the prologue for a function"""
-        self.emit(".globl", f"_{func.name}")
-        print(f"_{func.name}:", file=self.output)
-        frame = StackFrame(func.variables.values(), f"_{func.name}$end")
+        label = Label(func.label_name)
+        self.emit(".globl", label)
+        self.emit_label(label)
+        frame = StackFrame(func.variables.values(), label.end)
         self.stack.append(frame)
         self.emit("sub", "sp", "sp", Imm(frame.aligned_size() + 16))
         self.emit("stp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
@@ -318,7 +324,7 @@ class Compiler:
             case _:
                 raise ValueError(f"Unexpected function call {func_call.callee}")
         self.prepare_args(func, func_call.args)
-        self.emit("bl", f"_{func.name}")
+        self.emit("bl", func.label_name)
         return "x0"
 
     def prepare_args(self, func, args):

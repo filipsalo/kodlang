@@ -221,6 +221,7 @@ class ParsedFunctionDeclaration(ASTNode):
     """A function declaration."""
 
     name: str
+    label_name: str
     params: ParsedFunctionParamList
     body: list[ASTNode]
     return_type: str
@@ -244,7 +245,9 @@ class ParsedFunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, ParsedVariableDeclaration):
                     variables[statement.variable.id] = statement.variable
-        node = cls(name, params, body, return_type, variables, span)
+        label_parts = ["", *parser.path.parent.parts, parser.module_name, name]
+        label_name = "$".join(label_parts)
+        node = cls(name, label_name, params, body, return_type, variables, span)
         # parser.stack[-1][name] = node
         return node
 
@@ -270,6 +273,7 @@ class ParsedExternalFunctionDeclaration(ASTNode):
     """An external function declaration."""
 
     name: str
+    label_name: str
     params: ParsedFunctionParamList
     body: list[ASTNode]
     return_type: str
@@ -285,7 +289,8 @@ class ParsedExternalFunctionDeclaration(ASTNode):
             params = ParsedFunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
             return_type = parser.parse_type()
-        return cls(name, params, [], return_type, span)
+        label_name = f"_{name}"
+        return cls(name, label_name, params, [], return_type, span)
 
 
 @dataclasses.dataclass

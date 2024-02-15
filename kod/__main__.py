@@ -55,7 +55,7 @@ def main():
             print(bob.compile_module(entry_module))
             return 0
         case "build" | "run":
-            executable = bob.build_executable(Path("./main"))
+            executable = bob.build_executable(entry_module)
             if args.command == "run":
                 result = subprocess.run([executable, *args.args], check=False)
                 return result.returncode

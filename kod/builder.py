@@ -100,16 +100,34 @@ class Builder:
             "-"
         ], input=asm.encode("ascii"), check=True)
 
+    def build_runtime_main(self, main_module):
+        """Build the runtime main function."""
+        runtime_main_path = Path("build") / "runtime_main.o"
+        asm = f"""
+            .text
+            .globl _main
+            _main:
+                b ${main_module}$main
+        """
+        subprocess.run([
+            "as",
+            "-target", "arm64-apple-darwin",
+            "-o", runtime_main_path,
+            "-"
+        ], input=asm.encode("ascii"), check=True)
+
     def build_executable(self, path: Path) -> Path:
         """Build an executable."""
         for module in self.program:
             self.build_module(module.name)
+        self.build_runtime_main(path)
         executable = Path("build") / path
+        runtime_main_path = Path("build") / "runtime_main.o"
         subprocess.run([
             "ld",
             "-macos_version_min", "14",
             "-lc",
             "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
             "-o", executable,
-        ] + [Path("build") / module.object_path for module in self.program], check=True)
+        ] + [Path("build") / module.object_path for module in self.program] + [runtime_main_path], check=True)
         return executable
