@@ -2,8 +2,8 @@
 
 import dataclasses
 from pathlib import Path
-from kod import tokens, types
 
+from kod import tokens, types
 from kod.parser import Parser
 from kod.span import Span
 

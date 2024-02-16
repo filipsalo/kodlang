@@ -1,8 +1,8 @@
 """Built-in types for Kod."""
 
 
-from abc import ABC
 import dataclasses
+from abc import ABC
 from typing import Any, Self
 
 

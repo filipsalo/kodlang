@@ -3,10 +3,9 @@
 import io
 import subprocess
 import sys
-
 from pathlib import Path
-from kod import ast
 
+from kod import ast
 from kod.compiler import Compiler
 from kod.lexer import Lexer
 from kod.parser import Parser

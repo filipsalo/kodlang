@@ -1,7 +1,6 @@
 """A typechecker for the kod language."""
 
 from kod import ast
-
 from kod.exceptions import KodSyntaxError
 
 

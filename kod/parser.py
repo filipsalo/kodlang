@@ -2,16 +2,17 @@
 """A parser for the Kod lanuage"""
 
 from contextlib import contextmanager
+
 from kod import ast, types
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
+    EOF,
+    EOL,
     BooleanLiteral,
     CloseBracket,
     CloseCurly,
     Comment,
-    EOF,
-    EOL,
     Extern,
     For,
     Func,

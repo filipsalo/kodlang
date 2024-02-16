@@ -4,7 +4,6 @@
 import ctypes
 import dataclasses
 import sys
-
 from functools import partial
 
 from kod import ast, tokens, types

@@ -2,14 +2,14 @@
 """I am the Kod language."""
 
 import argparse
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
-from kod.builder import Builder, FileWrapper
-from kod.interpreter import Interpreter
-from kod.exceptions import KodSyntaxError
 import kod.ast as ast
+from kod.builder import Builder, FileWrapper
+from kod.exceptions import KodSyntaxError
+from kod.interpreter import Interpreter
 
 
 def main():

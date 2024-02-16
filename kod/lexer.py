@@ -4,6 +4,8 @@
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
+    EOF,
+    EOL,
     Anon,
     Arrow,
     BooleanLiteral,
@@ -14,8 +16,6 @@ from kod.tokens import (
     Comma,
     Comment,
     Dot,
-    EOF,
-    EOL,
     Else,
     Equal,
     EqualEqual,
@@ -26,9 +26,9 @@ from kod.tokens import (
     Identifier,
     If,
     Import,
+    IntegerLiteral,
     LessThan,
     Let,
-    IntegerLiteral,
     Minus,
     OpenBracket,
     OpenCurly,

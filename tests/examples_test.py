@@ -4,7 +4,6 @@ import io
 import subprocess
 import sys
 import unittest
-
 from pathlib import Path
 
 from kod.builder import Builder, FileWrapper
