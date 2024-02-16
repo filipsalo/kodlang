@@ -8,6 +8,7 @@ from typing import Any, Self
 
 class Type:
     """A type in Kod."""
+
     name = "Type"
 
     def __init__(self, value: Any):
@@ -20,14 +21,18 @@ class Type:
     def from_name(name):
         """Return a type from a name."""
         match name:
-            case "int64": return Int64
-            case "str": return String
-            case "none": return None_
+            case "int64":
+                return Int64
+            case "str":
+                return String
+            case "none":
+                return None_
         raise ValueError(f"Unknown type {name!r}")
 
 
 class Bool(Type):
     """A boolean."""
+
     name = "bool"
     width = 1
 
@@ -38,6 +43,7 @@ class Bool(Type):
 
 class String(Type):
     """A UTF-8 string."""
+
     name = "str"
     width = 8
 
@@ -62,6 +68,7 @@ class String(Type):
 
 class Int64(Type):
     """A 64-bit integer."""
+
     name = "int64"
     width = 8
 
@@ -107,6 +114,7 @@ None_ = object()
 
 class ArrayType(Type, ABC):
     """An array type."""
+
     _cache = {}
 
     @classmethod
@@ -121,7 +129,7 @@ class ArrayType(Type, ABC):
                 {
                     "name": kod_name,
                     "item_type": item_type,
-                    "__repr__": cls._subclass__repr__
+                    "__repr__": cls._subclass__repr__,
                 },
             )
         return cls._cache[item_type]

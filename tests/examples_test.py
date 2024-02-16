@@ -80,6 +80,7 @@ def make_testfunc(name, doc, src, expected):
         if "status" in expected:
             self.assertEqual(compiled.returncode, int(expected["status"]))
             self.assertEqual(interpreted.returncode, int(expected["status"]))
+
     testfunc.__name__ = name
     testfunc.__doc__ = doc
     return testfunc
@@ -87,6 +88,7 @@ def make_testfunc(name, doc, src, expected):
 
 class ExamplesTestCase(unittest.TestCase):
     """Test that the examples in the tests directory run without error."""
+
     maxDiff = 2048
 
 

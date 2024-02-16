@@ -14,6 +14,7 @@ libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
 class ReturnValue(Exception):
     """Return from a function"""
+
     def __init__(self, value):
         self.value = value
 
@@ -120,7 +121,9 @@ class Interpreter:
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
             case _:
-                raise ValueError(f"Don't know how to evaluate expression {expression!r}")
+                raise ValueError(
+                    f"Don't know how to evaluate expression {expression!r}"
+                )
 
     def execute_statement(self, module, statement):
         """Execute a statement"""
@@ -131,12 +134,17 @@ class Interpreter:
             case ast.ParsedImport(module_name):
                 name = module_name.value.to_py_str()
                 module.names[name.lstrip("./")] = self.program.get_module(name).module
-            case ast.ParsedFunctionDeclaration(name) | ast.ParsedExternalFunctionDeclaration(name):
+            case (
+                ast.ParsedFunctionDeclaration(name)
+                | ast.ParsedExternalFunctionDeclaration(name)
+            ):
                 module.names[name] = statement
                 statement.module = module
             case ast.ParsedFunctionCall():
                 callee = self.evaluate_expression(module, statement.callee)
-                args = list(map(partial(self.evaluate_expression, module), statement.args))
+                args = list(
+                    map(partial(self.evaluate_expression, module), statement.args)
+                )
                 self.call_function(module, callee, args)
             case ast.ParsedVariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
@@ -154,11 +162,15 @@ class Interpreter:
                 rhs = self.evaluate_expression(module, rhs)
                 self.assign(module, lhs.id, rhs)
             case ast.ParsedIfStatement(condition, true_branch, false_branch):
-                matched = self.evaluate_expression(module, condition).to_bool().value is True
+                matched = (
+                    self.evaluate_expression(module, condition).to_bool().value is True
+                )
                 for statement in true_branch if matched else false_branch:
                     self.execute_statement(module, statement)
             case ast.ParsedForStatement(condition, body):
-                while self.evaluate_expression(module, condition).to_bool().value is True:
+                while (
+                    self.evaluate_expression(module, condition).to_bool().value is True
+                ):
                     for stmt in body:
                         self.execute_statement(module, stmt)
             case _:
@@ -181,19 +193,14 @@ class Interpreter:
             return func(*args)
         if isinstance(func, ast.ParsedExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)
-            c_func.argtypes = [
-                self.c_type(p.variable.type)
-                for p in func.params
-            ]
+            c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]
             return getattr(libc, func.name)(*args)
 
         # Map args to params
         args = {
             param.variable.id: (
-                self.lookup(module, arg)
-                if isinstance(arg, ast.ParsedVariable)
-                else arg
+                self.lookup(module, arg) if isinstance(arg, ast.ParsedVariable) else arg
             )
             for param, arg in zip(func.params, args)
         }

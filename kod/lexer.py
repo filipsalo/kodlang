@@ -114,7 +114,7 @@ class Lexer:
             self.pos += 1
         self.consume('"')
         string = self.build(StringLiteral)
-        string.value = string.value.encode().decode('unicode-escape')
+        string.value = string.value.encode().decode("unicode-escape")
         return string
 
     def lex_number(self):
@@ -214,7 +214,7 @@ class Lexer:
                     yield self.lex_arrow_or_minus()
                 case '"':
                     yield self.lex_string()
-                case ("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"):
+                case "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9":
                     yield self.lex_number()
                 case "/":
                     yield self.lex_slash_or_comment()

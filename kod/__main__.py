@@ -8,7 +8,6 @@ import sys
 
 from kod.builder import Builder, FileWrapper
 from kod.interpreter import Interpreter
-from kod.typechecker import TypeChecker
 from kod.exceptions import KodSyntaxError
 import kod.ast as ast
 
@@ -21,11 +20,11 @@ def main():
 
     interpret_parser = subparsers.add_parser("interpret")
     interpret_parser.add_argument("file", type=FileWrapper)
-    interpret_parser.add_argument('args', nargs='*')
+    interpret_parser.add_argument("args", nargs="*")
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("file", type=FileWrapper)
-    run_parser.add_argument('args', nargs='*')
+    run_parser.add_argument("args", nargs="*")
 
     parse_parser = subparsers.add_parser("parse")
     parse_parser.add_argument("file", type=FileWrapper)

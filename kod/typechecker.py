@@ -7,6 +7,7 @@ from kod.exceptions import KodSyntaxError
 
 class TypeChecker:
     """A typechecker for the kod language."""
+
     def __init__(self, program):
         self.program = program
         self.function_types = {}
@@ -22,7 +23,10 @@ class TypeChecker:
         builtins = self.program.get_module("builtins")
         for node in module.body + builtins.ast.body:
             match node:
-                case ast.ParsedFunctionDeclaration() | ast.ParsedExternalFunctionDeclaration():
+                case (
+                    ast.ParsedFunctionDeclaration()
+                    | ast.ParsedExternalFunctionDeclaration()
+                ):
                     self.function_types[node.name] = node.params
         for statement in module.body:
             self.check_statement(statement)
@@ -33,7 +37,9 @@ class TypeChecker:
             case ast.ParsedFunctionCall():
                 self.check_function_call(node)
             case ast.ParsedFunctionDeclaration():
-                self.stack.append({param.variable.id: param.variable for param in node.params})
+                self.stack.append(
+                    {param.variable.id: param.variable for param in node.params}
+                )
                 for statement in node.body:
                     self.check_statement(statement)
             case ast.ParsedExternalFunctionDeclaration():
@@ -58,7 +64,9 @@ class TypeChecker:
     def verify_arguments(self, function_name, arguments):
         """Verify that the given arguments match the expected types."""
         if function_name not in self.function_types:
-            raise KodSyntaxError(f"Function '{function_name}' not found", function_name.span)
+            raise KodSyntaxError(
+                f"Function '{function_name}' not found", function_name.span
+            )
 
         params = self.function_types[function_name]
 

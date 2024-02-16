@@ -61,9 +61,25 @@ class StackFrame:
         self.end_label = end_label
         self.return_value = None
         self.registers = [
-            "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+            "x8",
+            "x9",
+            "x10",
+            "x11",
+            "x12",
+            "x13",
+            "x14",
+            "x15",
             # todo: handle the below as non-volatile
-            "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+            "x19",
+            "x20",
+            "x21",
+            "x22",
+            "x23",
+            "x24",
+            "x25",
+            "x26",
+            "x27",
+            "x28",
         ]
 
     def declare_variable(self, variable):
@@ -135,7 +151,10 @@ class Compiler:
         self.emit(".text")
         for statement in self.builtins.body:
             match statement:
-                case ParsedExternalFunctionDeclaration(name) | ParsedFunctionDeclaration(name):
+                case (
+                    ParsedExternalFunctionDeclaration(name)
+                    | ParsedFunctionDeclaration(name)
+                ):
                     self.functions[name] = statement
 
         for statement in self.module.body:
@@ -289,10 +308,14 @@ class Compiler:
             self.mov(rhs_register, right)
             if isinstance(expression.op, (LessThan, GreaterThan, EqualEqual)):
                 self.emit("cmp", lhs_register, rhs_register)
-                op = {LessThan: "lt", GreaterThan: "gt", EqualEqual: "eq"}[type(expression.op)]
+                op = {LessThan: "lt", GreaterThan: "gt", EqualEqual: "eq"}[
+                    type(expression.op)
+                ]
                 self.emit("cset", lhs_register, op)
             else:
-                op = {Plus: "add", Minus: "sub", Slash: "sdiv", Star: "mul"}[type(expression.op)]
+                op = {Plus: "add", Minus: "sub", Slash: "sdiv", Star: "mul"}[
+                    type(expression.op)
+                ]
                 self.emit(op, lhs_register, lhs_register, rhs_register)
             self.stack[-1].release_register(rhs_register)
             return lhs_register

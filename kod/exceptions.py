@@ -33,7 +33,7 @@ class KodSyntaxError(Exception):
 
         for n, line in list(enumerate(lines, 1))[first : last + 1]:
             excerpt += f"{n:3d}: {line}\n"
-            if n == self.line :
+            if n == self.line:
                 excerpt += f"     {' ' * (self.col - 1)}^\n"
         return excerpt
 

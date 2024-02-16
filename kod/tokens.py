@@ -8,6 +8,7 @@ from kod.span import Span
 @dataclasses.dataclass
 class Token:
     """A token in the Kod language."""
+
     value: str
     span: Span
 
@@ -17,6 +18,7 @@ class Token:
 
 class BinaryOperator(Token):
     """A binary operator."""
+
     precedence: int = 1
     left_associative: bool = True
 
@@ -24,72 +26,84 @@ class BinaryOperator(Token):
 @dataclasses.dataclass
 class OpenBracket(BinaryOperator):
     """An open bracket."""
+
     precedence = 20
 
 
 @dataclasses.dataclass
 class OpenParen(BinaryOperator):
     """An open parenthesis."""
+
     precedence = 20
 
 
 @dataclasses.dataclass
 class Dot(BinaryOperator):
     """A dot."""
+
     precedence = 20
 
 
 @dataclasses.dataclass
 class Percent(BinaryOperator):
     """A percent sign."""
+
     precedence = 16
 
 
 @dataclasses.dataclass
 class Slash(BinaryOperator):
     """A slash."""
+
     precedence = 16
 
 
 @dataclasses.dataclass
 class Star(BinaryOperator):
     """A star."""
+
     precedence = 16
 
 
 @dataclasses.dataclass
 class Plus(BinaryOperator):
     """A plus sign."""
+
     precedence = 15
 
 
 @dataclasses.dataclass
 class Minus(BinaryOperator):
     """A minus sign."""
+
     precedence = 15
 
 
 @dataclasses.dataclass
 class Equal(BinaryOperator):
     """An equals sign."""
+
     precedence = 10
 
 
 @dataclasses.dataclass
 class EqualEqual(BinaryOperator):
     """Two equals signs."""
+
     precedence = 12
 
 
 @dataclasses.dataclass
 class LessThan(BinaryOperator):
     """An equals sign."""
+
     precedence = 12
 
 
 @dataclasses.dataclass
 class GreaterThan(BinaryOperator):
     """An equals sign."""
+
     precedence = 12
 
 

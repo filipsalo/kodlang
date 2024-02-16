@@ -32,6 +32,7 @@ class ASTNode:
 @dataclasses.dataclass
 class Literal:
     """A literal."""
+
     value: any
     span: Span
 
@@ -78,7 +79,7 @@ class ParsedBooleanLiteral(ASTNode, Literal):
     def parse(cls, parser):
         """Parse an integer literal."""
         token = parser.consume(tokens.BooleanLiteral)
-        value = types.Bool(token.value == 'true')
+        value = types.Bool(token.value == "true")
         return cls(value, span=token.span)
 
 

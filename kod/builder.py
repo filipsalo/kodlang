@@ -15,6 +15,7 @@ from kod.program import BuildModule, Program
 
 class FileWrapper:
     """A wrapper for a file."""
+
     def __init__(self, path, file=None):
         if path == "-":
             file = sys.stdin
@@ -33,6 +34,7 @@ class FileWrapper:
 
 class Builder:
     """Build the project."""
+
     def __init__(self, *, root_path: Path, stdlib_path: Path):
         self.root_path = root_path
         self.stdlib_path = stdlib_path
@@ -41,7 +43,9 @@ class Builder:
 
     def parse_builtins(self) -> None:
         """Parse the builtins module."""
-        builtins = self.parse_module("builtins", self.resolve_name("builtins", self.root_path))
+        builtins = self.parse_module(
+            "builtins", self.resolve_name("builtins", self.root_path)
+        )
         self.program.add_module(builtins)
 
     def resolve_name(self, module_name, root_path) -> Path:
@@ -93,12 +97,11 @@ class Builder:
         asm = self.compile_module(name)
         (Path("build") / module.asm_path).write_text(asm)
         object_file = Path("build") / module.object_path
-        subprocess.run([
-            "as",
-            "-target", "arm64-apple-darwin",
-            "-o", object_file,
-            "-"
-        ], input=asm.encode("ascii"), check=True)
+        subprocess.run(
+            ["as", "-target", "arm64-apple-darwin", "-o", object_file, "-"],
+            input=asm.encode("ascii"),
+            check=True,
+        )
 
     def build_runtime_main(self, main_module):
         """Build the runtime main function."""
@@ -109,12 +112,11 @@ class Builder:
             _main:
                 b ${main_module}$main
         """
-        subprocess.run([
-            "as",
-            "-target", "arm64-apple-darwin",
-            "-o", runtime_main_path,
-            "-"
-        ], input=asm.encode("ascii"), check=True)
+        subprocess.run(
+            ["as", "-target", "arm64-apple-darwin", "-o", runtime_main_path, "-"],
+            input=asm.encode("ascii"),
+            check=True,
+        )
 
     def build_executable(self, path: Path) -> Path:
         """Build an executable."""
@@ -123,11 +125,19 @@ class Builder:
         self.build_runtime_main(path)
         executable = Path("build") / path
         runtime_main_path = Path("build") / "runtime_main.o"
-        subprocess.run([
-            "ld",
-            "-macos_version_min", "14",
-            "-lc",
-            "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-            "-o", executable,
-        ] + [Path("build") / module.object_path for module in self.program] + [runtime_main_path], check=True)
+        subprocess.run(
+            [
+                "ld",
+                "-macos_version_min",
+                "14",
+                "-lc",
+                "-L",
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+                "-o",
+                executable,
+            ]
+            + [Path("build") / module.object_path for module in self.program]
+            + [runtime_main_path],
+            check=True,
+        )
         return executable

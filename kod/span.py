@@ -6,6 +6,7 @@ from pathlib import Path
 @dataclasses.dataclass
 class Span:
     """A span between two positions in a source file."""
+
     filename: Path
     start: int
     end: int
@@ -15,7 +16,9 @@ class Span:
 
     def __or__(self, other: "Span") -> "Span":
         """Return the span that covers both self and other."""
-        return Span(self.filename, min(self.start, other.start), max(self.end, other.end))
+        return Span(
+            self.filename, min(self.start, other.start), max(self.end, other.end)
+        )
 
     def __ior__(self, other: "Span") -> "Span":
         """Update self to cover both self and other."""

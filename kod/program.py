@@ -3,6 +3,7 @@ from pathlib import Path
 
 class BuildModule:
     """A module is a collection of functions."""
+
     def __init__(self, module):
         self.module = module
         self.name = module.name
@@ -20,6 +21,7 @@ class BuildModule:
 
 class Program:
     """A program is a collection of modules."""
+
     def __init__(self):
         self.modules = {}
 
