@@ -3,14 +3,16 @@
 import io
 import subprocess
 import sys
+import types
 from pathlib import Path
+from typing import Dict, Generator, Tuple
 
 import pytest
 
 from kod.builder import Builder, FileWrapper
 
 
-def run_interpreted(source):
+def run_interpreted(source: str) -> subprocess.CompletedProcess:
     """Run a program in the interpreter."""
     result = subprocess.run(
         [sys.executable, "-m", "kod", "interpret", "-"],
@@ -22,7 +24,7 @@ def run_interpreted(source):
     return result
 
 
-def run_compiled(source):
+def run_compiled(source: str) -> subprocess.CompletedProcess:
     """Run a program compiled to an executable."""
     result = subprocess.run(
         [sys.executable, "-m", "kod", "run", "-"],
@@ -34,7 +36,7 @@ def run_compiled(source):
     return result
 
 
-def compile_to_assembly(source):
+def compile_to_assembly(source: str) -> str:
     """Compile a program to assembly."""
     bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
     file_wrapper = FileWrapper("main.kod", io.StringIO(source))
@@ -58,7 +60,7 @@ def parse_example(path: Path) -> tuple[str, dict[str, str]]:
     return src, expects
 
 
-def generate_tests():
+def generate_tests() -> Generator[Tuple[types.FunctionType, str, Dict[str, str]]]:
     """Generate tests from example files."""
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
     for path in test_dir.glob("*.kod"):
@@ -75,7 +77,7 @@ def generate_tests():
 
 
 @pytest.mark.parametrize("func,src,expects", generate_tests())
-def test_example(func, src: str, expects: dict[str, str]):
+def test_example(func: types.FunctionType, src: str, expects: dict[str, str]):
     """Run example-based tests."""
     result = func(src)
     assert result
