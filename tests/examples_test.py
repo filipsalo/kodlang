@@ -3,8 +3,9 @@
 import io
 import subprocess
 import sys
-import unittest
 from pathlib import Path
+
+import pytest
 
 from kod.builder import Builder, FileWrapper
 
@@ -41,13 +42,12 @@ def compile_to_assembly(source):
     return bob.compile_module("main")
 
 
-def make_tests(path):
-    """Make a test function for a given test file."""
+def parse_example(path: Path) -> tuple[str, dict[str, str]]:
+    """Parse an example file into source and expected results."""
     with path.open() as f:
         src, *expect_blocks = f.read().split("// expected ")
     expects = {}
     for expect_block in expect_blocks:
-        # print(repr(expect_block))
         expected, block = expect_block.split(":\n", 1)
         block = "".join(
             line.removeprefix("// ")
@@ -55,43 +55,32 @@ def make_tests(path):
             if line.strip()
         )
         expects[expected] = block
-
-    description = src.splitlines()[0].strip("/ ")
-    name = f"test_{path}"
-    doc = f"{description} ({path})"
-    yield make_testfunc(name, doc, src, expects)
+    return src, expects
 
 
-# pylint: disable=missing-function-docstring
-def make_testfunc(name, doc, src, expected):
-    def testfunc(self):
-        if not expected:
-            asm = compile_to_assembly(src)
-            self.assertTrue(asm)
-            return
-        compiled = run_compiled(src)
-        if "status" not in expected:
-            expected["status"] = "0"
-        interpreted = run_interpreted(src)
-        if "output" in expected:
-            self.assertEqual(compiled.stdout, expected["output"])
-            self.assertEqual(interpreted.stdout, expected["output"])
-        if "status" in expected:
-            self.assertEqual(compiled.returncode, int(expected["status"]))
-            self.assertEqual(interpreted.returncode, int(expected["status"]))
-
-    testfunc.__name__ = name
-    testfunc.__doc__ = doc
-    return testfunc
+def generate_tests():
+    """Generate tests from example files."""
+    test_dir = Path(__file__).parent.relative_to(Path.cwd())
+    for path in test_dir.glob("*.kod"):
+        src, expects = parse_example(path)
+        if not expects:
+            yield pytest.param(
+                compile_to_assembly, src, expects, id=f"{path.stem}_compile"
+            )
+        else:
+            yield pytest.param(run_compiled, src, expects, id=f"{path.stem}_run")
+            yield pytest.param(
+                run_interpreted, src, expects, id=f"{path.stem}_interpret"
+            )
 
 
-class ExamplesTestCase(unittest.TestCase):
-    """Test that the examples in the tests directory run without error."""
-
-    maxDiff = 2048
-
-
-test_dir = Path(__file__).parent.relative_to(Path.cwd())
-for example in test_dir.glob("*.kod"):
-    for test in make_tests(example):
-        setattr(ExamplesTestCase, test.__name__, test)
+@pytest.mark.parametrize("func,src,expects", generate_tests())
+def test_example(func, src: str, expects: dict[str, str]):
+    """Run example-based tests."""
+    result = func(src)
+    assert result
+    if not expects:
+        return
+    if "output" in expects:
+        assert result.stdout == expects["output"]
+    assert result.returncode == int(expects.get("status", 0))
