@@ -2,6 +2,7 @@
 
 import dataclasses
 from pathlib import Path
+from typing import Any
 
 from kod import tokens, types
 from kod.parser import Parser
@@ -33,7 +34,7 @@ class ASTNode:
 class Literal:
     """A literal."""
 
-    value: any
+    value: Any
     span: Span
 
 
@@ -265,7 +266,7 @@ class ParsedImport(ASTNode):
         """Parse an import statement."""
         with parser.span() as span:
             parser.consume(tokens.Import)
-            module_name = ParsedStringLiteral.parse(parser)
+            module_name = ParsedStringLiteral.parse(parser).value.to_py_str()
         return cls(module_name, span)
 
 

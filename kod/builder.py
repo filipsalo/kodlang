@@ -4,6 +4,7 @@ import io
 import subprocess
 import sys
 from pathlib import Path
+from typing import TextIO
 
 from kod import ast
 from kod.compiler import Compiler
@@ -22,7 +23,7 @@ class FileWrapper:
         self.path = Path(path)
         self.file = file
 
-    def open(self, *args, **kwargs) -> io.TextIOWrapper:
+    def open(self, *args, **kwargs) -> TextIO:
         """Open the file."""
         if self.file:
             return self.file
@@ -47,7 +48,7 @@ class Builder:
         )
         self.program.add_module(builtins)
 
-    def resolve_name(self, module_name, root_path) -> Path:
+    def resolve_name(self, module_name, root_path) -> FileWrapper:
         """Resolve a name to a Path"""
         if not module_name.startswith("./"):
             root_path = self.stdlib_path
@@ -67,7 +68,7 @@ class Builder:
         tokens = Lexer(source, file_wrapper.path).lex()
         module = Parser(tokens, file_wrapper.path, name).parse()
         for import_ in self.get_imports(module):
-            name = import_.module_name.value.to_py_str()
+            name = import_.module_name
             if name not in self.program.modules:
                 import_path = self.resolve_name(name, file_wrapper.path.parent)
                 import_module = self.parse_module(name, import_path)
@@ -133,10 +134,10 @@ class Builder:
                 "-L",
                 "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
                 "-o",
-                executable,
+                str(executable),
             ]
-            + [Path("build") / module.object_path for module in self.program]
-            + [runtime_main_path],
+            + [str(Path("build") / module.object_path) for module in self.program]
+            + [str(runtime_main_path)],
             check=True,
         )
         return executable

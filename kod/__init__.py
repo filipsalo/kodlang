@@ -11,4 +11,4 @@ def debug_print(*things):
         print("\033[00m", file=sys.stderr)
 
 
-builtins.dbg = debug_print
+setattr(builtins, "dbg", debug_print)

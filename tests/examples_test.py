@@ -60,7 +60,9 @@ def parse_example(path: Path) -> tuple[str, dict[str, str]]:
     return src, expects
 
 
-def generate_tests() -> Generator[Tuple[types.FunctionType, str, Dict[str, str]]]:
+def generate_tests() -> (
+    Generator[Tuple[types.FunctionType, str, Dict[str, str]], None, None]
+):
     """Generate tests from example files."""
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
     for path in test_dir.glob("*.kod"):

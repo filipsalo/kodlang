@@ -78,11 +78,11 @@ class Int64(Type):
 
     def op_plus(self, other: Self) -> Self:
         """Add two integers."""
-        return Int64(self.value + other.value)
+        return self.__class__(self.value + other.value)
 
     def op_minus(self, other: Self) -> Self:
         """Add two integers."""
-        return Int64(self.value - other.value)
+        return self.__class__(self.value - other.value)
 
     def op_eq(self, other: Self) -> Bool:
         """Compare two integers."""
@@ -98,15 +98,15 @@ class Int64(Type):
 
     def op_mod(self, other: Self) -> Self:
         """Modulo two integers."""
-        return Int64(self.value % other.value)
+        return self.__class__(self.value % other.value)
 
     def op_div(self, other: Self) -> Self:
         """Divide two integers."""
-        return Int64(self.value // other.value)
+        return self.__class__(self.value // other.value)
 
     def op_mul(self, other: Self) -> Self:
         """Multiply two integers."""
-        return Int64(self.value * other.value)
+        return self.__class__(self.value * other.value)
 
 
 None_ = object()
@@ -115,7 +115,7 @@ None_ = object()
 class ArrayType(Type, ABC):
     """An array type."""
 
-    _cache = {}
+    _cache: dict[Any, Any] = {}
 
     @classmethod
     def make(cls, item_type: Type):
