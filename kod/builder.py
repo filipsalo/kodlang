@@ -93,6 +93,7 @@ class Builder:
 
     def build_module(self, name: str) -> None:
         """Build a module."""
+        print(f"\033[1;30mBuilding module \033[1;36m{name}\033[0m", file=sys.stderr)
         module = self.program.get_module(name)
         asm = self.compile_module(name)
         (Path("build") / module.asm_path).write_text(asm)
@@ -112,6 +113,7 @@ class Builder:
             _main:
                 b ${main_module}$main
         """
+        (Path("build") / "runtime_main.s").write_text(asm)
         subprocess.run(
             ["as", "-target", "arm64-apple-darwin", "-o", runtime_main_path, "-"],
             input=asm.encode("ascii"),
@@ -120,12 +122,13 @@ class Builder:
 
     def build_executable(self, path: Path) -> Path:
         """Build an executable."""
+        print(f"\033[1;30mBuilding executable \033[1;36m{path}\033[0m", file=sys.stderr)
         for module in self.program:
             self.build_module(module.name)
         self.build_runtime_main(path)
         executable = Path("build") / path
         runtime_main_path = Path("build") / "runtime_main.o"
-        subprocess.run(
+        cmd = (
             [
                 "ld",
                 "-macos_version_min",
@@ -137,7 +140,11 @@ class Builder:
                 str(executable),
             ]
             + [str(Path("build") / module.object_path) for module in self.program]
-            + [str(runtime_main_path)],
+            + [str(runtime_main_path)]
+        )
+        print(f"\033[1;30mRunning\033[0m {" ".join(cmd)}", file=sys.stderr)
+        subprocess.run(
+            cmd,
             check=True,
         )
         return executable
