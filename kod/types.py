@@ -121,7 +121,7 @@ class ArrayType(Type, ABC):
     def make(cls, item_type: Type):
         """Make an array type."""
         if item_type not in cls._cache:
-            python_name = f"{item_type.__name__}Array"
+            python_name = f"{item_type.name}Array"
             kod_name = f"[{item_type.name}]"
             cls._cache[item_type] = type(
                 python_name,

@@ -30,7 +30,11 @@ class StringConstant:
         self.value = value
 
 
-class Label:
+class Operand:
+    """An address"""
+
+
+class Label(Operand):
     """A label"""
 
     def __init__(self, name):
@@ -46,11 +50,37 @@ class Label:
         return f"Label({self.name!r})"
 
 
-class Imm(int):
+class Imm(Operand):
     """An immediate value"""
 
+    def __init__(self, value: int):
+        self.value = value
+
     def __str__(self):
-        return f"#{int(self)}"
+        return f"#{self.value}"
+
+
+class Register(Operand):
+    """A register"""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+
+class StackAddress(Operand):
+    """An address on the stack"""
+
+    def __init__(self, offset: int, base: str = "fp"):
+        self.offset = offset
+        self.base = base
+
+    def __str__(self):
+        if not self.offset:
+            return f"[{self.base}]"
+        return f"[{self.base}, #{self.offset}]"
 
 
 class StackFrame:
@@ -60,27 +90,7 @@ class StackFrame:
         self.variables = {variable.id: variable for variable in variables}
         self.end_label = end_label
         self.return_value = None
-        self.registers = [
-            "x8",
-            "x9",
-            "x10",
-            "x11",
-            "x12",
-            "x13",
-            "x14",
-            "x15",
-            # todo: handle the below as non-volatile
-            "x19",
-            "x20",
-            "x21",
-            "x22",
-            "x23",
-            "x24",
-            "x25",
-            "x26",
-            "x27",
-            "x28",
-        ]
+        self.registers = [Register(f"x{n}") for n in [*range(8, 16), *range(19, 28)]]
 
     def declare_variable(self, variable):
         """Declare a variable"""
@@ -95,7 +105,7 @@ class StackFrame:
                 break
         else:
             raise ValueError(f"Unknown variable {variable!r}")
-        return f"[fp, #{offset}]" if offset else "[fp]"
+        return StackAddress(offset, "fp")
 
     def size(self):
         """Return the size of the stack frame"""
@@ -118,7 +128,7 @@ class StackFrame:
 class Compiler:
     """An assembler for the Kod language."""
 
-    _argregs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+    _argregs = [*map(Register, ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"])]
 
     def __init__(self, module, builtins, output=sys.stdout):
         self.module = module
@@ -204,9 +214,14 @@ class Compiler:
         self.emit_label(label)
         frame = StackFrame(func.variables.values(), label.end)
         self.stack.append(frame)
-        self.emit("sub", "sp", "sp", Imm(frame.aligned_size() + 16))
-        self.emit("stp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
-        self.emit("add", "fp", "sp", Imm(frame.aligned_size()))
+        self.emit("sub", Register("sp"), Register("sp"), Imm(frame.aligned_size() + 16))
+        self.emit(
+            "stp",
+            Register("fp"),
+            Register("lr"),
+            StackAddress(frame.aligned_size(), "sp"),
+        )
+        self.emit("add", Register("fp"), Register("sp"), Imm(frame.aligned_size()))
         if func.params:
             self.move_args_to_stack(func)
 
@@ -215,7 +230,7 @@ class Compiler:
         offset = 0
         for param, register in zip(func.params, self._argregs):
             offset -= param.variable.type.width
-            self.emit("str", register, f"[fp, #{offset}]")
+            self.emit("str", register, StackAddress(offset, "fp"))
 
     def leave_stack_frame(self):
         """Emit the epilogue for a function"""
@@ -223,13 +238,18 @@ class Compiler:
         return_value = self.stack[-1].return_value
         print(f"{label}:", file=self.output)
         if return_value is None:
-            self.mov("w0", Imm(0))
+            self.mov(Register("w0"), Imm(0))
         else:
             addr = self.compile_expression(return_value)
-            self.mov("x0", addr)
+            self.mov(Register("x0"), addr)
         frame = self.stack.pop()
-        self.emit("ldp", "fp", "lr", f"[sp, #{frame.aligned_size()}]")
-        self.emit("add", "sp", "sp", Imm(frame.aligned_size() + 16))
+        self.emit(
+            "ldp",
+            Register("fp"),
+            Register("lr"),
+            StackAddress(frame.aligned_size(), "sp"),
+        )
+        self.emit("add", Register("sp"), Register("sp"), Imm(frame.aligned_size() + 16))
         self.emit("ret")
 
     def compile_for_statement(self, condition, body):
@@ -265,7 +285,7 @@ class Compiler:
         """Compile a variable declaration to assembly"""
         destination = self.stack[-1].get_variable_address(variable)
         address = self.compile_expression(expression)
-        if isinstance(address, (Imm, str)):
+        if isinstance(address, (Imm, Register)):
             register = self.stack[-1].allocate_register()
             self.mov(register, address)
             self.emit("str", register, destination)
@@ -284,7 +304,7 @@ class Compiler:
         elif isinstance(expression, ParsedIntegerLiteral):
             return Imm(expression.value.value)
         elif isinstance(expression, ParsedBooleanLiteral):
-            return Imm(expression.value.value)
+            return Imm(int(expression.value.value))
         elif isinstance(expression, ParsedName):
             return self.stack[-1].get_variable_address(expression)
         elif isinstance(expression, ParsedFunctionCall):
@@ -320,9 +340,9 @@ class Compiler:
             self.stack[-1].release_register(rhs_register)
             return lhs_register
         finally:
-            if isinstance(left, str) and left[0] == "x":
+            if isinstance(left, Register):
                 self.stack[-1].release_register(left)
-            if isinstance(right, str) and right[0] == "x":
+            if isinstance(right, Register):
                 self.stack[-1].release_register(right)
 
     def emit_label(self, label):
@@ -348,7 +368,7 @@ class Compiler:
                 raise ValueError(f"Unexpected function call {func_call.callee}")
         self.prepare_args(func, func_call.args)
         self.emit("bl", func.label_name)
-        return "x0"
+        return Register("x0")
 
     def prepare_args(self, func, args):
         """Prepare arguments for a function call"""
@@ -360,7 +380,7 @@ class Compiler:
 
     def mov(self, dest, src):
         """Move a value"""
-        if isinstance(src, str) and src.startswith("["):
+        if isinstance(src, StackAddress):
             self.emit("ldr", dest, src)
         else:
             self.emit("mov", dest, src)

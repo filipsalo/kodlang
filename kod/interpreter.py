@@ -33,8 +33,8 @@ class Interpreter:
             module = module.module
             for statement in module.body:
                 self.execute_statement(module, statement)
-        entry_module_name = self.program.get_module(entry_module_name).module
-        main = self.lookup(entry_module_name, "main")
+        entry_module = self.program.get_module(entry_module_name).module
+        main = self.lookup(entry_module, "main")
         string_array = types.ArrayType.make(types.String)
         argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
         exit_code = self.call_function(entry_module_name, main, [argv])
