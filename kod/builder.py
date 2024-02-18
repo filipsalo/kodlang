@@ -55,7 +55,7 @@ class Builder:
         path = (root_path / module_name).with_suffix(".kod")
         return FileWrapper(path)
 
-    def parse_program(self, file_wrapper: FileWrapper) -> Program:
+    def parse_program(self, file_wrapper: str) -> Program:
         """Parse the program starting at `main_path`."""
         main = self.parse_module(file_wrapper.path.stem, file_wrapper)
         self.program.add_module(main)
@@ -111,7 +111,7 @@ class Builder:
             .text
             .globl _main
             _main:
-                b ${main_module}$main
+                b ${str(main_module).replace("/", "$")}$main
         """
         (Path("build") / "runtime_main.s").write_text(asm)
         subprocess.run(
@@ -126,7 +126,7 @@ class Builder:
         for module in self.program:
             self.build_module(module.name)
         self.build_runtime_main(path)
-        executable = Path("build") / path
+        executable = Path("build") / path.stem
         runtime_main_path = Path("build") / "runtime_main.o"
         cmd = (
             [

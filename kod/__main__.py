@@ -37,6 +37,8 @@ def main():
 
     args = parser.parse_args()
 
+    entry_module = args.file.path.with_suffix("")
+
     try:
         bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
         program = bob.parse_program(args.file)
@@ -44,12 +46,10 @@ def main():
         print(err, file=sys.stderr)
         return 1
 
-    entry_module = args.file.path.stem
-
     match args.command:
         case "interpret":
             argv = [str(args.file.path)] + args.args
-            Interpreter(program).run(entry_module, argv)
+            Interpreter(program).run(str(entry_module), argv)
         case "compile":
             print(bob.compile_module(entry_module))
             return 0
