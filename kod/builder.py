@@ -56,7 +56,7 @@ class Builder:
         path = (root_path / module_name).with_suffix(".kod")
         return FileWrapper(path)
 
-    def parse_program(self, file_wrapper: str) -> Program:
+    def parse_program(self, file_wrapper: FileWrapper) -> Program:
         """Parse the program starting at `main_path`."""
         main = self.parse_module(file_wrapper.path.stem, file_wrapper)
         self.program.add_module(main)
