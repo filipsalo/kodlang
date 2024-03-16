@@ -2,7 +2,7 @@
 
 import dataclasses
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from kod import tokens, types
 from kod.parser import Parser
@@ -23,6 +23,15 @@ def dump(node, indent=""):
         else:
             print(f"{indent + '    '}{field.name}={value!r},")
     print(f"{indent}),")
+
+
+Statement = Union[
+    "ParsedImport",
+    "ParsedExternalFunctionDeclaration",
+    "ParsedFunctionDeclaration",
+    "ParsedVariableDeclaration",
+    "ParsedAssignment",
+]
 
 
 @dataclasses.dataclass
@@ -214,7 +223,7 @@ class ParsedFunctionCall(ASTNode):
     """A function call."""
 
     callee: ASTNode
-    args: list[ASTNode]
+    args: list[Statement]
     span: Span
 
 
@@ -225,7 +234,7 @@ class ParsedFunctionDeclaration(ASTNode):
     name: str
     label_name: str
     params: ParsedFunctionParamList
-    body: list[ASTNode]
+    body: list[Statement]
     return_type: str
     variables: list[ParsedVariable]
     span: Span
@@ -391,15 +400,6 @@ class ParsedAssignment(ASTNode):
     lhs: ParsedExpression
     rhs: ParsedExpression
     span: Span
-
-
-Statement = (
-    ParsedImport
-    | ParsedExternalFunctionDeclaration
-    | ParsedFunctionDeclaration
-    | ParsedVariableDeclaration
-    | ParsedAssignment
-)
 
 
 @dataclasses.dataclass
