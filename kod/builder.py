@@ -29,7 +29,8 @@ class FileWrapper:
             return self.file
         elif self.path == Path("-"):
             return sys.stdin
-        return self.path.open(*args, **kwargs)
+        encoding = kwargs.pop("encoding", "utf8")
+        return self.path.open(*args, encoding=encoding, **kwargs)
 
 
 class Builder:
