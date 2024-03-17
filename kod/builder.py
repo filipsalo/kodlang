@@ -62,8 +62,7 @@ class Builder:
         main = self.parse_module(file_wrapper.path.stem, file_wrapper)
         self.program.add_module(main)
         type_checker = TypeChecker(self.program)
-        type_checker.check()
-        if type_checker.errors:
+        if not type_checker.check():
             for error in type_checker.errors:
                 print(error, file=sys.stderr)
             sys.exit(1)

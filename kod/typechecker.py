@@ -25,9 +25,7 @@ class TypeChecker:
         """Check the program for type errors."""
         for module in self.program:
             self.check_module(module.module)
-        # if self.errors:
-        #     msg = "\n".join(f"{err.span}: {err.msg}" for err in self.errors)
-        #     raise ValueError(msg)
+        return not self.errors
 
     def check_module(self, module):
         """Check a module for type errors."""
