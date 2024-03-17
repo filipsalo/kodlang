@@ -1,26 +1,38 @@
 """A typechecker for the kod language."""
 
+from typing import Any
+
 from kod import ast
 from kod.exceptions import KodSyntaxError
+from kod.span import Span
 
 
 class TypeChecker:
     """A typechecker for the kod language."""
 
-    def __init__(self, program):
+    def __init__(self, program) -> None:
         self.program = program
-        self.function_types = {}
-        self.stack = [{}]
+        self.function_types: dict[type, type] = {}
+        self.stack: list[dict[str, Any]] = [{}]
+        self.errors: list[KodSyntaxError] = []
+
+    def error(self, msg: str, span: Span):
+        """Add an error to the list of errors."""
+        err = KodSyntaxError(msg, span)
+        self.errors.append(err)
 
     def check(self):
         """Check the program for type errors."""
         for module in self.program:
-            self.check_module(module.ast)
+            self.check_module(module.module)
+        # if self.errors:
+        #     msg = "\n".join(f"{err.span}: {err.msg}" for err in self.errors)
+        #     raise ValueError(msg)
 
     def check_module(self, module):
         """Check a module for type errors."""
         builtins = self.program.get_module("builtins")
-        for node in module.body + builtins.ast.body:
+        for node in module.body + builtins.module.body:
             match node:
                 case (
                     ast.ParsedFunctionDeclaration()
@@ -30,7 +42,7 @@ class TypeChecker:
         for statement in module.body:
             self.check_statement(statement)
 
-    def check_statement(self, node):
+    def check_statement(self, node: ast.Statement):
         """Check a statement for type errors."""
         match node:
             case ast.ParsedFunctionCall():
@@ -43,18 +55,19 @@ class TypeChecker:
                     self.check_statement(statement)
             case ast.ParsedExternalFunctionDeclaration():
                 pass
-            case ast.ParsedVariableDeclaration(node):
+            case ast.ParsedVariableDeclaration():
                 self.check_variable_declaration(node)
-            case ast.ParsedAssignment():
-                pass
+            # case ast.ParsedAssignment():
+            #     pass
             case _:
-                raise ValueError(f"Don't know how to type check a {type(node)}")
+                self.error(f"Don't know how to typecheck a {type(node)}", node.span)
 
-    def check_variable_declaration(self, node):
+    def check_variable_declaration(self, node: ast.ParsedVariableDeclaration):
         """Check a function declaration for type errors."""
-        if node.id in self.stack[-1]:
-            raise ValueError(f"Variable '{node.name}' already declared")
-        self.stack[-1][node.id] = node
+        if node.variable.id in self.stack[-1]:
+            self.error(f"Variable '{node.variable.id}' already declared", node.span)
+
+        self.stack[-1][node.variable.id] = node
 
     def check_function_call(self, node):
         """Check a function call for type errors."""
@@ -63,32 +76,34 @@ class TypeChecker:
     def verify_arguments(self, function_name, arguments):
         """Verify that the given arguments match the expected types."""
         if function_name not in self.function_types:
-            raise KodSyntaxError(
-                f"Function '{function_name}' not found", function_name.span
+            self.error(
+                f"Function '{function_name}' not found",
+                function_name.span,
             )
 
         params = self.function_types[function_name]
 
         if len(arguments) != len(params):
-            raise KodSyntaxError(
+            self.error(
                 f"Expected {len(params)} arguments, but got {len(arguments)}",
-                arguments[0].span | arguments[-1].span,
+                arguments.span,
             )
 
         for arg, param in zip(arguments, params):
             if not arg.label and not param.anonymous:
-                raise ValueError(
-                    f"Expected argument '{param.variable.id}' to be labeled"
+                self.error(
+                    f"Expected argument '{param.variable.id}' to be labeled",
+                    arg.span,
                 )
             if isinstance(arg.expression, ast.ParsedVariable):
                 if arg.expression.id not in self.stack[-1]:
-                    raise KodSyntaxError(
+                    self.error(
                         f"Variable '{arg.expression.id}' not found",
                         arg.span,
                     )
                 arg_type = self.stack[-1][arg.expression.id].type
                 if arg_type != param.variable.type:
-                    raise KodSyntaxError(
+                    self.error(
                         f"Expected argument of type '{param.variable.type.name}', "
                         f"but got '{arg.expression.type}'",
                         arg.span,
