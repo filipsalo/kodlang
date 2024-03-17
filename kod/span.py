@@ -1,4 +1,5 @@
 """Helper class for representing spans in source files."""
+
 import dataclasses
 from pathlib import Path
 
@@ -10,6 +11,11 @@ class Span:
     filename: Path
     start: int
     end: int
+
+    @property
+    def length(self) -> int:
+        """Return the length of the span."""
+        return self.end - self.start
 
     def __repr__(self):
         return f"<{self.filename}:{self.start}-{self.end}>"
