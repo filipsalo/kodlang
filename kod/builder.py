@@ -11,6 +11,7 @@ from kod.compiler import Compiler
 from kod.lexer import Lexer
 from kod.parser import Parser
 from kod.program import BuildModule, Program
+from kod.typechecker import TypeChecker
 
 
 class FileWrapper:
@@ -60,6 +61,13 @@ class Builder:
         """Parse the program starting at `main_path`."""
         main = self.parse_module(file_wrapper.path.stem, file_wrapper)
         self.program.add_module(main)
+        type_checker = TypeChecker(self.program)
+        type_checker.check()
+        if type_checker.errors:
+            for error in type_checker.errors:
+                print(error, file=sys.stderr)
+            sys.exit(1)
+
         return self.program
 
     def parse_module(self, name: str, file_wrapper: FileWrapper) -> BuildModule:
