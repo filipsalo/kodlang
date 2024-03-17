@@ -5,8 +5,9 @@ import subprocess
 import sys
 import types
 from pathlib import Path
-from typing import Dict, Generator, Tuple
+from typing import Generator
 
+import _pytest
 import pytest
 
 from kod.builder import Builder, FileWrapper
@@ -60,22 +61,16 @@ def parse_example(path: Path) -> tuple[str, dict[str, str]]:
     return src, expects
 
 
-def generate_tests() -> (
-    Generator[Tuple[types.FunctionType, str, Dict[str, str]], None, None]
-):
+def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, None]:
     """Generate tests from example files."""
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
-    for path in test_dir.glob("*.kod"):
+    for path in test_dir.glob("**/*.kod"):
         src, expects = parse_example(path)
         if not expects:
-            yield pytest.param(
-                compile_to_assembly, src, expects, id=f"{path.stem}_compile"
-            )
+            yield pytest.param(compile_to_assembly, src, expects, id=f"{path} compile")
         else:
-            yield pytest.param(run_compiled, src, expects, id=f"{path.stem}_run")
-            yield pytest.param(
-                run_interpreted, src, expects, id=f"{path.stem}_interpret"
-            )
+            yield pytest.param(run_compiled, src, expects, id=f"{path} run")
+            yield pytest.param(run_interpreted, src, expects, id=f"{path} interpret")
 
 
 @pytest.mark.parametrize("func,src,expects", generate_tests())
@@ -87,4 +82,6 @@ def test_example(func: types.FunctionType, src: str, expects: dict[str, str]):
         return
     if "output" in expects:
         assert result.stdout == expects["output"]
+    if "stderr" in expects:
+        assert result.stderr == expects["stderr"]
     assert result.returncode == int(expects.get("status", 0))
