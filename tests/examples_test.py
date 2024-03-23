@@ -1,5 +1,6 @@
 """Example-based tests for the compiler."""
 
+import re
 import subprocess
 import sys
 import types
@@ -83,4 +84,13 @@ def test_example(func: types.FunctionType, path: str, expects: dict[str, str]):
         assert result.stdout == expects["output"]
     if "stderr" in expects:
         assert result.stderr == expects["stderr"]
+    if "errors" in expects:
+        expects["status"] = "1"
+        for error in expects["errors"].splitlines():
+            error = f"{path}:{error}"
+            stderr = result.stderr
+            # TODO: Don't emit colors at all when output is not a tty
+            stderr = re.sub("\033[^m]+?m", "", stderr)
+
+            assert error in stderr
     assert result.returncode == int(expects.get("status", 0))
