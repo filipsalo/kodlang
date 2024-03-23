@@ -1,6 +1,5 @@
 """Example-based tests for the compiler."""
 
-import io
 import subprocess
 import sys
 import types
@@ -10,14 +9,11 @@ from typing import Generator
 import _pytest
 import pytest
 
-from kod.builder import Builder, FileWrapper
 
-
-def run_interpreted(source: str) -> subprocess.CompletedProcess:
+def run_interpreted(path: str) -> subprocess.CompletedProcess:
     """Run a program in the interpreter."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "interpret", "-"],
-        input=source,
+        [sys.executable, "-m", "kod", "interpret", path],
         stdout=subprocess.PIPE,
         text=True,
         check=False,
@@ -25,11 +21,10 @@ def run_interpreted(source: str) -> subprocess.CompletedProcess:
     return result
 
 
-def run_compiled(source: str) -> subprocess.CompletedProcess:
+def run_compiled(path: str) -> subprocess.CompletedProcess:
     """Run a program compiled to an executable."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "run", "-"],
-        input=source,
+        [sys.executable, "-m", "kod", "run", path],
         stdout=subprocess.PIPE,
         text=True,
         check=False,
@@ -37,12 +32,16 @@ def run_compiled(source: str) -> subprocess.CompletedProcess:
     return result
 
 
-def compile_to_assembly(source: str) -> str:
+def compile_to_assembly(path: str) -> subprocess.CompletedProcess:
     """Compile a program to assembly."""
-    bob = Builder(root_path=Path.cwd(), stdlib_path=Path("stdlib"))
-    file_wrapper = FileWrapper("main.kod", io.StringIO(source))
-    bob.parse_program(file_wrapper)
-    return bob.compile_module("main")
+    result = subprocess.run(
+        [sys.executable, "-m", "kod", "compile", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return result
 
 
 def parse_example(path: Path) -> tuple[str, dict[str, str]]:
@@ -65,18 +64,18 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
     """Generate tests from example files."""
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
     for path in test_dir.glob("**/*.kod"):
-        src, expects = parse_example(path)
-        if not expects:
-            yield pytest.param(compile_to_assembly, src, expects, id=f"{path} compile")
+        _, expects = parse_example(path)
+        if "errors" in expects:
+            yield pytest.param(compile_to_assembly, path, expects, id=f"{path} compile")
         else:
-            yield pytest.param(run_compiled, src, expects, id=f"{path} run")
-            yield pytest.param(run_interpreted, src, expects, id=f"{path} interpret")
+            yield pytest.param(run_compiled, path, expects, id=f"{path} run")
+            yield pytest.param(run_interpreted, path, expects, id=f"{path} interpret")
 
 
-@pytest.mark.parametrize("func,src,expects", generate_tests())
-def test_example(func: types.FunctionType, src: str, expects: dict[str, str]):
+@pytest.mark.parametrize("func,path,expects", generate_tests())
+def test_example(func: types.FunctionType, path: str, expects: dict[str, str]):
     """Run example-based tests."""
-    result = func(src)
+    result = func(path)
     assert result
     if not expects:
         return

@@ -59,7 +59,8 @@ class Builder:
 
     def parse_program(self, file_wrapper: FileWrapper) -> Program:
         """Parse the program starting at `main_path`."""
-        main = self.parse_module(file_wrapper.path.stem, file_wrapper)
+        module_name = file_wrapper.path.stem
+        main = self.parse_module(module_name, file_wrapper)
         self.program.add_module(main)
         type_checker = TypeChecker(self.program)
         if not type_checker.check():
