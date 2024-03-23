@@ -55,10 +55,6 @@ class TypeChecker:
                 pass
             case ast.ParsedVariableDeclaration():
                 self.check_variable_declaration(node)
-            # case ast.ParsedAssignment():
-            #     pass
-            case _:
-                self.error(f"Don't know how to typecheck a {type(node)}", node.span)
 
     def check_variable_declaration(self, node: ast.ParsedVariableDeclaration):
         """Check a function declaration for type errors."""
