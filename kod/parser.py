@@ -2,6 +2,8 @@
 """A parser for the Kod lanuage"""
 
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Generator, Optional
 
 from kod import ast, types
 from kod.exceptions import KodSyntaxError
@@ -24,6 +26,7 @@ from kod.tokens import (
     OpenCurly,
     Return,
     Struct,
+    Token,
     Type,
 )
 
@@ -31,7 +34,7 @@ from kod.tokens import (
 class Parser:
     """A parser for the kod language."""
 
-    def __init__(self, tokens, path, module_name):
+    def __init__(self, tokens: list[Token], path: Path, module_name: str):
         self.tokens = tokens
         self.path = path
         self.module_name = module_name
@@ -39,12 +42,12 @@ class Parser:
         self.stack = [{}]
         self.spans = []
 
-    def eof(self):
+    def eof(self) -> bool:
         """Return True if at EOF."""
-        return self.peek(EOF)
+        return self.peeking_at(EOF)
 
     @contextmanager
-    def span(self):
+    def span(self) -> Generator[Span, None, None]:
         """Return a span for the next token."""
         span = self.peek().span
         span = Span(span.filename, span.start, span.end)
@@ -61,11 +64,11 @@ class Parser:
 
     def try_consume(self, token_type):
         """Consume the next token if it matches, otherwise return None."""
-        if not self.peek(token_type):
+        if not self.peeking_at(token_type):
             return None
         return self.consume(token_type)
 
-    def consume(self, token_type):
+    def consume(self, token_type) -> Token:
         """Consume the next token, or raise ValueError if it doesn't match."""
         token = self.peek()
         if not isinstance(token, token_type):
@@ -75,7 +78,7 @@ class Parser:
             self.spans[-1] |= token.span
         return token
 
-    def parse_type(self, name=None):
+    def parse_type(self, name=None) -> type[types.Type]:
         """Parse a type."""
         if self.try_consume(Struct):
             self.consume(OpenCurly)
@@ -93,7 +96,7 @@ class Parser:
         param_type = ast.ParsedName.parse(self)
         return types.Type.from_name(param_type.id)
 
-    def parse_statement(self):
+    def parse_statement(self) -> "Optional[ast.Statement]":
         """Parse a statement."""
         stmt = None
         match self.peek():
@@ -125,20 +128,23 @@ class Parser:
                 raise self.error(f"Unexpected token {self.peek()}")
         return stmt
 
-    def peek(self, token_type=None):
-        """Return the next token, or raise ValueError if it doesn't match."""
+    def peek(self) -> Token:
+        """Return the next token"""
         token = self.tokens[self.pos]
-        if token_type is not None:
-            return isinstance(token, token_type)
         return token
 
-    def parse(self):
+    def peeking_at(self, token_type: type[Token]) -> bool:
+        """Return True if the next token is of the given type."""
+        token = self.peek()
+        return isinstance(token, token_type)
+
+    def parse(self) -> "ast.ParsedModule":
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
         return ast.ParsedModule(self.path, self.module_name, statements, {}, span)
 
-    def __iter__(self):
+    def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:
             if self.eof():
                 return

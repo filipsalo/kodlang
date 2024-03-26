@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """A lexer for the kod language."""
 
+from pathlib import Path
+from typing import Iterator, Type, TypeVar
+
 from kod.exceptions import KodSyntaxError
 from kod.span import Span
 from kod.tokens import (
@@ -40,7 +43,7 @@ from kod.tokens import (
     Star,
     StringLiteral,
     Struct,
-    Type,
+    Token,
 )
 
 KEYWORDS = {
@@ -63,83 +66,91 @@ KEYWORDS = {
 class Lexer:
     """A lexer for the kod language."""
 
-    def __init__(self, source, filename="<unknown>"):
+    def __init__(self, source: str, filename: Path = Path("<unknown>")):
         self.source = source
         self.filename = filename
         self.pos = 0
         self.start = 0
 
-    def peek(self):
+    def peek(self) -> str:
         """Return the next character in the source, or None if at EOF."""
         if self.pos < len(self.source):
             return self.source[self.pos]
-        return None
+        return ""
 
-    def error(self, msg):
+    def error(self, msg: str) -> KodSyntaxError:
         """Raise a syntax error."""
         err = KodSyntaxError(msg, Span(self.filename, self.pos, self.pos + 1))
         return err
 
-    def skip_whitespace(self):
+    def skip_whitespace(self) -> None:
         """Skip whitespace and tabs."""
         while self.peek() in (" ", "\t"):
             self.pos += 1
         self.start = self.pos
 
-    def eof(self):
+    def eof(self) -> bool:
         """Return True if at EOF."""
         return self.pos == len(self.source)
 
-    def consume(self, char):
+    def consume(self, char) -> None:
         """Consume the next character, or raise ValueError if it doesn't match"""
         if self.peek() != char:
             raise self.error(f"Expected {char}, got {self.peek()!r}")
         self.pos += 1
 
-    def buffered(self):
+    def buffered(self) -> str:
         """Return the buffered text."""
         return self.source[self.start : self.pos]
 
-    def build(self, token_type):
+    T = TypeVar("T", bound=Token)
+
+    def build(self, token_type: type[T]) -> T:
         """Build a token."""
         value = self.source[self.start : self.pos]
         position = Span(self.filename, self.start, self.pos)
         self.start = self.pos
-        return token_type(value, position)
+        token = token_type(value, position)
+        return token
 
-    def lex_string(self):
+    def lex_string(self) -> StringLiteral:
         """Lex a quoted string."""
         self.consume('"')
         while self.peek() != '"':
             self.pos += 1
         self.consume('"')
-        string = self.build(StringLiteral)
+        string: StringLiteral = self.build(StringLiteral)
         string.value = string.value.encode().decode("unicode-escape")
         return string
 
-    def lex_number(self):
+    def lex_number(self) -> IntegerLiteral:
         """Lex a number."""
-        while self.peek() in "0123456789":
+        while char := self.peek():
+            if char not in "0123456789":
+                break
             self.pos += 1
         return self.build(IntegerLiteral)
 
-    def lex_single_char(self, token_type):
+    def lex_single_char(self, token_type) -> Token:
         """Lex a single character token."""
         char = self.peek()
         self.consume(char)
         return self.build(token_type)
 
-    def lex_identifier(self):
+    def lex_identifier(self) -> Token:
         """Lex an identifier."""
-        if not (self.peek().isalpha() or self.peek() == "_"):
-            raise self.error(f"Lexer expected identifier, got {self.peek()!r}")
-        while self.peek().isalnum() or self.peek() == "_":
+        char = self.peek()
+        assert char is not None
+        if not (char.isalpha() or char == "_"):
+            raise self.error(f"Lexer expected identifier, got {char!r}")
+        while char.isalnum() or char == "_":
             self.pos += 1
+            char = self.peek()
         if keyword_token_type := KEYWORDS.get(self.buffered()):
             return self.build(keyword_token_type)
         return self.build(Identifier)
 
-    def lex_slash_or_comment(self):
+    def lex_slash_or_comment(self) -> Token:
         """Lex a comment."""
         self.consume("/")
         if self.peek() == "/":
@@ -151,7 +162,7 @@ class Lexer:
             return self.build(Comment)
         return self.build(Slash)
 
-    def lex_arrow_or_minus(self):
+    def lex_arrow_or_minus(self) -> Token:
         """Lex an arrow (->) or a lone minus (-)."""
         self.consume("-")
         if self.peek() == ">":
@@ -159,7 +170,7 @@ class Lexer:
             return self.build(Arrow)
         return self.build(Minus)
 
-    def lex_equals(self):
+    def lex_equals(self) -> Token:
         """Lex an equals sign or two."""
         self.consume("=")
         if self.peek() == "=":
@@ -167,15 +178,15 @@ class Lexer:
             return self.build(EqualEqual)
         return self.build(Equal)
 
-    def lex(self):
+    def lex(self) -> list[Token]:
         """Lex the source code into tokens."""
         return list(self)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Token]:
         while True:
             self.skip_whitespace()
             match self.peek():
-                case None:
+                case "":
                     yield self.build(EOF)
                     return
                 case "\n":

@@ -12,7 +12,7 @@ class TypeChecker:
 
     def __init__(self, program) -> None:
         self.program = program
-        self.function_types: dict[type, type] = {}
+        self.function_types: dict[str, ast.ParsedFunctionParamList] = {}
         self.stack: list[dict[str, Any]] = [{}]
         self.errors: list[KodSyntaxError] = []
 
@@ -98,7 +98,7 @@ class TypeChecker:
                 arg_type = self.stack[-1][arg.expression.id].type
                 if arg_type != param.variable.type:
                     self.error(
-                        f"Expected argument of type '{param.variable.type.name}', "
+                        f"Expected argument of type '{param.variable.type}', "
                         f"but got '{arg.expression.type}'",
                         arg.span,
                     )

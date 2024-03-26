@@ -2,7 +2,7 @@
 
 import dataclasses
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Self, Union
 
 from kod import tokens, types
 from kod.parser import Parser
@@ -55,7 +55,7 @@ class ParsedStringLiteral(ASTNode, Literal):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a string literal."""
         token = parser.consume(tokens.StringLiteral)
         bytes_ = token.value.strip('"').encode("utf8")
@@ -71,7 +71,7 @@ class ParsedIntegerLiteral(ASTNode, Literal):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an integer literal."""
         token = parser.consume(tokens.IntegerLiteral)
         value = types.Int64(int(token.value))
@@ -86,7 +86,7 @@ class ParsedBooleanLiteral(ASTNode, Literal):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an integer literal."""
         token = parser.consume(tokens.BooleanLiteral)
         value = types.Bool(token.value == "true")
@@ -98,11 +98,11 @@ class ParsedVariable(ASTNode):
     """A name."""
 
     id: str
-    type: types.Type
+    type: Optional[type[types.Type]]
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a variable."""
         type_ = None
         token = parser.consume(tokens.Identifier)
@@ -119,7 +119,7 @@ class ParsedName(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a variable."""
         token = parser.consume(tokens.Identifier)
         return cls(token.value, span=token.span)
@@ -134,7 +134,7 @@ class ParsedFunctionParam(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a function parameter."""
         with parser.span() as span:
             anonymous = False
@@ -158,7 +158,7 @@ class ParsedFunctionParamList(ASTNode):
         return len(self.params)
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a function parameter list."""
         with parser.span() as span:
             parser.consume(tokens.OpenParen)
@@ -175,18 +175,19 @@ class ParsedFunctionParamList(ASTNode):
 class ParsedFunctionCallParam(ASTNode):
     """A function parameter."""
 
-    label: ParsedName
+    label: Optional[ParsedName]
     expression: ASTNode
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a function call parameter."""
         with parser.span() as span:
-            label = None
+            label: Optional[ParsedName] = None
             expr = ParsedExpression.parse(parser)
             if parser.try_consume(tokens.Colon):
-                label = ParsedName(expr, expr.span)
+                assert isinstance(expr, ParsedName)
+                label = expr
                 expr = ParsedExpression.parse(parser)
         return cls(label, expr, span)
 
@@ -205,7 +206,7 @@ class ParsedFunctionCallParamList(ASTNode):
         return len(self.params)
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a function call parameter list."""
         with parser.span() as span:
             parser.consume(tokens.OpenParen)
@@ -223,7 +224,7 @@ class ParsedFunctionCall(ASTNode):
     """A function call."""
 
     callee: ASTNode
-    args: list[Statement]
+    args: ParsedFunctionCallParamList
     span: Span
 
 
@@ -235,12 +236,12 @@ class ParsedFunctionDeclaration(ASTNode):
     label_name: str
     params: ParsedFunctionParamList
     body: list[Statement]
-    return_type: str
-    variables: list[ParsedVariable]
+    return_type: type[types.Type]
+    variables: dict[str, ParsedVariable]
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a function declaration."""
         with parser.span() as span:
             parser.consume(tokens.Func)
@@ -259,7 +260,6 @@ class ParsedFunctionDeclaration(ASTNode):
         label_parts = ["", *parser.path.parent.parts, parser.module_name, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
-        # parser.stack[-1][name] = node
         return node
 
 
@@ -271,7 +271,7 @@ class ParsedImport(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an import statement."""
         with parser.span() as span:
             parser.consume(tokens.Import)
@@ -287,11 +287,11 @@ class ParsedExternalFunctionDeclaration(ASTNode):
     label_name: str
     params: ParsedFunctionParamList
     body: list[ASTNode]
-    return_type: str
+    return_type: type[types.Type]
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an external function declaration."""
         with parser.span() as span:
             parser.consume(tokens.Extern)
@@ -313,7 +313,7 @@ class ParsedVariableDeclaration(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a variable declaration."""
         with parser.span() as span:
             parser.consume(tokens.Let)
@@ -321,7 +321,6 @@ class ParsedVariableDeclaration(ASTNode):
             parser.stack[-1][variable.id] = variable
             parser.consume(tokens.Equal)
             value = ParsedExpression.parse(parser)
-            # variable.type = value.type
         return cls(variable, value, span)
 
 
@@ -363,7 +362,7 @@ class ParsedExpression(ASTNode):
         return value
 
     @classmethod
-    def parse(cls, parser, precedence=0):
+    def parse(cls, parser, precedence=0) -> ASTNode:
         """Parse an expression."""
         op = rhs = None
         with parser.span() as span:
@@ -397,8 +396,8 @@ class ParsedExpression(ASTNode):
 class ParsedAssignment(ASTNode):
     """An assignment."""
 
-    lhs: ParsedExpression
-    rhs: ParsedExpression
+    lhs: ASTNode
+    rhs: ASTNode
     span: Span
 
 
@@ -417,11 +416,11 @@ class ParsedModule(ASTNode):
 class ParsedReturn(ASTNode):
     """A return statement."""
 
-    expression: ParsedExpression
+    expression: ASTNode
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an import statement."""
         with parser.span() as span:
             parser.consume(tokens.Return)
@@ -433,13 +432,13 @@ class ParsedReturn(ASTNode):
 class ParsedIfStatement(ASTNode):
     """An if statement."""
 
-    condition: ParsedExpression
+    condition: ASTNode
     true_branch: list[Statement]
     false_branch: list[Statement]
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an if statement."""
         true_branch = []
         false_branch = []
@@ -462,12 +461,12 @@ class ParsedIfStatement(ASTNode):
 class ParsedForStatement(ASTNode):
     """An if statement."""
 
-    condition: ParsedExpression
+    condition: ASTNode
     body: list[Statement]
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse an if statement."""
         body = []
         with parser.span() as span:
@@ -485,11 +484,11 @@ class ParsedTypeDeclaration(ASTNode):
     """A type declaration."""
 
     name: ParsedName
-    type: types.Type
+    type: type[types.Type]
     span: Span
 
     @classmethod
-    def parse(cls, parser: Parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a type declaration."""
         with parser.span() as span:
             parser.consume(tokens.Type)
@@ -508,7 +507,7 @@ class ParsedStruct(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser):
+    def parse(cls, parser: Parser) -> Self:
         """Parse a struct."""
         with parser.span() as span:
             parser.consume(tokens.Struct)

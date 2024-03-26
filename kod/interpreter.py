@@ -5,6 +5,7 @@ import ctypes
 import dataclasses
 import sys
 from functools import partial
+from typing import Any
 
 from kod import ast, tokens, types
 
@@ -51,7 +52,7 @@ class Interpreter:
                 return
         raise ValueError(f"Unknown name {name!r}")
 
-    def lookup(self, module, name):
+    def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
         match name:
             case ast.ParsedVariable() | ast.ParsedName():
@@ -98,7 +99,9 @@ class Interpreter:
             return op_func(rhs)
         raise ValueError(f"Don't know how to evaluate binary operator {op}")
 
-    def evaluate_expression(self, module, expression, as_lvalue=False):
+    def evaluate_expression(
+        self, module, expression, as_lvalue=False
+    ) -> ast.ASTNode | type[types.Type] | types.Type:
         """Resolve an expression"""
         match expression:
             case type() if issubclass(expression, types.Type):
@@ -130,15 +133,14 @@ class Interpreter:
             case ast.ParsedReturn(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
-            case ast.ParsedImport(module_name):
-                name = module_name.value.to_py_str()
+            case ast.ParsedImport(name):
                 module.names[name.lstrip("./")] = self.program.get_module(name).module
             case (
                 ast.ParsedFunctionDeclaration(name)
                 | ast.ParsedExternalFunctionDeclaration(name)
             ):
                 module.names[name] = statement
-                statement.module = module
+                setattr(statement, "module", module)
             case ast.ParsedFunctionCall():
                 callee = self.evaluate_expression(module, statement.callee)
                 args = list(

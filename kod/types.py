@@ -1,6 +1,5 @@
 """Built-in types for Kod."""
 
-
 import dataclasses
 from abc import ABC
 from typing import Any, Self
@@ -18,7 +17,7 @@ class Type:
         return f"<{self.name} {self.value!r}>"
 
     @staticmethod
-    def from_name(name):
+    def from_name(name) -> "type[Type]":
         """Return a type from a name."""
         match name:
             case "int64":
@@ -28,6 +27,42 @@ class Type:
             case "none":
                 return None_
         raise ValueError(f"Unknown type {name!r}")
+
+    def to_str(self) -> "String":
+        """Return the value as a Kod string."""
+        return String(str(self.value).encode("utf8"))
+
+    def op_plus(self, other: Self) -> Self:
+        """Add two integers."""
+        return self.__class__(self.value + other.value)
+
+    def op_minus(self, other: Self) -> Self:
+        """Add two integers."""
+        return self.__class__(self.value - other.value)
+
+    def op_eq(self, other: Self) -> "Bool":
+        """Compare two integers."""
+        return Bool(self.value == other.value)
+
+    def op_lt(self, other: Self) -> "Bool":
+        """Compare two integers."""
+        return Bool(self.value < other.value)
+
+    def op_gt(self, other: Self) -> "Bool":
+        """Compare two integers."""
+        return Bool(self.value > other.value)
+
+    def op_mod(self, other: Self) -> Self:
+        """Modulo two integers."""
+        return self.__class__(self.value % other.value)
+
+    def op_div(self, other: Self) -> Self:
+        """Divide two integers."""
+        return self.__class__(self.value // other.value)
+
+    def op_mul(self, other: Self) -> Self:
+        """Multiply two integers."""
+        return self.__class__(self.value * other.value)
 
 
 class Bool(Type):
@@ -72,42 +107,6 @@ class Int64(Type):
     name = "int64"
     width = 8
 
-    def to_str(self) -> String:
-        """Return the value as a Kod string."""
-        return String(str(self.value).encode("utf8"))
-
-    def op_plus(self, other: Self) -> Self:
-        """Add two integers."""
-        return self.__class__(self.value + other.value)
-
-    def op_minus(self, other: Self) -> Self:
-        """Add two integers."""
-        return self.__class__(self.value - other.value)
-
-    def op_eq(self, other: Self) -> Bool:
-        """Compare two integers."""
-        return Bool(self.value == other.value)
-
-    def op_lt(self, other: Self) -> Bool:
-        """Compare two integers."""
-        return Bool(self.value < other.value)
-
-    def op_gt(self, other: Self) -> Bool:
-        """Compare two integers."""
-        return Bool(self.value > other.value)
-
-    def op_mod(self, other: Self) -> Self:
-        """Modulo two integers."""
-        return self.__class__(self.value % other.value)
-
-    def op_div(self, other: Self) -> Self:
-        """Divide two integers."""
-        return self.__class__(self.value // other.value)
-
-    def op_mul(self, other: Self) -> Self:
-        """Multiply two integers."""
-        return self.__class__(self.value * other.value)
-
 
 None_ = object()
 
@@ -118,7 +117,7 @@ class ArrayType(Type, ABC):
     _cache: dict[Any, Any] = {}
 
     @classmethod
-    def make(cls, item_type: Type):
+    def make(cls, item_type: type[Type]) -> type[Self]:
         """Make an array type."""
         if item_type not in cls._cache:
             python_name = f"{item_type.name}Array"
