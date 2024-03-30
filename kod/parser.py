@@ -2,11 +2,11 @@
 """A parser for the Kod lanuage"""
 
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Generator, Optional
 
 from kod import ast, types
 from kod.exceptions import KodSyntaxError
+from kod.filesys import FileWrapper
 from kod.span import Span
 from kod.tokens import (
     EOF,
@@ -34,10 +34,9 @@ from kod.tokens import (
 class Parser:
     """A parser for the kod language."""
 
-    def __init__(self, tokens: list[Token], path: Path, module_name: str):
+    def __init__(self, tokens: list[Token], file: FileWrapper):
         self.tokens = tokens
-        self.path = path
-        self.module_name = module_name
+        self.file = file
         self.pos = 0
         self.stack = [{}]
         self.spans = []
@@ -142,7 +141,7 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        return ast.ParsedModule(self.path, self.module_name, statements, {}, span)
+        return ast.ParsedModule(self.file, statements, {}, span)
 
     def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:

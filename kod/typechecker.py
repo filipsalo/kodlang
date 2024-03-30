@@ -29,8 +29,7 @@ class TypeChecker:
 
     def check_module(self, module):
         """Check a module for type errors."""
-        builtins = self.program.get_module("builtins")
-        for node in module.body + builtins.module.body:
+        for node in module.body + self.program.builtins.module.body:
             match node:
                 case (
                     ast.ParsedFunctionDeclaration()

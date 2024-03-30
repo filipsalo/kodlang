@@ -25,20 +25,19 @@ class Interpreter:
     def __init__(self, program):
         self.program = program
         self.stack = [{}]
-        self.builtins_module = self.program.get_module("builtins").module
 
-    def run(self, entry_module_name="main", argv=()):
+    def run(self, file, argv=()):
         """Run the program"""
-        for module in self.program.modules.values():
+        for module in self.program:
             # fixme: these shouldn't be buildmodules
             module = module.module
             for statement in module.body:
                 self.execute_statement(module, statement)
-        entry_module = self.program.get_module(entry_module_name).module
+        entry_module = self.program.get_module(file.path).module
         main = self.lookup(entry_module, "main")
         string_array = types.ArrayType.make(types.String)
         argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
-        exit_code = self.call_function(entry_module_name, main, [argv])
+        exit_code = self.call_function(entry_module, main, [argv])
         sys.exit(exit_code.value if exit_code else 0)
 
     def assign(self, module, name, value):
@@ -57,7 +56,7 @@ class Interpreter:
         match name:
             case ast.ParsedVariable() | ast.ParsedName():
                 name = name.id
-        for frame in self.stack[-1], module.names, self.builtins_module.names:
+        for frame in self.stack[-1], module.names, self.program.builtins.module.names:
             if name in frame:
                 value = frame[name]
                 if isinstance(value, ast.ParsedStringLiteral):

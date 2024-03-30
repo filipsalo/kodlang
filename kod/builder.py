@@ -4,63 +4,47 @@ import io
 import subprocess
 import sys
 from pathlib import Path
-from typing import TextIO
+from typing import Optional
 
 from kod import ast
 from kod.compiler import Compiler
+from kod.filesys import FileSystem, FileWrapper
 from kod.lexer import Lexer
 from kod.parser import Parser
 from kod.program import BuildModule, Program
 from kod.typechecker import TypeChecker
 
 
-class FileWrapper:
-    """A wrapper for a file."""
-
-    def __init__(self, path, file=None):
-        if path == "-":
-            file = sys.stdin
-            path = "main.kod"
-        self.path = Path(path)
-        self.file = file
-
-    def open(self, *args, **kwargs) -> TextIO:
-        """Open the file."""
-        if self.file:
-            return self.file
-        elif self.path == Path("-"):
-            return sys.stdin
-        encoding = kwargs.pop("encoding", "utf8")
-        return self.path.open(*args, encoding=encoding, **kwargs)
-
-
 class Builder:
     """Build the project."""
 
-    def __init__(self, *, root_path: Path, stdlib_path: Path):
-        self.root_path = root_path
-        self.stdlib_path = stdlib_path
-        self.program = Program()
-        self.parse_builtins()
+    def __init__(self, *, project_fs: FileSystem, stdlib_fs: FileSystem):
+        self.project_fs = project_fs
+        self.stdlib_fs = stdlib_fs
+        self.program = Program(self.parse_builtins())
 
-    def parse_builtins(self) -> None:
+    def parse_builtins(self) -> BuildModule:
         """Parse the builtins module."""
-        builtins = self.parse_module(
-            "builtins", self.resolve_name("builtins", self.root_path)
-        )
-        self.program.add_module(builtins)
+        return self.parse_module(self.resolve_import("builtins"))
 
-    def resolve_name(self, module_name, root_path) -> FileWrapper:
+    def resolve_import(
+        self, module_name: str, relative_to: Optional[Path] = None
+    ) -> FileWrapper:
         """Resolve a name to a Path"""
-        if not module_name.startswith("./"):
-            root_path = self.stdlib_path
-        path = (root_path / module_name).with_suffix(".kod")
-        return FileWrapper(path)
+        path = Path(module_name).with_suffix(".kod")
+        if module_name.startswith("./"):
+            fs = self.project_fs
+            if relative_to:
+                path = relative_to.parent / path
+        else:
+            fs = self.stdlib_fs
+        return fs.open(path)
 
-    def parse_program(self, file_wrapper: FileWrapper) -> Program:
-        """Parse the program starting at `main_path`."""
-        module_name = file_wrapper.path.stem
-        main = self.parse_module(module_name, file_wrapper)
+    def parse_program(self, file: FileWrapper) -> Program:
+        """Parse the program starting at `file`."""
+        # print("in parse_program", entry_module_name)
+        # file = self.resolve_import(entry_module_name)
+        main = self.parse_module(file)
         self.program.add_module(main)
         type_checker = TypeChecker(self.program)
         if not type_checker.check():
@@ -70,17 +54,16 @@ class Builder:
 
         return self.program
 
-    def parse_module(self, name: str, file_wrapper: FileWrapper) -> BuildModule:
+    def parse_module(self, file: FileWrapper) -> BuildModule:
         """Parse a module."""
-        with file_wrapper.open(encoding="utf8") as f:
-            source = f.read()
-        tokens = Lexer(source, file_wrapper.path).lex()
-        module = Parser(tokens, file_wrapper.path, name).parse()
+        source = file.read()
+        tokens = Lexer(source, Path(file.name)).lex()
+        module = Parser(tokens, file).parse()
         for import_ in self.get_imports(module):
             name = import_.module_name
-            if name not in self.program.modules:
-                import_path = self.resolve_name(name, file_wrapper.path.parent)
-                import_module = self.parse_module(name, import_path)
+            import_file = self.resolve_import(name, relative_to=module.file.path)
+            if import_file not in self.program.modules:
+                import_module = self.parse_module(import_file)
                 self.program.add_module(import_module)
         return BuildModule(module)
 
@@ -92,19 +75,19 @@ class Builder:
                 imports.append(statement)
         return imports
 
-    def compile_module(self, name: str) -> str:
+    def compile_module(self, module: BuildModule) -> str:
         """Compile a module."""
-        build_module = self.program.modules[name]
-        builtins = self.program.modules["builtins"]
         output = io.StringIO()
-        Compiler(build_module.module, builtins.module, output).compile()
+        Compiler(module.module, self.program.builtins.module, output).compile()
         return output.getvalue()
 
-    def build_module(self, name: str) -> None:
+    def build_module(self, module: BuildModule) -> None:
         """Build a module."""
-        print(f"\033[1;30mBuilding module \033[1;36m{name}\033[0m", file=sys.stderr)
-        module = self.program.get_module(name)
-        asm = self.compile_module(name)
+        print(
+            f"\033[1;30mBuilding module \033[1;36m{module.source_path}\033[0m",
+            file=sys.stderr,
+        )
+        asm = self.compile_module(module)
         (Path("build") / module.asm_path).write_text(asm)
         object_file = Path("build") / module.object_path
         subprocess.run(
@@ -113,14 +96,14 @@ class Builder:
             check=True,
         )
 
-    def build_runtime_main(self, main_module):
+    def build_runtime_main(self, file: FileWrapper):
         """Build the runtime main function."""
         runtime_main_path = Path("build") / "runtime_main.o"
         asm = f"""
             .text
             .globl _main
             _main:
-                b ${str(main_module).replace("/", "$")}$main
+                b ${"$".join(file.canonical_module_path.parts)}$main
         """
         (Path("build") / "runtime_main.s").write_text(asm)
         subprocess.run(
@@ -129,13 +112,16 @@ class Builder:
             check=True,
         )
 
-    def build_executable(self, path: Path) -> Path:
+    def build_executable(self, file: FileWrapper) -> Path:
         """Build an executable."""
-        print(f"\033[1;30mBuilding executable \033[1;36m{path}\033[0m", file=sys.stderr)
+        executable = Path("build") / file.path.stem
+        print(
+            f"\033[1;30mBuilding executable \033[1;36m{executable}\033[0m",
+            file=sys.stderr,
+        )
         for module in self.program:
-            self.build_module(module.name)
-        self.build_runtime_main(path)
-        executable = Path("build") / path.stem
+            self.build_module(module)
+        self.build_runtime_main(file)
         runtime_main_path = Path("build") / "runtime_main.o"
         cmd = (
             [

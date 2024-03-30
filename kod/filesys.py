@@ -2,7 +2,7 @@
 
 from io import StringIO
 from pathlib import Path
-from typing import Self
+from typing import IO, Self
 
 
 class FileSystem:
@@ -19,13 +19,22 @@ class FileSystem:
             return path
         return self.root_path / path
 
-    def open(self, path: Path, mode: str = "r", encoding: str = "utf8"):
+    def _open(self, path: Path, mode: str = "r", encoding: str = "utf8") -> IO:
         """Open the file with the given path."""
-        path = self._resolve_path(path)
         return open(path, mode=mode, encoding=encoding)
 
+    def open(
+        self, path: Path, mode: str = "r", encoding: str = "utf8"
+    ) -> "FileWrapper":
+        """Open the file with the given path."""
+        path = self._resolve_path(path)
+        return FileWrapper(self, path, self._open(path, mode, encoding))
 
-class FakeFileSystem:
+    def __repr__(self):
+        return f"{self.__class__.__name__}(root_path={self.root_path!r})"
+
+
+class FakeFileSystem(FileSystem):
     """A fake file system for testing."""
 
     @classmethod
@@ -33,18 +42,41 @@ class FakeFileSystem:
         """Create a fake file system from a dictionary."""
         fs = cls()
         for path, content in files.items():
-            fs.files[Path(path)] = (
+            fs.files[fs.root_path / path] = (
                 content.encode("utf8") if isinstance(content, str) else content
             )
         return fs
 
-    def __init__(self):
+    def __init__(self, fake_root_path: Path = Path("/")):
+        self.root_path = fake_root_path
         self.files = {}
 
-    def open(self, path, _mode="r"):
+    def _open(self, path: Path, mode: str = "r", encoding: str = "utf8") -> IO:
         """Open the file with the given path."""
-        assert _mode == "r"
+        assert mode == "r"
         if path not in self.files:
             raise FileNotFoundError(f"File '{path}' does not exist.")
         content = self.files[path]
-        return StringIO(content.decode("utf8"))
+        file = StringIO(content.decode("utf8"))
+        file.name = path
+        return file
+
+
+class FileWrapper:
+    """A wrapper for a file."""
+
+    def __init__(self, fs: FileSystem, path: Path, file: IO):
+        self.fs = fs
+        self.path = path
+        self.file = file
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(path={self.path!r})"
+
+    @property
+    def canonical_module_path(self):
+        """Return the canonical module name."""
+        return self.path.relative_to(self.fs.root_path).with_suffix("")
+
+    def __getattr__(self, name):
+        return getattr(self.file, name)

@@ -1,10 +1,10 @@
 """Abstract syntax tree."""
 
 import dataclasses
-from pathlib import Path
 from typing import Any, Optional, Self, Union
 
 from kod import tokens, types
+from kod.filesys import FileWrapper
 from kod.parser import Parser
 from kod.span import Span
 
@@ -257,7 +257,7 @@ class ParsedFunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, ParsedVariableDeclaration):
                     variables[statement.variable.id] = statement.variable
-        label_parts = ["", *parser.path.parent.parts, parser.module_name, name]
+        label_parts = ["", *parser.file.canonical_module_path.parts, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
         return node
@@ -405,8 +405,7 @@ class ParsedAssignment(ASTNode):
 class ParsedModule(ASTNode):
     """A module."""
 
-    path: Path
-    name: str
+    file: FileWrapper
     body: list[Statement]
     names: dict
     span: Span

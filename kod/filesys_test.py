@@ -15,12 +15,17 @@ class TestFilesys:
             yield FileSystem(tmp_dir)
 
     def test_can_read_file(self, fs: FileSystem):
-        with fs.open(Path("hello.txt")) as f:
-            assert f.read() == "Hello, real world!"
+        f = fs.open(Path("hello.txt"))
+        assert f.read() == "Hello, real world!"
 
     def test_raises_filenotfound(self, fs: FileSystem):
         with pytest.raises(FileNotFoundError):
             fs.open(Path("nosuchfile.txt"))
+
+    def test_has_name(self, fs: FileSystem):
+        filename = Path("hello.txt")
+        f = fs.open(filename)
+        assert Path(f.name).relative_to(fs.root_path) == filename
 
 
 class TestFakeFilesys:
@@ -34,17 +39,22 @@ class TestFakeFilesys:
         return FakeFileSystem.from_dict(files)
 
     def test_can_read_file(self, fs: FileSystem):
-        with fs.open(Path("hello.txt")) as f:
-            assert f.read() == "Hello, fake world!"
+        f = fs.open(Path("hello.txt"))
+        assert f.read() == "Hello, fake world!"
 
     def test_raises_filenotfound(self, fs: FileSystem):
         with pytest.raises(FileNotFoundError):
             fs.open(Path("nosuchfile.txt"))
 
     def test_unicode(self, fs: FileSystem):
-        with fs.open(Path("unicode.txt")) as f:
-            assert f.read() == "🌍"
+        f = fs.open(Path("unicode.txt"))
+        assert f.read() == "🌍"
 
     def test_unicode_bytes(self, fs: FileSystem):
-        with fs.open(Path("unicode-bytes.txt")) as f:
-            assert f.read() == "🌍"
+        f = fs.open(Path("unicode-bytes.txt"))
+        assert f.read() == "🌍"
+
+    def test_has_name(self, fs: FileSystem):
+        filename = Path("hello.txt")
+        f = fs.open(filename)
+        assert Path(f.name).relative_to(fs.root_path) == filename
