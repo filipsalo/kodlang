@@ -4,13 +4,14 @@ from typing import Any
 
 from kod import ast
 from kod.exceptions import KodSyntaxError
+from kod.program import Program
 from kod.span import Span
 
 
 class TypeChecker:
     """A typechecker for the kod language."""
 
-    def __init__(self, program) -> None:
+    def __init__(self, program: Program) -> None:
         self.program = program
         self.function_types: dict[str, ast.ParsedFunctionParamList] = {}
         self.stack: list[dict[str, Any]] = [{}]
@@ -27,7 +28,7 @@ class TypeChecker:
             self.check_module(module.module)
         return not self.errors
 
-    def check_module(self, module):
+    def check_module(self, module: ast.ParsedModule):
         """Check a module for type errors."""
         for node in module.body + self.program.builtins.module.body:
             match node:

@@ -1,8 +1,9 @@
 """A simple file system abstraction."""
 
-from io import StringIO
+import os
+import tempfile
 from pathlib import Path
-from typing import IO, Self
+from typing import IO
 
 
 class FileSystem:
@@ -13,11 +14,10 @@ class FileSystem:
 
     def _resolve_path(self, path: Path) -> Path:
         """Resolve a path to an absolute path."""
-        if path.is_absolute():
-            if not path.is_relative_to(self.root_path):
-                raise ValueError(f"Path '{path}' is not within the root path.")
-            return path
-        return self.root_path / path
+        path = self.root_path / path
+        if not path.is_relative_to(self.root_path):
+            raise ValueError(f"Path '{path}' is not within the root path.")
+        return path
 
     def _open(self, path: Path, mode: str = "r", encoding: str = "utf8") -> IO:
         """Open the file with the given path."""
@@ -37,29 +37,16 @@ class FileSystem:
 class FakeFileSystem(FileSystem):
     """A fake file system for testing."""
 
-    @classmethod
-    def from_dict(cls, files: dict[str, str | bytes]) -> Self:
-        """Create a fake file system from a dictionary."""
-        fs = cls()
+    def __init__(self, files: dict[str, str | bytes]) -> None:
+        self._dir = tempfile.TemporaryDirectory(prefix="kod-build-")
+        self.root_path = Path(self._dir.name)
         for path, content in files.items():
-            fs.files[fs.root_path / path] = (
-                content.encode("utf8") if isinstance(content, str) else content
-            )
-        return fs
-
-    def __init__(self, fake_root_path: Path = Path("/")):
-        self.root_path = fake_root_path
-        self.files = {}
-
-    def _open(self, path: Path, mode: str = "r", encoding: str = "utf8") -> IO:
-        """Open the file with the given path."""
-        assert mode == "r"
-        if path not in self.files:
-            raise FileNotFoundError(f"File '{path}' does not exist.")
-        content = self.files[path]
-        file = StringIO(content.decode("utf8"))
-        file.name = path
-        return file
+            path = self._resolve_path(Path(path))
+            if isinstance(content, str):
+                path.write_text(content)
+            else:
+                path.write_bytes(content)
+        os.makedirs(self.root_path / "build")
 
 
 class FileWrapper:

@@ -81,65 +81,80 @@ class Builder:
         Compiler(module.module, self.program.builtins.module, output).compile()
         return output.getvalue()
 
-    def build_module(self, module: BuildModule) -> None:
+    def _build(self, module_name: str, asm: str) -> Path:
+        """Build an object file."""
+        asm_path = (self.project_fs.root_path / "build" / module_name).with_suffix(".s")
+        obj_path = asm_path.with_suffix(".o")
+        print(
+            f"\033[1;30mWriting assembly to \033[1;36m{asm_path}\033[0m",
+            file=sys.stderr,
+        )
+        asm_path.write_text(asm)
+        cmd = [
+            "as",
+            "-target",
+            "arm64-apple-darwin",
+            "-o",
+            obj_path.relative_to(self.project_fs.root_path),
+            asm_path.relative_to(self.project_fs.root_path),
+        ]
+        print(f"=> \033[1;30m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
+        subprocess.run(
+            cmd,
+            check=True,
+            cwd=self.project_fs.root_path,
+        )
+        return obj_path
+
+    def build_module(self, module: BuildModule) -> Path:
         """Build a module."""
         print(
             f"\033[1;30mBuilding module \033[1;36m{module.source_path}\033[0m",
             file=sys.stderr,
         )
         asm = self.compile_module(module)
-        (Path("build") / module.asm_path).write_text(asm)
-        object_file = Path("build") / module.object_path
-        subprocess.run(
-            ["as", "-target", "arm64-apple-darwin", "-o", object_file, "-"],
-            input=asm.encode("ascii"),
-            check=True,
-        )
+        return self._build(module.mangled_name(), asm)
 
-    def build_runtime_main(self, file: FileWrapper):
+    def build_runtime_main(self, file: FileWrapper) -> Path:
         """Build the runtime main function."""
-        runtime_main_path = Path("build") / "runtime_main.o"
         asm = f"""
             .text
             .globl _main
             _main:
                 b ${"$".join(file.canonical_module_path.parts)}$main
         """
-        (Path("build") / "runtime_main.s").write_text(asm)
-        subprocess.run(
-            ["as", "-target", "arm64-apple-darwin", "-o", runtime_main_path, "-"],
-            input=asm.encode("ascii"),
-            check=True,
-        )
+        return self._build("runtime_main", asm)
 
     def build_executable(self, file: FileWrapper) -> Path:
         """Build an executable."""
-        executable = Path("build") / file.path.stem
+        executable = self.project_fs.root_path / "build" / file.path.stem
         print(
             f"\033[1;30mBuilding executable \033[1;36m{executable}\033[0m",
             file=sys.stderr,
         )
+        object_files = []
         for module in self.program:
-            self.build_module(module)
-        self.build_runtime_main(file)
-        runtime_main_path = Path("build") / "runtime_main.o"
-        cmd = (
-            [
-                "ld",
-                "-macos_version_min",
-                "14",
-                "-lc",
-                "-L",
-                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-                "-o",
-                str(executable),
-            ]
-            + [str(Path("build") / module.object_path) for module in self.program]
-            + [str(runtime_main_path)]
+            object_files.append(
+                self.build_module(module).relative_to(self.project_fs.root_path)
+            )
+        object_files.append(
+            self.build_runtime_main(file).relative_to(self.project_fs.root_path)
         )
-        print(f"\033[1;30mRunning\033[0m {" ".join(cmd)}", file=sys.stderr)
+        cmd = [
+            "ld",
+            "-macos_version_min",
+            "14.0",
+            "-lc",
+            "-L",
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+            "-o",
+            executable.relative_to(self.project_fs.root_path),
+            *object_files,
+        ]
+        print(f"=> \033[1;30m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
         subprocess.run(
             cmd,
             check=True,
+            cwd=self.project_fs.root_path,
         )
         return executable

@@ -11,15 +11,7 @@ from kod.builder import Builder
 from kod.exceptions import KodSyntaxError
 from kod.filesys import FileSystem
 from kod.interpreter import Interpreter
-
-
-def find_stdlib_path() -> Path:
-    """Find the path to the standard library."""
-    stdlib_path = Path(sys.executable)
-    while not (stdlib_path / "stdlib").is_dir():
-        stdlib_path = stdlib_path.parent
-    stdlib_path = stdlib_path / "stdlib"
-    return stdlib_path
+from kod.paths import find_stdlib_path
 
 
 def main():
@@ -49,8 +41,8 @@ def main():
 
     stdlib_path = find_stdlib_path()
     stdlib_fs = FileSystem(stdlib_path)
-    project_fs = FileSystem(Path.cwd())
-    entry_path = Path(args.file).absolute()
+    project_fs = FileSystem(Path(Path.cwd()))
+    entry_path = Path(Path(args.file).absolute())
     entry_module = project_fs.open(entry_path)
 
     try:

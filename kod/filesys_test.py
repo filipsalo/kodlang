@@ -11,7 +11,8 @@ class TestFilesys:
     def fs(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_dir = Path(tmp_dir)
-            (tmp_dir / "hello.txt").write_text("Hello, real world!")
+            with open(tmp_dir / "hello.txt", "w") as f:
+                f.write("Hello, real world!")
             yield FileSystem(tmp_dir)
 
     def test_can_read_file(self, fs: FileSystem):
@@ -36,7 +37,7 @@ class TestFakeFilesys:
             "unicode.txt": "🌍",
             "unicode-bytes.txt": b"\xf0\x9f\x8c\x8d",
         }
-        return FakeFileSystem.from_dict(files)
+        return FakeFileSystem(files)
 
     def test_can_read_file(self, fs: FileSystem):
         f = fs.open(Path("hello.txt"))
