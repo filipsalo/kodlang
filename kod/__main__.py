@@ -12,11 +12,14 @@ from kod.exceptions import KodSyntaxError
 from kod.filesys import FileSystem
 from kod.interpreter import Interpreter
 from kod.paths import find_stdlib_path
+from kod.typechecker import TypeChecker
 
 
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser()
+    parser.add_argument("--no-type-check", dest="type_check", action="store_false")
+
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
@@ -45,12 +48,19 @@ def main():
     entry_path = Path(Path(args.file).absolute())
     entry_module = project_fs.open(entry_path)
 
+    bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
     try:
-        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
         program = bob.parse_program(entry_module)
     except KodSyntaxError as err:
         print(err, file=sys.stderr)
         return 1
+
+    if args.type_check:
+        type_checker = TypeChecker(program)
+        if not type_checker.check():
+            for error in type_checker.errors:
+                print(error, file=sys.stderr)
+            return 1
 
     match args.command:
         case "interpret":

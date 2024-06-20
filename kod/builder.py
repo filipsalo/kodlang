@@ -12,7 +12,6 @@ from kod.filesys import FileSystem, FileWrapper
 from kod.lexer import Lexer
 from kod.parser import Parser
 from kod.program import BuildModule, Program
-from kod.typechecker import TypeChecker
 
 
 class Builder:
@@ -46,12 +45,6 @@ class Builder:
         # file = self.resolve_import(entry_module_name)
         main = self.parse_module(file)
         self.program.add_module(main)
-        type_checker = TypeChecker(self.program)
-        if not type_checker.check():
-            for error in type_checker.errors:
-                print(error, file=sys.stderr)
-            sys.exit(1)
-
         return self.program
 
     def parse_module(self, file: FileWrapper) -> BuildModule:
