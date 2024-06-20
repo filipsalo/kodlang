@@ -86,7 +86,7 @@ class Builder:
         asm_path = (self.project_fs.root_path / "build" / module_name).with_suffix(".s")
         obj_path = asm_path.with_suffix(".o")
         print(
-            f"\033[1;30mWriting assembly to \033[1;36m{asm_path}\033[0m",
+            f"\033[2mWriting assembly to \033[22;1;36m{asm_path}\033[0m",
             file=sys.stderr,
         )
         asm_path.write_text(asm)
@@ -98,7 +98,7 @@ class Builder:
             obj_path.relative_to(self.project_fs.root_path),
             asm_path.relative_to(self.project_fs.root_path),
         ]
-        print(f"=> \033[1;30m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
+        print(f"=> \033[2m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
         subprocess.run(
             cmd,
             check=True,
@@ -109,7 +109,7 @@ class Builder:
     def build_module(self, module: BuildModule) -> Path:
         """Build a module."""
         print(
-            f"\033[1;30mBuilding module \033[1;36m{module.source_path}\033[0m",
+            f"\033[2mBuilding module \033[22;1;36m{module.source_path}\033[0m",
             file=sys.stderr,
         )
         asm = self.compile_module(module)
@@ -129,7 +129,7 @@ class Builder:
         """Build an executable."""
         executable = self.project_fs.root_path / "build" / file.path.stem
         print(
-            f"\033[1;30mBuilding executable \033[1;36m{executable}\033[0m",
+            f"\033[2mBuilding executable \033[22;1;36m{executable}\033[0m",
             file=sys.stderr,
         )
         object_files = []
@@ -151,7 +151,7 @@ class Builder:
             executable.relative_to(self.project_fs.root_path),
             *object_files,
         ]
-        print(f"=> \033[1;30m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
+        print(f"=> \033[2m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
         subprocess.run(
             cmd,
             check=True,
