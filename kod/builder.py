@@ -1,6 +1,7 @@
 """Building/compiling stuff"""
 
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -120,6 +121,7 @@ class Builder:
 
     def build_executable(self, file: FileWrapper) -> Path:
         """Build an executable."""
+        os.makedirs(self.project_fs.root_path / "build", exist_ok=True)
         executable = self.project_fs.root_path / "build" / file.path.stem
         print(
             f"\033[2mBuilding executable \033[22;1;36m{executable}\033[0m",
