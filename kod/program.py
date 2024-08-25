@@ -1,12 +1,12 @@
 from pathlib import Path
 
-from kod.ast import ParsedModule
+from kod.ast import Module
 
 
 class BuildModule:
     """A module is a collection of functions."""
 
-    def __init__(self, module: ParsedModule):
+    def __init__(self, module: Module):
         self.module = module
         self.name = str(module.file.canonical_module_path)
         self.source_path = module.file.path

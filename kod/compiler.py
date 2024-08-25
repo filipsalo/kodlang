@@ -5,19 +5,19 @@ import collections
 import sys
 
 from kod.ast import (
+    Assignment,
     BinaryOperator,
-    ParsedAssignment,
-    ParsedBooleanLiteral,
-    ParsedExternalFunctionDeclaration,
-    ParsedForStatement,
-    ParsedFunctionCall,
-    ParsedFunctionDeclaration,
-    ParsedIfStatement,
-    ParsedIntegerLiteral,
-    ParsedName,
-    ParsedReturn,
-    ParsedStringLiteral,
-    ParsedVariableDeclaration,
+    BooleanLiteral,
+    ExternalFunctionDeclaration,
+    ForStatement,
+    FunctionCall,
+    FunctionDeclaration,
+    IfStatement,
+    IntegerLiteral,
+    Name,
+    Return,
+    StringLiteral,
+    VariableDeclaration,
 )
 from kod.tokens import EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
 
@@ -161,17 +161,14 @@ class Compiler:
         self.emit(".text")
         for statement in self.builtins.body:
             match statement:
-                case (
-                    ParsedExternalFunctionDeclaration(name)
-                    | ParsedFunctionDeclaration(name)
-                ):
+                case ExternalFunctionDeclaration(name) | FunctionDeclaration(name):
                     self.functions[name] = statement
 
         for statement in self.module.body:
             match statement:
-                case ParsedExternalFunctionDeclaration(name):
+                case ExternalFunctionDeclaration(name):
                     self.functions[name] = statement
-                case ParsedFunctionDeclaration():
+                case FunctionDeclaration():
                     self.compile_function(statement)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
@@ -183,18 +180,18 @@ class Compiler:
     def compile_statement(self, statement):
         """Compile a statement to assembly"""
         match statement:
-            case ParsedFunctionCall():
+            case FunctionCall():
                 self.compile_function_call(statement)
-            case ParsedVariableDeclaration(variable, value):
+            case VariableDeclaration(variable, value):
                 self.compile_variable_declaration(variable, value)
-            case ParsedAssignment(variable, value):
+            case Assignment(variable, value):
                 self.compile_variable_declaration(variable, value)
-            case ParsedReturn(value):
+            case Return(value):
                 self.stack[-1].return_value = value
                 self.emit("b", self.stack[-1].end_label)
-            case ParsedIfStatement(condition, true_branch, false_branch):
+            case IfStatement(condition, true_branch, false_branch):
                 self.compile_if_statement(condition, true_branch, false_branch)
-            case ParsedForStatement(condition, body):
+            case ForStatement(condition, body):
                 self.compile_for_statement(condition, body)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
@@ -295,19 +292,19 @@ class Compiler:
 
     def compile_expression(self, expression):
         """Parse an expression"""
-        if isinstance(expression, ParsedStringLiteral):
+        if isinstance(expression, StringLiteral):
             value = self.literal_string(expression)
             register = self.stack[-1].allocate_register()
             self.emit("adrp", register, f"{value.label}@PAGE")
             self.emit("add", register, register, f"{value.label}@PAGEOFF")
             return register
-        elif isinstance(expression, ParsedIntegerLiteral):
+        elif isinstance(expression, IntegerLiteral):
             return Imm(expression.value.value)
-        elif isinstance(expression, ParsedBooleanLiteral):
+        elif isinstance(expression, BooleanLiteral):
             return Imm(int(expression.value.value))
-        elif isinstance(expression, ParsedName):
+        elif isinstance(expression, Name):
             return self.stack[-1].get_variable_address(expression)
-        elif isinstance(expression, ParsedFunctionCall):
+        elif isinstance(expression, FunctionCall):
             return self.compile_function_call(expression)
         elif isinstance(expression, BinaryOperator):
             return self.compile_binary_operator(expression)
@@ -362,7 +359,7 @@ class Compiler:
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
         match func_call.callee:
-            case ParsedName(id_):
+            case Name(id_):
                 func = self.functions[id_]
             case _:
                 raise ValueError(f"Unexpected function call {func_call.callee}")

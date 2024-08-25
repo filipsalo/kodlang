@@ -61,11 +61,11 @@ class Builder:
                 self.program.add_module(import_module)
         return BuildModule(module)
 
-    def get_imports(self, module) -> list[ast.ParsedImport]:
+    def get_imports(self, module) -> list[ast.Import]:
         """Get the imports of a module."""
         imports = []
         for statement in module.body:
-            if isinstance(statement, ast.ParsedImport):
+            if isinstance(statement, ast.Import):
                 imports.append(statement)
         return imports
 

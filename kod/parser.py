@@ -85,14 +85,14 @@ class Parser:
             while not self.try_consume(CloseCurly):
                 if self.try_consume(EOL):
                     continue
-                fields.append(ast.ParsedVariable.parse(self))
+                fields.append(ast.Variable.parse(self))
             self.try_consume(EOL)
             return types.StructType.make(name, fields)
         elif self.try_consume(OpenBracket):
             item_type = self.parse_type()
             self.consume(CloseBracket)
             return types.ArrayType.make(item_type)
-        param_type = ast.ParsedName.parse(self)
+        param_type = ast.Name.parse(self)
         return types.Type.from_name(param_type.id)
 
     def parse_statement(self) -> "Optional[ast.Statement]":
@@ -100,25 +100,25 @@ class Parser:
         stmt = None
         match self.peek():
             case BooleanLiteral():
-                stmt = ast.ParsedBooleanLiteral.parse(self)
+                stmt = ast.BooleanLiteral.parse(self)
             case Import():
-                stmt = ast.ParsedImport.parse(self)
+                stmt = ast.Import.parse(self)
             case Return():
-                stmt = ast.ParsedReturn.parse(self)
+                stmt = ast.Return.parse(self)
             case If():
-                stmt = ast.ParsedIfStatement.parse(self)
+                stmt = ast.IfStatement.parse(self)
             case For():
-                stmt = ast.ParsedForStatement.parse(self)
+                stmt = ast.ForStatement.parse(self)
             case Let():
-                stmt = ast.ParsedVariableDeclaration.parse(self)
+                stmt = ast.VariableDeclaration.parse(self)
             case Type():
-                stmt = ast.ParsedTypeDeclaration.parse(self)
+                stmt = ast.TypeDeclaration.parse(self)
             case Extern():
-                stmt = ast.ParsedExternalFunctionDeclaration.parse(self)
+                stmt = ast.ExternalFunctionDeclaration.parse(self)
             case Func():
-                stmt = ast.ParsedFunctionDeclaration.parse(self)
+                stmt = ast.FunctionDeclaration.parse(self)
             case Identifier():
-                stmt = ast.ParsedExpression.parse(self)
+                stmt = ast.Expression.parse(self)
             case Comment():
                 self.consume(Comment)
             case EOL():
@@ -137,11 +137,11 @@ class Parser:
         token = self.peek()
         return isinstance(token, token_type)
 
-    def parse(self) -> "ast.ParsedModule":
+    def parse(self) -> "ast.Module":
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        return ast.ParsedModule(self.file, statements, {}, span)
+        return ast.Module(self.file, statements, {}, span)
 
     def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:

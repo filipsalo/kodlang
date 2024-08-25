@@ -43,7 +43,7 @@ class Interpreter:
     def assign(self, module, name, value):
         """Assign a value to a variable"""
         match name:
-            case ast.ParsedVariable() | ast.ParsedName():
+            case ast.Variable() | ast.Name():
                 name = name.id
         for frame in self.stack[-1], module.names:
             if name in frame:
@@ -54,12 +54,12 @@ class Interpreter:
     def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
         match name:
-            case ast.ParsedVariable() | ast.ParsedName():
+            case ast.Variable() | ast.Name():
                 name = name.id
         for frame in self.stack[-1], module.names, self.program.builtins.module.names:
             if name in frame:
                 value = frame[name]
-                if isinstance(value, ast.ParsedStringLiteral):
+                if isinstance(value, ast.StringLiteral):
                     value = value.value
                 return value
         raise ValueError(f"Unknown name {name!r}")
@@ -69,7 +69,7 @@ class Interpreter:
         match op:
             case tokens.Dot():
                 lhs = self.evaluate_expression(module, lhs, as_lvalue)
-                if isinstance(lhs, ast.ParsedModule):
+                if isinstance(lhs, ast.Module):
                     return lhs.names[rhs.id]
                 return getattr(lhs, rhs.id)
             case tokens.OpenBracket():
@@ -109,15 +109,15 @@ class Interpreter:
                 return instance
             case ast.BinaryOperator(lhs, op, rhs):
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
-            case ast.ParsedName() | ast.ParsedVariable() as name:
+            case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):
                 return value
-            case ast.ParsedExpression(value):
+            case ast.Expression(value):
                 return self.evaluate_expression(module, value, as_lvalue)
-            case ast.ParsedFunctionCallParam() as param:
+            case ast.FunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
-            case ast.ParsedFunctionCall(callee, args):
+            case ast.FunctionCall(callee, args):
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
@@ -129,45 +129,42 @@ class Interpreter:
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
-            case ast.ParsedReturn(expression):
+            case ast.Return(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
-            case ast.ParsedImport(name):
+            case ast.Import(name):
                 module.names[name.lstrip("./")] = self.program.get_module(name).module
-            case (
-                ast.ParsedFunctionDeclaration(name)
-                | ast.ParsedExternalFunctionDeclaration(name)
-            ):
+            case ast.FunctionDeclaration(name) | ast.ExternalFunctionDeclaration(name):
                 module.names[name] = statement
                 setattr(statement, "module", module)
-            case ast.ParsedFunctionCall():
+            case ast.FunctionCall():
                 callee = self.evaluate_expression(module, statement.callee)
                 args = list(
                     map(partial(self.evaluate_expression, module), statement.args)
                 )
                 self.call_function(module, callee, args)
-            case ast.ParsedVariableDeclaration(variable, value):
+            case ast.VariableDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
                 if len(self.stack) > 1:
                     self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
                 else:
                     module.names[lhs.id] = self.evaluate_expression(module, value)
-            case ast.ParsedTypeDeclaration(variable, value):
+            case ast.TypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
                 module.names[lhs.id] = self.evaluate_expression(module, value)
-            case ast.ParsedAssignment(lhs, rhs):
+            case ast.Assignment(lhs, rhs):
                 lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
                 rhs = self.evaluate_expression(module, rhs)
                 self.assign(module, lhs.id, rhs)
-            case ast.ParsedIfStatement(condition, true_branch, false_branch):
+            case ast.IfStatement(condition, true_branch, false_branch):
                 matched = (
                     self.evaluate_expression(module, condition).to_bool().value is True
                 )
                 for statement in true_branch if matched else false_branch:
                     self.execute_statement(module, statement)
-            case ast.ParsedForStatement(condition, body):
+            case ast.ForStatement(condition, body):
                 while (
                     self.evaluate_expression(module, condition).to_bool().value is True
                 ):
@@ -191,7 +188,7 @@ class Interpreter:
                 arg_names = [field.name for field in dataclasses.fields(func)]
                 return func(**{name: value for name, value in zip(arg_names, args)})
             return func(*args)
-        if isinstance(func, ast.ParsedExternalFunctionDeclaration):
+        if isinstance(func, ast.ExternalFunctionDeclaration):
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]
@@ -200,7 +197,7 @@ class Interpreter:
         # Map args to params
         args = {
             param.variable.id: (
-                self.lookup(module, arg) if isinstance(arg, ast.ParsedVariable) else arg
+                self.lookup(module, arg) if isinstance(arg, ast.Variable) else arg
             )
             for param, arg in zip(func.params, args)
         }

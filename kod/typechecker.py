@@ -13,7 +13,7 @@ class TypeChecker:
 
     def __init__(self, program: Program) -> None:
         self.program = program
-        self.function_types: dict[str, ast.ParsedFunctionParamList] = {}
+        self.function_types: dict[str, ast.FunctionParamList] = {}
         self.stack: list[dict[str, Any]] = [{}]
         self.errors: list[KodSyntaxError] = []
 
@@ -28,14 +28,11 @@ class TypeChecker:
             self.check_module(module.module)
         return not self.errors
 
-    def check_module(self, module: ast.ParsedModule):
+    def check_module(self, module: ast.Module):
         """Check a module for type errors."""
         for node in module.body + self.program.builtins.module.body:
             match node:
-                case (
-                    ast.ParsedFunctionDeclaration()
-                    | ast.ParsedExternalFunctionDeclaration()
-                ):
+                case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = node.params
         for statement in module.body:
             self.check_statement(statement)
@@ -43,20 +40,20 @@ class TypeChecker:
     def check_statement(self, node: ast.Statement):
         """Check a statement for type errors."""
         match node:
-            case ast.ParsedFunctionCall():
+            case ast.FunctionCall():
                 self.check_function_call(node)
-            case ast.ParsedFunctionDeclaration():
+            case ast.FunctionDeclaration():
                 self.stack.append(
                     {param.variable.id: param.variable for param in node.params}
                 )
                 for statement in node.body:
                     self.check_statement(statement)
-            case ast.ParsedExternalFunctionDeclaration():
+            case ast.ExternalFunctionDeclaration():
                 pass
-            case ast.ParsedVariableDeclaration():
+            case ast.VariableDeclaration():
                 self.check_variable_declaration(node)
 
-    def check_variable_declaration(self, node: ast.ParsedVariableDeclaration):
+    def check_variable_declaration(self, node: ast.VariableDeclaration):
         """Check a function declaration for type errors."""
         if node.variable.id in self.stack[-1]:
             self.error(f"Variable '{node.variable.id}' already declared", node.span)
@@ -89,7 +86,7 @@ class TypeChecker:
                     f"Expected argument '{param.variable.id}' to be labeled",
                     arg.span,
                 )
-            if isinstance(arg.expression, ast.ParsedVariable):
+            if isinstance(arg.expression, ast.Variable):
                 if arg.expression.id not in self.stack[-1]:
                     self.error(
                         f"Variable '{arg.expression.id}' not found",
