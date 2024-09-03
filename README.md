@@ -1,6 +1,6 @@
 # Kod `>≤((º>`
 
-Kod is a toy language that compiles to x86 machine code for macOS.
+Kod is a toy language that compiles to AArch64 machine code for macOS.
 
 ## Example
 
