@@ -138,7 +138,7 @@ class Builder:
         cmd = [
             "ld",
             "-macos_version_min",
-            "14.0",
+            "15.0",
             "-lc",
             "-L",
             "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
