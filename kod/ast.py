@@ -38,6 +38,9 @@ Statement = Union[
 class ASTNode:
     """An AST node."""
 
+    def __repr__(self):
+        return f"ast.{super().__repr__()}"
+
 
 @dataclasses.dataclass
 class Literal:
