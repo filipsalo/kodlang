@@ -14,11 +14,13 @@ from kod.ast import (
     FunctionDeclaration,
     IfStatement,
     IntegerLiteral,
+    Module,
     Name,
     Return,
     StringLiteral,
     VariableDeclaration,
 )
+from kod.program import Program
 from kod.tokens import EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
 
 
@@ -130,9 +132,9 @@ class Compiler:
 
     _argregs = [*map(Register, ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"])]
 
-    def __init__(self, module, builtins, output=sys.stdout):
+    def __init__(self, module: Module, program: Program, output=sys.stdout):
         self.module = module
-        self.builtins = builtins
+        self.program = program
         self.output = output
         self.functions = {}
         self.strings = {}
@@ -159,7 +161,7 @@ class Compiler:
     def compile(self):
         """Compile the program to assembly"""
         self.emit(".text")
-        for statement in self.builtins.body:
+        for statement in self.program.builtins.module.body:
             match statement:
                 case ExternalFunctionDeclaration(name) | FunctionDeclaration(name):
                     self.functions[name] = statement

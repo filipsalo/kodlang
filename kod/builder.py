@@ -72,7 +72,7 @@ class Builder:
     def compile_module(self, module: BuildModule) -> str:
         """Compile a module."""
         output = io.StringIO()
-        Compiler(module.module, self.program.builtins.module, output).compile()
+        Compiler(module.module, self.program, output).compile()
         return output.getvalue()
 
     def _build(self, module_name: str, asm: str) -> Path:
