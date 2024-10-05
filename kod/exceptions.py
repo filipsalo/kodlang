@@ -3,6 +3,10 @@
 
 import itertools
 from functools import cache
+from pathlib import Path
+from typing import Optional
+
+from kod.span import Span
 
 RESET = "\033[0m"
 DIM = "\033[1;30m"
@@ -20,7 +24,7 @@ def get_source(filename):
 class ExcerptString:
     """A string that is part of an excerpt."""
 
-    def __init__(self, s, highlight=False):
+    def __init__(self, s: str, highlight: bool = False):
         self.str = s
         self.highlight = highlight
 
@@ -28,7 +32,7 @@ class ExcerptString:
 class ExcerptLine:
     """A line in an excerpt."""
 
-    def __init__(self, line_no, parts=None):
+    def __init__(self, line_no: int, parts: Optional[list[ExcerptString]] = None):
         self.line_no = line_no
         self.parts = parts or []
 
@@ -41,11 +45,11 @@ class ExcerptLine:
 class Excerpt:
     """An excerpt of a source file."""
 
-    def __init__(self, filename):
+    def __init__(self, filename: Path):
         self.filename = filename
-        self.lines = []
+        self.lines: list[ExcerptLine] = []
 
-    def append(self, line):
+    def append(self, line: ExcerptLine):
         """Append a line to the excerpt."""
         self.lines.append(line)
 
@@ -53,16 +57,16 @@ class Excerpt:
 class KodSyntaxError(Exception):
     """A syntax error in the Kod language."""
 
-    def __init__(self, msg, span):
+    def __init__(self, msg: str, span: Span):
         self.msg = msg
         self.span = span
 
     @property
-    def source(self):
+    def source(self) -> str:
         """Return the source code for the error."""
         return get_source(self.span.filename)
 
-    def excerpt(self):
+    def excerpt(self) -> Excerpt:
         """Return an excerpt of the source code around the error."""
         excerpt = Excerpt(self.span.filename)
         lines = self.source.split("\n")
@@ -86,18 +90,18 @@ class KodSyntaxError(Exception):
         return excerpt
 
     @property
-    def line(self):
+    def line(self) -> int:
         """Return the line number of the error."""
         return self.source.count("\n", 0, self.span.start)
 
     @property
-    def col(self):
+    def col(self) -> int:
         """Return the column number of the error."""
         line_start = self.source.rfind("\n", 0, self.span.start) + 1
         col = self.span.start - line_start
         return col
 
-    def __str__(self):
+    def __str__(self) -> str:
         excerpt = self.excerpt()
         s = f"\033[1;37m{self.span.filename}:{self.line+1}:{self.col+1}{RESET}: "
         s += f"{ERR}error: \033[1;37m{self.msg}{RESET}\n"
