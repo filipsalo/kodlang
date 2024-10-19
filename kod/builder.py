@@ -12,7 +12,7 @@ from kod.compiler import Compiler
 from kod.filesys import FileSystem, FileWrapper
 from kod.lexer import Lexer
 from kod.parser import Parser
-from kod.program import BuildModule, Program
+from kod.program import Program
 
 
 class Builder:
@@ -23,7 +23,7 @@ class Builder:
         self.stdlib_fs = stdlib_fs
         self.program = Program(self.parse_builtins())
 
-    def parse_builtins(self) -> BuildModule:
+    def parse_builtins(self) -> ast.Module:
         """Parse the builtins module."""
         return self.parse_module(self.resolve_import("builtins"))
 
@@ -48,18 +48,18 @@ class Builder:
         self.program.add_module(main)
         return self.program
 
-    def parse_module(self, file: FileWrapper) -> BuildModule:
+    def parse_module(self, file: FileWrapper) -> ast.Module:
         """Parse a module."""
         source = file.read()
         tokens = Lexer(source, Path(file.name)).lex()
         module = Parser(tokens, file).parse()
         for import_ in self.get_imports(module):
             name = import_.module_name
-            import_file = self.resolve_import(name, relative_to=module.file.path)
+            import_file = self.resolve_import(name, relative_to=module.source_file.path)
             if import_file not in self.program.modules:
                 import_module = self.parse_module(import_file)
                 self.program.add_module(import_module)
-        return BuildModule(module)
+        return module
 
     def get_imports(self, module) -> list[ast.Import]:
         """Get the imports of a module."""
@@ -69,10 +69,10 @@ class Builder:
                 imports.append(statement)
         return imports
 
-    def compile_module(self, module: BuildModule) -> str:
+    def compile_module(self, module: ast.Module) -> str:
         """Compile a module."""
         output = io.StringIO()
-        Compiler(module.module, self.program, output).compile()
+        Compiler(module, self.program, output).compile()
         return output.getvalue()
 
     def _build(self, module_name: str, asm: str) -> Path:
@@ -100,14 +100,14 @@ class Builder:
         )
         return obj_path
 
-    def build_module(self, module: BuildModule) -> Path:
+    def build_module(self, module: ast.Module) -> Path:
         """Build a module."""
         print(
-            f"\033[2mBuilding module \033[22;1;36m{module.source_path}\033[0m",
+            f"\033[2mBuilding module \033[22;1;36m{module.source_file.path}\033[0m",
             file=sys.stderr,
         )
         asm = self.compile_module(module)
-        return self._build(module.mangled_name(), asm)
+        return self._build(module.mangled_name, asm)
 
     def build_runtime_main(self, file: FileWrapper) -> Path:
         """Build the runtime main function."""
@@ -115,7 +115,7 @@ class Builder:
             .text
             .globl _main
             _main:
-                b ${"$".join(file.canonical_module_path.parts)}$main
+                b ${"$".join(file.canonical_path.parts)}$main
         """
         return self._build("runtime_main", asm)
 

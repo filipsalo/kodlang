@@ -141,7 +141,7 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        return ast.Module(self.file, statements, {}, span)
+        return ast.Module(self.file, statements, span)
 
     def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:

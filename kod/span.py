@@ -18,7 +18,10 @@ class Span:
         return self.end - self.start
 
     def __repr__(self):
-        return f"<{self.filename}:{self.start}-{self.end}>"
+        filename = self.filename
+        if filename.is_relative_to(Path.cwd()):
+            filename = self.filename.relative_to(Path.cwd())
+        return f"<{filename}:{self.start}-{self.end}>"
 
     def __or__(self, other: "Span") -> "Span":
         """Return the span that covers both self and other."""

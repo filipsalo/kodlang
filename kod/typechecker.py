@@ -25,12 +25,12 @@ class TypeChecker:
     def check(self):
         """Check the program for type errors."""
         for module in self.program:
-            self.check_module(module.module)
+            self.check_module(module)
         return not self.errors
 
     def check_module(self, module: ast.Module):
         """Check a module for type errors."""
-        for node in module.body + self.program.builtins.module.body:
+        for node in module.body + self.program.builtins.body:
             match node:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = node.params

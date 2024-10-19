@@ -1,6 +1,7 @@
 """Abstract syntax tree."""
 
 import dataclasses
+from pathlib import Path
 from typing import Any, Optional, Self, Union
 
 from kod import tokens, types
@@ -260,7 +261,7 @@ class FunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, VariableDeclaration):
                     variables[statement.variable.id] = statement.variable
-        label_parts = ["", *parser.file.canonical_module_path.parts, name]
+        label_parts = ["", *parser.file.canonical_path.parts, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
         return node
@@ -271,6 +272,7 @@ class Import(ASTNode):
     """An import statement."""
 
     module_name: str
+    local_name: str
     span: Span
 
     @classmethod
@@ -279,7 +281,8 @@ class Import(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.Import)
             module_name = StringLiteral.parse(parser).value.to_py_str()
-        return cls(module_name, span)
+            local_name = module_name.split("/")[-1]
+        return cls(module_name, local_name, span)
 
 
 @dataclasses.dataclass
@@ -408,10 +411,45 @@ class Assignment(ASTNode):
 class Module(ASTNode):
     """A module."""
 
-    file: FileWrapper
+    source_file: FileWrapper
     body: list[Statement]
-    names: dict
     span: Span
+
+    @property
+    def names(self):
+        names = {}
+        for statement in self.body:
+            match statement:
+                case FunctionDeclaration(name):
+                    names[name] = statement
+                case ExternalFunctionDeclaration(name):
+                    names[name] = statement
+                case VariableDeclaration(variable):
+                    names[variable.id] = statement
+                case Import(_, local_name):
+                    names[local_name] = statement
+        return names
+
+    @property
+    def canonical_name(self):
+        """Return the canonical module name."""
+        return self.source_file.canonical_path.with_suffix("")
+
+    @property
+    def mangled_name(self):
+        return f"_{self.canonical_name.name.replace('/', '$')}"
+
+    @property
+    def asm_path(self):
+        return Path(self.mangled_name).with_suffix(".s")
+
+    @property
+    def obj_path(self):
+        return Path(self.mangled_name).with_suffix(".o")
+
+    def resolve_import(self, module_name) -> Path:
+        """Resolve an import."""
+        return self.canonical_name.parent / module_name
 
 
 @dataclasses.dataclass

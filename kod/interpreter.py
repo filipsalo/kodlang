@@ -5,9 +5,11 @@ import ctypes
 import dataclasses
 import sys
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from kod import ast, tokens, types
+from kod.program import Program
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
@@ -22,18 +24,16 @@ class ReturnValue(Exception):
 class Interpreter:
     """Simple interpreter for the Kod language"""
 
-    def __init__(self, program):
+    def __init__(self, program: Program):
         self.program = program
         self.stack = [{}]
 
     def run(self, file, argv=()):
         """Run the program"""
         for module in self.program:
-            # fixme: these shouldn't be buildmodules
-            module = module.module
             for statement in module.body:
                 self.execute_statement(module, statement)
-        entry_module = self.program.get_module(file.path).module
+        entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
         main = self.lookup(entry_module, "main")
         string_array = types.ArrayType.make(types.String)
         argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
@@ -56,11 +56,15 @@ class Interpreter:
         match name:
             case ast.Variable() | ast.Name():
                 name = name.id
-        for frame in self.stack[-1], module.names, self.program.builtins.module.names:
+        for frame in self.stack[-1], module.names, self.program.builtins.names:
             if name in frame:
                 value = frame[name]
                 if isinstance(value, ast.StringLiteral):
                     value = value.value
+                elif isinstance(value, ast.Import):
+                    path = module.source_file.path.parent / Path(value.module_name)
+                    path = path.relative_to(module.source_file.fs.root_path)
+                    return self.program.get_module(path)
                 return value
         raise ValueError(f"Unknown name {name!r}")
 
@@ -132,8 +136,10 @@ class Interpreter:
             case ast.Return(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
-            case ast.Import(name):
-                module.names[name.lstrip("./")] = self.program.get_module(name).module
+            case ast.Import(name, local_name):
+                path = module.source_file.path.parent / Path(name)
+                path = path.relative_to(module.source_file.fs.root_path)
+                module.names[local_name] = self.program.get_module(path)
             case ast.FunctionDeclaration(name) | ast.ExternalFunctionDeclaration(name):
                 module.names[name] = statement
                 setattr(statement, "module", module)

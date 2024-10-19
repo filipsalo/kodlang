@@ -61,9 +61,9 @@ class FileWrapper:
         return f"{self.__class__.__name__}(path={self.path!r})"
 
     @property
-    def canonical_module_path(self):
-        """Return the canonical module name."""
-        return self.path.relative_to(self.fs.root_path).with_suffix("")
+    def canonical_path(self):
+        """Return the canonical source file path."""
+        return self.path.relative_to(self.fs.root_path)
 
     def __getattr__(self, name):
         return getattr(self.file, name)

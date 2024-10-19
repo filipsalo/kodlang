@@ -13,6 +13,7 @@ from kod.ast import (
     FunctionCall,
     FunctionDeclaration,
     IfStatement,
+    Import,
     IntegerLiteral,
     Module,
     Name,
@@ -21,7 +22,7 @@ from kod.ast import (
     VariableDeclaration,
 )
 from kod.program import Program
-from kod.tokens import EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
+from kod.tokens import Dot, EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
 
 
 class StringConstant:
@@ -136,6 +137,7 @@ class Compiler:
         self.module = module
         self.program = program
         self.output = output
+        self.imports: dict[str, Import] = {}
         self.functions = {}
         self.strings = {}
         self.stack = []
@@ -143,7 +145,12 @@ class Compiler:
 
     def create_global_label(self, base_name):
         """Create a global label"""
-        parts = ["", *self.module.path.parent.parts, self.module.path.stem, base_name]
+        parts = [
+            "",
+            *self.module.canonical_name.parent.parts,
+            self.module.canonical_name.stem,
+            base_name,
+        ]
         return Label("$".join(parts))
 
     def create_label(self, base_name):
@@ -161,7 +168,7 @@ class Compiler:
     def compile(self):
         """Compile the program to assembly"""
         self.emit(".text")
-        for statement in self.program.builtins.module.body:
+        for statement in self.program.builtins.body:
             match statement:
                 case ExternalFunctionDeclaration(name) | FunctionDeclaration(name):
                     self.functions[name] = statement
@@ -172,6 +179,8 @@ class Compiler:
                     self.functions[name] = statement
                 case FunctionDeclaration():
                     self.compile_function(statement)
+                case Import(_, local_name):
+                    self.imports[local_name] = statement
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
         self.emit("\n.data")
@@ -358,13 +367,35 @@ class Compiler:
             print(f"\t# {comment}", end="", file=self.output)
         print(file=self.output)
 
+    def resolve_function(self, callee):
+        """Resolve a function"""
+        match callee:
+            case Name(id_):
+                return self.functions[id_]
+            case BinaryOperator(lhs, op, rhs):
+                if (
+                    isinstance(op, Dot)
+                    and isinstance(lhs, Name)
+                    and lhs.id in self.imports
+                ):
+                    module_name = self.module.resolve_import(
+                        self.imports[lhs.id].module_name
+                    )
+                    module = self.program.get_module(module_name)
+                    return module.names[rhs.id]
+                else:
+                    raise ValueError(
+                        "LHS of dotted callable is not an import",
+                        op,
+                        lhs.id,
+                        self.imports,
+                    )
+            case _:
+                raise ValueError(f"Unexpected function {callee}")
+
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
-        match func_call.callee:
-            case Name(id_):
-                func = self.functions[id_]
-            case _:
-                raise ValueError(f"Unexpected function call {func_call.callee}")
+        func = self.resolve_function(func_call.callee)
         self.prepare_args(func, func_call.args)
         self.emit("bl", func.label_name)
         return Register("x0")
