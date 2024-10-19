@@ -17,18 +17,18 @@ class TypeChecker:
         self.stack: list[dict[str, Any]] = [{}]
         self.errors: list[KodSyntaxError] = []
 
-    def error(self, msg: str, span: Span):
+    def error(self, msg: str, span: Span) -> None:
         """Add an error to the list of errors."""
         err = KodSyntaxError(msg, span)
         self.errors.append(err)
 
-    def check(self):
+    def check(self) -> bool:
         """Check the program for type errors."""
         for module in self.program:
             self.check_module(module)
         return not self.errors
 
-    def check_module(self, module: ast.Module):
+    def check_module(self, module: ast.Module) -> None:
         """Check a module for type errors."""
         for node in module.body + self.program.builtins.body:
             match node:
@@ -37,7 +37,7 @@ class TypeChecker:
         for statement in module.body:
             self.check_statement(statement)
 
-    def check_statement(self, node: ast.Statement):
+    def check_statement(self, node: ast.Statement) -> None:
         """Check a statement for type errors."""
         match node:
             case ast.FunctionCall():
@@ -53,18 +53,18 @@ class TypeChecker:
             case ast.VariableDeclaration():
                 self.check_variable_declaration(node)
 
-    def check_variable_declaration(self, node: ast.VariableDeclaration):
+    def check_variable_declaration(self, node: ast.VariableDeclaration) -> None:
         """Check a function declaration for type errors."""
         if node.variable.id in self.stack[-1]:
             self.error(f"Variable '{node.variable.id}' already declared", node.span)
 
         self.stack[-1][node.variable.id] = node
 
-    def check_function_call(self, node):
+    def check_function_call(self, node) -> None:
         """Check a function call for type errors."""
         self.verify_arguments(node.callee.id, node.args)
 
-    def verify_arguments(self, function_name, arguments):
+    def verify_arguments(self, function_name, arguments) -> None:
         """Verify that the given arguments match the expected types."""
         if function_name not in self.function_types:
             self.error(
