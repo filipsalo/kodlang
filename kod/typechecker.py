@@ -3,7 +3,7 @@
 from typing import Any
 
 from kod import ast
-from kod.exceptions import KodSyntaxError
+from kod.exceptions import KodError
 from kod.program import Program
 from kod.span import Span
 
@@ -15,11 +15,11 @@ class TypeChecker:
         self.program = program
         self.function_types: dict[str, ast.FunctionParamList] = {}
         self.stack: list[dict[str, Any]] = [{}]
-        self.errors: list[KodSyntaxError] = []
+        self.errors: list[KodError] = []
 
     def error(self, msg: str, span: Span) -> None:
         """Add an error to the list of errors."""
-        err = KodSyntaxError(msg, span)
+        err = KodError(msg, span)
         self.errors.append(err)
 
     def check(self) -> bool:

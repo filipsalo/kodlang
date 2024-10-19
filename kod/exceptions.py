@@ -54,7 +54,7 @@ class Excerpt:
         self.lines.append(line)
 
 
-class KodSyntaxError(Exception):
+class KodError(Exception):
     """A syntax error in the Kod language."""
 
     def __init__(self, msg: str, span: Span):

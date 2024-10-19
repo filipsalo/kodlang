@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from typing import Generator, Optional
 
 from kod import ast, types
-from kod.exceptions import KodSyntaxError
+from kod.exceptions import KodError
 from kod.filesys import FileWrapper
 from kod.span import Span
 from kod.tokens import (
@@ -58,7 +58,7 @@ class Parser:
 
     def error(self, msg, span=None):
         """Return a syntax error."""
-        err = KodSyntaxError(msg, span or self.peek().span)
+        err = KodError(msg, span or self.peek().span)
         return err
 
     def try_consume(self, token_type):

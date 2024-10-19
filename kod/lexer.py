@@ -4,7 +4,7 @@
 from pathlib import Path
 from typing import Iterator, Type, TypeVar
 
-from kod.exceptions import KodSyntaxError
+from kod.exceptions import KodError
 from kod.span import Span
 from kod.tokens import (
     EOF,
@@ -78,9 +78,9 @@ class Lexer:
             return self.source[self.pos]
         return ""
 
-    def error(self, msg: str) -> KodSyntaxError:
+    def error(self, msg: str) -> KodError:
         """Raise a syntax error."""
-        err = KodSyntaxError(msg, Span(self.filename, self.pos, self.pos + 1))
+        err = KodError(msg, Span(self.filename, self.pos, self.pos + 1))
         return err
 
     def skip_whitespace(self) -> None:

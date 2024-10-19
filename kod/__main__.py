@@ -8,7 +8,7 @@ from pathlib import Path
 
 import kod.ast as ast
 from kod.builder import Builder
-from kod.exceptions import KodSyntaxError
+from kod.exceptions import KodError
 from kod.filesys import FileSystem
 from kod.interpreter import Interpreter
 from kod.paths import find_stdlib_path
@@ -51,7 +51,7 @@ def main():
     bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
     try:
         program = bob.parse_program(entry_module)
-    except KodSyntaxError as err:
+    except KodError as err:
         print(err, file=sys.stderr)
         return 1
 
