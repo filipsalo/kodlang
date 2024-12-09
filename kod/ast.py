@@ -430,6 +430,14 @@ class Module(ASTNode):
                     names[local_name] = statement
         return names
 
+    def get_imports(self) -> list[Import]:
+        """Get the imports of a module."""
+        imports = []
+        for statement in self.body:
+            if isinstance(statement, Import):
+                imports.append(statement)
+        return imports
+
     @property
     def canonical_name(self):
         """Return the canonical module name."""

@@ -44,8 +44,8 @@ def main():
 
     stdlib_path = find_stdlib_path()
     stdlib_fs = FileSystem(stdlib_path)
-    project_fs = FileSystem(Path(Path.cwd()))
-    entry_path = Path(Path(args.file).absolute())
+    project_fs = FileSystem(Path.cwd())
+    entry_path = Path(args.file).absolute()
     entry_module = project_fs.open(entry_path)
 
     bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
@@ -76,7 +76,7 @@ def main():
                 result = subprocess.run([executable, *args.args], check=False)
                 return result.returncode
         case "parse":
-            module = program.get_module(entry_module.path).module
+            module = program.get_module(entry_module.path)
             ast.dump(module)
 
 

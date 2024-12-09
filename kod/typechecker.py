@@ -14,7 +14,7 @@ class TypeChecker:
     def __init__(self, program: Program) -> None:
         self.program = program
         self.function_types: dict[str, ast.FunctionParamList] = {}
-        self.stack: list[dict[str, Any]] = [{}]
+        self.stack: list[dict[str, Any]] = []
         self.errors: list[KodError] = []
 
     def error(self, msg: str, span: Span) -> None:
@@ -25,17 +25,28 @@ class TypeChecker:
     def check(self) -> bool:
         """Check the program for type errors."""
         for module in self.program:
+            self.collect_functions(module)
+        for module in self.program:
             self.check_module(module)
         return not self.errors
 
-    def check_module(self, module: ast.Module) -> None:
-        """Check a module for type errors."""
-        for node in module.body + self.program.builtins.body:
+    def collect_functions(self, module: ast.Module) -> None:
+        """Collect all function declarations."""
+        for node in module.body:
             match node:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
-                    self.function_types[node.name] = node.params
+                    self.function_types[node.label_name] = node.params
+                case ast.Import():
+                    # fixme: this could get stuck in a loop
+                    path = module.canonical_name.parent / node.module_name
+                    self.collect_functions(self.program.get_module(path))
+
+    def check_module(self, module: ast.Module) -> None:
+        """Check a module for type errors."""
+        self.stack.append({})
         for statement in module.body:
             self.check_statement(statement)
+        # self.stack.pop()
 
     def check_statement(self, node: ast.Statement) -> None:
         """Check a statement for type errors."""
@@ -48,6 +59,7 @@ class TypeChecker:
                 )
                 for statement in node.body:
                     self.check_statement(statement)
+                self.stack.pop()
             case ast.ExternalFunctionDeclaration():
                 pass
             case ast.VariableDeclaration():
@@ -62,20 +74,37 @@ class TypeChecker:
 
     def check_function_call(self, node) -> None:
         """Check a function call for type errors."""
-        self.verify_arguments(node.callee.id, node.args)
+        # print(type(node), node)
+        # check the expression that is being called
+        # match callee := node.callee:
+        #     case ast.Name():
 
-    def verify_arguments(self, function_name, arguments) -> None:
+        #         self.verify_arguments(callee.id, node.args)
+        #     case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, Dot):
+        #         lhs
+        #         self.verify_arguments(rhs, node.args)
+
+        self.verify_arguments(node.callee, node.args)
+
+    def lookup(self, name: ast.Name) -> Any:
+        """Look up a name in the current scope."""
+        for scope in reversed(self.stack):
+            if name.id in scope:
+                return scope[name.id]
+        dbg("WELL SHIT")
+        self.error(f"Name '{name.id}' not found", name.span)
+
+    def verify_arguments(self, function, arguments) -> None:
         """Verify that the given arguments match the expected types."""
-        if function_name not in self.function_types:
-            self.error(
-                f"Function '{function_name}' not found",
-                function_name.span,
+        params = self.function_types.get(function.id)
+        if params is None:
+            return self.error(
+                "Callee is not a function",
+                function.span,
             )
 
-        params = self.function_types[function_name]
-
         if len(arguments) != len(params):
-            self.error(
+            return self.error(
                 f"Expected {len(params)} arguments, but got {len(arguments)}",
                 arguments.span,
             )
