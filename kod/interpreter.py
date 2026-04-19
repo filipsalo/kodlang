@@ -127,6 +127,8 @@ class Interpreter:
         match expression:
             case type() if issubclass(expression, types.Type):
                 return expression
+            case type() if hasattr(expression, "variants"):
+                return expression
             case types.Type() as instance:
                 return instance
             case ast.BinaryOperator(lhs, op, rhs):
@@ -200,6 +202,26 @@ class Interpreter:
                 ):
                     for stmt in body:
                         self.execute_statement(module, stmt)
+            case ast.MatchStatement(expression, arms):
+                value = self.evaluate_expression(module, expression)
+                for arm in arms:
+                    if isinstance(arm.pattern, ast.WildcardPattern):
+                        for stmt in arm.body:
+                            self.execute_statement(module, stmt)
+                        break
+                    elif isinstance(arm.pattern, ast.EnumVariantPattern):
+                        if (
+                            isinstance(value, types.EnumValue)
+                            and value.variant_name == arm.pattern.variant_name
+                        ):
+                            field_values = list(value.fields.values())
+                            for binding_name, field_value in zip(
+                                arm.pattern.bindings, field_values
+                            ):
+                                self.stack[-1][binding_name] = field_value
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 

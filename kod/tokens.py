@@ -275,3 +275,13 @@ class Type(Token):
 @dataclasses.dataclass
 class Struct(Token):
     """A struct token"""
+
+
+@dataclasses.dataclass
+class Enum(Token):
+    """An enum keyword token"""
+
+
+@dataclasses.dataclass
+class Match(Token):
+    """A match keyword token"""

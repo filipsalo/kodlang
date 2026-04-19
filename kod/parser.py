@@ -14,7 +14,10 @@ from kod.tokens import (
     BooleanLiteral,
     CloseBracket,
     CloseCurly,
+    CloseParen,
+    Comma,
     Comment,
+    Enum,
     Extern,
     For,
     Func,
@@ -22,9 +25,11 @@ from kod.tokens import (
     If,
     Import,
     Let,
+    Match,
     NoneLiteral,
     OpenBracket,
     OpenCurly,
+    OpenParen,
     Return,
     Struct,
     Token,
@@ -90,6 +95,22 @@ class Parser:
                 fields.append(ast.Variable.parse(self))
             self.try_consume(EOL)
             return types.StructType.make(name, fields)
+        elif self.try_consume(Enum):
+            self.consume(OpenCurly)
+            variants = []
+            while not self.try_consume(CloseCurly):
+                if self.try_consume(EOL):
+                    continue
+                variant_name = self.consume(Identifier).value
+                fields = []
+                if self.try_consume(OpenParen):
+                    while not self.try_consume(CloseParen):
+                        fields.append(ast.Variable.parse(self))
+                        if not self.try_consume(Comma):
+                            self.consume(CloseParen)
+                            break
+                variants.append((variant_name, fields))
+            return types.EnumType.make(name, variants)
         elif self.try_consume(OpenBracket):
             item_type = self.parse_type()
             self.consume(CloseBracket)
@@ -123,6 +144,8 @@ class Parser:
                 stmt = ast.ExternalFunctionDeclaration.parse(self)
             case Func():
                 stmt = ast.FunctionDeclaration.parse(self)
+            case Match():
+                stmt = ast.MatchStatement.parse(self)
             case Identifier():
                 stmt = ast.Expression.parse(self)
             case Comment():

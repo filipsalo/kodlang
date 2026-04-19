@@ -205,3 +205,112 @@ class StructType(Type, ABC):
         data_class.field_offsets = field_offsets
 
         return data_class
+
+
+@dataclasses.dataclass
+class EnumVariantInfo:
+    """Info about a single enum variant."""
+
+    name: str
+    fields: list  # list of Variable AST nodes
+    discriminant: int
+    field_offsets: dict  # field_id -> byte offset within payload
+    payload_width: int
+
+
+class EnumValue(Type):
+    """A runtime enum value."""
+
+    def __init__(self, enum_type, variant_name, fields):
+        super().__init__(None)
+        self.enum_type = enum_type
+        self.variant_name = variant_name
+        self.fields = fields  # dict: field_name -> value
+
+    def to_bool(self):
+        return Bool(True)
+
+    def op_eq(self, other):
+        if isinstance(other, EnumValue):
+            return Bool(
+                self.enum_type is other.enum_type
+                and self.variant_name == other.variant_name
+            )
+        return Bool(False)
+
+    def op_ne(self, other):
+        return Bool(not self.op_eq(other).value)
+
+    def __repr__(self):
+        return f"<{self.enum_type.name}.{self.variant_name}({self.fields!r})>"
+
+
+class EnumVariantConstructor:
+    """Callable constructor for enum variants with payload fields."""
+
+    def __init__(self, enum_type, variant_name, field_names):
+        self.enum_type = enum_type
+        self.variant_name = variant_name
+        self.field_names = field_names
+
+    def __call__(self, *args):
+        fields = dict(zip(self.field_names, args))
+        return EnumValue(self.enum_type, self.variant_name, fields)
+
+
+class EnumType:
+    """Base class for dynamically-created enum types."""
+
+    @classmethod
+    def make(cls, name, variants):
+        """Create an enum type. variants is list of (name, fields) tuples."""
+        variant_infos = {}
+        max_payload_width = 0
+
+        for i, (variant_name, fields) in enumerate(variants):
+            field_offsets = {}
+            offset = 0
+            for field in fields:
+                field_offsets[field.id] = offset
+                offset += field.type.width
+            payload_width = offset
+            max_payload_width = max(max_payload_width, payload_width)
+            variant_infos[variant_name] = EnumVariantInfo(
+                name=variant_name,
+                fields=fields,
+                discriminant=i,
+                field_offsets=field_offsets,
+                payload_width=payload_width,
+            )
+
+        total_width = 8 + max_payload_width  # discriminant + payload
+
+        enum_class = type(
+            name,
+            (cls,),
+            {
+                "name": name,
+                "width": total_width,
+                "variants": variant_infos,
+                "payload_offset": 8,
+                "max_payload_width": max_payload_width,
+            },
+        )
+
+        for variant_name, info in variant_infos.items():
+            if info.fields:
+                setattr(
+                    enum_class,
+                    variant_name,
+                    EnumVariantConstructor(
+                        enum_class, variant_name, [f.id for f in info.fields]
+                    ),
+                )
+            else:
+                setattr(
+                    enum_class,
+                    variant_name,
+                    EnumValue(enum_class, variant_name, {}),
+                )
+
+        return enum_class

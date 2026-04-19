@@ -8,6 +8,7 @@ from kod.ast import (
     Assignment,
     BinaryOperator,
     BooleanLiteral,
+    EnumVariantPattern,
     ExternalFunctionDeclaration,
     ForStatement,
     FunctionCall,
@@ -15,6 +16,7 @@ from kod.ast import (
     IfStatement,
     Import,
     IntegerLiteral,
+    MatchStatement,
     Module,
     Name,
     NoneLiteral,
@@ -22,6 +24,7 @@ from kod.ast import (
     StringLiteral,
     TypeDeclaration,
     VariableDeclaration,
+    WildcardPattern,
 )
 from kod.program import Program
 from kod.tokens import (
@@ -233,6 +236,8 @@ class Compiler:
                 self.compile_if_statement(condition, true_branch, false_branch)
             case ForStatement(condition, body):
                 self.compile_for_statement(condition, body)
+            case MatchStatement(expression, arms):
+                self.compile_match(expression, arms)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
@@ -337,8 +342,113 @@ class Compiler:
         self.emit("str", register, field_addr)
         self.stack[-1].release_register(register)
 
+    def compile_enum_unit_variant(self, expression) -> "Register":
+        """Compile a unit enum variant access (e.g. Direction.North) to its discriminant."""
+        enum_type = self.type_registry[expression.lhs.id]
+        variant_info = enum_type.variants[expression.rhs.id]
+        register = self.stack[-1].allocate_register()
+        self.emit("mov", register, Imm(variant_info.discriminant))
+        return register
+
+    def compile_match(self, expression, arms):
+        """Compile a match statement."""
+        if not isinstance(expression, Name):
+            raise ValueError(f"Match expression must be a Name, got {expression}")
+        label = self.create_label("match")
+        enum_addr = self.stack[-1].get_variable_address(expression)
+        disc_reg = self.stack[-1].allocate_register()
+        self.emit("ldr", disc_reg, enum_addr)
+
+        skip_labels = [self.create_label("skip") for _ in arms]
+
+        for i, arm in enumerate(arms):
+            if isinstance(arm.pattern, WildcardPattern):
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+            elif isinstance(arm.pattern, EnumVariantPattern):
+                enum_type = self.type_registry[arm.pattern.enum_name]
+                variant_info = enum_type.variants[arm.pattern.variant_name]
+                self.emit("cmp", disc_reg, Imm(variant_info.discriminant))
+                self.emit("bne", skip_labels[i])
+                # bind fields to pre-allocated stack slots
+                for binding_name, field in zip(
+                    arm.pattern.bindings, variant_info.fields
+                ):
+                    field_offset = variant_info.field_offsets[field.id]
+                    field_addr = StackAddress(
+                        enum_addr.offset + 8 + field_offset, enum_addr.base
+                    )
+                    binding_addr = self.stack[-1].get_variable_address(
+                        Name(binding_name, span=arm.pattern.span)
+                    )
+                    val_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", val_reg, field_addr)
+                    self.emit("str", val_reg, binding_addr)
+                    self.stack[-1].release_register(val_reg)
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+
+        self.emit_label(label.done)
+        self.stack[-1].release_register(disc_reg)
+
     def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
+        # Enum unit variant: let d: Direction = Direction.North
+        if (
+            isinstance(expression, BinaryOperator)
+            and isinstance(expression.op, Dot)
+            and isinstance(expression.lhs, Name)
+            and expression.lhs.id in self.type_registry
+            and hasattr(self.type_registry[expression.lhs.id], "variants")
+        ):
+            enum_type = self.type_registry[expression.lhs.id]
+            variant_info = enum_type.variants[expression.rhs.id]
+            if getattr(variable, "type", None) is None:
+                variable.type = enum_type
+            destination = self.stack[-1].get_variable_address(variable)
+            register = self.stack[-1].allocate_register()
+            self.emit("mov", register, Imm(variant_info.discriminant))
+            self.emit("str", register, destination)
+            self.stack[-1].release_register(register)
+            return
+
+        # Enum payload variant: let m: Message = Message.Text(content: "hello")
+        if (
+            isinstance(expression, FunctionCall)
+            and isinstance(expression.callee, BinaryOperator)
+            and isinstance(expression.callee.op, Dot)
+            and isinstance(expression.callee.lhs, Name)
+            and expression.callee.lhs.id in self.type_registry
+            and hasattr(self.type_registry[expression.callee.lhs.id], "variants")
+        ):
+            enum_type = self.type_registry[expression.callee.lhs.id]
+            variant_info = enum_type.variants[expression.callee.rhs.id]
+            if getattr(variable, "type", None) is None:
+                variable.type = enum_type
+            destination = self.stack[-1].get_variable_address(variable)
+            # Store discriminant
+            disc_reg = self.stack[-1].allocate_register()
+            self.emit("mov", disc_reg, Imm(variant_info.discriminant))
+            self.emit("str", disc_reg, destination)
+            self.stack[-1].release_register(disc_reg)
+            # Store payload fields
+            for arg in expression.args:
+                field_offset = variant_info.field_offsets[arg.label.id]
+                field_addr = StackAddress(
+                    destination.offset + 8 + field_offset, destination.base
+                )
+                val = self.compile_expression(arg.expression)
+                reg = self.stack[-1].allocate_register()
+                self.mov(reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("str", reg, field_addr)
+                self.stack[-1].release_register(reg)
+            return
+
         # Struct constructor: initialise each field directly on the stack
         if isinstance(expression, FunctionCall) and isinstance(expression.callee, Name):
             type_name = expression.callee.id
@@ -386,6 +496,12 @@ class Compiler:
             return self.compile_function_call(expression)
         elif isinstance(expression, BinaryOperator):
             if isinstance(expression.op, Dot):
+                if (
+                    isinstance(expression.lhs, Name)
+                    and expression.lhs.id in self.type_registry
+                    and hasattr(self.type_registry[expression.lhs.id], "variants")
+                ):
+                    return self.compile_enum_unit_variant(expression)
                 return self.compile_field_access(expression)
             return self.compile_binary_operator(expression)
         else:

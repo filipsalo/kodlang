@@ -275,6 +275,21 @@ class FunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, VariableDeclaration):
                     variables[statement.variable.id] = statement.variable
+                if isinstance(statement, MatchStatement):
+                    for arm in statement.arms:
+                        if isinstance(arm.pattern, EnumVariantPattern):
+                            enum_type = parser.type_registry.get(arm.pattern.enum_name)
+                            if enum_type is not None and hasattr(enum_type, "variants"):
+                                variant_info = enum_type.variants.get(
+                                    arm.pattern.variant_name
+                                )
+                                if variant_info is not None:
+                                    for binding_name, field in zip(
+                                        arm.pattern.bindings, variant_info.fields
+                                    ):
+                                        variables[binding_name] = Variable(
+                                            binding_name, field.type, arm.pattern.span
+                                        )
         label_parts = ["", *parser.file.canonical_path.with_suffix("").parts, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
@@ -584,3 +599,80 @@ class Struct(ASTNode):
             while not parser.try_consume(tokens.CloseCurly):
                 fields.append(Variable.parse(parser))
         return cls(name, fields, span)
+
+
+@dataclasses.dataclass
+class WildcardPattern:
+    span: Span
+
+
+@dataclasses.dataclass
+class EnumVariantPattern:
+    enum_name: str
+    variant_name: str
+    bindings: list  # list of str (binding names)
+    span: Span
+
+
+@dataclasses.dataclass
+class MatchArm:
+    pattern: Any  # WildcardPattern | EnumVariantPattern
+    body: list  # list of Statement
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: "Parser") -> "MatchArm":
+        with parser.span() as span:
+            # Parse pattern
+            if parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
+                parser.consume(tokens.Identifier)
+                pattern = WildcardPattern(span)
+            else:
+                enum_name = parser.consume(tokens.Identifier).value
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                bindings = []
+                if parser.try_consume(tokens.OpenParen):
+                    while not parser.try_consume(tokens.CloseParen):
+                        bindings.append(parser.consume(tokens.Identifier).value)
+                        if not parser.try_consume(tokens.Comma):
+                            parser.consume(tokens.CloseParen)
+                            break
+                pattern = EnumVariantPattern(enum_name, variant_name, bindings, span)
+            # Parse ->
+            parser.consume(tokens.Arrow)
+            # Parse body: block or single statement
+            if parser.peeking_at(tokens.OpenCurly):
+                parser.consume(tokens.OpenCurly)
+                body = []
+                while not parser.try_consume(tokens.CloseCurly):
+                    if parser.try_consume(tokens.EOL):
+                        continue
+                    if stmt := parser.parse_statement():
+                        body.append(stmt)
+            else:
+                body = []
+                if stmt := parser.parse_statement():
+                    body.append(stmt)
+        return cls(pattern, body, span)
+
+
+@dataclasses.dataclass
+class MatchStatement(ASTNode):
+    expression: ASTNode
+    arms: list  # list of MatchArm
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: "Parser") -> "MatchStatement":
+        with parser.span() as span:
+            parser.consume(tokens.Match)
+            expression = Expression.parse(parser)
+            parser.try_consume(tokens.EOL)
+            parser.consume(tokens.OpenCurly)
+            arms = []
+            while not parser.try_consume(tokens.CloseCurly):
+                if parser.try_consume(tokens.EOL):
+                    continue
+                arms.append(MatchArm.parse(parser))
+        return cls(expression, arms, span)
