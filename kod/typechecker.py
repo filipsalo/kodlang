@@ -143,7 +143,7 @@ class TypeChecker:
 
         if len(arguments) != len(params):
             self.error(
-                f"'{function_name}' takes {len(params)} argument(s), but got {len(arguments)}",
+                f"'{function_name}' takes {len(params)} {'argument' if len(params) == 1 else 'arguments'}, but got {len(arguments)}",
                 arguments.span,
             )
 
