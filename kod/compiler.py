@@ -115,10 +115,10 @@ class StackAddress(Operand):
 class StackFrame:
     """A stack frame"""
 
-    def __init__(self, variables, end_label):
+    def __init__(self, variables, end_label, return_type=None):
         self.variables = {variable.id: variable for variable in variables}
         self.end_label = end_label
-        self.return_value = None
+        self.return_type = return_type
         self.registers = [Register(f"x{n}") for n in [*range(8, 16), *range(19, 28)]]
 
     def declare_variable(self, variable):
@@ -152,9 +152,12 @@ class StackFrame:
         """Allocate a register"""
         return self.registers.pop(0)
 
+    _allocatable = {f"x{n}" for n in [*range(8, 16), *range(19, 28)]}
+
     def release_register(self, register):
         """Release a register"""
-        self.registers.insert(0, register)
+        if register.name in self._allocatable:
+            self.registers.insert(0, register)
 
 
 class Compiler:
@@ -240,7 +243,7 @@ class Compiler:
             case Assignment(variable, value):
                 self.compile_variable_declaration(variable, value)
             case Return(value):
-                self.stack[-1].return_value = value
+                self.compile_return(value)
                 self.emit("b", self.stack[-1].end_label)
             case IfStatement(condition, true_branch, false_branch):
                 self.compile_if_statement(condition, true_branch, false_branch)
@@ -258,6 +261,8 @@ class Compiler:
         self.enter_stack_frame(func)
         for statement in func.body:
             self.compile_statement(statement)
+        # Implicit return 0 for functions that fall off the end
+        self.mov(Register("x0"), Imm(0))
         self.leave_stack_frame()
         self.functions[func.name] = func
 
@@ -266,7 +271,7 @@ class Compiler:
         label = Label(func.label_name)
         self.emit(".globl", label)
         self.emit_label(label)
-        frame = StackFrame(func.variables.values(), label.end)
+        frame = StackFrame(func.variables.values(), label.end, func.return_type)
         self.stack.append(frame)
         self.emit("sub", Register("sp"), Register("sp"), Imm(frame.aligned_size() + 16))
         self.emit(
@@ -286,16 +291,48 @@ class Compiler:
             offset -= param.variable.type.width
             self.emit("str", register, StackAddress(offset, "fp"))
 
-    def leave_stack_frame(self):
-        """Emit the epilogue for a function"""
-        label = self.stack[-1].end_label
-        return_value = self.stack[-1].return_value
-        print(f"{label}:", file=self.output)
-        if return_value is None:
-            self.mov(Register("w0"), Imm(0))
+    def compile_return(self, value):
+        """Compile a return value into x0, handling optional wrapping."""
+        from kod import values as _types
+
+        return_type = self.stack[-1].return_type
+        is_optional_return = (
+            return_type is not None
+            and isinstance(return_type, type)
+            and issubclass(return_type, _types.OptionalType)
+        )
+        if is_optional_return and not isinstance(value, NoneLiteral):
+            # Compile value first (may call bl), save to stack temp, then arena-alloc
+            val = self.compile_expression(value)
+            # Save to stack temp to survive any upcoming bl
+            self.emit("sub", Register("sp"), Register("sp"), Imm(16))
+            val_reg = self.stack[-1].allocate_register()
+            self.mov(val_reg, val)
+            if isinstance(val, Register):
+                self.stack[-1].release_register(val)
+            self.emit("str", val_reg, StackAddress(0, "sp"))
+            self.stack[-1].release_register(val_reg)
+            # Arena-alloc the slot
+            self.mov(Register("x0"), Imm(return_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            # Reload value from stack temp and store into arena slot
+            tmp_reg = self.stack[-1].allocate_register()
+            self.emit("ldr", tmp_reg, StackAddress(0, "sp"))
+            self.emit("add", Register("sp"), Register("sp"), Imm(16))
+            self.emit("str", tmp_reg, StackAddress(0, str(Register("x0"))))
+            self.stack[-1].release_register(tmp_reg)
+        elif isinstance(value, NoneLiteral) or value is None:
+            self.mov(Register("x0"), Imm(0))
         else:
-            addr = self.compile_expression(return_value)
+            addr = self.compile_expression(value)
             self.mov(Register("x0"), addr)
+            if isinstance(addr, Register):
+                self.stack[-1].release_register(addr)
+
+    def leave_stack_frame(self):
+        """Emit the epilogue for a function (teardown only — return value already in x0)."""
+        label = self.stack[-1].end_label
+        print(f"{label}:", file=self.output)
         frame = self.stack.pop()
         self.emit(
             "ldp",
@@ -625,11 +662,24 @@ class Compiler:
         # Optional Some: let x: T? = <non-none value> — wrap in heap allocation
         from kod import values as _types
 
+        rhs_already_optional = (
+            isinstance(expression, FunctionCall)
+            and isinstance(expression.callee, Name)
+            and isinstance(
+                getattr(self.functions.get(expression.callee.id), "return_type", None),
+                type,
+            )
+            and issubclass(
+                self.functions[expression.callee.id].return_type, _types.OptionalType
+            )
+        )
+
         if (
             getattr(variable, "type", None) is not None
             and isinstance(variable.type, type)
             and issubclass(variable.type, _types.OptionalType)
             and not isinstance(expression, NoneLiteral)
+            and not rhs_already_optional
         ):
             destination = self.stack[-1].get_variable_address(variable)
             self.mov(Register("x0"), Imm(variable.type.data_width))
