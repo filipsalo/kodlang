@@ -7,7 +7,8 @@ import sys
 from functools import partial
 from typing import Any
 
-from kod import ast, tokens, types
+from kod import ast, tokens
+from kod import values as types
 from kod.program import Program
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")

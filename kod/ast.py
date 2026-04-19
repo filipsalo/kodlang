@@ -4,7 +4,8 @@ import dataclasses
 from pathlib import Path
 from typing import Any, Optional, Self, Union
 
-from kod import tokens, types
+from kod import tokens
+from kod import values as types
 from kod.filesys import FileWrapper
 from kod.parser import Parser
 from kod.span import Span

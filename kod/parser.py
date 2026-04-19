@@ -4,7 +4,8 @@
 from contextlib import contextmanager
 from typing import Generator, Optional
 
-from kod import ast, types
+from kod import ast
+from kod import values as types
 from kod.exceptions import KodError
 from kod.filesys import FileWrapper
 from kod.span import Span

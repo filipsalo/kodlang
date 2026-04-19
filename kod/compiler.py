@@ -385,7 +385,7 @@ class Compiler:
         """Compile a match statement."""
         if not isinstance(expression, Name):
             raise ValueError(f"Match expression must be a Name, got {expression}")
-        from kod import types as _types
+        from kod import values as _types
 
         label = self.create_label("match")
         enum_addr = self.stack[-1].get_variable_address(expression)
@@ -569,7 +569,7 @@ class Compiler:
                 return
 
         # Optional Some: let x: T? = <non-none value> — wrap in heap allocation
-        from kod import types as _types
+        from kod import values as _types
 
         if (
             getattr(variable, "type", None) is not None
@@ -708,7 +708,7 @@ class Compiler:
 
     def compile_index(self, expression):
         """Compile expr[i] — byte load for strings, 8-byte load for arrays."""
-        from kod import types as _types
+        from kod import values as _types
 
         lhs_type = None
         if isinstance(expression.lhs, Name):
@@ -832,7 +832,7 @@ class Compiler:
 
     def _infer_type(self, expression):
         """Infer the type of an expression, returning None if unknown."""
-        from kod import types as _types
+        from kod import values as _types
 
         if isinstance(expression, StringLiteral):
             return _types.String
@@ -854,7 +854,7 @@ class Compiler:
             return self.compile_short_circuit(expression)
 
         if isinstance(expression.op, Plus):
-            from kod import types as _types
+            from kod import values as _types
 
             lhs_type = self._infer_type(expression.lhs)
             if lhs_type is _types.String:
@@ -950,7 +950,7 @@ class Compiler:
 
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
-        from kod import types as _types
+        from kod import values as _types
 
         if (
             isinstance(func_call.callee, Name)

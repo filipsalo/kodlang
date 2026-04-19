@@ -92,19 +92,19 @@ class TypeChecker:
         """Infer the type of an expression, returning None if unknown."""
         match node:
             case ast.NoneLiteral():
-                from kod import types
+                from kod import values as types
 
                 return types.NoneType
             case ast.IntegerLiteral():
-                from kod import types
+                from kod import values as types
 
                 return types.Int64
             case ast.StringLiteral():
-                from kod import types
+                from kod import values as types
 
                 return types.String
             case ast.BooleanLiteral():
-                from kod import types
+                from kod import values as types
 
                 return types.Bool
             case ast.Name() | ast.Variable():
@@ -123,7 +123,7 @@ class TypeChecker:
             case ast.FunctionCall():
                 self.check_function_call(node)
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Is):
-                from kod import types
+                from kod import values as types
 
                 lhs_type = self.infer_type(lhs)
                 if lhs_type is not None and not (
@@ -137,7 +137,7 @@ class TypeChecker:
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(
                 op, (tokens.EqualEqual, tokens.NotEqual)
             ):
-                from kod import types
+                from kod import values as types
 
                 lhs_type = self.infer_type(lhs)
                 rhs_type = self.infer_type(rhs)
