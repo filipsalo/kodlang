@@ -9,6 +9,7 @@ from kod.span import Span
 from kod.tokens import (
     EOF,
     EOL,
+    And,
     Anon,
     Arrow,
     BooleanLiteral,
@@ -25,17 +26,21 @@ from kod.tokens import (
     Extern,
     For,
     Func,
+    GreaterEqual,
     GreaterThan,
     Identifier,
     If,
     Import,
     IntegerLiteral,
+    LessEqual,
     LessThan,
     Let,
     Minus,
+    NotEqual,
     OpenBracket,
     OpenCurly,
     OpenParen,
+    Or,
     Percent,
     Plus,
     Return,
@@ -61,6 +66,8 @@ KEYWORDS = {
     "for": For,
     "struct": Struct,
     "type": Type,
+    "and": And,
+    "or": Or,
 }
 
 
@@ -151,6 +158,28 @@ class Lexer:
             return self.build(keyword_token_type)
         return self.build(Identifier)
 
+    def lex_not_equal(self) -> Token:
+        """Lex a != operator."""
+        self.consume("!")
+        self.consume("=")
+        return self.build(NotEqual)
+
+    def lex_less_than_or_equal(self) -> Token:
+        """Lex < or <=."""
+        self.consume("<")
+        if self.peek() == "=":
+            self.consume("=")
+            return self.build(LessEqual)
+        return self.build(LessThan)
+
+    def lex_greater_than_or_equal(self) -> Token:
+        """Lex > or >=."""
+        self.consume(">")
+        if self.peek() == "=":
+            self.consume("=")
+            return self.build(GreaterEqual)
+        return self.build(GreaterThan)
+
     def lex_slash_or_comment(self) -> Token:
         """Lex a comment."""
         self.consume("/")
@@ -218,10 +247,12 @@ class Lexer:
                     yield self.lex_single_char(Percent)
                 case "*":
                     yield self.lex_single_char(Star)
+                case "!":
+                    yield self.lex_not_equal()
                 case "<":
-                    yield self.lex_single_char(LessThan)
+                    yield self.lex_less_than_or_equal()
                 case ">":
-                    yield self.lex_single_char(GreaterThan)
+                    yield self.lex_greater_than_or_equal()
                 case "-":
                     yield self.lex_arrow_or_minus()
                 case '"':

@@ -82,12 +82,30 @@ class Interpreter:
                 op_func_name = "op_plus"
             case tokens.Minus():
                 op_func_name = "op_minus"
+            case tokens.NotEqual():
+                op_func_name = "op_ne"
             case tokens.LessThan():
                 op_func_name = "op_lt"
+            case tokens.LessEqual():
+                op_func_name = "op_le"
             case tokens.GreaterThan():
                 op_func_name = "op_gt"
+            case tokens.GreaterEqual():
+                op_func_name = "op_ge"
             case tokens.EqualEqual():
                 op_func_name = "op_eq"
+            case tokens.And():
+                lhs_val = self.evaluate_expression(module, lhs)
+                if not lhs_val.to_bool().value:
+                    return types.Bool(False)
+                rhs_val = self.evaluate_expression(module, rhs)
+                return types.Bool(rhs_val.to_bool().value)
+            case tokens.Or():
+                lhs_val = self.evaluate_expression(module, lhs)
+                if lhs_val.to_bool().value:
+                    return types.Bool(True)
+                rhs_val = self.evaluate_expression(module, rhs)
+                return types.Bool(rhs_val.to_bool().value)
             case tokens.Percent():
                 op_func_name = "op_mod"
             case tokens.Slash():

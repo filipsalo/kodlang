@@ -23,7 +23,21 @@ from kod.ast import (
     VariableDeclaration,
 )
 from kod.program import Program
-from kod.tokens import Dot, EqualEqual, GreaterThan, LessThan, Minus, Plus, Slash, Star
+from kod.tokens import (
+    And,
+    Dot,
+    EqualEqual,
+    GreaterEqual,
+    GreaterThan,
+    LessEqual,
+    LessThan,
+    Minus,
+    NotEqual,
+    Or,
+    Plus,
+    Slash,
+    Star,
+)
 
 
 class StringConstant:
@@ -374,10 +388,43 @@ class Compiler:
         else:
             raise ValueError(f"Unexpected expression {expression}")
 
+    def compile_short_circuit(self, expression) -> Register:
+        """Compile a short-circuit 'and'/'or' expression."""
+        label = self.create_label("sc")
+        result = self.stack[-1].allocate_register()
+
+        lhs_val = self.compile_expression(expression.lhs)
+        self.mov(result, lhs_val)
+        if isinstance(lhs_val, Register):
+            self.stack[-1].release_register(lhs_val)
+
+        self.emit("cmp", result, Imm(0))
+        self.emit("cset", result, "ne")
+
+        if isinstance(expression.op, And):
+            self.emit("beq", label.done)
+        else:
+            self.emit("bne", label.done)
+
+        rhs_val = self.compile_expression(expression.rhs)
+        self.mov(result, rhs_val)
+        if isinstance(rhs_val, Register):
+            self.stack[-1].release_register(rhs_val)
+
+        self.emit("cmp", result, Imm(0))
+        self.emit("cset", result, "ne")
+
+        self.emit_label(label.done)
+        return result
+
     def compile_binary_operator(self, expression):
         """Compile a binary operator to assembly"""
-        optypes = (Plus, Minus, Slash, Star, LessThan, GreaterThan, EqualEqual)
-        if not isinstance(expression.op, optypes):
+        if isinstance(expression.op, (And, Or)):
+            return self.compile_short_circuit(expression)
+
+        cmp_ops = (LessThan, GreaterThan, EqualEqual, NotEqual, LessEqual, GreaterEqual)
+        arith_ops = (Plus, Minus, Slash, Star)
+        if not isinstance(expression.op, cmp_ops + arith_ops):
             raise ValueError(f"Unknown operator: {expression.op}")
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
@@ -386,11 +433,16 @@ class Compiler:
             rhs_register = self.stack[-1].allocate_register()
             self.mov(lhs_register, left)
             self.mov(rhs_register, right)
-            if isinstance(expression.op, (LessThan, GreaterThan, EqualEqual)):
+            if isinstance(expression.op, cmp_ops):
                 self.emit("cmp", lhs_register, rhs_register)
-                op = {LessThan: "lt", GreaterThan: "gt", EqualEqual: "eq"}[
-                    type(expression.op)
-                ]
+                op = {
+                    LessThan: "lt",
+                    GreaterThan: "gt",
+                    EqualEqual: "eq",
+                    NotEqual: "ne",
+                    LessEqual: "le",
+                    GreaterEqual: "ge",
+                }[type(expression.op)]
                 self.emit("cset", lhs_register, op)
             else:
                 op = {Plus: "add", Minus: "sub", Slash: "sdiv", Star: "mul"}[

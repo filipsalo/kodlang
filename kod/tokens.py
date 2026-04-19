@@ -94,17 +94,52 @@ class EqualEqual(BinaryOperator):
 
 
 @dataclasses.dataclass
+class NotEqual(BinaryOperator):
+    """Not-equal operator."""
+
+    precedence = 12
+
+
+@dataclasses.dataclass
 class LessThan(BinaryOperator):
-    """An equals sign."""
+    """Less-than operator."""
+
+    precedence = 12
+
+
+@dataclasses.dataclass
+class LessEqual(BinaryOperator):
+    """Less-than-or-equal operator."""
 
     precedence = 12
 
 
 @dataclasses.dataclass
 class GreaterThan(BinaryOperator):
-    """An equals sign."""
+    """Greater-than operator."""
 
     precedence = 12
+
+
+@dataclasses.dataclass
+class GreaterEqual(BinaryOperator):
+    """Greater-than-or-equal operator."""
+
+    precedence = 12
+
+
+@dataclasses.dataclass
+class And(BinaryOperator):
+    """Logical and operator."""
+
+    precedence = 9
+
+
+@dataclasses.dataclass
+class Or(BinaryOperator):
+    """Logical or operator."""
+
+    precedence = 8
 
 
 @dataclasses.dataclass

@@ -44,13 +44,25 @@ class Type:
         """Compare two integers."""
         return Bool(self.value == other.value)
 
+    def op_ne(self, other: Self) -> "Bool":
+        """Compare two values for inequality."""
+        return Bool(self.value != other.value)
+
     def op_lt(self, other: Self) -> "Bool":
         """Compare two integers."""
         return Bool(self.value < other.value)
 
+    def op_le(self, other: Self) -> "Bool":
+        """Compare two integers."""
+        return Bool(self.value <= other.value)
+
     def op_gt(self, other: Self) -> "Bool":
         """Compare two integers."""
         return Bool(self.value > other.value)
+
+    def op_ge(self, other: Self) -> "Bool":
+        """Compare two integers."""
+        return Bool(self.value >= other.value)
 
     def op_mod(self, other: Self) -> Self:
         """Modulo two integers."""
