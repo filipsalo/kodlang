@@ -123,6 +123,18 @@ class TypeChecker:
         match node:
             case ast.FunctionCall():
                 self.check_function_call(node)
+            case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Is):
+                from kod import types
+
+                lhs_type = self.infer_type(lhs)
+                if lhs_type is not None and not (
+                    isinstance(lhs_type, type)
+                    and issubclass(lhs_type, types.OptionalType)
+                ):
+                    self.error(
+                        f"Cannot use 'is' on non-optional type '{lhs_type.name}'",
+                        lhs.span,
+                    )
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(
                 op, (tokens.EqualEqual, tokens.NotEqual)
             ):

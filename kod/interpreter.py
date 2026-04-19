@@ -92,6 +92,13 @@ class Interpreter:
                 op_func_name = "op_gt"
             case tokens.GreaterEqual():
                 op_func_name = "op_ge"
+            case tokens.Is():
+                lhs_val = self.evaluate_expression(module, lhs)
+                is_none = isinstance(lhs_val, types.NoneType)
+                if rhs.id == "None":
+                    return types.Bool(is_none)
+                else:
+                    return types.Bool(not is_none)
             case tokens.EqualEqual():
                 op_func_name = "op_eq"
             case tokens.And():

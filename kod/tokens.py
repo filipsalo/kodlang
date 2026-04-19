@@ -288,5 +288,12 @@ class Match(Token):
 
 
 @dataclasses.dataclass
+class Is(BinaryOperator):
+    """An is operator."""
+
+    precedence = 12
+
+
+@dataclasses.dataclass
 class Question(Token):
     """A question mark."""

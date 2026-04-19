@@ -35,6 +35,7 @@ from kod.tokens import (
     EqualEqual,
     GreaterEqual,
     GreaterThan,
+    Is,
     LessEqual,
     LessThan,
     Minus,
@@ -660,10 +661,27 @@ class Compiler:
         self.emit_label(label.done)
         return result
 
+    def compile_is_check(self, expression):
+        """Compile an `is None` / `is Some` check for optional types."""
+        ptr = self.compile_expression(expression.lhs)
+        reg = self.stack[-1].allocate_register()
+        self.mov(reg, ptr)
+        if isinstance(ptr, Register):
+            self.stack[-1].release_register(ptr)
+        self.emit("cmp", reg, Imm(0))
+        if expression.rhs.id == "None":
+            self.emit("cset", reg, "eq")
+        else:
+            self.emit("cset", reg, "ne")
+        return reg
+
     def compile_binary_operator(self, expression):
         """Compile a binary operator to assembly"""
         if isinstance(expression.op, (And, Or)):
             return self.compile_short_circuit(expression)
+
+        if isinstance(expression.op, Is):
+            return self.compile_is_check(expression)
 
         cmp_ops = (LessThan, GreaterThan, EqualEqual, NotEqual, LessEqual, GreaterEqual)
         arith_ops = (Plus, Minus, Slash, Star)
