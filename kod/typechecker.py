@@ -187,7 +187,8 @@ class TypeChecker:
         match node.callee:
             case ast.Name() as callee:
                 dbg("got name", callee.id)
-                self.verify_arguments(callee, node.args)
+                if callee.id not in ("len",):
+                    self.verify_arguments(callee, node.args)
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Dot):
                 import_node = self.current_module.names.get(lhs.id)
                 if not isinstance(import_node, ast.Import):

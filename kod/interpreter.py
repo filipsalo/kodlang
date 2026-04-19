@@ -149,6 +149,10 @@ class Interpreter:
             case ast.FunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
             case ast.FunctionCall(callee, args):
+                if isinstance(callee, ast.Name) and callee.id == "len":
+                    arg_val = self.evaluate_expression(module, args.params[0])
+                    if isinstance(arg_val, types.String):
+                        return types.Int64(len(arg_val.value))
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)

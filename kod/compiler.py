@@ -40,6 +40,7 @@ from kod.tokens import (
     LessThan,
     Minus,
     NotEqual,
+    OpenBracket,
     Or,
     Plus,
     Slash,
@@ -628,6 +629,8 @@ class Compiler:
                 ):
                     return self.compile_enum_unit_variant(expression)
                 return self.compile_field_access(expression)
+            elif isinstance(expression.op, OpenBracket):
+                return self.compile_index(expression)
             return self.compile_binary_operator(expression)
         else:
             raise ValueError(f"Unexpected expression {expression}")
@@ -659,6 +662,33 @@ class Compiler:
         self.emit("cset", result, "ne")
 
         self.emit_label(label.done)
+        return result
+
+    def compile_len(self, func_call):
+        """Compile len(s) — calls _strlen for strings, extensible for other types later."""
+        ptr = self.compile_expression(func_call.args.params[0].expression)
+        self.mov(Register("x0"), ptr)
+        if isinstance(ptr, Register):
+            self.stack[-1].release_register(ptr)
+        self.emit("bl", "_strlen")
+        return Register("x0")
+
+    def compile_index(self, expression):
+        """Compile s[i] — load a single byte from a string pointer."""
+        ptr = self.compile_expression(expression.lhs)
+        idx = self.compile_expression(expression.rhs)
+        ptr_reg = self.stack[-1].allocate_register()
+        idx_reg = self.stack[-1].allocate_register()
+        self.mov(ptr_reg, ptr)
+        self.mov(idx_reg, idx)
+        if isinstance(ptr, Register):
+            self.stack[-1].release_register(ptr)
+        if isinstance(idx, Register):
+            self.stack[-1].release_register(idx)
+        result = self.stack[-1].allocate_register()
+        self.emit("ldrb", f"w{result.name[1:]}", f"[{ptr_reg}, {idx_reg}]")
+        self.stack[-1].release_register(idx_reg)
+        self.stack[-1].release_register(ptr_reg)
         return result
 
     def compile_is_check(self, expression):
@@ -764,6 +794,8 @@ class Compiler:
 
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
+        if isinstance(func_call.callee, Name) and func_call.callee.id == "len":
+            return self.compile_len(func_call)
         func = self.resolve_function(func_call.callee)
         self.prepare_args(func, func_call.args)
         self.emit("bl", func.label_name)

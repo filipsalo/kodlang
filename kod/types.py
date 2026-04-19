@@ -114,6 +114,9 @@ class String(Type):
         """Concatenate two strings."""
         return String(self.value + other.value)
 
+    def op_index(self, index: "Int64") -> "Int64":
+        return Int64(self.value[index.value])
+
 
 class Int64(Type):
     """A 64-bit integer."""
