@@ -5,6 +5,7 @@ import collections
 import sys
 
 from kod.ast import (
+    ArrayLiteral,
     Assignment,
     BinaryOperator,
     BooleanLiteral,
@@ -595,6 +596,45 @@ class Compiler:
             self.stack[-1].release_register(ptr_reg)
             return
 
+        # Array literal: arena-alloc header {ptr, len, cap} + element buffer
+        if isinstance(expression, ArrayLiteral):
+            n = len(expression.elements)
+            item_width = 8
+            destination = self.stack[-1].get_variable_address(variable)
+            # Alloc header first, save to stack slot immediately
+            self.mov(Register("x0"), Imm(24))
+            self.emit("bl", "_arena_alloc")
+            tmp = self.stack[-1].allocate_register()
+            self.mov(tmp, Register("x0"))
+            self.emit("str", tmp, destination)
+            self.stack[-1].release_register(tmp)
+            # Alloc element buffer
+            self.mov(Register("x0"), Imm(max(n, 1) * item_width))
+            self.emit("bl", "_arena_alloc")
+            buf_reg = self.stack[-1].allocate_register()
+            self.mov(buf_reg, Register("x0"))
+            # Fill elements into buffer (simple expressions only — no bl calls)
+            for i, elem in enumerate(expression.elements):
+                val = self.compile_expression(elem)
+                val_reg = self.stack[-1].allocate_register()
+                self.mov(val_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("str", val_reg, StackAddress(i * item_width, str(buf_reg)))
+                self.stack[-1].release_register(val_reg)
+            # Wire header: reload ptr, store buf_ptr/len/cap
+            ptr_reg = self.stack[-1].allocate_register()
+            self.emit("ldr", ptr_reg, destination)
+            self.emit("str", buf_reg, StackAddress(0, str(ptr_reg)))
+            len_reg = self.stack[-1].allocate_register()
+            self.emit("mov", len_reg, Imm(n))
+            self.emit("str", len_reg, StackAddress(8, str(ptr_reg)))
+            self.emit("str", len_reg, StackAddress(16, str(ptr_reg)))
+            self.stack[-1].release_register(len_reg)
+            self.stack[-1].release_register(buf_reg)
+            self.stack[-1].release_register(ptr_reg)
+            return
+
         destination = self.stack[-1].get_variable_address(variable)
         address = self.compile_expression(expression)
         register = self.stack[-1].allocate_register()
@@ -620,6 +660,10 @@ class Compiler:
             return self.stack[-1].get_variable_address(expression)
         elif isinstance(expression, FunctionCall):
             return self.compile_function_call(expression)
+        elif isinstance(expression, ArrayLiteral):
+            raise ValueError(
+                "Array literals are only supported in variable declarations"
+            )
         elif isinstance(expression, BinaryOperator):
             if isinstance(expression.op, Dot):
                 if (
@@ -665,7 +709,15 @@ class Compiler:
         return result
 
     def compile_index(self, expression):
-        """Compile s[i] — load a single byte from a string pointer."""
+        """Compile expr[i] — byte load for strings, 8-byte load for arrays."""
+        from kod import types as _types
+
+        lhs_type = None
+        if isinstance(expression.lhs, Name):
+            var = self.stack[-1].variables.get(expression.lhs.id)
+            if var is not None:
+                lhs_type = var.type
+
         ptr = self.compile_expression(expression.lhs)
         idx = self.compile_expression(expression.rhs)
         ptr_reg = self.stack[-1].allocate_register()
@@ -677,7 +729,19 @@ class Compiler:
         if isinstance(idx, Register):
             self.stack[-1].release_register(idx)
         result = self.stack[-1].allocate_register()
-        self.emit("ldrb", f"w{result.name[1:]}", f"[{ptr_reg}, {idx_reg}]")
+
+        if (
+            lhs_type is not None
+            and isinstance(lhs_type, type)
+            and issubclass(lhs_type, _types.ArrayType)
+        ):
+            # Dereference header to get data_ptr, scale index by item_width (8)
+            self.emit("ldr", ptr_reg, StackAddress(0, str(ptr_reg)))
+            self.emit("lsl", idx_reg, idx_reg, Imm(3))
+            self.emit("ldr", result, f"[{ptr_reg}, {idx_reg}]")
+        else:
+            self.emit("ldrb", f"w{result.name[1:]}", f"[{ptr_reg}, {idx_reg}]")
+
         self.stack[-1].release_register(idx_reg)
         self.stack[-1].release_register(ptr_reg)
         return result

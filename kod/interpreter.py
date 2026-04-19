@@ -148,6 +148,11 @@ class Interpreter:
                 return self.evaluate_expression(module, value, as_lvalue)
             case ast.FunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
+            case ast.ArrayLiteral(elements):
+                evaled = [self.evaluate_expression(module, e) for e in elements]
+                item_type = type(evaled[0]) if evaled else types.NoneType
+                arr_type = types.ArrayType.make(item_type)
+                return arr_type(evaled)
             case ast.FunctionCall(callee, args):
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]

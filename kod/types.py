@@ -164,6 +164,8 @@ class ArrayType(Type, ABC):
                 {
                     "name": kod_name,
                     "item_type": item_type,
+                    "width": 8,
+                    "data_width": 24,
                     "__repr__": cls._subclass__repr__,
                 },
             )

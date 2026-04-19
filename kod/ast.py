@@ -386,6 +386,14 @@ class BinaryOperator(ASTNode):
 
 
 @dataclasses.dataclass
+class ArrayLiteral(ASTNode):
+    """An array literal like [1, 2, 3]."""
+
+    elements: list
+    span: Span
+
+
+@dataclasses.dataclass
 class Expression(ASTNode):
     """An expression."""
 
@@ -408,6 +416,16 @@ class Expression(ASTNode):
                 value = BooleanLiteral.parse(parser)
             case tokens.NoneLiteral():
                 value = NoneLiteral.parse(parser)
+            case tokens.OpenBracket():
+                span = parser.peek().span
+                parser.consume(tokens.OpenBracket)
+                elements = []
+                while not parser.try_consume(tokens.CloseBracket):
+                    elements.append(Expression.parse(parser))
+                    if not parser.try_consume(tokens.Comma):
+                        parser.consume(tokens.CloseBracket)
+                        break
+                value = ArrayLiteral(elements, span)
             case tokens.Identifier():
                 value = Name.parse(parser)
             case _:
