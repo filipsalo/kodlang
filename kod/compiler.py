@@ -664,15 +664,6 @@ class Compiler:
         self.emit_label(label.done)
         return result
 
-    def compile_len(self, func_call):
-        """Compile len(s) — calls _strlen for strings, extensible for other types later."""
-        ptr = self.compile_expression(func_call.args.params[0].expression)
-        self.mov(Register("x0"), ptr)
-        if isinstance(ptr, Register):
-            self.stack[-1].release_register(ptr)
-        self.emit("bl", "_strlen")
-        return Register("x0")
-
     def compile_index(self, expression):
         """Compile s[i] — load a single byte from a string pointer."""
         ptr = self.compile_expression(expression.lhs)
@@ -794,8 +785,6 @@ class Compiler:
 
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
-        if isinstance(func_call.callee, Name) and func_call.callee.id == "len":
-            return self.compile_len(func_call)
         func = self.resolve_function(func_call.callee)
         self.prepare_args(func, func_call.args)
         self.emit("bl", func.label_name)

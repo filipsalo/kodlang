@@ -149,10 +149,6 @@ class Interpreter:
             case ast.FunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
             case ast.FunctionCall(callee, args):
-                if isinstance(callee, ast.Name) and callee.id == "len":
-                    arg_val = self.evaluate_expression(module, args.params[0])
-                    if isinstance(arg_val, types.String):
-                        return types.Int64(len(arg_val.value))
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
@@ -267,7 +263,12 @@ class Interpreter:
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]
-            return getattr(libc, func.name)(*args)
+            result = c_func(*args)
+            if func.return_type is types.Int64:
+                return types.Int64(result)
+            if func.return_type is types.String:
+                return types.String(result)
+            return types.none_value
 
         # Map args to params
         args = {
