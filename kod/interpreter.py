@@ -275,6 +275,14 @@ class Interpreter:
                 return types.String(result)
             return types.none_value
 
+        if (
+            isinstance(func, ast.FunctionDeclaration)
+            and func.name == "len"
+            and len(args) == 1
+            and isinstance(args[0], types.ArrayType)
+        ):
+            return types.Int64(len(args[0].value))
+
         # Map args to params
         args = {
             param.variable.id: (

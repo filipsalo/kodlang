@@ -918,6 +918,29 @@ class Compiler:
 
     def compile_function_call(self, func_call):
         """Compile a function call to assembly"""
+        from kod import types as _types
+
+        if (
+            isinstance(func_call.callee, Name)
+            and func_call.callee.id == "len"
+            and len(func_call.args) == 1
+        ):
+            arg_expr = func_call.args.params[0].expression
+            if isinstance(arg_expr, Name):
+                var = self.stack[-1].variables.get(arg_expr.id)
+                if (
+                    var is not None
+                    and isinstance(var.type, type)
+                    and issubclass(var.type, _types.ArrayType)
+                ):
+                    addr = self.stack[-1].get_variable_address(arg_expr)
+                    ptr_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", ptr_reg, addr)
+                    result = self.stack[-1].allocate_register()
+                    self.emit("ldr", result, StackAddress(8, str(ptr_reg)))
+                    self.stack[-1].release_register(ptr_reg)
+                    return result
+
         func = self.resolve_function(func_call.callee)
         self.prepare_args(func, func_call.args)
         self.emit("bl", func.label_name)
