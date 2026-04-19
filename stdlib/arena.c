@@ -21,6 +21,17 @@ static Block *new_block(int64_t min_size) {
 }
 
 void *arena_alloc(int64_t size);
+int64_t strlen(const char *s);
+
+char *kod_str_concat(const char *a, const char *b) {
+    int64_t la = strlen(a);
+    int64_t lb = strlen(b);
+    char *buf = (char *)arena_alloc(la + lb + 1);
+    for (int64_t i = 0; i < la; i++) buf[i] = a[i];
+    for (int64_t i = 0; i < lb; i++) buf[la + i] = b[i];
+    buf[la + lb] = '\0';
+    return buf;
+}
 
 typedef struct {
     void *ptr;

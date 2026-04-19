@@ -110,7 +110,7 @@ class String(Type):
         """Return the value as a Kod string."""
         return self
 
-    def op_plus(self, other):
+    def op_plus(self, other: "String") -> "String":
         """Concatenate two strings."""
         return String(self.value + other.value)
 

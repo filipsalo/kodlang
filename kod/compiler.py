@@ -782,6 +782,22 @@ class Compiler:
         self.stack[-1].release_register(buf_reg)
         return hdr_reg
 
+    def compile_str_concat(self, expression):
+        """Compile str + str → _kod_str_concat(lhs, rhs)."""
+        rhs = self.compile_expression(expression.rhs)
+        rhs_reg = self.stack[-1].allocate_register()
+        self.mov(rhs_reg, rhs)
+        if isinstance(rhs, Register):
+            self.stack[-1].release_register(rhs)
+        lhs = self.compile_expression(expression.lhs)
+        self.mov(Register("x0"), lhs)
+        if isinstance(lhs, Register):
+            self.stack[-1].release_register(lhs)
+        self.mov(Register("x1"), rhs_reg)
+        self.stack[-1].release_register(rhs_reg)
+        self.emit("bl", "_kod_str_concat")
+        return Register("x0")
+
     def compile_array_concat(self, expression):
         """Compile [T] + [T] → _kod_array_concat(lhs, rhs)."""
         # Compile RHS first (may involve bl calls, e.g. ArrayLiteral)
@@ -827,6 +843,8 @@ class Compiler:
                 var = self.stack[-1].variables.get(expression.lhs.id)
                 if var is not None:
                     lhs_type = var.type
+            if lhs_type is _types.String:
+                return self.compile_str_concat(expression)
             if (
                 lhs_type is not None
                 and isinstance(lhs_type, type)
