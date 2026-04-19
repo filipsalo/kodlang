@@ -72,6 +72,29 @@ class TypeChecker:
                 pass
             case ast.VariableDeclaration():
                 self.check_variable_declaration(node)
+            case ast.IfStatement(_, true_branch, false_branch):
+                for statement in true_branch:
+                    self.check_statement(statement)
+                for statement in false_branch:
+                    self.check_statement(statement)
+            case ast.ForStatement(_, body):
+                for statement in body:
+                    self.check_statement(statement)
+            case ast.Return(expression):
+                self.check_expression(expression)
+            case ast.Assignment(_, rhs):
+                self.check_expression(rhs)
+            case ast.Import():
+                pass
+
+    def check_expression(self, node: ast.ASTNode) -> None:
+        """Check an expression for type errors."""
+        match node:
+            case ast.FunctionCall():
+                self.check_function_call(node)
+            case ast.BinaryOperator(lhs, _, rhs):
+                self.check_expression(lhs)
+                self.check_expression(rhs)
 
     def check_variable_declaration(self, node: ast.VariableDeclaration) -> None:
         """Check a function declaration for type errors."""
