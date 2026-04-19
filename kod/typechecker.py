@@ -134,6 +134,10 @@ class TypeChecker:
                     rhs_type is types.NoneType
                     and lhs_type is not None
                     and lhs_type is not types.NoneType
+                    and not (
+                        isinstance(lhs_type, type)
+                        and issubclass(lhs_type, types.OptionalType)
+                    )
                 ):
                     self.error(
                         f"Cannot compare non-optional type '{lhs_type.name}' with none",
@@ -143,6 +147,10 @@ class TypeChecker:
                     lhs_type is types.NoneType
                     and rhs_type is not None
                     and rhs_type is not types.NoneType
+                    and not (
+                        isinstance(rhs_type, type)
+                        and issubclass(rhs_type, types.OptionalType)
+                    )
                 ):
                     self.error(
                         f"Cannot compare non-optional type '{rhs_type.name}' with none",

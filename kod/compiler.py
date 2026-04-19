@@ -20,6 +20,8 @@ from kod.ast import (
     Module,
     Name,
     NoneLiteral,
+    OptionalNonePattern,
+    OptionalSomePattern,
     Return,
     StringLiteral,
     TypeDeclaration,
@@ -380,13 +382,24 @@ class Compiler:
         """Compile a match statement."""
         if not isinstance(expression, Name):
             raise ValueError(f"Match expression must be a Name, got {expression}")
+        from kod import types as _types
+
         label = self.create_label("match")
         enum_addr = self.stack[-1].get_variable_address(expression)
         disc_reg = self.stack[-1].allocate_register()
         self.emit("ldr", disc_reg, enum_addr)  # load pointer from stack slot
-        self.emit(
-            "ldr", disc_reg, StackAddress(0, str(disc_reg))
-        )  # load discriminant through pointer
+
+        var = self.stack[-1].variables.get(expression.id)
+        is_optional = (
+            var is not None
+            and var.type is not None
+            and isinstance(var.type, type)
+            and issubclass(var.type, _types.OptionalType)
+        )
+
+        if not is_optional:
+            # For enums: load discriminant through pointer
+            self.emit("ldr", disc_reg, StackAddress(0, str(disc_reg)))
 
         skip_labels = [self.create_label("skip") for _ in arms]
 
@@ -395,6 +408,33 @@ class Compiler:
                 for stmt in arm.body:
                     self.compile_statement(stmt)
                 self.emit("b", label.done)
+            elif isinstance(arm.pattern, OptionalNonePattern):
+                # None: pointer == 0
+                self.emit("cmp", disc_reg, Imm(0))
+                self.emit("bne", skip_labels[i])
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+            elif isinstance(arm.pattern, OptionalSomePattern):
+                # Some: pointer != 0
+                self.emit("cmp", disc_reg, Imm(0))
+                self.emit("beq", skip_labels[i])
+                if arm.pattern.binding:
+                    ptr_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", ptr_reg, enum_addr)
+                    binding_addr = self.stack[-1].get_variable_address(
+                        Name(arm.pattern.binding, span=arm.pattern.span)
+                    )
+                    val_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", val_reg, StackAddress(0, str(ptr_reg)))
+                    self.emit("str", val_reg, binding_addr)
+                    self.stack[-1].release_register(val_reg)
+                    self.stack[-1].release_register(ptr_reg)
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
             elif isinstance(arm.pattern, EnumVariantPattern):
                 enum_type = self.type_registry[arm.pattern.enum_name]
                 variant_info = enum_type.variants[arm.pattern.variant_name]
@@ -524,6 +564,34 @@ class Compiler:
                     self.stack[-1].release_register(val_reg)
                     self.stack[-1].release_register(ptr_reg)
                 return
+
+        # Optional Some: let x: T? = <non-none value> — wrap in heap allocation
+        from kod import types as _types
+
+        if (
+            getattr(variable, "type", None) is not None
+            and isinstance(variable.type, type)
+            and issubclass(variable.type, _types.OptionalType)
+            and not isinstance(expression, NoneLiteral)
+        ):
+            destination = self.stack[-1].get_variable_address(variable)
+            self.mov(Register("x0"), Imm(variable.type.data_width))
+            self.emit("bl", "_arena_alloc")
+            ptr_reg = self.stack[-1].allocate_register()
+            self.mov(ptr_reg, Register("x0"))
+            self.emit("str", ptr_reg, destination)
+            val = self.compile_expression(expression)
+            ptr_reg2 = self.stack[-1].allocate_register()
+            self.emit("ldr", ptr_reg2, destination)
+            val_reg = self.stack[-1].allocate_register()
+            self.mov(val_reg, val)
+            if isinstance(val, Register):
+                self.stack[-1].release_register(val)
+            self.emit("str", val_reg, StackAddress(0, str(ptr_reg2)))
+            self.stack[-1].release_register(val_reg)
+            self.stack[-1].release_register(ptr_reg2)
+            self.stack[-1].release_register(ptr_reg)
+            return
 
         destination = self.stack[-1].get_variable_address(variable)
         address = self.compile_expression(expression)

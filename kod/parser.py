@@ -30,6 +30,7 @@ from kod.tokens import (
     OpenBracket,
     OpenCurly,
     OpenParen,
+    Question,
     Return,
     Struct,
     Token,
@@ -85,7 +86,14 @@ class Parser:
         return token
 
     def parse_type(self, name=None) -> type[types.Type]:
-        """Parse a type."""
+        """Parse a type, including optional T? suffix."""
+        base = self._parse_base_type(name)
+        if self.try_consume(Question):
+            return types.OptionalType.make(base)
+        return base
+
+    def _parse_base_type(self, name=None) -> type[types.Type]:
+        """Parse a base type without optional suffix."""
         if self.try_consume(Struct):
             self.consume(OpenCurly)
             fields = []

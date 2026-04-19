@@ -290,6 +290,22 @@ class FunctionDeclaration(ASTNode):
                                         variables[binding_name] = Variable(
                                             binding_name, field.type, arm.pattern.span
                                         )
+                        elif (
+                            isinstance(arm.pattern, OptionalSomePattern)
+                            and arm.pattern.binding
+                        ):
+                            if isinstance(statement.expression, Name):
+                                var = variables.get(statement.expression.id)
+                                if (
+                                    var is not None
+                                    and var.type is not None
+                                    and hasattr(var.type, "inner_type")
+                                ):
+                                    variables[arm.pattern.binding] = Variable(
+                                        arm.pattern.binding,
+                                        var.type.inner_type,
+                                        arm.pattern.span,
+                                    )
         label_parts = ["", *parser.file.canonical_path.with_suffix("").parts, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
@@ -615,6 +631,17 @@ class EnumVariantPattern:
 
 
 @dataclasses.dataclass
+class OptionalSomePattern:
+    binding: str  # empty string if no binding
+    span: Span
+
+
+@dataclasses.dataclass
+class OptionalNonePattern:
+    span: Span
+
+
+@dataclasses.dataclass
 class MatchArm:
     pattern: Any  # WildcardPattern | EnumVariantPattern
     body: list  # list of Statement
@@ -627,6 +654,16 @@ class MatchArm:
             if parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
                 parser.consume(tokens.Identifier)
                 pattern = WildcardPattern(span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "None":
+                parser.consume(tokens.Identifier)
+                pattern = OptionalNonePattern(span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
+                parser.consume(tokens.Identifier)
+                binding = ""
+                if parser.try_consume(tokens.OpenParen):
+                    binding = parser.consume(tokens.Identifier).value
+                    parser.consume(tokens.CloseParen)
+                pattern = OptionalSomePattern(binding, span)
             else:
                 enum_name = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)

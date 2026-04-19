@@ -209,6 +209,18 @@ class Interpreter:
                         for stmt in arm.body:
                             self.execute_statement(module, stmt)
                         break
+                    elif isinstance(arm.pattern, ast.OptionalNonePattern):
+                        if isinstance(value, types.NoneType):
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
+                    elif isinstance(arm.pattern, ast.OptionalSomePattern):
+                        if not isinstance(value, types.NoneType):
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
                     elif isinstance(arm.pattern, ast.EnumVariantPattern):
                         if (
                             isinstance(value, types.EnumValue)

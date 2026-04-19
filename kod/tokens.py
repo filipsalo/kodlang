@@ -285,3 +285,8 @@ class Enum(Token):
 @dataclasses.dataclass
 class Match(Token):
     """A match keyword token"""
+
+
+@dataclasses.dataclass
+class Question(Token):
+    """A question mark."""

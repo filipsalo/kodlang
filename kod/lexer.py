@@ -46,6 +46,7 @@ from kod.tokens import (
     Or,
     Percent,
     Plus,
+    Question,
     Return,
     Slash,
     Star,
@@ -267,5 +268,7 @@ class Lexer:
                     yield self.lex_number()
                 case "/":
                     yield self.lex_slash_or_comment()
+                case "?":
+                    yield self.lex_single_char(Question)
                 case _:
                     yield self.lex_identifier()

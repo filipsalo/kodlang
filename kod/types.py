@@ -259,6 +259,34 @@ class EnumVariantConstructor:
         return EnumValue(self.enum_type, self.variant_name, fields)
 
 
+class OptionalType(Type):
+    """Base class for optional types (T?)."""
+
+    inner_type: "type[Type]"
+
+    @classmethod
+    def make(cls, inner: "type[Type]") -> "type[OptionalType]":
+        """Create an optional type wrapping inner. None = null pointer, Some(v) = heap pointer."""
+        return type(
+            f"{inner.name}Optional",
+            (cls,),
+            {
+                "name": f"{inner.name}?",
+                "inner_type": inner,
+                "width": 8,
+                "data_width": 8,  # heap slot for Some payload
+            },
+        )
+
+    def op_eq(self, other) -> "Bool":
+        if isinstance(other, NoneType):
+            return Bool(isinstance(self, NoneType))
+        return Bool(self.value == other.value if hasattr(other, "value") else False)
+
+    def op_ne(self, other) -> "Bool":
+        return Bool(not self.op_eq(other).value)
+
+
 class EnumType:
     """Base class for dynamically-created enum types."""
 
