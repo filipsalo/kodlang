@@ -157,7 +157,7 @@ class Lexer:
             self.consume("/")
             while self.peek() in (" ", "\t"):
                 self.pos += 1
-            while self.peek() != "\n":
+            while self.peek() not in ("\n", ""):
                 self.pos += 1
             return self.build(Comment)
         return self.build(Slash)
