@@ -122,8 +122,13 @@ class Builder:
         for module in self.program:
             object_files.append(self.build_module(module).relative_to(root_path))
         object_files.append(self.build_runtime_main(file).relative_to(root_path))
-        arena_c = self.program.stdlib_fs.root_path / "arena.c"
-        object_files.append(self._build_c(arena_c).relative_to(root_path))
+        stdlib_root = self.program.stdlib_fs.root_path
+        object_files.append(
+            self._build_c(stdlib_root / "arena.c").relative_to(root_path)
+        )
+        object_files.append(
+            self._build_c(stdlib_root / "runtime.c").relative_to(root_path)
+        )
         cmd = [
             "ld",
             "-macos_version_min",
