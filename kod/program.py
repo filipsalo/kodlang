@@ -19,7 +19,6 @@ class Program:
 
     def get_module(self, name: Path) -> Module:
         """Get a module by name."""
-        dbg("getting", name, "among", self.modules.keys())
         return self.modules[name]
 
     def add_module(self, module: Module) -> None:

@@ -57,7 +57,6 @@ class TypeChecker:
 
     def check_statement(self, node: ast.Statement) -> None:
         """Check a statement for type errors."""
-        dbg("node", node)
         match node:
             case ast.FunctionCall():
                 self.check_function_call(node)
@@ -183,10 +182,8 @@ class TypeChecker:
 
     def check_function_call(self, node) -> None:
         """Check a function call for type errors."""
-        dbg(type(node.callee), node.callee)
         match node.callee:
             case ast.Name() as callee:
-                dbg("got name", callee.id)
                 self.verify_arguments(callee, node.args)
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Dot):
                 import_node = self.current_module.names.get(lhs.id)
