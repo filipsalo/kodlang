@@ -26,6 +26,7 @@ from kod.ast import (
     OptionalSomePattern,
     Return,
     StringLiteral,
+    StringSlice,
     TypeDeclaration,
     VariableDeclaration,
     WildcardPattern,
@@ -715,6 +716,8 @@ class Compiler:
             return self.compile_function_call(expression)
         elif isinstance(expression, ArrayLiteral):
             return self.compile_array_literal_expr(expression)
+        elif isinstance(expression, StringSlice):
+            return self.compile_str_slice(expression)
         elif isinstance(expression, BinaryOperator):
             if isinstance(expression.op, Dot):
                 if (
@@ -851,6 +854,48 @@ class Compiler:
         self.emit("bl", "_kod_str_concat")
         return Register("x0")
 
+    def compile_str_slice(self, expression: StringSlice):
+        """Compile s[i:j] → _kod_str_slice(s, i, j)."""
+        end = self.compile_expression(expression.end)
+        end_reg = self.stack[-1].allocate_register()
+        self.mov(end_reg, end)
+        if isinstance(end, Register):
+            self.stack[-1].release_register(end)
+        start = self.compile_expression(expression.start)
+        start_reg = self.stack[-1].allocate_register()
+        self.mov(start_reg, start)
+        if isinstance(start, Register):
+            self.stack[-1].release_register(start)
+        s = self.compile_expression(expression.string)
+        self.mov(Register("x0"), s)
+        if isinstance(s, Register):
+            self.stack[-1].release_register(s)
+        self.mov(Register("x1"), start_reg)
+        self.mov(Register("x2"), end_reg)
+        self.stack[-1].release_register(start_reg)
+        self.stack[-1].release_register(end_reg)
+        self.emit("bl", "_kod_str_slice")
+        return Register("x0")
+
+    def compile_str_eq(self, expression, negate: bool):
+        """Compile str == str or str != str via strcmp."""
+        rhs = self.compile_expression(expression.rhs)
+        rhs_reg = self.stack[-1].allocate_register()
+        self.mov(rhs_reg, rhs)
+        if isinstance(rhs, Register):
+            self.stack[-1].release_register(rhs)
+        lhs = self.compile_expression(expression.lhs)
+        self.mov(Register("x0"), lhs)
+        if isinstance(lhs, Register):
+            self.stack[-1].release_register(lhs)
+        self.mov(Register("x1"), rhs_reg)
+        self.stack[-1].release_register(rhs_reg)
+        self.emit("bl", "_strcmp")
+        result = self.stack[-1].allocate_register()
+        self.emit("cmp", Register("x0"), Imm(0))
+        self.emit("cset", result, "ne" if negate else "eq")
+        return result
+
     def compile_array_concat(self, expression):
         """Compile [T] + [T] → _kod_array_concat(lhs, rhs)."""
         # Compile RHS first (may involve bl calls, e.g. ArrayLiteral)
@@ -918,6 +963,15 @@ class Compiler:
                 and issubclass(lhs_type, _types.ArrayType)
             ):
                 return self.compile_array_concat(expression)
+
+        if isinstance(expression.op, (EqualEqual, NotEqual)):
+            from kod import values as _types
+
+            lhs_type = self._infer_type(expression.lhs)
+            if lhs_type is _types.String:
+                return self.compile_str_eq(
+                    expression, negate=isinstance(expression.op, NotEqual)
+                )
 
         if isinstance(expression.op, Is):
             return self.compile_is_check(expression)

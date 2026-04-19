@@ -17,6 +17,15 @@ char *read_file(const char *path) {
     return buf;
 }
 
+char *kod_str_slice(const char *s, int64_t start, int64_t end) {
+    int64_t len = end - start;
+    if (len < 0) len = 0;
+    char *buf = (char *)arena_alloc(len + 1);
+    for (int64_t i = 0; i < len; i++) buf[i] = s[start + i];
+    buf[len] = '\0';
+    return buf;
+}
+
 char *kod_str_concat(const char *a, const char *b) {
     int64_t la = strlen(a);
     int64_t lb = strlen(b);

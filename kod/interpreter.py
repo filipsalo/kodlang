@@ -156,6 +156,11 @@ class Interpreter:
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
+            case ast.StringSlice(string, start, end):
+                s = self.evaluate_expression(module, string)
+                i = self.evaluate_expression(module, start)
+                j = self.evaluate_expression(module, end)
+                return types.String(s.value[i.value : j.value])
             case _:
                 raise ValueError(
                     f"Don't know how to evaluate expression {expression!r}"

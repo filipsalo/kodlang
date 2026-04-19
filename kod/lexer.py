@@ -133,6 +133,24 @@ class Lexer:
         token = token_type(value, position)
         return token
 
+    def lex_char_literal(self) -> IntegerLiteral:
+        """Lex a single-quoted character literal, producing its ASCII value."""
+        self.consume("'")
+        char = self.peek()
+        if char == "\\":
+            self.pos += 1
+            escape = self.peek()
+            self.pos += 1
+            char = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'"}.get(
+                escape, escape
+            )
+        else:
+            self.pos += 1
+        self.consume("'")
+        token = self.build(IntegerLiteral)
+        token.value = str(ord(char))
+        return token
+
     def lex_string(self) -> StringLiteral:
         """Lex a quoted string."""
         self.consume('"')
@@ -275,6 +293,8 @@ class Lexer:
                     yield self.lex_greater_than_or_equal()
                 case "-":
                     yield self.lex_arrow_or_minus()
+                case "'":
+                    yield self.lex_char_literal()
                 case '"':
                     yield self.lex_string()
                 case "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9":

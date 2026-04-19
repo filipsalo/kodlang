@@ -401,6 +401,16 @@ class ArrayLiteral(ASTNode):
 
 
 @dataclasses.dataclass
+class StringSlice(ASTNode):
+    """A string slice expression: s[i:j]."""
+
+    string: ASTNode
+    start: ASTNode
+    end: ASTNode
+    span: Span
+
+
+@dataclasses.dataclass
 class Expression(ASTNode):
     """An expression."""
 
@@ -462,9 +472,14 @@ class Expression(ASTNode):
                     lhs = FunctionCall(lhs, rhs, span)
                 elif isinstance(op, tokens.OpenBracket):
                     parser.consume(tokens.OpenBracket)
-                    rhs = Expression.parse(parser)
-                    parser.consume(tokens.CloseBracket)
-                    lhs = BinaryOperator(lhs, op, rhs, span)
+                    start = Expression.parse(parser)
+                    if parser.try_consume(tokens.Colon):
+                        end = Expression.parse(parser)
+                        parser.consume(tokens.CloseBracket)
+                        lhs = StringSlice(lhs, start, end, span)
+                    else:
+                        parser.consume(tokens.CloseBracket)
+                        lhs = BinaryOperator(lhs, op, start, span)
                 else:
                     parser.consume(type(op))
                     rhs = cls.parse(parser, op.precedence + op.left_associative)
