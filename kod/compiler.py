@@ -323,11 +323,88 @@ class Compiler:
             self.stack[-1].release_register(tmp_reg)
         elif isinstance(value, NoneLiteral) or value is None:
             self.mov(Register("x0"), Imm(0))
+        elif self._is_enum_literal(value):
+            self._compile_enum_literal_to_x0(value)
         else:
             addr = self.compile_expression(value)
             self.mov(Register("x0"), addr)
             if isinstance(addr, Register):
                 self.stack[-1].release_register(addr)
+
+    def _is_enum_literal(self, expression) -> bool:
+        """Return True if expression is an enum unit or payload variant literal."""
+        if (
+            isinstance(expression, BinaryOperator)
+            and isinstance(expression.op, Dot)
+            and isinstance(expression.lhs, Name)
+            and expression.lhs.id in self.type_registry
+            and hasattr(self.type_registry[expression.lhs.id], "variants")
+        ):
+            return True
+        if (
+            isinstance(expression, FunctionCall)
+            and isinstance(expression.callee, BinaryOperator)
+            and isinstance(expression.callee.op, Dot)
+            and isinstance(expression.callee.lhs, Name)
+            and expression.callee.lhs.id in self.type_registry
+            and hasattr(self.type_registry[expression.callee.lhs.id], "variants")
+        ):
+            return True
+        return False
+
+    def _compile_enum_literal_to_x0(self, expression):
+        """Arena-alloc an enum struct from a literal and leave the pointer in x0."""
+        if isinstance(expression, BinaryOperator):
+            # Unit variant: Direction.North
+            enum_type = self.type_registry[expression.lhs.id]
+            variant_info = enum_type.variants[expression.rhs.id]
+            self.mov(Register("x0"), Imm(enum_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            ptr_reg = self.stack[-1].allocate_register()
+            disc_reg = self.stack[-1].allocate_register()
+            self.mov(ptr_reg, Register("x0"))
+            self.emit("mov", disc_reg, Imm(variant_info.discriminant))
+            self.emit("str", disc_reg, StackAddress(0, str(ptr_reg)))
+            self.stack[-1].release_register(disc_reg)
+            self.mov(Register("x0"), ptr_reg)
+            self.stack[-1].release_register(ptr_reg)
+        else:
+            # Payload variant: Message.Text(content: "hello") — compile like a var decl
+            # Use a stack temp to hold the pointer across field stores
+            enum_type = self.type_registry[expression.callee.lhs.id]
+            variant_info = enum_type.variants[expression.callee.rhs.id]
+            self.mov(Register("x0"), Imm(enum_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            # Save pointer on stack temp — field compilation may call bl
+            self.emit("sub", Register("sp"), Register("sp"), Imm(16))
+            tmp = self.stack[-1].allocate_register()
+            self.mov(tmp, Register("x0"))
+            self.emit("str", tmp, StackAddress(0, "sp"))
+            self.stack[-1].release_register(tmp)
+            disc_reg = self.stack[-1].allocate_register()
+            self.emit("ldr", disc_reg, StackAddress(0, "sp"))
+            self.emit(
+                "mov",
+                tmp := self.stack[-1].allocate_register(),
+                Imm(variant_info.discriminant),
+            )
+            self.emit("str", tmp, StackAddress(0, str(disc_reg)))
+            self.stack[-1].release_register(tmp)
+            for arg in expression.args:
+                field_offset = variant_info.field_offsets[arg.label.id]
+                val = self.compile_expression(arg.expression)
+                ptr = self.stack[-1].allocate_register()
+                self.emit("ldr", ptr, StackAddress(0, "sp"))
+                val_reg = self.stack[-1].allocate_register()
+                self.mov(val_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("str", val_reg, StackAddress(8 + field_offset, str(ptr)))
+                self.stack[-1].release_register(val_reg)
+                self.stack[-1].release_register(ptr)
+            self.stack[-1].release_register(disc_reg)
+            self.emit("ldr", Register("x0"), StackAddress(0, "sp"))
+            self.emit("add", Register("sp"), Register("sp"), Imm(16))
 
     def leave_stack_frame(self):
         """Emit the epilogue for a function (teardown only — return value already in x0)."""
