@@ -1,5 +1,16 @@
 # Roadmap
 
+## Milestone: Self-hosting
+
+The primary near-term goal is to implement just enough language features to be able to write
+the Kod compiler in Kod itself. The Python implementation will serve as a bootstrap compiler —
+used to compile the Kod-written compiler, which can then compile itself going forward.
+
+This means prioritising features that a compiler implementation actually needs: string
+manipulation, data structures, pattern matching, file I/O, and a sufficient type system.
+Feature work should be evaluated against whether it moves the needle toward self-hosting.
+
+
 ## Typechecker
 
 - Two-pass type inference and checking:
