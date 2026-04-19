@@ -81,6 +81,10 @@ class TypeChecker:
                 self.check_expression(condition)
                 for statement in body:
                     self.check_statement(statement)
+            case ast.ForEachStatement(_, iterable, body):
+                self.check_expression(iterable)
+                for statement in body:
+                    self.check_statement(statement)
             case ast.Return(expression):
                 self.check_expression(expression)
             case ast.Assignment(_, rhs):

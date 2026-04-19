@@ -11,6 +11,7 @@ from kod.ast import (
     BooleanLiteral,
     EnumVariantPattern,
     ExternalFunctionDeclaration,
+    ForEachStatement,
     ForStatement,
     FunctionCall,
     FunctionDeclaration,
@@ -244,6 +245,8 @@ class Compiler:
                 self.compile_if_statement(condition, true_branch, false_branch)
             case ForStatement(condition, body):
                 self.compile_for_statement(condition, body)
+            case ForEachStatement(binding, iterable, body):
+                self.compile_for_each_statement(binding, iterable, body)
             case MatchStatement(expression, arms):
                 self.compile_match(expression, arms)
             case _:
@@ -313,6 +316,56 @@ class Compiler:
             self.compile_statement(statement)
         self.emit("b", label.start)
         self.emit_label(label.end)
+
+    def compile_for_each_statement(self, binding, iterable, body):
+        """Compile a for-each loop over an array"""
+        label = self.create_label("foreach")
+        frame = self.stack[-1]
+        idx_name = f"__foreach_idx_{binding}"
+
+        # Load array header ptr into a register, then read len and data ptr
+        hdr_reg = frame.allocate_register()
+        len_reg = frame.allocate_register()
+        ptr_reg = frame.allocate_register()
+        idx_reg = frame.allocate_register()
+        elem_reg = frame.allocate_register()
+
+        arr_reg = self.compile_expression(iterable)
+        self.mov(hdr_reg, arr_reg)
+
+        self.emit("ldr", len_reg, StackAddress(8, str(hdr_reg)))  # header.len
+        self.emit("ldr", ptr_reg, StackAddress(0, str(hdr_reg)))  # header.ptr
+        frame.release_register(hdr_reg)
+
+        # index = 0, store to stack slot
+        self.emit("mov", idx_reg, Imm(0))
+        self.emit("str", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
+
+        self.emit_label(label.start)
+        # reload index, compare with len
+        self.emit("ldr", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
+        self.emit("cmp", idx_reg, len_reg)
+        self.emit("bge", label.end)
+
+        # load element: ptr[idx * 8]
+        self.emit("lsl", elem_reg, idx_reg, Imm(3))
+        self.emit("ldr", elem_reg, f"[{ptr_reg}, {elem_reg}]")
+        self.emit("str", elem_reg, frame.get_variable_address(frame.variables[binding]))
+
+        for stmt in body:
+            self.compile_statement(stmt)
+
+        # increment index and store back
+        self.emit("ldr", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
+        self.emit("add", idx_reg, idx_reg, Imm(1))
+        self.emit("str", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
+        self.emit("b", label.start)
+        self.emit_label(label.end)
+
+        frame.release_register(len_reg)
+        frame.release_register(ptr_reg)
+        frame.release_register(idx_reg)
+        frame.release_register(elem_reg)
 
     def compile_if_statement(self, condition, true_branch, false_branch):
         """Compile an if statement to assembly"""

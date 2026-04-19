@@ -258,6 +258,11 @@ class For(Token):
 
 
 @dataclasses.dataclass
+class In(Token):
+    """An in token"""
+
+
+@dataclasses.dataclass
 class BooleanLiteral(Token):
     """A true/false token"""
 

@@ -212,6 +212,12 @@ class Interpreter:
                 ):
                     for stmt in body:
                         self.execute_statement(module, stmt)
+            case ast.ForEachStatement(binding, iterable, body):
+                array = self.evaluate_expression(module, iterable)
+                for element in array.value:
+                    self.stack[-1][binding] = element
+                    for stmt in body:
+                        self.execute_statement(module, stmt)
             case ast.MatchStatement(expression, arms):
                 value = self.evaluate_expression(module, expression)
                 for arm in arms:

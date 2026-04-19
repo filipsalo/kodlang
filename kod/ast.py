@@ -276,6 +276,12 @@ class FunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, VariableDeclaration):
                     variables[statement.variable.id] = statement.variable
+                if isinstance(statement, ForEachStatement):
+                    idx_name = f"__foreach_idx_{statement.binding}"
+                    variables[statement.binding] = Variable(
+                        statement.binding, None, statement.span
+                    )
+                    variables[idx_name] = Variable(idx_name, None, statement.span)
                 if isinstance(statement, MatchStatement):
                     for arm in statement.arms:
                         if isinstance(arm.pattern, EnumVariantPattern):
@@ -588,24 +594,45 @@ class IfStatement(ASTNode):
 
 @dataclasses.dataclass
 class ForStatement(ASTNode):
-    """An if statement."""
+    """A while-style for loop."""
 
     condition: ASTNode
     body: list[Statement]
     span: Span
 
     @classmethod
-    def parse(cls, parser: Parser) -> Self:
-        """Parse an if statement."""
+    def parse(cls, parser: Parser) -> "ForStatement | ForEachStatement":
+        """Parse a for statement (while-style or foreach)."""
         body = []
         with parser.span() as span:
             parser.consume(tokens.For)
+            if parser.peeking_at(tokens.Identifier):
+                saved_pos = parser.pos
+                binding = parser.consume(tokens.Identifier).value
+                if parser.try_consume(tokens.In):
+                    iterable = Expression.parse(parser)
+                    parser.consume(tokens.OpenCurly)
+                    while not parser.try_consume(tokens.CloseCurly):
+                        if statement := parser.parse_statement():
+                            body.append(statement)
+                    return ForEachStatement(binding, iterable, body, span)
+                parser.pos = saved_pos
             condition = Expression.parse(parser)
             parser.consume(tokens.OpenCurly)
             while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
                     body.append(statement)
         return cls(condition, body, span)
+
+
+@dataclasses.dataclass
+class ForEachStatement(ASTNode):
+    """A for-each loop over an array."""
+
+    binding: str
+    iterable: ASTNode
+    body: list[Statement]
+    span: Span
 
 
 @dataclasses.dataclass
