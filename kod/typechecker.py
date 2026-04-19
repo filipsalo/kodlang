@@ -17,6 +17,7 @@ class TypeChecker:
         self.stack: list[dict[str, Any]] = []
         self.errors: list[KodError] = []
         self._collected_modules: set[str] = set()
+        self.current_module: ast.Module | None = None
 
     def error(self, msg: str, span: Span) -> None:
         """Add an error to the list of errors."""
@@ -47,10 +48,12 @@ class TypeChecker:
 
     def check_module(self, module: ast.Module) -> None:
         """Check a module for type errors."""
+        self.current_module = module
         self.stack.append({})
         for statement in module.body:
             self.check_statement(statement)
         self.stack.pop()
+        self.current_module = None
 
     def check_statement(self, node: ast.Statement) -> None:
         """Check a statement for type errors."""
@@ -85,10 +88,12 @@ class TypeChecker:
                 dbg("got name", callee.id)
                 self.verify_arguments(callee, node.args)
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Dot):
-                path = self.program.resolve_import(lhs.id)
-                imported_module = self.program.get_module(
-                    path.canonical_path.with_suffix("")
-                )
+                import_node = self.current_module.names.get(lhs.id)
+                if not isinstance(import_node, ast.Import):
+                    self.error(f"'{lhs.id}' is not an imported module", lhs.span)
+                    return
+                path = self.current_module.resolve_import(import_node.module_name)
+                imported_module = self.program.get_module(path)
                 declaration = imported_module.names[rhs.id]
                 self.verify_arguments(declaration, node.args)
 
