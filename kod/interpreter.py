@@ -95,7 +95,7 @@ class Interpreter:
             case tokens.Is():
                 lhs_val = self.evaluate_expression(module, lhs)
                 is_none = isinstance(lhs_val, types.NoneType)
-                if rhs.id == "None":
+                if isinstance(rhs, ast.NoneLiteral):
                     return types.Bool(is_none)
                 else:
                     return types.Bool(not is_none)

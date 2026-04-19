@@ -669,7 +669,7 @@ class Compiler:
         if isinstance(ptr, Register):
             self.stack[-1].release_register(ptr)
         self.emit("cmp", reg, Imm(0))
-        if expression.rhs.id == "None":
+        if isinstance(expression.rhs, NoneLiteral):
             self.emit("cset", reg, "eq")
         else:
             self.emit("cset", reg, "ne")

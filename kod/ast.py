@@ -654,8 +654,8 @@ class MatchArm:
             if parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
                 parser.consume(tokens.Identifier)
                 pattern = WildcardPattern(span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "None":
-                parser.consume(tokens.Identifier)
+            elif parser.peeking_at(tokens.NoneLiteral):
+                parser.consume(tokens.NoneLiteral)
                 pattern = OptionalNonePattern(span)
             elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
                 parser.consume(tokens.Identifier)
