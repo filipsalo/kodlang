@@ -5,7 +5,6 @@ import ctypes
 import dataclasses
 import sys
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 from kod import ast, tokens, types
@@ -62,8 +61,7 @@ class Interpreter:
                 if isinstance(value, ast.StringLiteral):
                     value = value.value
                 elif isinstance(value, ast.Import):
-                    path = module.source_file.path.parent / Path(value.module_name)
-                    path = path.relative_to(module.source_file.fs.root_path)
+                    path = module.resolve_import(value.module_name)
                     return self.program.get_module(path)
                 return value
         raise ValueError(f"Unknown name {name!r}")
@@ -169,8 +167,7 @@ class Interpreter:
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
             case ast.Import(name, local_name):
-                path = module.source_file.path.parent / Path(name)
-                path = path.relative_to(module.source_file.fs.root_path)
+                path = module.resolve_import(name)
                 module.names[local_name] = self.program.get_module(path)
             case ast.FunctionDeclaration(name) | ast.ExternalFunctionDeclaration(name):
                 module.names[name] = statement
@@ -267,6 +264,12 @@ class Interpreter:
         if isinstance(func, ast.ExternalFunctionDeclaration):
             if func.name == "int_to_str":
                 return types.String(str(args[0].value).encode("utf8"))
+            if func.name == "read_file":
+                path = args[0].value.decode("utf8")
+                try:
+                    return types.String(open(path, "rb").read())
+                except OSError:
+                    return types.String(b"")
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]

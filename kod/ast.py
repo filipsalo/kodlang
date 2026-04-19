@@ -533,8 +533,11 @@ class Module(ASTNode):
         return Path(self.mangled_name).with_suffix(".o")
 
     def resolve_import(self, module_name) -> Path:
-        """Resolve an import."""
-        return self.canonical_name.parent / module_name
+        """Resolve an import. Relative (./foo) imports are resolved against
+        the importing module; stdlib imports are just the bare path."""
+        if module_name.startswith("./"):
+            return self.canonical_name.parent / module_name
+        return Path(module_name)
 
 
 @dataclasses.dataclass

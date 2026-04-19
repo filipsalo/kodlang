@@ -43,7 +43,7 @@ class TypeChecker:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = node.params
                 case ast.Import():
-                    path = module.canonical_name.parent / node.module_name
+                    path = module.resolve_import(node.module_name)
                     self.collect_functions(self.program.get_module(path))
 
     def check_module(self, module: ast.Module) -> None:

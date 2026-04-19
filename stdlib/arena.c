@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define BLOCK_SIZE (4 * 1024 * 1024) /* 4 MB */
 
@@ -22,6 +23,19 @@ static Block *new_block(int64_t min_size) {
 
 void *arena_alloc(int64_t size);
 int64_t strlen(const char *s);
+
+char *read_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return "";
+    fseek(fp, 0, SEEK_END);
+    int64_t size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *buf = (char *)arena_alloc(size + 1);
+    fread(buf, 1, size, fp);
+    buf[size] = '\0';
+    fclose(fp);
+    return buf;
+}
 
 char *kod_str_concat(const char *a, const char *b) {
     int64_t la = strlen(a);
