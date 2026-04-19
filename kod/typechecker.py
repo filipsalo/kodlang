@@ -129,11 +129,12 @@ class TypeChecker:
 
     def verify_arguments(self, function, arguments) -> None:
         """Verify that the given arguments match the expected types."""
-        params = self.function_types.get(
+        function_name = (
             function.name
             if isinstance(function, ast.FunctionDeclaration)
             else function.id
         )
+        params = self.function_types.get(function_name)
         if params is None:
             return self.error(
                 "Callee is not a function",
@@ -142,7 +143,7 @@ class TypeChecker:
 
         if len(arguments) != len(params):
             self.error(
-                f"Expected {len(params)} arguments, but got {len(arguments)}",
+                f"'{function_name}' takes {len(params)} argument(s), but got {len(arguments)}",
                 arguments.span,
             )
 
