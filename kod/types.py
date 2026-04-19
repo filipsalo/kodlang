@@ -200,7 +200,8 @@ class StructType(Type, ABC):
         for field in fields:
             field_offsets[field.id] = offset
             offset += field.type.width
-        data_class.width = offset
+        data_class.data_width = offset  # actual struct size (for arena allocation)
+        data_class.width = 8  # pointer size (for stack frame layout)
         data_class.struct_fields = fields
         data_class.field_offsets = field_offsets
 

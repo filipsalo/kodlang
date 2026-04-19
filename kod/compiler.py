@@ -122,7 +122,8 @@ class StackFrame:
         """Get the offset of a variable in the stack frame"""
         offset = 0
         for var in self.variables.values():
-            offset -= var.type.width
+            width = var.type.width if var.type is not None else 8
+            offset -= width
             if var.id == variable.id:
                 break
         else:
@@ -131,7 +132,9 @@ class StackFrame:
 
     def size(self):
         """Return the size of the stack frame"""
-        return sum(variable.type.width for variable in self.variables.values())
+        return sum(
+            (v.type.width if v.type is not None else 8) for v in self.variables.values()
+        )
 
     def aligned_size(self):
         """Return the aligned size of the stack frame"""
@@ -323,24 +326,35 @@ class Compiler:
             self.compile_statement(statement)
         self.emit_label(label.end)
 
-    def compile_field_access(self, expression: BinaryOperator) -> "StackAddress":
-        """Compile a struct field read, returning the field's stack address."""
+    def compile_field_access(self, expression: BinaryOperator) -> Register:
+        """Compile a struct field read via pointer indirection, returning a register."""
         obj_addr = self.stack[-1].get_variable_address(expression.lhs)
         struct_type = self.stack[-1].variables[expression.lhs.id].type
         field_offset = struct_type.field_offsets[expression.rhs.id]
-        return StackAddress(obj_addr.offset + field_offset, obj_addr.base)
+        reg = self.stack[-1].allocate_register()
+        self.emit("ldr", reg, obj_addr)  # load pointer from stack slot
+        self.emit(
+            "ldr", reg, StackAddress(field_offset, str(reg))
+        )  # load field through pointer
+        return reg
 
     def compile_field_write(self, lhs: BinaryOperator, rhs) -> None:
-        """Compile a struct field write."""
+        """Compile a struct field write via pointer indirection."""
         obj_addr = self.stack[-1].get_variable_address(lhs.lhs)
         struct_type = self.stack[-1].variables[lhs.lhs.id].type
         field_offset = struct_type.field_offsets[lhs.rhs.id]
-        field_addr = StackAddress(obj_addr.offset + field_offset, obj_addr.base)
+        # Compute RHS value first (may call functions — pointer is safe on stack)
         value = self.compile_expression(rhs)
-        register = self.stack[-1].allocate_register()
-        self.mov(register, value)
-        self.emit("str", register, field_addr)
-        self.stack[-1].release_register(register)
+        # Load pointer, then store value through it
+        ptr_reg = self.stack[-1].allocate_register()
+        self.emit("ldr", ptr_reg, obj_addr)
+        val_reg = self.stack[-1].allocate_register()
+        self.mov(val_reg, value)
+        if isinstance(value, Register):
+            self.stack[-1].release_register(value)
+        self.emit("str", val_reg, StackAddress(field_offset, str(ptr_reg)))
+        self.stack[-1].release_register(val_reg)
+        self.stack[-1].release_register(ptr_reg)
 
     def compile_enum_unit_variant(self, expression) -> "Register":
         """Compile a unit enum variant access (e.g. Direction.North) to its discriminant."""
@@ -449,24 +463,37 @@ class Compiler:
                 self.stack[-1].release_register(reg)
             return
 
-        # Struct constructor: initialise each field directly on the stack
+        # Struct constructor: arena-allocate, store pointer, store fields via pointer
         if isinstance(expression, FunctionCall) and isinstance(expression.callee, Name):
             type_name = expression.callee.id
-            if type_name in self.type_registry:
+            if type_name in self.type_registry and hasattr(
+                self.type_registry[type_name], "field_offsets"
+            ):
                 struct_type = self.type_registry[type_name]
                 if getattr(variable, "type", None) is None:
                     variable.type = struct_type
                 destination = self.stack[-1].get_variable_address(variable)
+                # Call arena_alloc(data_width) — returns pointer in x0
+                self.mov(Register("x0"), Imm(struct_type.data_width))
+                self.emit("bl", "_arena_alloc")
+                # Save pointer to variable's stack slot immediately
+                tmp = self.stack[-1].allocate_register()
+                self.mov(tmp, Register("x0"))
+                self.emit("str", tmp, destination)
+                self.stack[-1].release_register(tmp)
+                # Store each field: compute value first, then reload pointer and store
                 for arg in expression.args:
                     field_offset = struct_type.field_offsets[arg.label.id]
-                    field_addr = StackAddress(
-                        destination.offset + field_offset, destination.base
-                    )
                     value = self.compile_expression(arg.expression)
-                    register = self.stack[-1].allocate_register()
-                    self.mov(register, value)
-                    self.emit("str", register, field_addr)
-                    self.stack[-1].release_register(register)
+                    ptr_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", ptr_reg, destination)  # reload pointer (safe)
+                    val_reg = self.stack[-1].allocate_register()
+                    self.mov(val_reg, value)
+                    if isinstance(value, Register):
+                        self.stack[-1].release_register(value)
+                    self.emit("str", val_reg, StackAddress(field_offset, str(ptr_reg)))
+                    self.stack[-1].release_register(val_reg)
+                    self.stack[-1].release_register(ptr_reg)
                 return
 
         destination = self.stack[-1].get_variable_address(variable)

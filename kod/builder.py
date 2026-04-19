@@ -52,6 +52,21 @@ class Builder:
         Compiler(module, self.program, output).compile()
         return output.getvalue()
 
+    def _build_c(self, c_path: Path) -> Path:
+        """Compile a C source file to an object file."""
+        root_path = self.program.root_fs.root_path
+        obj_path = (root_path / "build" / c_path.stem).with_suffix(".o")
+        cmd = [
+            "clang",
+            "-c",
+            "-o",
+            str(obj_path.relative_to(root_path)),
+            str(c_path),
+        ]
+        print(f"=> \033[2m{' '.join(map(str, cmd))}\033[0m", file=sys.stderr)
+        subprocess.run(cmd, check=True, cwd=root_path)
+        return obj_path
+
     def _build(self, module_name: str, asm: str) -> Path:
         """Build an object file."""
         root_path = self.program.root_fs.root_path
@@ -107,6 +122,8 @@ class Builder:
         for module in self.program:
             object_files.append(self.build_module(module).relative_to(root_path))
         object_files.append(self.build_runtime_main(file).relative_to(root_path))
+        arena_c = self.program.stdlib_fs.root_path / "arena.c"
+        object_files.append(self._build_c(arena_c).relative_to(root_path))
         cmd = [
             "ld",
             "-macos_version_min",
