@@ -161,9 +161,15 @@ class Interpreter:
                 value = self.evaluate_expression(module, value)
                 module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.Assignment(lhs, rhs):
-                lhs = self.evaluate_expression(module, lhs, as_lvalue=True)
-                rhs = self.evaluate_expression(module, rhs)
-                self.assign(module, lhs.id, rhs)
+                rhs_val = self.evaluate_expression(module, rhs)
+                if isinstance(lhs, ast.BinaryOperator) and isinstance(
+                    lhs.op, tokens.Dot
+                ):
+                    obj = self.evaluate_expression(module, lhs.lhs)
+                    setattr(obj, lhs.rhs.id, rhs_val)
+                else:
+                    lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
+                    self.assign(module, lhs_val.id, rhs_val)
             case ast.IfStatement(condition, true_branch, false_branch):
                 matched = (
                     self.evaluate_expression(module, condition).to_bool().value is True

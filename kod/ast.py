@@ -428,6 +428,8 @@ class Module(ASTNode):
                     names[variable.id] = statement
                 case Import(_, local_name):
                     names[local_name] = statement
+                case TypeDeclaration(name, type_):
+                    names[name.id] = type_
         return names
 
     def get_imports(self) -> list[Import]:
@@ -543,6 +545,7 @@ class TypeDeclaration(ASTNode):
             name = Name.parse(parser)
             parser.consume(tokens.Equal)
             type_ = parser.parse_type(name.id)
+        parser.type_registry[name.id] = type_
         return cls(name, type_, span)
 
 

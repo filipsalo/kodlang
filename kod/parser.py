@@ -40,6 +40,7 @@ class Parser:
         self.pos = 0
         self.stack = [{}]
         self.spans = []
+        self.type_registry: dict[str, type] = {}
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -93,6 +94,8 @@ class Parser:
             self.consume(CloseBracket)
             return types.ArrayType.make(item_type)
         param_type = ast.Name.parse(self)
+        if param_type.id in self.type_registry:
+            return self.type_registry[param_type.id]
         return types.Type.from_name(param_type.id)
 
     def parse_statement(self) -> "Optional[ast.Statement]":

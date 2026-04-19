@@ -148,15 +148,27 @@ class StructType(Type, ABC):
     @classmethod
     def make(cls, name, fields):
         """Make a struct type."""
+        field_ids = [f.id for f in fields]
+
+        def __repr__(self):
+            parts = ", ".join(f"{fid}={getattr(self, fid)!r}" for fid in field_ids)
+            return f"<{name}({parts})>"
+
         data_class = dataclasses.make_dataclass(
             name,
             [(field.id, field.type) for field in fields],
             bases=(cls,),
-            namespace={"__repr__": cls._subclass__repr__},
+            namespace={"__repr__": __repr__},
             kw_only=True,
         )
-        return data_class
 
-    @staticmethod
-    def _subclass__repr__(subclass_instance):
-        return f"<{subclass_instance.__class__.__name__} {subclass_instance.value!r}>"
+        field_offsets = {}
+        offset = 0
+        for field in fields:
+            field_offsets[field.id] = offset
+            offset += field.type.width
+        data_class.width = offset
+        data_class.struct_fields = fields
+        data_class.field_offsets = field_offsets
+
+        return data_class

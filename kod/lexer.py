@@ -2,7 +2,7 @@
 """A lexer for the kod language."""
 
 from pathlib import Path
-from typing import Iterator, Type, TypeVar
+from typing import Iterator, TypeVar
 
 from kod.exceptions import KodError
 from kod.span import Span
@@ -44,6 +44,7 @@ from kod.tokens import (
     StringLiteral,
     Struct,
     Token,
+    Type,
 )
 
 KEYWORDS = {
