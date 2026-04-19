@@ -284,14 +284,14 @@ class EnumType:
                 payload_width=payload_width,
             )
 
-        total_width = 8 + max_payload_width  # discriminant + payload
-
         enum_class = type(
             name,
             (cls,),
             {
                 "name": name,
-                "width": total_width,
+                "data_width": 8
+                + max_payload_width,  # actual enum size (for arena allocation)
+                "width": 8,  # pointer size (for stack frame layout)
                 "variants": variant_infos,
                 "payload_offset": 8,
                 "max_payload_width": max_payload_width,

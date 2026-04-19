@@ -364,6 +364,18 @@ class Compiler:
         self.emit("mov", register, Imm(variant_info.discriminant))
         return register
 
+    def _load_enum_discriminant(self, expr, operand):
+        """For enum variable operands, load discriminant through pointer; others unchanged."""
+        if isinstance(expr, Name):
+            var = self.stack[-1].variables.get(expr.id)
+            if var is not None and hasattr(getattr(var, "type", None), "variants"):
+                # operand is StackAddress pointing to pointer slot — load ptr then discriminant
+                reg = self.stack[-1].allocate_register()
+                self.mov(reg, operand)
+                self.emit("ldr", reg, StackAddress(0, str(reg)))
+                return reg
+        return operand
+
     def compile_match(self, expression, arms):
         """Compile a match statement."""
         if not isinstance(expression, Name):
@@ -371,7 +383,10 @@ class Compiler:
         label = self.create_label("match")
         enum_addr = self.stack[-1].get_variable_address(expression)
         disc_reg = self.stack[-1].allocate_register()
-        self.emit("ldr", disc_reg, enum_addr)
+        self.emit("ldr", disc_reg, enum_addr)  # load pointer from stack slot
+        self.emit(
+            "ldr", disc_reg, StackAddress(0, str(disc_reg))
+        )  # load discriminant through pointer
 
         skip_labels = [self.create_label("skip") for _ in arms]
 
@@ -385,14 +400,14 @@ class Compiler:
                 variant_info = enum_type.variants[arm.pattern.variant_name]
                 self.emit("cmp", disc_reg, Imm(variant_info.discriminant))
                 self.emit("bne", skip_labels[i])
-                # bind fields to pre-allocated stack slots
+                # bind fields to pre-allocated stack slots via pointer
                 for binding_name, field in zip(
                     arm.pattern.bindings, variant_info.fields
                 ):
                     field_offset = variant_info.field_offsets[field.id]
-                    field_addr = StackAddress(
-                        enum_addr.offset + 8 + field_offset, enum_addr.base
-                    )
+                    ptr_reg = self.stack[-1].allocate_register()
+                    self.emit("ldr", ptr_reg, enum_addr)  # reload pointer from stack
+                    field_addr = StackAddress(8 + field_offset, str(ptr_reg))
                     binding_addr = self.stack[-1].get_variable_address(
                         Name(binding_name, span=arm.pattern.span)
                     )
@@ -400,6 +415,7 @@ class Compiler:
                     self.emit("ldr", val_reg, field_addr)
                     self.emit("str", val_reg, binding_addr)
                     self.stack[-1].release_register(val_reg)
+                    self.stack[-1].release_register(ptr_reg)
                 for stmt in arm.body:
                     self.compile_statement(stmt)
                 self.emit("b", label.done)
@@ -423,10 +439,17 @@ class Compiler:
             if getattr(variable, "type", None) is None:
                 variable.type = enum_type
             destination = self.stack[-1].get_variable_address(variable)
-            register = self.stack[-1].allocate_register()
-            self.emit("mov", register, Imm(variant_info.discriminant))
-            self.emit("str", register, destination)
-            self.stack[-1].release_register(register)
+            # arena-allocate, store pointer, write discriminant through pointer
+            self.mov(Register("x0"), Imm(enum_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            ptr_reg = self.stack[-1].allocate_register()
+            disc_reg = self.stack[-1].allocate_register()
+            self.mov(ptr_reg, Register("x0"))
+            self.emit("str", ptr_reg, destination)
+            self.emit("mov", disc_reg, Imm(variant_info.discriminant))
+            self.emit("str", disc_reg, StackAddress(0, str(ptr_reg)))
+            self.stack[-1].release_register(disc_reg)
+            self.stack[-1].release_register(ptr_reg)
             return
 
         # Enum payload variant: let m: Message = Message.Text(content: "hello")
@@ -443,24 +466,30 @@ class Compiler:
             if getattr(variable, "type", None) is None:
                 variable.type = enum_type
             destination = self.stack[-1].get_variable_address(variable)
-            # Store discriminant
+            # arena-allocate, store pointer, write discriminant and fields through pointer
+            self.mov(Register("x0"), Imm(enum_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            ptr_reg = self.stack[-1].allocate_register()
             disc_reg = self.stack[-1].allocate_register()
+            self.mov(ptr_reg, Register("x0"))
+            self.emit("str", ptr_reg, destination)
             self.emit("mov", disc_reg, Imm(variant_info.discriminant))
-            self.emit("str", disc_reg, destination)
+            self.emit("str", disc_reg, StackAddress(0, str(ptr_reg)))
             self.stack[-1].release_register(disc_reg)
-            # Store payload fields
+            self.stack[-1].release_register(ptr_reg)
+            # Store payload fields: compute value first, then reload pointer and store
             for arg in expression.args:
                 field_offset = variant_info.field_offsets[arg.label.id]
-                field_addr = StackAddress(
-                    destination.offset + 8 + field_offset, destination.base
-                )
                 val = self.compile_expression(arg.expression)
-                reg = self.stack[-1].allocate_register()
-                self.mov(reg, val)
+                ptr_reg2 = self.stack[-1].allocate_register()
+                self.emit("ldr", ptr_reg2, destination)  # reload pointer (safe)
+                val_reg = self.stack[-1].allocate_register()
+                self.mov(val_reg, val)
                 if isinstance(val, Register):
                     self.stack[-1].release_register(val)
-                self.emit("str", reg, field_addr)
-                self.stack[-1].release_register(reg)
+                self.emit("str", val_reg, StackAddress(8 + field_offset, str(ptr_reg2)))
+                self.stack[-1].release_register(val_reg)
+                self.stack[-1].release_register(ptr_reg2)
             return
 
         # Struct constructor: arena-allocate, store pointer, store fields via pointer
@@ -574,6 +603,10 @@ class Compiler:
             raise ValueError(f"Unknown operator: {expression.op}")
         left = self.compile_expression(expression.lhs)
         right = self.compile_expression(expression.rhs)
+        # For enum comparisons, load discriminants through pointers
+        if isinstance(expression.op, cmp_ops):
+            left = self._load_enum_discriminant(expression.lhs, left)
+            right = self._load_enum_discriminant(expression.rhs, right)
         try:
             lhs_register = self.stack[-1].allocate_register()
             rhs_register = self.stack[-1].allocate_register()
