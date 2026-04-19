@@ -129,10 +129,13 @@ class Builder:
         object_files.append(
             self._build_c(stdlib_root / "runtime.c").relative_to(root_path)
         )
+        macos_version = subprocess.check_output(
+            ["sw_vers", "-productVersion"], text=True
+        ).strip()
         cmd = [
             "ld",
             "-macos_version_min",
-            "15.0",
+            macos_version,
             "-lc",
             "-L",
             "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
