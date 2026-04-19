@@ -265,6 +265,8 @@ class Interpreter:
                 return func(**{name: value for name, value in zip(arg_names, args)})
             return func(*args)
         if isinstance(func, ast.ExternalFunctionDeclaration):
+            if func.name == "int_to_str":
+                return types.String(str(args[0].value).encode("utf8"))
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]

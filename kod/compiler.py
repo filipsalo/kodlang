@@ -830,6 +830,24 @@ class Compiler:
             self.emit("cset", reg, "ne")
         return reg
 
+    def _infer_type(self, expression):
+        """Infer the type of an expression, returning None if unknown."""
+        from kod import types as _types
+
+        if isinstance(expression, StringLiteral):
+            return _types.String
+        if isinstance(expression, IntegerLiteral):
+            return _types.Int64
+        if isinstance(expression, Name):
+            var = self.stack[-1].variables.get(expression.id)
+            if var is not None:
+                return var.type
+        if isinstance(expression, FunctionCall) and isinstance(expression.callee, Name):
+            func = self.functions.get(expression.callee.id)
+            if func is not None:
+                return getattr(func, "return_type", None)
+        return None
+
     def compile_binary_operator(self, expression):
         """Compile a binary operator to assembly"""
         if isinstance(expression.op, (And, Or)):
@@ -838,11 +856,7 @@ class Compiler:
         if isinstance(expression.op, Plus):
             from kod import types as _types
 
-            lhs_type = None
-            if isinstance(expression.lhs, Name):
-                var = self.stack[-1].variables.get(expression.lhs.id)
-                if var is not None:
-                    lhs_type = var.type
+            lhs_type = self._infer_type(expression.lhs)
             if lhs_type is _types.String:
                 return self.compile_str_concat(expression)
             if (
