@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from kod import ast
+from kod import ast, tokens
 from kod.exceptions import KodError
 from kod.program import Program
 from kod.span import Span
@@ -14,8 +14,9 @@ class TypeChecker:
     def __init__(self, program: Program) -> None:
         self.program = program
         self.function_types: dict[str, ast.FunctionParamList] = {}
-        self.stack: list[dict[str, Any]] = [{}]
+        self.stack: list[dict[str, Any]] = []
         self.errors: list[KodError] = []
+        self._collected_modules: set[str] = set()
 
     def error(self, msg: str, span: Span) -> None:
         """Add an error to the list of errors."""
@@ -25,20 +26,35 @@ class TypeChecker:
     def check(self) -> bool:
         """Check the program for type errors."""
         for module in self.program:
+            self.collect_functions(module)
+        for module in self.program:
             self.check_module(module)
         return not self.errors
 
-    def check_module(self, module: ast.Module) -> None:
-        """Check a module for type errors."""
-        for node in module.body + self.program.builtins.body:
+    def collect_functions(self, module: ast.Module) -> None:
+        """Collect all function declarations."""
+        key = str(module.canonical_name)
+        if key in self._collected_modules:
+            return
+        self._collected_modules.add(key)
+        for node in module.body:
             match node:
                 case ast.FunctionDeclaration() | ast.ExternalFunctionDeclaration():
                     self.function_types[node.name] = node.params
+                case ast.Import():
+                    path = module.canonical_name.parent / node.module_name
+                    self.collect_functions(self.program.get_module(path))
+
+    def check_module(self, module: ast.Module) -> None:
+        """Check a module for type errors."""
+        self.stack.append({})
         for statement in module.body:
             self.check_statement(statement)
+        self.stack.pop()
 
     def check_statement(self, node: ast.Statement) -> None:
         """Check a statement for type errors."""
+        dbg("node", node)
         match node:
             case ast.FunctionCall():
                 self.check_function_call(node)
@@ -48,6 +64,7 @@ class TypeChecker:
                 )
                 for statement in node.body:
                     self.check_statement(statement)
+                self.stack.pop()
             case ast.ExternalFunctionDeclaration():
                 pass
             case ast.VariableDeclaration():
@@ -62,17 +79,38 @@ class TypeChecker:
 
     def check_function_call(self, node) -> None:
         """Check a function call for type errors."""
-        self.verify_arguments(node.callee.id, node.args)
+        dbg(type(node.callee), node.callee)
+        match node.callee:
+            case ast.Name() as callee:
+                dbg("got name", callee.id)
+                self.verify_arguments(callee, node.args)
+            case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Dot):
+                path = self.program.resolve_import(lhs.id)
+                imported_module = self.program.get_module(
+                    path.canonical_path.with_suffix("")
+                )
+                declaration = imported_module.names[rhs.id]
+                self.verify_arguments(declaration, node.args)
 
-    def verify_arguments(self, function_name, arguments) -> None:
+    def lookup(self, name: ast.Name) -> Any:
+        """Look up a name in the current scope."""
+        for scope in reversed(self.stack):
+            if name.id in scope:
+                return scope[name.id]
+        self.error(f"Name '{name.id}' not found", name.span)
+
+    def verify_arguments(self, function, arguments) -> None:
         """Verify that the given arguments match the expected types."""
-        if function_name not in self.function_types:
-            self.error(
-                f"Function '{function_name}' not found",
-                function_name.span,
+        params = self.function_types.get(
+            function.name
+            if isinstance(function, ast.FunctionDeclaration)
+            else function.id
+        )
+        if params is None:
+            return self.error(
+                "Callee is not a function",
+                function.span,
             )
-
-        params = self.function_types[function_name]
 
         if len(arguments) != len(params):
             self.error(
@@ -86,16 +124,17 @@ class TypeChecker:
                     f"Expected argument '{param.variable.id}' to be labeled",
                     arg.span,
                 )
-            if isinstance(arg.expression, ast.Variable):
-                if arg.expression.id not in self.stack[-1]:
-                    self.error(
-                        f"Variable '{arg.expression.id}' not found",
-                        arg.span,
+            if isinstance(arg.expression, ast.Name):
+                declaration = self.lookup(arg.expression)
+                if declaration is not None:
+                    arg_type = (
+                        declaration.type
+                        if isinstance(declaration, ast.Variable)
+                        else None
                     )
-                arg_type = self.stack[-1][arg.expression.id].type
-                if arg_type != param.variable.type:
-                    self.error(
-                        f"Expected argument of type '{param.variable.type}', "
-                        f"but got '{arg.expression.type}'",
-                        arg.span,
-                    )
+                    if arg_type is not None and arg_type != param.variable.type:
+                        self.error(
+                            f"Expected argument of type '{param.variable.type}', "
+                            f"but got '{arg_type}'",
+                            arg.span,
+                        )
