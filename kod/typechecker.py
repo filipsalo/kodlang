@@ -72,12 +72,14 @@ class TypeChecker:
                 pass
             case ast.VariableDeclaration():
                 self.check_variable_declaration(node)
-            case ast.IfStatement(_, true_branch, false_branch):
+            case ast.IfStatement(condition, true_branch, false_branch):
+                self.check_expression(condition)
                 for statement in true_branch:
                     self.check_statement(statement)
                 for statement in false_branch:
                     self.check_statement(statement)
-            case ast.ForStatement(_, body):
+            case ast.ForStatement(condition, body):
+                self.check_expression(condition)
                 for statement in body:
                     self.check_statement(statement)
             case ast.Return(expression):
@@ -87,11 +89,67 @@ class TypeChecker:
             case ast.Import():
                 pass
 
+    def infer_type(self, node: ast.ASTNode):
+        """Infer the type of an expression, returning None if unknown."""
+        match node:
+            case ast.NoneLiteral():
+                from kod import types
+
+                return types.NoneType
+            case ast.IntegerLiteral():
+                from kod import types
+
+                return types.Int64
+            case ast.StringLiteral():
+                from kod import types
+
+                return types.String
+            case ast.BooleanLiteral():
+                from kod import types
+
+                return types.Bool
+            case ast.Name() | ast.Variable():
+                for scope in reversed(self.stack):
+                    if node.id in scope:
+                        decl = scope[node.id]
+                        if isinstance(decl, ast.Variable):
+                            return decl.type
+                        if isinstance(decl, ast.VariableDeclaration):
+                            return decl.variable.type
+        return None
+
     def check_expression(self, node: ast.ASTNode) -> None:
         """Check an expression for type errors."""
         match node:
             case ast.FunctionCall():
                 self.check_function_call(node)
+            case ast.BinaryOperator(lhs, op, rhs) if isinstance(
+                op, (tokens.EqualEqual, tokens.NotEqual)
+            ):
+                from kod import types
+
+                lhs_type = self.infer_type(lhs)
+                rhs_type = self.infer_type(rhs)
+                if (
+                    rhs_type is types.NoneType
+                    and lhs_type is not None
+                    and lhs_type is not types.NoneType
+                ):
+                    self.error(
+                        f"Cannot compare non-optional type '{lhs_type.name}' with none",
+                        lhs.span,
+                    )
+                elif (
+                    lhs_type is types.NoneType
+                    and rhs_type is not None
+                    and rhs_type is not types.NoneType
+                ):
+                    self.error(
+                        f"Cannot compare non-optional type '{rhs_type.name}' with none",
+                        rhs.span,
+                    )
+                self.check_expression(lhs)
+                self.check_expression(rhs)
             case ast.BinaryOperator(lhs, _, rhs):
                 self.check_expression(lhs)
                 self.check_expression(rhs)
