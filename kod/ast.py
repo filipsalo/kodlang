@@ -261,7 +261,7 @@ class FunctionDeclaration(ASTNode):
                     body.append(statement)
                 if isinstance(statement, VariableDeclaration):
                     variables[statement.variable.id] = statement.variable
-        label_parts = ["", *parser.file.canonical_path.parts, name]
+        label_parts = ["", *parser.file.canonical_path.with_suffix("").parts, name]
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
         return node
@@ -429,6 +429,14 @@ class Module(ASTNode):
                 case Import(_, local_name):
                     names[local_name] = statement
         return names
+
+    def get_imports(self) -> list[Import]:
+        """Get the imports of a module."""
+        imports = []
+        for statement in self.body:
+            if isinstance(statement, Import):
+                imports.append(statement)
+        return imports
 
     @property
     def canonical_name(self):
