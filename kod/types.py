@@ -179,6 +179,10 @@ class ArrayType(Type, ABC):
         """Index into the array."""
         return self.value[index.value]
 
+    def op_plus(self, other: "ArrayType") -> "ArrayType":
+        """Concatenate two arrays."""
+        return type(self)(self.value + other.value)
+
 
 class StructType(Type, ABC):
     """A struct type."""

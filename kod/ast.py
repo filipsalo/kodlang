@@ -458,6 +458,11 @@ class Expression(ASTNode):
                     rhs = cls.parse(parser, op.precedence + op.left_associative)
                     if isinstance(op, tokens.Equal):
                         lhs = Assignment(lhs, rhs, span)
+                    elif isinstance(op, tokens.PlusEqual):
+                        plus = tokens.Plus(value="+", span=op.span)
+                        lhs = Assignment(
+                            lhs, BinaryOperator(lhs, plus, rhs, span), span
+                        )
                     else:
                         lhs = BinaryOperator(lhs, op, rhs, span)
         return lhs

@@ -295,5 +295,13 @@ class Is(BinaryOperator):
 
 
 @dataclasses.dataclass
+class PlusEqual(BinaryOperator):
+    """A += operator."""
+
+    precedence = 1
+    left_associative = False
+
+
+@dataclasses.dataclass
 class Question(Token):
     """A question mark."""

@@ -20,6 +20,30 @@ static Block *new_block(int64_t min_size) {
     return b;
 }
 
+void *arena_alloc(int64_t size);
+
+typedef struct {
+    void *ptr;
+    int64_t len;
+    int64_t cap;
+} KodArray;
+
+void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
+    KodArray *lhs = (KodArray *)lhs_raw;
+    KodArray *rhs = (KodArray *)rhs_raw;
+    int64_t total = lhs->len + rhs->len;
+    int64_t *buf = (int64_t *)arena_alloc(total * 8);
+    int64_t *sl = (int64_t *)lhs->ptr;
+    int64_t *sr = (int64_t *)rhs->ptr;
+    for (int64_t i = 0; i < lhs->len; i++) buf[i] = sl[i];
+    for (int64_t i = 0; i < rhs->len; i++) buf[lhs->len + i] = sr[i];
+    KodArray *hdr = (KodArray *)arena_alloc(sizeof(KodArray));
+    hdr->ptr = buf;
+    hdr->len = total;
+    hdr->cap = total;
+    return hdr;
+}
+
 void *arena_alloc(int64_t size) {
     /* Align to 8 bytes */
     size = (size + 7) & ~7;

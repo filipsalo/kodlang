@@ -47,6 +47,7 @@ from kod.tokens import (
     Or,
     Percent,
     Plus,
+    PlusEqual,
     Question,
     Return,
     Slash,
@@ -209,6 +210,14 @@ class Lexer:
             return self.build(Arrow)
         return self.build(Minus)
 
+    def lex_plus_or_plus_equal(self) -> Token:
+        """Lex + or +=."""
+        self.consume("+")
+        if self.peek() == "=":
+            self.consume("=")
+            return self.build(PlusEqual)
+        return self.build(Plus)
+
     def lex_equals(self) -> Token:
         """Lex an equals sign or two."""
         self.consume("=")
@@ -251,7 +260,7 @@ class Lexer:
                 case "=":
                     yield self.lex_equals()
                 case "+":
-                    yield self.lex_single_char(Plus)
+                    yield self.lex_plus_or_plus_equal()
                 case "%":
                     yield self.lex_single_char(Percent)
                 case "*":

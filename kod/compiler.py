@@ -661,9 +661,7 @@ class Compiler:
         elif isinstance(expression, FunctionCall):
             return self.compile_function_call(expression)
         elif isinstance(expression, ArrayLiteral):
-            raise ValueError(
-                "Array literals are only supported in variable declarations"
-            )
+            return self.compile_array_literal_expr(expression)
         elif isinstance(expression, BinaryOperator):
             if isinstance(expression.op, Dot):
                 if (
@@ -746,6 +744,62 @@ class Compiler:
         self.stack[-1].release_register(ptr_reg)
         return result
 
+    def compile_array_literal_expr(self, node):
+        """Compile an array literal in expression context using a temp stack slot."""
+        n = len(node.elements)
+        item_width = 8
+        # Push a temp slot below the frame to survive the arena_alloc calls
+        self.emit("sub", Register("sp"), Register("sp"), Imm(16))
+        # Alloc header, save ptr to temp slot
+        self.mov(Register("x0"), Imm(24))
+        self.emit("bl", "_arena_alloc")
+        self.emit("str", Register("x0"), StackAddress(0, "sp"))
+        # Alloc element buffer
+        self.mov(Register("x0"), Imm(max(n, 1) * item_width))
+        self.emit("bl", "_arena_alloc")
+        buf_reg = self.stack[-1].allocate_register()
+        self.mov(buf_reg, Register("x0"))
+        # Fill elements
+        for i, elem in enumerate(node.elements):
+            val = self.compile_expression(elem)
+            val_reg = self.stack[-1].allocate_register()
+            self.mov(val_reg, val)
+            if isinstance(val, Register):
+                self.stack[-1].release_register(val)
+            self.emit("str", val_reg, StackAddress(i * item_width, str(buf_reg)))
+            self.stack[-1].release_register(val_reg)
+        # Load header ptr from temp slot, restore sp
+        hdr_reg = self.stack[-1].allocate_register()
+        self.emit("ldr", hdr_reg, StackAddress(0, "sp"))
+        self.emit("add", Register("sp"), Register("sp"), Imm(16))
+        # Wire header: ptr, len, cap
+        self.emit("str", buf_reg, StackAddress(0, str(hdr_reg)))
+        len_reg = self.stack[-1].allocate_register()
+        self.emit("mov", len_reg, Imm(n))
+        self.emit("str", len_reg, StackAddress(8, str(hdr_reg)))
+        self.emit("str", len_reg, StackAddress(16, str(hdr_reg)))
+        self.stack[-1].release_register(len_reg)
+        self.stack[-1].release_register(buf_reg)
+        return hdr_reg
+
+    def compile_array_concat(self, expression):
+        """Compile [T] + [T] → _kod_array_concat(lhs, rhs)."""
+        # Compile RHS first (may involve bl calls, e.g. ArrayLiteral)
+        rhs = self.compile_expression(expression.rhs)
+        rhs_reg = self.stack[-1].allocate_register()
+        self.mov(rhs_reg, rhs)
+        if isinstance(rhs, Register):
+            self.stack[-1].release_register(rhs)
+        # Compile LHS (Name → StackAddress, no bl)
+        lhs = self.compile_expression(expression.lhs)
+        self.mov(Register("x0"), lhs)
+        if isinstance(lhs, Register):
+            self.stack[-1].release_register(lhs)
+        self.mov(Register("x1"), rhs_reg)
+        self.stack[-1].release_register(rhs_reg)
+        self.emit("bl", "_kod_array_concat")
+        return Register("x0")
+
     def compile_is_check(self, expression):
         """Compile an `is None` / `is Some` check for optional types."""
         ptr = self.compile_expression(expression.lhs)
@@ -764,6 +818,21 @@ class Compiler:
         """Compile a binary operator to assembly"""
         if isinstance(expression.op, (And, Or)):
             return self.compile_short_circuit(expression)
+
+        if isinstance(expression.op, Plus):
+            from kod import types as _types
+
+            lhs_type = None
+            if isinstance(expression.lhs, Name):
+                var = self.stack[-1].variables.get(expression.lhs.id)
+                if var is not None:
+                    lhs_type = var.type
+            if (
+                lhs_type is not None
+                and isinstance(lhs_type, type)
+                and issubclass(lhs_type, _types.ArrayType)
+            ):
+                return self.compile_array_concat(expression)
 
         if isinstance(expression.op, Is):
             return self.compile_is_check(expression)
