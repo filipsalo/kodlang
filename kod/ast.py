@@ -416,6 +416,11 @@ class Expression(ASTNode):
                 value = BooleanLiteral.parse(parser)
             case tokens.NoneLiteral():
                 value = NoneLiteral.parse(parser)
+            case tokens.Minus():
+                op_token = parser.consume(tokens.Minus)
+                operand = Expression.parse(parser, 17)
+                zero = IntegerLiteral(types.Int64(0), span=op_token.span)
+                value = BinaryOperator(zero, op_token, operand, op_token.span)
             case tokens.OpenBracket():
                 span = parser.peek().span
                 parser.consume(tokens.OpenBracket)
