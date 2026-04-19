@@ -17,6 +17,7 @@ from kod.ast import (
     IntegerLiteral,
     Module,
     Name,
+    NoneLiteral,
     Return,
     StringLiteral,
     TypeDeclaration,
@@ -377,6 +378,8 @@ class Compiler:
             return Imm(expression.value.value)
         elif isinstance(expression, BooleanLiteral):
             return Imm(int(expression.value.value))
+        elif isinstance(expression, NoneLiteral):
+            return Imm(0)
         elif isinstance(expression, Name):
             return self.stack[-1].get_variable_address(expression)
         elif isinstance(expression, FunctionCall):

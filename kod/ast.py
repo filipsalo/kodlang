@@ -98,6 +98,20 @@ class BooleanLiteral(ASTNode, Literal):
 
 
 @dataclasses.dataclass
+class NoneLiteral(ASTNode, Literal):
+    """A none literal."""
+
+    value: types.NoneType
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        """Parse a none literal."""
+        token = parser.consume(tokens.NoneLiteral)
+        return cls(types.none_value, span=token.span)
+
+
+@dataclasses.dataclass
 class Variable(ASTNode):
     """A name."""
 
@@ -361,6 +375,8 @@ class Expression(ASTNode):
                 value = IntegerLiteral.parse(parser)
             case tokens.BooleanLiteral():
                 value = BooleanLiteral.parse(parser)
+            case tokens.NoneLiteral():
+                value = NoneLiteral.parse(parser)
             case tokens.Identifier():
                 value = Name.parse(parser)
             case _:

@@ -36,6 +36,7 @@ from kod.tokens import (
     LessThan,
     Let,
     Minus,
+    NoneLiteral,
     NotEqual,
     OpenBracket,
     OpenCurly,
@@ -68,6 +69,7 @@ KEYWORDS = {
     "type": Type,
     "and": And,
     "or": Or,
+    "none": NoneLiteral,
 }
 
 

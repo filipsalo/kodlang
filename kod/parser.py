@@ -22,6 +22,7 @@ from kod.tokens import (
     If,
     Import,
     Let,
+    NoneLiteral,
     OpenBracket,
     OpenCurly,
     Return,
@@ -93,6 +94,8 @@ class Parser:
             item_type = self.parse_type()
             self.consume(CloseBracket)
             return types.ArrayType.make(item_type)
+        if self.try_consume(NoneLiteral):
+            return types.NoneType
         param_type = ast.Name.parse(self)
         if param_type.id in self.type_registry:
             return self.type_registry[param_type.id]

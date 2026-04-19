@@ -263,6 +263,11 @@ class BooleanLiteral(Token):
 
 
 @dataclasses.dataclass
+class NoneLiteral(Token):
+    """A none token"""
+
+
+@dataclasses.dataclass
 class Type(Token):
     """A type token"""
 

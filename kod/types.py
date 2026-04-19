@@ -25,7 +25,7 @@ class Type:
             case "str":
                 return String
             case "none":
-                return None_
+                return NoneType
         raise ValueError(f"Unknown type {name!r}")
 
     def to_str(self) -> "String":
@@ -41,7 +41,9 @@ class Type:
         return self.__class__(self.value - other.value)
 
     def op_eq(self, other: Self) -> "Bool":
-        """Compare two integers."""
+        """Compare two values."""
+        if isinstance(other, NoneType):
+            return Bool(False)
         return Bool(self.value == other.value)
 
     def op_ne(self, other: Self) -> "Bool":
@@ -120,7 +122,26 @@ class Int64(Type):
     width = 8
 
 
-None_ = object()
+class NoneType(Type):
+    """The none type."""
+
+    name = "none"
+    width = 8
+
+    def to_bool(self) -> "Bool":
+        return Bool(False)
+
+    def op_eq(self, other) -> "Bool":
+        return Bool(isinstance(other, NoneType))
+
+    def op_ne(self, other) -> "Bool":
+        return Bool(not isinstance(other, NoneType))
+
+
+# Keep None_ as an alias for backward compatibility
+None_ = NoneType
+
+none_value = NoneType(None)
 
 
 class ArrayType(Type, ABC):
