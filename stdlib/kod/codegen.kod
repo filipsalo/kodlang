@@ -1,0 +1,1836 @@
+import "kod/ast"
+import "kod/parser"
+import "kod/lexer"
+
+// ── Type layout structures ────────────────────────────────────────────────────
+
+type VariantInfo = struct {
+    name: str
+    discriminant: int64
+    field_names: [str]
+    field_offsets: [int64]
+}
+
+type EnumInfo = struct {
+    name: str
+    variants: [VariantInfo]
+    data_width: int64
+}
+
+type FieldInfo = struct {
+    name: str
+    offset: int64
+}
+
+type StructInfo = struct {
+    name: str
+    fields: [FieldInfo]
+    method_names: [str]
+    method_decl_ids: [int64]
+    data_width: int64
+}
+
+// ── Per-variable stack slot ───────────────────────────────────────────────────
+
+type TypeKind = enum {
+    KVoid
+    KInt64
+    KBool
+    KStr
+    KArray
+    KOptional
+    KEnum(idx: int64)
+    KStruct(idx: int64)
+}
+
+type VarSlot = struct {
+    name: str
+    offset: int64
+    kind: TypeKind
+}
+
+// ── Expression result (what compile_expr returns) ─────────────────────────────
+
+type Val = enum {
+    VReg(name: str)
+    VImm(value: int64)
+    VStack(offset: int64)
+    VStrLbl(page: str)
+}
+
+// ── Loop label stack entry ────────────────────────────────────────────────────
+
+type LoopLbl = struct {
+    start_lbl: str
+    end_lbl: str
+    incr_lbl: str
+}
+
+// ── Codegen struct ────────────────────────────────────────────────────────────
+
+type Codegen = struct {
+    p: parser.Parser
+    path_prefix: str
+
+    enums: [EnumInfo]
+    structs: [StructInfo]
+
+    import_local: [str]
+    import_prefix: [str]
+
+    vars: [VarSlot]
+    frame_slots: int64
+    ret_lbl: str
+
+    free_regs: [str]
+
+    loop_stack: [LoopLbl]
+
+    str_labels: [str]
+    str_values: [str]
+
+    label_count: int64
+
+    func_names: [str]
+    func_labels: [str]
+
+
+    func itos(self, anon n: int64) -> str {
+        return int_to_str(n)
+    }
+
+    func fresh(self, anon prefix: str) -> str {
+        self.label_count = self.label_count + 1
+        return prefix + "$" + self.itos(self.label_count)
+    }
+
+    func emit(self, anon line: str) -> none {
+        print("\t" + line)
+    }
+
+    func emit_label(self, anon lbl: str) -> none {
+        print(lbl + ":")
+    }
+
+    func emit_globl(self, anon lbl: str) -> none {
+        print("\t.globl " + lbl)
+    }
+
+    func emit_asciz(self, anon value: str) -> none {
+        putchar(9)   // \t
+        let i: int64 = 0
+        let prefix: str = ".asciz "
+        for i < len(prefix) {
+            putchar(prefix[i])
+            i = i + 1
+        }
+        putchar('"')
+        let j: int64 = 0
+        for j < len(value) {
+            putchar(value[j])
+            j = j + 1
+        }
+        putchar('"')
+        putchar(10)
+    }
+
+
+    func alloc_reg(self) -> str {
+        let n: int64 = len(self.free_regs)
+        let r: str = self.free_regs[n - 1]
+        let new_regs: [str] = []
+        let i: int64 = 0
+        for i < n - 1 {
+            new_regs += [self.free_regs[i]]
+            i = i + 1
+        }
+        self.free_regs = new_regs
+        return r
+    }
+
+    func free_reg(self, anon r: str) -> none {
+        self.free_regs += [r]
+    }
+
+    func free_val(self, anon v: Val) -> none {
+        match v {
+            Val.VReg(name) -> self.free_reg(name)
+            _ -> {}
+        }
+    }
+
+
+    func load(self, anon v: Val) -> str {
+        match v {
+            Val.VReg(name) -> return name
+            Val.VImm(value) -> {
+                let r: str = self.alloc_reg()
+                self.emit("mov " + r + ", #" + self.itos(value))
+                return r
+            }
+            Val.VStack(offset) -> {
+                let r: str = self.alloc_reg()
+                if offset < 0 {
+                    self.emit("ldr " + r + ", [fp, #" + self.itos(offset) + "]")
+                } else {
+                    self.emit("ldr " + r + ", [fp]")
+                }
+                return r
+            }
+            Val.VStrLbl(page) -> {
+                let r: str = self.alloc_reg()
+                self.emit("adrp " + r + ", " + page + "@PAGE")
+                self.emit("add " + r + ", " + r + ", " + page + "@PAGEOFF")
+                return r
+            }
+        }
+    }
+
+    func mov_to(self, dest: str, anon v: Val) -> str {
+        match v {
+            Val.VReg(name) -> {
+                if name != dest {
+                    self.emit("mov " + dest + ", " + name)
+                    self.free_reg(name)
+                }
+                return dest
+            }
+            Val.VImm(value) -> {
+                self.emit("mov " + dest + ", #" + self.itos(value))
+                return dest
+            }
+            Val.VStack(offset) -> {
+                if offset < 0 {
+                    self.emit("ldr " + dest + ", [fp, #" + self.itos(offset) + "]")
+                } else {
+                    self.emit("ldr " + dest + ", [fp]")
+                }
+                return dest
+            }
+            Val.VStrLbl(page) -> {
+                self.emit("adrp " + dest + ", " + page + "@PAGE")
+                self.emit("add " + dest + ", " + dest + ", " + page + "@PAGEOFF")
+                return dest
+            }
+        }
+    }
+
+
+    func intern_str(self, anon value: str) -> str {
+        let i: int64 = 0
+        for i < len(self.str_values) {
+            if self.str_values[i] == value {
+                return self.str_labels[i]
+            }
+            i = i + 1
+        }
+        let lbl: str = self.fresh("Lstr")
+        self.str_labels += [lbl]
+        self.str_values += [value]
+        return lbl
+    }
+
+
+    func alloc_var(self, name: str, kind: TypeKind) -> int64 {
+        self.frame_slots = self.frame_slots + 1
+        let offset: int64 = 0 - self.frame_slots * 8
+        self.vars += [VarSlot(name: name, offset: offset, kind: kind)]
+        return offset
+    }
+
+    func find_var_offset(self, anon name: str) -> int64 {
+        let i: int64 = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].offset
+            }
+            i = i - 1
+        }
+        return -9999
+    }
+
+    func find_var_kind(self, anon name: str) -> TypeKind {
+        let i: int64 = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].kind
+            }
+            i = i - 1
+        }
+        return .KVoid
+    }
+
+    func var_declared(self, anon name: str) -> bool {
+        let i: int64 = 0
+        for i < len(self.vars) {
+            if self.vars[i].name == name {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+
+    func find_enum_idx(self, anon name: str) -> int64 {
+        let i: int64 = 0
+        for i < len(self.enums) {
+            if self.enums[i].name == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func find_struct_idx(self, anon name: str) -> int64 {
+        let i: int64 = 0
+        for i < len(self.structs) {
+            if self.structs[i].name == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func find_enum_with_variant(self, anon variant_name: str) -> int64 {
+        let i: int64 = 0
+        for i < len(self.enums) {
+            let j: int64 = 0
+            for j < len(self.enums[i].variants) {
+                if self.enums[i].variants[j].name == variant_name {
+                    return i
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func find_variant_idx(self, enum_idx: int64, anon variant_name: str) -> int64 {
+        let j: int64 = 0
+        for j < len(self.enums[enum_idx].variants) {
+            if self.enums[enum_idx].variants[j].name == variant_name {
+                return j
+            }
+            j = j + 1
+        }
+        return -1
+    }
+
+    func find_field_offset(self, struct_idx: int64, anon field_name: str) -> int64 {
+        let j: int64 = 0
+        for j < len(self.structs[struct_idx].fields) {
+            if self.structs[struct_idx].fields[j].name == field_name {
+                return self.structs[struct_idx].fields[j].offset
+            }
+            j = j + 1
+        }
+        return 0
+    }
+
+
+    func resolve_type(self, anon type_id: int64) -> TypeKind {
+        if type_id == 0 {
+            return .KVoid
+        }
+        match self.p.type_exprs[type_id] {
+            ast.TypeExpr.Named(name) -> {
+                if name == "int64" {
+                    return .KInt64
+                }
+                if name == "bool" {
+                    return .KBool
+                }
+                if name == "str" {
+                    return .KStr
+                }
+                if name == "none" {
+                    return .KVoid
+                }
+                let ei: int64 = self.find_enum_idx(name)
+                if ei >= 0 {
+                    return TypeKind.KEnum(idx: ei)
+                }
+                let si: int64 = self.find_struct_idx(name)
+                if si >= 0 {
+                    return TypeKind.KStruct(idx: si)
+                }
+                return .KInt64
+            }
+            ast.TypeExpr.Array(inner) -> return .KArray
+            ast.TypeExpr.Optional(inner) -> return .KOptional
+            ast.TypeExpr.Generic(name, arg) -> return .KStruct(idx: 0)
+        }
+    }
+
+
+    func func_label(self, anon name: str) -> str {
+        let i: int64 = 0
+        for i < len(self.func_names) {
+            if self.func_names[i] == name {
+                return self.func_labels[i]
+            }
+            i = i + 1
+        }
+        return self.path_prefix + "$" + name
+    }
+
+    func import_func_label(self, local_mod: str, anon func_name: str) -> str {
+        let i: int64 = 0
+        for i < len(self.import_local) {
+            if self.import_local[i] == local_mod {
+                return self.import_prefix[i] + "$" + func_name
+            }
+            i = i + 1
+        }
+        return "_" + func_name
+    }
+
+
+    func emit_ldr(self, reg: str, anon offset: int64) -> none {
+        if offset < 0 {
+            self.emit("ldr " + reg + ", [fp, #" + self.itos(offset) + "]")
+        } else {
+            self.emit("ldr " + reg + ", [fp]")
+        }
+    }
+
+    func emit_str(self, reg: str, anon offset: int64) -> none {
+        if offset < 0 {
+            self.emit("str " + reg + ", [fp, #" + self.itos(offset) + "]")
+        } else {
+            self.emit("str " + reg + ", [fp]")
+        }
+    }
+
+
+    func register_enum(self, anon decl: ast.Decl) -> none {
+        match decl {
+            ast.Decl.Enum(name, variants) -> {
+                let vinfos: [VariantInfo] = []
+                let disc: int64 = 0
+                let max_payload: int64 = 0
+                let i: int64 = 0
+                for i < len(variants) {
+                    let v: ast.EnumVariant = variants[i]
+                    let fnames: [str] = []
+                    let foffsets: [int64] = []
+                    let j: int64 = 0
+                    for j < len(v.fields) {
+                        fnames += [v.fields[j].name]
+                        foffsets += [j * 8]
+                        j = j + 1
+                    }
+                    let payload: int64 = len(v.fields) * 8
+                    if payload > max_payload {
+                        max_payload = payload
+                    }
+                    vinfos += [VariantInfo(name: v.name, discriminant: disc, field_names: fnames, field_offsets: foffsets)]
+                    disc = disc + 1
+                    i = i + 1
+                }
+                let dw: int64 = 8 + max_payload
+                self.enums += [EnumInfo(name: name, variants: vinfos, data_width: dw)]
+            }
+            _ -> {}
+        }
+    }
+
+    func register_struct(self, anon decl: ast.Decl) -> none {
+        match decl {
+            ast.Decl.Struct(name, fields, methods) -> {
+                let finfos: [FieldInfo] = []
+                let offset: int64 = 0
+                let i: int64 = 0
+                for i < len(fields) {
+                    finfos += [FieldInfo(name: fields[i].name, offset: offset)]
+                    offset = offset + 8
+                    i = i + 1
+                }
+                let mnames: [str] = []
+                let mids: [int64] = []
+                let j: int64 = 0
+                for j < len(methods) {
+                    let fd: ast.FuncDecl = self.p.func_decls[methods[j]]
+                    mnames += [fd.name]
+                    mids += [methods[j]]
+                    j = j + 1
+                }
+                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, data_width: offset)]
+            }
+            _ -> {}
+        }
+    }
+
+
+    func collect_stmt_vars(self, stmt_id: int64) -> none {
+        match self.p.stmts[stmt_id] {
+            ast.Stmt.Let(name, typ, value) -> {
+                if self.var_declared(name) == false {
+                    let kind: TypeKind = self.resolve_type(typ)
+                    self.alloc_var(name, kind)
+                }
+            }
+            ast.Stmt.If(cond, then_body, else_body) -> {
+                let i: int64 = 0
+                for i < len(then_body) {
+                    self.collect_stmt_vars(then_body[i])
+                    i = i + 1
+                }
+                let j: int64 = 0
+                for j < len(else_body) {
+                    self.collect_stmt_vars(else_body[j])
+                    j = j + 1
+                }
+            }
+            ast.Stmt.For(cond, body) -> {
+                let i: int64 = 0
+                for i < len(body) {
+                    self.collect_stmt_vars(body[i])
+                    i = i + 1
+                }
+            }
+            ast.Stmt.ForEach(name, iter, body) -> {
+                if self.var_declared(name) == false {
+                    self.alloc_var(name, .KInt64)
+                }
+                let idx_name: str = "__fi_" + name
+                if self.var_declared(idx_name) == false {
+                    self.alloc_var(idx_name, .KInt64)
+                }
+                let i: int64 = 0
+                for i < len(body) {
+                    self.collect_stmt_vars(body[i])
+                    i = i + 1
+                }
+            }
+            ast.Stmt.MatchStmt(subject, arms) -> {
+                let i: int64 = 0
+                for i < len(arms) {
+                    let arm: ast.MatchArm = self.p.match_arms[arms[i]]
+                    match self.p.patterns[arm.pattern] {
+                        ast.Pattern.SomePat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(binding, .KInt64)
+                            }
+                        }
+                        ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                            let j: int64 = 0
+                            for j < len(bindings) {
+                                if self.var_declared(bindings[j]) == false {
+                                    self.alloc_var(bindings[j], .KInt64)
+                                }
+                                j = j + 1
+                            }
+                        }
+                        ast.Pattern.ImplicitEnumPat(variant_name) -> {}
+                        _ -> {}
+                    }
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.collect_stmt_vars(arm.body[j])
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+            }
+            _ -> {}
+        }
+    }
+
+
+    func compile_expr(self, anon expr_id: int64) -> Val {
+        match self.p.exprs[expr_id] {
+            ast.Expr.IntLit(value) -> return Val.VImm(value: value)
+            ast.Expr.BoolLit(value) -> {
+                if value {
+                    return Val.VImm(value: 1)
+                }
+                return Val.VImm(value: 0)
+            }
+            ast.Expr.NoneLit -> return Val.VImm(value: 0)
+            ast.Expr.StrLit(value) -> {
+                let lbl: str = self.intern_str(value)
+                return Val.VStrLbl(page: lbl)
+            }
+            ast.Expr.Ident(name) -> {
+                let off: int64 = self.find_var_offset(name)
+                return Val.VStack(offset: off)
+            }
+            ast.Expr.ImplicitVariant(name) -> {
+                let ei: int64 = self.find_enum_with_variant(name)
+                let vi: int64 = self.find_variant_idx(ei, name)
+                let disc: int64 = self.enums[ei].variants[vi].discriminant
+                return Val.VImm(value: disc)
+            }
+            ast.Expr.Binary(lhs, op, rhs) -> return self.compile_binary(lhs, op, rhs)
+            ast.Expr.Call(callee, args) -> return self.compile_call(callee, args)
+            ast.Expr.ArrayLit(elements) -> return self.compile_array_lit(elements)
+            ast.Expr.MatchExpr(subject, arms) -> return self.compile_match_expr(subject, arms)
+            ast.Expr.Slice(s, lo, hi) -> return self.compile_slice(s, lo, hi)
+        }
+    }
+
+    func compile_binary(self, lhs: int64, op: ast.Op, rhs: int64) -> Val {
+        match op {
+            ast.Op.Dot -> return self.compile_dot(lhs, rhs)
+            ast.Op.Index -> return self.compile_index(lhs, rhs)
+            ast.Op.And -> return self.compile_and(lhs, rhs)
+            ast.Op.Or -> return self.compile_or(lhs, rhs)
+            ast.Op.Is -> return self.compile_is(lhs, rhs)
+            _ -> return self.compile_arith_cmp(lhs, op, rhs)
+        }
+    }
+
+    func compile_dot(self, lhs: int64, rhs: int64) -> Val {
+        match self.p.exprs[lhs] {
+            ast.Expr.Ident(type_name) -> {
+                let ei: int64 = self.find_enum_idx(type_name)
+                if ei >= 0 {
+                    match self.p.exprs[rhs] {
+                        ast.Expr.Ident(variant_name) -> {
+                            let vi: int64 = self.find_variant_idx(ei, variant_name)
+                            let disc: int64 = self.enums[ei].variants[vi].discriminant
+                            return Val.VImm(value: disc)
+                        }
+                        _ -> {}
+                    }
+                }
+            }
+            _ -> {}
+        }
+        let ptr_v: Val = self.compile_expr(lhs)
+        let ptr_r: str = self.load(ptr_v)
+        match self.p.exprs[rhs] {
+            ast.Expr.Ident(field_name) -> {
+                let struct_idx: int64 = -1
+                match self.p.exprs[lhs] {
+                    ast.Expr.Ident(obj_name) -> {
+                        match self.find_var_kind(obj_name) {
+                            TypeKind.KStruct(idx) -> struct_idx = idx
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+                let field_off: int64 = 0
+                if struct_idx >= 0 {
+                    field_off = self.find_field_offset(struct_idx, field_name)
+                }
+                let result: str = self.alloc_reg()
+                let tmp: str = self.alloc_reg()
+                self.emit("ldr " + tmp + ", [fp, #" + self.itos(self.find_var_offset_by_lhs(lhs)) + "]")
+                self.emit("ldr " + result + ", [" + tmp + ", #" + self.itos(field_off) + "]")
+                self.free_reg(tmp)
+                self.free_reg(ptr_r)
+                return Val.VReg(name: result)
+            }
+            _ -> {}
+        }
+        self.free_reg(ptr_r)
+        return Val.VImm(value: 0)
+    }
+
+    func find_var_offset_by_lhs(self, anon expr_id: int64) -> int64 {
+        match self.p.exprs[expr_id] {
+            ast.Expr.Ident(name) -> return self.find_var_offset(name)
+            _ -> return -8
+        }
+    }
+
+    func compile_index(self, lhs: int64, rhs: int64) -> Val {
+        let lhs_kind: TypeKind = self.infer_kind(lhs)
+        let ptr_v: Val = self.compile_expr(lhs)
+        let idx_v: Val = self.compile_expr(rhs)
+        let ptr_r: str = self.load(ptr_v)
+        let idx_r: str = self.load(idx_v)
+        let result: str = self.alloc_reg()
+        match lhs_kind {
+            TypeKind.KArray -> {
+                let hdr: str = self.alloc_reg()
+                self.emit("ldr " + hdr + ", [" + ptr_r + "]")
+                self.emit("lsl " + idx_r + ", " + idx_r + ", #3")
+                self.emit("ldr " + result + ", [" + hdr + ", " + idx_r + "]")
+                self.free_reg(hdr)
+            }
+            _ -> {
+                self.emit("ldrb w" + result[1:len(result)] + ", [" + ptr_r + ", " + idx_r + "]")
+            }
+        }
+        self.free_reg(ptr_r)
+        self.free_reg(idx_r)
+        return Val.VReg(name: result)
+    }
+
+    func compile_and(self, lhs: int64, rhs: int64) -> Val {
+        let done: str = self.fresh("Land")
+        let result: str = self.alloc_reg()
+        let lv: Val = self.compile_expr(lhs)
+        self.mov_to(result, lv)
+        self.emit("cmp " + result + ", #0")
+        self.emit("cset " + result + ", ne")
+        self.emit("beq " + done)
+        let rv: Val = self.compile_expr(rhs)
+        self.mov_to(result, rv)
+        self.emit("cmp " + result + ", #0")
+        self.emit("cset " + result + ", ne")
+        self.emit_label(done)
+        return Val.VReg(name: result)
+    }
+
+    func compile_or(self, lhs: int64, rhs: int64) -> Val {
+        let done: str = self.fresh("Lor")
+        let result: str = self.alloc_reg()
+        let lv: Val = self.compile_expr(lhs)
+        self.mov_to(result, lv)
+        self.emit("cmp " + result + ", #0")
+        self.emit("cset " + result + ", ne")
+        self.emit("bne " + done)
+        let rv: Val = self.compile_expr(rhs)
+        self.mov_to(result, rv)
+        self.emit("cmp " + result + ", #0")
+        self.emit("cset " + result + ", ne")
+        self.emit_label(done)
+        return Val.VReg(name: result)
+    }
+
+    func compile_is(self, lhs: int64, rhs: int64) -> Val {
+        let ptr_v: Val = self.compile_expr(lhs)
+        let r: str = self.load(ptr_v)
+        self.emit("cmp " + r + ", #0")
+        match self.p.exprs[rhs] {
+            ast.Expr.NoneLit -> self.emit("cset " + r + ", eq")
+            _ -> self.emit("cset " + r + ", ne")
+        }
+        return Val.VReg(name: r)
+    }
+
+    func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
+        let lhs_kind: TypeKind = self.infer_kind(lhs_id)
+        match lhs_kind {
+            TypeKind.KStr -> {
+                match op {
+                    ast.Op.Eq -> return self.compile_str_eq(lhs_id, rhs_id, false)
+                    ast.Op.Ne -> return self.compile_str_eq(lhs_id, rhs_id, true)
+                    _ -> {}
+                }
+            }
+            _ -> {}
+        }
+        match op {
+            ast.Op.Add -> {
+                match lhs_kind {
+                    TypeKind.KStr -> return self.compile_str_concat(lhs_id, rhs_id)
+                    TypeKind.KArray -> return self.compile_arr_concat(lhs_id, rhs_id)
+                    _ -> {}
+                }
+            }
+            _ -> {}
+        }
+
+        let lv: Val = self.compile_expr(lhs_id)
+        let rv: Val = self.compile_expr(rhs_id)
+        let lr: str = self.load_enum_or_val(lhs_id, lv)
+        let rr: str = self.load_enum_or_val(rhs_id, rv)
+        let result: str = self.alloc_reg()
+        match op {
+            ast.Op.Eq -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", eq")
+            }
+            ast.Op.Ne -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", ne")
+            }
+            ast.Op.Lt -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", lt")
+            }
+            ast.Op.Le -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", le")
+            }
+            ast.Op.Gt -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", gt")
+            }
+            ast.Op.Ge -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", ge")
+            }
+            ast.Op.Add -> {
+                self.emit("add " + result + ", " + lr + ", " + rr)
+            }
+            ast.Op.Sub -> {
+                self.emit("sub " + result + ", " + lr + ", " + rr)
+            }
+            ast.Op.Mul -> {
+                self.emit("mul " + result + ", " + lr + ", " + rr)
+            }
+            ast.Op.Div -> {
+                self.emit("sdiv " + result + ", " + lr + ", " + rr)
+            }
+            ast.Op.Mod -> {
+                let tmp2: str = self.alloc_reg()
+                self.emit("sdiv " + result + ", " + lr + ", " + rr)
+                self.emit("mul " + tmp2 + ", " + result + ", " + rr)
+                self.emit("sub " + result + ", " + lr + ", " + tmp2)
+                self.free_reg(tmp2)
+            }
+            _ -> {
+                self.emit("cmp " + lr + ", " + rr)
+                self.emit("cset " + result + ", eq")
+            }
+        }
+        self.free_reg(lr)
+        self.free_reg(rr)
+        return Val.VReg(name: result)
+    }
+
+    func load_enum_or_val(self, expr_id: int64, anon v: Val) -> str {
+        match self.p.exprs[expr_id] {
+            ast.Expr.Ident(name) -> {
+                match self.find_var_kind(name) {
+                    TypeKind.KEnum(idx) -> {
+                        let r: str = self.load(v)
+                        self.emit("ldr " + r + ", [" + r + "]")
+                        return r
+                    }
+                    _ -> return self.load(v)
+                }
+            }
+            _ -> return self.load(v)
+        }
+    }
+
+    func compile_str_eq(self, lhs_id: int64, rhs_id: int64, negate: bool) -> Val {
+        let rv: Val = self.compile_expr(rhs_id)
+        let rr: str = self.load(rv)
+        let lv: Val = self.compile_expr(lhs_id)
+        self.mov_to("x0", lv)
+        self.emit("mov x1, " + rr)
+        self.free_reg(rr)
+        self.emit("bl _strcmp")
+        let result: str = self.alloc_reg()
+        self.emit("cmp x0, #0")
+        if negate {
+            self.emit("cset " + result + ", ne")
+        } else {
+            self.emit("cset " + result + ", eq")
+        }
+        return Val.VReg(name: result)
+    }
+
+    func compile_str_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
+        let rv: Val = self.compile_expr(rhs_id)
+        let rr: str = self.load(rv)
+        let lv: Val = self.compile_expr(lhs_id)
+        self.mov_to("x0", lv)
+        self.emit("mov x1, " + rr)
+        self.free_reg(rr)
+        self.emit("bl _kod_str_concat")
+        return Val.VReg(name: "x0")
+    }
+
+    func compile_arr_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
+        let rv: Val = self.compile_expr(rhs_id)
+        let rr: str = self.load(rv)
+        let lv: Val = self.compile_expr(lhs_id)
+        self.mov_to("x0", lv)
+        self.emit("mov x1, " + rr)
+        self.free_reg(rr)
+        self.emit("bl _kod_array_concat")
+        return Val.VReg(name: "x0")
+    }
+
+    func compile_slice(self, s_id: int64, lo_id: int64, hi_id: int64) -> Val {
+        let hi_v: Val = self.compile_expr(hi_id)
+        let hi_r: str = self.load(hi_v)
+        let lo_v: Val = self.compile_expr(lo_id)
+        let lo_r: str = self.load(lo_v)
+        let sv: Val = self.compile_expr(s_id)
+        self.mov_to("x0", sv)
+        self.emit("mov x1, " + lo_r)
+        self.emit("mov x2, " + hi_r)
+        self.free_reg(lo_r)
+        self.free_reg(hi_r)
+        self.emit("bl _kod_str_slice")
+        return Val.VReg(name: "x0")
+    }
+
+    func compile_array_lit(self, anon elements: [int64]) -> Val {
+        let n: int64 = len(elements)
+        let item_sz: int64 = 8
+        self.emit("sub sp, sp, #16")
+        self.emit("mov x0, #24")
+        self.emit("bl _arena_alloc")
+        self.emit("str x0, [sp]")
+        let buf_sz: int64 = n * item_sz
+        if buf_sz < 8 {
+            buf_sz = 8
+        }
+        self.emit("mov x0, #" + self.itos(buf_sz))
+        self.emit("bl _arena_alloc")
+        let buf_r: str = self.alloc_reg()
+        self.emit("mov " + buf_r + ", x0")
+        let i: int64 = 0
+        for i < n {
+            let ev: Val = self.compile_expr(elements[i])
+            let er: str = self.load(ev)
+            self.emit("str " + er + ", [" + buf_r + ", #" + self.itos(i * item_sz) + "]")
+            self.free_reg(er)
+            i = i + 1
+        }
+        let hdr_r: str = self.alloc_reg()
+        self.emit("ldr " + hdr_r + ", [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit("str " + buf_r + ", [" + hdr_r + "]")
+        let len_r: str = self.alloc_reg()
+        self.emit("mov " + len_r + ", #" + self.itos(n))
+        self.emit("str " + len_r + ", [" + hdr_r + ", #8]")
+        self.emit("str " + len_r + ", [" + hdr_r + ", #16]")
+        self.free_reg(len_r)
+        self.free_reg(buf_r)
+        return Val.VReg(name: hdr_r)
+    }
+
+    func compile_call(self, callee_id: int64, anon args: [ast.CallArg]) -> Val {
+        match self.p.exprs[callee_id] {
+            ast.Expr.Ident(name) -> {
+                if name == "len" and len(args) == 1 {
+                    return self.compile_len(args[0].value)
+                }
+                self.prepare_args(args)
+                let lbl: str = self.func_label(name)
+                self.emit("bl " + lbl)
+                return Val.VReg(name: "x0")
+            }
+            ast.Expr.Binary(lhs, op, rhs) -> {
+                match op {
+                    ast.Op.Dot -> {
+                        match self.p.exprs[lhs] {
+                            ast.Expr.Ident(mod_or_obj) -> {
+                                match self.p.exprs[rhs] {
+                                    ast.Expr.Ident(method_name) -> {
+                                        let is_import: bool = false
+                                        let i: int64 = 0
+                                        for i < len(self.import_local) {
+                                            if self.import_local[i] == mod_or_obj {
+                                                is_import = true
+                                                i = len(self.import_local)
+                                            } else {
+                                                i = i + 1
+                                            }
+                                        }
+                                        if is_import {
+                                            self.prepare_args(args)
+                                            let lbl: str = self.import_func_label(mod_or_obj, method_name)
+                                            self.emit("bl " + lbl)
+                                            return Val.VReg(name: "x0")
+                                        }
+                                        return self.compile_method_call(mod_or_obj, method_name, args)
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+                self.prepare_args(args)
+                self.emit("bl _unknown")
+                return Val.VReg(name: "x0")
+            }
+            _ -> {
+                self.prepare_args(args)
+                self.emit("bl _unknown")
+                return Val.VReg(name: "x0")
+            }
+        }
+    }
+
+    func compile_len(self, anon arg_id: int64) -> Val {
+        let kind: TypeKind = self.infer_kind(arg_id)
+        let av: Val = self.compile_expr(arg_id)
+        match kind {
+            TypeKind.KArray -> {
+                let r: str = self.load(av)
+                self.emit("ldr " + r + ", [" + r + ", #8]")
+                return Val.VReg(name: r)
+            }
+            TypeKind.KStr -> {
+                self.mov_to("x0", av)
+                self.emit("bl _strlen")
+                return Val.VReg(name: "x0")
+            }
+            _ -> {
+                let r: str = self.load(av)
+                self.emit("ldr " + r + ", [" + r + ", #8]")
+                return Val.VReg(name: r)
+            }
+        }
+    }
+
+    func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg]) -> Val {
+        let var_kind: TypeKind = self.find_var_kind(obj_name)
+        let obj_off: int64 = self.find_var_offset(obj_name)
+        self.emit_ldr("x0", obj_off)
+
+        let method_lbl: str = "_unknown_method"
+        match var_kind {
+            TypeKind.KStruct(idx) -> {
+                let i: int64 = 0
+                for i < len(self.structs[idx].method_names) {
+                    if self.structs[idx].method_names[i] == method_name {
+                        let fd_id: int64 = self.structs[idx].method_decl_ids[i]
+                        method_lbl = self.path_prefix + "$" + self.structs[idx].name + "$" + method_name
+                        i = len(self.structs[idx].method_names)
+                    } else {
+                        i = i + 1
+                    }
+                }
+            }
+            _ -> {}
+        }
+
+        let i: int64 = 0
+        let arg_regs: [str] = ["x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        for i < len(args) {
+            let av: Val = self.compile_expr(args[i].value)
+            self.mov_to(arg_regs[i], av)
+            i = i + 1
+        }
+        self.emit("bl " + method_lbl)
+        return Val.VReg(name: "x0")
+    }
+
+    func prepare_args(self, anon args: [ast.CallArg]) -> none {
+        let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let i: int64 = 0
+        for i < len(args) {
+            let av: Val = self.compile_expr(args[i].value)
+            self.mov_to(arg_regs[i], av)
+            i = i + 1
+        }
+    }
+
+    func compile_match_expr(self, subject_id: int64, anon arms: [int64]) -> Val {
+        let done_lbl: str = self.fresh("Lmexpr_done")
+        let sv: Val = self.compile_expr(subject_id)
+        let disc_r: str = self.load_enum_or_val(subject_id, sv)
+        let result_r: str = self.alloc_reg()
+        let i: int64 = 0
+        for i < len(arms) {
+            let arm: ast.MatchExprArm = self.p.match_expr_arms[arms[i]]
+            let skip_lbl: str = self.fresh("Lmexpr_skip")
+            match self.p.patterns[arm.pattern] {
+                ast.Pattern.Wildcard -> {
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                }
+                ast.Pattern.IntPat(value) -> {
+                    self.emit("cmp " + disc_r + ", #" + self.itos(value))
+                    self.emit("bne " + skip_lbl)
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.StrPat(value) -> {
+                    let slbl: str = self.intern_str(value)
+                    self.emit("adrp x0, " + slbl + "@PAGE")
+                    self.emit("add x0, x0, " + slbl + "@PAGEOFF")
+                    self.emit("mov x1, " + disc_r)
+                    self.emit("bl _strcmp")
+                    self.emit("cmp x0, #0")
+                    self.emit("bne " + skip_lbl)
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                    let ei: int64 = self.find_enum_idx(enum_name)
+                    let vi: int64 = self.find_variant_idx(ei, variant_name)
+                    let disc: int64 = self.enums[ei].variants[vi].discriminant
+                    self.emit("cmp " + disc_r + ", #" + self.itos(disc))
+                    self.emit("bne " + skip_lbl)
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.ImplicitEnumPat(variant_name) -> {
+                    let ei: int64 = self.find_enum_with_variant(variant_name)
+                    let vi: int64 = self.find_variant_idx(ei, variant_name)
+                    let disc: int64 = self.enums[ei].variants[vi].discriminant
+                    self.emit("cmp " + disc_r + ", #" + self.itos(disc))
+                    self.emit("bne " + skip_lbl)
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                _ -> {
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit("b " + done_lbl)
+                }
+            }
+            i = i + 1
+        }
+        self.emit_label(done_lbl)
+        self.free_reg(disc_r)
+        return Val.VReg(name: result_r)
+    }
+
+
+    func infer_kind(self, anon expr_id: int64) -> TypeKind {
+        match self.p.exprs[expr_id] {
+            ast.Expr.IntLit(value) -> return .KInt64
+            ast.Expr.BoolLit(value) -> return .KBool
+            ast.Expr.StrLit(value) -> return .KStr
+            ast.Expr.NoneLit -> return .KOptional
+            ast.Expr.Ident(name) -> return self.find_var_kind(name)
+            ast.Expr.ArrayLit(elements) -> return .KArray
+            ast.Expr.Slice(s, lo, hi) -> return .KStr
+            ast.Expr.Binary(lhs, op, rhs) -> {
+                match op {
+                    ast.Op.Add -> return self.infer_kind(lhs)
+                    ast.Op.Index -> {
+                        match self.infer_kind(lhs) {
+                            TypeKind.KArray -> return .KInt64
+                            _ -> return .KInt64
+                        }
+                    }
+                    _ -> return .KInt64
+                }
+            }
+            _ -> return .KInt64
+        }
+    }
+
+
+    func compile_stmt(self, anon stmt_id: int64) -> none {
+        match self.p.stmts[stmt_id] {
+            ast.Stmt.Let(name, typ, value) -> self.compile_let(name, typ, value)
+            ast.Stmt.Assign(lhs, rhs) -> self.compile_assign(lhs, rhs)
+            ast.Stmt.PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs, rhs)
+            ast.Stmt.Return(value) -> self.compile_return(value)
+            ast.Stmt.If(cond, then_body, else_body) -> self.compile_if(cond, then_body, else_body)
+            ast.Stmt.For(cond, body) -> self.compile_for(cond, body)
+            ast.Stmt.ForEach(name, iter, body) -> self.compile_foreach(name, iter, body)
+            ast.Stmt.Break -> self.compile_break()
+            ast.Stmt.Continue -> self.compile_continue()
+            ast.Stmt.ExprStmt(expr) -> {
+                let v: Val = self.compile_expr(expr)
+                self.free_val(v)
+            }
+            ast.Stmt.MatchStmt(subject, arms) -> self.compile_match_stmt(subject, arms)
+        }
+    }
+
+    func compile_let(self, name: str, typ: int64, value: int64) -> none {
+        let off: int64 = self.find_var_offset(name)
+        let kind: TypeKind = self.resolve_type(typ)
+        match kind {
+            TypeKind.KVoid -> kind = self.infer_kind(value)
+            _ -> {}
+        }
+        let i: int64 = 0
+        for i < len(self.vars) {
+            if self.vars[i].name == name {
+                self.vars[i].kind = kind
+                i = len(self.vars)
+            } else {
+                i = i + 1
+            }
+        }
+        self.compile_store(off, kind, value)
+    }
+
+    func compile_store(self, dest_off: int64, kind: TypeKind, value_id: int64) -> none {
+        match kind {
+            TypeKind.KEnum(idx) -> {
+                self.emit_enum_alloc(idx, value_id, dest_off)
+            }
+            TypeKind.KStruct(idx) -> {
+                self.emit_struct_alloc(idx, value_id, dest_off)
+            }
+            TypeKind.KArray -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+            }
+            TypeKind.KOptional -> {
+                match self.p.exprs[value_id] {
+                    ast.Expr.NoneLit -> {
+                        let r: str = self.alloc_reg()
+                        self.emit("mov " + r + ", #0")
+                        self.emit_str(r, dest_off)
+                        self.free_reg(r)
+                    }
+                    _ -> {
+                        let vv: Val = self.compile_expr(value_id)
+                        let vr: str = self.load(vv)
+                        self.emit("sub sp, sp, #16")
+                        self.emit("str " + vr + ", [sp]")
+                        self.free_reg(vr)
+                        self.emit("mov x0, #8")
+                        self.emit("bl _arena_alloc")
+                        let pr: str = self.alloc_reg()
+                        self.emit("mov " + pr + ", x0")
+                        self.emit_str(pr, dest_off)
+                        let tmp: str = self.alloc_reg()
+                        self.emit("ldr " + tmp + ", [sp]")
+                        self.emit("add sp, sp, #16")
+                        self.emit("str " + tmp + ", [" + pr + "]")
+                        self.free_reg(tmp)
+                        self.free_reg(pr)
+                    }
+                }
+            }
+            _ -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+            }
+        }
+    }
+
+    func emit_enum_alloc(self, enum_idx: int64, value_id: int64, dest_off: int64) -> none {
+        let dw: int64 = self.enums[enum_idx].data_width
+        let disc: int64 = 0
+        let field_args: [ast.CallArg] = []
+        let variant_idx: int64 = -1
+        match self.p.exprs[value_id] {
+            ast.Expr.ImplicitVariant(variant_name) -> {
+                variant_idx = self.find_variant_idx(enum_idx, variant_name)
+                disc = self.enums[enum_idx].variants[variant_idx].discriminant
+            }
+            ast.Expr.Binary(lhs, op, rhs) -> {
+                match op {
+                    ast.Op.Dot -> {
+                        match self.p.exprs[rhs] {
+                            ast.Expr.Ident(variant_name) -> {
+                                variant_idx = self.find_variant_idx(enum_idx, variant_name)
+                                disc = self.enums[enum_idx].variants[variant_idx].discriminant
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            ast.Expr.Call(callee_id, call_args) -> {
+                match self.p.exprs[callee_id] {
+                    ast.Expr.Binary(lhs, op, rhs) -> {
+                        match op {
+                            ast.Op.Dot -> {
+                                match self.p.exprs[rhs] {
+                                    ast.Expr.Ident(variant_name) -> {
+                                        variant_idx = self.find_variant_idx(enum_idx, variant_name)
+                                        disc = self.enums[enum_idx].variants[variant_idx].discriminant
+                                        field_args = call_args
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            _ -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+                return none
+            }
+        }
+        self.emit("mov x0, #" + self.itos(dw))
+        self.emit("bl _arena_alloc")
+        let ptr_r: str = self.alloc_reg()
+        self.emit("mov " + ptr_r + ", x0")
+        self.emit_str(ptr_r, dest_off)
+        let disc_r: str = self.alloc_reg()
+        self.emit("mov " + disc_r + ", #" + self.itos(disc))
+        self.emit("str " + disc_r + ", [" + ptr_r + "]")
+        self.free_reg(disc_r)
+        if variant_idx >= 0 {
+            let vinfo: VariantInfo = self.enums[enum_idx].variants[variant_idx]
+            let i: int64 = 0
+            for i < len(field_args) {
+                let foff: int64 = vinfo.field_offsets[i]
+                let fv: Val = self.compile_expr(field_args[i].value)
+                let fr: str = self.load(fv)
+                let pr2: str = self.alloc_reg()
+                self.emit_ldr(pr2, dest_off)
+                self.emit("str " + fr + ", [" + pr2 + ", #" + self.itos(8 + foff) + "]")
+                self.free_reg(fr)
+                self.free_reg(pr2)
+                i = i + 1
+            }
+        }
+        self.free_reg(ptr_r)
+    }
+
+    func emit_struct_alloc(self, struct_idx: int64, value_id: int64, dest_off: int64) -> none {
+        let dw: int64 = self.structs[struct_idx].data_width
+        self.emit("mov x0, #" + self.itos(dw))
+        self.emit("bl _arena_alloc")
+        let ptr_r: str = self.alloc_reg()
+        self.emit("mov " + ptr_r + ", x0")
+        self.emit_str(ptr_r, dest_off)
+        self.free_reg(ptr_r)
+        match self.p.exprs[value_id] {
+            ast.Expr.Call(callee_id, args) -> {
+                let i: int64 = 0
+                for i < len(args) {
+                    let arg: ast.CallArg = args[i]
+                    let foff: int64 = self.find_field_offset(struct_idx, arg.label)
+                    let fv: Val = self.compile_expr(arg.value)
+                    let fr: str = self.load(fv)
+                    let pr: str = self.alloc_reg()
+                    self.emit_ldr(pr, dest_off)
+                    self.emit("str " + fr + ", [" + pr + ", #" + self.itos(foff) + "]")
+                    self.free_reg(fr)
+                    self.free_reg(pr)
+                    i = i + 1
+                }
+            }
+            _ -> {}
+        }
+    }
+
+    func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
+        match self.p.exprs[lhs_id] {
+            ast.Expr.Ident(name) -> {
+                let off: int64 = self.find_var_offset(name)
+                let kind: TypeKind = self.find_var_kind(name)
+                self.compile_store(off, kind, rhs_id)
+            }
+            ast.Expr.Binary(lhs2, op, rhs2) -> {
+                match op {
+                    ast.Op.Dot -> {
+                        match self.p.exprs[lhs2] {
+                            ast.Expr.Ident(obj_name) -> {
+                                match self.p.exprs[rhs2] {
+                                    ast.Expr.Ident(field_name) -> {
+                                        let obj_off: int64 = self.find_var_offset(obj_name)
+                                        let struct_idx: int64 = -1
+                                        match self.find_var_kind(obj_name) {
+                                            TypeKind.KStruct(idx) -> struct_idx = idx
+                                            _ -> {}
+                                        }
+                                        let foff: int64 = 0
+                                        if struct_idx >= 0 {
+                                            foff = self.find_field_offset(struct_idx, field_name)
+                                        }
+                                        let rv: Val = self.compile_expr(rhs_id)
+                                        let rr: str = self.load(rv)
+                                        let pr: str = self.alloc_reg()
+                                        self.emit_ldr(pr, obj_off)
+                                        self.emit("str " + rr + ", [" + pr + ", #" + self.itos(foff) + "]")
+                                        self.free_reg(rr)
+                                        self.free_reg(pr)
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
+                    ast.Op.Index -> {
+                        match self.p.exprs[lhs2] {
+                            ast.Expr.Ident(arr_name) -> {
+                                let arr_off: int64 = self.find_var_offset(arr_name)
+                                let idx_v: Val = self.compile_expr(rhs2)
+                                let idx_r: str = self.load(idx_v)
+                                let rhs_v: Val = self.compile_expr(rhs_id)
+                                let rhs_r: str = self.load(rhs_v)
+                                let ptr_r: str = self.alloc_reg()
+                                self.emit_ldr(ptr_r, arr_off)
+                                self.emit("ldr " + ptr_r + ", [" + ptr_r + "]")
+                                self.emit("lsl " + idx_r + ", " + idx_r + ", #3")
+                                self.emit("str " + rhs_r + ", [" + ptr_r + ", " + idx_r + "]")
+                                self.free_reg(ptr_r)
+                                self.free_reg(idx_r)
+                                self.free_reg(rhs_r)
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            _ -> {}
+        }
+    }
+
+    func compile_plus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
+        match self.p.exprs[lhs_id] {
+            ast.Expr.Ident(name) -> {
+                let off: int64 = self.find_var_offset(name)
+                let kind: TypeKind = self.find_var_kind(name)
+                match kind {
+                    TypeKind.KArray -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit("mov x0, " + lr)
+                        self.emit("mov x1, " + rr)
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                        self.emit("bl _kod_array_concat")
+                        self.emit_str("x0", off)
+                    }
+                    TypeKind.KStr -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit("mov x0, " + lr)
+                        self.emit("mov x1, " + rr)
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                        self.emit("bl _kod_str_concat")
+                        self.emit_str("x0", off)
+                    }
+                    _ -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit("add " + lr + ", " + lr + ", " + rr)
+                        self.emit_str(lr, off)
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                    }
+                }
+            }
+            _ -> {}
+        }
+    }
+
+    func compile_return(self, anon value_id: int64) -> none {
+        if value_id == 0 {
+            self.emit("mov x0, #0")
+        } else {
+            let v: Val = self.compile_expr(value_id)
+            self.mov_to("x0", v)
+        }
+        self.emit("b " + self.ret_lbl)
+    }
+
+    func compile_if(self, cond_id: int64, then_body: [int64], else_body: [int64]) -> none {
+        let lbl: str = self.fresh("Lif")
+        let false_lbl: str = lbl + "_false"
+        let end_lbl: str = lbl + "_end"
+        let cv: Val = self.compile_expr(cond_id)
+        let cr: str = self.load(cv)
+        self.emit("cmp " + cr + ", #0")
+        self.free_reg(cr)
+        self.emit("beq " + false_lbl)
+        let i: int64 = 0
+        for i < len(then_body) {
+            self.compile_stmt(then_body[i])
+            i = i + 1
+        }
+        self.emit("b " + end_lbl)
+        self.emit_label(false_lbl)
+        let j: int64 = 0
+        for j < len(else_body) {
+            self.compile_stmt(else_body[j])
+            j = j + 1
+        }
+        self.emit_label(end_lbl)
+    }
+
+    func compile_for(self, cond_id: int64, anon body: [int64]) -> none {
+        let lbl: str = self.fresh("Lfor")
+        let start_lbl: str = lbl + "_start"
+        let end_lbl: str = lbl + "_end"
+        self.loop_stack += [LoopLbl(start_lbl: start_lbl, end_lbl: end_lbl, incr_lbl: end_lbl)]
+        self.emit_label(start_lbl)
+        let cv: Val = self.compile_expr(cond_id)
+        let cr: str = self.load(cv)
+        self.emit("cmp " + cr + ", #0")
+        self.free_reg(cr)
+        self.emit("beq " + end_lbl)
+        let i: int64 = 0
+        for i < len(body) {
+            self.compile_stmt(body[i])
+            i = i + 1
+        }
+        self.emit("b " + start_lbl)
+        self.emit_label(end_lbl)
+        let n: int64 = len(self.loop_stack)
+        let new_stack: [LoopLbl] = []
+        let j: int64 = 0
+        for j < n - 1 {
+            new_stack += [self.loop_stack[j]]
+            j = j + 1
+        }
+        self.loop_stack = new_stack
+    }
+
+    func compile_foreach(self, name: str, iter_id: int64, anon body: [int64]) -> none {
+        let lbl: str = self.fresh("Lfe")
+        let start_lbl: str = lbl + "_start"
+        let incr_lbl: str = lbl + "_incr"
+        let end_lbl: str = lbl + "_end"
+        self.loop_stack += [LoopLbl(start_lbl: incr_lbl, end_lbl: end_lbl, incr_lbl: incr_lbl)]
+
+        let idx_name: str = "__fi_" + name
+        let idx_off: int64 = self.find_var_offset(idx_name)
+        let elem_off: int64 = self.find_var_offset(name)
+
+        let arr_v: Val = self.compile_expr(iter_id)
+        let hdr_r: str = self.load(arr_v)
+
+        let len_r: str = self.alloc_reg()
+        let ptr_r: str = self.alloc_reg()
+        self.emit("ldr " + len_r + ", [" + hdr_r + ", #8]")
+        self.emit("ldr " + ptr_r + ", [" + hdr_r + "]")
+        self.free_reg(hdr_r)
+
+        let idx_r: str = self.alloc_reg()
+        self.emit("mov " + idx_r + ", #0")
+        self.emit_str(idx_r, idx_off)
+
+        self.emit_label(start_lbl)
+        self.emit_ldr(idx_r, idx_off)
+        self.emit("cmp " + idx_r + ", " + len_r)
+        self.emit("bge " + end_lbl)
+
+        let elem_r: str = self.alloc_reg()
+        self.emit("lsl " + elem_r + ", " + idx_r + ", #3")
+        self.emit("ldr " + elem_r + ", [" + ptr_r + ", " + elem_r + "]")
+        self.emit_str(elem_r, elem_off)
+        self.free_reg(elem_r)
+
+        let i: int64 = 0
+        for i < len(body) {
+            self.compile_stmt(body[i])
+            i = i + 1
+        }
+
+        self.emit_label(incr_lbl)
+        self.emit_ldr(idx_r, idx_off)
+        self.emit("add " + idx_r + ", " + idx_r + ", #1")
+        self.emit_str(idx_r, idx_off)
+        self.emit("b " + start_lbl)
+        self.emit_label(end_lbl)
+
+        self.free_reg(idx_r)
+        self.free_reg(len_r)
+        self.free_reg(ptr_r)
+
+        let n: int64 = len(self.loop_stack)
+        let new_stack: [LoopLbl] = []
+        let j: int64 = 0
+        for j < n - 1 {
+            new_stack += [self.loop_stack[j]]
+            j = j + 1
+        }
+        self.loop_stack = new_stack
+    }
+
+    func compile_break(self) -> none {
+        let n: int64 = len(self.loop_stack)
+        self.emit("b " + self.loop_stack[n - 1].end_lbl)
+    }
+
+    func compile_continue(self) -> none {
+        let n: int64 = len(self.loop_stack)
+        self.emit("b " + self.loop_stack[n - 1].incr_lbl)
+    }
+
+    func compile_match_stmt(self, subject_id: int64, anon arms: [int64]) -> none {
+        let done_lbl: str = self.fresh("Lmatch_done")
+        let sv: Val = self.compile_expr(subject_id)
+        let disc_r: str = self.load_enum_or_val(subject_id, sv)
+        let i: int64 = 0
+        for i < len(arms) {
+            let arm: ast.MatchArm = self.p.match_arms[arms[i]]
+            let skip_lbl: str = self.fresh("Lmatch_skip")
+            match self.p.patterns[arm.pattern] {
+                ast.Pattern.Wildcard -> {
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                }
+                ast.Pattern.IntPat(value) -> {
+                    self.emit("cmp " + disc_r + ", #" + self.itos(value))
+                    self.emit("bne " + skip_lbl)
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.StrPat(value) -> {
+                    let slbl: str = self.intern_str(value)
+                    self.emit("mov x0, " + disc_r)
+                    self.emit("adrp x1, " + slbl + "@PAGE")
+                    self.emit("add x1, x1, " + slbl + "@PAGEOFF")
+                    self.emit("bl _strcmp")
+                    self.emit("cmp x0, #0")
+                    self.emit("bne " + skip_lbl)
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                    let ei: int64 = self.find_enum_idx(enum_name)
+                    let vi: int64 = self.find_variant_idx(ei, variant_name)
+                    let disc: int64 = self.enums[ei].variants[vi].discriminant
+                    self.emit("cmp " + disc_r + ", #" + self.itos(disc))
+                    self.emit("bne " + skip_lbl)
+                    let vinfo: VariantInfo = self.enums[ei].variants[vi]
+                    let ki: int64 = 0
+                    for ki < len(bindings) {
+                        let foff: int64 = vinfo.field_offsets[ki]
+                        let binding_off: int64 = self.find_var_offset(bindings[ki])
+                        let ptr_r: str = self.alloc_reg()
+                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
+                        self.emit_ldr(ptr_r, subj_off)
+                        let fv_r: str = self.alloc_reg()
+                        self.emit("ldr " + fv_r + ", [" + ptr_r + ", #" + self.itos(8 + foff) + "]")
+                        self.emit_str(fv_r, binding_off)
+                        self.free_reg(fv_r)
+                        self.free_reg(ptr_r)
+                        ki = ki + 1
+                    }
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.ImplicitEnumPat(variant_name) -> {
+                    let ei: int64 = self.find_enum_with_variant(variant_name)
+                    let vi: int64 = self.find_variant_idx(ei, variant_name)
+                    let disc: int64 = self.enums[ei].variants[vi].discriminant
+                    self.emit("cmp " + disc_r + ", #" + self.itos(disc))
+                    self.emit("bne " + skip_lbl)
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.NonePat -> {
+                    self.emit("cmp " + disc_r + ", #0")
+                    self.emit("bne " + skip_lbl)
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.SomePat(binding) -> {
+                    self.emit("cmp " + disc_r + ", #0")
+                    self.emit("beq " + skip_lbl)
+                    if len(binding) > 0 {
+                        let boff: int64 = self.find_var_offset(binding)
+                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
+                        let ptr_r: str = self.alloc_reg()
+                        self.emit_ldr(ptr_r, subj_off)
+                        let val_r: str = self.alloc_reg()
+                        self.emit("ldr " + val_r + ", [" + ptr_r + "]")
+                        self.emit_str(val_r, boff)
+                        self.free_reg(val_r)
+                        self.free_reg(ptr_r)
+                    }
+                    let j: int64 = 0
+                    for j < len(arm.body) {
+                        self.compile_stmt(arm.body[j])
+                        j = j + 1
+                    }
+                    self.emit("b " + done_lbl)
+                    self.emit_label(skip_lbl)
+                }
+            }
+            i = i + 1
+        }
+        self.emit_label(done_lbl)
+        self.free_reg(disc_r)
+    }
+
+
+    func compile_func(self, fd_id: int64, struct_name: str) -> none {
+        let fd: ast.FuncDecl = self.p.func_decls[fd_id]
+        self.vars = []
+        self.frame_slots = 0
+        self.free_regs = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
+        self.loop_stack = []
+
+        let i: int64 = 0
+        for i < len(fd.params) {
+            let param: ast.Param = fd.params[i]
+            let kind: TypeKind = self.resolve_type(param.typ)
+            self.alloc_var(param.name, kind)
+            i = i + 1
+        }
+
+        let j: int64 = 0
+        for j < len(fd.body) {
+            self.collect_stmt_vars(fd.body[j])
+            j = j + 1
+        }
+
+        let raw_sz: int64 = self.frame_slots * 8
+        let aligned: int64 = raw_sz + 16 - raw_sz % 16
+
+        let func_lbl: str = self.path_prefix + "$" + fd.name
+        if len(struct_name) > 0 {
+            func_lbl = self.path_prefix + "$" + struct_name + "$" + fd.name
+        }
+        self.ret_lbl = func_lbl + "$end"
+
+        self.emit_globl(func_lbl)
+        self.emit_label(func_lbl)
+        self.emit("sub sp, sp, #" + self.itos(aligned + 16))
+        self.emit("stp fp, lr, [sp, #" + self.itos(aligned) + "]")
+        self.emit("add fp, sp, #" + self.itos(aligned))
+
+        let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let k: int64 = 0
+        for k < len(fd.params) {
+            let off: int64 = self.find_var_offset(fd.params[k].name)
+            self.emit_str(arg_regs[k], off)
+            k = k + 1
+        }
+
+        let b: int64 = 0
+        for b < len(fd.body) {
+            self.compile_stmt(fd.body[b])
+            b = b + 1
+        }
+
+        self.emit("mov x0, #0")
+
+        self.emit_label(self.ret_lbl)
+        self.emit("ldp fp, lr, [sp, #" + self.itos(aligned) + "]")
+        self.emit("add sp, sp, #" + self.itos(aligned + 16))
+        self.emit("ret")
+    }
+
+
+    func compile_module(self, anon m: ast.Module) -> none {
+        print(".text")
+
+        let i: int64 = 0
+        for i < len(m.decls) {
+            self.register_enum(m.decls[i])
+            i = i + 1
+        }
+        let j: int64 = 0
+        for j < len(m.decls) {
+            self.register_struct(m.decls[j])
+            j = j + 1
+        }
+
+        let k: int64 = 0
+        for k < len(m.decls) {
+            match m.decls[k] {
+                ast.Decl.Func(decl_id) -> {
+                    let fd: ast.FuncDecl = self.p.func_decls[decl_id]
+                    self.func_names += [fd.name]
+                    self.func_labels += [self.path_prefix + "$" + fd.name]
+                }
+                ast.Decl.Import(module_name, local_name) -> {
+                    if len(module_name) > 0 {
+                        self.import_local += [local_name]
+                        let prefix: str = self.module_name_to_prefix(module_name)
+                        self.import_prefix += [prefix]
+                    }
+                }
+                _ -> {}
+            }
+            k = k + 1
+        }
+
+        let d: int64 = 0
+        for d < len(m.decls) {
+            match m.decls[d] {
+                ast.Decl.Func(decl_id) -> self.compile_func(decl_id, "")
+                ast.Decl.Struct(name, fields, methods) -> {
+                    let mi: int64 = 0
+                    for mi < len(methods) {
+                        self.compile_func(methods[mi], name)
+                        mi = mi + 1
+                    }
+                }
+                _ -> {}
+            }
+            d = d + 1
+        }
+
+        if len(self.str_labels) > 0 {
+            print(".data")
+            let si: int64 = 0
+            for si < len(self.str_labels) {
+                print(self.str_labels[si] + ":")
+                self.emit_asciz(self.str_values[si])
+                si = si + 1
+            }
+        }
+    }
+
+    func module_name_to_prefix(self, anon module_name: str) -> str {
+        let result: str = ""
+        let i: int64 = 0
+        for i < len(module_name) {
+            if module_name[i] == '/' {
+                result = result + "$"
+            } else {
+                result = result + module_name[i:i+1]
+            }
+            i = i + 1
+        }
+        return result
+    }
+}
+
+func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
+    let enums: [EnumInfo] = []
+    let structs: [StructInfo] = []
+    let import_local: [str] = []
+    let import_prefix: [str] = []
+    let vars: [VarSlot] = []
+    let loop_stack: [LoopLbl] = []
+    let str_labels: [str] = []
+    let str_values: [str] = []
+    let func_names: [str] = []
+    let func_labels: [str] = []
+    let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, import_local: import_local, import_prefix: import_prefix, vars: vars, frame_slots: 0, ret_lbl: "", free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
+}

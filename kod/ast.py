@@ -653,7 +653,10 @@ class Return(ASTNode):
         """Parse an import statement."""
         with parser.span() as span:
             parser.consume(tokens.Return)
-            expression = Expression.parse(parser)
+            if parser.peeking_at(tokens.EOL) or parser.peeking_at(tokens.CloseCurly):
+                expression = NoneLiteral(span)
+            else:
+                expression = Expression.parse(parser)
         return cls(expression, span)
 
 
@@ -885,9 +888,16 @@ class MatchExpressionArm:
                             break
                 pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
-                enum_name = parser.consume(tokens.Identifier).value
+                first = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
-                variant_name = parser.consume(tokens.Identifier).value
+                second = parser.consume(tokens.Identifier).value
+                if parser.peeking_at(tokens.Dot):
+                    parser.consume(tokens.Dot)
+                    variant_name = parser.consume(tokens.Identifier).value
+                    enum_name = second
+                else:
+                    enum_name = first
+                    variant_name = second
                 bindings = []
                 if parser.try_consume(tokens.OpenParen):
                     while not parser.try_consume(tokens.CloseParen):
@@ -965,9 +975,17 @@ class MatchArm:
                             break
                 pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
-                enum_name = parser.consume(tokens.Identifier).value
+                first = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
-                variant_name = parser.consume(tokens.Identifier).value
+                second = parser.consume(tokens.Identifier).value
+                # Three-part: module.Enum.Variant — consume the third identifier
+                if parser.peeking_at(tokens.Dot):
+                    parser.consume(tokens.Dot)
+                    variant_name = parser.consume(tokens.Identifier).value
+                    enum_name = second
+                else:
+                    enum_name = first
+                    variant_name = second
                 bindings = []
                 if parser.try_consume(tokens.OpenParen):
                     while not parser.try_consume(tokens.CloseParen):
