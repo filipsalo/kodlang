@@ -94,6 +94,14 @@ class Parser:
             self.spans[-1] |= token.span
         return token
 
+    def lookup_type(self, name: str):
+        """Look up a type by name in the local registry, then builtins."""
+        if name in self.type_registry:
+            return self.type_registry[name]
+        if self.program is not None and hasattr(self.program, "builtins"):
+            return self.program.builtins.names.get(name)
+        return None
+
     def parse_type(self, name=None) -> type[types.Type]:
         """Parse a type, including optional T? suffix."""
         base = self._parse_base_type(name)
@@ -140,8 +148,8 @@ class Parser:
         if self.try_consume(NoneLiteral):
             return types.NoneType
         param_type = ast.Name.parse(self)
-        if param_type.id in self.type_registry:
-            result = self.type_registry[param_type.id]
+        result = self.lookup_type(param_type.id)
+        if result is not None:
             if isinstance(result, types.GenericTemplate):
                 self.consume(OpenBracket)
                 type_args = []

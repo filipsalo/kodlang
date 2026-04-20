@@ -487,12 +487,8 @@ class Expression(ASTNode):
                 value = MatchExpression.parse(parser)
             case tokens.Identifier():
                 value = Name.parse(parser)
-                if (
-                    isinstance(parser.peek(), tokens.OpenBracket)
-                    and value.id in parser.type_registry
-                    and isinstance(
-                        parser.type_registry[value.id], types.GenericTemplate
-                    )
+                if isinstance(parser.peek(), tokens.OpenBracket) and isinstance(
+                    parser.lookup_type(value.id), types.GenericTemplate
                 ):
                     parser.consume(tokens.OpenBracket)
                     type_args = []
