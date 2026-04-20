@@ -180,6 +180,34 @@ class Interpreter:
                 i = self.evaluate_expression(module, start)
                 j = self.evaluate_expression(module, end)
                 return types.String(s.value[i.value : j.value])
+            case ast.MatchExpression(subject, arms):
+                value = self.evaluate_expression(module, subject)
+                for arm in arms:
+                    if isinstance(arm.pattern, ast.IntegerPattern):
+                        if value.value == arm.pattern.value:
+                            return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.WildcardPattern):
+                        return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.OptionalNonePattern):
+                        if isinstance(value, types.NoneType):
+                            return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.OptionalSomePattern):
+                        if not isinstance(value, types.NoneType):
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value
+                            return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.EnumVariantPattern):
+                        if (
+                            isinstance(value, types.EnumValue)
+                            and value.variant_name == arm.pattern.variant_name
+                        ):
+                            field_values = list(value.fields.values())
+                            for binding_name, field_value in zip(
+                                arm.pattern.bindings, field_values
+                            ):
+                                self.stack[-1][binding_name] = field_value
+                            return self.evaluate_expression(module, arm.body)
+                raise ValueError("Non-exhaustive match expression")
             case _:
                 raise ValueError(
                     f"Don't know how to evaluate expression {expression!r}"

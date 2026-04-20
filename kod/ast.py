@@ -483,6 +483,8 @@ class Expression(ASTNode):
                         parser.consume(tokens.CloseBracket)
                         break
                 value = ArrayLiteral(elements, span)
+            case tokens.Match():
+                value = MatchExpression.parse(parser)
             case tokens.Identifier():
                 value = Name.parse(parser)
             case _:
@@ -780,6 +782,71 @@ class OptionalSomePattern:
 @dataclasses.dataclass
 class OptionalNonePattern:
     span: Span
+
+
+@dataclasses.dataclass
+class MatchExpressionArm:
+    pattern: Any  # same patterns as MatchArm
+    body: Any  # single expression ASTNode
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: "Parser") -> "MatchExpressionArm":
+        with parser.span() as span:
+            if parser.peeking_at(tokens.IntegerLiteral):
+                tok = parser.consume(tokens.IntegerLiteral)
+                pattern = IntegerPattern(int(tok.value), span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
+                parser.consume(tokens.Identifier)
+                pattern = WildcardPattern(span)
+            elif parser.peeking_at(tokens.NoneLiteral):
+                parser.consume(tokens.NoneLiteral)
+                pattern = OptionalNonePattern(span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
+                parser.consume(tokens.Identifier)
+                binding = ""
+                if parser.try_consume(tokens.OpenParen):
+                    binding = parser.consume(tokens.Identifier).value
+                    parser.consume(tokens.CloseParen)
+                pattern = OptionalSomePattern(binding, span)
+            else:
+                enum_name = parser.consume(tokens.Identifier).value
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                bindings = []
+                if parser.try_consume(tokens.OpenParen):
+                    while not parser.try_consume(tokens.CloseParen):
+                        bindings.append(parser.consume(tokens.Identifier).value)
+                        if not parser.try_consume(tokens.Comma):
+                            parser.consume(tokens.CloseParen)
+                            break
+                pattern = EnumVariantPattern(enum_name, variant_name, bindings, span)
+            parser.consume(tokens.Arrow)
+            body = Expression.parse(parser)
+        return cls(pattern, body, span)
+
+
+@dataclasses.dataclass
+class MatchExpression(ASTNode):
+    """A match expression that produces a value."""
+
+    expression: Any
+    arms: list  # list of MatchExpressionArm
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: "Parser") -> "MatchExpression":
+        with parser.span() as span:
+            parser.consume(tokens.Match)
+            expression = Expression.parse(parser)
+            parser.try_consume(tokens.EOL)
+            parser.consume(tokens.OpenCurly)
+            arms = []
+            while not parser.try_consume(tokens.CloseCurly):
+                if parser.try_consume(tokens.EOL):
+                    continue
+                arms.append(MatchExpressionArm.parse(parser))
+        return cls(expression, arms, span)
 
 
 @dataclasses.dataclass

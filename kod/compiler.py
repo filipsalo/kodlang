@@ -21,6 +21,7 @@ from kod.ast import (
     Import,
     IntegerLiteral,
     IntegerPattern,
+    MatchExpression,
     MatchStatement,
     Module,
     Name,
@@ -667,6 +668,51 @@ class Compiler:
         self.emit_label(label.done)
         self.stack[-1].release_register(disc_reg)
 
+    def compile_match_expression(self, node: MatchExpression) -> Register:
+        """Compile a match expression, returning a register with the result."""
+
+        label = self.create_label("matchexpr")
+        subject_val = self.compile_expression(node.expression)
+        disc_reg = self.stack[-1].allocate_register()
+        self.mov(disc_reg, subject_val)
+        if isinstance(subject_val, Register):
+            self.stack[-1].release_register(subject_val)
+
+        result_reg = self.stack[-1].allocate_register()
+        skip_labels = [self.create_label("skip") for _ in node.arms]
+
+        for i, arm in enumerate(node.arms):
+            if isinstance(arm.pattern, IntegerPattern):
+                self.emit("cmp", disc_reg, Imm(arm.pattern.value))
+                self.emit("bne", skip_labels[i])
+                val = self.compile_expression(arm.body)
+                self.mov(result_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+            elif isinstance(arm.pattern, WildcardPattern):
+                val = self.compile_expression(arm.body)
+                self.mov(result_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("b", label.done)
+            elif isinstance(arm.pattern, EnumVariantPattern):
+                enum_type = self.type_registry[arm.pattern.enum_name]
+                variant_info = enum_type.variants[arm.pattern.variant_name]
+                self.emit("cmp", disc_reg, Imm(variant_info.discriminant))
+                self.emit("bne", skip_labels[i])
+                val = self.compile_expression(arm.body)
+                self.mov(result_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+
+        self.emit_label(label.done)
+        self.stack[-1].release_register(disc_reg)
+        return result_reg
+
     def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
         # Enum unit variant: let d: Direction = Direction.North
@@ -889,6 +935,8 @@ class Compiler:
             elif isinstance(expression.op, OpenBracket):
                 return self.compile_index(expression)
             return self.compile_binary_operator(expression)
+        elif isinstance(expression, MatchExpression):
+            return self.compile_match_expression(expression)
         else:
             raise ValueError(f"Unexpected expression {expression}")
 
