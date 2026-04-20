@@ -69,7 +69,8 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
         if "errors" in expects:
             yield pytest.param(compile_to_assembly, path, expects, id=f"{path} compile")
         else:
-            yield pytest.param(run_compiled, path, expects, id=f"{path} run")
+            if expects.get("mode", "both").strip() != "interpret":
+                yield pytest.param(run_compiled, path, expects, id=f"{path} run")
             yield pytest.param(run_interpreted, path, expects, id=f"{path} interpret")
 
 

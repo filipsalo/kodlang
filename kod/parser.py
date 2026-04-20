@@ -20,6 +20,7 @@ from kod.tokens import (
     Comma,
     Comment,
     Continue,
+    Dot,
     Enum,
     Extern,
     For,
@@ -44,13 +45,18 @@ from kod.tokens import (
 class Parser:
     """A parser for the kod language."""
 
-    def __init__(self, tokens: list[Token], file: FileWrapper):
+    def __init__(
+        self, tokens: list[Token], file: FileWrapper, program=None, resolve_import=None
+    ):
         self.tokens = tokens
         self.file = file
         self.pos = 0
         self.stack = [{}]
         self.spans = []
         self.type_registry: dict[str, type] = {}
+        self.program = program
+        self.resolve_import = resolve_import  # Callable[[str] -> ast.Module] | None
+        self.import_aliases: dict[str, str] = {}  # local_name -> module_name
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -146,6 +152,28 @@ class Parser:
                     self.consume(Comma)
                 return result.instantiate(tuple(type_args))
             return result
+        if (
+            self.program is not None
+            and param_type.id in self.import_aliases
+            and self.try_consume(Dot)
+        ):
+            type_name = self.consume(Identifier).value
+            module_name = self.import_aliases[param_type.id]
+            import_file = self.program.resolve_import(
+                module_name, relative_to=self.file.path
+            )
+            mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
+            result = mod.names.get(type_name)
+            if isinstance(result, types.GenericTemplate):
+                self.consume(OpenBracket)
+                type_args = []
+                while True:
+                    type_args.append(self.parse_type())
+                    if self.try_consume(CloseBracket):
+                        break
+                    self.consume(Comma)
+                return result.instantiate(tuple(type_args))
+            return result
         return types.Type.from_name(param_type.id)
 
     def parse_statement(self) -> "Optional[ast.Statement]":
@@ -156,6 +184,9 @@ class Parser:
                 stmt = ast.BooleanLiteral.parse(self)
             case Import():
                 stmt = ast.Import.parse(self)
+                self.import_aliases[stmt.local_name] = stmt.module_name
+                if self.resolve_import:
+                    self.resolve_import(stmt.module_name)
             case Return():
                 stmt = ast.Return.parse(self)
             case If():

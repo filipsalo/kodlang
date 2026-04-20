@@ -35,15 +35,19 @@ class Builder:
         """Parse a module."""
         source = file.read()
         tokens = Lexer(source, Path(file.name)).lex()
-        module = Parser(tokens, file).parse()
-        for import_ in module.get_imports():
-            name = import_.module_name
+
+        def resolve_import(module_name):
             import_file = self.program.resolve_import(
-                name, relative_to=module.source_file.path
+                module_name, relative_to=file.path
             )
-            if import_file not in self.program.modules:
-                import_module = self.parse_module(import_file)
-                self.program.add_module(import_module)
+            key = import_file.canonical_path.with_suffix("")
+            if key not in self.program.modules:
+                dep = self.parse_module(import_file)
+                self.program.add_module(dep)
+
+        module = Parser(
+            tokens, file, program=self.program, resolve_import=resolve_import
+        ).parse()
         return module
 
     def compile_module(self, module: ast.Module) -> str:

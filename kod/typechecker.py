@@ -207,6 +207,9 @@ class TypeChecker:
             case ast.BinaryOperator(lhs, op, rhs) if isinstance(op, tokens.Dot):
                 import_node = self.current_module.names.get(lhs.id)
                 if not isinstance(import_node, ast.Import):
+                    lhs_type = self.infer_type(lhs)
+                    if lhs_type is not None and hasattr(lhs_type, "methods"):
+                        return
                     self.error(f"'{lhs.id}' is not an imported module", lhs.span)
                     return
                 path = self.current_module.resolve_import(import_node.module_name)
