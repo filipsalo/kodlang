@@ -1256,10 +1256,13 @@ class Compiler:
             expression.op, OpenBracket
         ):
             obj_type = self._infer_type(expression.lhs)
-            if obj_type is not None and hasattr(obj_type, "methods"):
-                method = obj_type.methods.get("op_index")
-                if method is not None:
-                    return getattr(method, "return_type", None)
+            if obj_type is not None and isinstance(obj_type, type):
+                if issubclass(obj_type, _types.ArrayType):
+                    return getattr(obj_type, "item_type", None)
+                if hasattr(obj_type, "methods"):
+                    method = obj_type.methods.get("op_index")
+                    if method is not None:
+                        return getattr(method, "return_type", None)
         if isinstance(expression, FunctionCall):
             if isinstance(expression.callee, Name):
                 func = self.functions.get(expression.callee.id)
