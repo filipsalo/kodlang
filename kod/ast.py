@@ -258,6 +258,7 @@ class FunctionDeclaration(ASTNode):
     return_type: type[types.Type]
     variables: dict[str, Variable]
     span: Span
+    struct_name: Optional[str] = None
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
@@ -317,6 +318,40 @@ class FunctionDeclaration(ASTNode):
         label_name = "$".join(label_parts)
         node = cls(name, label_name, params, body, return_type, variables, span)
         return node
+
+    @classmethod
+    def parse_method(cls, parser: Parser, struct_name: str) -> "FunctionDeclaration":
+        """Parse a method declaration inside a struct block."""
+        with parser.span() as span:
+            parser.consume(tokens.Func)
+            name = parser.consume(tokens.Identifier).value
+            params = FunctionParamList.parse(parser)
+            parser.consume(tokens.Arrow)
+            return_type = parser.parse_type()
+            parser.consume(tokens.OpenCurly)
+            body = []
+            variables = {param.variable.id: param.variable for param in params}
+            while not parser.try_consume(tokens.CloseCurly):
+                if statement := parser.parse_statement():
+                    body.append(statement)
+                if isinstance(statement, VariableDeclaration):
+                    variables[statement.variable.id] = statement.variable
+                if isinstance(statement, ForEachStatement):
+                    idx_name = f"__foreach_idx_{statement.binding}"
+                    variables[statement.binding] = Variable(
+                        statement.binding, None, statement.span
+                    )
+                    variables[idx_name] = Variable(idx_name, None, statement.span)
+        label_parts = [
+            "",
+            *parser.file.canonical_path.with_suffix("").parts,
+            struct_name,
+            name,
+        ]
+        label_name = "$".join(label_parts)
+        return cls(
+            name, label_name, params, body, return_type, variables, span, struct_name
+        )
 
 
 @dataclasses.dataclass

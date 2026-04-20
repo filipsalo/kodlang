@@ -188,7 +188,7 @@ class StructType(Type, ABC):
     """A struct type."""
 
     @classmethod
-    def make(cls, name, fields):
+    def make(cls, name, fields, methods=None):
         """Make a struct type."""
         field_ids = [f.id for f in fields]
 
@@ -213,6 +213,7 @@ class StructType(Type, ABC):
         data_class.width = 8  # pointer size (for stack frame layout)
         data_class.struct_fields = fields
         data_class.field_offsets = field_offsets
+        data_class.methods = methods or {}
 
         return data_class
 

@@ -220,8 +220,10 @@ class Compiler:
                     self.compile_function(statement)
                 case Import(_, local_name):
                     self.imports[local_name] = statement
-                case TypeDeclaration():
-                    pass
+                case TypeDeclaration(_, type_):
+                    if hasattr(type_, "methods"):
+                        for method in type_.methods.values():
+                            self.compile_function(method)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
         self.emit("\n.data")
@@ -259,6 +261,8 @@ class Compiler:
     def compile_function(self, func):
         """Compile a function to assembly"""
         self.enter_stack_frame(func)
+        if func.struct_name and "self" in self.stack[-1].variables:
+            self.stack[-1].variables["self"].type = self.type_registry[func.struct_name]
         for statement in func.body:
             self.compile_statement(statement)
         # Implicit return 0 for functions that fall off the end
@@ -288,7 +292,8 @@ class Compiler:
         """Move arguments from registers to the stack"""
         offset = 0
         for param, register in zip(func.params, self._argregs):
-            offset -= param.variable.type.width
+            width = param.variable.type.width if param.variable.type else 8
+            offset -= width
             self.emit("str", register, StackAddress(offset, "fp"))
 
     def compile_return(self, value):
@@ -1206,6 +1211,34 @@ class Compiler:
                     self.emit("ldr", result, StackAddress(8, str(ptr_reg)))
                     self.stack[-1].release_register(ptr_reg)
                     return result
+
+        # Detect method call: obj.method(args)
+        if (
+            isinstance(func_call.callee, BinaryOperator)
+            and isinstance(func_call.callee.op, Dot)
+            and isinstance(func_call.callee.lhs, Name)
+            and isinstance(func_call.callee.rhs, Name)
+            and func_call.callee.lhs.id not in self.imports
+            and self.stack
+        ):
+            obj_name = func_call.callee.lhs.id
+            method_name = func_call.callee.rhs.id
+            var = self.stack[-1].variables.get(obj_name)
+            if (
+                var is not None
+                and hasattr(var.type, "methods")
+                and method_name in var.type.methods
+            ):
+                method = var.type.methods[method_name]
+                obj_addr = self.stack[-1].get_variable_address(func_call.callee.lhs)
+                self.emit("ldr", self._argregs[0], obj_addr)
+                for arg, arg_reg in zip(func_call.args, self._argregs[1:]):
+                    reg = self.compile_expression(arg.expression)
+                    self.mov(arg_reg, reg)
+                    if isinstance(reg, Register):
+                        self.stack[-1].release_register(reg)
+                self.emit("bl", method.label_name)
+                return Register("x0")
 
         func = self.resolve_function(func_call.callee)
         self.prepare_args(func, func_call.args)

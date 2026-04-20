@@ -98,12 +98,17 @@ class Parser:
         if self.try_consume(Struct):
             self.consume(OpenCurly)
             fields = []
+            methods = {}
             while not self.try_consume(CloseCurly):
                 if self.try_consume(EOL):
                     continue
-                fields.append(ast.Variable.parse(self))
+                if self.peeking_at(Func):
+                    method = ast.FunctionDeclaration.parse_method(self, name)
+                    methods[method.name] = method
+                else:
+                    fields.append(ast.Variable.parse(self))
             self.try_consume(EOL)
-            return types.StructType.make(name, fields)
+            return types.StructType.make(name, fields, methods)
         elif self.try_consume(Enum):
             self.consume(OpenCurly)
             variants = []

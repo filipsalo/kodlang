@@ -21,6 +21,14 @@ class ReturnValue(Exception):
         self.value = value
 
 
+@dataclasses.dataclass
+class BoundMethod:
+    """A method bound to a receiver instance."""
+
+    func: ast.FunctionDeclaration
+    receiver: Any
+
+
 class Interpreter:
     """Simple interpreter for the Kod language"""
 
@@ -74,6 +82,9 @@ class Interpreter:
                 lhs = self.evaluate_expression(module, lhs, as_lvalue)
                 if isinstance(lhs, ast.Module):
                     return lhs.names[rhs.id]
+                methods = getattr(type(lhs), "methods", {})
+                if rhs.id in methods:
+                    return BoundMethod(methods[rhs.id], lhs)
                 return getattr(lhs, rhs.id)
             case tokens.OpenBracket():
                 op_func_name = "op_index"
@@ -193,8 +204,11 @@ class Interpreter:
                     module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.TypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
-                value = self.evaluate_expression(module, value)
-                module.names[lhs.id] = self.evaluate_expression(module, value)
+                type_ = self.evaluate_expression(module, value)
+                module.names[lhs.id] = type_
+                if hasattr(type_, "methods"):
+                    for method in type_.methods.values():
+                        method.module = module
             case ast.Assignment(lhs, rhs):
                 rhs_val = self.evaluate_expression(module, rhs)
                 if isinstance(lhs, ast.BinaryOperator) and isinstance(
@@ -299,6 +313,27 @@ class Interpreter:
             and isinstance(args[0], types.ArrayType)
         ):
             return types.Int64(len(args[0].value))
+
+        if isinstance(func, BoundMethod):
+            receiver = func.receiver
+            func = func.func
+            explicit_params = list(func.params)[1:]  # skip self
+            frame = {
+                param.variable.id: (
+                    self.lookup(module, arg) if isinstance(arg, ast.Variable) else arg
+                )
+                for param, arg in zip(explicit_params, args)
+            }
+            frame["self"] = receiver
+            self.stack.append(frame)
+            try:
+                for statement in func.body:
+                    self.execute_statement(func.module, statement)
+            except ReturnValue as return_value:
+                return return_value.value
+            finally:
+                self.stack.pop()
+            return None
 
         # Map args to params
         args = {
