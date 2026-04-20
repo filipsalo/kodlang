@@ -17,6 +17,7 @@ from kod.ast import (
     ForStatement,
     FunctionCall,
     FunctionDeclaration,
+    GenericInstantiation,
     IfStatement,
     Import,
     IntegerLiteral,
@@ -819,37 +820,41 @@ class Compiler:
             return
 
         # Struct constructor: arena-allocate, store pointer, store fields via pointer
+        struct_type = None
         if isinstance(expression, FunctionCall) and isinstance(expression.callee, Name):
             type_name = expression.callee.id
             if type_name in self.type_registry and hasattr(
                 self.type_registry[type_name], "field_offsets"
             ):
                 struct_type = self.type_registry[type_name]
-                if getattr(variable, "type", None) is None:
-                    variable.type = struct_type
-                destination = self.stack[-1].get_variable_address(variable)
-                # Call arena_alloc(data_width) — returns pointer in x0
-                self.mov(Register("x0"), Imm(struct_type.data_width))
-                self.emit("bl", "_arena_alloc")
-                # Save pointer to variable's stack slot immediately
-                tmp = self.stack[-1].allocate_register()
-                self.mov(tmp, Register("x0"))
-                self.emit("str", tmp, destination)
-                self.stack[-1].release_register(tmp)
-                # Store each field: compute value first, then reload pointer and store
-                for arg in expression.args:
-                    field_offset = struct_type.field_offsets[arg.label.id]
-                    value = self.compile_expression(arg.expression)
-                    ptr_reg = self.stack[-1].allocate_register()
-                    self.emit("ldr", ptr_reg, destination)  # reload pointer (safe)
-                    val_reg = self.stack[-1].allocate_register()
-                    self.mov(val_reg, value)
-                    if isinstance(value, Register):
-                        self.stack[-1].release_register(value)
-                    self.emit("str", val_reg, StackAddress(field_offset, str(ptr_reg)))
-                    self.stack[-1].release_register(val_reg)
-                    self.stack[-1].release_register(ptr_reg)
-                return
+        elif isinstance(expression, FunctionCall) and isinstance(
+            expression.callee, GenericInstantiation
+        ):
+            template = self.type_registry[expression.callee.name.id]
+            struct_type = template.instantiate(tuple(expression.callee.type_args))
+        if struct_type is not None:
+            if getattr(variable, "type", None) is None:
+                variable.type = struct_type
+            destination = self.stack[-1].get_variable_address(variable)
+            self.mov(Register("x0"), Imm(struct_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            tmp = self.stack[-1].allocate_register()
+            self.mov(tmp, Register("x0"))
+            self.emit("str", tmp, destination)
+            self.stack[-1].release_register(tmp)
+            for arg in expression.args:
+                field_offset = struct_type.field_offsets[arg.label.id]
+                value = self.compile_expression(arg.expression)
+                ptr_reg = self.stack[-1].allocate_register()
+                self.emit("ldr", ptr_reg, destination)
+                val_reg = self.stack[-1].allocate_register()
+                self.mov(val_reg, value)
+                if isinstance(value, Register):
+                    self.stack[-1].release_register(value)
+                self.emit("str", val_reg, StackAddress(field_offset, str(ptr_reg)))
+                self.stack[-1].release_register(val_reg)
+                self.stack[-1].release_register(ptr_reg)
+            return
 
         # Optional Some: let x: T? = <non-none value> — wrap in heap allocation
         from kod import values as _types

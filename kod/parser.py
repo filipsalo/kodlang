@@ -135,7 +135,17 @@ class Parser:
             return types.NoneType
         param_type = ast.Name.parse(self)
         if param_type.id in self.type_registry:
-            return self.type_registry[param_type.id]
+            result = self.type_registry[param_type.id]
+            if isinstance(result, types.GenericTemplate):
+                self.consume(OpenBracket)
+                type_args = []
+                while True:
+                    type_args.append(self.parse_type())
+                    if self.try_consume(CloseBracket):
+                        break
+                    self.consume(Comma)
+                return result.instantiate(tuple(type_args))
+            return result
         return types.Type.from_name(param_type.id)
 
     def parse_statement(self) -> "Optional[ast.Statement]":

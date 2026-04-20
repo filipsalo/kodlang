@@ -175,6 +175,9 @@ class Interpreter:
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
+            case ast.GenericInstantiation(name, type_args):
+                template = self.lookup(module, name)
+                return template.instantiate(tuple(type_args))
             case ast.StringSlice(string, start, end):
                 s = self.evaluate_expression(module, string)
                 i = self.evaluate_expression(module, start)
@@ -243,7 +246,10 @@ class Interpreter:
                     module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.TypeDeclaration(variable, value):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
-                type_ = self.evaluate_expression(module, value)
+                if isinstance(value, types.GenericTemplate):
+                    type_ = value
+                else:
+                    type_ = self.evaluate_expression(module, value)
                 module.names[lhs.id] = type_
                 if hasattr(type_, "methods"):
                     for method in type_.methods.values():

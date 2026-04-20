@@ -487,6 +487,21 @@ class Expression(ASTNode):
                 value = MatchExpression.parse(parser)
             case tokens.Identifier():
                 value = Name.parse(parser)
+                if (
+                    isinstance(parser.peek(), tokens.OpenBracket)
+                    and value.id in parser.type_registry
+                    and isinstance(
+                        parser.type_registry[value.id], types.GenericTemplate
+                    )
+                ):
+                    parser.consume(tokens.OpenBracket)
+                    type_args = []
+                    while True:
+                        type_args.append(parser.parse_type())
+                        if parser.try_consume(tokens.CloseBracket):
+                            break
+                        parser.consume(tokens.Comma)
+                    value = GenericInstantiation(value, type_args, value.span)
             case _:
                 raise parser.error(f"Expected an expression: {parser.peek()}")
         return value
@@ -530,6 +545,15 @@ class Expression(ASTNode):
                     else:
                         lhs = BinaryOperator(lhs, op, rhs, span)
         return lhs
+
+
+@dataclasses.dataclass
+class GenericInstantiation(ASTNode):
+    """A generic type instantiation used as an expression, e.g. Pair[str, int64]."""
+
+    name: "Name"
+    type_args: list
+    span: Span
 
 
 @dataclasses.dataclass
@@ -727,8 +751,21 @@ class TypeDeclaration(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.Type)
             name = Name.parse(parser)
+            type_param_names = []
+            if parser.try_consume(tokens.OpenBracket):
+                while True:
+                    tok = parser.consume(tokens.Identifier)
+                    type_param_names.append(tok.value)
+                    parser.type_registry[tok.value] = types.TypeParam.make(tok.value)
+                    if parser.try_consume(tokens.CloseBracket):
+                        break
+                    parser.consume(tokens.Comma)
             parser.consume(tokens.Equal)
             type_ = parser.parse_type(name.id)
+            if type_param_names:
+                for p in type_param_names:
+                    del parser.type_registry[p]
+                type_ = types.GenericTemplate(name.id, type_param_names, type_)
         parser.type_registry[name.id] = type_
         return cls(name, type_, span)
 

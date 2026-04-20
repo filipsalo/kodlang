@@ -355,3 +355,50 @@ class EnumType:
                 )
 
         return enum_class
+
+
+class TypeParam(Type):
+    """A type parameter placeholder used during generic type parsing."""
+
+    param_name = ""
+    width = 8
+
+    @classmethod
+    def make(cls, name: str) -> "type[TypeParam]":
+        return type(
+            f"TypeParam_{name}", (cls,), {"param_name": name, "name": name, "width": 8}
+        )
+
+
+def _substitute_type(t, subst: dict):
+    """Recursively substitute TypeParam placeholders with concrete types."""
+    if isinstance(t, type) and issubclass(t, TypeParam):
+        return subst[t.param_name]
+    if isinstance(t, type) and issubclass(t, ArrayType) and hasattr(t, "item_type"):
+        return ArrayType.make(_substitute_type(t.item_type, subst))
+    if isinstance(t, type) and issubclass(t, OptionalType) and hasattr(t, "inner_type"):
+        return OptionalType.make(_substitute_type(t.inner_type, subst))
+    return t
+
+
+class GenericTemplate:
+    """A parameterized type template (e.g. HashMap[K, V])."""
+
+    def __init__(self, name: str, param_names: list[str], template_struct):
+        self.name = name
+        self.param_names = param_names
+        self.template_struct = template_struct
+        self._cache: dict = {}
+
+    def instantiate(self, type_args: tuple) -> type:
+        if type_args in self._cache:
+            return self._cache[type_args]
+        subst = dict(zip(self.param_names, type_args))
+        new_fields = [
+            dataclasses.replace(f, type=_substitute_type(f.type, subst))
+            for f in self.template_struct.struct_fields
+        ]
+        inst_name = f"{self.name}[{', '.join(t.name for t in type_args)}]"
+        result = StructType.make(inst_name, new_fields, self.template_struct.methods)
+        self._cache[type_args] = result
+        return result
