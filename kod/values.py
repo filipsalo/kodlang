@@ -24,6 +24,8 @@ class Type:
                 return Int64
             case "str":
                 return String
+            case "bool":
+                return Bool
             case "none":
                 return NoneType
         raise ValueError(f"Unknown type {name!r}")
