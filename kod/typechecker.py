@@ -81,10 +81,25 @@ class TypeChecker:
                 self.check_expression(condition)
                 for statement in body:
                     self.check_statement(statement)
-            case ast.ForEachStatement(_, iterable, body):
+            case ast.ForEachStatement(binding, iterable, body):
                 self.check_expression(iterable)
+                from kod import values as types
+
+                iterable_type = self.infer_type(iterable)
+                binding_type = (
+                    iterable_type.item_type
+                    if iterable_type is not None
+                    and isinstance(iterable_type, type)
+                    and issubclass(iterable_type, types.ArrayType)
+                    else None
+                )
+                binding_var = ast.Variable(binding, binding_type, iterable.span)
+                self.stack.append({binding: binding_var})
                 for statement in body:
                     self.check_statement(statement)
+                self.stack.pop()
+            case ast.BreakStatement() | ast.ContinueStatement():
+                pass
             case ast.Return(expression):
                 self.check_expression(expression)
             case ast.Assignment(_, rhs):
