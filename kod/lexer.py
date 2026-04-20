@@ -28,6 +28,7 @@ from kod.tokens import (
     EqualEqual,
     Extern,
     For,
+    FStringLiteral,
     Func,
     GreaterEqual,
     GreaterThan,
@@ -165,6 +166,24 @@ class Lexer:
         string.value = string.value.encode().decode("unicode-escape")
         return string
 
+    def lex_fstring(self) -> FStringLiteral:
+        """Lex an f-string literal f"...{expr}..."."""
+        self.consume('"')
+        depth = 0
+        while True:
+            ch = self.peek()
+            if ch == "":
+                raise self.error("Unterminated f-string")
+            if ch == '"' and depth == 0:
+                self.pos += 1
+                break
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            self.pos += 1
+        return self.build(FStringLiteral)
+
     def lex_number(self) -> IntegerLiteral:
         """Lex a number."""
         while char := self.peek():
@@ -188,6 +207,8 @@ class Lexer:
         while char.isalnum() or char == "_":
             self.pos += 1
             char = self.peek()
+        if self.buffered() == "f" and self.peek() == '"':
+            return self.lex_fstring()
         if keyword_token_type := KEYWORDS.get(self.buffered()):
             return self.build(keyword_token_type)
         return self.build(Identifier)

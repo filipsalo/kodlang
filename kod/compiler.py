@@ -1241,10 +1241,15 @@ class Compiler:
         self.mov(rhs_reg, rhs)
         if isinstance(rhs, Register):
             self.stack[-1].release_register(rhs)
+        # Save rhs to the stack so it survives any bl calls while compiling lhs.
+        self.emit("sub", Register("sp"), Register("sp"), Imm(16))
+        self.emit("str", rhs_reg, StackAddress(0, "sp"))
         lhs = self.compile_expression(expression.lhs)
         self.mov(Register("x0"), lhs)
         if isinstance(lhs, Register):
             self.stack[-1].release_register(lhs)
+        self.emit("ldr", rhs_reg, StackAddress(0, "sp"))
+        self.emit("add", Register("sp"), Register("sp"), Imm(16))
         self.mov(Register("x1"), rhs_reg)
         self.stack[-1].release_register(rhs_reg)
         self.emit("bl", "_kod_str_concat")
@@ -1336,6 +1341,10 @@ class Compiler:
             var = self.stack[-1].variables.get(expression.id)
             if var is not None:
                 return var.type
+        if isinstance(expression, BinaryOperator) and isinstance(expression.op, Plus):
+            lhs_type = self._infer_type(expression.lhs)
+            if lhs_type is _types.String:
+                return _types.String
         if isinstance(expression, BinaryOperator) and isinstance(expression.op, Dot):
             obj_type = self._infer_type(expression.lhs)
             if obj_type is not None and hasattr(obj_type, "struct_fields"):

@@ -193,6 +193,11 @@ class StringLiteral(Token):
 
 
 @dataclasses.dataclass
+class FStringLiteral(Token):
+    """An f-string literal like f"hello {name}"."""
+
+
+@dataclasses.dataclass
 class IntegerLiteral(Token):
     """A literal number."""
 

@@ -68,6 +68,51 @@ class StringLiteral(ASTNode, Literal):
         return cls(value, span=token.span)
 
 
+def _parse_fstring(parser: Parser) -> ASTNode:
+    """Parse an f-string token into a BinaryOperator tree of str concatenations."""
+    from kod.lexer import Lexer
+
+    token = parser.consume(tokens.FStringLiteral)
+    # token.value is the raw source: f"hello {name} world"
+    inner = token.value[2:-1]  # strip f" and trailing "
+    span = token.span
+
+    def make_str(text: str) -> StringLiteral:
+        raw = text.encode().decode("unicode-escape")
+        return StringLiteral(types.String(raw.encode("utf8")), span=span)
+
+    def parse_expr(expr_text: str) -> ASTNode:
+        sub_tokens = Lexer(expr_text, span.filename).lex()
+        sub_parser = Parser(
+            sub_tokens, parser.file, parser.program, parser.resolve_import
+        )
+        return Expression.parse(sub_parser)
+
+    parts: list[ASTNode] = []
+    i = 0
+    while i < len(inner):
+        j = inner.find("{", i)
+        if j == -1:
+            if i < len(inner):
+                parts.append(make_str(inner[i:]))
+            break
+        if j > i:
+            parts.append(make_str(inner[i:j]))
+        k = inner.find("}", j + 1)
+        if k == -1:
+            raise parser.error("Unterminated { in f-string", span)
+        parts.append(parse_expr(inner[j + 1 : k]))
+        i = k + 1
+
+    if not parts:
+        return StringLiteral(types.String(b""), span=span)
+    result = parts[0]
+    plus = tokens.Plus("+", span)
+    for part in parts[1:]:
+        result = BinaryOperator(result, plus, part, span)
+    return result
+
+
 @dataclasses.dataclass
 class IntegerLiteral(ASTNode, Literal):
     """An integerliteral."""
@@ -462,6 +507,8 @@ class Expression(ASTNode):
                 parser.consume(tokens.CloseParen)
             case tokens.StringLiteral():
                 value = StringLiteral.parse(parser)
+            case tokens.FStringLiteral():
+                value = _parse_fstring(parser)
             case tokens.IntegerLiteral():
                 value = IntegerLiteral.parse(parser)
             case tokens.BooleanLiteral():
