@@ -104,12 +104,62 @@ class Builder:
 
     def build_runtime_main(self, file: FileWrapper) -> Path:
         """Build the runtime main function."""
-        asm = f"""
-            .text
-            .globl _main
-            _main:
-                b ${"$".join(file.canonical_path.with_suffix("").parts)}$main
-        """
+        module = self.program.get_module(file.canonical_path.with_suffix(""))
+        main_decl = next(
+            s
+            for s in module.body
+            if isinstance(s, ast.FunctionDeclaration) and s.name == "main"
+        )
+        mangled = "$".join(file.canonical_path.with_suffix("").parts)
+        if len(main_decl.params) == 0:
+            asm = f"""
+                .text
+                .globl _main
+                _main:
+                    b ${mangled}$main
+            """
+        else:
+            asm = f"""
+                .text
+                .globl _main
+                _main:
+                    stp x29, x30, [sp, #-64]!
+                    mov x29, sp
+                    stp x19, x20, [sp, #16]
+                    stp x21, x22, [sp, #32]
+                    str x23, [sp, #48]
+
+                    mov x19, x0
+                    mov x20, x1
+
+                    lsl x0, x19, #3
+                    bl _arena_alloc
+                    mov x21, x0
+
+                    mov x22, #0
+                Lloop:
+                    cmp x22, x19
+                    b.ge Ldone
+                    ldr x23, [x20, x22, lsl #3]
+                    str x23, [x21, x22, lsl #3]
+                    add x22, x22, #1
+                    b Lloop
+                Ldone:
+
+                    mov x0, #24
+                    bl _arena_alloc
+                    str x21, [x0]
+                    str x19, [x0, #8]
+                    str x19, [x0, #16]
+
+                    bl ${mangled}$main
+
+                    ldr x23, [sp, #48]
+                    ldp x21, x22, [sp, #32]
+                    ldp x19, x20, [sp, #16]
+                    ldp x29, x30, [sp], #64
+                    ret
+            """
         return self._build("runtime_main", asm)
 
     def build_executable(self, file: FileWrapper) -> Path:

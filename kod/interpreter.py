@@ -51,9 +51,13 @@ class Interpreter:
                 self.execute_statement(module, statement)
         entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
         main = self.lookup(entry_module, "main")
-        string_array = types.ArrayType.make(types.String)
-        argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
-        exit_code = self.call_function(entry_module, main, [argv])
+        if len(main.params) > 0:
+            string_array = types.ArrayType.make(types.String)
+            argv = string_array([types.String(arg.encode("utf8")) for arg in argv])
+            args = [argv]
+        else:
+            args = []
+        exit_code = self.call_function(entry_module, main, args)
         sys.exit(exit_code.value if exit_code else 0)
 
     def assign(self, module, name, value):
