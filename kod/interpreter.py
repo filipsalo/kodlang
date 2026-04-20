@@ -95,7 +95,16 @@ class Interpreter:
                     return BoundMethod(methods[rhs.id], lhs)
                 return getattr(lhs, rhs.id)
             case tokens.OpenBracket():
-                op_func_name = "op_index"
+                lhs_val = self.evaluate_expression(module, lhs)
+                rhs_val = self.evaluate_expression(module, rhs)
+                struct_methods = getattr(type(lhs_val), "methods", {})
+                if "op_index" in struct_methods:
+                    return self.call_function(
+                        module,
+                        BoundMethod(struct_methods["op_index"], lhs_val),
+                        [rhs_val],
+                    )
+                return lhs_val.op_index(rhs_val)
             case tokens.Plus():
                 op_func_name = "op_plus"
             case tokens.Minus():
@@ -261,6 +270,20 @@ class Interpreter:
                 ):
                     obj = self.evaluate_expression(module, lhs.lhs)
                     setattr(obj, lhs.rhs.id, rhs_val)
+                elif isinstance(lhs, ast.BinaryOperator) and isinstance(
+                    lhs.op, tokens.OpenBracket
+                ):
+                    obj = self.evaluate_expression(module, lhs.lhs)
+                    key_val = self.evaluate_expression(module, lhs.rhs)
+                    struct_methods = getattr(type(obj), "methods", {})
+                    if "op_index_set" in struct_methods:
+                        self.call_function(
+                            module,
+                            BoundMethod(struct_methods["op_index_set"], obj),
+                            [key_val, rhs_val],
+                        )
+                    else:
+                        obj.value[key_val.value] = rhs_val
                 else:
                     lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
                     self.assign(module, lhs_val.id, rhs_val)
