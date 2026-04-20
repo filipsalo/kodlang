@@ -187,6 +187,20 @@ class Interpreter:
             case ast.GenericInstantiation(name, type_args):
                 template = self.lookup(module, name)
                 return template.instantiate(tuple(type_args))
+            case ast.ImplicitEnumVariant(variant_name):
+                for name_, val in module.names.items():
+                    if (
+                        isinstance(val, type)
+                        and hasattr(val, "variants")
+                        and variant_name in val.variants
+                    ):
+                        variant_info = val.variants[variant_name]
+                        if not variant_info.fields:
+                            return types.EnumValue(val, variant_name, {})
+                        raise ValueError(
+                            f"Implicit enum variant .{variant_name} has payload fields; use explicit syntax"
+                        )
+                raise ValueError(f"No enum found with variant .{variant_name}")
             case ast.StringSlice(string, start, end):
                 s = self.evaluate_expression(module, string)
                 i = self.evaluate_expression(module, start)

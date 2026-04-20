@@ -483,6 +483,11 @@ class Expression(ASTNode):
                         parser.consume(tokens.CloseBracket)
                         break
                 value = ArrayLiteral(elements, span)
+            case tokens.Dot():
+                with parser.span() as span:
+                    parser.consume(tokens.Dot)
+                    variant_name = parser.consume(tokens.Identifier).value
+                    value = ImplicitEnumVariant(variant_name, span)
             case tokens.Match():
                 value = MatchExpression.parse(parser)
             case tokens.Identifier():
@@ -549,6 +554,14 @@ class GenericInstantiation(ASTNode):
 
     name: "Name"
     type_args: list
+    span: Span
+
+
+@dataclasses.dataclass
+class ImplicitEnumVariant(ASTNode):
+    """An implicit enum variant, e.g. `.North` where the enum type is inferred from context."""
+
+    variant_name: str
     span: Span
 
 

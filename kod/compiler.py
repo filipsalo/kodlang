@@ -19,6 +19,7 @@ from kod.ast import (
     FunctionDeclaration,
     GenericInstantiation,
     IfStatement,
+    ImplicitEnumVariant,
     Import,
     IntegerLiteral,
     IntegerPattern,
@@ -387,11 +388,33 @@ class Compiler:
             and hasattr(self.type_registry[expression.callee.lhs.id], "variants")
         ):
             return True
+        if isinstance(expression, ImplicitEnumVariant):
+            return any(
+                hasattr(t, "variants") and expression.variant_name in t.variants
+                for t in self.type_registry.values()
+            )
         return False
 
     def _compile_enum_literal_to_x0(self, expression):
         """Arena-alloc an enum struct from a literal and leave the pointer in x0."""
-        if isinstance(expression, BinaryOperator):
+        if isinstance(expression, ImplicitEnumVariant):
+            enum_type = next(
+                t
+                for t in self.type_registry.values()
+                if hasattr(t, "variants") and expression.variant_name in t.variants
+            )
+            variant_info = enum_type.variants[expression.variant_name]
+            self.mov(Register("x0"), Imm(enum_type.data_width))
+            self.emit("bl", "_arena_alloc")
+            ptr_reg = self.stack[-1].allocate_register()
+            disc_reg = self.stack[-1].allocate_register()
+            self.mov(ptr_reg, Register("x0"))
+            self.emit("mov", disc_reg, Imm(variant_info.discriminant))
+            self.emit("str", disc_reg, StackAddress(0, str(ptr_reg)))
+            self.stack[-1].release_register(disc_reg)
+            self.mov(Register("x0"), ptr_reg)
+            self.stack[-1].release_register(ptr_reg)
+        elif isinstance(expression, BinaryOperator):
             # Unit variant: Direction.North
             enum_type = self.type_registry[expression.lhs.id]
             variant_info = enum_type.variants[expression.rhs.id]
@@ -608,6 +631,19 @@ class Compiler:
             self.stack[-1].release_register(val_reg)
         self.emit("bl", method.label_name)
 
+    def compile_implicit_enum_variant(
+        self, expression: ImplicitEnumVariant
+    ) -> "Register":
+        """Compile .VariantName by scanning the type registry for the matching enum."""
+        variant_name = expression.variant_name
+        for enum_type in self.type_registry.values():
+            if hasattr(enum_type, "variants") and variant_name in enum_type.variants:
+                variant_info = enum_type.variants[variant_name]
+                register = self.stack[-1].allocate_register()
+                self.emit("mov", register, Imm(variant_info.discriminant))
+                return register
+        raise ValueError(f"No enum found with variant .{variant_name}")
+
     def compile_enum_unit_variant(self, expression) -> "Register":
         """Compile a unit enum variant access (e.g. Direction.North) to its discriminant."""
         enum_type = self.type_registry[expression.lhs.id]
@@ -805,6 +841,33 @@ class Compiler:
 
     def compile_variable_declaration(self, variable, expression):
         """Compile a variable declaration to assembly"""
+        # Implicit enum variant: let d: Direction = .North
+        if isinstance(expression, ImplicitEnumVariant):
+            enum_type = next(
+                (
+                    t
+                    for t in self.type_registry.values()
+                    if hasattr(t, "variants") and expression.variant_name in t.variants
+                ),
+                None,
+            )
+            if enum_type is not None:
+                variant_info = enum_type.variants[expression.variant_name]
+                if getattr(variable, "type", None) is None:
+                    variable.type = enum_type
+                destination = self.stack[-1].get_variable_address(variable)
+                self.mov(Register("x0"), Imm(enum_type.data_width))
+                self.emit("bl", "_arena_alloc")
+                ptr_reg = self.stack[-1].allocate_register()
+                disc_reg = self.stack[-1].allocate_register()
+                self.mov(ptr_reg, Register("x0"))
+                self.emit("str", ptr_reg, destination)
+                self.emit("mov", disc_reg, Imm(variant_info.discriminant))
+                self.emit("str", disc_reg, StackAddress(0, str(ptr_reg)))
+                self.stack[-1].release_register(disc_reg)
+                self.stack[-1].release_register(ptr_reg)
+                return
+
         # Enum unit variant: let d: Direction = Direction.North
         if (
             isinstance(expression, BinaryOperator)
@@ -1036,6 +1099,8 @@ class Compiler:
             return self.compile_binary_operator(expression)
         elif isinstance(expression, MatchExpression):
             return self.compile_match_expression(expression)
+        elif isinstance(expression, ImplicitEnumVariant):
+            return self.compile_implicit_enum_variant(expression)
         else:
             raise ValueError(f"Unexpected expression {expression}")
 
@@ -1440,10 +1505,14 @@ class Compiler:
                 obj_addr = self.stack[-1].get_variable_address(func_call.callee.lhs)
                 self.emit("ldr", self._argregs[0], obj_addr)
                 for arg, arg_reg in zip(func_call.args, self._argregs[1:]):
-                    reg = self.compile_expression(arg.expression)
-                    self.mov(arg_reg, reg)
-                    if isinstance(reg, Register):
-                        self.stack[-1].release_register(reg)
+                    if self._is_enum_literal(arg.expression):
+                        self._compile_enum_literal_to_x0(arg.expression)
+                        self.mov(arg_reg, Register("x0"))
+                    else:
+                        reg = self.compile_expression(arg.expression)
+                        self.mov(arg_reg, reg)
+                        if isinstance(reg, Register):
+                            self.stack[-1].release_register(reg)
                 self.emit("bl", method.label_name)
                 return Register("x0")
 
@@ -1457,8 +1526,13 @@ class Compiler:
         offset = 0
         for param, arg, arg_register in zip(func.params, args, self._argregs):
             offset -= param.variable.type.width
-            register = self.compile_expression(arg.expression)
-            self.mov(arg_register, register)
+            expr = arg.expression
+            if self._is_enum_literal(expr):
+                self._compile_enum_literal_to_x0(expr)
+                self.mov(arg_register, Register("x0"))
+            else:
+                register = self.compile_expression(expr)
+                self.mov(arg_register, register)
 
     def mov(self, dest, src):
         """Move a value"""
