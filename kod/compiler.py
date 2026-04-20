@@ -1176,6 +1176,15 @@ class Compiler:
             and isinstance(lhs_type, type)
             and issubclass(lhs_type, _types.ArrayType)
         ):
+            # Normalise negative index: if idx < 0, idx += len
+            pos_label = self.create_label("idx_pos")
+            len_reg = self.stack[-1].allocate_register()
+            self.emit("ldr", len_reg, StackAddress(8, str(ptr_reg)))
+            self.emit("cmp", idx_reg, Imm(0))
+            self.emit("bge", pos_label)
+            self.emit("add", idx_reg, idx_reg, len_reg)
+            self.emit_label(pos_label)
+            self.stack[-1].release_register(len_reg)
             # Dereference header to get data_ptr, scale index by item_width (8)
             self.emit("ldr", ptr_reg, StackAddress(0, str(ptr_reg)))
             self.emit("lsl", idx_reg, idx_reg, Imm(3))
