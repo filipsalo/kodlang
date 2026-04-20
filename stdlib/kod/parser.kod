@@ -1,0 +1,714 @@
+import "kod/lexer"
+import "kod/ast"
+
+func str_to_int(anon s: str) -> int64 {
+	let result: int64 = 0
+	let i: int64 = 0
+	for i < len(s) {
+		result = result * 10 + s[i] - '0'
+		i = i + 1
+	}
+	return result
+}
+
+// Parse a string token value (with surrounding quotes) into a Kod string,
+// processing escape sequences.
+func parse_string_value(anon raw: str) -> str {
+	let result: str = ""
+	let i: int64 = 1
+	let end: int64 = len(raw) - 1
+	for i < end {
+		if raw[i] == '\\' and i + 1 < end {
+			i = i + 1
+			if raw[i] == 'n' {
+				result = result + "\n"
+			}
+			if raw[i] == 't' {
+				result = result + "\t"
+			}
+				if raw[i] == '\\' {
+				result = result + "\\"
+			}
+			if raw[i] == '\'' {
+				result = result + "'"
+			}
+			if raw[i] == '0' {
+				result = result + "\0"
+			}
+		} else {
+			result = result + raw[i:i+1]
+		}
+		i = i + 1
+	}
+	return result
+}
+
+type Parser = struct {
+	tokens: [lexer.Token]
+	pos: int64
+
+	exprs: [ast.Expr]
+	stmts: [ast.Stmt]
+	type_exprs: [ast.TypeExpr]
+	patterns: [ast.Pattern]
+	match_arms: [ast.MatchArm]
+	match_expr_arms: [ast.MatchExprArm]
+	func_decls: [ast.FuncDecl]
+
+	func peek(self) -> lexer.Token {
+		return self.tokens[self.pos]
+	}
+
+	func peek_kind(self) -> lexer.TokenKind {
+		return self.tokens[self.pos].kind
+	}
+
+	func peek_kind_at(self, anon offset: int64) -> lexer.TokenKind {
+		let idx: int64 = self.pos + offset
+		if idx >= len(self.tokens) {
+			return lexer.TokenKind.EOF
+		}
+		return self.tokens[idx].kind
+	}
+
+	func advance(self) -> lexer.Token {
+		let t: lexer.Token = self.tokens[self.pos]
+		self.pos = self.pos + 1
+		return t
+	}
+
+	func at(self, anon kind: lexer.TokenKind) -> bool {
+		return self.peek_kind() == kind
+	}
+
+	func try_consume(self, anon kind: lexer.TokenKind) -> bool {
+		if self.peek_kind() == kind {
+			self.advance()
+			return true
+		}
+		return false
+	}
+
+	func expect(self, anon kind: lexer.TokenKind) -> lexer.Token {
+		return self.advance()
+	}
+
+	func expect_identifier(self) -> str {
+		return self.advance().value
+	}
+
+	func skip_newlines(self) -> none {
+		for self.at(.EOL) or self.at(.Comment) {
+			self.advance()
+		}
+	}
+
+
+	func alloc_expr(self, anon e: ast.Expr) -> int64 {
+		let id: int64 = len(self.exprs)
+		self.exprs += [e]
+		return id
+	}
+
+	func alloc_stmt(self, anon s: ast.Stmt) -> int64 {
+		let id: int64 = len(self.stmts)
+		self.stmts += [s]
+		return id
+	}
+
+	func alloc_type(self, anon t: ast.TypeExpr) -> int64 {
+		let id: int64 = len(self.type_exprs)
+		self.type_exprs += [t]
+		return id
+	}
+
+	func alloc_pattern(self, anon p: ast.Pattern) -> int64 {
+		let id: int64 = len(self.patterns)
+		self.patterns += [p]
+		return id
+	}
+
+	func alloc_match_arm(self, anon a: ast.MatchArm) -> int64 {
+		let id: int64 = len(self.match_arms)
+		self.match_arms += [a]
+		return id
+	}
+
+	func alloc_match_expr_arm(self, anon a: ast.MatchExprArm) -> int64 {
+		let id: int64 = len(self.match_expr_arms)
+		self.match_expr_arms += [a]
+		return id
+	}
+
+	func alloc_func_decl(self, anon f: ast.FuncDecl) -> int64 {
+		let id: int64 = len(self.func_decls)
+		self.func_decls += [f]
+		return id
+	}
+
+
+	func parse_type_expr(self) -> int64 {
+		// Array type: [T]
+		if self.try_consume(.OpenBracket) {
+			let inner: int64 = self.parse_type_expr()
+			self.expect(.CloseBracket)
+			return self.alloc_type(ast.TypeExpr.Array(inner: inner))
+		}
+		let name: str = self.expect_identifier()
+		// Optional: T?
+		if self.try_consume(.Question) {
+			let inner: int64 = self.alloc_type(ast.TypeExpr.Named(name: name))
+			return self.alloc_type(ast.TypeExpr.Optional(inner: inner))
+		}
+		// Generic: T[U] (single type arg for now)
+		if self.try_consume(.OpenBracket) {
+			let arg: int64 = self.parse_type_expr()
+			self.expect(.CloseBracket)
+			return self.alloc_type(ast.TypeExpr.Generic(name: name, arg: arg))
+		}
+		return self.alloc_type(ast.TypeExpr.Named(name: name))
+	}
+
+	func parse_param(self) -> ast.Param {
+		let anonymous: bool = self.try_consume(.KwAnon)
+		let name: str = self.expect_identifier()
+		self.expect(.Colon)
+		let typ: int64 = self.parse_type_expr()
+		return ast.Param(name: name, typ: typ, anonymous: anonymous)
+	}
+
+	func parse_param_list(self) -> [ast.Param] {
+		self.expect(.OpenParen)
+		let params: [ast.Param] = []
+		for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+			params += [self.parse_param()]
+			if self.try_consume(.Comma) == false {
+				break
+			}
+		}
+		self.expect(.CloseParen)
+		return params
+	}
+
+
+	func parse_pattern(self) -> int64 {
+		// Wildcard: _
+		if self.at(.Identifier) and self.peek().value == "_" {
+			self.advance()
+			return self.alloc_pattern(ast.Pattern.Wildcard)
+		}
+		// Integer
+		if self.at(.IntegerLit) {
+			let t: lexer.Token = self.advance()
+			return self.alloc_pattern(ast.Pattern.IntPat(value: str_to_int(t.value)))
+		}
+		// String
+		if self.at(.StringLit) {
+			let t: lexer.Token = self.advance()
+			return self.alloc_pattern(ast.Pattern.StrPat(value: parse_string_value(t.value)))
+		}
+		// none
+		if self.try_consume(.KwNone) {
+			return self.alloc_pattern(ast.Pattern.NonePat)
+		}
+		// Some(binding)
+		if self.at(.Identifier) and self.peek().value == "Some" {
+			self.advance()
+			let binding: str = ""
+			if self.try_consume(.OpenParen) {
+				binding = self.expect_identifier()
+				self.expect(.CloseParen)
+			}
+			return self.alloc_pattern(ast.Pattern.SomePat(binding: binding))
+		}
+		// Implicit enum variant: .Variant
+		if self.try_consume(.Dot) {
+			let variant_name: str = self.expect_identifier()
+			return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: variant_name))
+		}
+		// Explicit enum variant: Enum.Variant or Enum.Variant(bindings...)
+		let name: str = self.expect_identifier()
+		self.expect(.Dot)
+		let variant_name: str = self.expect_identifier()
+		let bindings: [str] = []
+		if self.try_consume(.OpenParen) {
+			for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+				bindings += [self.expect_identifier()]
+				if self.try_consume(.Comma) == false {
+					break
+				}
+			}
+			self.expect(.CloseParen)
+		}
+		return self.alloc_pattern(ast.Pattern.EnumPat(enum_name: name, variant_name: variant_name, bindings: bindings))
+	}
+
+
+	func parse_primary(self) -> int64 {
+		// Integer literal
+		if self.at(.IntegerLit) {
+			let t: lexer.Token = self.advance()
+			return self.alloc_expr(ast.Expr.IntLit(value: str_to_int(t.value)))
+		}
+		// String literal
+		if self.at(.StringLit) {
+			let t: lexer.Token = self.advance()
+			return self.alloc_expr(ast.Expr.StrLit(value: parse_string_value(t.value)))
+		}
+		// Boolean
+		if self.try_consume(.KwTrue) {
+			return self.alloc_expr(ast.Expr.BoolLit(value: true))
+		}
+		if self.try_consume(.KwFalse) {
+			return self.alloc_expr(ast.Expr.BoolLit(value: false))
+		}
+		// none literal
+		if self.try_consume(.KwNone) {
+			return self.alloc_expr(ast.Expr.NoneLit)
+		}
+		// Implicit enum variant: .Variant
+		if self.try_consume(.Dot) {
+			let name: str = self.expect_identifier()
+			return self.alloc_expr(ast.Expr.ImplicitVariant(name: name))
+		}
+		// Array literal: [e1, e2, ...]
+		if self.try_consume(.OpenBracket) {
+			let elements: [int64] = []
+			for self.peek_kind() != .CloseBracket and self.peek_kind() != .EOF {
+				elements += [self.parse_expr()]
+				if self.try_consume(.Comma) == false {
+					break
+				}
+			}
+			self.expect(.CloseBracket)
+			return self.alloc_expr(ast.Expr.ArrayLit(elements: elements))
+		}
+		// Parenthesized expression
+		if self.try_consume(.OpenParen) {
+			let e: int64 = self.parse_expr()
+			self.expect(.CloseParen)
+			return e
+		}
+		// match expression
+		if self.try_consume(.KwMatch) {
+			return self.parse_match_expr()
+		}
+		// Identifier
+		let name: str = self.expect_identifier()
+		return self.alloc_expr(ast.Expr.Ident(name: name))
+	}
+
+	func parse_match_expr(self) -> int64 {
+		let subject: int64 = self.parse_expr()
+		self.expect(.OpenCurly)
+		self.skip_newlines()
+		let arms: [int64] = []
+		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
+			self.skip_newlines()
+			if self.peek_kind() == .CloseCurly {
+				break
+			}
+			let pat: int64 = self.parse_pattern()
+			self.expect(.Arrow)
+			let body: int64 = self.parse_expr()
+			arms += [self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, body: body))]
+			self.skip_newlines()
+		}
+		self.expect(.CloseCurly)
+		return self.alloc_expr(ast.Expr.MatchExpr(subject: subject, arms: arms))
+	}
+
+	func parse_postfix(self, anon base: int64) -> int64 {
+		let lhs: int64 = base
+		for self.at(.OpenParen) or self.at(.Dot) or self.at(.OpenBracket) {
+			// Function/method call
+			if self.at(.OpenParen) {
+				self.advance()
+				let args: [ast.CallArg] = []
+				for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+					// Labeled arg: if next two tokens are identifier + colon
+					if self.at(.Identifier) and self.peek_kind_at(1) == .Colon {
+						let label: str = self.expect_identifier()
+						self.expect(.Colon)
+						let val: int64 = self.parse_expr()
+						args += [ast.CallArg(label: label, value: val)]
+					} else {
+						let val: int64 = self.parse_expr()
+						args += [ast.CallArg(label: "", value: val)]
+					}
+					if self.try_consume(.Comma) == false {
+						break
+					}
+				}
+				self.expect(.CloseParen)
+				lhs = self.alloc_expr(ast.Expr.Call(callee: lhs, args: args))
+			}
+			// Dot access: expr.name
+			if self.at(.Dot) {
+				self.advance()
+				let field: str = self.expect_identifier()
+				let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field))
+				lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Dot, rhs: rhs))
+			}
+			// Index or slice: expr[idx] or expr[lo:hi]
+			if self.at(.OpenBracket) {
+				self.advance()
+				let lo: int64 = self.parse_expr()
+				if self.try_consume(.Colon) {
+					let hi: int64 = 0
+					if self.peek_kind() != .CloseBracket {
+						hi = self.parse_expr()
+					}
+					self.expect(.CloseBracket)
+					lhs = self.alloc_expr(ast.Expr.Slice(s: lhs, lo: lo, hi: hi))
+				} else {
+					self.expect(.CloseBracket)
+					lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Index, rhs: lo))
+				}
+			}
+		}
+		return lhs
+	}
+
+	func bin_op_prec(self) -> int64 {
+		match self.peek_kind() {
+			.KwIs -> return 1
+			.KwOr -> return 2
+			.KwAnd -> return 3
+			.EqualEqual -> return 4
+			.NotEqual -> return 4
+			.LessThan -> return 4
+			.LessEqual -> return 4
+			.GreaterThan -> return 4
+			.GreaterEqual -> return 4
+			.Plus -> return 5
+			.Minus -> return 5
+			.Star -> return 6
+			.Slash -> return 6
+			.Percent -> return 6
+			_ -> return 0
+		}
+	}
+
+	func consume_bin_op(self) -> ast.Op {
+		let kind: lexer.TokenKind = self.peek_kind()
+		self.advance()
+		match kind {
+			.KwIs -> return .Is
+			.KwOr -> return .Or
+			.KwAnd -> return .And
+			.EqualEqual -> return .Eq
+			.NotEqual -> return .Ne
+			.LessThan -> return .Lt
+			.LessEqual -> return .Le
+			.GreaterThan -> return .Gt
+			.GreaterEqual -> return .Ge
+			.Plus -> return .Add
+			.Minus -> return .Sub
+			.Star -> return .Mul
+			.Slash -> return .Div
+			.Percent -> return .Mod
+			_ -> return .Add
+		}
+	}
+
+	func parse_expr(self) -> int64 {
+		return self.parse_expr_prec(1)
+	}
+
+	func parse_expr_prec(self, anon min_prec: int64) -> int64 {
+		let lhs: int64 = self.parse_primary()
+		lhs = self.parse_postfix(lhs)
+		for self.bin_op_prec() >= min_prec and self.bin_op_prec() > 0 {
+			let prec: int64 = self.bin_op_prec()
+			let op: ast.Op = self.consume_bin_op()
+			let rhs: int64 = self.parse_expr_prec(prec + 1)
+			lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: op, rhs: rhs))
+		}
+		return lhs
+	}
+
+
+	func parse_block(self) -> [int64] {
+		self.expect(.OpenCurly)
+		self.skip_newlines()
+		let stmts: [int64] = []
+		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
+			self.skip_newlines()
+			if self.peek_kind() == .CloseCurly {
+				break
+			}
+			stmts += [self.parse_stmt()]
+			self.skip_newlines()
+		}
+		self.expect(.CloseCurly)
+		return stmts
+	}
+
+	func parse_stmt(self) -> int64 {
+		self.skip_newlines()
+
+		// let declaration
+		if self.try_consume(.KwLet) {
+			let name: str = self.expect_identifier()
+			let typ: int64 = 0
+			if self.try_consume(.Colon) {
+				typ = self.parse_type_expr()
+			}
+			self.expect(.Equal)
+			let value: int64 = self.parse_expr()
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Let(name: name, typ: typ, value: value))
+		}
+
+		// return
+		if self.try_consume(.KwReturn) {
+			if self.at(.EOL) or self.at(.CloseCurly) or self.at(.EOF) {
+				self.skip_newlines()
+				return self.alloc_stmt(ast.Stmt.Return(value: 0))
+			}
+			let value: int64 = self.parse_expr()
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Return(value: value))
+		}
+
+		// if / else
+		if self.try_consume(.KwIf) {
+			let cond: int64 = self.parse_expr()
+			let then_body: [int64] = self.parse_block()
+			let else_body: [int64] = []
+			self.skip_newlines()
+			if self.try_consume(.KwElse) {
+				if self.at(.KwIf) {
+					else_body += [self.parse_stmt()]
+				} else {
+					else_body = self.parse_block()
+				}
+			}
+			return self.alloc_stmt(ast.Stmt.If(cond: cond, then_body: then_body, else_body: else_body))
+		}
+
+		// for (with foreach detection)
+		if self.try_consume(.KwFor) {
+			self.skip_newlines()
+			if self.at(.Identifier) and self.peek_kind_at(1) == .KwIn {
+				let name: str = self.expect_identifier()
+				self.expect(.KwIn)
+				let iter: int64 = self.parse_expr()
+				let body: [int64] = self.parse_block()
+				return self.alloc_stmt(ast.Stmt.ForEach(name: name, iter: iter, body: body))
+			}
+			let cond: int64 = self.parse_expr()
+			let body: [int64] = self.parse_block()
+			return self.alloc_stmt(ast.Stmt.For(cond: cond, body: body))
+		}
+
+		// break / continue
+		if self.try_consume(.KwBreak) {
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Break)
+		}
+		if self.try_consume(.KwContinue) {
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Continue)
+		}
+
+		// match statement
+		if self.try_consume(.KwMatch) {
+			let subject: int64 = self.parse_expr()
+			self.expect(.OpenCurly)
+			self.skip_newlines()
+			let arms: [int64] = []
+			for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
+				self.skip_newlines()
+				if self.peek_kind() == .CloseCurly {
+					break
+				}
+				let pat: int64 = self.parse_pattern()
+				self.expect(.Arrow)
+				let body: [int64] = []
+				if self.at(.OpenCurly) {
+					body = self.parse_block()
+				} else {
+					body += [self.parse_stmt()]
+				}
+				arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, body: body))]
+				self.skip_newlines()
+			}
+			self.expect(.CloseCurly)
+			return self.alloc_stmt(ast.Stmt.MatchStmt(subject: subject, arms: arms))
+		}
+
+		// Expression, assignment, or +=
+		let expr: int64 = self.parse_expr()
+		if self.try_consume(.Equal) {
+			let rhs: int64 = self.parse_expr()
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Assign(lhs: expr, rhs: rhs))
+		}
+		if self.try_consume(.PlusEqual) {
+			let rhs: int64 = self.parse_expr()
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.PlusAssign(lhs: expr, rhs: rhs))
+		}
+		self.skip_newlines()
+		return self.alloc_stmt(ast.Stmt.ExprStmt(expr: expr))
+	}
+
+
+	func parse_func_decl(self) -> ast.FuncDecl {
+		self.expect(.KwFunc)
+		let name: str = self.expect_identifier()
+		let params: [ast.Param] = self.parse_param_list()
+		let return_typ: int64 = 0
+		if self.try_consume(.Arrow) {
+			return_typ = self.parse_type_expr()
+		}
+		let body: [int64] = self.parse_block()
+		return ast.FuncDecl(name: name, params: params, return_typ: return_typ, body: body)
+	}
+
+	func parse_struct_fields(self) -> [ast.StructField] {
+		let fields: [ast.StructField] = []
+		for self.peek_kind() != .CloseCurly and self.peek_kind() != .KwFunc and self.peek_kind() != .EOF {
+			self.skip_newlines()
+			if self.peek_kind() == .CloseCurly or self.peek_kind() == .KwFunc {
+				break
+			}
+			let name: str = self.expect_identifier()
+			self.expect(.Colon)
+			let typ: int64 = self.parse_type_expr()
+			fields += [ast.StructField(name: name, typ: typ)]
+			self.skip_newlines()
+		}
+		return fields
+	}
+
+	func parse_enum_variants(self) -> [ast.EnumVariant] {
+		let variants: [ast.EnumVariant] = []
+		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
+			self.skip_newlines()
+			if self.peek_kind() == .CloseCurly {
+				break
+			}
+			let name: str = self.expect_identifier()
+			let fields: [ast.Param] = []
+			if self.try_consume(.OpenParen) {
+				for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+					fields += [self.parse_param()]
+					if self.try_consume(.Comma) == false {
+						break
+					}
+				}
+				self.expect(.CloseParen)
+			}
+			variants += [ast.EnumVariant(name: name, fields: fields)]
+			self.skip_newlines()
+		}
+		return variants
+	}
+
+	func parse_decl(self) -> ast.Decl {
+		self.skip_newlines()
+
+		// import "path"
+		if self.try_consume(.KwImport) {
+			let t: lexer.Token = self.advance()
+			let raw: str = t.value
+			let module_name: str = raw[1:len(raw)-1]
+			// local name = last path component
+			let local_name: str = module_name
+			let i: int64 = len(module_name) - 1
+			for i >= 0 {
+				if module_name[i] == '/' {
+					local_name = module_name[i+1:len(module_name)]
+					i = -1
+				} else {
+					i = i - 1
+				}
+			}
+			self.skip_newlines()
+			return ast.Decl.Import(module_name: module_name, local_name: local_name)
+		}
+
+		// extern func
+		if self.try_consume(.KwExtern) {
+			self.expect(.KwFunc)
+			let name: str = self.expect_identifier()
+			let params: [ast.Param] = self.parse_param_list()
+			let return_typ: int64 = 0
+			if self.try_consume(.Arrow) {
+				return_typ = self.parse_type_expr()
+			}
+			self.skip_newlines()
+			return ast.Decl.Extern(name: name, params: params, return_typ: return_typ)
+		}
+
+		// func
+		if self.at(.KwFunc) {
+			let f: ast.FuncDecl = self.parse_func_decl()
+			let id: int64 = self.alloc_func_decl(f)
+			self.skip_newlines()
+			return ast.Decl.Func(decl: id)
+		}
+
+		// type Name = struct { } or enum { }
+		if self.try_consume(.KwType) {
+			let name: str = self.expect_identifier()
+			self.expect(.Equal)
+			if self.try_consume(.KwStruct) {
+				self.expect(.OpenCurly)
+				self.skip_newlines()
+				let fields: [ast.StructField] = self.parse_struct_fields()
+				let methods: [int64] = []
+				for self.at(.KwFunc) {
+					let m: ast.FuncDecl = self.parse_func_decl()
+					methods += [self.alloc_func_decl(m)]
+					self.skip_newlines()
+				}
+				self.expect(.CloseCurly)
+				self.skip_newlines()
+				return ast.Decl.Struct(name: name, fields: fields, methods: methods)
+			}
+			if self.try_consume(.KwEnum) {
+				self.expect(.OpenCurly)
+				self.skip_newlines()
+				let variants: [ast.EnumVariant] = self.parse_enum_variants()
+				self.expect(.CloseCurly)
+				self.skip_newlines()
+				return ast.Decl.Enum(name: name, variants: variants)
+			}
+			// Unhandled type alias; skip to next line
+			self.skip_newlines()
+			return ast.Decl.Import(module_name: "", local_name: name)
+		}
+
+		// Unknown token: skip it
+		self.advance()
+		self.skip_newlines()
+		return ast.Decl.Import(module_name: "", local_name: "")
+	}
+
+	func parse_module(self) -> ast.Module {
+		let decls: [ast.Decl] = []
+		for self.peek_kind() != .EOF {
+			self.skip_newlines()
+			if self.peek_kind() == .EOF {
+				break
+			}
+			decls += [self.parse_decl()]
+		}
+		return ast.Module(decls: decls)
+	}
+}
+
+func make_parser(anon tokens: [lexer.Token]) -> Parser {
+	let exprs: [ast.Expr] = []
+	let stmts: [ast.Stmt] = []
+	let type_exprs: [ast.TypeExpr] = []
+	let patterns: [ast.Pattern] = []
+	let match_arms: [ast.MatchArm] = []
+	let match_expr_arms: [ast.MatchExprArm] = []
+	let func_decls: [ast.FuncDecl] = []
+	return Parser(tokens: tokens, pos: 0, exprs: exprs, stmts: stmts, type_exprs: type_exprs, patterns: patterns, match_arms: match_arms, match_expr_arms: match_expr_arms, func_decls: func_decls)
+}

@@ -567,9 +567,10 @@ class ImplicitEnumVariant(ASTNode):
 
 @dataclasses.dataclass
 class ImplicitEnumVariantPattern:
-    """An implicit enum variant pattern in a match arm, e.g. `.North`."""
+    """An implicit enum variant pattern in a match arm, e.g. `.North` or `.Some(x)`."""
 
     variant_name: str
+    bindings: list
     span: Span
 
 
@@ -875,7 +876,14 @@ class MatchExpressionArm:
             elif parser.peeking_at(tokens.Dot):
                 parser.consume(tokens.Dot)
                 variant_name = parser.consume(tokens.Identifier).value
-                pattern = ImplicitEnumVariantPattern(variant_name, span)
+                bindings = []
+                if parser.try_consume(tokens.OpenParen):
+                    while not parser.try_consume(tokens.CloseParen):
+                        bindings.append(parser.consume(tokens.Identifier).value)
+                        if not parser.try_consume(tokens.Comma):
+                            parser.consume(tokens.CloseParen)
+                            break
+                pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
                 enum_name = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
@@ -948,7 +956,14 @@ class MatchArm:
             elif parser.peeking_at(tokens.Dot):
                 parser.consume(tokens.Dot)
                 variant_name = parser.consume(tokens.Identifier).value
-                pattern = ImplicitEnumVariantPattern(variant_name, span)
+                bindings = []
+                if parser.try_consume(tokens.OpenParen):
+                    while not parser.try_consume(tokens.CloseParen):
+                        bindings.append(parser.consume(tokens.Identifier).value)
+                        if not parser.try_consume(tokens.Comma):
+                            parser.consume(tokens.CloseParen)
+                            break
+                pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
                 enum_name = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
