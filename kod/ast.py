@@ -761,6 +761,12 @@ class IntegerPattern:
 
 
 @dataclasses.dataclass
+class StringPattern:
+    value: str
+    span: Span
+
+
+@dataclasses.dataclass
 class WildcardPattern:
     span: Span
 
@@ -796,6 +802,9 @@ class MatchExpressionArm:
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
                 pattern = IntegerPattern(int(tok.value), span)
+            elif parser.peeking_at(tokens.StringLiteral):
+                tok = StringLiteral.parse(parser)
+                pattern = StringPattern(tok.value.to_py_str(), span)
             elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
                 parser.consume(tokens.Identifier)
                 pattern = WildcardPattern(span)
@@ -862,6 +871,9 @@ class MatchArm:
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
                 pattern = IntegerPattern(int(tok.value), span)
+            elif parser.peeking_at(tokens.StringLiteral):
+                tok = StringLiteral.parse(parser)
+                pattern = StringPattern(tok.value.to_py_str(), span)
             elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
                 parser.consume(tokens.Identifier)
                 pattern = WildcardPattern(span)

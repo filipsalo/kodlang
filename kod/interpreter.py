@@ -186,6 +186,9 @@ class Interpreter:
                     if isinstance(arm.pattern, ast.IntegerPattern):
                         if value.value == arm.pattern.value:
                             return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.StringPattern):
+                        if value.to_py_str() == arm.pattern.value:
+                            return self.evaluate_expression(module, arm.body)
                     elif isinstance(arm.pattern, ast.WildcardPattern):
                         return self.evaluate_expression(module, arm.body)
                     elif isinstance(arm.pattern, ast.OptionalNonePattern):
@@ -292,6 +295,11 @@ class Interpreter:
                 for arm in arms:
                     if isinstance(arm.pattern, ast.IntegerPattern):
                         if value.value == arm.pattern.value:
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
+                    elif isinstance(arm.pattern, ast.StringPattern):
+                        if value.to_py_str() == arm.pattern.value:
                             for stmt in arm.body:
                                 self.execute_statement(module, stmt)
                             break

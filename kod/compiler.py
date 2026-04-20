@@ -30,6 +30,7 @@ from kod.ast import (
     OptionalSomePattern,
     Return,
     StringLiteral,
+    StringPattern,
     StringSlice,
     TypeDeclaration,
     VariableDeclaration,
@@ -574,6 +575,22 @@ class Compiler:
                 return reg
         return operand
 
+    def _emit_strcmp_pattern(self, subject_reg, pattern: StringPattern) -> None:
+        """Emit strcmp(subject, literal) and set flags; caller emits branch."""
+        from kod import values as _types
+
+        pat_lit = self.literal_string(
+            StringLiteral(_types.String(pattern.value.encode()), span=pattern.span)
+        )
+        self.mov(Register("x0"), subject_reg)
+        pat_reg = self.stack[-1].allocate_register()
+        self.emit("adrp", pat_reg, f"{pat_lit.label}@PAGE")
+        self.emit("add", pat_reg, pat_reg, f"{pat_lit.label}@PAGEOFF")
+        self.mov(Register("x1"), pat_reg)
+        self.stack[-1].release_register(pat_reg)
+        self.emit("bl", "_strcmp")
+        self.emit("cmp", Register("x0"), Imm(0))
+
     def compile_match(self, expression, arms):
         """Compile a match statement."""
         if not isinstance(expression, Name):
@@ -592,7 +609,11 @@ class Compiler:
             and isinstance(var.type, type)
             and issubclass(var.type, _types.OptionalType)
         )
-        is_scalar = var is not None and var.type in (_types.Int64, _types.Bool)
+        is_scalar = var is not None and var.type in (
+            _types.Int64,
+            _types.Bool,
+            _types.String,
+        )
 
         if not is_optional and not is_scalar:
             # For enums: load discriminant through pointer
@@ -603,6 +624,13 @@ class Compiler:
         for i, arm in enumerate(arms):
             if isinstance(arm.pattern, IntegerPattern):
                 self.emit("cmp", disc_reg, Imm(arm.pattern.value))
+                self.emit("bne", skip_labels[i])
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+            elif isinstance(arm.pattern, StringPattern):
+                self._emit_strcmp_pattern(disc_reg, arm.pattern)
                 self.emit("bne", skip_labels[i])
                 for stmt in arm.body:
                     self.compile_statement(stmt)
@@ -684,6 +712,15 @@ class Compiler:
         for i, arm in enumerate(node.arms):
             if isinstance(arm.pattern, IntegerPattern):
                 self.emit("cmp", disc_reg, Imm(arm.pattern.value))
+                self.emit("bne", skip_labels[i])
+                val = self.compile_expression(arm.body)
+                self.mov(result_reg, val)
+                if isinstance(val, Register):
+                    self.stack[-1].release_register(val)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+            elif isinstance(arm.pattern, StringPattern):
+                self._emit_strcmp_pattern(disc_reg, arm.pattern)
                 self.emit("bne", skip_labels[i])
                 val = self.compile_expression(arm.body)
                 self.mov(result_reg, val)
