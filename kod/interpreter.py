@@ -225,14 +225,18 @@ class Interpreter:
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value
                             return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.EnumVariantPattern):
+                    elif isinstance(
+                        arm.pattern,
+                        (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern),
+                    ):
                         if (
                             isinstance(value, types.EnumValue)
                             and value.variant_name == arm.pattern.variant_name
                         ):
+                            bindings = getattr(arm.pattern, "bindings", [])
                             field_values = list(value.fields.values())
                             for binding_name, field_value in zip(
-                                arm.pattern.bindings, field_values
+                                bindings, field_values
                             ):
                                 self.stack[-1][binding_name] = field_value
                             return self.evaluate_expression(module, arm.body)
@@ -362,14 +366,18 @@ class Interpreter:
                             for stmt in arm.body:
                                 self.execute_statement(module, stmt)
                             break
-                    elif isinstance(arm.pattern, ast.EnumVariantPattern):
+                    elif isinstance(
+                        arm.pattern,
+                        (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern),
+                    ):
                         if (
                             isinstance(value, types.EnumValue)
                             and value.variant_name == arm.pattern.variant_name
                         ):
+                            bindings = getattr(arm.pattern, "bindings", [])
                             field_values = list(value.fields.values())
                             for binding_name, field_value in zip(
-                                arm.pattern.bindings, field_values
+                                bindings, field_values
                             ):
                                 self.stack[-1][binding_name] = field_value
                             for stmt in arm.body:

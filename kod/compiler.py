@@ -20,6 +20,7 @@ from kod.ast import (
     GenericInstantiation,
     IfStatement,
     ImplicitEnumVariant,
+    ImplicitEnumVariantPattern,
     Import,
     IntegerLiteral,
     IntegerPattern,
@@ -756,15 +757,24 @@ class Compiler:
                     self.compile_statement(stmt)
                 self.emit("b", label.done)
                 self.emit_label(skip_labels[i])
-            elif isinstance(arm.pattern, EnumVariantPattern):
-                enum_type = self.type_registry[arm.pattern.enum_name]
+            elif isinstance(
+                arm.pattern, (EnumVariantPattern, ImplicitEnumVariantPattern)
+            ):
+                if isinstance(arm.pattern, EnumVariantPattern):
+                    enum_type = self.type_registry[arm.pattern.enum_name]
+                else:
+                    enum_type = next(
+                        t
+                        for t in self.type_registry.values()
+                        if hasattr(t, "variants")
+                        and arm.pattern.variant_name in t.variants
+                    )
                 variant_info = enum_type.variants[arm.pattern.variant_name]
                 self.emit("cmp", disc_reg, Imm(variant_info.discriminant))
                 self.emit("bne", skip_labels[i])
                 # bind fields to pre-allocated stack slots via pointer
-                for binding_name, field in zip(
-                    arm.pattern.bindings, variant_info.fields
-                ):
+                bindings = getattr(arm.pattern, "bindings", [])
+                for binding_name, field in zip(bindings, variant_info.fields):
                     field_offset = variant_info.field_offsets[field.id]
                     ptr_reg = self.stack[-1].allocate_register()
                     self.emit("ldr", ptr_reg, enum_addr)  # reload pointer from stack
@@ -823,8 +833,18 @@ class Compiler:
                 if isinstance(val, Register):
                     self.stack[-1].release_register(val)
                 self.emit("b", label.done)
-            elif isinstance(arm.pattern, EnumVariantPattern):
-                enum_type = self.type_registry[arm.pattern.enum_name]
+            elif isinstance(
+                arm.pattern, (EnumVariantPattern, ImplicitEnumVariantPattern)
+            ):
+                if isinstance(arm.pattern, EnumVariantPattern):
+                    enum_type = self.type_registry[arm.pattern.enum_name]
+                else:
+                    enum_type = next(
+                        t
+                        for t in self.type_registry.values()
+                        if hasattr(t, "variants")
+                        and arm.pattern.variant_name in t.variants
+                    )
                 variant_info = enum_type.variants[arm.pattern.variant_name]
                 self.emit("cmp", disc_reg, Imm(variant_info.discriminant))
                 self.emit("bne", skip_labels[i])

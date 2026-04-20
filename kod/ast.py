@@ -566,6 +566,14 @@ class ImplicitEnumVariant(ASTNode):
 
 
 @dataclasses.dataclass
+class ImplicitEnumVariantPattern:
+    """An implicit enum variant pattern in a match arm, e.g. `.North`."""
+
+    variant_name: str
+    span: Span
+
+
+@dataclasses.dataclass
 class Assignment(ASTNode):
     """An assignment."""
 
@@ -864,6 +872,10 @@ class MatchExpressionArm:
                     binding = parser.consume(tokens.Identifier).value
                     parser.consume(tokens.CloseParen)
                 pattern = OptionalSomePattern(binding, span)
+            elif parser.peeking_at(tokens.Dot):
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                pattern = ImplicitEnumVariantPattern(variant_name, span)
             else:
                 enum_name = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
@@ -933,6 +945,10 @@ class MatchArm:
                     binding = parser.consume(tokens.Identifier).value
                     parser.consume(tokens.CloseParen)
                 pattern = OptionalSomePattern(binding, span)
+            elif parser.peeking_at(tokens.Dot):
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                pattern = ImplicitEnumVariantPattern(variant_name, span)
             else:
                 enum_name = parser.consume(tokens.Identifier).value
                 parser.consume(tokens.Dot)
