@@ -855,6 +855,8 @@ class Struct(ASTNode):
             parser.consume(tokens.OpenCurly)
             fields = []
             while not parser.try_consume(tokens.CloseCurly):
+                if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
+                    continue
                 fields.append(Variable.parse(parser))
         return cls(name, fields, span)
 

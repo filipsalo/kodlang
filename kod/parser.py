@@ -116,7 +116,7 @@ class Parser:
             fields = []
             methods = {}
             while not self.try_consume(CloseCurly):
-                if self.try_consume(EOL):
+                if self.try_consume(EOL) or self.try_consume(Comment):
                     continue
                 if self.peeking_at(Func):
                     method = ast.FunctionDeclaration.parse_method(self, name)
@@ -129,7 +129,7 @@ class Parser:
             self.consume(OpenCurly)
             variants = []
             while not self.try_consume(CloseCurly):
-                if self.try_consume(EOL):
+                if self.try_consume(EOL) or self.try_consume(Comment):
                     continue
                 variant_name = self.consume(Identifier).value
                 fields = []
