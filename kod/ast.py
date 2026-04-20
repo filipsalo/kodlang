@@ -753,6 +753,12 @@ class Struct(ASTNode):
 
 
 @dataclasses.dataclass
+class IntegerPattern:
+    value: int
+    span: Span
+
+
+@dataclasses.dataclass
 class WildcardPattern:
     span: Span
 
@@ -786,7 +792,10 @@ class MatchArm:
     def parse(cls, parser: "Parser") -> "MatchArm":
         with parser.span() as span:
             # Parse pattern
-            if parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
+            if parser.peeking_at(tokens.IntegerLiteral):
+                tok = parser.consume(tokens.IntegerLiteral)
+                pattern = IntegerPattern(int(tok.value), span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
                 parser.consume(tokens.Identifier)
                 pattern = WildcardPattern(span)
             elif parser.peeking_at(tokens.NoneLiteral):

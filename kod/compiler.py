@@ -20,6 +20,7 @@ from kod.ast import (
     IfStatement,
     Import,
     IntegerLiteral,
+    IntegerPattern,
     MatchStatement,
     Module,
     Name,
@@ -590,15 +591,23 @@ class Compiler:
             and isinstance(var.type, type)
             and issubclass(var.type, _types.OptionalType)
         )
+        is_scalar = var is not None and var.type in (_types.Int64, _types.Bool)
 
-        if not is_optional:
+        if not is_optional and not is_scalar:
             # For enums: load discriminant through pointer
             self.emit("ldr", disc_reg, StackAddress(0, str(disc_reg)))
 
         skip_labels = [self.create_label("skip") for _ in arms]
 
         for i, arm in enumerate(arms):
-            if isinstance(arm.pattern, WildcardPattern):
+            if isinstance(arm.pattern, IntegerPattern):
+                self.emit("cmp", disc_reg, Imm(arm.pattern.value))
+                self.emit("bne", skip_labels[i])
+                for stmt in arm.body:
+                    self.compile_statement(stmt)
+                self.emit("b", label.done)
+                self.emit_label(skip_labels[i])
+            elif isinstance(arm.pattern, WildcardPattern):
                 for stmt in arm.body:
                     self.compile_statement(stmt)
                 self.emit("b", label.done)
