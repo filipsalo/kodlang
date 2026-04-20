@@ -207,6 +207,8 @@ class Compiler:
 
     def compile(self):
         """Compile the program to assembly"""
+        from kod import values as _types
+
         self.emit(".text")
         for statement in self.program.builtins.body:
             match statement:
@@ -228,9 +230,11 @@ class Compiler:
                 case Import(_, local_name):
                     self.imports[local_name] = statement
                 case TypeDeclaration(_, type_):
-                    if hasattr(type_, "methods"):
+                    if hasattr(type_, "methods") and not isinstance(
+                        type_, _types.GenericTemplate
+                    ):
                         for method in type_.methods.values():
-                            self.compile_function(method)
+                            self.compile_function(method, struct_type=type_)
                 case _:
                     raise ValueError(f"Unexpected statement {statement}")
         self.emit("\n.data")
@@ -249,6 +253,10 @@ class Compiler:
                 lhs.op, Dot
             ):
                 self.compile_field_write(lhs, rhs)
+            case Assignment(lhs, rhs) if isinstance(lhs, BinaryOperator) and isinstance(
+                lhs.op, OpenBracket
+            ):
+                self.compile_subscript_write(lhs, rhs)
             case Assignment(variable, value):
                 self.compile_variable_declaration(variable, value)
             case Return(value):
@@ -269,11 +277,13 @@ class Compiler:
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
-    def compile_function(self, func):
+    def compile_function(self, func, struct_type=None):
         """Compile a function to assembly"""
         self.enter_stack_frame(func)
         if func.struct_name and "self" in self.stack[-1].variables:
-            self.stack[-1].variables["self"].type = self.type_registry[func.struct_name]
+            if struct_type is None:
+                struct_type = self.type_registry.get(func.struct_name)
+            self.stack[-1].variables["self"].type = struct_type
         for statement in func.body:
             self.compile_statement(statement)
         # Implicit return 0 for functions that fall off the end
@@ -317,7 +327,18 @@ class Compiler:
             and isinstance(return_type, type)
             and issubclass(return_type, _types.OptionalType)
         )
-        if is_optional_return and not isinstance(value, NoneLiteral):
+        # If expression is already optional (e.g. returning result of another ?-returning func)
+        expr_type = self._infer_type(value) if value is not None else None
+        expr_already_optional = (
+            expr_type is not None
+            and isinstance(expr_type, type)
+            and issubclass(expr_type, _types.OptionalType)
+        )
+        if (
+            is_optional_return
+            and not isinstance(value, NoneLiteral)
+            and not expr_already_optional
+        ):
             # Compile value first (may call bl), save to stack temp, then arena-alloc
             val = self.compile_expression(value)
             # Save to stack temp to survive any upcoming bl
@@ -555,6 +576,37 @@ class Compiler:
         self.emit("str", val_reg, StackAddress(field_offset, str(ptr_reg)))
         self.stack[-1].release_register(val_reg)
         self.stack[-1].release_register(ptr_reg)
+
+    def compile_subscript_read(self, expression: BinaryOperator) -> "Register":
+        """Compile m[key] by calling op_index on the object."""
+        obj_name = expression.lhs.id
+        var = self.stack[-1].variables[obj_name]
+        method = var.type.methods["op_index"]
+        obj_addr = self.stack[-1].get_variable_address(expression.lhs)
+        self.emit("ldr", self._argregs[0], obj_addr)
+        key_reg = self.compile_expression(expression.rhs)
+        self.mov(self._argregs[1], key_reg)
+        if isinstance(key_reg, Register):
+            self.stack[-1].release_register(key_reg)
+        self.emit("bl", method.label_name)
+        return Register("x0")
+
+    def compile_subscript_write(self, lhs: BinaryOperator, rhs) -> None:
+        """Compile m[key] = value by calling op_index_set on the object."""
+        obj_name = lhs.lhs.id
+        var = self.stack[-1].variables.get(obj_name)
+        method = var.type.methods["op_index_set"]
+        obj_addr = self.stack[-1].get_variable_address(lhs.lhs)
+        self.emit("ldr", self._argregs[0], obj_addr)
+        key_reg = self.compile_expression(lhs.rhs)
+        self.mov(self._argregs[1], key_reg)
+        if isinstance(key_reg, Register):
+            self.stack[-1].release_register(key_reg)
+        val_reg = self.compile_expression(rhs)
+        self.mov(self._argregs[2], val_reg)
+        if isinstance(val_reg, Register):
+            self.stack[-1].release_register(val_reg)
+        self.emit("bl", method.label_name)
 
     def compile_enum_unit_variant(self, expression) -> "Register":
         """Compile a unit enum variant access (e.g. Direction.North) to its discriminant."""
@@ -859,16 +911,11 @@ class Compiler:
         # Optional Some: let x: T? = <non-none value> — wrap in heap allocation
         from kod import values as _types
 
+        expr_type = self._infer_type(expression)
         rhs_already_optional = (
-            isinstance(expression, FunctionCall)
-            and isinstance(expression.callee, Name)
-            and isinstance(
-                getattr(self.functions.get(expression.callee.id), "return_type", None),
-                type,
-            )
-            and issubclass(
-                self.functions[expression.callee.id].return_type, _types.OptionalType
-            )
+            expr_type is not None
+            and isinstance(expr_type, type)
+            and issubclass(expr_type, _types.OptionalType)
         )
 
         if (
@@ -975,6 +1022,16 @@ class Compiler:
                     return self.compile_enum_unit_variant(expression)
                 return self.compile_field_access(expression)
             elif isinstance(expression.op, OpenBracket):
+                if (
+                    isinstance(expression.lhs, Name)
+                    and expression.lhs.id in self.stack[-1].variables
+                    and hasattr(
+                        self.stack[-1].variables[expression.lhs.id].type, "methods"
+                    )
+                    and "op_index"
+                    in self.stack[-1].variables[expression.lhs.id].type.methods
+                ):
+                    return self.compile_subscript_read(expression)
                 return self.compile_index(expression)
             return self.compile_binary_operator(expression)
         elif isinstance(expression, MatchExpression):
@@ -1015,11 +1072,7 @@ class Compiler:
         """Compile expr[i] — byte load for strings, 8-byte load for arrays."""
         from kod import values as _types
 
-        lhs_type = None
-        if isinstance(expression.lhs, Name):
-            var = self.stack[-1].variables.get(expression.lhs.id)
-            if var is not None:
-                lhs_type = var.type
+        lhs_type = self._infer_type(expression.lhs)
 
         ptr = self.compile_expression(expression.lhs)
         idx = self.compile_expression(expression.rhs)
@@ -1189,10 +1242,39 @@ class Compiler:
             var = self.stack[-1].variables.get(expression.id)
             if var is not None:
                 return var.type
-        if isinstance(expression, FunctionCall) and isinstance(expression.callee, Name):
-            func = self.functions.get(expression.callee.id)
-            if func is not None:
-                return getattr(func, "return_type", None)
+        if isinstance(expression, BinaryOperator) and isinstance(expression.op, Dot):
+            obj_type = self._infer_type(expression.lhs)
+            if obj_type is not None and hasattr(obj_type, "struct_fields"):
+                field_name = (
+                    expression.rhs.id if isinstance(expression.rhs, Name) else None
+                )
+                if field_name is not None:
+                    for f in obj_type.struct_fields:
+                        if f.id == field_name:
+                            return f.type
+        if isinstance(expression, BinaryOperator) and isinstance(
+            expression.op, OpenBracket
+        ):
+            obj_type = self._infer_type(expression.lhs)
+            if obj_type is not None and hasattr(obj_type, "methods"):
+                method = obj_type.methods.get("op_index")
+                if method is not None:
+                    return getattr(method, "return_type", None)
+        if isinstance(expression, FunctionCall):
+            if isinstance(expression.callee, Name):
+                func = self.functions.get(expression.callee.id)
+                if func is not None:
+                    return getattr(func, "return_type", None)
+            if (
+                isinstance(expression.callee, BinaryOperator)
+                and isinstance(expression.callee.op, Dot)
+                and isinstance(expression.callee.rhs, Name)
+            ):
+                obj_type = self._infer_type(expression.callee.lhs)
+                if obj_type is not None and hasattr(obj_type, "methods"):
+                    method = obj_type.methods.get(expression.callee.rhs.id)
+                    if method is not None:
+                        return getattr(method, "return_type", None)
         return None
 
     def compile_binary_operator(self, expression):
@@ -1314,20 +1396,25 @@ class Compiler:
             and len(func_call.args) == 1
         ):
             arg_expr = func_call.args.params[0].expression
-            if isinstance(arg_expr, Name):
-                var = self.stack[-1].variables.get(arg_expr.id)
-                if (
-                    var is not None
-                    and isinstance(var.type, type)
-                    and issubclass(var.type, _types.ArrayType)
-                ):
+            arg_type = self._infer_type(arg_expr)
+            if (
+                arg_type is not None
+                and isinstance(arg_type, type)
+                and issubclass(arg_type, _types.ArrayType)
+            ):
+                ptr_reg = self.stack[-1].allocate_register()
+                if isinstance(arg_expr, Name):
                     addr = self.stack[-1].get_variable_address(arg_expr)
-                    ptr_reg = self.stack[-1].allocate_register()
                     self.emit("ldr", ptr_reg, addr)
-                    result = self.stack[-1].allocate_register()
-                    self.emit("ldr", result, StackAddress(8, str(ptr_reg)))
-                    self.stack[-1].release_register(ptr_reg)
-                    return result
+                else:
+                    val = self.compile_expression(arg_expr)
+                    self.mov(ptr_reg, val)
+                    if isinstance(val, Register):
+                        self.stack[-1].release_register(val)
+                result = self.stack[-1].allocate_register()
+                self.emit("ldr", result, StackAddress(8, str(ptr_reg)))
+                self.stack[-1].release_register(ptr_reg)
+                return result
 
         # Detect method call: obj.method(args)
         if (
