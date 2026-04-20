@@ -1,8 +1,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <string.h>
+
 void *arena_alloc(int64_t size);
-int64_t strlen(const char *s);
 
 char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
