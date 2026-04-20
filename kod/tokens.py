@@ -263,6 +263,16 @@ class In(Token):
 
 
 @dataclasses.dataclass
+class Break(Token):
+    """A break token"""
+
+
+@dataclasses.dataclass
+class Continue(Token):
+    """A continue token"""
+
+
+@dataclasses.dataclass
 class BooleanLiteral(Token):
     """A true/false token"""
 

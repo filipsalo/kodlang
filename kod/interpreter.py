@@ -14,6 +14,14 @@ from kod.program import Program
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
 
+class BreakSignal(Exception):
+    """Break out of a loop"""
+
+
+class ContinueSignal(Exception):
+    """Continue to next loop iteration"""
+
+
 class ReturnValue(Exception):
     """Return from a function"""
 
@@ -225,18 +233,32 @@ class Interpreter:
                 )
                 for statement in true_branch if matched else false_branch:
                     self.execute_statement(module, statement)
+            case ast.BreakStatement():
+                raise BreakSignal()
+            case ast.ContinueStatement():
+                raise ContinueSignal()
             case ast.ForStatement(condition, body):
                 while (
                     self.evaluate_expression(module, condition).to_bool().value is True
                 ):
-                    for stmt in body:
-                        self.execute_statement(module, stmt)
+                    try:
+                        for stmt in body:
+                            self.execute_statement(module, stmt)
+                    except BreakSignal:
+                        break
+                    except ContinueSignal:
+                        continue
             case ast.ForEachStatement(binding, iterable, body):
                 array = self.evaluate_expression(module, iterable)
                 for element in array.value:
                     self.stack[-1][binding] = element
-                    for stmt in body:
-                        self.execute_statement(module, stmt)
+                    try:
+                        for stmt in body:
+                            self.execute_statement(module, stmt)
+                    except BreakSignal:
+                        break
+                    except ContinueSignal:
+                        continue
             case ast.MatchStatement(expression, arms):
                 value = self.evaluate_expression(module, expression)
                 for arm in arms:

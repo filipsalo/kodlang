@@ -13,11 +13,13 @@ from kod.tokens import (
     EOF,
     EOL,
     BooleanLiteral,
+    Break,
     CloseBracket,
     CloseCurly,
     CloseParen,
     Comma,
     Comment,
+    Continue,
     Enum,
     Extern,
     For,
@@ -158,6 +160,10 @@ class Parser:
                 stmt = ast.ExternalFunctionDeclaration.parse(self)
             case Func():
                 stmt = ast.FunctionDeclaration.parse(self)
+            case Break():
+                stmt = ast.BreakStatement.parse(self)
+            case Continue():
+                stmt = ast.ContinueStatement.parse(self)
             case Match():
                 stmt = ast.MatchStatement.parse(self)
             case Identifier():

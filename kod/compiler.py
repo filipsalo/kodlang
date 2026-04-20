@@ -9,6 +9,8 @@ from kod.ast import (
     Assignment,
     BinaryOperator,
     BooleanLiteral,
+    BreakStatement,
+    ContinueStatement,
     EnumVariantPattern,
     ExternalFunctionDeclaration,
     ForEachStatement,
@@ -174,6 +176,7 @@ class Compiler:
         self.type_registry: dict[str, type] = {}
         self.strings = {}
         self.stack = []
+        self.loop_labels = []
         self.label_counters = collections.defaultdict(int)
 
     def create_global_label(self, base_name):
@@ -255,6 +258,10 @@ class Compiler:
                 self.compile_for_each_statement(binding, iterable, body)
             case MatchStatement(expression, arms):
                 self.compile_match(expression, arms)
+            case BreakStatement():
+                self.emit("b", self.loop_labels[-1].end)
+            case ContinueStatement():
+                self.emit("b", self.loop_labels[-1].start)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
@@ -428,6 +435,7 @@ class Compiler:
     def compile_for_statement(self, condition, body):
         """Compile a for statement to assembly"""
         label = self.create_label("for")
+        self.loop_labels.append(label)
         self.emit_label(label.start)
         register = self.compile_expression(condition)
         self.emit("cmp", register, Imm(0))
@@ -436,10 +444,18 @@ class Compiler:
             self.compile_statement(statement)
         self.emit("b", label.start)
         self.emit_label(label.end)
+        self.loop_labels.pop()
 
     def compile_for_each_statement(self, binding, iterable, body):
         """Compile a for-each loop over an array"""
         label = self.create_label("foreach")
+
+        # for-each continue target is the increment, not the condition check
+        class _ForeachLabel:
+            start = label.incr
+            end = label.end
+
+        self.loop_labels.append(_ForeachLabel())
         frame = self.stack[-1]
         idx_name = f"__foreach_idx_{binding}"
 
@@ -475,13 +491,15 @@ class Compiler:
         for stmt in body:
             self.compile_statement(stmt)
 
-        # increment index and store back
+        # increment index and store back — continue jumps here
+        self.emit_label(label.incr)
         self.emit("ldr", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
         self.emit("add", idx_reg, idx_reg, Imm(1))
         self.emit("str", idx_reg, frame.get_variable_address(frame.variables[idx_name]))
         self.emit("b", label.start)
         self.emit_label(label.end)
 
+        self.loop_labels.pop()
         frame.release_register(len_reg)
         frame.release_register(ptr_reg)
         frame.release_register(idx_reg)

@@ -686,6 +686,32 @@ class ForEachStatement(ASTNode):
 
 
 @dataclasses.dataclass
+class BreakStatement(ASTNode):
+    """A break statement."""
+
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> "BreakStatement":
+        with parser.span() as span:
+            parser.consume(tokens.Break)
+        return cls(span)
+
+
+@dataclasses.dataclass
+class ContinueStatement(ASTNode):
+    """A continue statement."""
+
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> "ContinueStatement":
+        with parser.span() as span:
+            parser.consume(tokens.Continue)
+        return cls(span)
+
+
+@dataclasses.dataclass
 class TypeDeclaration(ASTNode):
     """A type declaration."""
 
