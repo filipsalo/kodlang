@@ -13,6 +13,7 @@ type TypeKind = enum {
     KOptional
     KEnum(idx: int64)
     KStruct(idx: int64)
+    KArrayStruct(elem_idx: int64)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -22,6 +23,7 @@ type VariantInfo = struct {
     discriminant: int64
     field_names: [str]
     field_offsets: [int64]
+    field_kinds: [TypeKind]
 }
 
 type EnumInfo = struct {
@@ -45,6 +47,7 @@ type StructInfo = struct {
     fields: [FieldInfo]
     method_names: [str]
     method_decl_ids: [int64]
+    method_return_kinds: [TypeKind]
     data_width: int64
     // See EnumInfo.module_prefix.
     module_prefix: str
@@ -229,11 +232,7 @@ type Codegen = struct {
             }
             .VStack(offset) -> {
                 let r: str = self.alloc_reg()
-                if offset < 0 {
-                    self.emit(f"ldr {r}, [fp, #{self.itos(offset)}]")
-                } else {
-                    self.emit(f"ldr {r}, [fp]")
-                }
+                self.emit_ldr(r, offset)
                 return r
             }
             .VStrLbl(page) -> {
@@ -259,11 +258,7 @@ type Codegen = struct {
                 return dest
             }
             .VStack(offset) -> {
-                if offset < 0 {
-                    self.emit(f"ldr {dest}, [fp, #{self.itos(offset)}]")
-                } else {
-                    self.emit(f"ldr {dest}, [fp]")
-                }
+                self.emit_ldr(dest, offset)
                 return dest
             }
             .VStrLbl(page) -> {
@@ -433,7 +428,13 @@ type Codegen = struct {
                 }
                 return .KInt64
             }
-            ast.TypeExpr.Array(inner) -> return .KArray
+            ast.TypeExpr.Array(inner) -> {
+                let ek: TypeKind = self.resolve_type(inner)
+                match ek {
+                    .KStruct(si) -> return TypeKind.KArrayStruct(elem_idx: si)
+                    _ -> return .KArray
+                }
+            }
             ast.TypeExpr.Optional(inner) -> return .KOptional
             ast.TypeExpr.Generic(name, arg) -> {
                 // Generics are erased at codegen — look up the base type.
@@ -485,25 +486,40 @@ type Codegen = struct {
 
 
     func emit_ldr(self, reg: str, anon offset: int64) -> none {
-        if offset < 0 {
-            self.emit(f"ldr {reg}, [fp, #{self.itos(offset)}]")
-        } else {
+        if offset >= 0 {
             self.emit(f"ldr {reg}, [fp]")
+            return
         }
+        if offset >= -256 {
+            self.emit(f"ldr {reg}, [fp, #{self.itos(offset)}]")
+            return
+        }
+        // Out of immediate range — materialise the negative offset first.
+        self.emit(f"mov x16, #{self.itos(0 - offset)}")
+        self.emit(f"sub x16, fp, x16")
+        self.emit(f"ldr {reg}, [x16]")
     }
 
     func emit_str(self, reg: str, anon offset: int64) -> none {
-        if offset < 0 {
-            self.emit(f"str {reg}, [fp, #{self.itos(offset)}]")
-        } else {
+        if offset >= 0 {
             self.emit(f"str {reg}, [fp]")
+            return
         }
+        if offset >= -256 {
+            self.emit(f"str {reg}, [fp, #{self.itos(offset)}]")
+            return
+        }
+        self.emit(f"mov x16, #{self.itos(0 - offset)}")
+        self.emit(f"sub x16, fp, x16")
+        self.emit(f"str {reg}, [x16]")
     }
 
 
-    func register_enum(self, anon decl: ast.Decl, prefix: str) -> none {
+    func register_enum(self, anon decl: ast.Decl, prefix: str, p: parser.Parser) -> none {
         match decl {
             ast.Decl.Enum(name, variants) -> {
+                let saved_p: parser.Parser = self.p
+                self.p = p
                 let vinfos: [VariantInfo] = []
                 let disc: int64 = 0
                 let max_payload: int64 = 0
@@ -512,20 +528,23 @@ type Codegen = struct {
                     let v: ast.EnumVariant = variants[i]
                     let fnames: [str] = []
                     let foffsets: [int64] = []
+                    let fkinds: [TypeKind] = []
                     let j: int64 = 0
                     for j < len(v.fields) {
                         fnames += [v.fields[j].name]
                         foffsets += [j * 8]
+                        fkinds += [self.resolve_type(v.fields[j].typ)]
                         j = j + 1
                     }
                     let payload: int64 = len(v.fields) * 8
                     if payload > max_payload {
                         max_payload = payload
                     }
-                    vinfos += [VariantInfo(name: v.name, discriminant: disc, field_names: fnames, field_offsets: foffsets)]
+                    vinfos += [VariantInfo(name: v.name, discriminant: disc, field_names: fnames, field_offsets: foffsets, field_kinds: fkinds)]
                     disc = disc + 1
                     i = i + 1
                 }
+                self.p = saved_p
                 let dw: int64 = 8 + max_payload
                 self.enums += [EnumInfo(name: name, variants: vinfos, data_width: dw, module_prefix: prefix)]
             }
@@ -549,17 +568,19 @@ type Codegen = struct {
                     offset = offset + 8
                     i = i + 1
                 }
-                self.p = saved_p
                 let mnames: [str] = []
                 let mids: [int64] = []
+                let mrets: [TypeKind] = []
                 let j: int64 = 0
                 for j < len(methods) {
                     let fd: ast.FuncDecl = p.func_decls[methods[j]]
                     mnames += [fd.name]
                     mids += [methods[j]]
+                    mrets += [self.resolve_type(fd.return_typ)]
                     j = j + 1
                 }
-                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, data_width: offset, module_prefix: prefix)]
+                self.p = saved_p
+                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, method_return_kinds: mrets, data_width: offset, module_prefix: prefix)]
             }
             _ -> {}
         }
@@ -571,7 +592,7 @@ type Codegen = struct {
     func register_module_types(self, anon m: ast.Module, prefix: str, p: parser.Parser) -> none {
         let i: int64 = 0
         for i < len(m.decls) {
-            self.register_enum(m.decls[i], prefix: prefix)
+            self.register_enum(m.decls[i], prefix: prefix, p: p)
             self.register_struct(m.decls[i], prefix: prefix, p: p)
             i = i + 1
         }
@@ -621,19 +642,37 @@ type Codegen = struct {
                             }
                         }
                         ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                            let ei: int64 = self.find_enum_idx(enum_name)
+                            let vi: int64 = -1
+                            if ei >= 0 {
+                                vi = self.find_variant_idx(ei, variant_name)
+                            }
                             let j: int64 = 0
                             for j < len(bindings) {
                                 if self.var_declared(bindings[j]) == false {
-                                    self.alloc_var(bindings[j], .KInt64)
+                                    let bkind: TypeKind = .KInt64
+                                    if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                        bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                    }
+                                    self.alloc_var(bindings[j], bkind)
                                 }
                                 j = j + 1
                             }
                         }
                         ast.Pattern.ImplicitEnumPat(variant_name, bindings) -> {
+                            let ei: int64 = self.find_enum_with_variant(variant_name)
+                            let vi: int64 = -1
+                            if ei >= 0 {
+                                vi = self.find_variant_idx(ei, variant_name)
+                            }
                             let j: int64 = 0
                             for j < len(bindings) {
                                 if self.var_declared(bindings[j]) == false {
-                                    self.alloc_var(bindings[j], .KInt64)
+                                    let bkind: TypeKind = .KInt64
+                                    if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                        bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                    }
+                                    self.alloc_var(bindings[j], bkind)
                                 }
                                 j = j + 1
                             }
@@ -687,7 +726,12 @@ type Codegen = struct {
             }
             ast.Stmt.ForEach(name, iter, body) -> {
                 if self.var_declared(name) == false {
-                    self.alloc_var(name, .KInt64)
+                    let ekind: TypeKind = .KInt64
+                    match self.infer_kind(iter) {
+                        .KArrayStruct(elem_idx) -> ekind = TypeKind.KStruct(idx: elem_idx)
+                        _ -> {}
+                    }
+                    self.alloc_var(name, ekind)
                 }
                 let idx_name: str = f"__fi_{name}"
                 if self.var_declared(idx_name) == false {
@@ -710,19 +754,37 @@ type Codegen = struct {
                             }
                         }
                         ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                            let ei: int64 = self.find_enum_idx(enum_name)
+                            let vi: int64 = -1
+                            if ei >= 0 {
+                                vi = self.find_variant_idx(ei, variant_name)
+                            }
                             let j: int64 = 0
                             for j < len(bindings) {
                                 if self.var_declared(bindings[j]) == false {
-                                    self.alloc_var(bindings[j], .KInt64)
+                                    let bkind: TypeKind = .KInt64
+                                    if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                        bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                    }
+                                    self.alloc_var(bindings[j], bkind)
                                 }
                                 j = j + 1
                             }
                         }
                         ast.Pattern.ImplicitEnumPat(variant_name, bindings) -> {
+                            let ei: int64 = self.find_enum_with_variant(variant_name)
+                            let vi: int64 = -1
+                            if ei >= 0 {
+                                vi = self.find_variant_idx(ei, variant_name)
+                            }
                             let j: int64 = 0
                             for j < len(bindings) {
                                 if self.var_declared(bindings[j]) == false {
-                                    self.alloc_var(bindings[j], .KInt64)
+                                    let bkind: TypeKind = .KInt64
+                                    if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                        bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                    }
+                                    self.alloc_var(bindings[j], bkind)
                                 }
                                 j = j + 1
                             }
@@ -835,14 +897,11 @@ type Codegen = struct {
         let ptr_r: str = self.load(ptr_v)
         match self.p.exprs[rhs] {
             ast.Expr.Ident(field_name) -> {
+                // Resolve the struct via infer_kind so chained accesses
+                // (e.g. obj.field, arr[i].field) work, not just Ident lhs.
                 let struct_idx: int64 = -1
-                match self.p.exprs[lhs] {
-                    ast.Expr.Ident(obj_name) -> {
-                        match self.find_var_kind(obj_name) {
-                            .KStruct(idx) -> struct_idx = idx
-                            _ -> {}
-                        }
-                    }
+                match self.infer_kind(lhs) {
+                    .KStruct(idx) -> struct_idx = idx
                     _ -> {}
                 }
                 let field_off: int64 = 0
@@ -850,10 +909,7 @@ type Codegen = struct {
                     field_off = self.find_field_offset(struct_idx, field_name)
                 }
                 let result: str = self.alloc_reg()
-                let tmp: str = self.alloc_reg()
-                self.emit(f"ldr {tmp}, [fp, #{self.itos(self.find_var_offset_by_lhs(lhs))}]")
-                self.emit(f"ldr {result}, [{tmp}, #{self.itos(field_off)}]")
-                self.free_reg(tmp)
+                self.emit(f"ldr {result}, [{ptr_r}, #{self.itos(field_off)}]")
                 self.free_reg(ptr_r)
                 return Val.VReg(name: result)
             }
@@ -905,27 +961,30 @@ type Codegen = struct {
         let ptr_r: str = self.load(ptr_v)
         let idx_r: str = self.load(idx_v)
         let result: str = self.alloc_reg()
+        let array_like: bool = false
         match lhs_kind {
-            .KArray -> {
-                // Normalise negative index: if idx < 0, idx += len.
-                let pos_lbl: str = self.fresh("Lidx_pos")
-                let len_r: str = self.alloc_reg()
-                self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
-                self.emit(f"cmp {idx_r}, #0")
-                self.emit(f"bge {pos_lbl}")
-                self.emit(f"add {idx_r}, {idx_r}, {len_r}")
-                self.emit_label(pos_lbl)
-                self.free_reg(len_r)
+            .KArray -> array_like = true
+            .KArrayStruct(elem_idx) -> array_like = true
+            _ -> {}
+        }
+        if array_like {
+            // Normalise negative index: if idx < 0, idx += len.
+            let pos_lbl: str = self.fresh("Lidx_pos")
+            let len_r: str = self.alloc_reg()
+            self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
+            self.emit(f"cmp {idx_r}, #0")
+            self.emit(f"bge {pos_lbl}")
+            self.emit(f"add {idx_r}, {idx_r}, {len_r}")
+            self.emit_label(pos_lbl)
+            self.free_reg(len_r)
 
-                let hdr: str = self.alloc_reg()
-                self.emit(f"ldr {hdr}, [{ptr_r}]")
-                self.emit(f"lsl {idx_r}, {idx_r}, #3")
-                self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
-                self.free_reg(hdr)
-            }
-            _ -> {
-                self.emit(f"ldrb w{result[1:len(result)]}, [{ptr_r}, {idx_r}]")
-            }
+            let hdr: str = self.alloc_reg()
+            self.emit(f"ldr {hdr}, [{ptr_r}]")
+            self.emit(f"lsl {idx_r}, {idx_r}, #3")
+            self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
+            self.free_reg(hdr)
+        } else {
+            self.emit(f"ldrb w{result[1:len(result)]}, [{ptr_r}, {idx_r}]")
         }
         self.free_reg(ptr_r)
         self.free_reg(idx_r)
@@ -992,16 +1051,28 @@ type Codegen = struct {
                 match lhs_kind {
                     .KStr -> return self.compile_str_concat(lhs_id, rhs_id)
                     .KArray -> return self.compile_arr_concat(lhs_id, rhs_id)
+                    .KArrayStruct(elem_idx) -> return self.compile_arr_concat(lhs_id, rhs_id)
                     _ -> {}
                 }
             }
             _ -> {}
         }
 
+        // Compile both sides, stashing the lhs on the stack across the rhs
+        // compilation so its value survives any bl calls in rhs.
         let lv: Val = self.compile_expr(lhs_id)
+        let lv_r: str = self.load_enum_or_val(lhs_id, lv)
+        let lr: str = self.alloc_reg()
+        if lv_r != lr {
+            self.emit(f"mov {lr}, {lv_r}")
+        }
+        self.free_reg(lv_r)
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {lr}, [sp]")
         let rv: Val = self.compile_expr(rhs_id)
-        let lr: str = self.load_enum_or_val(lhs_id, lv)
         let rr: str = self.load_enum_or_val(rhs_id, rv)
+        self.emit(f"ldr {lr}, [sp]")
+        self.emit("add sp, sp, #16")
         let result: str = self.alloc_reg()
         match op {
             ast.Op.Eq -> {
@@ -1070,9 +1141,16 @@ type Codegen = struct {
 
     func compile_str_eq(self, lhs_id: int64, rhs_id: int64, negate: bool) -> Val {
         let rv: Val = self.compile_expr(rhs_id)
-        let rr: str = self.load(rv)
+        let rr: str = self.alloc_reg()
+        self.mov_to(rr, rv)
+        // Stash rhs to the stack so the lhs compilation (which may bl)
+        // doesn't clobber rr's pool register.
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {rr}, [sp]")
         let lv: Val = self.compile_expr(lhs_id)
         self.mov_to("x0", lv)
+        self.emit(f"ldr {rr}, [sp]")
+        self.emit("add sp, sp, #16")
         self.emit(f"mov x1, {rr}")
         self.free_reg(rr)
         self.emit("bl _strcmp")
@@ -1134,6 +1212,9 @@ type Codegen = struct {
     func compile_array_lit(self, anon elements: [int64]) -> Val {
         let n: int64 = len(elements)
         let item_sz: int64 = 8
+        // Allocate header (24 bytes) and buf, saving both pointers on
+        // the stack so element compilation (which may bl) doesn't
+        // clobber them via pool-register reuse.
         self.emit("sub sp, sp, #16")
         self.emit("mov x0, #24")
         self.emit("bl _arena_alloc")
@@ -1144,18 +1225,24 @@ type Codegen = struct {
         }
         self.emit(f"mov x0, #{self.itos(buf_sz)}")
         self.emit("bl _arena_alloc")
-        let buf_r: str = self.alloc_reg()
-        self.emit(f"mov {buf_r}, x0")
+        self.emit("str x0, [sp, #8]")
         let i: int64 = 0
         for i < n {
             let ev: Val = self.compile_expr(elements[i])
             let er: str = self.load(ev)
+            // Reload buf from stack — any bl in compile_expr above would
+            // have clobbered a pool-register copy.
+            let buf_r: str = self.alloc_reg()
+            self.emit(f"ldr {buf_r}, [sp, #8]")
             self.emit(f"str {er}, [{buf_r}, #{self.itos(i * item_sz)}]")
+            self.free_reg(buf_r)
             self.free_reg(er)
             i = i + 1
         }
         let hdr_r: str = self.alloc_reg()
+        let buf_r: str = self.alloc_reg()
         self.emit(f"ldr {hdr_r}, [sp]")
+        self.emit(f"ldr {buf_r}, [sp, #8]")
         self.emit("add sp, sp, #16")
         self.emit(f"str {buf_r}, [{hdr_r}]")
         let len_r: str = self.alloc_reg()
@@ -1286,6 +1373,11 @@ type Codegen = struct {
                 self.emit(f"ldr {r}, [{r}, #8]")
                 return Val.VReg(name: r)
             }
+            .KArrayStruct(elem_idx) -> {
+                let r: str = self.load(av)
+                self.emit(f"ldr {r}, [{r}, #8]")
+                return Val.VReg(name: r)
+            }
             .KStr -> {
                 self.mov_to("x0", av)
                 self.emit("bl _strlen")
@@ -1302,44 +1394,82 @@ type Codegen = struct {
     func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg]) -> Val {
         let var_kind: TypeKind = self.find_var_kind(obj_name)
         let obj_off: int64 = self.find_var_offset(obj_name)
-        self.emit_ldr("x0", obj_off)
 
         let method_lbl: str = "_unknown_method"
         match var_kind {
             .KStruct(idx) -> {
-                let i: int64 = 0
-                for i < len(self.structs[idx].method_names) {
-                    if self.structs[idx].method_names[i] == method_name {
-                        let fd_id: int64 = self.structs[idx].method_decl_ids[i]
+                let mi: int64 = 0
+                for mi < len(self.structs[idx].method_names) {
+                    if self.structs[idx].method_names[mi] == method_name {
                         method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
-                        i = len(self.structs[idx].method_names)
+                        mi = len(self.structs[idx].method_names)
                     } else {
-                        i = i + 1
+                        mi = mi + 1
                     }
                 }
             }
             _ -> {}
         }
 
+        // Stash self and each compiled arg on the stack so that arg
+        // expressions (which may issue bl calls) don't clobber preceding
+        // values held in x0..x7.
+        let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let n: int64 = len(args) + 1
+        let padded: int64 = n * 8
+        if padded % 16 != 0 {
+            padded = padded + 8
+        }
+        self.emit(f"sub sp, sp, #{self.itos(padded)}")
+        self.emit_ldr("x0", obj_off)
+        self.emit("str x0, [sp]")
         let i: int64 = 0
-        let arg_regs: [str] = ["x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         for i < len(args) {
             let av: Val = self.compile_expr(args[i].value)
-            self.mov_to(arg_regs[i], av)
+            let ar: str = self.load(av)
+            self.emit(f"str {ar}, [sp, #{self.itos((i + 1) * 8)}]")
+            self.free_reg(ar)
             i = i + 1
         }
+        let k: int64 = 0
+        for k < n {
+            self.emit(f"ldr {arg_regs[k]}, [sp, #{self.itos(k * 8)}]")
+            k = k + 1
+        }
+        self.emit(f"add sp, sp, #{self.itos(padded)}")
         self.emit(f"bl {method_lbl}")
         return Val.VReg(name: "x0")
     }
 
     func prepare_args(self, anon args: [ast.CallArg]) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let n: int64 = len(args)
+        if n == 0 {
+            return none
+        }
+        // Reserve 16-byte aligned stack space and stash each compiled arg
+        // there. Compiling an arg may issue bl calls (e.g. into match
+        // expressions, struct/enum construction, array concat) which would
+        // clobber any earlier args we'd already placed into x0..x7.
+        let padded: int64 = n * 8
+        if padded % 16 != 0 {
+            padded = padded + 8
+        }
+        self.emit(f"sub sp, sp, #{self.itos(padded)}")
         let i: int64 = 0
-        for i < len(args) {
+        for i < n {
             let av: Val = self.compile_expr(args[i].value)
-            self.mov_to(arg_regs[i], av)
+            let ar: str = self.load(av)
+            self.emit(f"str {ar}, [sp, #{self.itos(i * 8)}]")
+            self.free_reg(ar)
             i = i + 1
         }
+        let k: int64 = 0
+        for k < n {
+            self.emit(f"ldr {arg_regs[k]}, [sp, #{self.itos(k * 8)}]")
+            k = k + 1
+        }
+        self.emit(f"add sp, sp, #{self.itos(padded)}")
     }
 
     func compile_match_expr(self, subject_id: int64, anon arms: [int64]) -> Val {
@@ -1458,9 +1588,9 @@ type Codegen = struct {
                 return .KInt64
             }
             ast.Expr.Call(callee, args) -> {
-                // Struct or enum constructor: TypeName(...)
                 match self.p.exprs[callee] {
                     ast.Expr.Ident(name) -> {
+                        // Struct or enum constructor: TypeName(...)
                         let si: int64 = self.find_struct_idx(name)
                         if si >= 0 {
                             return TypeKind.KStruct(idx: si)
@@ -1470,6 +1600,37 @@ type Codegen = struct {
                             return TypeKind.KEnum(idx: ei)
                         }
                     }
+                    ast.Expr.Binary(call_lhs, call_op, call_rhs) -> {
+                        // Method call obj.method() — look up the method's
+                        // recorded return type on obj's struct.
+                        match call_op {
+                            ast.Op.Dot -> {
+                                match self.p.exprs[call_lhs] {
+                                    ast.Expr.Ident(obj_name) -> {
+                                        match self.find_var_kind(obj_name) {
+                                            .KStruct(sidx) -> {
+                                                match self.p.exprs[call_rhs] {
+                                                    ast.Expr.Ident(method_name) -> {
+                                                        let mi: int64 = 0
+                                                        for mi < len(self.structs[sidx].method_names) {
+                                                            if self.structs[sidx].method_names[mi] == method_name {
+                                                                return self.structs[sidx].method_return_kinds[mi]
+                                                            }
+                                                            mi = mi + 1
+                                                        }
+                                                    }
+                                                    _ -> {}
+                                                }
+                                            }
+                                            _ -> {}
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
                     _ -> {}
                 }
                 return .KInt64
@@ -1477,6 +1638,26 @@ type Codegen = struct {
             ast.Expr.Binary(lhs, op, rhs) -> {
                 match op {
                     ast.Op.Dot -> {
+                        // Three-part module.Enum.Variant — an enum value.
+                        match self.p.exprs[lhs] {
+                            ast.Expr.Binary(inner_lhs, inner_op, inner_rhs) -> {
+                                match inner_op {
+                                    ast.Op.Dot -> {
+                                        match self.p.exprs[inner_rhs] {
+                                            ast.Expr.Ident(enum_name) -> {
+                                                let ei3: int64 = self.find_enum_idx(enum_name)
+                                                if ei3 >= 0 {
+                                                    return TypeKind.KEnum(idx: ei3)
+                                                }
+                                            }
+                                            _ -> {}
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
                         // EnumName.Variant — an enum value (unit variant).
                         match self.p.exprs[lhs] {
                             ast.Expr.Ident(type_name) -> {
@@ -1505,12 +1686,31 @@ type Codegen = struct {
                             }
                             _ -> {}
                         }
+                        // Generic field access on any struct-valued expression
+                        // (e.g. self.p.type_exprs, arr[i].field).
+                        match self.infer_kind(lhs) {
+                            .KStruct(si2) -> {
+                                match self.p.exprs[rhs] {
+                                    ast.Expr.Ident(field_name2) -> {
+                                        let fi2: int64 = 0
+                                        for fi2 < len(self.structs[si2].fields) {
+                                            if self.structs[si2].fields[fi2].name == field_name2 {
+                                                return self.structs[si2].fields[fi2].kind
+                                            }
+                                            fi2 = fi2 + 1
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
                         return .KInt64
                     }
                     ast.Op.Add -> return self.infer_kind(lhs)
                     ast.Op.Index -> {
                         match self.infer_kind(lhs) {
-                            .KArray -> return .KInt64
+                            .KArrayStruct(elem_idx) -> return TypeKind.KStruct(idx: elem_idx)
                             _ -> return .KInt64
                         }
                     }
@@ -1578,6 +1778,15 @@ type Codegen = struct {
                         }
                     }
                     ast.Expr.Call(callee, args) -> alias = true
+                    ast.Expr.Binary(blhs, bop, brhs) -> {
+                        // Index/field access expressions that yield a struct
+                        // pointer should be aliased, not re-allocated.
+                        match bop {
+                            ast.Op.Index -> alias = true
+                            ast.Op.Dot -> alias = true
+                            _ -> {}
+                        }
+                    }
                     _ -> {}
                 }
                 if alias {
@@ -1590,6 +1799,12 @@ type Codegen = struct {
                 }
             }
             .KArray -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+            }
+            .KArrayStruct(elem_idx) -> {
                 let v: Val = self.compile_expr(value_id)
                 let r: str = self.load(v)
                 self.emit_str(r, dest_off)
@@ -1915,6 +2130,18 @@ type Codegen = struct {
                         self.emit("bl _kod_array_concat")
                         self.emit_str("x0", off)
                     }
+                    .KArrayStruct(elem_idx) -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit(f"mov x0, {lr}")
+                        self.emit(f"mov x1, {rr}")
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                        self.emit("bl _kod_array_concat")
+                        self.emit_str("x0", off)
+                    }
                     .KStr -> {
                         let rv: Val = self.compile_expr(rhs_id)
                         let rr: str = self.load(rv)
@@ -1968,8 +2195,15 @@ type Codegen = struct {
             _ -> {}
         }
         if needs_wrap {
+            // Conditional wrap: if the value is 0 (none), return 0 directly;
+            // otherwise allocate a cell holding the value. This lets a match
+            // expression whose arms include `_ -> none` produce a real none.
             let v: Val = self.compile_expr(value_id)
             let r: str = self.load(v)
+            let skip_lbl: str = self.fresh("Lwrap_skip")
+            let done_lbl: str = self.fresh("Lwrap_done")
+            self.emit(f"cmp {r}, #0")
+            self.emit(f"beq {skip_lbl}")
             self.emit("sub sp, sp, #16")
             self.emit(f"str {r}, [sp]")
             self.free_reg(r)
@@ -1980,6 +2214,10 @@ type Codegen = struct {
             self.emit("add sp, sp, #16")
             self.emit(f"str {tmp}, [x0]")
             self.free_reg(tmp)
+            self.emit(f"b {done_lbl}")
+            self.emit_label(skip_lbl)
+            self.emit("mov x0, #0")
+            self.emit_label(done_lbl)
         } else {
             let v: Val = self.compile_expr(value_id)
             self.mov_to("x0", v)
@@ -2325,7 +2563,7 @@ type Codegen = struct {
 
         let i: int64 = 0
         for i < len(m.decls) {
-            self.register_enum(m.decls[i], prefix: self.path_prefix)
+            self.register_enum(m.decls[i], prefix: self.path_prefix, p: self.p)
             i = i + 1
         }
         let j: int64 = 0
