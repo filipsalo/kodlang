@@ -11,12 +11,11 @@ func str_to_int(anon s: str) -> int64 {
 	return result
 }
 
-// Parse a string token value (with surrounding quotes) into a Kod string,
-// processing escape sequences.
-func parse_string_value(anon raw: str) -> str {
+// Process backslash escape sequences in a raw string body.
+func unescape_str(anon raw: str) -> str {
 	let result: str = ""
-	let i: int64 = 1
-	let end: int64 = len(raw) - 1
+	let i: int64 = 0
+	let end: int64 = len(raw)
 	for i < end {
 		if raw[i] == '\\' and i + 1 < end {
 			i = i + 1
@@ -26,7 +25,10 @@ func parse_string_value(anon raw: str) -> str {
 			if raw[i] == 't' {
 				result = result + "\t"
 			}
-				if raw[i] == '\\' {
+			if raw[i] == 'r' {
+				result = result + "\r"
+			}
+			if raw[i] == '\\' {
 				result = result + "\\"
 			}
 			if raw[i] == '\'' {
@@ -41,6 +43,12 @@ func parse_string_value(anon raw: str) -> str {
 		i = i + 1
 	}
 	return result
+}
+
+// Parse a string token value (with surrounding quotes) into a Kod string,
+// processing escape sequences.
+func parse_string_value(anon raw: str) -> str {
+	return unescape_str(raw[1:len(raw)-1])
 }
 
 type Parser = struct {
@@ -244,6 +252,61 @@ type Parser = struct {
 	}
 
 
+	// Lex and parse a Kod expression from a freshly supplied source string.
+	// Temporarily swaps the parser's token stream so nodes are allocated into
+	// the same pools as the surrounding parse, then restores the position.
+	func parse_expr_substring(self, anon source: str) -> int64 {
+		let sub_lexer: lexer.Lexer = lexer.Lexer(source: source, pos: 0, start: 0)
+		let sub_tokens: [lexer.Token] = sub_lexer.lex()
+		let saved_tokens: [lexer.Token] = self.tokens
+		let saved_pos: int64 = self.pos
+		self.tokens = sub_tokens
+		self.pos = 0
+		let result: int64 = self.parse_expr()
+		self.tokens = saved_tokens
+		self.pos = saved_pos
+		return result
+	}
+
+	// Parse the raw token value of an f-string (including f" and trailing ")
+	// into a left-folded Binary(Add) tree of string concatenations.
+	func parse_fstring(self, anon raw: str) -> int64 {
+		let inner: str = raw[2:len(raw)-1]
+		let parts: [int64] = []
+		let i: int64 = 0
+		for i < len(inner) {
+			let j: int64 = i
+			for j < len(inner) and inner[j] != '{' {
+				j = j + 1
+			}
+			if j > i {
+				let lit: str = unescape_str(inner[i:j])
+				parts += [self.alloc_expr(ast.Expr.StrLit(value: lit))]
+			}
+			if j >= len(inner) {
+				i = j
+			} else {
+				let k: int64 = j + 1
+				for k < len(inner) and inner[k] != '}' {
+					k = k + 1
+				}
+				let expr_text: str = inner[j+1:k]
+				parts += [self.parse_expr_substring(expr_text)]
+				i = k + 1
+			}
+		}
+		if len(parts) == 0 {
+			return self.alloc_expr(ast.Expr.StrLit(value: ""))
+		}
+		let result: int64 = parts[0]
+		let p: int64 = 1
+		for p < len(parts) {
+			result = self.alloc_expr(ast.Expr.Binary(lhs: result, op: ast.Op.Add, rhs: parts[p]))
+			p = p + 1
+		}
+		return result
+	}
+
 	func parse_primary(self) -> int64 {
 		// Unary minus: desugar -x to 0 - x
 		if self.try_consume(.Minus) {
@@ -255,6 +318,11 @@ type Parser = struct {
 		if self.at(.IntegerLit) {
 			let t: lexer.Token = self.advance()
 			return self.alloc_expr(ast.Expr.IntLit(value: str_to_int(t.value)))
+		}
+		// F-string literal
+		if self.at(.FStringLit) {
+			let t: lexer.Token = self.advance()
+			return self.parse_fstring(t.value)
 		}
 		// String literal
 		if self.at(.StringLit) {
