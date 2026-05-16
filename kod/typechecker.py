@@ -233,6 +233,13 @@ class TypeChecker:
         )
         params = self.function_types.get(function_name)
         if params is None:
+            # Struct constructors are valid callees — skip if it's a known type.
+            from kod import values as _types
+
+            if self.current_module:
+                decl = self.current_module.names.get(function_name)
+                if isinstance(decl, type) and issubclass(decl, _types.StructType):
+                    return
             return self.error(
                 "Callee is not a function",
                 function.span,
