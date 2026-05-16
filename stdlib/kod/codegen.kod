@@ -152,7 +152,36 @@ type Codegen = struct {
         putchar('"')
         let j: int64 = 0
         for j < len(value) {
-            putchar(value[j])
+            let c: int64 = value[j]
+            let escaped: bool = false
+            if c == '\n' {
+                putchar('\\')
+                putchar('n')
+                escaped = true
+            }
+            if c == '\t' {
+                putchar('\\')
+                putchar('t')
+                escaped = true
+            }
+            if c == '\r' {
+                putchar('\\')
+                putchar('r')
+                escaped = true
+            }
+            if c == '\\' {
+                putchar('\\')
+                putchar('\\')
+                escaped = true
+            }
+            if c == '"' {
+                putchar('\\')
+                putchar('"')
+                escaped = true
+            }
+            if escaped == false {
+                putchar(c)
+            }
             j = j + 1
         }
         putchar('"')
@@ -549,6 +578,76 @@ type Codegen = struct {
     }
 
 
+    // Walk an expression and allocate stack slots for any bindings that
+    // appear in nested match expressions. Without this, 'Some(x) -> x'
+    // inside a match expression returns 'x' as an unknown var.
+    func collect_expr_vars(self, anon expr_id: int64) -> none {
+        match self.p.exprs[expr_id] {
+            ast.Expr.Binary(lhs, op, rhs) -> {
+                self.collect_expr_vars(lhs)
+                self.collect_expr_vars(rhs)
+            }
+            ast.Expr.Call(callee, args) -> {
+                self.collect_expr_vars(callee)
+                let i: int64 = 0
+                for i < len(args) {
+                    self.collect_expr_vars(args[i].value)
+                    i = i + 1
+                }
+            }
+            ast.Expr.ArrayLit(elements) -> {
+                let i: int64 = 0
+                for i < len(elements) {
+                    self.collect_expr_vars(elements[i])
+                    i = i + 1
+                }
+            }
+            ast.Expr.Slice(s, lo, hi) -> {
+                self.collect_expr_vars(s)
+                self.collect_expr_vars(lo)
+                if hi != 0 {
+                    self.collect_expr_vars(hi)
+                }
+            }
+            ast.Expr.MatchExpr(subject, arms) -> {
+                self.collect_expr_vars(subject)
+                let i: int64 = 0
+                for i < len(arms) {
+                    let arm: ast.MatchExprArm = self.p.match_expr_arms[arms[i]]
+                    match self.p.patterns[arm.pattern] {
+                        ast.Pattern.SomePat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(binding, .KInt64)
+                            }
+                        }
+                        ast.Pattern.EnumPat(enum_name, variant_name, bindings) -> {
+                            let j: int64 = 0
+                            for j < len(bindings) {
+                                if self.var_declared(bindings[j]) == false {
+                                    self.alloc_var(bindings[j], .KInt64)
+                                }
+                                j = j + 1
+                            }
+                        }
+                        ast.Pattern.ImplicitEnumPat(variant_name, bindings) -> {
+                            let j: int64 = 0
+                            for j < len(bindings) {
+                                if self.var_declared(bindings[j]) == false {
+                                    self.alloc_var(bindings[j], .KInt64)
+                                }
+                                j = j + 1
+                            }
+                        }
+                        _ -> {}
+                    }
+                    self.collect_expr_vars(arm.body)
+                    i = i + 1
+                }
+            }
+            _ -> {}
+        }
+    }
+
     func collect_stmt_vars(self, stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
             ast.Stmt.Let(name, typ, value) -> {
@@ -556,8 +655,18 @@ type Codegen = struct {
                     let kind: TypeKind = self.resolve_type(typ)
                     self.alloc_var(name, kind)
                 }
+                self.collect_expr_vars(value)
             }
+            ast.Stmt.Assign(lhs, rhs) -> self.collect_expr_vars(rhs)
+            ast.Stmt.PlusAssign(lhs, rhs) -> self.collect_expr_vars(rhs)
+            ast.Stmt.Return(value) -> {
+                if value != 0 {
+                    self.collect_expr_vars(value)
+                }
+            }
+            ast.Stmt.ExprStmt(expr) -> self.collect_expr_vars(expr)
             ast.Stmt.If(cond, then_body, else_body) -> {
+                self.collect_expr_vars(cond)
                 let i: int64 = 0
                 for i < len(then_body) {
                     self.collect_stmt_vars(then_body[i])
@@ -677,6 +786,35 @@ type Codegen = struct {
     }
 
     func compile_dot(self, lhs: int64, rhs: int64) -> Val {
+        // Three-part: module.Enum.Variant — drop the module qualifier.
+        match self.p.exprs[lhs] {
+            ast.Expr.Binary(inner_lhs, inner_op, inner_rhs) -> {
+                match inner_op {
+                    ast.Op.Dot -> {
+                        match self.p.exprs[inner_rhs] {
+                            ast.Expr.Ident(enum_name) -> {
+                                let ei3: int64 = self.find_enum_idx(enum_name)
+                                if ei3 >= 0 {
+                                    match self.p.exprs[rhs] {
+                                        ast.Expr.Ident(variant_name) -> {
+                                            let vi3: int64 = self.find_variant_idx(ei3, variant_name)
+                                            if vi3 >= 0 {
+                                                let empty3: [ast.CallArg] = []
+                                                return self.compile_enum_construct(ei3, vi3, empty3)
+                                            }
+                                        }
+                                        _ -> {}
+                                    }
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            _ -> {}
+        }
         match self.p.exprs[lhs] {
             ast.Expr.Ident(type_name) -> {
                 let ei: int64 = self.find_enum_idx(type_name)
@@ -1257,6 +1395,33 @@ type Codegen = struct {
                     let disc: int64 = self.enums[ei].variants[vi].discriminant
                     self.emit(f"cmp {disc_r}, #{self.itos(disc)}")
                     self.emit(f"bne {skip_lbl}")
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.NonePat -> {
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"bne {skip_lbl}")
+                    let bv: Val = self.compile_expr(arm.body)
+                    self.mov_to(result_r, bv)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                ast.Pattern.SomePat(binding) -> {
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"beq {skip_lbl}")
+                    if len(binding) > 0 {
+                        let boff: int64 = self.find_var_offset(binding)
+                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
+                        let ptr_r: str = self.alloc_reg()
+                        self.emit_ldr(ptr_r, subj_off)
+                        let val_r: str = self.alloc_reg()
+                        self.emit(f"ldr {val_r}, [{ptr_r}]")
+                        self.emit_str(val_r, boff)
+                        self.free_reg(val_r)
+                        self.free_reg(ptr_r)
+                    }
                     let bv: Val = self.compile_expr(arm.body)
                     self.mov_to(result_r, bv)
                     self.emit(f"b {done_lbl}")
