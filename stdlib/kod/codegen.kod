@@ -15,6 +15,10 @@ type EnumInfo = struct {
     name: str
     variants: [VariantInfo]
     data_width: int64
+    // Module prefix used to mangle this enum's method/value labels.
+    // Local enums use the current module's prefix; imported ones use
+    // the source module's prefix (e.g. "builtins").
+    module_prefix: str
 }
 
 type FieldInfo = struct {
@@ -28,6 +32,8 @@ type StructInfo = struct {
     method_names: [str]
     method_decl_ids: [int64]
     data_width: int64
+    // See EnumInfo.module_prefix.
+    module_prefix: str
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
@@ -74,6 +80,14 @@ type Codegen = struct {
 
     enums: [EnumInfo]
     structs: [StructInfo]
+
+    // Type-alias maps: `type X = Y` adds an entry pointing X's name to
+    // Y's struct/enum index. find_struct_idx / find_enum_idx consult
+    // these before searching the main lists.
+    struct_alias_name: [str]
+    struct_alias_target: [int64]
+    enum_alias_name: [str]
+    enum_alias_target: [int64]
 
     import_local: [str]
     import_prefix: [str]
@@ -286,6 +300,13 @@ type Codegen = struct {
 
 
     func find_enum_idx(self, anon name: str) -> int64 {
+        let a: int64 = 0
+        for a < len(self.enum_alias_name) {
+            if self.enum_alias_name[a] == name {
+                return self.enum_alias_target[a]
+            }
+            a = a + 1
+        }
         let i: int64 = 0
         for i < len(self.enums) {
             if self.enums[i].name == name {
@@ -297,6 +318,13 @@ type Codegen = struct {
     }
 
     func find_struct_idx(self, anon name: str) -> int64 {
+        let a: int64 = 0
+        for a < len(self.struct_alias_name) {
+            if self.struct_alias_name[a] == name {
+                return self.struct_alias_target[a]
+            }
+            a = a + 1
+        }
         let i: int64 = 0
         for i < len(self.structs) {
             if self.structs[i].name == name {
@@ -441,7 +469,7 @@ type Codegen = struct {
     }
 
 
-    func register_enum(self, anon decl: ast.Decl) -> none {
+    func register_enum(self, anon decl: ast.Decl, prefix: str) -> none {
         match decl {
             ast.Decl.Enum(name, variants) -> {
                 let vinfos: [VariantInfo] = []
@@ -467,13 +495,13 @@ type Codegen = struct {
                     i = i + 1
                 }
                 let dw: int64 = 8 + max_payload
-                self.enums += [EnumInfo(name: name, variants: vinfos, data_width: dw)]
+                self.enums += [EnumInfo(name: name, variants: vinfos, data_width: dw, module_prefix: prefix)]
             }
             _ -> {}
         }
     }
 
-    func register_struct(self, anon decl: ast.Decl) -> none {
+    func register_struct(self, anon decl: ast.Decl, prefix: str, p: parser.Parser) -> none {
         match decl {
             ast.Decl.Struct(name, fields, methods) -> {
                 let finfos: [FieldInfo] = []
@@ -488,14 +516,26 @@ type Codegen = struct {
                 let mids: [int64] = []
                 let j: int64 = 0
                 for j < len(methods) {
-                    let fd: ast.FuncDecl = self.p.func_decls[methods[j]]
+                    let fd: ast.FuncDecl = p.func_decls[methods[j]]
                     mnames += [fd.name]
                     mids += [methods[j]]
                     j = j + 1
                 }
-                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, data_width: offset)]
+                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, data_width: offset, module_prefix: prefix)]
             }
             _ -> {}
+        }
+    }
+
+    // Register all struct and enum declarations from another module under the
+    // given prefix (e.g. "builtins"). Doesn't emit any code for them — just
+    // makes their names and methods visible for label resolution.
+    func register_module_types(self, anon m: ast.Module, prefix: str, p: parser.Parser) -> none {
+        let i: int64 = 0
+        for i < len(m.decls) {
+            self.register_enum(m.decls[i], prefix: prefix)
+            self.register_struct(m.decls[i], prefix: prefix, p: p)
+            i = i + 1
         }
     }
 
@@ -677,6 +717,34 @@ type Codegen = struct {
 
     func compile_index(self, lhs: int64, rhs: int64) -> Val {
         let lhs_kind: TypeKind = self.infer_kind(lhs)
+        // Struct with op_index — dispatch as a method call.
+        match lhs_kind {
+            .KStruct(idx) -> {
+                let mi: int64 = 0
+                let found: bool = false
+                for mi < len(self.structs[idx].method_names) {
+                    if self.structs[idx].method_names[mi] == "op_index" {
+                        found = true
+                        mi = len(self.structs[idx].method_names)
+                    } else {
+                        mi = mi + 1
+                    }
+                }
+                if found {
+                    let kv: Val = self.compile_expr(rhs)
+                    let kr: str = self.alloc_reg()
+                    self.mov_to(kr, kv)
+                    let ov: Val = self.compile_expr(lhs)
+                    self.mov_to("x0", ov)
+                    self.emit(f"mov x1, {kr}")
+                    self.free_reg(kr)
+                    let method_lbl: str = f"${self.structs[idx].module_prefix}${self.structs[idx].name}$op_index"
+                    self.emit(f"bl {method_lbl}")
+                    return Val.VReg(name: "x0")
+                }
+            }
+            _ -> {}
+        }
         let ptr_v: Val = self.compile_expr(lhs)
         let idx_v: Val = self.compile_expr(rhs)
         let ptr_r: str = self.load(ptr_v)
@@ -1047,7 +1115,7 @@ type Codegen = struct {
                 for i < len(self.structs[idx].method_names) {
                     if self.structs[idx].method_names[i] == method_name {
                         let fd_id: int64 = self.structs[idx].method_decl_ids[i]
-                        method_lbl = f"${self.path_prefix}${self.structs[idx].name}${method_name}"
+                        method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
                         i = len(self.structs[idx].method_names)
                     } else {
                         i = i + 1
@@ -1521,19 +1589,62 @@ type Codegen = struct {
                     ast.Op.Index -> {
                         match self.p.exprs[lhs2] {
                             ast.Expr.Ident(arr_name) -> {
-                                let arr_off: int64 = self.find_var_offset(arr_name)
-                                let idx_v: Val = self.compile_expr(rhs2)
-                                let idx_r: str = self.load(idx_v)
-                                let rhs_v: Val = self.compile_expr(rhs_id)
-                                let rhs_r: str = self.load(rhs_v)
-                                let ptr_r: str = self.alloc_reg()
-                                self.emit_ldr(ptr_r, arr_off)
-                                self.emit(f"ldr {ptr_r}, [{ptr_r}]")
-                                self.emit(f"lsl {idx_r}, {idx_r}, #3")
-                                self.emit(f"str {rhs_r}, [{ptr_r}, {idx_r}]")
-                                self.free_reg(ptr_r)
-                                self.free_reg(idx_r)
-                                self.free_reg(rhs_r)
+                                // Struct with op_index_set — dispatch as a
+                                // method call: target[key] = value.
+                                let var_kind: TypeKind = self.find_var_kind(arr_name)
+                                let struct_idx: int64 = -1
+                                match var_kind {
+                                    .KStruct(si) -> struct_idx = si
+                                    _ -> {}
+                                }
+                                let has_setter: bool = false
+                                if struct_idx >= 0 {
+                                    let mi: int64 = 0
+                                    for mi < len(self.structs[struct_idx].method_names) {
+                                        if self.structs[struct_idx].method_names[mi] == "op_index_set" {
+                                            has_setter = true
+                                            mi = len(self.structs[struct_idx].method_names)
+                                        } else {
+                                            mi = mi + 1
+                                        }
+                                    }
+                                }
+                                if has_setter {
+                                    // Compile rhs first (clean register state),
+                                    // stash on the stack, then compile key,
+                                    // restore rhs into x2.
+                                    let rhs_v: Val = self.compile_expr(rhs_id)
+                                    let rhs_r: str = self.alloc_reg()
+                                    self.mov_to(rhs_r, rhs_v)
+                                    self.emit("sub sp, sp, #16")
+                                    self.emit(f"str {rhs_r}, [sp]")
+                                    self.free_reg(rhs_r)
+                                    let kv: Val = self.compile_expr(rhs2)
+                                    let kr: str = self.alloc_reg()
+                                    self.mov_to(kr, kv)
+                                    let arr_off: int64 = self.find_var_offset(arr_name)
+                                    self.emit_ldr("x0", arr_off)
+                                    self.emit(f"mov x1, {kr}")
+                                    self.free_reg(kr)
+                                    self.emit("ldr x2, [sp]")
+                                    self.emit("add sp, sp, #16")
+                                    let method_lbl: str = f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
+                                    self.emit(f"bl {method_lbl}")
+                                } else {
+                                    let arr_off: int64 = self.find_var_offset(arr_name)
+                                    let idx_v: Val = self.compile_expr(rhs2)
+                                    let idx_r: str = self.load(idx_v)
+                                    let rhs_v: Val = self.compile_expr(rhs_id)
+                                    let rhs_r: str = self.load(rhs_v)
+                                    let ptr_r: str = self.alloc_reg()
+                                    self.emit_ldr(ptr_r, arr_off)
+                                    self.emit(f"ldr {ptr_r}, [{ptr_r}]")
+                                    self.emit(f"lsl {idx_r}, {idx_r}, #3")
+                                    self.emit(f"str {rhs_r}, [{ptr_r}, {idx_r}]")
+                                    self.free_reg(ptr_r)
+                                    self.free_reg(idx_r)
+                                    self.free_reg(rhs_r)
+                                }
                             }
                             _ -> {}
                         }
@@ -1958,13 +2069,35 @@ type Codegen = struct {
 
         let i: int64 = 0
         for i < len(m.decls) {
-            self.register_enum(m.decls[i])
+            self.register_enum(m.decls[i], prefix: self.path_prefix)
             i = i + 1
         }
         let j: int64 = 0
         for j < len(m.decls) {
-            self.register_struct(m.decls[j])
+            self.register_struct(m.decls[j], prefix: self.path_prefix, p: self.p)
             j = j + 1
+        }
+        // Process type aliases now that base types are registered.
+        let a: int64 = 0
+        for a < len(m.decls) {
+            match m.decls[a] {
+                ast.Decl.TypeAlias(name, target) -> {
+                    let kind: TypeKind = self.resolve_type(target)
+                    match kind {
+                        .KStruct(idx) -> {
+                            self.struct_alias_name += [name]
+                            self.struct_alias_target += [idx]
+                        }
+                        .KEnum(idx) -> {
+                            self.enum_alias_name += [name]
+                            self.enum_alias_target += [idx]
+                        }
+                        _ -> {}
+                    }
+                }
+                _ -> {}
+            }
+            a = a + 1
         }
 
         let k: int64 = 0
@@ -2077,6 +2210,10 @@ type Codegen = struct {
 func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let enums: [EnumInfo] = []
     let structs: [StructInfo] = []
+    let struct_alias_name: [str] = []
+    let struct_alias_target: [int64] = []
+    let enum_alias_name: [str] = []
+    let enum_alias_target: [int64] = []
     let import_local: [str] = []
     let import_prefix: [str] = []
     let import_fn_module: [str] = []
@@ -2089,5 +2226,5 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let func_names: [str] = []
     let func_labels: [str] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
 }
