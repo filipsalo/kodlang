@@ -137,10 +137,13 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
     for path in sorted(test_dir.glob("**/*.kod")):
         _, expects = parse_example(path)
+        mode = expects.get("mode", "both").strip()
+        if mode == "skip":
+            continue
         if "errors" in expects:
             yield pytest.param(compile_to_assembly, path, expects, id=f"{path} compile")
         else:
-            if expects.get("mode", "both").strip() != "interpret":
+            if mode != "interpret":
                 yield pytest.param(run_compiled, path, expects, id=f"{path} run")
             yield pytest.param(run_interpreted, path, expects, id=f"{path} interpret")
 
