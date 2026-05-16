@@ -168,9 +168,13 @@ type Parser = struct {
 			let inner: int64 = self.alloc_type(ast.TypeExpr.Named(name: name))
 			return self.alloc_type(ast.TypeExpr.Optional(inner: inner))
 		}
-		// Generic: T[U] (single type arg for now)
+		// Generic: T[U] or T[U, V, ...]. Codegen erases type args, so we
+		// only retain the first for the AST node and discard the rest.
 		if self.try_consume(.OpenBracket) {
 			let arg: int64 = self.parse_type_expr()
+			for self.try_consume(.Comma) {
+				self.parse_type_expr()
+			}
 			self.expect(.CloseBracket)
 			return self.alloc_type(ast.TypeExpr.Generic(name: name, arg: arg))
 		}
@@ -427,7 +431,8 @@ type Parser = struct {
 				let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field))
 				lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Dot, rhs: rhs))
 			}
-			// Index or slice: expr[idx] or expr[lo:hi]
+			// Index, slice, or generic constructor: expr[idx], expr[lo:hi],
+			// or Type[A, B](...) — the last form erases the type args.
 			if self.at(.OpenBracket) {
 				self.advance()
 				let lo: int64 = self.parse_expr()
@@ -439,8 +444,25 @@ type Parser = struct {
 					self.expect(.CloseBracket)
 					lhs = self.alloc_expr(ast.Expr.Slice(s: lhs, lo: lo, hi: hi))
 				} else {
-					self.expect(.CloseBracket)
-					lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Index, rhs: lo))
+					if self.try_consume(.Comma) {
+						// Multi-arg generic type instantiation: Type[A, B](...)
+						// Discard remaining type args; lhs stays unchanged so
+						// the following ( triggers a regular Call.
+						for self.peek_kind() != .CloseBracket and self.peek_kind() != .EOF {
+							self.parse_expr()
+							if self.try_consume(.Comma) == false {
+								break
+							}
+						}
+						self.expect(.CloseBracket)
+					} else {
+						self.expect(.CloseBracket)
+						if self.at(.OpenParen) {
+							// Single-arg generic constructor Type[A](...) — erase.
+						} else {
+							lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Index, rhs: lo))
+						}
+					}
 				}
 			}
 		}
@@ -732,6 +754,17 @@ type Parser = struct {
 		// type Name = struct { } or enum { }
 		if self.try_consume(.KwType) {
 			let name: str = self.expect_identifier()
+			// Optional generic params: type Name[A, B, ...] = ...
+			// Codegen erases type params; consume and discard the names.
+			if self.try_consume(.OpenBracket) {
+				for self.peek_kind() != .CloseBracket and self.peek_kind() != .EOF {
+					self.expect_identifier()
+					if self.try_consume(.Comma) == false {
+						break
+					}
+				}
+				self.expect(.CloseBracket)
+			}
 			self.expect(.Equal)
 			if self.try_consume(.KwStruct) {
 				self.expect(.OpenCurly)
