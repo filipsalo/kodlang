@@ -88,6 +88,7 @@ type Codegen = struct {
     vars: [VarSlot]
     frame_slots: int64
     ret_lbl: str
+    return_kind: TypeKind
 
     free_regs: [str]
 
@@ -585,8 +586,8 @@ type Codegen = struct {
             ast.Expr.ImplicitVariant(name) -> {
                 let ei: int64 = self.find_enum_with_variant(name)
                 let vi: int64 = self.find_variant_idx(ei, name)
-                let disc: int64 = self.enums[ei].variants[vi].discriminant
-                return Val.VImm(value: disc)
+                let empty: [ast.CallArg] = []
+                return self.compile_enum_construct(ei, vi, empty)
             }
             ast.Expr.Binary(lhs, op, rhs) -> return self.compile_binary(lhs, op, rhs)
             ast.Expr.Call(callee, args) -> return self.compile_call(callee, args)
@@ -615,8 +616,8 @@ type Codegen = struct {
                     match self.p.exprs[rhs] {
                         ast.Expr.Ident(variant_name) -> {
                             let vi: int64 = self.find_variant_idx(ei, variant_name)
-                            let disc: int64 = self.enums[ei].variants[vi].discriminant
-                            return Val.VImm(value: disc)
+                            let empty: [ast.CallArg] = []
+                            return self.compile_enum_construct(ei, vi, empty)
                         }
                         _ -> {}
                     }
@@ -823,16 +824,11 @@ type Codegen = struct {
     }
 
     func load_enum_or_val(self, expr_id: int64, anon v: Val) -> str {
-        match self.p.exprs[expr_id] {
-            ast.Expr.Ident(name) -> {
-                match self.find_var_kind(name) {
-                    .KEnum(idx) -> {
-                        let r: str = self.load(v)
-                        self.emit(f"ldr {r}, [{r}]")
-                        return r
-                    }
-                    _ -> return self.load(v)
-                }
+        match self.infer_kind(expr_id) {
+            .KEnum(idx) -> {
+                let r: str = self.load(v)
+                self.emit(f"ldr {r}, [{r}]")
+                return r
             }
             _ -> return self.load(v)
         }
@@ -955,6 +951,14 @@ type Codegen = struct {
                             ast.Expr.Ident(mod_or_obj) -> {
                                 match self.p.exprs[rhs] {
                                     ast.Expr.Ident(method_name) -> {
+                                        // EnumName.Variant(args) — payload constructor
+                                        let enum_idx: int64 = self.find_enum_idx(mod_or_obj)
+                                        if enum_idx >= 0 {
+                                            let variant_idx: int64 = self.find_variant_idx(enum_idx, method_name)
+                                            if variant_idx >= 0 {
+                                                return self.compile_enum_construct(enum_idx, variant_idx, args)
+                                            }
+                                        }
                                         let is_import: bool = false
                                         let i: int64 = 0
                                         for i < len(self.import_local) {
@@ -1139,8 +1143,28 @@ type Codegen = struct {
             ast.Expr.Ident(name) -> return self.find_var_kind(name)
             ast.Expr.ArrayLit(elements) -> return .KArray
             ast.Expr.Slice(s, lo, hi) -> return .KStr
+            ast.Expr.ImplicitVariant(name) -> {
+                let ei: int64 = self.find_enum_with_variant(name)
+                if ei >= 0 {
+                    return TypeKind.KEnum(idx: ei)
+                }
+                return .KInt64
+            }
             ast.Expr.Binary(lhs, op, rhs) -> {
                 match op {
+                    ast.Op.Dot -> {
+                        // EnumName.Variant — an enum value (unit variant).
+                        match self.p.exprs[lhs] {
+                            ast.Expr.Ident(type_name) -> {
+                                let ei: int64 = self.find_enum_idx(type_name)
+                                if ei >= 0 {
+                                    return TypeKind.KEnum(idx: ei)
+                                }
+                            }
+                            _ -> {}
+                        }
+                        return .KInt64
+                    }
                     ast.Op.Add -> return self.infer_kind(lhs)
                     ast.Op.Index -> {
                         match self.infer_kind(lhs) {
@@ -1209,31 +1233,40 @@ type Codegen = struct {
                 self.free_reg(r)
             }
             .KOptional -> {
+                let needs_wrap: bool = true
                 match self.p.exprs[value_id] {
-                    ast.Expr.NoneLit -> {
-                        let r: str = self.alloc_reg()
-                        self.emit(f"mov {r}, #0")
-                        self.emit_str(r, dest_off)
-                        self.free_reg(r)
+                    ast.Expr.NoneLit -> needs_wrap = false
+                    ast.Expr.Call(callee, args) -> needs_wrap = false
+                    ast.Expr.Ident(name) -> {
+                        match self.find_var_kind(name) {
+                            .KOptional -> needs_wrap = false
+                            _ -> {}
+                        }
                     }
-                    _ -> {
-                        let vv: Val = self.compile_expr(value_id)
-                        let vr: str = self.load(vv)
-                        self.emit("sub sp, sp, #16")
-                        self.emit(f"str {vr}, [sp]")
-                        self.free_reg(vr)
-                        self.emit("mov x0, #8")
-                        self.emit("bl _arena_alloc")
-                        let pr: str = self.alloc_reg()
-                        self.emit(f"mov {pr}, x0")
-                        self.emit_str(pr, dest_off)
-                        let tmp: str = self.alloc_reg()
-                        self.emit(f"ldr {tmp}, [sp]")
-                        self.emit("add sp, sp, #16")
-                        self.emit(f"str {tmp}, [{pr}]")
-                        self.free_reg(tmp)
-                        self.free_reg(pr)
-                    }
+                    _ -> {}
+                }
+                if needs_wrap == false {
+                    let vv: Val = self.compile_expr(value_id)
+                    let vr: str = self.load(vv)
+                    self.emit_str(vr, dest_off)
+                    self.free_reg(vr)
+                } else {
+                    let vv: Val = self.compile_expr(value_id)
+                    let vr: str = self.load(vv)
+                    self.emit("sub sp, sp, #16")
+                    self.emit(f"str {vr}, [sp]")
+                    self.free_reg(vr)
+                    self.emit("mov x0, #8")
+                    self.emit("bl _arena_alloc")
+                    let pr: str = self.alloc_reg()
+                    self.emit(f"mov {pr}, x0")
+                    self.emit_str(pr, dest_off)
+                    let tmp: str = self.alloc_reg()
+                    self.emit(f"ldr {tmp}, [sp]")
+                    self.emit("add sp, sp, #16")
+                    self.emit(f"str {tmp}, [{pr}]")
+                    self.free_reg(tmp)
+                    self.free_reg(pr)
                 }
             }
             _ -> {
@@ -1245,15 +1278,51 @@ type Codegen = struct {
         }
     }
 
+    // Allocate an enum value on the arena and return its pointer in x0.
+    // field_args supplies payload values (empty for unit variants).
+    func compile_enum_construct(self, ei: int64, vi: int64, anon field_args: [ast.CallArg]) -> Val {
+        let dw: int64 = self.enums[ei].data_width
+        let disc: int64 = self.enums[ei].variants[vi].discriminant
+        self.emit(f"mov x0, #{self.itos(dw)}")
+        self.emit("bl _arena_alloc")
+        let ptr_r: str = self.alloc_reg()
+        self.emit(f"mov {ptr_r}, x0")
+        let disc_r: str = self.alloc_reg()
+        self.emit(f"mov {disc_r}, #{self.itos(disc)}")
+        self.emit(f"str {disc_r}, [{ptr_r}]")
+        self.free_reg(disc_r)
+        if len(field_args) > 0 {
+            let vinfo: VariantInfo = self.enums[ei].variants[vi]
+            let i: int64 = 0
+            for i < len(field_args) {
+                let foff: int64 = vinfo.field_offsets[i]
+                // Stash ptr_r across the call so it survives any bl in the
+                // field expression.
+                self.emit("sub sp, sp, #16")
+                self.emit(f"str {ptr_r}, [sp]")
+                let fv: Val = self.compile_expr(field_args[i].value)
+                let fr: str = self.load(fv)
+                self.emit(f"ldr {ptr_r}, [sp]")
+                self.emit("add sp, sp, #16")
+                self.emit(f"str {fr}, [{ptr_r}, #{self.itos(8 + foff)}]")
+                self.free_reg(fr)
+                i = i + 1
+            }
+        }
+        self.emit(f"mov x0, {ptr_r}")
+        self.free_reg(ptr_r)
+        return Val.VReg(name: "x0")
+    }
+
     func emit_enum_alloc(self, enum_idx: int64, value_id: int64, dest_off: int64) -> none {
-        let dw: int64 = self.enums[enum_idx].data_width
-        let disc: int64 = 0
-        let field_args: [ast.CallArg] = []
+        // Detect direct enum construction patterns and route through
+        // compile_enum_construct; otherwise compile the expression and store
+        // its (pointer) result.
         let variant_idx: int64 = -1
+        let field_args: [ast.CallArg] = []
         match self.p.exprs[value_id] {
             ast.Expr.ImplicitVariant(variant_name) -> {
                 variant_idx = self.find_variant_idx(enum_idx, variant_name)
-                disc = self.enums[enum_idx].variants[variant_idx].discriminant
             }
             ast.Expr.Binary(lhs, op, rhs) -> {
                 match op {
@@ -1261,7 +1330,6 @@ type Codegen = struct {
                         match self.p.exprs[rhs] {
                             ast.Expr.Ident(variant_name) -> {
                                 variant_idx = self.find_variant_idx(enum_idx, variant_name)
-                                disc = self.enums[enum_idx].variants[variant_idx].discriminant
                             }
                             _ -> {}
                         }
@@ -1277,7 +1345,6 @@ type Codegen = struct {
                                 match self.p.exprs[rhs] {
                                     ast.Expr.Ident(variant_name) -> {
                                         variant_idx = self.find_variant_idx(enum_idx, variant_name)
-                                        disc = self.enums[enum_idx].variants[variant_idx].discriminant
                                         field_args = call_args
                                     }
                                     _ -> {}
@@ -1289,39 +1356,17 @@ type Codegen = struct {
                     _ -> {}
                 }
             }
-            _ -> {
-                let v: Val = self.compile_expr(value_id)
-                let r: str = self.load(v)
-                self.emit_str(r, dest_off)
-                self.free_reg(r)
-                return none
-            }
+            _ -> {}
         }
-        self.emit(f"mov x0, #{self.itos(dw)}")
-        self.emit("bl _arena_alloc")
-        let ptr_r: str = self.alloc_reg()
-        self.emit(f"mov {ptr_r}, x0")
-        self.emit_str(ptr_r, dest_off)
-        let disc_r: str = self.alloc_reg()
-        self.emit(f"mov {disc_r}, #{self.itos(disc)}")
-        self.emit(f"str {disc_r}, [{ptr_r}]")
-        self.free_reg(disc_r)
         if variant_idx >= 0 {
-            let vinfo: VariantInfo = self.enums[enum_idx].variants[variant_idx]
-            let i: int64 = 0
-            for i < len(field_args) {
-                let foff: int64 = vinfo.field_offsets[i]
-                let fv: Val = self.compile_expr(field_args[i].value)
-                let fr: str = self.load(fv)
-                let pr2: str = self.alloc_reg()
-                self.emit_ldr(pr2, dest_off)
-                self.emit(f"str {fr}, [{pr2}, #{self.itos(8 + foff)}]")
-                self.free_reg(fr)
-                self.free_reg(pr2)
-                i = i + 1
-            }
+            let v: Val = self.compile_enum_construct(enum_idx, variant_idx, field_args)
+            self.emit_str("x0", dest_off)
+        } else {
+            let v: Val = self.compile_expr(value_id)
+            let r: str = self.load(v)
+            self.emit_str(r, dest_off)
+            self.free_reg(r)
         }
-        self.free_reg(ptr_r)
     }
 
     func emit_struct_alloc(self, struct_idx: int64, value_id: int64, dest_off: int64) -> none {
@@ -1466,6 +1511,40 @@ type Codegen = struct {
     func compile_return(self, anon value_id: int64) -> none {
         if value_id == 0 {
             self.emit("mov x0, #0")
+            self.emit(f"b {self.ret_lbl}")
+            return
+        }
+        // If returning into an optional and the value isn't already optional
+        // (NoneLit/Call/Optional variable), wrap it in an arena allocation.
+        let needs_wrap: bool = false
+        match self.return_kind {
+            .KOptional -> {
+                match self.p.exprs[value_id] {
+                    ast.Expr.NoneLit -> {}
+                    ast.Expr.Call(callee, args) -> {}
+                    _ -> {
+                        match self.infer_kind(value_id) {
+                            .KOptional -> {}
+                            _ -> needs_wrap = true
+                        }
+                    }
+                }
+            }
+            _ -> {}
+        }
+        if needs_wrap {
+            let v: Val = self.compile_expr(value_id)
+            let r: str = self.load(v)
+            self.emit("sub sp, sp, #16")
+            self.emit(f"str {r}, [sp]")
+            self.free_reg(r)
+            self.emit("mov x0, #8")
+            self.emit("bl _arena_alloc")
+            let tmp: str = self.alloc_reg()
+            self.emit(f"ldr {tmp}, [sp]")
+            self.emit("add sp, sp, #16")
+            self.emit(f"str {tmp}, [x0]")
+            self.free_reg(tmp)
         } else {
             let v: Val = self.compile_expr(value_id)
             self.mov_to("x0", v)
@@ -1752,6 +1831,7 @@ type Codegen = struct {
             func_lbl = f"${self.path_prefix}${struct_name}${fd.name}"
         }
         self.ret_lbl = f"{func_lbl}$end"
+        self.return_kind = self.resolve_type(fd.return_typ)
 
         self.emit_globl(func_lbl)
         self.emit_label(func_lbl)
@@ -1918,5 +1998,5 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let func_names: [str] = []
     let func_labels: [str] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
 }
