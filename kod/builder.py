@@ -1,13 +1,11 @@
 """Building/compiling stuff"""
 
-import io
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from kod import ast
-from kod.compiler import Compiler
 from kod.filesys import FileSystem, FileWrapper
 from kod.lexer import Lexer
 from kod.parser import Parser
@@ -51,10 +49,40 @@ class Builder:
         return module
 
     def compile_module(self, module: ast.Module) -> str:
-        """Compile a module."""
-        output = io.StringIO()
-        Compiler(module, self.program, output).compile()
-        return output.getvalue()
+        """Compile a module by running the self-hosted compiler (kodc.kod)
+        inside the Python interpreter. Returns the emitted assembly."""
+        root_path = self.program.root_fs.root_path
+        kodc_path = root_path / "kodc.kod"
+        if not kodc_path.exists():
+            raise RuntimeError(
+                f"kodc.kod not found at {kodc_path}; cannot self-host compile."
+            )
+        module_path = module.source_file.path
+        try:
+            rel_path = module_path.relative_to(root_path)
+        except ValueError:
+            rel_path = module_path
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "kod",
+                "--no-type-check",
+                "interpret",
+                str(kodc_path),
+                str(rel_path),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=root_path,
+            check=False,
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            raise RuntimeError(
+                f"kodc.kod failed for {rel_path} (exit {result.returncode})"
+            )
+        return result.stdout
 
     def _build_c(self, c_path: Path) -> Path:
         """Compile a C source file to an object file."""
