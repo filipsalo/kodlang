@@ -2,6 +2,19 @@ import "kod/ast"
 import "kod/parser"
 import "kod/lexer"
 
+// ── Type kind (must precede uses in FieldInfo/VarSlot) ───────────────────────
+
+type TypeKind = enum {
+    KVoid
+    KInt64
+    KBool
+    KStr
+    KArray
+    KOptional
+    KEnum(idx: int64)
+    KStruct(idx: int64)
+}
+
 // ── Type layout structures ────────────────────────────────────────────────────
 
 type VariantInfo = struct {
@@ -24,6 +37,7 @@ type EnumInfo = struct {
 type FieldInfo = struct {
     name: str
     offset: int64
+    kind: TypeKind
 }
 
 type StructInfo = struct {
@@ -37,17 +51,6 @@ type StructInfo = struct {
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
-
-type TypeKind = enum {
-    KVoid
-    KInt64
-    KBool
-    KStr
-    KArray
-    KOptional
-    KEnum(idx: int64)
-    KStruct(idx: int64)
-}
 
 type VarSlot = struct {
     name: str
@@ -507,11 +510,17 @@ type Codegen = struct {
                 let finfos: [FieldInfo] = []
                 let offset: int64 = 0
                 let i: int64 = 0
+                // Temporarily swap parser so resolve_type reads field type
+                // expressions from p (the source module's parser), not self.p.
+                let saved_p: parser.Parser = self.p
+                self.p = p
                 for i < len(fields) {
-                    finfos += [FieldInfo(name: fields[i].name, offset: offset)]
+                    let fkind: TypeKind = self.resolve_type(fields[i].typ)
+                    finfos += [FieldInfo(name: fields[i].name, offset: offset, kind: fkind)]
                     offset = offset + 8
                     i = i + 1
                 }
+                self.p = saved_p
                 let mnames: [str] = []
                 let mids: [int64] = []
                 let j: int64 = 0
@@ -1031,6 +1040,40 @@ type Codegen = struct {
             ast.Expr.Binary(lhs, op, rhs) -> {
                 match op {
                     ast.Op.Dot -> {
+                        // Three-part dotted call: mod.Enum.Variant(args).
+                        // lhs is Binary(Ident(mod), Dot, Ident(enum)); rhs is Ident(variant).
+                        match self.p.exprs[lhs] {
+                            ast.Expr.Binary(inner_lhs, inner_op, inner_rhs) -> {
+                                match inner_op {
+                                    ast.Op.Dot -> {
+                                        match self.p.exprs[inner_lhs] {
+                                            ast.Expr.Ident(mod_name) -> {
+                                                match self.p.exprs[inner_rhs] {
+                                                    ast.Expr.Ident(enum_name) -> {
+                                                        match self.p.exprs[rhs] {
+                                                            ast.Expr.Ident(variant_name) -> {
+                                                                let ei3: int64 = self.find_enum_idx(enum_name)
+                                                                if ei3 >= 0 {
+                                                                    let vi3: int64 = self.find_variant_idx(ei3, variant_name)
+                                                                    if vi3 >= 0 {
+                                                                        return self.compile_enum_construct(ei3, vi3, args)
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ -> {}
+                                                        }
+                                                    }
+                                                    _ -> {}
+                                                }
+                                            }
+                                            _ -> {}
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
                         match self.p.exprs[lhs] {
                             ast.Expr.Ident(mod_or_obj) -> {
                                 match self.p.exprs[rhs] {
@@ -1054,6 +1097,13 @@ type Codegen = struct {
                                             }
                                         }
                                         if is_import {
+                                            // mod.StructName(args) — struct constructor on an imported struct
+                                            let s_idx: int64 = self.find_struct_idx(method_name)
+                                            if s_idx >= 0 {
+                                                return self.compile_struct_construct(s_idx, args)
+                                            }
+                                            // mod.EnumName.Variant(args) is handled at the outer level
+                                            // (this case is two-deep dotted, not handled here).
                                             self.prepare_args(args)
                                             let lbl: str = self.import_func_label(mod_or_obj, method_name)
                                             self.emit(f"bl {lbl}")
@@ -1260,6 +1310,24 @@ type Codegen = struct {
                                 let ei: int64 = self.find_enum_idx(type_name)
                                 if ei >= 0 {
                                     return TypeKind.KEnum(idx: ei)
+                                }
+                                // Field access on a struct-typed variable.
+                                match self.find_var_kind(type_name) {
+                                    .KStruct(si) -> {
+                                        match self.p.exprs[rhs] {
+                                            ast.Expr.Ident(field_name) -> {
+                                                let fi: int64 = 0
+                                                for fi < len(self.structs[si].fields) {
+                                                    if self.structs[si].fields[fi].name == field_name {
+                                                        return self.structs[si].fields[fi].kind
+                                                    }
+                                                    fi = fi + 1
+                                                }
+                                            }
+                                            _ -> {}
+                                        }
+                                    }
+                                    _ -> {}
                                 }
                             }
                             _ -> {}
