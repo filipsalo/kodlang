@@ -701,7 +701,7 @@ class Return(ASTNode):
         with parser.span() as span:
             parser.consume(tokens.Return)
             if parser.peeking_at(tokens.EOL) or parser.peeking_at(tokens.CloseCurly):
-                expression = NoneLiteral(span)
+                expression = NoneLiteral(types.none_value, span=span)
             else:
                 expression = Expression.parse(parser)
         return cls(expression, span)
