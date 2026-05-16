@@ -108,7 +108,13 @@ class Interpreter:
                         BoundMethod(struct_methods["op_index"], lhs_val),
                         [rhs_val],
                     )
-                return lhs_val.op_index(rhs_val)
+                try:
+                    return lhs_val.op_index(rhs_val)
+                except (IndexError, KeyError) as e:
+                    sp = lhs.span
+                    src = sp.filename.read_text() if sp.filename.exists() else ""
+                    line_no = src[: sp.start].count("\n") + 1
+                    raise IndexError(f"{e} at {sp.filename}:{line_no}") from None
             case tokens.Plus():
                 op_func_name = "op_plus"
             case tokens.Minus():
