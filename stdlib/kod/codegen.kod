@@ -53,6 +53,10 @@ type StructInfo = struct {
     data_width: int64
     // See EnumInfo.module_prefix.
     module_prefix: str
+    // Parser that owns this struct's method func_decls. Needed to
+    // monomorphise the methods into the consuming module's object file
+    // when a type alias instantiates a generic struct.
+    src_p: parser.Parser
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
@@ -584,7 +588,7 @@ type Codegen = struct {
                     j = j + 1
                 }
                 self.p = saved_p
-                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, method_return_kinds: mrets, data_width: offset, module_prefix: prefix)]
+                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, method_return_kinds: mrets, data_width: offset, module_prefix: prefix, src_p: p)]
             }
             _ -> {}
         }
@@ -1747,6 +1751,17 @@ type Codegen = struct {
                             .KArrayStruct(elem_idx) -> return TypeKind.KStruct(idx: elem_idx)
                             .KArrayEnum(elem_idx) -> return TypeKind.KEnum(idx: elem_idx)
                             .KArrayStr -> return .KStr
+                            .KStruct(sidx) -> {
+                                // Struct with op_index — return its return kind.
+                                let mi: int64 = 0
+                                for mi < len(self.structs[sidx].method_names) {
+                                    if self.structs[sidx].method_names[mi] == "op_index" {
+                                        return self.structs[sidx].method_return_kinds[mi]
+                                    }
+                                    mi = mi + 1
+                                }
+                                return .KInt64
+                            }
                             _ -> return .KInt64
                         }
                     }
@@ -1870,6 +1885,14 @@ type Codegen = struct {
                         }
                     }
                     _ -> {}
+                }
+                // Also avoid wrapping when the expression's inferred kind is
+                // already Optional (e.g. m["key"] dispatching to op_index).
+                if needs_wrap {
+                    match self.infer_kind(value_id) {
+                        .KOptional -> needs_wrap = false
+                        _ -> {}
+                    }
                 }
                 if needs_wrap == false {
                     let vv: Val = self.compile_expr(value_id)
@@ -2779,6 +2802,11 @@ type Codegen = struct {
             j = j + 1
         }
         // Process type aliases now that base types are registered.
+        // When an alias instantiates a generic struct that lives in another
+        // module (e.g. `type IntMap = Map[str, int64]`), monomorphise its
+        // methods into the current object file under the struct's source
+        // prefix so the linker can resolve them.
+        let emitted_struct_methods: [int64] = []
         let a: int64 = 0
         for a < len(m.decls) {
             match m.decls[a] {
@@ -2788,6 +2816,30 @@ type Codegen = struct {
                         .KStruct(idx) -> {
                             self.struct_alias_name += [name]
                             self.struct_alias_target += [idx]
+                            let already: bool = false
+                            let ei: int64 = 0
+                            for ei < len(emitted_struct_methods) {
+                                if emitted_struct_methods[ei] == idx {
+                                    already = true
+                                    ei = len(emitted_struct_methods)
+                                } else {
+                                    ei = ei + 1
+                                }
+                            }
+                            if already == false and len(self.structs[idx].method_names) > 0 {
+                                emitted_struct_methods += [idx]
+                                let saved_pfx: str = self.path_prefix
+                                let saved_p: parser.Parser = self.p
+                                self.path_prefix = self.structs[idx].module_prefix
+                                self.p = self.structs[idx].src_p
+                                let mi: int64 = 0
+                                for mi < len(self.structs[idx].method_decl_ids) {
+                                    self.compile_func(self.structs[idx].method_decl_ids[mi], self.structs[idx].name)
+                                    mi = mi + 1
+                                }
+                                self.path_prefix = saved_pfx
+                                self.p = saved_p
+                            }
                         }
                         .KEnum(idx) -> {
                             self.enum_alias_name += [name]
