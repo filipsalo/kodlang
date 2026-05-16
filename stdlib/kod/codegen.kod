@@ -14,6 +14,8 @@ type TypeKind = enum {
     KEnum(idx: int64)
     KStruct(idx: int64)
     KArrayStruct(elem_idx: int64)
+    KArrayEnum(elem_idx: int64)
+    KArrayStr
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -432,6 +434,8 @@ type Codegen = struct {
                 let ek: TypeKind = self.resolve_type(inner)
                 match ek {
                     .KStruct(si) -> return TypeKind.KArrayStruct(elem_idx: si)
+                    .KEnum(ei) -> return TypeKind.KArrayEnum(elem_idx: ei)
+                    .KStr -> return .KArrayStr
                     _ -> return .KArray
                 }
             }
@@ -729,6 +733,8 @@ type Codegen = struct {
                     let ekind: TypeKind = .KInt64
                     match self.infer_kind(iter) {
                         .KArrayStruct(elem_idx) -> ekind = TypeKind.KStruct(idx: elem_idx)
+                        .KArrayEnum(elem_idx) -> ekind = TypeKind.KEnum(idx: elem_idx)
+                        .KArrayStr -> ekind = .KStr
                         _ -> {}
                     }
                     self.alloc_var(name, ekind)
@@ -965,6 +971,8 @@ type Codegen = struct {
         match lhs_kind {
             .KArray -> array_like = true
             .KArrayStruct(elem_idx) -> array_like = true
+            .KArrayEnum(elem_idx) -> array_like = true
+            .KArrayStr -> array_like = true
             _ -> {}
         }
         if array_like {
@@ -1052,6 +1060,8 @@ type Codegen = struct {
                     .KStr -> return self.compile_str_concat(lhs_id, rhs_id)
                     .KArray -> return self.compile_arr_concat(lhs_id, rhs_id)
                     .KArrayStruct(elem_idx) -> return self.compile_arr_concat(lhs_id, rhs_id)
+                    .KArrayEnum(elem_idx) -> return self.compile_arr_concat(lhs_id, rhs_id)
+                    .KArrayStr -> return self.compile_arr_concat(lhs_id, rhs_id)
                     _ -> {}
                 }
             }
@@ -1378,6 +1388,16 @@ type Codegen = struct {
                 self.emit(f"ldr {r}, [{r}, #8]")
                 return Val.VReg(name: r)
             }
+            .KArrayEnum(elem_idx) -> {
+                let r: str = self.load(av)
+                self.emit(f"ldr {r}, [{r}, #8]")
+                return Val.VReg(name: r)
+            }
+            .KArrayStr -> {
+                let r: str = self.load(av)
+                self.emit(f"ldr {r}, [{r}, #8]")
+                return Val.VReg(name: r)
+            }
             .KStr -> {
                 self.mov_to("x0", av)
                 self.emit("bl _strlen")
@@ -1475,7 +1495,12 @@ type Codegen = struct {
     func compile_match_expr(self, subject_id: int64, anon arms: [int64]) -> Val {
         let done_lbl: str = self.fresh("Lmexpr_done")
         let sv: Val = self.compile_expr(subject_id)
-        let disc_r: str = self.load_enum_or_val(subject_id, sv)
+        let sptr_r: str = self.load(sv)
+        let subj_slot: int64 = self.alloc_var(self.fresh("__msubj"), .KInt64)
+        self.emit_str(sptr_r, subj_slot)
+        self.free_reg(sptr_r)
+        let dv: Val = Val.VStack(offset: subj_slot)
+        let disc_r: str = self.load_enum_or_val(subject_id, dv)
         let result_r: str = self.alloc_reg()
         let i: int64 = 0
         for i < len(arms) {
@@ -1543,9 +1568,8 @@ type Codegen = struct {
                     self.emit(f"beq {skip_lbl}")
                     if len(binding) > 0 {
                         let boff: int64 = self.find_var_offset(binding)
-                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
                         let ptr_r: str = self.alloc_reg()
-                        self.emit_ldr(ptr_r, subj_off)
+                        self.emit_ldr(ptr_r, subj_slot)
                         let val_r: str = self.alloc_reg()
                         self.emit(f"ldr {val_r}, [{ptr_r}]")
                         self.emit_str(val_r, boff)
@@ -1711,6 +1735,8 @@ type Codegen = struct {
                     ast.Op.Index -> {
                         match self.infer_kind(lhs) {
                             .KArrayStruct(elem_idx) -> return TypeKind.KStruct(idx: elem_idx)
+                            .KArrayEnum(elem_idx) -> return TypeKind.KEnum(idx: elem_idx)
+                            .KArrayStr -> return .KStr
                             _ -> return .KInt64
                         }
                     }
@@ -1805,6 +1831,18 @@ type Codegen = struct {
                 self.free_reg(r)
             }
             .KArrayStruct(elem_idx) -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+            }
+            .KArrayEnum(elem_idx) -> {
+                let v: Val = self.compile_expr(value_id)
+                let r: str = self.load(v)
+                self.emit_str(r, dest_off)
+                self.free_reg(r)
+            }
+            .KArrayStr -> {
                 let v: Val = self.compile_expr(value_id)
                 let r: str = self.load(v)
                 self.emit_str(r, dest_off)
@@ -2112,8 +2150,103 @@ type Codegen = struct {
         }
     }
 
+    func find_field_kind(self, struct_idx: int64, anon field_name: str) -> TypeKind {
+        let fi: int64 = 0
+        for fi < len(self.structs[struct_idx].fields) {
+            if self.structs[struct_idx].fields[fi].name == field_name {
+                return self.structs[struct_idx].fields[fi].kind
+            }
+            fi = fi + 1
+        }
+        return .KInt64
+    }
+
     func compile_plus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         match self.p.exprs[lhs_id] {
+            ast.Expr.Binary(lhs2, op, rhs2) -> {
+                match op {
+                    ast.Op.Dot -> {
+                        match self.p.exprs[lhs2] {
+                            ast.Expr.Ident(obj_name) -> {
+                                match self.p.exprs[rhs2] {
+                                    ast.Expr.Ident(field_name) -> {
+                                        let obj_off: int64 = self.find_var_offset(obj_name)
+                                        let struct_idx: int64 = -1
+                                        match self.find_var_kind(obj_name) {
+                                            .KStruct(idx) -> struct_idx = idx
+                                            _ -> {}
+                                        }
+                                        let foff: int64 = 0
+                                        let fkind: TypeKind = .KInt64
+                                        if struct_idx >= 0 {
+                                            foff = self.find_field_offset(struct_idx, field_name)
+                                            fkind = self.find_field_kind(struct_idx, field_name)
+                                        }
+                                        let is_arr: bool = false
+                                        let is_str: bool = false
+                                        match fkind {
+                                            .KArray -> is_arr = true
+                                            .KArrayStruct(elem_idx) -> is_arr = true
+                                            .KArrayEnum(elem_idx) -> is_arr = true
+                                            .KArrayStr -> is_arr = true
+                                            .KStr -> is_str = true
+                                            _ -> {}
+                                        }
+                                        if is_arr {
+                                            let rv: Val = self.compile_expr(rhs_id)
+                                            let rr: str = self.load(rv)
+                                            self.emit("sub sp, sp, #16")
+                                            self.emit(f"str {rr}, [sp]")
+                                            self.free_reg(rr)
+                                            let pr: str = self.alloc_reg()
+                                            self.emit_ldr(pr, obj_off)
+                                            self.emit(f"ldr x0, [{pr}, #{self.itos(foff)}]")
+                                            self.emit("ldr x1, [sp]")
+                                            self.emit("add sp, sp, #16")
+                                            self.emit("bl _kod_array_concat")
+                                            self.emit_ldr(pr, obj_off)
+                                            self.emit(f"str x0, [{pr}, #{self.itos(foff)}]")
+                                            self.free_reg(pr)
+                                        } else {
+                                            if is_str {
+                                                let rv: Val = self.compile_expr(rhs_id)
+                                                let rr: str = self.load(rv)
+                                                self.emit("sub sp, sp, #16")
+                                                self.emit(f"str {rr}, [sp]")
+                                                self.free_reg(rr)
+                                                let pr: str = self.alloc_reg()
+                                                self.emit_ldr(pr, obj_off)
+                                                self.emit(f"ldr x0, [{pr}, #{self.itos(foff)}]")
+                                                self.emit("ldr x1, [sp]")
+                                                self.emit("add sp, sp, #16")
+                                                self.emit("bl _kod_str_concat")
+                                                self.emit_ldr(pr, obj_off)
+                                                self.emit(f"str x0, [{pr}, #{self.itos(foff)}]")
+                                                self.free_reg(pr)
+                                            } else {
+                                                let rv: Val = self.compile_expr(rhs_id)
+                                                let rr: str = self.load(rv)
+                                                let pr: str = self.alloc_reg()
+                                                self.emit_ldr(pr, obj_off)
+                                                let lr: str = self.alloc_reg()
+                                                self.emit(f"ldr {lr}, [{pr}, #{self.itos(foff)}]")
+                                                self.emit(f"add {lr}, {lr}, {rr}")
+                                                self.emit(f"str {lr}, [{pr}, #{self.itos(foff)}]")
+                                                self.free_reg(lr)
+                                                self.free_reg(rr)
+                                                self.free_reg(pr)
+                                            }
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                            }
+                            _ -> {}
+                        }
+                    }
+                    _ -> {}
+                }
+            }
             ast.Expr.Ident(name) -> {
                 let off: int64 = self.find_var_offset(name)
                 let kind: TypeKind = self.find_var_kind(name)
@@ -2131,6 +2264,30 @@ type Codegen = struct {
                         self.emit_str("x0", off)
                     }
                     .KArrayStruct(elem_idx) -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit(f"mov x0, {lr}")
+                        self.emit(f"mov x1, {rr}")
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                        self.emit("bl _kod_array_concat")
+                        self.emit_str("x0", off)
+                    }
+                    .KArrayEnum(elem_idx) -> {
+                        let rv: Val = self.compile_expr(rhs_id)
+                        let rr: str = self.load(rv)
+                        let lr: str = self.alloc_reg()
+                        self.emit_ldr(lr, off)
+                        self.emit(f"mov x0, {lr}")
+                        self.emit(f"mov x1, {rr}")
+                        self.free_reg(lr)
+                        self.free_reg(rr)
+                        self.emit("bl _kod_array_concat")
+                        self.emit_str("x0", off)
+                    }
+                    .KArrayStr -> {
                         let rv: Val = self.compile_expr(rhs_id)
                         let rr: str = self.load(rv)
                         let lr: str = self.alloc_reg()
@@ -2349,8 +2506,15 @@ type Codegen = struct {
 
     func compile_match_stmt(self, subject_id: int64, anon arms: [int64]) -> none {
         let done_lbl: str = self.fresh("Lmatch_done")
+        // Evaluate subject once; stash its pointer on the stack so pattern
+        // bindings can read fields off the subject after disc_r is consumed.
         let sv: Val = self.compile_expr(subject_id)
-        let disc_r: str = self.load_enum_or_val(subject_id, sv)
+        let sptr_r: str = self.load(sv)
+        let subj_slot: int64 = self.alloc_var(self.fresh("__msubj"), .KInt64)
+        self.emit_str(sptr_r, subj_slot)
+        self.free_reg(sptr_r)
+        let dv: Val = Val.VStack(offset: subj_slot)
+        let disc_r: str = self.load_enum_or_val(subject_id, dv)
         let i: int64 = 0
         for i < len(arms) {
             let arm: ast.MatchArm = self.p.match_arms[arms[i]]
@@ -2403,8 +2567,7 @@ type Codegen = struct {
                         let foff: int64 = vinfo.field_offsets[ki]
                         let binding_off: int64 = self.find_var_offset(bindings[ki])
                         let ptr_r: str = self.alloc_reg()
-                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
-                        self.emit_ldr(ptr_r, subj_off)
+                        self.emit_ldr(ptr_r, subj_slot)
                         let fv_r: str = self.alloc_reg()
                         self.emit(f"ldr {fv_r}, [{ptr_r}, #{self.itos(8 + foff)}]")
                         self.emit_str(fv_r, binding_off)
@@ -2432,8 +2595,7 @@ type Codegen = struct {
                         let foff: int64 = vinfo2.field_offsets[ki]
                         let binding_off: int64 = self.find_var_offset(bindings[ki])
                         let ptr_r: str = self.alloc_reg()
-                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
-                        self.emit_ldr(ptr_r, subj_off)
+                        self.emit_ldr(ptr_r, subj_slot)
                         let fv_r: str = self.alloc_reg()
                         self.emit(f"ldr {fv_r}, [{ptr_r}, #{self.itos(8 + foff)}]")
                         self.emit_str(fv_r, binding_off)
@@ -2465,9 +2627,8 @@ type Codegen = struct {
                     self.emit(f"beq {skip_lbl}")
                     if len(binding) > 0 {
                         let boff: int64 = self.find_var_offset(binding)
-                        let subj_off: int64 = self.find_var_offset_by_lhs(subject_id)
                         let ptr_r: str = self.alloc_reg()
-                        self.emit_ldr(ptr_r, subj_off)
+                        self.emit_ldr(ptr_r, subj_slot)
                         let val_r: str = self.alloc_reg()
                         self.emit(f"ldr {val_r}, [{ptr_r}]")
                         self.emit_str(val_r, boff)
