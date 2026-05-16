@@ -191,6 +191,35 @@ class Interpreter:
                 arr_type = types.ArrayType.make(item_type)
                 return arr_type(evaled)
             case ast.FunctionCall(callee, args):
+                # .Variant(payload) — implicit enum variant constructor with
+                # payload fields. Resolve the enum here so we can pass args
+                # straight to its constructor instead of trying to evaluate
+                # the bare implicit variant (which errors when fields exist).
+                if isinstance(callee, ast.ImplicitEnumVariant):
+                    variant_name = callee.variant_name
+                    search_scopes = [module.names]
+                    for val in module.names.values():
+                        if isinstance(val, ast.Import):
+                            try:
+                                path = module.resolve_import(val.module_name)
+                                imported = self.program.get_module(path)
+                                search_scopes.append(imported.names)
+                            except Exception:
+                                pass
+                    for scope in search_scopes:
+                        for _, val in scope.items():
+                            if (
+                                isinstance(val, type)
+                                and hasattr(val, "variants")
+                                and variant_name in val.variants
+                            ):
+                                vinfo = val.variants[variant_name]
+                                evaled = [
+                                    self.evaluate_expression(module, a) for a in args
+                                ]
+                                fields = {f.id: v for f, v in zip(vinfo.fields, evaled)}
+                                return types.EnumValue(val, variant_name, fields)
+                    raise ValueError(f"No enum found with variant .{variant_name}")
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, func, args)
