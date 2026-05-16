@@ -939,6 +939,11 @@ type Codegen = struct {
                 if name == "len" and len(args) == 1 {
                     return self.compile_len(args[0].value)
                 }
+                // Struct constructor: StructName(field1: v1, ...)
+                let si: int64 = self.find_struct_idx(name)
+                if si >= 0 {
+                    return self.compile_struct_construct(si, args)
+                }
                 self.prepare_args(args)
                 let lbl: str = self.func_label(name)
                 self.emit(f"bl {lbl}")
@@ -1031,7 +1036,7 @@ type Codegen = struct {
                 for i < len(self.structs[idx].method_names) {
                     if self.structs[idx].method_names[i] == method_name {
                         let fd_id: int64 = self.structs[idx].method_decl_ids[i]
-                        method_lbl = f"{self.path_prefix}${self.structs[idx].name}${method_name}"
+                        method_lbl = f"${self.path_prefix}${self.structs[idx].name}${method_name}"
                         i = len(self.structs[idx].method_names)
                     } else {
                         i = i + 1
@@ -1150,6 +1155,23 @@ type Codegen = struct {
                 }
                 return .KInt64
             }
+            ast.Expr.Call(callee, args) -> {
+                // Struct or enum constructor: TypeName(...)
+                match self.p.exprs[callee] {
+                    ast.Expr.Ident(name) -> {
+                        let si: int64 = self.find_struct_idx(name)
+                        if si >= 0 {
+                            return TypeKind.KStruct(idx: si)
+                        }
+                        let ei: int64 = self.find_enum_idx(name)
+                        if ei >= 0 {
+                            return TypeKind.KEnum(idx: ei)
+                        }
+                    }
+                    _ -> {}
+                }
+                return .KInt64
+            }
             ast.Expr.Binary(lhs, op, rhs) -> {
                 match op {
                     ast.Op.Dot -> {
@@ -1224,7 +1246,28 @@ type Codegen = struct {
                 self.emit_enum_alloc(idx, value_id, dest_off)
             }
             .KStruct(idx) -> {
-                self.emit_struct_alloc(idx, value_id, dest_off)
+                // If the source is a value already producing a struct pointer
+                // (variable alias, call result, or constructor expression),
+                // just store the pointer — preserve reference semantics.
+                let alias: bool = false
+                match self.p.exprs[value_id] {
+                    ast.Expr.Ident(name) -> {
+                        match self.find_var_kind(name) {
+                            .KStruct(other) -> alias = true
+                            _ -> {}
+                        }
+                    }
+                    ast.Expr.Call(callee, args) -> alias = true
+                    _ -> {}
+                }
+                if alias {
+                    let v: Val = self.compile_expr(value_id)
+                    let r: str = self.load(v)
+                    self.emit_str(r, dest_off)
+                    self.free_reg(r)
+                } else {
+                    self.emit_struct_alloc(idx, value_id, dest_off)
+                }
             }
             .KArray -> {
                 let v: Val = self.compile_expr(value_id)
@@ -1276,6 +1319,35 @@ type Codegen = struct {
                 self.free_reg(r)
             }
         }
+    }
+
+    // Allocate a struct value on the arena and return its pointer in x0.
+    // field_args supplies the labelled field values.
+    func compile_struct_construct(self, si: int64, anon field_args: [ast.CallArg]) -> Val {
+        let dw: int64 = self.structs[si].data_width
+        self.emit(f"mov x0, #{self.itos(dw)}")
+        self.emit("bl _arena_alloc")
+        let ptr_r: str = self.alloc_reg()
+        self.emit(f"mov {ptr_r}, x0")
+        let i: int64 = 0
+        for i < len(field_args) {
+            let arg: ast.CallArg = field_args[i]
+            let foff: int64 = self.find_field_offset(si, arg.label)
+            // Stash ptr_r across the call so it survives any bl in the
+            // field expression.
+            self.emit("sub sp, sp, #16")
+            self.emit(f"str {ptr_r}, [sp]")
+            let fv: Val = self.compile_expr(arg.value)
+            let fr: str = self.load(fv)
+            self.emit(f"ldr {ptr_r}, [sp]")
+            self.emit("add sp, sp, #16")
+            self.emit(f"str {fr}, [{ptr_r}, #{self.itos(foff)}]")
+            self.free_reg(fr)
+            i = i + 1
+        }
+        self.emit(f"mov x0, {ptr_r}")
+        self.free_reg(ptr_r)
+        return Val.VReg(name: "x0")
     }
 
     // Allocate an enum value on the arena and return its pointer in x0.
@@ -1813,6 +1885,14 @@ type Codegen = struct {
         for i < len(fd.params) {
             let param: ast.Param = fd.params[i]
             let kind: TypeKind = self.resolve_type(param.typ)
+            // The method receiver `self` has no type annotation; give it
+            // the kind of the enclosing struct so field/method access works.
+            if param.name == "self" and len(struct_name) > 0 {
+                let si: int64 = self.find_struct_idx(struct_name)
+                if si >= 0 {
+                    kind = TypeKind.KStruct(idx: si)
+                }
+            }
             self.alloc_var(param.name, kind)
             i = i + 1
         }
