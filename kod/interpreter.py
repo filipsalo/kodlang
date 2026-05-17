@@ -29,6 +29,15 @@ class ReturnValue(Exception):
         self.value = value
 
 
+class ThrownError(Exception):
+    """A Kod `throw` — propagates up through function calls until caught by
+    a `must` (panic) or a `try` (re-raise + return from the enclosing fn).
+    Equivalent to the compiled .Err arm of a Result return."""
+
+    def __init__(self, value):
+        self.value = value
+
+
 @dataclasses.dataclass
 class BoundMethod:
     """A method bound to a receiver instance."""
@@ -57,7 +66,12 @@ class Interpreter:
             args = [argv]
         else:
             args = []
-        exit_code = self.call_function(entry_module, main, args)
+        try:
+            exit_code = self.call_function(entry_module, main, args)
+        except ThrownError as e:
+            msg = self._coerce_to_str(entry_module, e.value)
+            sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
+            sys.exit(1)
         sys.exit(exit_code.value if exit_code else 0)
 
     def assign(self, module, name, value):
@@ -177,6 +191,18 @@ class Interpreter:
                 return instance
             case ast.BinaryOperator(lhs, op, rhs):
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
+            case ast.TryExpression(inner):
+                # Letting the ThrownError propagate is exactly the `try`
+                # semantics — the surrounding call_function frame catches
+                # it (or main does).
+                return self.evaluate_expression(module, inner)
+            case ast.MustExpression(inner):
+                try:
+                    return self.evaluate_expression(module, inner)
+                except ThrownError as e:
+                    msg = self._coerce_to_str(module, e.value)
+                    sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
+                    sys.exit(1)
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):
@@ -314,6 +340,9 @@ class Interpreter:
             case ast.Return(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ReturnValue(value)
+            case ast.ThrowStatement(expression):
+                value = self.evaluate_expression(module, expression)
+                raise ThrownError(value)
             case ast.Import(name, local_name):
                 path = module.resolve_import(name)
                 module.names[local_name] = self.program.get_module(path)

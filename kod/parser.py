@@ -38,6 +38,7 @@ from kod.tokens import (
     Question,
     Return,
     Struct,
+    Throw,
     Token,
     Type,
 )
@@ -104,10 +105,24 @@ class Parser:
         return None
 
     def parse_type(self, name=None) -> type[types.Type]:
-        """Parse a type, including optional T? suffix."""
+        """Parse a type, including optional T? suffix and trailing `or Error`
+        for fallible results."""
         base = self._parse_base_type(name)
         if self.try_consume(Question):
-            return types.OptionalType.make(base)
+            base = types.OptionalType.make(base)
+        # `T or Error` — fallible result. Only the umbrella Error is allowed;
+        # idempotent under repetition.
+        from kod.tokens import Or as OrTok
+
+        while self.peeking_at(OrTok):
+            self.consume(OrTok)
+            err_name = self.consume(Identifier).value
+            if err_name != "Error":
+                raise self.error(
+                    f"unsupported `or` clause in type: only `or Error` is allowed, got `or {err_name}`",
+                    self.peek().span,
+                )
+            base = types.ResultType.make(base)
         return base
 
     def _parse_base_type(self, name=None) -> type[types.Type]:
@@ -198,6 +213,8 @@ class Parser:
                     self.resolve_import(stmt.module_name)
             case Return():
                 stmt = ast.Return.parse(self)
+            case Throw():
+                stmt = ast.ThrowStatement.parse(self)
             case If():
                 stmt = ast.IfStatement.parse(self)
             case For():

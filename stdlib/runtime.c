@@ -1,9 +1,17 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <string.h>
 
 void *arena_alloc(int64_t size);
+
+// Called by `must expr` when the expression evaluates to an error.
+// `msg` is the result of calling the error's to_str method.
+void kod_panic(const char *msg) {
+    fprintf(stderr, "panic: %s\n", msg);
+    exit(1);
+}
 
 char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");

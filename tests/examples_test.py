@@ -16,6 +16,7 @@ def run_interpreted(path: str) -> subprocess.CompletedProcess:
     result = subprocess.run(
         [sys.executable, "-m", "kod", "interpret", path],
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
@@ -28,6 +29,7 @@ def run_compiled(path: str) -> subprocess.CompletedProcess:
     result = subprocess.run(
         [sys.executable, "-m", "kod", "run", path],
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
@@ -92,7 +94,12 @@ def test_example(func: types.FunctionType, path: str, expects: dict[str, str], s
     if "output" in expects:
         assert result.stdout == expects["output"]
     if "stderr" in expects:
-        assert result.stderr == expects["stderr"]
+        # The Kod CLI prints its own build-progress chatter to stderr,
+        # so we accept any stderr that *contains* the expected substring
+        # (with terminal color escapes stripped) rather than requiring
+        # byte-for-byte equality.
+        stderr = re.sub("\033[^m]+?m", "", result.stderr)
+        assert expects["stderr"] in stderr
     if "errors" in expects:
         expects["status"] = "1"
         for error in expects["errors"].splitlines():

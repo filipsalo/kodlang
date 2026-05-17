@@ -19,6 +19,10 @@ type TypeKind = enum {
     KArrayEnum(elem_idx: int64)
     KArrayStr
     KInterface(idx: int64)
+    // Fallible result `T or Error`. Runtime cell is 16 bytes:
+    //   {discriminant: 0=Ok|1=Err, payload: inner value or Error iface ptr}.
+    // Variables of this type hold an arena pointer to that cell.
+    KResult(inner: TypeKind)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -542,6 +546,7 @@ type Codegen = struct {
                 }
             }
             .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
+            .Throws(inner) -> return .KResult(inner: self.resolve_type(inner))
             .Generic(name, arg) -> {
                 // Generics are erased at codegen — look up the base type.
                 let si = self.find_struct_idx(name)
@@ -838,6 +843,8 @@ type Codegen = struct {
                     self.collect_expr_vars(hi)
                 }
             }
+            .Try(inner) -> self.collect_expr_vars(inner)
+            .Must(inner) -> self.collect_expr_vars(inner)
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
                 let subj_inner: TypeKind = .KInt64
@@ -915,6 +922,7 @@ type Codegen = struct {
                     self.collect_expr_vars(value)
                 }
             }
+            .Throw(value) -> self.collect_expr_vars(value)
             .ExprStmt(expr) -> self.collect_expr_vars(expr)
             .If(cond, then_body, else_body) -> {
                 self.collect_expr_vars(cond)
@@ -1110,6 +1118,8 @@ type Codegen = struct {
             .ArrayLit(elements) -> return self.compile_array_lit(elements)
             .MatchExpr(subject, arms) -> return self.compile_match_expr(subject, arms)
             .Slice(s, lo, hi) -> return self.compile_slice(s, lo, hi)
+            .Try(inner) -> return self.compile_try(inner)
+            .Must(inner) -> return self.compile_must(inner)
         }
     }
 
@@ -2186,6 +2196,20 @@ type Codegen = struct {
                     else return .KInt64
                 }
             }
+            .Try(inner) -> {
+                let k = self.infer_kind(inner)
+                if k is .KResult(inner_kind) {
+                    return inner_kind
+                }
+                return k
+            }
+            .Must(inner) -> {
+                let k = self.infer_kind(inner)
+                if k is .KResult(inner_kind) {
+                    return inner_kind
+                }
+                return k
+            }
             else return .KInt64
         }
     }
@@ -2208,6 +2232,7 @@ type Codegen = struct {
             }
             .MatchStmt(subject, arms) -> self.compile_match_stmt(subject, arms)
             .LetElse(pattern, value, else_body) -> self.compile_let_else(pattern, value, else_body)
+            .Throw(value) -> self.compile_throw(value)
         }
     }
 
@@ -2766,6 +2791,22 @@ type Codegen = struct {
             self.emit(f"b {self.ret_lbl}")
             return
         }
+        // If returning into a Result and the value isn't already a Result,
+        // wrap it as .Ok(value) — a 16-byte arena cell {0, value}.
+        if self.return_kind is .KResult(inner) {
+            let already = false
+            if self.infer_kind(value_id) is .KResult(inner2) {
+                already = true
+            }
+            if already {
+                let v = self.compile_expr(value_id)
+                self.mov_to("x0", v)
+            } else {
+                self.compile_wrap_ok(value_id)
+            }
+            self.emit(f"b {self.ret_lbl}")
+            return
+        }
         // If returning into an optional and the value isn't already optional,
         // wrap it in an arena allocation. NoneLit is always Optional. For Call,
         // trust free-function returns (we don't track free-fn return kinds);
@@ -2821,6 +2862,101 @@ type Codegen = struct {
             self.mov_to("x0", v)
         }
         self.emit(f"b {self.ret_lbl}")
+    }
+
+    // Compile `value_id` and wrap the result in a Result.Ok cell. Leaves
+    // the cell pointer in x0. Used for implicit `return v` in Result-typed
+    // functions and for the Ok arm of try/must.
+    func compile_wrap_ok(self, anon value_id: int64) -> none {
+        let v = self.compile_expr(value_id)
+        let r = self.alloc_reg()
+        self.mov_to(r, v)
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {r}, [sp]")
+        self.free_reg(r)
+        self.emit("mov x0, #16")
+        self.emit("bl _arena_alloc")
+        let payload = self.alloc_reg()
+        self.emit(f"ldr {payload}, [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit("str xzr, [x0]")              // discriminant = 0 (Ok)
+        self.emit(f"str {payload}, [x0, #8]")   // payload
+        self.free_reg(payload)
+    }
+
+    // `throw expr` — box `expr` as an Error (fat pointer with vtable) and
+    // return a Result.Err cell {1, error_ptr} from the enclosing function.
+    func compile_throw(self, anon value_id: int64) -> none {
+        let iface_idx = self.find_iface_idx("Error")
+        let actual = self.infer_kind(value_id)
+        let v = self.compile_expr(value_id)
+        let r = self.alloc_reg()
+        self.mov_to(r, v)
+        // Box into the Error interface if the source is a concrete struct.
+        if iface_idx >= 0 {
+            r = self.maybe_box_for_iface(r, actual: actual, expected: .KInterface(idx: iface_idx))
+        }
+        // Build the Result.Err cell.
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {r}, [sp]")
+        self.free_reg(r)
+        self.emit("mov x0, #16")
+        self.emit("bl _arena_alloc")
+        let payload = self.alloc_reg()
+        self.emit(f"ldr {payload}, [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit("mov x9, #1")
+        self.emit("str x9, [x0]")               // discriminant = 1 (Err)
+        self.emit(f"str {payload}, [x0, #8]")   // error iface ptr
+        self.free_reg(payload)
+        self.emit(f"b {self.ret_lbl}")
+    }
+
+    // `try expr` / `must expr` — evaluate `expr` (yielding a Result cell
+    // pointer in x0), then branch on the discriminant. The Ok arm yields
+    // the unwrapped inner value as this expression's value. The Err arm
+    // either returns the same cell from the enclosing function (try) or
+    // calls _kod_panic_error and aborts (must).
+    func compile_try_or_must(self, anon inner_id: int64, is_must: bool) -> Val {
+        let v = self.compile_expr(inner_id)
+        self.mov_to("x0", v)
+        let disc = self.alloc_reg()
+        self.emit(f"ldr {disc}, [x0]")
+        let ok_lbl = self.fresh("Lresult_ok")
+        let done_lbl = self.fresh("Lresult_done")
+        self.emit(f"cmp {disc}, #0")
+        self.free_reg(disc)
+        self.emit(f"beq {ok_lbl}")
+        // Err path.
+        if is_must {
+            // Load the Error interface cell, then dispatch its to_str
+            // method to render a panic message. Layout:
+            //   result cell:    [disc, error_iface_ptr]
+            //   error iface:    [data_ptr, vtable_ptr]
+            //   vtable[0]:      to_str method (only entry on Error)
+            self.emit("ldr x0, [x0, #8]")    // x0 = error iface cell ptr
+            self.emit("ldr x1, [x0, #8]")    // x1 = vtable ptr
+            self.emit("ldr x9, [x1, #0]")    // x9 = to_str method
+            self.emit("ldr x0, [x0, #0]")    // x0 = self (data ptr)
+            self.emit("blr x9")              // x0 = str
+            self.emit("bl _kod_panic")
+        } else {
+            // Propagate: the cell ptr is already in x0; just return it.
+            self.emit(f"b {self.ret_lbl}")
+        }
+        self.emit_label(ok_lbl)
+        let result_r = self.alloc_reg()
+        self.emit(f"ldr {result_r}, [x0, #8]")
+        self.emit_label(done_lbl)
+        return .VReg(name: result_r)
+    }
+
+    func compile_try(self, anon inner_id: int64) -> Val {
+        return self.compile_try_or_must(inner_id, is_must: false)
+    }
+
+    func compile_must(self, anon inner_id: int64) -> Val {
+        return self.compile_try_or_must(inner_id, is_must: true)
     }
 
     func compile_if(self, cond_id: int64, then_body: [int64], else_body: [int64]) -> none {

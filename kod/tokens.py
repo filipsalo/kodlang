@@ -298,6 +298,21 @@ class Struct(Token):
 
 
 @dataclasses.dataclass
+class Throw(Token):
+    """A throw token"""
+
+
+@dataclasses.dataclass
+class Try(Token):
+    """A try token"""
+
+
+@dataclasses.dataclass
+class Must(Token):
+    """A must token"""
+
+
+@dataclasses.dataclass
 class Interface(Token):
     """An interface token"""
 

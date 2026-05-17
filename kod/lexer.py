@@ -44,6 +44,7 @@ from kod.tokens import (
     Let,
     Match,
     Minus,
+    Must,
     NoneLiteral,
     NotEqual,
     OpenBracket,
@@ -59,7 +60,9 @@ from kod.tokens import (
     Star,
     StringLiteral,
     Struct,
+    Throw,
     Token,
+    Try,
     Type,
 )
 
@@ -82,6 +85,9 @@ KEYWORDS = {
     "type": Type,
     "enum": Enum,
     "interface": Interface,
+    "throw": Throw,
+    "try": Try,
+    "must": Must,
     "match": Match,
     "is": Is,
     "and": And,

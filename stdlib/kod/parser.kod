@@ -155,7 +155,7 @@ type Parser = struct {
 	}
 
 
-	func parse_type_expr(self) -> int64 {
+	func parse_type_expr_core(self) -> int64 {
 		// Array type: [T]
 		if self.try_consume(.OpenBracket) {
 			let inner: int64 = self.parse_type_expr()
@@ -185,6 +185,26 @@ type Parser = struct {
 			return self.alloc_type(ast.TypeExpr.Generic(name: name, arg: arg))
 		}
 		return self.alloc_type(ast.TypeExpr.Named(name: name))
+	}
+
+	func parse_type_expr(self) -> int64 {
+		let id: int64 = self.parse_type_expr_core()
+		// Fallible result: `T or Error`. Only `or Error` is supported; the
+		// umbrella Error interface is the thrown type. Repeated `or Error`
+		// collapses so chains like `(T or Error) or Error` are idempotent.
+		for self.try_consume(.KwOr) {
+			let err_name: str = self.expect_identifier()
+			if err_name == "Error" {
+				let already_throws: bool = false
+				if self.type_exprs[id] is .Throws(prev) {
+					already_throws = true
+				}
+				if already_throws == false {
+					id = self.alloc_type(ast.TypeExpr.Throws(inner: id))
+				}
+			}
+		}
+		return id
 	}
 
 	func parse_param(self) -> ast.Param {
@@ -346,6 +366,21 @@ type Parser = struct {
 			let operand: int64 = self.parse_primary()
 			let zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0))
 			return self.alloc_expr(ast.Expr.Binary(lhs: zero, op: ast.Op.Sub, rhs: operand))
+		}
+		// `try expr` — unwrap on Ok, propagate Err to the enclosing function.
+		// Both `try` and `must` bind at unary precedence: they grab the
+		// next primary AND its postfix chain (so `try foo().bar()` wraps
+		// the whole `foo().bar()`), but stop at binary operators.
+		if self.try_consume(.KwTry) {
+			let inner: int64 = self.parse_primary()
+			inner = self.parse_postfix(inner)
+			return self.alloc_expr(ast.Expr.Try(inner: inner))
+		}
+		// `must expr` — unwrap on Ok, panic + abort on Err.
+		if self.try_consume(.KwMust) {
+			let inner: int64 = self.parse_primary()
+			inner = self.parse_postfix(inner)
+			return self.alloc_expr(ast.Expr.Must(inner: inner))
 		}
 		// Integer literal
 		if self.at(.IntegerLit) {
@@ -616,6 +651,14 @@ type Parser = struct {
 			let value: int64 = self.parse_expr()
 			self.skip_newlines()
 			return self.alloc_stmt(ast.Stmt.Return(value: value))
+		}
+
+		// throw — same as `return .Err(value)` for a function declared
+		// `T or Error`. Body must produce an Error-conforming value.
+		if self.try_consume(.KwThrow) {
+			let value: int64 = self.parse_expr()
+			self.skip_newlines()
+			return self.alloc_stmt(ast.Stmt.Throw(value: value))
 		}
 
 		// if / else. `if expr is Pat { body }` is sugar for a one-arm

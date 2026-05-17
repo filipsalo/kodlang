@@ -166,55 +166,93 @@ class Builder:
             if isinstance(s, ast.FunctionDeclaration) and s.name == "main"
         )
         mangled = "$".join(file.canonical_path.with_suffix("").parts)
-        if len(main_decl.params) == 0:
-            asm = f"""
-                .text
-                .globl _main
-                _main:
-                    b ${mangled}$main
+        # If main returns `T or Error`, the call result is a Result cell ptr:
+        # {discriminant, payload}. On Ok, we unwrap the payload as the exit
+        # code; on Err, we call _kod_panic (prints the message and exits 1).
+        from kod import values as types
+
+        returns_result = isinstance(main_decl.return_type, type) and issubclass(
+            main_decl.return_type, types.ResultType
+        )
+        if returns_result:
+            unwrap = """
+                    ldr x9, [x0, #0]
+                    cbz x9, Lmain_ok
+                    ldr x0, [x0, #8]
+                    ldr x1, [x0, #8]
+                    ldr x9, [x1, #0]
+                    ldr x0, [x0, #0]
+                    blr x9
+                    bl _kod_panic
+                Lmain_ok:
+                    ldr x0, [x0, #8]
             """
         else:
-            asm = f"""
-                .text
-                .globl _main
-                _main:
-                    stp x29, x30, [sp, #-64]!
-                    mov x29, sp
-                    stp x19, x20, [sp, #16]
-                    stp x21, x22, [sp, #32]
-                    str x23, [sp, #48]
+            unwrap = ""
+        if len(main_decl.params) == 0:
+            if returns_result:
+                asm = f"""
+                    .text
+                    .globl _main
+                    _main:
+                        stp x29, x30, [sp, #-16]!
+                        mov x29, sp
+                        bl ${mangled}$main
+                        {unwrap}
+                        ldp x29, x30, [sp], #16
+                        ret
+                """
+            else:
+                asm = f"""
+                    .text
+                    .globl _main
+                    _main:
+                        b ${mangled}$main
+                """
+            return self._build("runtime_main", asm)
+        # Param-form (main accepts argv).
+        asm = f"""
+            .text
+            .globl _main
+            _main:
+                stp x29, x30, [sp, #-64]!
+                mov x29, sp
+                stp x19, x20, [sp, #16]
+                stp x21, x22, [sp, #32]
+                str x23, [sp, #48]
 
-                    mov x19, x0
-                    mov x20, x1
+                mov x19, x0
+                mov x20, x1
 
-                    lsl x0, x19, #3
-                    bl _arena_alloc
-                    mov x21, x0
+                lsl x0, x19, #3
+                bl _arena_alloc
+                mov x21, x0
 
-                    mov x22, #0
-                Lloop:
-                    cmp x22, x19
-                    b.ge Ldone
-                    ldr x23, [x20, x22, lsl #3]
-                    str x23, [x21, x22, lsl #3]
-                    add x22, x22, #1
-                    b Lloop
-                Ldone:
+                mov x22, #0
+            Lloop:
+                cmp x22, x19
+                b.ge Ldone
+                ldr x23, [x20, x22, lsl #3]
+                str x23, [x21, x22, lsl #3]
+                add x22, x22, #1
+                b Lloop
+            Ldone:
 
-                    mov x0, #24
-                    bl _arena_alloc
-                    str x21, [x0]
-                    str x19, [x0, #8]
-                    str x19, [x0, #16]
+                mov x0, #24
+                bl _arena_alloc
+                str x21, [x0]
+                str x19, [x0, #8]
+                str x19, [x0, #16]
 
-                    bl ${mangled}$main
+                bl ${mangled}$main
+                {unwrap}
 
-                    ldr x23, [sp, #48]
-                    ldp x21, x22, [sp, #32]
-                    ldp x19, x20, [sp, #16]
-                    ldp x29, x30, [sp], #64
-                    ret
-            """
+                ldr x23, [sp, #48]
+                ldp x21, x22, [sp, #32]
+                ldp x19, x20, [sp, #16]
+                ldp x29, x30, [sp], #64
+                ret
+        """
         return self._build("runtime_main", asm)
 
     def build_executable(self, file: FileWrapper) -> Path:

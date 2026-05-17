@@ -424,6 +424,51 @@ class FunctionDeclaration(ASTNode):
 
 
 @dataclasses.dataclass
+class ThrowStatement(ASTNode):
+    """`throw expr` — return an Err from the enclosing function."""
+
+    expression: ASTNode
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Throw)
+            expression = Expression.parse(parser)
+        return cls(expression, span)
+
+
+@dataclasses.dataclass
+class TryExpression(ASTNode):
+    """`try expr` — unwrap or propagate the Err."""
+
+    expression: ASTNode
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Try)
+            expression = Expression.parse(parser)
+        return cls(expression, span)
+
+
+@dataclasses.dataclass
+class MustExpression(ASTNode):
+    """`must expr` — unwrap or panic on Err."""
+
+    expression: ASTNode
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Must)
+            expression = Expression.parse(parser)
+        return cls(expression, span)
+
+
+@dataclasses.dataclass
 class InterfaceDeclaration(ASTNode):
     """An interface declaration. The compiler enforces conformance; the
     interpreter is permissive and relies on dynamic method lookup."""
@@ -611,6 +656,10 @@ class Expression(ASTNode):
                 operand = Expression.parse(parser, 17)
                 zero = IntegerLiteral(types.Int64(0), span=op_token.span)
                 value = BinaryOperator(zero, op_token, operand, op_token.span)
+            case tokens.Try():
+                value = TryExpression.parse(parser)
+            case tokens.Must():
+                value = MustExpression.parse(parser)
             case tokens.OpenBracket():
                 span = parser.peek().span
                 parser.consume(tokens.OpenBracket)
