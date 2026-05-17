@@ -21,6 +21,14 @@ type TypeKind = enum {
 
 // ── Type layout structures ────────────────────────────────────────────────────
 
+// Pre-resolved function signature. Filled in once at registration time
+// against the owning module's parser, so call sites never need to look at
+// raw type_expr arena ids again.
+type SigInfo = struct {
+    param_kinds: [TypeKind]
+    return_kind: TypeKind
+}
+
 type VariantInfo = struct {
     name: str
     discriminant: int64
@@ -50,7 +58,7 @@ type StructInfo = struct {
     fields: [FieldInfo]
     method_names: [str]
     method_decl_ids: [int64]
-    method_return_kinds: [TypeKind]
+    method_sigs: [SigInfo]
     data_width: int64
     // See EnumInfo.module_prefix.
     module_prefix: str
@@ -60,14 +68,13 @@ type StructInfo = struct {
     src_p: parser.Parser
 }
 
-// Interface metadata. method_return_kinds is parallel to method_names and
-// records each method's return kind (resolved against the interface's
-// owning module). data_width is unused; interface values are an 8-byte
-// pointer to an arena cell {data_ptr, vtable_ptr}.
+// Interface metadata. method_sigs is parallel to method_names and records
+// each method's resolved param + return kinds. Interface values are an
+// 8-byte pointer to an arena cell {data_ptr, vtable_ptr}.
 type IfaceInfo = struct {
     name: str
     method_names: [str]
-    method_return_kinds: [TypeKind]
+    method_sigs: [SigInfo]
     module_prefix: str
 }
 
@@ -125,10 +132,12 @@ type Codegen = struct {
 
     // Functions exported by imported modules, indexed by parallel arrays.
     // Used to resolve mod.func() calls to their exact labels (extern names
-    // get _name, regular functions get $prefix$name).
+    // get _name, regular functions get $prefix$name). import_fn_sigs holds
+    // pre-resolved parameter and return kinds for upcast handling.
     import_fn_module: [str]
     import_fn_name: [str]
     import_fn_label: [str]
+    import_fn_sigs: [SigInfo]
 
     vars: [VarSlot]
     frame_slots: int64
@@ -146,11 +155,10 @@ type Codegen = struct {
 
     func_names: [str]
     func_labels: [str]
-    // Parallel to func_names: the local-module FuncDecl id when known
-    // (so we can read param types for interface upcasting), or -1 for
-    // externs / cross-module functions whose param types live in another
-    // parser.
-    func_decl_ids: [int64]
+    // Parallel to func_names: pre-resolved param + return kinds. Empty
+    // SigInfo (zero-length param_kinds, .KVoid return_kind) for externs
+    // that haven't been registered with full signature info.
+    func_sigs: [SigInfo]
 
 
     func itos(self, anon n: int64) -> str {
@@ -425,16 +433,31 @@ type Codegen = struct {
         return self.vtable_label(si, ii)
     }
 
-    // Find the FuncDecl id for a local function by name, or -1.
-    func find_func_decl_id(self, anon name: str) -> int64 {
+    // Find the cached signature for a function by name. Returns an empty
+    // SigInfo (no params, void return) if the name isn't registered or
+    // wasn't resolved with full signature info.
+    func find_func_sig(self, anon name: str) -> SigInfo {
         let i = 0
         for i < len(self.func_names) {
             if self.func_names[i] == name {
-                return self.func_decl_ids[i]
+                return self.func_sigs[i]
             }
             i = i + 1
         }
-        return -1
+        let empty: [TypeKind] = []
+        return SigInfo(param_kinds: empty, return_kind: .KVoid)
+    }
+
+    func find_import_fn_sig(self, anon local_mod: str, anon name: str) -> SigInfo {
+        let i = 0
+        for i < len(self.import_fn_module) {
+            if self.import_fn_module[i] == local_mod and self.import_fn_name[i] == name {
+                return self.import_fn_sigs[i]
+            }
+            i = i + 1
+        }
+        let empty: [TypeKind] = []
+        return SigInfo(param_kinds: empty, return_kind: .KVoid)
     }
 
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
@@ -532,6 +555,41 @@ type Codegen = struct {
         }
     }
 
+
+    // Resolve a FuncDecl's params and return type into a SigInfo, using p
+    // as the owning parser (the type_expr arena ids in the FuncDecl point
+    // into p.type_exprs). Type *names* are still looked up in self's own
+    // registered tables — they must have been registered via
+    // register_module_types beforehand.
+    func resolve_sig(self, anon fd: ast.FuncDecl, p: parser.Parser) -> SigInfo {
+        let saved_p = self.p
+        self.p = p
+        let pks: [TypeKind] = []
+        let i = 0
+        for i < len(fd.params) {
+            pks += [self.resolve_type(fd.params[i].typ)]
+            i = i + 1
+        }
+        let rk = self.resolve_type(fd.return_typ)
+        self.p = saved_p
+        return SigInfo(param_kinds: pks, return_kind: rk)
+    }
+
+    // Same as resolve_sig but for an Extern decl, whose params/return_typ
+    // are inlined in the Decl variant rather than wrapped in a FuncDecl.
+    func resolve_extern_sig(self, anon params: [ast.Param], return_typ: int64, p: parser.Parser) -> SigInfo {
+        let saved_p = self.p
+        self.p = p
+        let pks: [TypeKind] = []
+        let i = 0
+        for i < len(params) {
+            pks += [self.resolve_type(params[i].typ)]
+            i = i + 1
+        }
+        let rk = self.resolve_type(return_typ)
+        self.p = saved_p
+        return SigInfo(param_kinds: pks, return_kind: rk)
+    }
 
     func func_label(self, anon name: str) -> str {
         let i = 0
@@ -651,38 +709,66 @@ type Codegen = struct {
                 }
                 let mnames: [str] = []
                 let mids: [int64] = []
-                let mrets: [TypeKind] = []
+                let msigs: [SigInfo] = []
                 let j = 0
                 for j < len(methods) {
                     let fd = p.func_decls[methods[j]]
                     mnames += [fd.name]
                     mids += [methods[j]]
-                    mrets += [self.resolve_type(fd.return_typ)]
                     j = j + 1
                 }
+                // Restore parser before resolve_sig (which swaps internally).
                 self.p = saved_p
-                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, method_return_kinds: mrets, data_width: offset, module_prefix: prefix, src_p: p)]
+                let mj = 0
+                for mj < len(methods) {
+                    msigs += [self.resolve_sig(p.func_decls[methods[mj]], p: p)]
+                    mj = mj + 1
+                }
+                self.structs += [StructInfo(name: name, fields: finfos, method_names: mnames, method_decl_ids: mids, method_sigs: msigs, data_width: offset, module_prefix: prefix, src_p: p)]
             }
             else none
         }
     }
 
+    // First pass: register interface NAME so it's findable by name during
+    // struct method sig resolution. method_sigs is left empty for now; a
+    // second pass (resolve_interface_methods) fills it in once all types
+    // are registered.
     func register_interface(self, anon decl: ast.Decl, prefix: str, p: parser.Parser) -> none {
         match decl {
             .Interface(name, methods) -> {
                 let mnames: [str] = []
-                let mrets: [TypeKind] = []
-                let saved_p = self.p
-                self.p = p
+                let msigs: [SigInfo] = []
                 let j = 0
                 for j < len(methods) {
                     let fd = p.func_decls[methods[j]]
                     mnames += [fd.name]
-                    mrets += [self.resolve_type(fd.return_typ)]
                     j = j + 1
                 }
-                self.p = saved_p
-                self.interfaces += [IfaceInfo(name: name, method_names: mnames, method_return_kinds: mrets, module_prefix: prefix)]
+                self.interfaces += [IfaceInfo(name: name, method_names: mnames, method_sigs: msigs, module_prefix: prefix)]
+            }
+            else none
+        }
+    }
+
+    // Second pass: resolve method signatures for an interface declaration.
+    // Builds the [SigInfo] list locally and assigns it onto the existing
+    // IfaceInfo. (`+= [...]` against a nested array isn't currently
+    // supported, but plain field assignment via array index is.)
+    func resolve_interface_methods(self, anon decl: ast.Decl, p: parser.Parser) -> none {
+        match decl {
+            .Interface(name, methods) -> {
+                let ii = self.find_iface_idx(name)
+                if ii >= 0 {
+                    let sigs: [SigInfo] = []
+                    let j = 0
+                    for j < len(methods) {
+                        let fd = p.func_decls[methods[j]]
+                        sigs += [self.resolve_sig(fd, p: p)]
+                        j = j + 1
+                    }
+                    self.interfaces[ii].method_sigs = sigs
+                }
             }
             else none
         }
@@ -690,14 +776,31 @@ type Codegen = struct {
 
     // Register all struct and enum declarations from another module under the
     // given prefix (e.g. "builtins"). Doesn't emit any code for them — just
-    // makes their names and methods visible for label resolution.
+    // makes their names and methods visible for label resolution. Interfaces
+    // are registered before structs so struct method signatures can reference
+    // interface types.
     func register_module_types(self, anon m: ast.Module, prefix: str, p: parser.Parser) -> none {
+        // Phase 1: register interface NAMES (with empty sigs) so they're
+        // findable when struct method signatures reference them.
+        let a = 0
+        for a < len(m.decls) {
+            self.register_interface(m.decls[a], prefix: prefix, p: p)
+            a = a + 1
+        }
+        // Phase 2: register enums and structs. Struct method signatures
+        // can now resolve interface names from phase 1.
         let i = 0
         for i < len(m.decls) {
             self.register_enum(m.decls[i], prefix: prefix, p: p)
             self.register_struct(m.decls[i], prefix: prefix, p: p)
-            self.register_interface(m.decls[i], prefix: prefix, p: p)
             i = i + 1
+        }
+        // Phase 3: now that structs are also registered, resolve the
+        // interface method signatures (which may reference struct types).
+        let b = 0
+        for b < len(m.decls) {
+            self.resolve_interface_methods(m.decls[b], p: p)
+            b = b + 1
         }
     }
 
@@ -1456,7 +1559,8 @@ type Codegen = struct {
             if s_idx >= 0 {
                 return self.compile_struct_construct(s_idx, args)
             }
-            self.prepare_args(args)
+            let sig = self.find_import_fn_sig(mod_or_obj, method_name)
+            self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds)
             let lbl = self.import_func_label(mod_or_obj, method_name)
             self.emit(f"bl {lbl}")
             return .VReg(name: "x0")
@@ -1475,17 +1579,8 @@ type Codegen = struct {
                 if si >= 0 {
                     return self.compile_struct_construct(si, args)
                 }
-                let expected_kinds: [TypeKind] = []
-                let fd_id = self.find_func_decl_id(name)
-                if fd_id >= 0 {
-                    let fd = self.p.func_decls[fd_id]
-                    let q = 0
-                    for q < len(fd.params) {
-                        expected_kinds += [self.resolve_type(fd.params[q].typ)]
-                        q = q + 1
-                    }
-                }
-                self.prepare_args_with_kinds(args, expected_kinds: expected_kinds)
+                let sig = self.find_func_sig(name)
+                self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds)
                 let lbl = self.func_label(name)
                 self.emit(f"bl {lbl}")
                 return .VReg(name: "x0")
@@ -1578,6 +1673,10 @@ type Codegen = struct {
                 mi = mi + 1
             }
         }
+        let sig_params: [TypeKind] = []
+        if method_idx >= 0 {
+            sig_params = self.interfaces[ii].method_sigs[method_idx].param_kinds
+        }
         // Stash self (data_ptr) and each compiled arg, plus the method ptr,
         // so arg compilation doesn't clobber x0..x7. Layout in the spill
         // area: [data_ptr, arg0, arg1, ..., method_ptr].
@@ -1602,6 +1701,12 @@ type Codegen = struct {
         for i < len(args) {
             let av = self.compile_expr(args[i].value)
             let ar = self.load(av)
+            // Method param 0 is self; caller arg i maps to param i+1.
+            let pi = i + 1
+            if pi < len(sig_params) {
+                let actual = self.infer_kind(args[i].value)
+                ar = self.maybe_box_for_iface(ar, actual: actual, expected: sig_params[pi])
+            }
             self.emit(f"str {ar}, [sp, #{self.itos((i + 1) * 8)}]")
             self.free_reg(ar)
             i = i + 1
@@ -1627,12 +1732,14 @@ type Codegen = struct {
         }
 
         let method_lbl = "_unknown_method"
+        let sig_params: [TypeKind] = []
         match var_kind {
             .KStruct(idx) -> {
                 let mi = 0
                 for mi < len(self.structs[idx].method_names) {
                     if self.structs[idx].method_names[mi] == method_name {
                         method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
+                        sig_params = self.structs[idx].method_sigs[mi].param_kinds
                         mi = len(self.structs[idx].method_names)
                     } else {
                         mi = mi + 1
@@ -1658,6 +1765,12 @@ type Codegen = struct {
         for i < len(args) {
             let av = self.compile_expr(args[i].value)
             let ar = self.load(av)
+            // Method param 0 is self; caller arg i maps to param i+1.
+            let pi = i + 1
+            if pi < len(sig_params) {
+                let actual = self.infer_kind(args[i].value)
+                ar = self.maybe_box_for_iface(ar, actual: actual, expected: sig_params[pi])
+            }
             self.emit(f"str {ar}, [sp, #{self.itos((i + 1) * 8)}]")
             self.free_reg(ar)
             i = i + 1
@@ -1860,7 +1973,7 @@ type Codegen = struct {
             let mi = 0
             for mi < len(self.interfaces[iidx].method_names) {
                 if self.interfaces[iidx].method_names[mi] == method_name {
-                    return self.interfaces[iidx].method_return_kinds[mi]
+                    return self.interfaces[iidx].method_sigs[mi].return_kind
                 }
                 mi = mi + 1
             }
@@ -1870,7 +1983,7 @@ type Codegen = struct {
         let mi = 0
         for mi < len(self.structs[sidx].method_names) {
             if self.structs[sidx].method_names[mi] == method_name {
-                return self.structs[sidx].method_return_kinds[mi]
+                return self.structs[sidx].method_sigs[mi].return_kind
             }
             mi = mi + 1
         }
@@ -1982,7 +2095,7 @@ type Codegen = struct {
                                 let mi = 0
                                 for mi < len(self.structs[sidx].method_names) {
                                     if self.structs[sidx].method_names[mi] == "op_index" {
-                                        return self.structs[sidx].method_return_kinds[mi]
+                                        return self.structs[sidx].method_sigs[mi].return_kind
                                     }
                                     mi = mi + 1
                                 }
@@ -3076,6 +3189,13 @@ type Codegen = struct {
     func compile_module(self, anon m: ast.Module) -> none {
         print("\t.text")
 
+        // Three-phase registration to handle struct ⇄ interface refs:
+        // 1) interface names, 2) enums + structs, 3) interface method sigs.
+        let ii = 0
+        for ii < len(m.decls) {
+            self.register_interface(m.decls[ii], prefix: self.path_prefix, p: self.p)
+            ii = ii + 1
+        }
         let i = 0
         for i < len(m.decls) {
             self.register_enum(m.decls[i], prefix: self.path_prefix, p: self.p)
@@ -3086,10 +3206,10 @@ type Codegen = struct {
             self.register_struct(m.decls[j], prefix: self.path_prefix, p: self.p)
             j = j + 1
         }
-        let ii = 0
-        for ii < len(m.decls) {
-            self.register_interface(m.decls[ii], prefix: self.path_prefix, p: self.p)
-            ii = ii + 1
+        let b = 0
+        for b < len(m.decls) {
+            self.resolve_interface_methods(m.decls[b], p: self.p)
+            b = b + 1
         }
         // Process type aliases now that base types are registered.
         let a = 0
@@ -3121,12 +3241,12 @@ type Codegen = struct {
                     let fd = self.p.func_decls[decl_id]
                     self.func_names += [fd.name]
                     self.func_labels += [f"${self.path_prefix}${fd.name}"]
-                    self.func_decl_ids += [decl_id]
+                    self.func_sigs += [self.resolve_sig(fd, p: self.p)]
                 }
                 .Extern(name, params, return_typ) -> {
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
-                    self.func_decl_ids += [-1]
+                    self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: self.p)]
                 }
                 else none
             }
@@ -3221,12 +3341,12 @@ type Codegen = struct {
                     let fd = p.func_decls[decl_id]
                     self.func_names += [fd.name]
                     self.func_labels += [f"${prefix}${fd.name}"]
-                    self.func_decl_ids += [-1]
+                    self.func_sigs += [self.resolve_sig(fd, p: p)]
                 }
                 .Extern(name, params, return_typ) -> {
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
-                    self.func_decl_ids += [-1]
+                    self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: p)]
                 }
                 else none
             }
@@ -3250,14 +3370,14 @@ type Codegen = struct {
                         if fd.name == want {
                             self.func_names += [fd.name]
                             self.func_labels += [f"${prefix}${fd.name}"]
-                            self.func_decl_ids += [-1]
+                            self.func_sigs += [self.resolve_sig(fd, p: p)]
                         }
                     }
                     .Extern(name, params, return_typ) -> {
                         if name == want {
                             self.func_names += [name]
                             self.func_labels += [f"_{name}"]
-                            self.func_decl_ids += [-1]
+                            self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: p)]
                         }
                     }
                     else none
@@ -3283,11 +3403,13 @@ type Codegen = struct {
                     self.import_fn_module += [local_mod]
                     self.import_fn_name += [fd.name]
                     self.import_fn_label += [f"${prefix}${fd.name}"]
+                    self.import_fn_sigs += [self.resolve_sig(fd, p: p)]
                 }
                 .Extern(name, params, return_typ) -> {
                     self.import_fn_module += [local_mod]
                     self.import_fn_name += [name]
                     self.import_fn_label += [f"_{name}"]
+                    self.import_fn_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: p)]
                 }
                 else none
             }
@@ -3311,13 +3433,14 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let import_fn_module: [str] = []
     let import_fn_name: [str] = []
     let import_fn_label: [str] = []
+    let import_fn_sigs: [SigInfo] = []
     let vars: [VarSlot] = []
     let loop_stack: [LoopLbl] = []
     let str_labels: [str] = []
     let str_values: [str] = []
     let func_names: [str] = []
     let func_labels: [str] = []
-    let func_decl_ids: [int64] = []
+    let func_sigs: [SigInfo] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels, func_decl_ids: func_decl_ids)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs)
 }
