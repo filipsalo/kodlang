@@ -941,6 +941,14 @@ class MatchExpressionArm:
     @classmethod
     def parse(cls, parser: "Parser") -> "MatchExpressionArm":
         with parser.span() as span:
+            # `else` is the wildcard/catch-all arm; the arrow after it is
+            # optional since `else` is already unambiguous.
+            if parser.peeking_at(tokens.Else):
+                parser.consume(tokens.Else)
+                pattern = WildcardPattern(span)
+                parser.try_consume(tokens.Arrow)
+                body = Expression.parse(parser)
+                return cls(pattern, body, span)
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
                 pattern = IntegerPattern(int(tok.value), span)
@@ -1027,6 +1035,28 @@ class MatchArm:
     @classmethod
     def parse(cls, parser: "Parser") -> "MatchArm":
         with parser.span() as span:
+            # `else` is the wildcard/catch-all arm; arrow is optional after it.
+            # `else none` is sugar for an empty body (no-op catch-all).
+            if parser.peeking_at(tokens.Else):
+                parser.consume(tokens.Else)
+                pattern = WildcardPattern(span)
+                parser.try_consume(tokens.Arrow)
+                if parser.peeking_at(tokens.NoneLiteral):
+                    parser.consume(tokens.NoneLiteral)
+                    return cls(pattern, [], span)
+                if parser.peeking_at(tokens.OpenCurly):
+                    parser.consume(tokens.OpenCurly)
+                    body = []
+                    while not parser.try_consume(tokens.CloseCurly):
+                        if parser.try_consume(tokens.EOL):
+                            continue
+                        if stmt := parser.parse_statement():
+                            body.append(stmt)
+                else:
+                    body = []
+                    if stmt := parser.parse_statement():
+                        body.append(stmt)
+                return cls(pattern, body, span)
             # Parse pattern
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
