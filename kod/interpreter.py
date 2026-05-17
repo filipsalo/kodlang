@@ -432,6 +432,31 @@ class Interpreter:
                             for stmt in arm.body:
                                 self.execute_statement(module, stmt)
                             break
+            case ast.LetElseStatement(pattern, value_expr, else_body):
+                value = self.evaluate_expression(module, value_expr)
+                matched = False
+                if isinstance(
+                    pattern, (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern)
+                ):
+                    if (
+                        isinstance(value, types.EnumValue)
+                        and value.variant_name == pattern.variant_name
+                    ):
+                        bindings = getattr(pattern, "bindings", [])
+                        field_values = list(value.fields.values())
+                        for binding_name, field_value in zip(bindings, field_values):
+                            self.stack[-1][binding_name] = field_value
+                        matched = True
+                elif isinstance(pattern, ast.OptionalNonePattern):
+                    matched = isinstance(value, types.NoneType)
+                elif isinstance(pattern, ast.OptionalSomePattern):
+                    if not isinstance(value, types.NoneType):
+                        if pattern.binding:
+                            self.stack[-1][pattern.binding] = value
+                        matched = True
+                if not matched:
+                    for stmt in else_body:
+                        self.execute_statement(module, stmt)
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 

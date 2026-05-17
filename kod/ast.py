@@ -451,15 +451,50 @@ class VariableDeclaration(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser: Parser) -> Self:
-        """Parse a variable declaration."""
+    def parse(cls, parser: Parser) -> "VariableDeclaration | LetElseStatement":
+        """Parse a variable declaration, or a `let .Pat = expr else { ... }`."""
         with parser.span() as span:
             parser.consume(tokens.Let)
+            # Refutable form: `let .Variant(b1, b2, ...) = expr else { ... }`.
+            if parser.peeking_at(tokens.Dot):
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                bindings = []
+                if parser.try_consume(tokens.OpenParen):
+                    while not parser.try_consume(tokens.CloseParen):
+                        bindings.append(parser.consume(tokens.Identifier).value)
+                        if not parser.try_consume(tokens.Comma):
+                            parser.consume(tokens.CloseParen)
+                            break
+                pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
+                for b in bindings:
+                    parser.stack[-1][b] = Variable(b, None, span)
+                parser.consume(tokens.Equal)
+                value = Expression.parse(parser)
+                parser.consume(tokens.Else)
+                parser.consume(tokens.OpenCurly)
+                else_body = []
+                while not parser.try_consume(tokens.CloseCurly):
+                    if parser.try_consume(tokens.EOL):
+                        continue
+                    if stmt := parser.parse_statement():
+                        else_body.append(stmt)
+                return LetElseStatement(pattern, value, else_body, span)
             variable = Variable.parse(parser)
             parser.stack[-1][variable.id] = variable
             parser.consume(tokens.Equal)
             value = Expression.parse(parser)
         return cls(variable, value, span)
+
+
+@dataclasses.dataclass
+class LetElseStatement(ASTNode):
+    """`let .Pat(...) = expr else { ... }` — refutable destructure."""
+
+    pattern: Any
+    value: ASTNode
+    else_body: list
+    span: Span
 
 
 @dataclasses.dataclass

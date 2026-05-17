@@ -809,6 +809,61 @@ type Codegen = struct {
                     i = i + 1
                 }
             }
+            .LetElse(pattern, value, else_body) -> {
+                // Allocate bindings introduced by the pattern (same shape as
+                // a match arm) so the rest of the surrounding block can use
+                // them.
+                match self.p.patterns[pattern] {
+                    .EnumPat(enum_name, variant_name, bindings) -> {
+                        let ei: int64 = self.find_enum_idx(enum_name)
+                        let vi: int64 = -1
+                        if ei >= 0 {
+                            vi = self.find_variant_idx(ei, variant_name)
+                        }
+                        let j: int64 = 0
+                        for j < len(bindings) {
+                            if self.var_declared(bindings[j]) == false {
+                                let bkind: TypeKind = .KInt64
+                                if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                    bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                }
+                                self.alloc_var(bindings[j], bkind)
+                            }
+                            j = j + 1
+                        }
+                    }
+                    .ImplicitEnumPat(variant_name, bindings) -> {
+                        let ei: int64 = self.find_enum_with_variant(variant_name)
+                        let vi: int64 = -1
+                        if ei >= 0 {
+                            vi = self.find_variant_idx(ei, variant_name)
+                        }
+                        let j: int64 = 0
+                        for j < len(bindings) {
+                            if self.var_declared(bindings[j]) == false {
+                                let bkind: TypeKind = .KInt64
+                                if vi >= 0 and j < len(self.enums[ei].variants[vi].field_kinds) {
+                                    bkind = self.enums[ei].variants[vi].field_kinds[j]
+                                }
+                                self.alloc_var(bindings[j], bkind)
+                            }
+                            j = j + 1
+                        }
+                    }
+                    .SomePat(binding) -> {
+                        if len(binding) > 0 and self.var_declared(binding) == false {
+                            self.alloc_var(binding, .KInt64)
+                        }
+                    }
+                    _ -> {}
+                }
+                self.collect_expr_vars(value)
+                let e: int64 = 0
+                for e < len(else_body) {
+                    self.collect_stmt_vars(else_body[e])
+                    e = e + 1
+                }
+            }
             _ -> {}
         }
     }
@@ -857,51 +912,40 @@ type Codegen = struct {
         }
     }
 
+    // Try `module.Enum.Variant` — bare three-part unit-variant access.
+    // Drops the module qualifier (types are global in the codegen).
+    func try_three_part_unit_variant(self, dot_lhs: int64, dot_rhs: int64) -> Val? {
+        let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[dot_lhs] else { return none }
+        let .Dot = inner_op else { return none }
+        let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
+        let .Ident(variant_name) = self.p.exprs[dot_rhs] else { return none }
+        let ei3: int64 = self.find_enum_idx(enum_name)
+        if ei3 < 0 { return none }
+        let vi3: int64 = self.find_variant_idx(ei3, variant_name)
+        if vi3 < 0 { return none }
+        let empty: [ast.CallArg] = []
+        return self.compile_enum_construct(ei3, vi3, empty)
+    }
+
+    // Try `EnumName.Variant` — bare two-part unit-variant access.
+    func try_two_part_unit_variant(self, dot_lhs: int64, dot_rhs: int64) -> Val? {
+        let .Ident(type_name) = self.p.exprs[dot_lhs] else { return none }
+        let ei: int64 = self.find_enum_idx(type_name)
+        if ei < 0 { return none }
+        let .Ident(variant_name) = self.p.exprs[dot_rhs] else { return none }
+        let vi: int64 = self.find_variant_idx(ei, variant_name)
+        let empty: [ast.CallArg] = []
+        return self.compile_enum_construct(ei, vi, empty)
+    }
+
     func compile_dot(self, lhs: int64, rhs: int64) -> Val {
-        // Three-part: module.Enum.Variant — drop the module qualifier.
-        match self.p.exprs[lhs] {
-            .Binary(inner_lhs, inner_op, inner_rhs) -> {
-                match inner_op {
-                    .Dot -> {
-                        match self.p.exprs[inner_rhs] {
-                            .Ident(enum_name) -> {
-                                let ei3: int64 = self.find_enum_idx(enum_name)
-                                if ei3 >= 0 {
-                                    match self.p.exprs[rhs] {
-                                        .Ident(variant_name) -> {
-                                            let vi3: int64 = self.find_variant_idx(ei3, variant_name)
-                                            if vi3 >= 0 {
-                                                let empty3: [ast.CallArg] = []
-                                                return self.compile_enum_construct(ei3, vi3, empty3)
-                                            }
-                                        }
-                                        _ -> {}
-                                    }
-                                }
-                            }
-                            _ -> {}
-                        }
-                    }
-                    _ -> {}
-                }
-            }
-            _ -> {}
+        match self.try_three_part_unit_variant(lhs, rhs) {
+            Some(v) -> return v
+            none -> {}
         }
-        match self.p.exprs[lhs] {
-            .Ident(type_name) -> {
-                let ei: int64 = self.find_enum_idx(type_name)
-                if ei >= 0 {
-                    match self.p.exprs[rhs] {
-                        .Ident(variant_name) -> {
-                            let vi: int64 = self.find_variant_idx(ei, variant_name)
-                            let empty: [ast.CallArg] = []
-                            return self.compile_enum_construct(ei, vi, empty)
-                        }
-                        _ -> {}
-                    }
-                }
-            }
-            _ -> {}
+        match self.try_two_part_unit_variant(lhs, rhs) {
+            Some(v) -> return v
+            none -> {}
         }
         let ptr_v: Val = self.compile_expr(lhs)
         let ptr_r: str = self.load(ptr_v)
@@ -1278,6 +1322,56 @@ type Codegen = struct {
         return .VReg(name: hdr_r)
     }
 
+    // Try `mod.Enum.Variant(args)` — succeed iff the callee shape is
+    // Binary(Binary(Ident(mod), Dot, Ident(enum)), Dot, Ident(variant))
+    // and Enum/Variant resolve.
+    func try_three_part_construct(self, callee_lhs: int64, callee_rhs: int64, anon args: [ast.CallArg]) -> Val? {
+        let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[callee_lhs] else { return none }
+        let .Dot = inner_op else { return none }
+        let .Ident(mod_name) = self.p.exprs[inner_lhs] else { return none }
+        let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
+        let .Ident(variant_name) = self.p.exprs[callee_rhs] else { return none }
+        let ei: int64 = self.find_enum_idx(enum_name)
+        if ei < 0 { return none }
+        let vi: int64 = self.find_variant_idx(ei, variant_name)
+        if vi < 0 { return none }
+        return self.compile_enum_construct(ei, vi, args)
+    }
+
+    // Try `EnumName.Variant(args)` or `module.thing(args)` two-part forms.
+    func try_two_part_call(self, callee_lhs: int64, callee_rhs: int64, anon args: [ast.CallArg]) -> Val? {
+        let .Ident(mod_or_obj) = self.p.exprs[callee_lhs] else { return none }
+        let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
+        let enum_idx: int64 = self.find_enum_idx(mod_or_obj)
+        if enum_idx >= 0 {
+            let variant_idx: int64 = self.find_variant_idx(enum_idx, method_name)
+            if variant_idx >= 0 {
+                return self.compile_enum_construct(enum_idx, variant_idx, args)
+            }
+        }
+        let is_import: bool = false
+        let i: int64 = 0
+        for i < len(self.import_local) {
+            if self.import_local[i] == mod_or_obj {
+                is_import = true
+                i = len(self.import_local)
+            } else {
+                i = i + 1
+            }
+        }
+        if is_import {
+            let s_idx: int64 = self.find_struct_idx(method_name)
+            if s_idx >= 0 {
+                return self.compile_struct_construct(s_idx, args)
+            }
+            self.prepare_args(args)
+            let lbl: str = self.import_func_label(mod_or_obj, method_name)
+            self.emit(f"bl {lbl}")
+            return .VReg(name: "x0")
+        }
+        return self.compile_method_call(mod_or_obj, method_name, args)
+    }
+
     func compile_call(self, callee_id: int64, anon args: [ast.CallArg]) -> Val {
         match self.p.exprs[callee_id] {
             .Ident(name) -> {
@@ -1297,81 +1391,13 @@ type Codegen = struct {
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Dot -> {
-                        // Three-part dotted call: mod.Enum.Variant(args).
-                        // lhs is Binary(Ident(mod), Dot, Ident(enum)); rhs is Ident(variant).
-                        match self.p.exprs[lhs] {
-                            .Binary(inner_lhs, inner_op, inner_rhs) -> {
-                                match inner_op {
-                                    .Dot -> {
-                                        match self.p.exprs[inner_lhs] {
-                                            .Ident(mod_name) -> {
-                                                match self.p.exprs[inner_rhs] {
-                                                    .Ident(enum_name) -> {
-                                                        match self.p.exprs[rhs] {
-                                                            .Ident(variant_name) -> {
-                                                                let ei3: int64 = self.find_enum_idx(enum_name)
-                                                                if ei3 >= 0 {
-                                                                    let vi3: int64 = self.find_variant_idx(ei3, variant_name)
-                                                                    if vi3 >= 0 {
-                                                                        return self.compile_enum_construct(ei3, vi3, args)
-                                                                    }
-                                                                }
-                                                            }
-                                                            _ -> {}
-                                                        }
-                                                    }
-                                                    _ -> {}
-                                                }
-                                            }
-                                            _ -> {}
-                                        }
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
+                        match self.try_three_part_construct(lhs, rhs, args) {
+                            Some(v) -> return v
+                            none -> {}
                         }
-                        match self.p.exprs[lhs] {
-                            .Ident(mod_or_obj) -> {
-                                match self.p.exprs[rhs] {
-                                    .Ident(method_name) -> {
-                                        // EnumName.Variant(args) — payload constructor
-                                        let enum_idx: int64 = self.find_enum_idx(mod_or_obj)
-                                        if enum_idx >= 0 {
-                                            let variant_idx: int64 = self.find_variant_idx(enum_idx, method_name)
-                                            if variant_idx >= 0 {
-                                                return self.compile_enum_construct(enum_idx, variant_idx, args)
-                                            }
-                                        }
-                                        let is_import: bool = false
-                                        let i: int64 = 0
-                                        for i < len(self.import_local) {
-                                            if self.import_local[i] == mod_or_obj {
-                                                is_import = true
-                                                i = len(self.import_local)
-                                            } else {
-                                                i = i + 1
-                                            }
-                                        }
-                                        if is_import {
-                                            // mod.StructName(args) — struct constructor on an imported struct
-                                            let s_idx: int64 = self.find_struct_idx(method_name)
-                                            if s_idx >= 0 {
-                                                return self.compile_struct_construct(s_idx, args)
-                                            }
-                                            // mod.EnumName.Variant(args) is handled at the outer level
-                                            // (this case is two-deep dotted, not handled here).
-                                            self.prepare_args(args)
-                                            let lbl: str = self.import_func_label(mod_or_obj, method_name)
-                                            self.emit(f"bl {lbl}")
-                                            return .VReg(name: "x0")
-                                        }
-                                        return self.compile_method_call(mod_or_obj, method_name, args)
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
+                        match self.try_two_part_call(lhs, rhs, args) {
+                            Some(v) -> return v
+                            none -> {}
                         }
                     }
                     _ -> {}
@@ -1622,6 +1648,23 @@ type Codegen = struct {
     }
 
 
+    // For `obj.method()` where obj is a known struct, return the method's
+    // recorded return kind. Returns none if anything about the shape doesn't
+    // match (callee not Ident.Ident, obj not a struct, method not found).
+    func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64) -> TypeKind? {
+        let .Ident(obj_name) = self.p.exprs[callee_lhs] else { return none }
+        let .KStruct(sidx) = self.find_var_kind(obj_name) else { return none }
+        let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
+        let mi: int64 = 0
+        for mi < len(self.structs[sidx].method_names) {
+            if self.structs[sidx].method_names[mi] == method_name {
+                return self.structs[sidx].method_return_kinds[mi]
+            }
+            mi = mi + 1
+        }
+        return none
+    }
+
     func infer_kind(self, anon expr_id: int64) -> TypeKind {
         match self.p.exprs[expr_id] {
             .IntLit(value) -> return .KInt64
@@ -1652,34 +1695,10 @@ type Codegen = struct {
                         }
                     }
                     .Binary(call_lhs, call_op, call_rhs) -> {
-                        // Method call obj.method() — look up the method's
-                        // recorded return type on obj's struct.
-                        match call_op {
-                            .Dot -> {
-                                match self.p.exprs[call_lhs] {
-                                    .Ident(obj_name) -> {
-                                        match self.find_var_kind(obj_name) {
-                                            .KStruct(sidx) -> {
-                                                match self.p.exprs[call_rhs] {
-                                                    .Ident(method_name) -> {
-                                                        let mi: int64 = 0
-                                                        for mi < len(self.structs[sidx].method_names) {
-                                                            if self.structs[sidx].method_names[mi] == method_name {
-                                                                return self.structs[sidx].method_return_kinds[mi]
-                                                            }
-                                                            mi = mi + 1
-                                                        }
-                                                    }
-                                                    _ -> {}
-                                                }
-                                            }
-                                            _ -> {}
-                                        }
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
+                        let .Dot = call_op else { return .KInt64 }
+                        match self.method_call_return_kind(call_lhs, call_rhs) {
+                            Some(k) -> return k
+                            none -> {}
                         }
                     }
                     .ImplicitVariant(variant_name) -> {
@@ -1716,52 +1735,26 @@ type Codegen = struct {
                             }
                             _ -> {}
                         }
-                        // EnumName.Variant — an enum value (unit variant).
+                        // EnumName.Variant — unit-variant reference.
                         match self.p.exprs[lhs] {
                             .Ident(type_name) -> {
                                 let ei: int64 = self.find_enum_idx(type_name)
                                 if ei >= 0 {
                                     return .KEnum(idx: ei)
                                 }
-                                // Field access on a struct-typed variable.
-                                match self.find_var_kind(type_name) {
-                                    .KStruct(si) -> {
-                                        match self.p.exprs[rhs] {
-                                            .Ident(field_name) -> {
-                                                let fi: int64 = 0
-                                                for fi < len(self.structs[si].fields) {
-                                                    if self.structs[si].fields[fi].name == field_name {
-                                                        return self.structs[si].fields[fi].kind
-                                                    }
-                                                    fi = fi + 1
-                                                }
-                                            }
-                                            _ -> {}
-                                        }
-                                    }
-                                    _ -> {}
-                                }
                             }
                             _ -> {}
                         }
-                        // Generic field access on any struct-valued expression
-                        // (e.g. self.p.type_exprs, arr[i].field).
-                        match self.infer_kind(lhs) {
-                            .KStruct(si2) -> {
-                                match self.p.exprs[rhs] {
-                                    .Ident(field_name2) -> {
-                                        let fi2: int64 = 0
-                                        for fi2 < len(self.structs[si2].fields) {
-                                            if self.structs[si2].fields[fi2].name == field_name2 {
-                                                return self.structs[si2].fields[fi2].kind
-                                            }
-                                            fi2 = fi2 + 1
-                                        }
-                                    }
-                                    _ -> {}
-                                }
+                        // Field access on any struct-valued expression
+                        // (Ident.field, self.p.type_exprs, arr[i].field, ...).
+                        let .KStruct(si) = self.infer_kind(lhs) else { return .KInt64 }
+                        let .Ident(field_name) = self.p.exprs[rhs] else { return .KInt64 }
+                        let fi: int64 = 0
+                        for fi < len(self.structs[si].fields) {
+                            if self.structs[si].fields[fi].name == field_name {
+                                return self.structs[si].fields[fi].kind
                             }
-                            _ -> {}
+                            fi = fi + 1
                         }
                         return .KInt64
                     }
@@ -1809,6 +1802,7 @@ type Codegen = struct {
                 self.free_val(v)
             }
             .MatchStmt(subject, arms) -> self.compile_match_stmt(subject, arms)
+            .LetElse(pattern, value, else_body) -> self.compile_let_else(pattern, value, else_body)
         }
     }
 
@@ -2591,6 +2585,111 @@ type Codegen = struct {
 
     func compile_continue(self) -> none {
         self.emit(f"b {self.loop_stack[-1].incr_lbl}")
+    }
+
+    // Refutable `let .Pat(...) = expr else { ... }`. On a successful pattern
+    // match, the bindings receive the variant's payload fields and execution
+    // falls through; on mismatch, the else-block runs (and must diverge).
+    func compile_let_else(self, pattern_id: int64, value_id: int64, anon else_body: [int64]) -> none {
+        let else_lbl: str = self.fresh("Llet_else")
+        let done_lbl: str = self.fresh("Llet_done")
+        let sv: Val = self.compile_expr(value_id)
+        let sptr_r: str = self.load(sv)
+        let subj_slot: int64 = self.alloc_var(self.fresh("__lsubj"), .KInt64)
+        self.emit_str(sptr_r, subj_slot)
+        self.free_reg(sptr_r)
+        match self.p.patterns[pattern_id] {
+            .EnumPat(enum_name, variant_name, bindings) -> {
+                let ei: int64 = self.find_enum_idx(enum_name)
+                let vi: int64 = self.find_variant_idx(ei, variant_name)
+                let disc: int64 = self.enums[ei].variants[vi].discriminant
+                let disc_r: str = self.alloc_reg()
+                let ptr_r: str = self.alloc_reg()
+                self.emit_ldr(ptr_r, subj_slot)
+                self.emit(f"ldr {disc_r}, [{ptr_r}]")
+                self.emit(f"cmp {disc_r}, #{self.itos(disc)}")
+                self.emit(f"bne {else_lbl}")
+                self.free_reg(disc_r)
+                self.free_reg(ptr_r)
+                let vinfo: VariantInfo = self.enums[ei].variants[vi]
+                let ki: int64 = 0
+                for ki < len(bindings) {
+                    let foff: int64 = vinfo.field_offsets[ki]
+                    let binding_off: int64 = self.find_var_offset(bindings[ki])
+                    let ptr_r2: str = self.alloc_reg()
+                    self.emit_ldr(ptr_r2, subj_slot)
+                    let fv_r: str = self.alloc_reg()
+                    self.emit(f"ldr {fv_r}, [{ptr_r2}, #{self.itos(8 + foff)}]")
+                    self.emit_str(fv_r, binding_off)
+                    self.free_reg(fv_r)
+                    self.free_reg(ptr_r2)
+                    ki = ki + 1
+                }
+            }
+            .ImplicitEnumPat(variant_name, bindings) -> {
+                let ei: int64 = self.find_enum_with_variant(variant_name)
+                let vi: int64 = self.find_variant_idx(ei, variant_name)
+                let disc: int64 = self.enums[ei].variants[vi].discriminant
+                let disc_r: str = self.alloc_reg()
+                let ptr_r: str = self.alloc_reg()
+                self.emit_ldr(ptr_r, subj_slot)
+                self.emit(f"ldr {disc_r}, [{ptr_r}]")
+                self.emit(f"cmp {disc_r}, #{self.itos(disc)}")
+                self.emit(f"bne {else_lbl}")
+                self.free_reg(disc_r)
+                self.free_reg(ptr_r)
+                let vinfo2: VariantInfo = self.enums[ei].variants[vi]
+                let ki: int64 = 0
+                for ki < len(bindings) {
+                    let foff: int64 = vinfo2.field_offsets[ki]
+                    let binding_off: int64 = self.find_var_offset(bindings[ki])
+                    let ptr_r2: str = self.alloc_reg()
+                    self.emit_ldr(ptr_r2, subj_slot)
+                    let fv_r: str = self.alloc_reg()
+                    self.emit(f"ldr {fv_r}, [{ptr_r2}, #{self.itos(8 + foff)}]")
+                    self.emit_str(fv_r, binding_off)
+                    self.free_reg(fv_r)
+                    self.free_reg(ptr_r2)
+                    ki = ki + 1
+                }
+            }
+            .SomePat(binding) -> {
+                let disc_r: str = self.alloc_reg()
+                self.emit_ldr(disc_r, subj_slot)
+                self.emit(f"cmp {disc_r}, #0")
+                self.emit(f"beq {else_lbl}")
+                self.free_reg(disc_r)
+                if len(binding) > 0 {
+                    let boff: int64 = self.find_var_offset(binding)
+                    let ptr_r: str = self.alloc_reg()
+                    self.emit_ldr(ptr_r, subj_slot)
+                    let val_r: str = self.alloc_reg()
+                    self.emit(f"ldr {val_r}, [{ptr_r}]")
+                    self.emit_str(val_r, boff)
+                    self.free_reg(val_r)
+                    self.free_reg(ptr_r)
+                }
+            }
+            .NonePat -> {
+                let disc_r: str = self.alloc_reg()
+                self.emit_ldr(disc_r, subj_slot)
+                self.emit(f"cmp {disc_r}, #0")
+                self.emit(f"bne {else_lbl}")
+                self.free_reg(disc_r)
+            }
+            _ -> {
+                // Other patterns are not supported here yet.
+                self.emit(f"b {else_lbl}")
+            }
+        }
+        self.emit(f"b {done_lbl}")
+        self.emit_label(else_lbl)
+        let i: int64 = 0
+        for i < len(else_body) {
+            self.compile_stmt(else_body[i])
+            i = i + 1
+        }
+        self.emit_label(done_lbl)
     }
 
     func compile_match_stmt(self, subject_id: int64, anon arms: [int64]) -> none {
