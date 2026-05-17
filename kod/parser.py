@@ -28,6 +28,7 @@ from kod.tokens import (
     Identifier,
     If,
     Import,
+    Interface,
     Let,
     Match,
     NoneLiteral,
@@ -205,6 +206,8 @@ class Parser:
                 stmt = ast.VariableDeclaration.parse(self)
             case Type():
                 stmt = ast.TypeDeclaration.parse(self)
+            case Interface():
+                stmt = ast.InterfaceDeclaration.parse(self)
             case Extern():
                 stmt = ast.ExternalFunctionDeclaration.parse(self)
             case Func():

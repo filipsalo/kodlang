@@ -45,6 +45,8 @@ class TypeChecker:
                 case ast.Import():
                     path = module.resolve_import(node.module_name)
                     self.collect_functions(self.program.get_module(path))
+                case ast.InterfaceDeclaration():
+                    pass
 
     def check_module(self, module: ast.Module) -> None:
         """Check a module for type errors."""
@@ -105,6 +107,8 @@ class TypeChecker:
             case ast.Assignment(_, rhs):
                 self.check_expression(rhs)
             case ast.Import():
+                pass
+            case ast.InterfaceDeclaration():
                 pass
 
     def infer_type(self, node: ast.ASTNode):
@@ -209,6 +213,12 @@ class TypeChecker:
                 if not isinstance(import_node, ast.Import):
                     lhs_type = self.infer_type(lhs)
                     if lhs_type is not None and hasattr(lhs_type, "methods"):
+                        return
+                    from kod.values import InterfaceType
+
+                    if isinstance(lhs_type, type) and issubclass(
+                        lhs_type, InterfaceType
+                    ):
                         return
                     self.error(f"'{lhs.id}' is not an imported module", lhs.span)
                     return

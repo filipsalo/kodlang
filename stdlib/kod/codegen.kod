@@ -16,6 +16,7 @@ type TypeKind = enum {
     KArrayStruct(elem_idx: int64)
     KArrayEnum(elem_idx: int64)
     KArrayStr
+    KInterface(idx: int64)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -59,6 +60,17 @@ type StructInfo = struct {
     src_p: parser.Parser
 }
 
+// Interface metadata. method_return_kinds is parallel to method_names and
+// records each method's return kind (resolved against the interface's
+// owning module). data_width is unused; interface values are an 8-byte
+// pointer to an arena cell {data_ptr, vtable_ptr}.
+type IfaceInfo = struct {
+    name: str
+    method_names: [str]
+    method_return_kinds: [TypeKind]
+    module_prefix: str
+}
+
 // ── Per-variable stack slot ───────────────────────────────────────────────────
 
 type VarSlot = struct {
@@ -92,6 +104,13 @@ type Codegen = struct {
 
     enums: [EnumInfo]
     structs: [StructInfo]
+    interfaces: [IfaceInfo]
+
+    // Pending vtables to emit at end of compile_module. Each (s, i) pair
+    // means "struct s conforms to interface i and has been observed in an
+    // upcast"; we emit one vtable per unique pair.
+    vtable_struct_idx: [int64]
+    vtable_iface_idx: [int64]
 
     // Type-alias maps: `type X = Y` adds an entry pointing X's name to
     // Y's struct/enum index. find_struct_idx / find_enum_idx consult
@@ -127,6 +146,11 @@ type Codegen = struct {
 
     func_names: [str]
     func_labels: [str]
+    // Parallel to func_names: the local-module FuncDecl id when known
+    // (so we can read param types for interface upcasting), or -1 for
+    // externs / cross-module functions whose param types live in another
+    // parser.
+    func_decl_ids: [int64]
 
 
     func itos(self, anon n: int64) -> str {
@@ -367,6 +391,52 @@ type Codegen = struct {
         return -1
     }
 
+    func find_iface_idx(self, anon name: str) -> int64 {
+        let i = 0
+        for i < len(self.interfaces) {
+            if self.interfaces[i].name == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // The label of the vtable for struct s acting as interface i.
+    func vtable_label(self, anon si: int64, anon ii: int64) -> str {
+        let s = self.structs[si]
+        let f = self.interfaces[ii]
+        return f"${f.module_prefix}${f.name}$for${s.module_prefix}${s.name}$vtable"
+    }
+
+    // Register a (struct, interface) pair so its vtable is emitted at the
+    // end of compile_module. Idempotent: subsequent calls for the same
+    // pair do nothing. Returns the vtable label.
+    func register_vtable(self, anon si: int64, anon ii: int64) -> str {
+        let k = 0
+        for k < len(self.vtable_struct_idx) {
+            if self.vtable_struct_idx[k] == si and self.vtable_iface_idx[k] == ii {
+                return self.vtable_label(si, ii)
+            }
+            k = k + 1
+        }
+        self.vtable_struct_idx += [si]
+        self.vtable_iface_idx += [ii]
+        return self.vtable_label(si, ii)
+    }
+
+    // Find the FuncDecl id for a local function by name, or -1.
+    func find_func_decl_id(self, anon name: str) -> int64 {
+        let i = 0
+        for i < len(self.func_names) {
+            if self.func_names[i] == name {
+                return self.func_decl_ids[i]
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
         let i = 0
         for i < len(self.enums) {
@@ -430,6 +500,10 @@ type Codegen = struct {
                 let si = self.find_struct_idx(name)
                 if si >= 0 {
                     return .KStruct(idx: si)
+                }
+                let ii = self.find_iface_idx(name)
+                if ii >= 0 {
+                    return .KInterface(idx: ii)
                 }
                 return .KInt64
             }
@@ -593,6 +667,27 @@ type Codegen = struct {
         }
     }
 
+    func register_interface(self, anon decl: ast.Decl, prefix: str, p: parser.Parser) -> none {
+        match decl {
+            .Interface(name, methods) -> {
+                let mnames: [str] = []
+                let mrets: [TypeKind] = []
+                let saved_p = self.p
+                self.p = p
+                let j = 0
+                for j < len(methods) {
+                    let fd = p.func_decls[methods[j]]
+                    mnames += [fd.name]
+                    mrets += [self.resolve_type(fd.return_typ)]
+                    j = j + 1
+                }
+                self.p = saved_p
+                self.interfaces += [IfaceInfo(name: name, method_names: mnames, method_return_kinds: mrets, module_prefix: prefix)]
+            }
+            else none
+        }
+    }
+
     // Register all struct and enum declarations from another module under the
     // given prefix (e.g. "builtins"). Doesn't emit any code for them — just
     // makes their names and methods visible for label resolution.
@@ -601,6 +696,7 @@ type Codegen = struct {
         for i < len(m.decls) {
             self.register_enum(m.decls[i], prefix: prefix, p: p)
             self.register_struct(m.decls[i], prefix: prefix, p: p)
+            self.register_interface(m.decls[i], prefix: prefix, p: p)
             i = i + 1
         }
     }
@@ -1379,7 +1475,17 @@ type Codegen = struct {
                 if si >= 0 {
                     return self.compile_struct_construct(si, args)
                 }
-                self.prepare_args(args)
+                let expected_kinds: [TypeKind] = []
+                let fd_id = self.find_func_decl_id(name)
+                if fd_id >= 0 {
+                    let fd = self.p.func_decls[fd_id]
+                    let q = 0
+                    for q < len(fd.params) {
+                        expected_kinds += [self.resolve_type(fd.params[q].typ)]
+                        q = q + 1
+                    }
+                }
+                self.prepare_args_with_kinds(args, expected_kinds: expected_kinds)
                 let lbl = self.func_label(name)
                 self.emit(f"bl {lbl}")
                 return .VReg(name: "x0")
@@ -1458,9 +1564,67 @@ type Codegen = struct {
         }
     }
 
+    // Dispatch on an interface value: the variable holds a pointer to an
+    // arena cell {data_ptr at 0, vtable_ptr at 8}. The method index in the
+    // vtable matches its order in the interface declaration.
+    func compile_iface_method_call(self, obj_off: int64, ii: int64, method_name: str, anon args: [ast.CallArg]) -> Val {
+        let mi = 0
+        let method_idx = -1
+        for mi < len(self.interfaces[ii].method_names) {
+            if self.interfaces[ii].method_names[mi] == method_name {
+                method_idx = mi
+                mi = len(self.interfaces[ii].method_names)
+            } else {
+                mi = mi + 1
+            }
+        }
+        // Stash self (data_ptr) and each compiled arg, plus the method ptr,
+        // so arg compilation doesn't clobber x0..x7. Layout in the spill
+        // area: [data_ptr, arg0, arg1, ..., method_ptr].
+        let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let n = len(args) + 1
+        let padded = (n + 1) * 8
+        if padded % 16 != 0 {
+            padded = padded + 8
+        }
+        self.emit(f"sub sp, sp, #{self.itos(padded)}")
+        // Load cell ptr -> x0; data_ptr -> sp[0]; vtable -> x1; method ptr -> sp[n*8].
+        self.emit_ldr("x0", obj_off)
+        let cell_r = self.alloc_reg()
+        self.emit(f"mov {cell_r}, x0")
+        self.emit(f"ldr x9, [{cell_r}]")
+        self.emit(f"str x9, [sp]")
+        self.emit(f"ldr x9, [{cell_r}, #8]")
+        self.emit(f"ldr x9, [x9, #{self.itos(method_idx * 8)}]")
+        self.emit(f"str x9, [sp, #{self.itos(n * 8)}]")
+        self.free_reg(cell_r)
+        let i = 0
+        for i < len(args) {
+            let av = self.compile_expr(args[i].value)
+            let ar = self.load(av)
+            self.emit(f"str {ar}, [sp, #{self.itos((i + 1) * 8)}]")
+            self.free_reg(ar)
+            i = i + 1
+        }
+        let k = 0
+        for k < n {
+            self.emit(f"ldr {arg_regs[k]}, [sp, #{self.itos(k * 8)}]")
+            k = k + 1
+        }
+        self.emit(f"ldr x9, [sp, #{self.itos(n * 8)}]")
+        self.emit(f"add sp, sp, #{self.itos(padded)}")
+        self.emit("blr x9")
+        return .VReg(name: "x0")
+    }
+
     func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg]) -> Val {
         let var_kind = self.find_var_kind(obj_name)
         let obj_off = self.find_var_offset(obj_name)
+
+        // Interface dispatch: load vtable from the cell, then indirect call.
+        if var_kind is .KInterface(ii) {
+            return self.compile_iface_method_call(obj_off, ii, method_name, args)
+        }
 
         let method_lbl = "_unknown_method"
         match var_kind {
@@ -1508,7 +1672,47 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
+    // Box `arg_reg` (an arena pointer to a struct of kind .KStruct(si))
+    // into an arena-allocated {data_ptr, vtable_ptr} cell for interface
+    // ii. Returns a fresh register holding the cell pointer. Frees the
+    // input register.
+    func emit_iface_box(self, anon arg_reg: str, si: int64, ii: int64) -> str {
+        let vt_lbl = self.register_vtable(si, ii)
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {arg_reg}, [sp]")
+        self.free_reg(arg_reg)
+        self.emit("mov x0, #16")
+        self.emit("bl _arena_alloc")
+        let data_r = self.alloc_reg()
+        self.emit(f"ldr {data_r}, [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit(f"str {data_r}, [x0]")
+        self.free_reg(data_r)
+        let vt_r = self.alloc_reg()
+        self.emit(f"adrp {vt_r}, {vt_lbl}@PAGE")
+        self.emit(f"add {vt_r}, {vt_r}, {vt_lbl}@PAGEOFF")
+        self.emit(f"str {vt_r}, [x0, #8]")
+        self.free_reg(vt_r)
+        let cell_r = self.alloc_reg()
+        self.emit(f"mov {cell_r}, x0")
+        return cell_r
+    }
+
+    // If expected kind is KInterface and actual is KStruct, perform an
+    // implicit upcast: box the struct pointer in a {data, vtable} cell
+    // and return the new register. Otherwise returns the input register.
+    func maybe_box_for_iface(self, anon arg_reg: str, actual: TypeKind, expected: TypeKind) -> str {
+        let .KInterface(ii) = expected else { return arg_reg }
+        let .KStruct(si) = actual else { return arg_reg }
+        return self.emit_iface_box(arg_reg, si: si, ii: ii)
+    }
+
     func prepare_args(self, anon args: [ast.CallArg]) -> none {
+        let empty: [TypeKind] = []
+        self.prepare_args_with_kinds(args, expected_kinds: empty)
+    }
+
+    func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind]) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         let n = len(args)
         if n == 0 {
@@ -1527,6 +1731,10 @@ type Codegen = struct {
         for i < n {
             let av = self.compile_expr(args[i].value)
             let ar = self.load(av)
+            if i < len(expected_kinds) {
+                let actual = self.infer_kind(args[i].value)
+                ar = self.maybe_box_for_iface(ar, actual: actual, expected: expected_kinds[i])
+            }
             self.emit(f"str {ar}, [sp, #{self.itos(i * 8)}]")
             self.free_reg(ar)
             i = i + 1
@@ -1647,8 +1855,18 @@ type Codegen = struct {
     // match (callee not Ident.Ident, obj not a struct, method not found).
     func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64) -> TypeKind? {
         let .Ident(obj_name) = self.p.exprs[callee_lhs] else { return none }
-        let .KStruct(sidx) = self.find_var_kind(obj_name) else { return none }
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
+        if self.find_var_kind(obj_name) is .KInterface(iidx) {
+            let mi = 0
+            for mi < len(self.interfaces[iidx].method_names) {
+                if self.interfaces[iidx].method_names[mi] == method_name {
+                    return self.interfaces[iidx].method_return_kinds[mi]
+                }
+                mi = mi + 1
+            }
+            return none
+        }
+        let .KStruct(sidx) = self.find_var_kind(obj_name) else { return none }
         let mi = 0
         for mi < len(self.structs[sidx].method_names) {
             if self.structs[sidx].method_names[mi] == method_name {
@@ -2868,6 +3086,11 @@ type Codegen = struct {
             self.register_struct(m.decls[j], prefix: self.path_prefix, p: self.p)
             j = j + 1
         }
+        let ii = 0
+        for ii < len(m.decls) {
+            self.register_interface(m.decls[ii], prefix: self.path_prefix, p: self.p)
+            ii = ii + 1
+        }
         // Process type aliases now that base types are registered.
         let a = 0
         for a < len(m.decls) {
@@ -2898,10 +3121,12 @@ type Codegen = struct {
                     let fd = self.p.func_decls[decl_id]
                     self.func_names += [fd.name]
                     self.func_labels += [f"${self.path_prefix}${fd.name}"]
+                    self.func_decl_ids += [decl_id]
                 }
                 .Extern(name, params, return_typ) -> {
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
+                    self.func_decl_ids += [-1]
                 }
                 else none
             }
@@ -2924,7 +3149,7 @@ type Codegen = struct {
             d = d + 1
         }
 
-        if len(self.str_labels) > 0 {
+        if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 {
             print(".data")
             let si = 0
             for si < len(self.str_labels) {
@@ -2932,6 +3157,43 @@ type Codegen = struct {
                 self.emit_asciz(self.str_values[si])
                 si = si + 1
             }
+            self.emit_vtables()
+        }
+    }
+
+    // Emit one row per registered (struct, interface) pair. Methods are
+    // listed in the order they appear in the interface declaration; for
+    // each, look up the matching method on the struct and emit a .quad
+    // pointing at its mangled label.
+    func emit_vtables(self) -> none {
+        let v = 0
+        for v < len(self.vtable_struct_idx) {
+            let si = self.vtable_struct_idx[v]
+            let ii = self.vtable_iface_idx[v]
+            let s = self.structs[si]
+            let f = self.interfaces[ii]
+            print("\t.p2align 3")
+            print(f"{self.vtable_label(si, ii)}:")
+            let mi = 0
+            for mi < len(f.method_names) {
+                let mname = f.method_names[mi]
+                let mj = 0
+                let found = false
+                for mj < len(s.method_names) {
+                    if s.method_names[mj] == mname {
+                        print(f"\t.quad ${s.module_prefix}${s.name}${mname}")
+                        mj = len(s.method_names)
+                        found = true
+                    } else {
+                        mj = mj + 1
+                    }
+                }
+                if found == false {
+                    print(f"\t.quad 0")
+                }
+                mi = mi + 1
+            }
+            v = v + 1
         }
     }
 
@@ -2959,14 +3221,50 @@ type Codegen = struct {
                     let fd = p.func_decls[decl_id]
                     self.func_names += [fd.name]
                     self.func_labels += [f"${prefix}${fd.name}"]
+                    self.func_decl_ids += [-1]
                 }
                 .Extern(name, params, return_typ) -> {
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
+                    self.func_decl_ids += [-1]
                 }
                 else none
             }
             k = k + 1
+        }
+    }
+
+    // Register selected items from an imported module into the local
+    // namespace so they can be referenced without the module prefix.
+    // For functions/externs this means appending to func_names/func_labels.
+    // Types (struct/enum) are already global-by-name, so they need no entry.
+    func register_imported_items(self, anon items: [str], prefix: str, anon m: ast.Module, p: parser.Parser) -> none {
+        let i = 0
+        for i < len(items) {
+            let want = items[i]
+            let k = 0
+            for k < len(m.decls) {
+                match m.decls[k] {
+                    .Func(decl_id) -> {
+                        let fd = p.func_decls[decl_id]
+                        if fd.name == want {
+                            self.func_names += [fd.name]
+                            self.func_labels += [f"${prefix}${fd.name}"]
+                            self.func_decl_ids += [-1]
+                        }
+                    }
+                    .Extern(name, params, return_typ) -> {
+                        if name == want {
+                            self.func_names += [name]
+                            self.func_labels += [f"_{name}"]
+                            self.func_decl_ids += [-1]
+                        }
+                    }
+                    else none
+                }
+                k = k + 1
+            }
+            i = i + 1
         }
     }
 
@@ -3001,6 +3299,9 @@ type Codegen = struct {
 func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let enums: [EnumInfo] = []
     let structs: [StructInfo] = []
+    let interfaces: [IfaceInfo] = []
+    let vtable_struct_idx: [int64] = []
+    let vtable_iface_idx: [int64] = []
     let struct_alias_name: [str] = []
     let struct_alias_target: [int64] = []
     let enum_alias_name: [str] = []
@@ -3016,6 +3317,7 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let str_values: [str] = []
     let func_names: [str] = []
     let func_labels: [str] = []
+    let func_decl_ids: [int64] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, label_count: 0, func_names: func_names, func_labels: func_labels, func_decl_ids: func_decl_ids)
 }

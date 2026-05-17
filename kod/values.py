@@ -357,6 +357,13 @@ class EnumType:
         return enum_class
 
 
+class InterfaceType(Type):
+    """A type-erased interface value. The interpreter never inspects this —
+    method calls are resolved dynamically on the underlying instance."""
+
+    name = "InterfaceType"
+
+
 class TypeParam(Type):
     """A type parameter placeholder used during generic type parsing."""
 

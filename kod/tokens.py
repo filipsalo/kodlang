@@ -298,6 +298,11 @@ class Struct(Token):
 
 
 @dataclasses.dataclass
+class Interface(Token):
+    """An interface token"""
+
+
+@dataclasses.dataclass
 class Enum(Token):
     """An enum keyword token"""
 

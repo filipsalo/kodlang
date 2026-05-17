@@ -31,6 +31,7 @@ Statement = Union[
     "Import",
     "ExternalFunctionDeclaration",
     "FunctionDeclaration",
+    "InterfaceDeclaration",
     "VariableDeclaration",
     "Assignment",
 ]
@@ -365,6 +366,21 @@ class FunctionDeclaration(ASTNode):
         return node
 
     @classmethod
+    def parse_signature(cls, parser: Parser) -> "FunctionDeclaration":
+        """Parse a function signature with no body (for interface methods)."""
+        with parser.span() as span:
+            parser.consume(tokens.Func)
+            name = parser.consume(tokens.Identifier).value
+            params = FunctionParamList.parse(parser)
+            if parser.try_consume(tokens.Arrow):
+                return_type = parser.parse_type()
+            else:
+                return_type = types.Type.from_name("none")
+        variables = {param.variable.id: param.variable for param in params}
+        label_name = name
+        return cls(name, label_name, params, [], return_type, variables, span)
+
+    @classmethod
     def parse_method(cls, parser: Parser, struct_name: str) -> "FunctionDeclaration":
         """Parse a method declaration inside a struct block."""
         with parser.span() as span:
@@ -400,11 +416,36 @@ class FunctionDeclaration(ASTNode):
 
 
 @dataclasses.dataclass
+class InterfaceDeclaration(ASTNode):
+    """An interface declaration. The compiler enforces conformance; the
+    interpreter is permissive and relies on dynamic method lookup."""
+
+    name: str
+    methods: list  # list of FunctionDeclaration (signatures only)
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Interface)
+            name = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.OpenCurly)
+            methods = []
+            while not parser.try_consume(tokens.CloseCurly):
+                if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
+                    continue
+                methods.append(FunctionDeclaration.parse_signature(parser))
+        parser.type_registry[name] = types.InterfaceType
+        return cls(name, methods, span)
+
+
+@dataclasses.dataclass
 class Import(ASTNode):
     """An import statement."""
 
     module_name: str
     local_name: str
+    items: list[str]
     span: Span
 
     @classmethod
@@ -414,7 +455,14 @@ class Import(ASTNode):
             parser.consume(tokens.Import)
             module_name = StringLiteral.parse(parser).value.to_py_str()
             local_name = module_name.split("/")[-1]
-        return cls(module_name, local_name, span)
+            items: list[str] = []
+            if parser.try_consume(tokens.OpenCurly):
+                while not parser.try_consume(tokens.CloseCurly):
+                    items.append(parser.consume(tokens.Identifier).value)
+                    if not parser.try_consume(tokens.Comma):
+                        parser.consume(tokens.CloseCurly)
+                        break
+        return cls(module_name, local_name, items, span)
 
 
 @dataclasses.dataclass

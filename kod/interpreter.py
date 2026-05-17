@@ -304,6 +304,8 @@ class Interpreter:
             case ast.Import(name, local_name):
                 path = module.resolve_import(name)
                 module.names[local_name] = self.program.get_module(path)
+            case ast.InterfaceDeclaration():
+                pass
             case ast.FunctionDeclaration(name) | ast.ExternalFunctionDeclaration(name):
                 module.names[name] = statement
                 setattr(statement, "module", module)
