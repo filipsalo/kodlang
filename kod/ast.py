@@ -753,16 +753,21 @@ class IfStatement(ASTNode):
 
     @classmethod
     def parse(cls, parser: Parser) -> "IfStatement | MatchStatement":
-        """Parse an if statement. `if let .Pat = expr { body }` is sugar for
-        a one-arm match-statement with a catch-all empty arm."""
+        """Parse an if statement. `if expr is Pat { body }` is sugar for
+        a one-arm match-statement: the body runs when `expr` matches `Pat`
+        (with any bindings from the pattern in scope), and is skipped
+        otherwise."""
         true_branch = []
         false_branch = []
         with parser.span() as span:
             parser.consume(tokens.If)
-            if parser.try_consume(tokens.Let):
-                pattern = _parse_match_pattern(parser, span)
-                parser.consume(tokens.Equal)
-                value = Expression.parse(parser)
+            condition = Expression.parse(parser)
+            # `if <lhs> is <rhs>` where rhs can be reinterpreted as a binding
+            # pattern -> desugar to a one-arm match. Bare `<lhs> is none` /
+            # unit-variant checks keep their bool semantics.
+            pat = _pattern_from_is_rhs(condition)
+            if pat is not None:
+                lhs = condition.lhs
                 parser.consume(tokens.OpenCurly)
                 body = []
                 while not parser.try_consume(tokens.CloseCurly):
@@ -771,11 +776,10 @@ class IfStatement(ASTNode):
                     if stmt := parser.parse_statement():
                         body.append(stmt)
                 arms = [
-                    MatchArm(pattern, body, span),
+                    MatchArm(pat, body, span),
                     MatchArm(WildcardPattern(span), [], span),
                 ]
-                return MatchStatement(value, arms, span)
-            condition = Expression.parse(parser)
+                return MatchStatement(lhs, arms, span)
             parser.consume(tokens.OpenCurly)
             while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
@@ -786,6 +790,58 @@ class IfStatement(ASTNode):
                     if statement := parser.parse_statement():
                         false_branch.append(statement)
         return cls(condition, true_branch, false_branch, span)
+
+
+def _pattern_from_is_rhs(cond):
+    """If `cond` is `<lhs> is <rhs>` where rhs is a binding pattern shape
+    (Some(v), .Variant(b), Enum.Variant(b)), return the corresponding
+    Pattern node. Otherwise return None — the if-stmt keeps its bool
+    semantics."""
+    if not isinstance(cond, BinaryOperator):
+        return None
+    if not isinstance(cond.op, tokens.Is):
+        return None
+    rhs = cond.rhs
+    span = cond.span
+    name_like = (Variable, Name)
+    # Some(v) — FunctionCall on Name("Some")
+    if isinstance(rhs, FunctionCall):
+        callee = rhs.callee
+        args = (
+            rhs.args.params if isinstance(rhs.args, FunctionCallParamList) else rhs.args
+        )
+        arg_names = [
+            a.expression.id
+            for a in args
+            if isinstance(a, FunctionCallParam) and isinstance(a.expression, name_like)
+        ]
+        if isinstance(callee, name_like) and callee.id == "Some":
+            binding = arg_names[0] if arg_names else ""
+            return OptionalSomePattern(binding, span)
+        # .Variant(b1, b2)
+        if isinstance(callee, ImplicitEnumVariant):
+            return ImplicitEnumVariantPattern(callee.variant_name, arg_names, span)
+        # Enum.Variant(b1) or module.Enum.Variant(b)
+        if isinstance(callee, BinaryOperator) and isinstance(callee.op, tokens.Dot):
+            inner = callee.lhs
+            if isinstance(inner, BinaryOperator) and isinstance(inner.op, tokens.Dot):
+                # module.Enum.Variant — drop the module qualifier
+                if isinstance(inner.rhs, name_like) and isinstance(
+                    callee.rhs, name_like
+                ):
+                    return EnumVariantPattern(
+                        inner.rhs.id, callee.rhs.id, arg_names, span
+                    )
+            if isinstance(inner, name_like) and isinstance(callee.rhs, name_like):
+                return EnumVariantPattern(inner.id, callee.rhs.id, arg_names, span)
+    # `.Variant` (unit) — ImplicitEnumVariant without payload.
+    if isinstance(rhs, ImplicitEnumVariant):
+        return ImplicitEnumVariantPattern(rhs.variant_name, [], span)
+    # `Enum.Variant` (unit) — Binary(Dot, Name, Name).
+    if isinstance(rhs, BinaryOperator) and isinstance(rhs.op, tokens.Dot):
+        if isinstance(rhs.lhs, name_like) and isinstance(rhs.rhs, name_like):
+            return EnumVariantPattern(rhs.lhs.id, rhs.rhs.id, [], span)
+    return None
 
 
 def _parse_match_pattern(parser, span):
