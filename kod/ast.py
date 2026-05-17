@@ -752,12 +752,29 @@ class IfStatement(ASTNode):
     span: Span
 
     @classmethod
-    def parse(cls, parser: Parser) -> Self:
-        """Parse an if statement."""
+    def parse(cls, parser: Parser) -> "IfStatement | MatchStatement":
+        """Parse an if statement. `if let .Pat = expr { body }` is sugar for
+        a one-arm match-statement with a catch-all empty arm."""
         true_branch = []
         false_branch = []
         with parser.span() as span:
             parser.consume(tokens.If)
+            if parser.try_consume(tokens.Let):
+                pattern = _parse_match_pattern(parser, span)
+                parser.consume(tokens.Equal)
+                value = Expression.parse(parser)
+                parser.consume(tokens.OpenCurly)
+                body = []
+                while not parser.try_consume(tokens.CloseCurly):
+                    if parser.try_consume(tokens.EOL):
+                        continue
+                    if stmt := parser.parse_statement():
+                        body.append(stmt)
+                arms = [
+                    MatchArm(pattern, body, span),
+                    MatchArm(WildcardPattern(span), [], span),
+                ]
+                return MatchStatement(value, arms, span)
             condition = Expression.parse(parser)
             parser.consume(tokens.OpenCurly)
             while not parser.try_consume(tokens.CloseCurly):
@@ -769,6 +786,55 @@ class IfStatement(ASTNode):
                     if statement := parser.parse_statement():
                         false_branch.append(statement)
         return cls(condition, true_branch, false_branch, span)
+
+
+def _parse_match_pattern(parser, span):
+    """Parse a single match pattern (the bit before `->`)."""
+    if parser.peeking_at(tokens.IntegerLiteral):
+        tok = parser.consume(tokens.IntegerLiteral)
+        return IntegerPattern(int(tok.value), span)
+    if parser.peeking_at(tokens.StringLiteral):
+        tok = StringLiteral.parse(parser)
+        return StringPattern(tok.value.to_py_str(), span)
+    if parser.peeking_at(tokens.NoneLiteral):
+        parser.consume(tokens.NoneLiteral)
+        return OptionalNonePattern(span)
+    if parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
+        parser.consume(tokens.Identifier)
+        binding = ""
+        if parser.try_consume(tokens.OpenParen):
+            binding = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.CloseParen)
+        return OptionalSomePattern(binding, span)
+    if parser.peeking_at(tokens.Dot):
+        parser.consume(tokens.Dot)
+        variant_name = parser.consume(tokens.Identifier).value
+        bindings = []
+        if parser.try_consume(tokens.OpenParen):
+            while not parser.try_consume(tokens.CloseParen):
+                bindings.append(parser.consume(tokens.Identifier).value)
+                if not parser.try_consume(tokens.Comma):
+                    parser.consume(tokens.CloseParen)
+                    break
+        return ImplicitEnumVariantPattern(variant_name, bindings, span)
+    first = parser.consume(tokens.Identifier).value
+    parser.consume(tokens.Dot)
+    second = parser.consume(tokens.Identifier).value
+    if parser.peeking_at(tokens.Dot):
+        parser.consume(tokens.Dot)
+        variant_name = parser.consume(tokens.Identifier).value
+        enum_name = second
+    else:
+        enum_name = first
+        variant_name = second
+    bindings = []
+    if parser.try_consume(tokens.OpenParen):
+        while not parser.try_consume(tokens.CloseParen):
+            bindings.append(parser.consume(tokens.Identifier).value)
+            if not parser.try_consume(tokens.Comma):
+                parser.consume(tokens.CloseParen)
+                break
+    return EnumVariantPattern(enum_name, variant_name, bindings, span)
 
 
 @dataclasses.dataclass
