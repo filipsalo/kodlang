@@ -955,9 +955,6 @@ class MatchExpressionArm:
             elif parser.peeking_at(tokens.StringLiteral):
                 tok = StringLiteral.parse(parser)
                 pattern = StringPattern(tok.value.to_py_str(), span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
-                parser.consume(tokens.Identifier)
-                pattern = WildcardPattern(span)
             elif parser.peeking_at(tokens.NoneLiteral):
                 parser.consume(tokens.NoneLiteral)
                 pattern = OptionalNonePattern(span)
@@ -1064,9 +1061,6 @@ class MatchArm:
             elif parser.peeking_at(tokens.StringLiteral):
                 tok = StringLiteral.parse(parser)
                 pattern = StringPattern(tok.value.to_py_str(), span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "_":
-                parser.consume(tokens.Identifier)
-                pattern = WildcardPattern(span)
             elif parser.peeking_at(tokens.NoneLiteral):
                 parser.consume(tokens.NoneLiteral)
                 pattern = OptionalNonePattern(span)
