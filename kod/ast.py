@@ -89,6 +89,14 @@ def _parse_fstring(parser: Parser) -> ASTNode:
         )
         return Expression.parse(sub_parser)
 
+    def wrap_in_str(expr: ASTNode) -> ASTNode:
+        """Wrap an f-string interpolation in `str(expr)` so concatenation
+        doesn't need any implicit coercion of its own."""
+        callee = Name("str", span)
+        param = FunctionCallParam(None, expr, span)
+        param_list = FunctionCallParamList([param], span)
+        return FunctionCall(callee, param_list, span)
+
     parts: list[ASTNode] = []
     i = 0
     while i < len(inner):
@@ -102,7 +110,7 @@ def _parse_fstring(parser: Parser) -> ASTNode:
         k = inner.find("}", j + 1)
         if k == -1:
             raise parser.error("Unterminated { in f-string", span)
-        parts.append(parse_expr(inner[j + 1 : k]))
+        parts.append(wrap_in_str(parse_expr(inner[j + 1 : k])))
         i = k + 1
 
     if not parts:

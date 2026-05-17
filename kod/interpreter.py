@@ -161,18 +161,6 @@ class Interpreter:
         lhs = self.evaluate_expression(module, lhs)
         if op_func := getattr(lhs, op_func_name):
             rhs = self.evaluate_expression(module, rhs)
-            # f-string parity with the compiler: when concatenating a string
-            # with a non-string operand that has a user-defined to_str method
-            # (e.g. struct with `func to_str(self) -> str`), invoke it here
-            # since op_plus on the value object can't reach the Interpreter.
-            if (
-                op_func_name == "op_plus"
-                and isinstance(lhs, types.String)
-                and not isinstance(rhs, (types.String, types.Int64, types.Bool))
-            ):
-                methods = getattr(type(rhs), "methods", None) or {}
-                if "to_str" in methods:
-                    rhs = self.call_function(module, methods["to_str"], (rhs,))
             return op_func(rhs)
         raise ValueError(f"Don't know how to evaluate binary operator {op}")
 
@@ -207,6 +195,19 @@ class Interpreter:
                 # payload fields. Resolve the enum here so we can pass args
                 # straight to its constructor instead of trying to evaluate
                 # the bare implicit variant (which errors when fields exist).
+                # `str(x)` — explicit conversion intrinsic. Mirrors the
+                # codegen's special case: dispatches by the value's runtime
+                # type to a string representation. Primitives convert to
+                # their decimal / true-false / identity form; structs with a
+                # user-defined to_str method dispatch through it.
+                if (
+                    isinstance(callee, ast.Name)
+                    and callee.id == "str"
+                    and len(args) == 1
+                ):
+                    arg_params = list(args)
+                    value = self.evaluate_expression(module, arg_params[0])
+                    return self._coerce_to_str(module, value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
                     variant_name = callee.variant_name
                     search_scopes = [module.names]
@@ -481,6 +482,21 @@ class Interpreter:
         if type_ is types.Int64:
             return ctypes.c_int
         raise ValueError(f"Unknown type {type_!r}")
+
+    def _coerce_to_str(self, module, value):
+        """Convert a value to a Kod `str`. Used to implement the `str(x)`
+        intrinsic: int → decimal, bool → "true"/"false", str → identity,
+        struct with `to_str` method → call that method."""
+        if isinstance(value, types.String):
+            return value
+        if isinstance(value, types.Int64):
+            return types.String(str(value.value).encode("utf8"))
+        if isinstance(value, types.Bool):
+            return types.String(b"true" if value.value else b"false")
+        methods = getattr(type(value), "methods", None) or {}
+        if "to_str" in methods:
+            return self.call_function(module, methods["to_str"], (value,))
+        return types.String(str(value).encode("utf8"))
 
     def call_function(self, module, func, args=()):
         """Call a function"""

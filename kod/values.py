@@ -112,21 +112,10 @@ class String(Type):
         """Return the value as a Kod string."""
         return self
 
-    def op_plus(self, other) -> "String":
-        """Concatenate. For f-string interpolation parity with the compiler:
-        Int64 / Bool are coerced to their decimal / "true"-"false" form.
-        Struct receivers with a user-defined to_str method aren't dispatched
-        here (the interpreter would need to invoke the method through the
-        Interpreter, which isn't reachable from this site); the compiled path
-        handles those correctly."""
-        if isinstance(other, String):
-            return String(self.value + other.value)
-        if isinstance(other, Int64):
-            return String(self.value + str(other.value).encode("utf8"))
-        if isinstance(other, Bool):
-            label = b"true" if other.value else b"false"
-            return String(self.value + label)
-        return String(self.value + str(other.value).encode("utf8"))
+    def op_plus(self, other: "String") -> "String":
+        """Concatenate two strings. Non-string operands must be cast
+        explicitly: `"x = " + str(n)`."""
+        return String(self.value + other.value)
 
     def op_index(self, index: "Int64") -> "Int64":
         return Int64(self.value[index.value])
