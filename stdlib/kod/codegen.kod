@@ -10,7 +10,9 @@ type TypeKind = enum {
     KBool
     KStr
     KArray
-    KOptional
+    // The inner type of an optional. KVoid means "unknown" (e.g. a bare
+    // `none` literal — its inner is fixed up by the surrounding context).
+    KOptional(inner: TypeKind)
     KEnum(idx: int64)
     KStruct(idx: int64)
     KArrayStruct(elem_idx: int64)
@@ -539,7 +541,7 @@ type Codegen = struct {
                     else return .KArray
                 }
             }
-            .Optional(inner) -> return .KOptional
+            .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
             .Generic(name, arg) -> {
                 // Generics are erased at codegen — look up the base type.
                 let si = self.find_struct_idx(name)
@@ -838,13 +840,17 @@ type Codegen = struct {
             }
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
+                let subj_inner: TypeKind = .KInt64
+                if self.infer_kind(subject) is .KOptional(inner) {
+                    subj_inner = inner
+                }
                 let i = 0
                 for i < len(arms) {
                     let arm = self.p.match_expr_arms[arms[i]]
                     match self.p.patterns[arm.pattern] {
                         .SomePat(binding) -> {
                             if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(binding, .KInt64)
+                                self.alloc_var(binding, subj_inner)
                             }
                         }
                         .EnumPat(enum_name, variant_name, bindings) -> {
@@ -952,13 +958,17 @@ type Codegen = struct {
                 }
             }
             .MatchStmt(subject, arms) -> {
+                let subj_inner: TypeKind = .KInt64
+                if self.infer_kind(subject) is .KOptional(inner) {
+                    subj_inner = inner
+                }
                 let i = 0
                 for i < len(arms) {
                     let arm = self.p.match_arms[arms[i]]
                     match self.p.patterns[arm.pattern] {
                         .SomePat(binding) -> {
                             if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(binding, .KInt64)
+                                self.alloc_var(binding, subj_inner)
                             }
                         }
                         .EnumPat(enum_name, variant_name, bindings) -> {
@@ -1050,7 +1060,11 @@ type Codegen = struct {
                     }
                     .SomePat(binding) -> {
                         if len(binding) > 0 and self.var_declared(binding) == false {
-                            self.alloc_var(binding, .KInt64)
+                            let inner_kind: TypeKind = .KInt64
+                            if self.infer_kind(value) is .KOptional(inner) {
+                                inner_kind = inner
+                            }
+                            self.alloc_var(binding, inner_kind)
                         }
                     }
                     else none
@@ -1417,8 +1431,52 @@ type Codegen = struct {
         return .VReg(name: result)
     }
 
+    // Compile `expr_id` and coerce the result to a `str` value. Used for
+    // f-string interpolations and `str + X` concatenation so that non-string
+    // values are rendered before being passed to _kod_str_concat. Lowering
+    // matches the Stringable interface from stdlib/builtins.kod:
+    //   - KStr        : already a string, pass through
+    //   - KInt64      : bl _int_to_str
+    //   - KBool       : bl $builtins$bool_to_str
+    //   - KStruct(si) : if the struct defines a `to_str` method, call it
+    //   - anything else: best-effort pass-through (likely garbage, but
+    //                    we don't have a string representation for it yet)
+    func compile_as_str(self, anon expr_id: int64) -> Val {
+        let k = self.infer_kind(expr_id)
+        match k {
+            .KStr -> return self.compile_expr(expr_id)
+            .KInt64 -> {
+                let v = self.compile_expr(expr_id)
+                self.mov_to("x0", v)
+                self.emit("bl _int_to_str")
+                return .VReg(name: "x0")
+            }
+            .KBool -> {
+                let v = self.compile_expr(expr_id)
+                self.mov_to("x0", v)
+                self.emit("bl $builtins$bool_to_str")
+                return .VReg(name: "x0")
+            }
+            .KStruct(si) -> {
+                let mi = 0
+                for mi < len(self.structs[si].method_names) {
+                    if self.structs[si].method_names[mi] == "to_str" {
+                        let v = self.compile_expr(expr_id)
+                        self.mov_to("x0", v)
+                        let s = self.structs[si]
+                        self.emit(f"bl ${s.module_prefix}${s.name}$to_str")
+                        return .VReg(name: "x0")
+                    }
+                    mi = mi + 1
+                }
+                return self.compile_expr(expr_id)
+            }
+            else return self.compile_expr(expr_id)
+        }
+    }
+
     func compile_str_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
-        let rv = self.compile_expr(rhs_id)
+        let rv = self.compile_as_str(rhs_id)
         let rr = self.alloc_reg()
         self.mov_to(rr, rv)
         // Save rhs to the stack so it survives any bl calls inside lhs
@@ -1426,7 +1484,7 @@ type Codegen = struct {
         // be clobbered by an inner _kod_str_concat for chained concats).
         self.emit("sub sp, sp, #16")
         self.emit(f"str {rr}, [sp]")
-        let lv = self.compile_expr(lhs_id)
+        let lv = self.compile_as_str(lhs_id)
         self.mov_to("x0", lv)
         self.emit(f"ldr {rr}, [sp]")
         self.emit("add sp, sp, #16")
@@ -2025,7 +2083,7 @@ type Codegen = struct {
             .IntLit(value) -> return .KInt64
             .BoolLit(value) -> return .KBool
             .StrLit(value) -> return .KStr
-            .NoneLit -> return .KOptional
+            .NoneLit -> return .KOptional(inner: .KVoid)
             .Ident(name) -> return self.find_var_kind(name)
             .ArrayLit(elements) -> return .KArray
             .Slice(s, lo, hi) -> return .KStr
@@ -2047,6 +2105,14 @@ type Codegen = struct {
                         let ei = self.find_enum_idx(name)
                         if ei >= 0 {
                             return .KEnum(idx: ei)
+                        }
+                        // Free function call: use the cached return kind.
+                        let fi = 0
+                        for fi < len(self.func_names) {
+                            if self.func_names[fi] == name {
+                                return self.func_sigs[fi].return_kind
+                            }
+                            fi = fi + 1
                         }
                     }
                     .Binary(call_lhs, call_op, call_rhs) -> {
@@ -2209,7 +2275,7 @@ type Codegen = struct {
                 self.emit_str(r, dest_off)
                 self.free_reg(r)
             }
-            .KOptional -> {
+            .KOptional(inner) -> {
                 // Wrap into an Optional cell unless the value is already an
                 // Optional (NoneLit, Call return, or an inferred-Optional expr).
                 let needs_wrap = true
@@ -2219,7 +2285,7 @@ type Codegen = struct {
                     else none
                 }
                 if needs_wrap {
-                    if self.infer_kind(value_id) is .KOptional {
+                    if self.infer_kind(value_id) is .KOptional(inner2) {
                         needs_wrap = false
                     }
                 }
@@ -2693,7 +2759,7 @@ type Codegen = struct {
         // for method calls, infer_kind looks up the method's return type.
         let needs_wrap = false
         match self.return_kind {
-            .KOptional -> {
+            .KOptional(inner) -> {
                 let assume_optional = false
                 match self.p.exprs[value_id] {
                     .NoneLit -> assume_optional = true
@@ -2706,7 +2772,7 @@ type Codegen = struct {
                 }
                 if assume_optional == false {
                     match self.infer_kind(value_id) {
-                        .KOptional -> {}
+                        .KOptional(inner2) -> {}
                         else needs_wrap = true
                     }
                 }

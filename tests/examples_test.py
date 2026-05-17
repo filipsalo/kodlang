@@ -75,7 +75,10 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
         else:
             if mode != "interpret":
                 yield pytest.param(run_compiled, path, expects, id=f"{path} run")
-            yield pytest.param(run_interpreted, path, expects, id=f"{path} interpret")
+            if mode != "run":
+                yield pytest.param(
+                    run_interpreted, path, expects, id=f"{path} interpret"
+                )
 
 
 @pytest.mark.parametrize("func,path,expects", generate_tests())

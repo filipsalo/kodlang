@@ -161,6 +161,18 @@ class Interpreter:
         lhs = self.evaluate_expression(module, lhs)
         if op_func := getattr(lhs, op_func_name):
             rhs = self.evaluate_expression(module, rhs)
+            # f-string parity with the compiler: when concatenating a string
+            # with a non-string operand that has a user-defined to_str method
+            # (e.g. struct with `func to_str(self) -> str`), invoke it here
+            # since op_plus on the value object can't reach the Interpreter.
+            if (
+                op_func_name == "op_plus"
+                and isinstance(lhs, types.String)
+                and not isinstance(rhs, (types.String, types.Int64, types.Bool))
+            ):
+                methods = getattr(type(rhs), "methods", None) or {}
+                if "to_str" in methods:
+                    rhs = self.call_function(module, methods["to_str"], (rhs,))
             return op_func(rhs)
         raise ValueError(f"Don't know how to evaluate binary operator {op}")
 

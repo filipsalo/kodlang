@@ -112,9 +112,21 @@ class String(Type):
         """Return the value as a Kod string."""
         return self
 
-    def op_plus(self, other: "String") -> "String":
-        """Concatenate two strings."""
-        return String(self.value + other.value)
+    def op_plus(self, other) -> "String":
+        """Concatenate. For f-string interpolation parity with the compiler:
+        Int64 / Bool are coerced to their decimal / "true"-"false" form.
+        Struct receivers with a user-defined to_str method aren't dispatched
+        here (the interpreter would need to invoke the method through the
+        Interpreter, which isn't reachable from this site); the compiled path
+        handles those correctly."""
+        if isinstance(other, String):
+            return String(self.value + other.value)
+        if isinstance(other, Int64):
+            return String(self.value + str(other.value).encode("utf8"))
+        if isinstance(other, Bool):
+            label = b"true" if other.value else b"false"
+            return String(self.value + label)
+        return String(self.value + str(other.value).encode("utf8"))
 
     def op_index(self, index: "Int64") -> "Int64":
         return Int64(self.value[index.value])
@@ -359,9 +371,14 @@ class EnumType:
 
 class InterfaceType(Type):
     """A type-erased interface value. The interpreter never inspects this —
-    method calls are resolved dynamically on the underlying instance."""
+    method calls are resolved dynamically on the underlying instance.
+
+    Also used as a forward-reference placeholder for self-referential
+    type declarations (e.g. recursive enums), so width must match a
+    pointer-sized field."""
 
     name = "InterfaceType"
+    width = 8
 
 
 class TypeParam(Type):

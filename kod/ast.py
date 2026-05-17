@@ -1034,6 +1034,10 @@ class TypeDeclaration(ASTNode):
                         break
                     parser.consume(tokens.Comma)
             parser.consume(tokens.Equal)
+            # Pre-register the name so self-referential enums/structs (e.g.
+            # `KOptional(inner: TypeKind)` inside `type TypeKind = enum {...}`)
+            # can resolve the name while their own body is being parsed.
+            parser.type_registry[name.id] = types.InterfaceType
             type_ = parser.parse_type(name.id)
             if type_param_names:
                 for p in type_param_names:
