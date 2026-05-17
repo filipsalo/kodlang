@@ -49,8 +49,9 @@ class Builder:
         return module
 
     def compile_module(self, module: ast.Module) -> str:
-        """Compile a module by running the self-hosted compiler (kodc.kod)
-        inside the Python interpreter. Returns the emitted assembly."""
+        """Compile a module with the self-hosted compiler. Prefers the
+        pre-built native binary at build/sh_kodc (fast); falls back to running
+        kodc.kod through the Python interpreter (slow, used to bootstrap)."""
         root_path = self.program.root_fs.root_path
         kodc_path = root_path / "kodc.kod"
         if not kodc_path.exists():
@@ -62,8 +63,12 @@ class Builder:
             rel_path = module_path.relative_to(root_path)
         except ValueError:
             rel_path = module_path
-        result = subprocess.run(
-            [
+
+        sh_kodc = root_path / "build" / "sh_kodc"
+        if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
+            cmd = [str(sh_kodc), str(rel_path)]
+        else:
+            cmd = [
                 sys.executable,
                 "-m",
                 "kod",
@@ -71,18 +76,40 @@ class Builder:
                 "interpret",
                 str(kodc_path),
                 str(rel_path),
-            ],
-            capture_output=True,
-            text=True,
-            cwd=root_path,
-            check=False,
+            ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=root_path, check=False
         )
         if result.returncode != 0:
             sys.stderr.write(result.stderr)
             raise RuntimeError(
-                f"kodc.kod failed for {rel_path} (exit {result.returncode})"
+                f"compile_module failed for {rel_path} (exit {result.returncode})"
             )
         return result.stdout
+
+    def _sh_kodc_stale(self, sh_kodc: Path) -> bool:
+        """True if sh_kodc is older than any compiler source it was built from."""
+        try:
+            sh_mtime = sh_kodc.stat().st_mtime
+        except OSError:
+            return True
+        root_path = self.program.root_fs.root_path
+        stdlib_path = self.program.stdlib_fs.root_path
+        sources = [
+            root_path / "kodc.kod",
+            stdlib_path / "kod" / "codegen.kod",
+            stdlib_path / "kod" / "parser.kod",
+            stdlib_path / "kod" / "lexer.kod",
+            stdlib_path / "kod" / "ast.kod",
+            stdlib_path / "builtins.kod",
+        ]
+        for src in sources:
+            try:
+                if src.stat().st_mtime > sh_mtime:
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _build_c(self, c_path: Path) -> Path:
         """Compile a C source file to an object file."""
