@@ -1665,6 +1665,36 @@ type Codegen = struct {
         return none
     }
 
+    // For an expression of shape `mod.Enum.Variant`, return KEnum(idx).
+    func three_part_enum_kind(self, dot_lhs: int64) -> TypeKind? {
+        let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[dot_lhs] else { return none }
+        let .Dot = inner_op else { return none }
+        let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
+        let ei: int64 = self.find_enum_idx(enum_name)
+        if ei < 0 { return none }
+        return .KEnum(idx: ei)
+    }
+
+    // For `EnumName.X`, return KEnum(idx). (X is checked at the call site.)
+    func two_part_enum_kind(self, dot_lhs: int64) -> TypeKind? {
+        let .Ident(type_name) = self.p.exprs[dot_lhs] else { return none }
+        let ei: int64 = self.find_enum_idx(type_name)
+        if ei < 0 { return none }
+        return .KEnum(idx: ei)
+    }
+
+    // Look up a struct field's kind by name. Returns none if absent.
+    func struct_field_kind(self, struct_idx: int64, field_name: str) -> TypeKind? {
+        let fi: int64 = 0
+        for fi < len(self.structs[struct_idx].fields) {
+            if self.structs[struct_idx].fields[fi].name == field_name {
+                return self.structs[struct_idx].fields[fi].kind
+            }
+            fi = fi + 1
+        }
+        return none
+    }
+
     func infer_kind(self, anon expr_id: int64) -> TypeKind {
         match self.p.exprs[expr_id] {
             .IntLit(value) -> return .KInt64
@@ -1715,48 +1745,22 @@ type Codegen = struct {
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Dot -> {
-                        // Three-part module.Enum.Variant — an enum value.
-                        match self.p.exprs[lhs] {
-                            .Binary(inner_lhs, inner_op, inner_rhs) -> {
-                                match inner_op {
-                                    .Dot -> {
-                                        match self.p.exprs[inner_rhs] {
-                                            .Ident(enum_name) -> {
-                                                let ei3: int64 = self.find_enum_idx(enum_name)
-                                                if ei3 >= 0 {
-                                                    return .KEnum(idx: ei3)
-                                                }
-                                            }
-                                            _ -> {}
-                                        }
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
+                        // `mod.Enum.Variant` or `Enum.Variant` — unit-variant ref.
+                        match self.three_part_enum_kind(lhs) {
+                            Some(k) -> return k
+                            none -> {}
                         }
-                        // EnumName.Variant — unit-variant reference.
-                        match self.p.exprs[lhs] {
-                            .Ident(type_name) -> {
-                                let ei: int64 = self.find_enum_idx(type_name)
-                                if ei >= 0 {
-                                    return .KEnum(idx: ei)
-                                }
-                            }
-                            _ -> {}
+                        match self.two_part_enum_kind(lhs) {
+                            Some(k) -> return k
+                            none -> {}
                         }
-                        // Field access on any struct-valued expression
-                        // (Ident.field, self.p.type_exprs, arr[i].field, ...).
+                        // Field access on any struct-valued expression.
                         let .KStruct(si) = self.infer_kind(lhs) else { return .KInt64 }
                         let .Ident(field_name) = self.p.exprs[rhs] else { return .KInt64 }
-                        let fi: int64 = 0
-                        for fi < len(self.structs[si].fields) {
-                            if self.structs[si].fields[fi].name == field_name {
-                                return self.structs[si].fields[fi].kind
-                            }
-                            fi = fi + 1
+                        match self.struct_field_kind(si, field_name) {
+                            Some(k) -> return k
+                            none -> return .KInt64
                         }
-                        return .KInt64
                     }
                     .Add -> return self.infer_kind(lhs)
                     .Index -> {
@@ -1844,8 +1848,6 @@ type Codegen = struct {
                     }
                     .Call(callee, args) -> alias = true
                     .Binary(blhs, bop, brhs) -> {
-                        // Index/field access expressions that yield a struct
-                        // pointer should be aliased, not re-allocated.
                         match bop {
                             .Index -> alias = true
                             .Dot -> alias = true
@@ -1888,20 +1890,14 @@ type Codegen = struct {
                 self.free_reg(r)
             }
             .KOptional -> {
+                // Wrap into an Optional cell unless the value is already an
+                // Optional (NoneLit, Call return, or an inferred-Optional expr).
                 let needs_wrap: bool = true
                 match self.p.exprs[value_id] {
                     .NoneLit -> needs_wrap = false
                     .Call(callee, args) -> needs_wrap = false
-                    .Ident(name) -> {
-                        match self.find_var_kind(name) {
-                            .KOptional -> needs_wrap = false
-                            _ -> {}
-                        }
-                    }
                     _ -> {}
                 }
-                // Also avoid wrapping when the expression's inferred kind is
-                // already Optional (e.g. m["key"] dispatching to op_index).
                 if needs_wrap {
                     match self.infer_kind(value_id) {
                         .KOptional -> needs_wrap = false
@@ -2006,46 +2002,40 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
+    // For an expression that looks like a dotted variant reference, return
+    // the variant name. Handles `.Variant`, `Enum.Variant`, and the Dot side
+    // of `Enum.Variant(args)`.
+    func dotted_variant_name(self, expr_id: int64) -> str? {
+        match self.p.exprs[expr_id] {
+            .ImplicitVariant(variant_name) -> return variant_name
+            _ -> {}
+        }
+        let .Binary(lhs, op, rhs) = self.p.exprs[expr_id] else { return none }
+        let .Dot = op else { return none }
+        let .Ident(variant_name) = self.p.exprs[rhs] else { return none }
+        return variant_name
+    }
+
     func emit_enum_alloc(self, enum_idx: int64, value_id: int64, dest_off: int64) -> none {
         // Detect direct enum construction patterns and route through
         // compile_enum_construct; otherwise compile the expression and store
         // its (pointer) result.
         let variant_idx: int64 = -1
         let field_args: [ast.CallArg] = []
+        // Bare-variant cases: .Variant or Enum.Variant
+        match self.dotted_variant_name(value_id) {
+            Some(name) -> variant_idx = self.find_variant_idx(enum_idx, name)
+            none -> {}
+        }
+        // Variant-with-args case: <dotted>(args)
         match self.p.exprs[value_id] {
-            .ImplicitVariant(variant_name) -> {
-                variant_idx = self.find_variant_idx(enum_idx, variant_name)
-            }
-            .Binary(lhs, op, rhs) -> {
-                match op {
-                    .Dot -> {
-                        match self.p.exprs[rhs] {
-                            .Ident(variant_name) -> {
-                                variant_idx = self.find_variant_idx(enum_idx, variant_name)
-                            }
-                            _ -> {}
-                        }
-                    }
-                    _ -> {}
-                }
-            }
             .Call(callee_id, call_args) -> {
-                match self.p.exprs[callee_id] {
-                    .Binary(lhs, op, rhs) -> {
-                        match op {
-                            .Dot -> {
-                                match self.p.exprs[rhs] {
-                                    .Ident(variant_name) -> {
-                                        variant_idx = self.find_variant_idx(enum_idx, variant_name)
-                                        field_args = call_args
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
-                        }
+                match self.dotted_variant_name(callee_id) {
+                    Some(name) -> {
+                        variant_idx = self.find_variant_idx(enum_idx, name)
+                        field_args = call_args
                     }
-                    _ -> {}
+                    none -> {}
                 }
             }
             _ -> {}
@@ -2089,6 +2079,99 @@ type Codegen = struct {
         }
     }
 
+    // Compile `<lhs>.<field> = <rhs>` for any lhs expression that yields a
+    // struct pointer.
+    func compile_field_assign(self, lhs: int64, rhs: int64, rhs_id: int64) -> none {
+        let .Ident(field_name) = self.p.exprs[rhs] else { return }
+        let struct_idx: int64 = -1
+        match self.infer_kind(lhs) {
+            .KStruct(idx) -> struct_idx = idx
+            _ -> {}
+        }
+        let foff: int64 = 0
+        if struct_idx >= 0 {
+            foff = self.find_field_offset(struct_idx, field_name)
+        }
+        // Compute rhs first, stash on stack, then compute the lhs pointer.
+        let rv: Val = self.compile_expr(rhs_id)
+        let rr: str = self.load(rv)
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {rr}, [sp]")
+        self.free_reg(rr)
+        let pv: Val = self.compile_expr(lhs)
+        let pr: str = self.load(pv)
+        let tr: str = self.alloc_reg()
+        self.emit(f"ldr {tr}, [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit(f"str {tr}, [{pr}, #{self.itos(foff)}]")
+        self.free_reg(tr)
+        self.free_reg(pr)
+    }
+
+    // Look up `op_index_set` on a struct, returning its mangled label.
+    func struct_index_setter_label(self, struct_idx: int64) -> str? {
+        let mi: int64 = 0
+        for mi < len(self.structs[struct_idx].method_names) {
+            if self.structs[struct_idx].method_names[mi] == "op_index_set" {
+                return f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
+            }
+            mi = mi + 1
+        }
+        return none
+    }
+
+    // Compile `<arr>[<key>] = <rhs>` for Ident-named arr. Dispatches to
+    // op_index_set when available; otherwise plain array indexed store.
+    func compile_index_assign(self, lhs: int64, rhs: int64, rhs_id: int64) -> none {
+        let .Ident(arr_name) = self.p.exprs[lhs] else { return }
+        let struct_idx: int64 = -1
+        match self.find_var_kind(arr_name) {
+            .KStruct(si) -> struct_idx = si
+            _ -> {}
+        }
+        let setter: str? = none
+        if struct_idx >= 0 {
+            setter = self.struct_index_setter_label(struct_idx)
+        }
+        match setter {
+            Some(method_lbl) -> {
+                // Compile rhs first (clean register state), stash, then key,
+                // then load the array and call.
+                let rhs_v: Val = self.compile_expr(rhs_id)
+                let rhs_r: str = self.alloc_reg()
+                self.mov_to(rhs_r, rhs_v)
+                self.emit("sub sp, sp, #16")
+                self.emit(f"str {rhs_r}, [sp]")
+                self.free_reg(rhs_r)
+                let kv: Val = self.compile_expr(rhs)
+                let kr: str = self.alloc_reg()
+                self.mov_to(kr, kv)
+                let arr_off: int64 = self.find_var_offset(arr_name)
+                self.emit_ldr("x0", arr_off)
+                self.emit(f"mov x1, {kr}")
+                self.free_reg(kr)
+                self.emit("ldr x2, [sp]")
+                self.emit("add sp, sp, #16")
+                self.emit(f"bl {method_lbl}")
+            }
+            none -> {
+                let arr_off: int64 = self.find_var_offset(arr_name)
+                let idx_v: Val = self.compile_expr(rhs)
+                let idx_r: str = self.load(idx_v)
+                let rhs_v: Val = self.compile_expr(rhs_id)
+                let rhs_r: str = self.load(rhs_v)
+                let ptr_r: str = self.alloc_reg()
+                self.emit_ldr(ptr_r, arr_off)
+                self.emit(f"ldr {ptr_r}, [{ptr_r}]")
+                self.emit(f"lsl {idx_r}, {idx_r}, #3")
+                self.emit(f"str {rhs_r}, [{ptr_r}, {idx_r}]")
+                self.free_reg(ptr_r)
+                self.free_reg(idx_r)
+                self.free_reg(rhs_r)
+            }
+        }
+    }
+
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         match self.p.exprs[lhs_id] {
             .Ident(name) -> {
@@ -2098,134 +2181,8 @@ type Codegen = struct {
             }
             .Binary(lhs2, op, rhs2) -> {
                 match op {
-                    .Dot -> {
-                        let handled: bool = false
-                        match self.p.exprs[lhs2] {
-                            .Ident(obj_name) -> {
-                                match self.p.exprs[rhs2] {
-                                    .Ident(field_name) -> {
-                                        let obj_off: int64 = self.find_var_offset(obj_name)
-                                        let struct_idx: int64 = -1
-                                        match self.find_var_kind(obj_name) {
-                                            .KStruct(idx) -> struct_idx = idx
-                                            _ -> {}
-                                        }
-                                        let foff: int64 = 0
-                                        if struct_idx >= 0 {
-                                            foff = self.find_field_offset(struct_idx, field_name)
-                                        }
-                                        let rv: Val = self.compile_expr(rhs_id)
-                                        let rr: str = self.load(rv)
-                                        let pr: str = self.alloc_reg()
-                                        self.emit_ldr(pr, obj_off)
-                                        self.emit(f"str {rr}, [{pr}, #{self.itos(foff)}]")
-                                        self.free_reg(rr)
-                                        self.free_reg(pr)
-                                        handled = true
-                                    }
-                                    _ -> {}
-                                }
-                            }
-                            _ -> {}
-                        }
-                        if handled == false {
-                            // Fallback: arbitrary lhs.field = rhs, where lhs
-                            // yields a struct pointer. Determine field offset
-                            // via infer_kind on the lhs sub-expression.
-                            match self.p.exprs[rhs2] {
-                                .Ident(field_name) -> {
-                                    let struct_idx2: int64 = -1
-                                    match self.infer_kind(lhs2) {
-                                        .KStruct(idx2) -> struct_idx2 = idx2
-                                        _ -> {}
-                                    }
-                                    let foff2: int64 = 0
-                                    if struct_idx2 >= 0 {
-                                        foff2 = self.find_field_offset(struct_idx2, field_name)
-                                    }
-                                    // Compute rhs first, stash, then compute
-                                    // the lhs struct pointer.
-                                    let rv2: Val = self.compile_expr(rhs_id)
-                                    let rr2: str = self.load(rv2)
-                                    self.emit("sub sp, sp, #16")
-                                    self.emit(f"str {rr2}, [sp]")
-                                    self.free_reg(rr2)
-                                    let pv: Val = self.compile_expr(lhs2)
-                                    let pr2: str = self.load(pv)
-                                    let tr: str = self.alloc_reg()
-                                    self.emit(f"ldr {tr}, [sp]")
-                                    self.emit("add sp, sp, #16")
-                                    self.emit(f"str {tr}, [{pr2}, #{self.itos(foff2)}]")
-                                    self.free_reg(tr)
-                                    self.free_reg(pr2)
-                                }
-                                _ -> {}
-                            }
-                        }
-                    }
-                    .Index -> {
-                        match self.p.exprs[lhs2] {
-                            .Ident(arr_name) -> {
-                                // Struct with op_index_set — dispatch as a
-                                // method call: target[key] = value.
-                                let var_kind: TypeKind = self.find_var_kind(arr_name)
-                                let struct_idx: int64 = -1
-                                match var_kind {
-                                    .KStruct(si) -> struct_idx = si
-                                    _ -> {}
-                                }
-                                let has_setter: bool = false
-                                if struct_idx >= 0 {
-                                    let mi: int64 = 0
-                                    for mi < len(self.structs[struct_idx].method_names) {
-                                        if self.structs[struct_idx].method_names[mi] == "op_index_set" {
-                                            has_setter = true
-                                            mi = len(self.structs[struct_idx].method_names)
-                                        } else {
-                                            mi = mi + 1
-                                        }
-                                    }
-                                }
-                                if has_setter {
-                                    // Compile rhs first (clean register state),
-                                    // stash on the stack, then compile key,
-                                    // restore rhs into x2.
-                                    let rhs_v: Val = self.compile_expr(rhs_id)
-                                    let rhs_r: str = self.alloc_reg()
-                                    self.mov_to(rhs_r, rhs_v)
-                                    self.emit("sub sp, sp, #16")
-                                    self.emit(f"str {rhs_r}, [sp]")
-                                    self.free_reg(rhs_r)
-                                    let kv: Val = self.compile_expr(rhs2)
-                                    let kr: str = self.alloc_reg()
-                                    self.mov_to(kr, kv)
-                                    let arr_off: int64 = self.find_var_offset(arr_name)
-                                    self.emit_ldr("x0", arr_off)
-                                    self.emit(f"mov x1, {kr}")
-                                    self.free_reg(kr)
-                                    self.emit("ldr x2, [sp]")
-                                    self.emit("add sp, sp, #16")
-                                    let method_lbl: str = f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
-                                    self.emit(f"bl {method_lbl}")
-                                } else {
-                                    let arr_off: int64 = self.find_var_offset(arr_name)
-                                    let idx_v: Val = self.compile_expr(rhs2)
-                                    let idx_r: str = self.load(idx_v)
-                                    let rhs_v: Val = self.compile_expr(rhs_id)
-                                    let rhs_r: str = self.load(rhs_v)
-                                    let ptr_r: str = self.alloc_reg()
-                                    self.emit_ldr(ptr_r, arr_off)
-                                    self.emit(f"ldr {ptr_r}, [{ptr_r}]")
-                                    self.emit(f"lsl {idx_r}, {idx_r}, #3")
-                                    self.emit(f"str {rhs_r}, [{ptr_r}, {idx_r}]")
-                                    self.free_reg(ptr_r)
-                                    self.free_reg(idx_r)
-                                    self.free_reg(rhs_r)
-                                }
-                            }
-                            _ -> {}
-                        }
-                    }
+                    .Dot -> self.compile_field_assign(lhs2, rhs2, rhs_id)
+                    .Index -> self.compile_index_assign(lhs2, rhs2, rhs_id)
                     _ -> {}
                 }
             }
@@ -2416,19 +2373,28 @@ type Codegen = struct {
             self.emit(f"b {self.ret_lbl}")
             return
         }
-        // If returning into an optional and the value isn't already optional
-        // (NoneLit/Call/Optional variable), wrap it in an arena allocation.
+        // If returning into an optional and the value isn't already optional,
+        // wrap it in an arena allocation. NoneLit is always Optional. For Call,
+        // trust free-function returns (we don't track free-fn return kinds);
+        // for method calls, infer_kind looks up the method's return type.
         let needs_wrap: bool = false
         match self.return_kind {
             .KOptional -> {
+                let assume_optional: bool = false
                 match self.p.exprs[value_id] {
-                    .NoneLit -> {}
-                    .Call(callee, args) -> {}
-                    _ -> {
-                        match self.infer_kind(value_id) {
-                            .KOptional -> {}
-                            _ -> needs_wrap = true
+                    .NoneLit -> assume_optional = true
+                    .Call(callee, args) -> {
+                        match self.p.exprs[callee] {
+                            .Ident(name) -> assume_optional = true
+                            _ -> {}
                         }
+                    }
+                    _ -> {}
+                }
+                if assume_optional == false {
+                    match self.infer_kind(value_id) {
+                        .KOptional -> {}
+                        _ -> needs_wrap = true
                     }
                 }
             }
