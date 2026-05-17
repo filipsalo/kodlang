@@ -959,6 +959,13 @@ type Codegen = struct {
                 if self.var_declared(idx_name) == false {
                     self.alloc_var(idx_name, .KInt64)
                 }
+                // Persistent slot for the array header pointer so we can
+                // reload it each iteration (bl calls in the body would
+                // clobber a register-resident copy).
+                let hdr_name = f"__fh_{name}"
+                if self.var_declared(hdr_name) == false {
+                    self.alloc_var(hdr_name, .KInt64)
+                }
                 let i = 0
                 for i < len(body) {
                     self.collect_stmt_vars(body[i])
@@ -3021,30 +3028,40 @@ type Codegen = struct {
         let idx_name = f"__fi_{name}"
         let idx_off = self.find_var_offset(idx_name)
         let elem_off = self.find_var_offset(name)
+        // Pre-allocated by collect_stmt_vars: stash the array header here
+        // so the body can issue `bl` calls without clobbering data/len regs.
+        let hdr_name = f"__fh_{name}"
+        let hdr_off = self.find_var_offset(hdr_name)
 
-        let arr_v = self.compile_expr(iter_id)
-        let hdr_r = self.load(arr_v)
-
-        let len_r = self.alloc_reg()
-        let ptr_r = self.alloc_reg()
-        self.emit(f"ldr {len_r}, [{hdr_r}, #8]")
-        self.emit(f"ldr {ptr_r}, [{hdr_r}]")
+        let arr_val = self.compile_expr(iter_id)
+        let hdr_r = self.load(arr_val)
+        self.emit_str(hdr_r, hdr_off)
         self.free_reg(hdr_r)
 
         let idx_r = self.alloc_reg()
         self.emit(f"mov {idx_r}, #0")
         self.emit_str(idx_r, idx_off)
+        self.free_reg(idx_r)
 
         self.emit_label(start_lbl)
-        self.emit_ldr(idx_r, idx_off)
-        self.emit(f"cmp {idx_r}, {len_r}")
+        let hdr_reg = self.alloc_reg()
+        let len_reg = self.alloc_reg()
+        let idx_reg = self.alloc_reg()
+        self.emit_ldr(hdr_reg, hdr_off)
+        self.emit(f"ldr {len_reg}, [{hdr_reg}, #8]")
+        self.emit_ldr(idx_reg, idx_off)
+        self.emit(f"cmp {idx_reg}, {len_reg}")
         self.emit(f"bge {end_lbl}")
+        self.free_reg(len_reg)
 
-        let elem_r = self.alloc_reg()
-        self.emit(f"lsl {elem_r}, {idx_r}, #3")
-        self.emit(f"ldr {elem_r}, [{ptr_r}, {elem_r}]")
-        self.emit_str(elem_r, elem_off)
-        self.free_reg(elem_r)
+        let elem_reg = self.alloc_reg()
+        self.emit(f"ldr {elem_reg}, [{hdr_reg}]")
+        self.emit(f"lsl {idx_reg}, {idx_reg}, #3")
+        self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
+        self.emit_str(elem_reg, elem_off)
+        self.free_reg(elem_reg)
+        self.free_reg(idx_reg)
+        self.free_reg(hdr_reg)
 
         let i = 0
         for i < len(body) {
@@ -3053,15 +3070,13 @@ type Codegen = struct {
         }
 
         self.emit_label(incr_lbl)
-        self.emit_ldr(idx_r, idx_off)
-        self.emit(f"add {idx_r}, {idx_r}, #1")
-        self.emit_str(idx_r, idx_off)
+        let bump_reg = self.alloc_reg()
+        self.emit_ldr(bump_reg, idx_off)
+        self.emit(f"add {bump_reg}, {bump_reg}, #1")
+        self.emit_str(bump_reg, idx_off)
+        self.free_reg(bump_reg)
         self.emit(f"b {start_lbl}")
         self.emit_label(end_lbl)
-
-        self.free_reg(idx_r)
-        self.free_reg(len_r)
-        self.free_reg(ptr_r)
 
         let n = len(self.loop_stack)
         let new_stack: [LoopLbl] = []
@@ -3406,30 +3421,21 @@ type Codegen = struct {
 
         // Three-phase registration to handle struct ⇄ interface refs:
         // 1) interface names, 2) enums + structs, 3) interface method sigs.
-        let iface_idx = 0
-        for iface_idx < len(module.decls) {
-            self.register_interface(module.decls[iface_idx], prefix: self.path_prefix, p: self.p)
-            iface_idx = iface_idx + 1
+        for decl in module.decls {
+            self.register_interface(decl, prefix: self.path_prefix, p: self.p)
         }
-        let i = 0
-        for i < len(module.decls) {
-            self.register_enum(module.decls[i], prefix: self.path_prefix, p: self.p)
-            i = i + 1
+        for decl in module.decls {
+            self.register_enum(decl, prefix: self.path_prefix, p: self.p)
         }
-        let j = 0
-        for j < len(module.decls) {
-            self.register_struct(module.decls[j], prefix: self.path_prefix, p: self.p)
-            j = j + 1
+        for decl in module.decls {
+            self.register_struct(decl, prefix: self.path_prefix, p: self.p)
         }
-        let b = 0
-        for b < len(module.decls) {
-            self.resolve_interface_methods(module.decls[b], p: self.p)
-            b = b + 1
+        for decl in module.decls {
+            self.resolve_interface_methods(decl, p: self.p)
         }
         // Process type aliases now that base types are registered.
-        let a = 0
-        for a < len(module.decls) {
-            match module.decls[a] {
+        for decl in module.decls {
+            match decl {
                 .TypeAlias(name, target) -> {
                     let kind = self.resolve_type(target)
                     match kind {
@@ -3446,12 +3452,10 @@ type Codegen = struct {
                 }
                 else none
             }
-            a = a + 1
         }
 
-        let k = 0
-        for k < len(module.decls) {
-            match module.decls[k] {
+        for decl in module.decls {
+            match decl {
                 .Func(decl_id) -> {
                     let func_decl = self.p.func_decls[decl_id]
                     self.func_names += [func_decl.name]
@@ -3465,32 +3469,27 @@ type Codegen = struct {
                 }
                 else none
             }
-            k = k + 1
         }
 
-        let d = 0
-        for d < len(module.decls) {
-            match module.decls[d] {
+        for decl in module.decls {
+            match decl {
                 .Func(decl_id) -> self.compile_func(decl_id, "")
                 .Struct(name, fields, methods) -> {
-                    let method_idx = 0
-                    for method_idx < len(methods) {
-                        self.compile_func(methods[method_idx], name)
-                        method_idx = method_idx + 1
+                    for method_id in methods {
+                        self.compile_func(method_id, name)
                     }
                 }
                 else none
             }
-            d = d + 1
         }
 
         if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 {
             print(".data")
-            let struct_idx = 0
-            for struct_idx < len(self.str_labels) {
-                print(f"{self.str_labels[struct_idx]}:")
-                self.emit_asciz(self.str_values[struct_idx])
-                struct_idx = struct_idx + 1
+            let i = 0
+            for i < len(self.str_labels) {
+                print(f"{self.str_labels[i]}:")
+                self.emit_asciz(self.str_values[i])
+                i = i + 1
             }
             self.emit_vtables()
         }
