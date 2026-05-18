@@ -52,10 +52,20 @@ func parse_string_value(anon raw: str) -> str {
 }
 
 type Parser = struct {
+	// Path of the source file this parser was built from. Used by
+	// the codegen's error reporter to produce `path:line:col` prefixes.
+	path: str
+	// The original source text. Kept on the parser so downstream tools
+	// (the codegen's error reporter) can decode `Span.start` byte
+	// offsets into line:col without re-reading the file.
+	source: str
 	tokens: [lexing.Token]
 	pos: int64
 
 	exprs: [ast.Expr]
+	// Parallel to `exprs`: source span for each expression. Indexed
+	// by expr_id. Populated by alloc_expr.
+	expr_spans: [ast.Span]
 	stmts: [ast.Stmt]
 	type_exprs: [ast.TypeExpr]
 	patterns: [ast.Pattern]
@@ -112,10 +122,19 @@ type Parser = struct {
 	}
 
 
-	func alloc_expr(self, anon e: ast.Expr) -> int64 {
+	func alloc_expr(self, anon e: ast.Expr, span: ast.Span) -> int64 {
 		let id: int64 = len(self.exprs)
 		self.exprs += [e]
+		self.expr_spans += [span]
 		return id
+	}
+
+	// Capture the byte offset of the upcoming token. Caller-side
+	// helper: stash the result at the top of a parse method, build
+	// the expression, then pass the result as the `span` argument
+	// to alloc_expr.
+	func here(self) -> ast.Span {
+		return ast.Span(start: self.peek().start)
 	}
 
 	func alloc_stmt(self, anon s: ast.Stmt) -> int64 {
@@ -328,7 +347,7 @@ type Parser = struct {
 
 	// Parse the raw token value of an f-string (including f" and trailing ")
 	// into a left-folded Binary(Add) tree of string concatenations.
-	func parse_fstring(self, anon raw: str) -> int64 {
+	func parse_fstring(self, anon raw: str, span: ast.Span) -> int64 {
 		let inner: str = raw[2:len(raw)-1]
 		let parts: [int64] = []
 		let i: int64 = 0
@@ -339,7 +358,7 @@ type Parser = struct {
 			}
 			if j > i {
 				let lit: str = unescape_str(inner[i:j])
-				parts += [self.alloc_expr(ast.Expr.StrLit(value: lit))]
+				parts += [self.alloc_expr(ast.Expr.StrLit(value: lit), span: span)]
 			}
 			if j >= len(inner) {
 				i = j
@@ -353,31 +372,32 @@ type Parser = struct {
 				// cleanly with non-string values without `+` doing any
 				// implicit coercion of its own.
 				let inner_expr: int64 = self.parse_expr_substring(expr_text)
-				let str_callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "str"))
+				let str_callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "str"), span: span)
 				let arg: ast.CallArg = ast.CallArg(label: "", value: inner_expr)
 				let call_args: [ast.CallArg] = [arg]
-				parts += [self.alloc_expr(ast.Expr.Call(callee: str_callee, args: call_args))]
+				parts += [self.alloc_expr(ast.Expr.Call(callee: str_callee, args: call_args), span: span)]
 				i = k + 1
 			}
 		}
 		if len(parts) == 0 {
-			return self.alloc_expr(ast.Expr.StrLit(value: ""))
+			return self.alloc_expr(ast.Expr.StrLit(value: ""), span: span)
 		}
 		let result: int64 = parts[0]
 		let i: int64 = 1
 		for i < len(parts) {
-			result = self.alloc_expr(ast.Expr.Binary(lhs: result, op: ast.Op.Add, rhs: parts[i]))
+			result = self.alloc_expr(ast.Expr.Binary(lhs: result, op: ast.Op.Add, rhs: parts[i]), span: span)
 			i = i + 1
 		}
 		return result
 	}
 
 	func parse_primary(self) -> int64 {
+		let span: ast.Span = self.here()
 		// Unary minus: desugar -x to 0 - x
 		if self.try_consume(.Minus) {
 			let operand: int64 = self.parse_primary()
-			let zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0))
-			return self.alloc_expr(ast.Expr.Binary(lhs: zero, op: ast.Op.Sub, rhs: operand))
+			let zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0), span: span)
+			return self.alloc_expr(ast.Expr.Binary(lhs: zero, op: ast.Op.Sub, rhs: operand), span: span)
 		}
 		// `try expr` — unwrap on Ok, propagate Err to the enclosing function.
 		// Both `try` and `must` bind at unary precedence: they grab the
@@ -386,44 +406,44 @@ type Parser = struct {
 		if self.try_consume(.KwTry) {
 			let inner: int64 = self.parse_primary()
 			inner = self.parse_postfix(inner)
-			return self.alloc_expr(ast.Expr.Try(inner: inner))
+			return self.alloc_expr(ast.Expr.Try(inner: inner), span: span)
 		}
 		// `must expr` — unwrap on Ok, panic + abort on Err.
 		if self.try_consume(.KwMust) {
 			let inner: int64 = self.parse_primary()
 			inner = self.parse_postfix(inner)
-			return self.alloc_expr(ast.Expr.Must(inner: inner))
+			return self.alloc_expr(ast.Expr.Must(inner: inner), span: span)
 		}
 		// Integer literal
 		if self.at(.IntegerLit) {
 			let tok: lexing.Token = self.advance()
-			return self.alloc_expr(ast.Expr.IntLit(value: str_to_int(tok.value)))
+			return self.alloc_expr(ast.Expr.IntLit(value: str_to_int(tok.value)), span: span)
 		}
 		// F-string literal
 		if self.at(.FStringLit) {
 			let tok: lexing.Token = self.advance()
-			return self.parse_fstring(tok.value)
+			return self.parse_fstring(tok.value, span: span)
 		}
 		// String literal
 		if self.at(.StringLit) {
 			let tok: lexing.Token = self.advance()
-			return self.alloc_expr(ast.Expr.StrLit(value: parse_string_value(tok.value)))
+			return self.alloc_expr(ast.Expr.StrLit(value: parse_string_value(tok.value)), span: span)
 		}
 		// Boolean
 		if self.try_consume(.KwTrue) {
-			return self.alloc_expr(ast.Expr.BoolLit(value: true))
+			return self.alloc_expr(ast.Expr.BoolLit(value: true), span: span)
 		}
 		if self.try_consume(.KwFalse) {
-			return self.alloc_expr(ast.Expr.BoolLit(value: false))
+			return self.alloc_expr(ast.Expr.BoolLit(value: false), span: span)
 		}
 		// none literal
 		if self.try_consume(.KwNone) {
-			return self.alloc_expr(ast.Expr.NoneLit)
+			return self.alloc_expr(ast.Expr.NoneLit, span: span)
 		}
 		// Implicit enum variant: .Variant
 		if self.try_consume(.Dot) {
 			let name: str = self.expect_identifier()
-			return self.alloc_expr(ast.Expr.ImplicitVariant(name: name))
+			return self.alloc_expr(ast.Expr.ImplicitVariant(name: name), span: span)
 		}
 		// Array literal: [e1, e2, ...]
 		if self.try_consume(.OpenBracket) {
@@ -435,7 +455,7 @@ type Parser = struct {
 				}
 			}
 			self.expect(.CloseBracket)
-			return self.alloc_expr(ast.Expr.ArrayLit(elements: elements))
+			return self.alloc_expr(ast.Expr.ArrayLit(elements: elements), span: span)
 		}
 		// Parenthesized expression
 		if self.try_consume(.OpenParen) {
@@ -445,14 +465,14 @@ type Parser = struct {
 		}
 		// match expression
 		if self.try_consume(.KwMatch) {
-			return self.parse_match_expr()
+			return self.parse_match_expr(span)
 		}
 		// Identifier
 		let name: str = self.expect_identifier()
-		return self.alloc_expr(ast.Expr.Ident(name: name))
+		return self.alloc_expr(ast.Expr.Ident(name: name), span: span)
 	}
 
-	func parse_match_expr(self) -> int64 {
+	func parse_match_expr(self, anon span: ast.Span) -> int64 {
 		let subject: int64 = self.parse_expr()
 		self.expect(.OpenCurly)
 		self.skip_newlines()
@@ -468,7 +488,7 @@ type Parser = struct {
 			self.skip_newlines()
 		}
 		self.expect(.CloseCurly)
-		return self.alloc_expr(ast.Expr.MatchExpr(subject: subject, arms: arms))
+		return self.alloc_expr(ast.Expr.MatchExpr(subject: subject, arms: arms), span: span)
 	}
 
 	// Parse a match-arm's pattern and the connecting token. `else { ... }`,
@@ -486,6 +506,10 @@ type Parser = struct {
 
 	func parse_postfix(self, anon base: int64) -> int64 {
 		let lhs: int64 = base
+		// Source span carried forward across all postfix wraps of the
+		// same base expression. For `obj.method(args)` and similar, the
+		// resulting nodes all point back to where the base started.
+		let lhs_span: ast.Span = self.expr_spans[lhs]
 		for self.at(.OpenParen) or self.at(.Dot) or self.at(.OpenBracket) {
 			// Function/method call
 			if self.at(.OpenParen) {
@@ -516,14 +540,15 @@ type Parser = struct {
 					}
 				}
 				self.expect(.CloseParen)
-				lhs = self.alloc_expr(ast.Expr.Call(callee: lhs, args: args))
+				lhs = self.alloc_expr(ast.Expr.Call(callee: lhs, args: args), span: lhs_span)
 			}
 			// Dot access: expr.name
 			if self.at(.Dot) {
 				self.advance()
+				let field_span: ast.Span = self.here()
 				let field: str = self.expect_identifier()
-				let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field))
-				lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Dot, rhs: rhs))
+				let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field), span: field_span)
+				lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Dot, rhs: rhs), span: lhs_span)
 			}
 			// Index, slice, or generic constructor: expr[idx], expr[lo:hi],
 			// or Type[A, B](...) — the last form erases the type args.
@@ -536,7 +561,7 @@ type Parser = struct {
 						hi = self.parse_expr()
 					}
 					self.expect(.CloseBracket)
-					lhs = self.alloc_expr(ast.Expr.Slice(s: lhs, lo: lo, hi: hi))
+					lhs = self.alloc_expr(ast.Expr.Slice(s: lhs, lo: lo, hi: hi), span: lhs_span)
 				} else {
 					if self.try_consume(.Comma) {
 						// Multi-arg generic type instantiation: Type[A, B](...)
@@ -554,7 +579,7 @@ type Parser = struct {
 						if self.at(.OpenParen) {
 							// Single-arg generic constructor Type[A](...) — erase.
 						} else {
-							lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Index, rhs: lo))
+							lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: ast.Op.Index, rhs: lo), span: lhs_span)
 						}
 					}
 				}
@@ -612,11 +637,14 @@ type Parser = struct {
 	func parse_expr_prec(self, anon min_prec: int64) -> int64 {
 		let lhs: int64 = self.parse_primary()
 		lhs = self.parse_postfix(lhs)
+		// Binary-op nodes inherit the lhs's span so the whole tree
+		// points back to the leftmost token.
+		let lhs_span: ast.Span = self.expr_spans[lhs]
 		for self.bin_op_prec() >= min_prec and self.bin_op_prec() > 0 {
 			let prec: int64 = self.bin_op_prec()
 			let op: ast.Op = self.consume_bin_op()
 			let rhs: int64 = self.parse_expr_prec(prec + 1)
-			lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: op, rhs: rhs))
+			lhs = self.alloc_expr(ast.Expr.Binary(lhs: lhs, op: op, rhs: rhs), span: lhs_span)
 		}
 		return lhs
 	}
@@ -981,11 +1009,12 @@ type Parser = struct {
 	}
 }
 
-func make_parser(anon tokens: [lexing.Token]) -> Parser {
+func make_parser(path: str, source: str, anon tokens: [lexing.Token]) -> Parser {
 	// Index 0 is reserved as a null sentinel in every pool so that fields
 	// of type int64 can use 0 to mean 'absent' (e.g. no return type, no
 	// type annotation, bare return, open slice). Push a dummy at index 0.
 	let exprs: [ast.Expr] = [ast.Expr.NoneLit]
+	let expr_spans: [ast.Span] = [ast.Span(start: 0)]
 	let stmts: [ast.Stmt] = [ast.Stmt.Break]
 	let type_exprs: [ast.TypeExpr] = [ast.TypeExpr.Named(name: "")]
 	let patterns: [ast.Pattern] = [ast.Pattern.Wildcard]
@@ -995,5 +1024,5 @@ func make_parser(anon tokens: [lexing.Token]) -> Parser {
 	let dummy_params: [ast.Param] = []
 	let dummy_body: [int64] = []
 	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", params: dummy_params, return_typ: 0, body: dummy_body)]
-	return Parser(tokens: tokens, pos: 0, exprs: exprs, stmts: stmts, type_exprs: type_exprs, patterns: patterns, match_arms: match_arms, match_expr_arms: match_expr_arms, func_decls: func_decls)
+	return Parser(path: path, source: source, tokens: tokens, pos: 0, exprs: exprs, expr_spans: expr_spans, stmts: stmts, type_exprs: type_exprs, patterns: patterns, match_arms: match_arms, match_expr_arms: match_expr_arms, func_decls: func_decls)
 }

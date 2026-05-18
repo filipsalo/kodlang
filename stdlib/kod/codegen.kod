@@ -227,11 +227,33 @@ type Codegen = struct {
     errors: [str]
 
 
+    // Convert a span's byte offset into a `path:line:col` prefix for
+    // user-facing errors. Walks the source string once per call —
+    // cheap enough for the handful of errors we'd ever report in a
+    // single compile.
+    func format_span(self, anon span: ast.Span) -> str {
+        let source: str = self.p.source
+        let offset: int64 = span.start
+        let line: int64 = 1
+        let col: int64 = 1
+        let i: int64 = 0
+        for i < offset and i < len(source) {
+            if source[i] == '\n' {
+                line = line + 1
+                col = 1
+            } else {
+                col = col + 1
+            }
+            i = i + 1
+        }
+        return f"{self.p.path}:{line.to_str()}:{col.to_str()}"
+    }
+
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
     // surfaces every error rather than stopping at the first.
-    func report_error(self, anon msg: str) -> none {
-        self.errors += [msg]
+    func report_error(self, anon msg: str, span: ast.Span) -> none {
+        self.errors += [f"{self.format_span(span)}: {msg}"]
     }
 
     func had_errors(self) -> bool {
@@ -1875,7 +1897,7 @@ type Codegen = struct {
             self.emit(f"bl {lbl}")
             return .VReg(name: "x0")
         }
-        return self.compile_method_call(mod_or_obj, method_name, args)
+        return self.compile_method_call(mod_or_obj, method_name, args, span: self.p.expr_spans[callee_lhs])
     }
 
     func compile_call(self, callee_id: int64, anon args: [ast.CallArg]) -> Val {
@@ -1927,7 +1949,7 @@ type Codegen = struct {
                     }
                     else none
                 }
-                self.report_error("codegen: unresolved call on dotted callee")
+                self.report_error("codegen: unresolved call on dotted callee", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
             .ImplicitVariant(variant_name) -> {
@@ -1939,11 +1961,11 @@ type Codegen = struct {
                         return self.compile_enum_construct(enum_idx, variant_idx, args)
                     }
                 }
-                self.report_error(f"codegen: unknown implicit variant `.{variant_name}` in call position")
+                self.report_error(f"codegen: unknown implicit variant `.{variant_name}` in call position", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
             else {
-                self.report_error("codegen: call with non-callable expression")
+                self.report_error("codegen: call with non-callable expression", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
         }
@@ -2081,7 +2103,7 @@ type Codegen = struct {
         return -1
     }
 
-    func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg]) -> Val {
+    func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg], span: ast.Span) -> Val {
         let var_kind = self.find_var_kind(obj_name)
         let obj_off = self.find_var_offset(obj_name)
 
@@ -2117,7 +2139,7 @@ type Codegen = struct {
             }
         }
         if len(method_lbl) == 0 {
-            self.report_error(f"codegen: unknown method `{method_name}` on `{obj_name}`")
+            self.report_error(f"codegen: unknown method `{method_name}` on `{obj_name}`", span: span)
             return .VImm(value: 0)
         }
 
@@ -2372,7 +2394,8 @@ type Codegen = struct {
     func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64) -> TypeKind? {
         let .Ident(obj_name) = self.p.exprs[callee_lhs] else { return none }
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
-        if self.find_var_kind(obj_name) is .KInterface(iidx) {
+        let obj_kind = self.find_var_kind(obj_name)
+        if obj_kind is .KInterface(iidx) {
             let method_idx = 0
             for method_idx < len(self.interfaces[iidx].method_names) {
                 if self.interfaces[iidx].method_names[method_idx] == method_name {
@@ -2382,13 +2405,21 @@ type Codegen = struct {
             }
             return none
         }
-        let .KStruct(sidx, _struct_type_args) = self.find_var_kind(obj_name) else { return none }
-        let method_idx = 0
-        for method_idx < len(self.structs[sidx].method_names) {
-            if self.structs[sidx].method_names[method_idx] == method_name {
-                return self.structs[sidx].method_sigs[method_idx].return_kind
+        if obj_kind is .KStruct(sidx, _struct_type_args) {
+            let method_idx = 0
+            for method_idx < len(self.structs[sidx].method_names) {
+                if self.structs[sidx].method_names[method_idx] == method_name {
+                    return self.structs[sidx].method_sigs[method_idx].return_kind
+                }
+                method_idx = method_idx + 1
             }
-            method_idx = method_idx + 1
+            return none
+        }
+        // Primitive receivers (int64.to_str, str.hash, etc.) go through
+        // the primitive method table.
+        let prim_idx = self.find_prim_method(obj_kind, method_name)
+        if prim_idx >= 0 {
+            return self.prim_method_sigs[prim_idx].return_kind
         }
         return none
     }
