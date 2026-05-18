@@ -18,6 +18,29 @@ class Builder:
     def __init__(self, *, project_fs: FileSystem, stdlib_fs: FileSystem):
         self.program = Program(project_fs, stdlib_fs)
         self.program.builtins = self.parse_builtins()
+        # Primitive-type modules live in stdlib/primitives/. They're parsed
+        # and added to the program so the build pipeline produces a .o for
+        # each (linker resolves the $primitives$<kind>$<method> labels that
+        # the codegen emits for primitive method calls). The functions are
+        # also attached as `methods` on the corresponding Python wrapper
+        # type so the interpreter's `x.method()` dispatch path finds them
+        # in `getattr(type(lhs), "methods", {})`.
+        from kod import values as types
+
+        primitive_modules = (
+            ("primitives/int64", types.Int64),
+            ("primitives/str", types.String),
+            ("primitives/bool", types.Bool),
+        )
+        for name, type_cls in primitive_modules:
+            module = self.parse_module(self.program.resolve_import(name))
+            self.program.add_module(module)
+            if not hasattr(type_cls, "methods") or type_cls.methods is None:
+                type_cls.methods = {}
+            for decl in module.body:
+                if isinstance(decl, ast.FunctionDeclaration):
+                    decl.module = module
+                    type_cls.methods[decl.name] = decl
 
     def parse_builtins(self) -> ast.Module:
         """Parse the builtins module."""

@@ -200,6 +200,14 @@ type Codegen = struct {
     // otherwise be an O(n) linear scan per call-site lookup.
     func_idx: FuncIdx
 
+    // Methods registered against primitive types via stdlib/primitives/
+    // modules. Parallel arrays: kind, name, label, sig. Method dispatch
+    // on a primitive receiver finds the entry whose kind + name match.
+    prim_method_kinds: [TypeKind]
+    prim_method_names: [str]
+    prim_method_labels: [str]
+    prim_method_sigs: [SigInfo]
+
     // Active type-parameter substitution. While compiling a specialised
     // method (e.g. Map[str, str].get) `subst_names` holds the template's
     // type-parameter names and `subst_args` the concrete types. `resolve_type`
@@ -1969,6 +1977,38 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
+    // Find a primitive method registered via `register_primitive_module`.
+    // Returns the entry index, or -1 if `kind` is not primitive or has no
+    // method named `name`.
+    func find_prim_method(self, kind: TypeKind, anon name: str) -> int64 {
+        let i = 0
+        for i < len(self.prim_method_names) {
+            if self.prim_method_names[i] == name {
+                let stored = self.prim_method_kinds[i]
+                match kind {
+                    .KInt64 -> {
+                        if stored is .KInt64 {
+                            return i
+                        }
+                    }
+                    .KStr -> {
+                        if stored is .KStr {
+                            return i
+                        }
+                    }
+                    .KBool -> {
+                        if stored is .KBool {
+                            return i
+                        }
+                    }
+                    else none
+                }
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
     func compile_method_call(self, obj_name: str, method_name: str, anon args: [ast.CallArg]) -> Val {
         let var_kind = self.find_var_kind(obj_name)
         let obj_off = self.find_var_offset(obj_name)
@@ -1994,6 +2034,15 @@ type Codegen = struct {
                 }
             }
             else none
+        }
+        // Primitive method dispatch (int64.to_str etc.) for non-struct
+        // receivers — looked up against stdlib/primitives/<kind>.kod.
+        if len(method_lbl) == 0 {
+            let prim_idx = self.find_prim_method(var_kind, method_name)
+            if prim_idx >= 0 {
+                method_lbl = self.prim_method_labels[prim_idx]
+                sig_params = self.prim_method_sigs[prim_idx].param_kinds
+            }
         }
         if len(method_lbl) == 0 {
             kod_panic(f"codegen: unknown method `{method_name}` on `{obj_name}`")
@@ -3730,6 +3779,26 @@ type Codegen = struct {
         }
     }
 
+    // Register every function in a primitive's module (e.g. stdlib/primitives/int64.kod)
+    // as a method on that primitive `kind`. Method dispatch on a receiver
+    // of this kind will look up `name` and emit `bl $prefix$name`.
+    func register_primitive_module(self, anon module: ast.Module, kind: TypeKind, prefix: str, p: parser.Parser) -> none {
+        for decl in module.decls {
+            match decl {
+                .Func(decl_id) -> {
+                    let func_decl = p.func_decls[decl_id]
+                    let lbl = f"${prefix}${func_decl.name}"
+                    let sig = self.resolve_sig(func_decl, p: p)
+                    self.prim_method_kinds += [kind]
+                    self.prim_method_names += [func_decl.name]
+                    self.prim_method_labels += [lbl]
+                    self.prim_method_sigs += [sig]
+                }
+                else none
+            }
+        }
+    }
+
     // Register selected items from an imported module into the local
     // namespace so they can be referenced without the module prefix.
     // For functions/externs this appends to func_names/func_labels/func_sigs.
@@ -3814,9 +3883,13 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let func_labels: [str] = []
     let func_sigs: [SigInfo] = []
     let func_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
+    let prim_method_kinds: [TypeKind] = []
+    let prim_method_names: [str] = []
+    let prim_method_labels: [str] = []
+    let prim_method_sigs: [SigInfo] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
     let subst_names: [str] = []
     let subst_args: [TypeKind] = []
     let interned: StrMap = StrMap(keys: [], values: [], indices: [])
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, subst_names: subst_names, subst_args: subst_args)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, prim_method_kinds: prim_method_kinds, prim_method_names: prim_method_names, prim_method_labels: prim_method_labels, prim_method_sigs: prim_method_sigs, subst_names: subst_names, subst_args: subst_args)
 }
