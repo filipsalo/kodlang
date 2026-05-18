@@ -616,8 +616,6 @@ class Interpreter:
                 return func(**{name: value for name, value in zip(arg_names, args)})
             return func(*args)
         if isinstance(func, ast.ExternalFunctionDeclaration):
-            if func.name == "int_to_str":
-                return types.String(str(args[0].value).encode("utf8"))
             if func.name == "read_file":
                 path = args[0].value.decode("utf8")
                 try:

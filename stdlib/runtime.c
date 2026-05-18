@@ -51,41 +51,6 @@ typedef struct {
     int64_t cap;
 } KodArray;
 
-char *int_to_str(int64_t n) {
-    char tmp[24];
-    int len = 0;
-    int neg = n < 0;
-    if (n == 0) {
-        tmp[len++] = '0';
-    } else {
-        if (neg) n = -n;
-        while (n > 0) {
-            tmp[len++] = '0' + (int)(n % 10);
-            n /= 10;
-        }
-        if (neg) tmp[len++] = '-';
-        for (int i = 0, j = len - 1; i < j; i++, j--) {
-            char c = tmp[i]; tmp[i] = tmp[j]; tmp[j] = c;
-        }
-    }
-    tmp[len] = '\0';
-    char *result = (char *)arena_alloc(len + 1);
-    for (int i = 0; i <= len; i++) result[i] = tmp[i];
-    return result;
-}
-
-// FNV-1a 64-bit hash. Used for the `hash(s)` intrinsic on strings so
-// Map[str, V] finds keys by content rather than pointer identity.
-int64_t kod_str_hash(const char *s) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    while (*s) {
-        h ^= (uint8_t)(*s);
-        h *= 0x100000001b3ULL;
-        s++;
-    }
-    return (int64_t)h;
-}
-
 void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
