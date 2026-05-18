@@ -13,6 +13,13 @@ void kod_panic(const char *msg) {
     exit(1);
 }
 
+// Print to stderr without exiting. Used by the codegen to surface
+// user-facing errors (unknown method, etc.) while continuing to
+// scan the rest of the module for additional errors.
+void kod_eprint(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+}
+
 char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return "";

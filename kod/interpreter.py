@@ -634,6 +634,11 @@ class Interpreter:
                 msg = args[0].value.decode("utf8")
                 sys.stderr.write(f"panic: {msg}\n")
                 sys.exit(1)
+            if func.name == "kod_eprint":
+                # Mirror runtime kod_eprint: write to stderr, no exit.
+                msg = args[0].value.decode("utf8")
+                sys.stderr.write(f"{msg}\n")
+                return types.none_value
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]
