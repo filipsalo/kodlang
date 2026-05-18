@@ -43,6 +43,13 @@ type SigInfo = struct {
     return_kind: TypeKind
 }
 
+// Name → entry-index map for the parallel `func_names` / `func_labels`
+// / `func_sigs` arrays. Keys are function names, values are indices
+// into those arrays. Using a primitive int64 value keeps the type
+// resolvable during early registration (no forward reference to a
+// local struct).
+type FuncIdx = Map[str, int64]
+
 type VariantInfo = struct {
     name: str
     discriminant: int64
@@ -189,6 +196,9 @@ type Codegen = struct {
     // SigInfo (zero-length param_kinds, .KVoid return_kind) for externs
     // that haven't been registered with full signature info.
     func_sigs: [SigInfo]
+    // Name → index into the parallel func_* arrays. Replaces what would
+    // otherwise be an O(n) linear scan per call-site lookup.
+    func_idx: FuncIdx
 
     // Active type-parameter substitution. While compiling a specialised
     // method (e.g. Map[str, str].get) `subst_names` holds the template's
@@ -477,12 +487,9 @@ type Codegen = struct {
     // SigInfo (no params, void return) if the name isn't registered or
     // wasn't resolved with full signature info.
     func find_func_sig(self, anon name: str) -> SigInfo {
-        let i = 0
-        for i < len(self.func_names) {
-            if self.func_names[i] == name {
-                return self.func_sigs[i]
-            }
-            i = i + 1
+        let m = self.func_idx
+        if m.get(name) is Some(idx) {
+            return self.func_sigs[idx]
         }
         let empty: [TypeKind] = []
         return SigInfo(param_kinds: empty, return_kind: .KVoid)
@@ -722,12 +729,9 @@ type Codegen = struct {
     }
 
     func func_label(self, anon name: str) -> str {
-        let i = 0
-        for i < len(self.func_names) {
-            if self.func_names[i] == name {
-                return self.func_labels[i]
-            }
-            i = i + 1
+        let m = self.func_idx
+        if m.get(name) is Some(idx) {
+            return self.func_labels[idx]
         }
         return f"$builtins${name}"
     }
@@ -2303,12 +2307,9 @@ type Codegen = struct {
                             return .KEnum(idx: enum_idx)
                         }
                         // Free function call: use the cached return kind.
-                        let field_idx = 0
-                        for field_idx < len(self.func_names) {
-                            if self.func_names[field_idx] == name {
-                                return self.func_sigs[field_idx].return_kind
-                            }
-                            field_idx = field_idx + 1
+                        let idx_m = self.func_idx
+                        if idx_m.get(name) is Some(idx) {
+                            return self.func_sigs[idx].return_kind
                         }
                     }
                     .Binary(call_lhs, call_op, call_rhs) -> {
@@ -3587,14 +3588,17 @@ type Codegen = struct {
         }
 
         for decl in module.decls {
+            let idx_m = self.func_idx
             match decl {
                 .Func(decl_id) -> {
                     let func_decl = self.p.func_decls[decl_id]
+                    idx_m.set(func_decl.name, len(self.func_names))
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${self.path_prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(func_decl, p: self.p)]
                 }
                 .Extern(name, params, return_typ) -> {
+                    idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
                     self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: self.p)]
@@ -3705,15 +3709,18 @@ type Codegen = struct {
     // Register all functions and externs from a dependency module without compiling it.
     // Call this for each imported module (e.g. builtins) before compile_module.
     func register_module_funcs(self, anon module: ast.Module, prefix: str, p: parser.Parser) -> none {
+        let idx_m = self.func_idx
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> {
                     let func_decl = p.func_decls[decl_id]
+                    idx_m.set(func_decl.name, len(self.func_names))
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(func_decl, p: p)]
                 }
                 .Extern(name, params, return_typ) -> {
+                    idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
                     self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: p)]
@@ -3725,15 +3732,17 @@ type Codegen = struct {
 
     // Register selected items from an imported module into the local
     // namespace so they can be referenced without the module prefix.
-    // For functions/externs this means appending to func_names/func_labels.
+    // For functions/externs this appends to func_names/func_labels/func_sigs.
     // Types (struct/enum) are already global-by-name, so they need no entry.
     func register_imported_items(self, anon items: [str], prefix: str, anon module: ast.Module, p: parser.Parser) -> none {
+        let idx_m = self.func_idx
         for want in items {
             for decl in module.decls {
                 match decl {
                     .Func(decl_id) -> {
                         let func_decl = p.func_decls[decl_id]
                         if func_decl.name == want {
+                            idx_m.set(func_decl.name, len(self.func_names))
                             self.func_names += [func_decl.name]
                             self.func_labels += [f"${prefix}${func_decl.name}"]
                             self.func_sigs += [self.resolve_sig(func_decl, p: p)]
@@ -3741,6 +3750,7 @@ type Codegen = struct {
                     }
                     .Extern(name, params, return_typ) -> {
                         if name == want {
+                            idx_m.set(name, len(self.func_names))
                             self.func_names += [name]
                             self.func_labels += [f"_{name}"]
                             self.func_sigs += [self.resolve_extern_sig(params, return_typ: return_typ, p: p)]
@@ -3803,9 +3813,10 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let func_names: [str] = []
     let func_labels: [str] = []
     let func_sigs: [SigInfo] = []
+    let func_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
     let subst_names: [str] = []
     let subst_args: [TypeKind] = []
     let interned: StrMap = StrMap(keys: [], values: [], indices: [])
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, subst_names: subst_names, subst_args: subst_args)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, subst_names: subst_names, subst_args: subst_args)
 }
