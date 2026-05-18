@@ -312,7 +312,7 @@ type Codegen = struct {
     func check_call_args(self, anon args: [ast.CallArg], param_labels: [str], skip: int64, call_name: str, call_span: ast.Span) -> none {
         let expected_count: int64 = len(param_labels) - skip
         if len(args) != expected_count {
-            self.report_error(f"codegen: `{call_name}` takes {self.itos(expected_count)} arguments, got {self.itos(len(args))}", span: call_span)
+            self.report_error(f"error: `{call_name}` takes {self.itos(expected_count)} arguments, got {self.itos(len(args))}", span: call_span)
             return none
         }
         let i: int64 = 0
@@ -321,7 +321,7 @@ type Codegen = struct {
             let expected = param_labels[i + skip]
             if len(expected) == 0 {
                 if arg.inferred == false and len(arg.label) > 0 {
-                    self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` is anon; remove label `{arg.label}`", span: arg.label_span)
+                    self.report_error(f"error: parameter {self.itos(i)} of `{call_name}` is anon; remove label `{arg.label}`", span: arg.label_span)
                 }
             } else {
                 let effective: str = arg.label
@@ -329,14 +329,44 @@ type Codegen = struct {
                     effective = ""
                 }
                 if len(effective) == 0 {
-                    self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` requires label `{expected}`", span: self.p.expr_spans[arg.value])
+                    self.report_error(f"error: parameter {self.itos(i)} of `{call_name}` requires label `{expected}`", span: self.p.expr_spans[arg.value])
                 } else {
                     if effective != expected {
-                        self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` expected label `{expected}`, got `{arg.label}`", span: arg.label_span)
+                        self.report_error(f"error: parameter {self.itos(i)} of `{call_name}` expected label `{expected}`, got `{arg.label}`", span: arg.label_span)
                     }
                 }
             }
             i = i + 1
+        }
+    }
+
+    // If any arm of a match statement uses NonePat or SomePat, the
+    // subject must have an optional type — `none`/`Some` aren't
+    // meaningful patterns on a non-optional value. Same intent as
+    // the Python typechecker's "Cannot use 'is' on non-optional" rule,
+    // since `if x is none {...}` lowers to a MatchStmt.
+    func check_match_subject(self, anon subject_id: int64, arms: [int64]) -> none {
+        let needs_optional: bool = false
+        for arm_id in arms {
+            let arm = self.p.match_arms[arm_id]
+            let pat = self.p.patterns[arm.pattern]
+            if pat is .NonePat {
+                needs_optional = true
+            }
+            if pat is .SomePat(_binding) {
+                needs_optional = true
+            }
+        }
+        if needs_optional == false {
+            return none
+        }
+        let subj_kind = self.infer_kind(subject_id)
+        let is_optional: bool = false
+        if subj_kind is .KOptional(_inner) {
+            is_optional = true
+        }
+        if is_optional == false {
+            self.report_error("error: `is` / `match` with none/Some requires an optional value", span: self.p.expr_spans[subject_id])
         }
     }
 
@@ -352,7 +382,7 @@ type Codegen = struct {
             }
             if param.anonymous {
                 if seen_labeled {
-                    self.report_error(f"codegen: in `{name}`, anon parameter `{param.name}` cannot follow a labeled parameter", span: param.span)
+                    self.report_error(f"error: in `{name}`, anon parameter `{param.name}` cannot follow a labeled parameter", span: param.span)
                 }
             } else {
                 seen_labeled = true
@@ -1678,6 +1708,14 @@ type Codegen = struct {
     }
 
     func compile_is(self, lhs: int64, rhs: int64) -> Val {
+        let lhs_kind = self.infer_kind(lhs)
+        let is_optional: bool = false
+        if lhs_kind is .KOptional(_inner) {
+            is_optional = true
+        }
+        if is_optional == false {
+            self.report_error("error: `is` requires an optional value", span: self.p.expr_spans[lhs])
+        }
         let ptr_v = self.compile_expr(lhs)
         let reg = self.load(ptr_v)
         self.emit(f"cmp {reg}, #0")
@@ -1690,6 +1728,44 @@ type Codegen = struct {
 
     func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
         let lhs_kind = self.infer_kind(lhs_id)
+        // Comparing against `none` only makes sense for optional types;
+        // for other kinds it would silently compile to `x == 0`.
+        let is_eq_or_ne: bool = false
+        if op is .Eq {
+            is_eq_or_ne = true
+        }
+        if op is .Ne {
+            is_eq_or_ne = true
+        }
+        if is_eq_or_ne {
+            let lhs_is_none: bool = false
+            if self.p.exprs[lhs_id] is .NoneLit {
+                lhs_is_none = true
+            }
+            let rhs_is_none: bool = false
+            if self.p.exprs[rhs_id] is .NoneLit {
+                rhs_is_none = true
+            }
+            if lhs_is_none and rhs_is_none == false {
+                let rhs_kind = self.infer_kind(rhs_id)
+                let rhs_is_opt: bool = false
+                if rhs_kind is .KOptional(_inner) {
+                    rhs_is_opt = true
+                }
+                if rhs_is_opt == false {
+                    self.report_error("error: cannot compare non-optional value with `none`", span: self.p.expr_spans[rhs_id])
+                }
+            }
+            if rhs_is_none and lhs_is_none == false {
+                let lhs_is_opt: bool = false
+                if lhs_kind is .KOptional(_inner) {
+                    lhs_is_opt = true
+                }
+                if lhs_is_opt == false {
+                    self.report_error("error: cannot compare non-optional value with `none`", span: self.p.expr_spans[lhs_id])
+                }
+            }
+        }
         match lhs_kind {
             .KStr -> {
                 match op {
@@ -2056,7 +2132,7 @@ type Codegen = struct {
                     self.emit(f"bl {self.func_labels[idx]}")
                     return .VReg(name: "x0")
                 }
-                self.report_error(f"codegen: unknown function `{name}`", span: self.p.expr_spans[callee_id])
+                self.report_error(f"error: unknown function `{name}`", span: self.p.expr_spans[callee_id])
                 return .VImm(value: 0)
             }
             .Binary(lhs, op, rhs) -> {
@@ -2071,7 +2147,7 @@ type Codegen = struct {
                     }
                     else none
                 }
-                self.report_error("codegen: unresolved call on dotted callee", span: self.p.expr_spans[callee_id])
+                self.report_error("error: unresolved call on dotted callee", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
             .ImplicitVariant(variant_name) -> {
@@ -2083,11 +2159,11 @@ type Codegen = struct {
                         return self.compile_enum_construct(args, enum_idx, variant_idx)
                     }
                 }
-                self.report_error(f"codegen: unknown implicit variant `.{variant_name}` in call position", span: self.p.expr_spans[callee_id])
+                self.report_error(f"error: unknown implicit variant `.{variant_name}` in call position", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
             else {
-                self.report_error("codegen: call with non-callable expression", span: self.p.expr_spans[callee_id])
+                self.report_error("error: call with non-callable expression", span: self.p.expr_spans[callee_id])
                 return .VReg(name: "x0")
             }
         }
@@ -2264,7 +2340,7 @@ type Codegen = struct {
             }
         }
         if len(method_lbl) == 0 {
-            self.report_error(f"codegen: unknown method `{method_name}` on `{obj_name}`", span: span)
+            self.report_error(f"error: unknown method `{method_name}` on `{obj_name}`", span: span)
             return .VImm(value: 0)
         }
         // self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method_name, call_span: span)
@@ -2854,7 +2930,7 @@ type Codegen = struct {
         self.emit(f"mov {ptr_r}, x0")
         for arg in field_args {
             if self.has_field(arg.label, struct_idx) == false {
-                self.report_error(f"codegen: struct `{self.structs[struct_idx].name}` has no field `{arg.label}`", span: arg.label_span)
+                self.report_error(f"error: struct `{self.structs[struct_idx].name}` has no field `{arg.label}`", span: arg.label_span)
             }
             let foff = self.find_field_offset(arg.label, struct_idx)
             // Stash ptr_r across the call so it survives any bl in the
@@ -3679,6 +3755,7 @@ type Codegen = struct {
     }
 
     func compile_match_stmt(self, anon arms: [int64], subject_id: int64) -> none {
+        self.check_match_subject(subject_id, arms)
         let done_lbl = self.fresh("Lmatch_done")
         // Evaluate subject once; stash its pointer on the stack so pattern
         // bindings can read fields off the subject after disc_r is consumed.

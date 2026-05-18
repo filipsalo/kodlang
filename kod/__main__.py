@@ -12,12 +12,14 @@ from kod.exceptions import KodError
 from kod.filesys import FileSystem
 from kod.interpreter import Interpreter
 from kod.paths import find_stdlib_path
-from kod.typechecker import TypeChecker
 
 
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser()
+    # Accepted-but-ignored: the standalone typechecker was retired once the
+    # self-hosted codegen began reporting the same errors with spans, so the
+    # flag exists only to keep existing build scripts working.
     parser.add_argument("--no-type-check", dest="type_check", action="store_false")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -55,19 +57,13 @@ def main():
         print(err, file=sys.stderr)
         return 1
 
-    if args.type_check:
-        type_checker = TypeChecker(program)
-        if not type_checker.check():
-            for error in type_checker.errors:
-                print(error, file=sys.stderr)
-            return 1
-
+    entry_key = entry_module.canonical_path.with_suffix("")
     match args.command:
         case "interpret":
             argv = [str(entry_module), *args.args]
             Interpreter(program).run(entry_module, argv)
         case "compile":
-            module = program.get_module(entry_module.path)
+            module = program.get_module(entry_key)
             print(bob.compile_module(module))
             return 0
         case "build" | "run":
