@@ -25,8 +25,8 @@ gen() {
     fi
 }
 
-gen stdlib/kod/lexer.kod    build/sh/lexer.s
-gen stdlib/kod/parser.kod   build/sh/parser.s
+gen stdlib/kod/lexing.kod   build/sh/lexing.s
+gen stdlib/kod/parsing.kod  build/sh/parsing.s
 gen stdlib/kod/codegen.kod  build/sh/codegen.s
 gen kodc.kod                build/sh/kodc.s
 
@@ -37,8 +37,8 @@ assemble() {
     fi
 }
 
-assemble build/sh/lexer.s
-assemble build/sh/parser.s
+assemble build/sh/lexing.s
+assemble build/sh/parsing.s
 assemble build/sh/codegen.s
 assemble build/sh/kodc.s
 
@@ -87,6 +87,6 @@ ld -arch arm64 \
    build/runtime_main.o build/runtime.o build/arena.o \
    build/_builtins.o build/_io.o \
    build/_int64.o build/_str.o build/_bool.o \
-   build/sh/lexer.o build/sh/parser.o build/sh/codegen.o build/sh/kodc.o 2>/dev/null
+   build/sh/lexing.o build/sh/parsing.o build/sh/codegen.o build/sh/kodc.o 2>/dev/null
 
 echo "built build/sh_kodc"

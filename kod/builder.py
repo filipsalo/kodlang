@@ -121,8 +121,8 @@ class Builder:
         sources = [
             root_path / "kodc.kod",
             stdlib_path / "kod" / "codegen.kod",
-            stdlib_path / "kod" / "parser.kod",
-            stdlib_path / "kod" / "lexer.kod",
+            stdlib_path / "kod" / "parsing.kod",
+            stdlib_path / "kod" / "lexing.kod",
             stdlib_path / "kod" / "ast.kod",
             stdlib_path / "builtins.kod",
         ]
