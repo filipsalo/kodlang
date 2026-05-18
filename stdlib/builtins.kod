@@ -1,32 +1,114 @@
+// Open-addressing hash map laid out as in CPython's PEP 468 dict
+// (3.6+): a dense, insertion-ordered `keys` / `values` pair plus a
+// sparse `indices` table mapping hash slots to entry positions.
+//
+// Lookup hashes the key, probes `indices` until it finds an empty
+// slot (miss) or a slot whose entry's key matches (hit). The probe
+// sequence is Python's `(5*i + 1 + perturb)` recurrence so a single
+// missing slot doesn't trigger a long linear scan.
+//
+// `K` is opaque at codegen time (the generic monomorphisation erases
+// the type to a pointer-sized value), so we hash and compare keys
+// bit-identically. This is correct for primitives and for any
+// reference-typed key whose equality is pointer equality (e.g. all
+// interned strings in Kod). Hash callers needing value equality of
+// non-interned structured keys should intern them first.
 type Map[K, V] = struct {
 	keys: [K]
 	values: [V]
+	// Sparse open-addressing index table; -1 marks an empty slot.
+	// Always a power of two with load factor at most ~2/3. Empty
+	// until the first insert (then lazy-initialised).
+	indices: [int64]
 
-	func get(self, anon key: K) -> V? {
-		let i: int64 = 0
-		for i < len(self.keys) {
-			if self.keys[i] == key {
-				return self.values[i]
-			}
+	// Allocate a fresh `size`-slot indices table, all empty.
+	func empty_indices(self, anon size: int64) -> [int64] {
+		let arr: [int64] = []
+		let i = 0
+		for i < size {
+			arr += [-1]
 			i = i + 1
 		}
-		return none
+		return arr
+	}
+
+	// Find the slot in `indices` for `key`. Returns either the slot
+	// pointing at the matching entry, or an empty (-1) slot where a
+	// new entry could be inserted. Assumes len(self.indices) > 0.
+	func probe(self, anon key: K) -> int64 {
+		let size = len(self.indices)
+		let h = hash(key)
+		let perturb = h
+		let slot = ((h % size) + size) % size
+		for true {
+			let entry_idx = self.indices[slot]
+			if entry_idx == -1 {
+				return slot
+			}
+			if self.keys[entry_idx] == key {
+				return slot
+			}
+			perturb = perturb / 32
+			slot = ((5 * slot + 1 + perturb) % size + size) % size
+		}
+		return -1
+	}
+
+	// Grow the indices table to `new_size` (power of two), re-probing
+	// every live entry. Order in `keys` / `values` is preserved.
+	func resize(self, anon new_size: int64) -> none {
+		self.indices = self.empty_indices(new_size)
+		let i = 0
+		for i < len(self.keys) {
+			let slot = self.probe(self.keys[i])
+			let tmp = self.indices
+			tmp[slot] = i
+			i = i + 1
+		}
+	}
+
+	func get(self, anon key: K) -> V? {
+		if len(self.indices) == 0 {
+			return none
+		}
+		let slot = self.probe(key)
+		let entry_idx = self.indices[slot]
+		if entry_idx == -1 {
+			return none
+		}
+		return self.values[entry_idx]
 	}
 
 	func set(self, anon key: K, anon value: V) -> none {
+		if len(self.indices) == 0 {
+			self.indices = self.empty_indices(8)
+		}
+		let slot = self.probe(key)
+		let entry_idx = self.indices[slot]
+		if entry_idx != -1 {
+			// Existing entry: update in place. Mutating values[i]
+			// through a local alias works because arrays are heap
+			// references.
+			let vals = self.values
+			vals[entry_idx] = value
+			return none
+		}
 		self.keys += [key]
 		self.values += [value]
+		let tmp = self.indices
+		tmp[slot] = len(self.keys) - 1
+		// Grow the indices table whenever it would exceed ~2/3 load.
+		if len(self.keys) * 3 > len(self.indices) * 2 {
+			self.resize(len(self.indices) * 2)
+		}
 	}
 
 	func contains(self, anon key: K) -> bool {
-		let i: int64 = 0
-		for i < len(self.keys) {
-			if self.keys[i] == key {
-				return true
-			}
-			i = i + 1
+		if len(self.indices) == 0 {
+			return false
 		}
-		return false
+		let slot = self.probe(key)
+		return self.indices[slot] != -1
 	}
 
 	func op_index(self, anon key: K) -> V? {

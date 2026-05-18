@@ -234,6 +234,18 @@ class Interpreter:
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._coerce_to_str(module, value)
+                # `hash(x)` — int64 hash. Compiled side uses identity
+                # hashing (the value's bit pattern); we use Python's
+                # hash() on the underlying value so the interpreter
+                # produces consistent (if different) hashes.
+                if (
+                    isinstance(callee, ast.Name)
+                    and callee.id == "hash"
+                    and len(args) == 1
+                ):
+                    arg_params = list(args)
+                    value = self.evaluate_expression(module, arg_params[0])
+                    return self._hash_value(value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
                     variant_name = callee.variant_name
                     search_scopes = [module.names]
@@ -511,6 +523,19 @@ class Interpreter:
         if type_ is types.Int64:
             return ctypes.c_int
         raise ValueError(f"Unknown type {type_!r}")
+
+    def _hash_value(self, value) -> "types.Int64":
+        """Hash a Kod value to an int64. Used to implement the `hash(x)`
+        intrinsic. Content-based for primitives; pointer-id for anything
+        else (matches the compiled-side identity hash for non-interned
+        struct keys)."""
+        if isinstance(value, types.Int64):
+            return types.Int64(value.value)
+        if isinstance(value, types.Bool):
+            return types.Int64(1 if value.value else 0)
+        if isinstance(value, types.String):
+            return types.Int64(hash(value.value))
+        return types.Int64(id(value))
 
     def _coerce_to_str(self, module, value):
         """Convert a value to a Kod `str`. Used to implement the `str(x)`
