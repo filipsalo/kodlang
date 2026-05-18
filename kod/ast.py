@@ -920,10 +920,17 @@ class IfStatement(ASTNode):
                 if statement := parser.parse_statement():
                     true_branch.append(statement)
             if parser.try_consume(tokens.Else):
-                parser.consume(tokens.OpenCurly)
-                while not parser.try_consume(tokens.CloseCurly):
-                    if statement := parser.parse_statement():
-                        false_branch.append(statement)
+                # `else if …` is desugared as `else { if … }` — the
+                # nested IfStatement becomes the sole statement in the
+                # false branch.
+                if parser.peeking_at(tokens.If):
+                    nested = IfStatement.parse(parser)
+                    false_branch.append(nested)
+                else:
+                    parser.consume(tokens.OpenCurly)
+                    while not parser.try_consume(tokens.CloseCurly):
+                        if statement := parser.parse_statement():
+                            false_branch.append(statement)
         return cls(condition, true_branch, false_branch, span)
 
 
