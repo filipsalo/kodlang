@@ -624,6 +624,13 @@ class Interpreter:
                     return types.String(open(path, "rb").read())
                 except OSError:
                     return types.String(b"")
+            if func.name == "kod_panic":
+                # Mirror the runtime helper: print "panic: <msg>" to
+                # stderr and exit(1). The Python interpreter has no
+                # access to the C symbol so we implement it directly.
+                msg = args[0].value.decode("utf8")
+                sys.stderr.write(f"panic: {msg}\n")
+                sys.exit(1)
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]

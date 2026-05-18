@@ -314,6 +314,11 @@ type Codegen = struct {
 
 
     func intern_str(self, anon value: str) -> str {
+        // Linear scan: O(n) per intern. Switching this to a Map[str, str]
+        // would be asymptotically better but the codegen's generic erasure
+        // (K/V become int64) means iterating self.interned.values[i] would
+        // be typed as int64 and stringify wrong. Wait until we have generic
+        // monomorphisation.
         let i = 0
         for i < len(self.str_values) {
             if self.str_values[i] == value {
@@ -772,19 +777,58 @@ type Codegen = struct {
     // makes their names and methods visible for label resolution. Interfaces
     // are registered before structs so struct method signatures can reference
     // interface types.
+    // Register a `type Name = OtherType` alias. The target type must
+    // already be known (typically an import or an earlier enum). `p`
+    // is the parser that owns the type_expr arena entry for `target`;
+    // we swap self.p so resolve_type indexes into the right arena.
+    func register_type_alias(self, anon decl: ast.Decl, p: parser.Parser) -> none {
+        match decl {
+            .TypeAlias(name, target) -> {
+                let saved_p = self.p
+                self.p = p
+                let kind = self.resolve_type(target)
+                self.p = saved_p
+                match kind {
+                    .KStruct(idx) -> {
+                        self.struct_alias_name += [name]
+                        self.struct_alias_target += [idx]
+                    }
+                    .KEnum(idx) -> {
+                        self.enum_alias_name += [name]
+                        self.enum_alias_target += [idx]
+                    }
+                    else none
+                }
+            }
+            else none
+        }
+    }
+
     func register_module_types(self, anon module: ast.Module, prefix: str, p: parser.Parser) -> none {
         // Phase 1: register interface NAMES (with empty sigs) so they're
         // findable when struct method signatures reference them.
         for decl in module.decls {
             self.register_interface(decl, prefix: prefix, p: p)
         }
-        // Phase 2: register enums and structs. Struct method signatures
-        // can now resolve interface names from phase 1.
+        // Phase 2: register type aliases targeting *already-registered*
+        // types (e.g. `type StrMap = Map[str, str]` where Map came from
+        // an imported module). Aliases targeting local enums or structs
+        // would also work as long as they appear after the target in the
+        // source, but in practice this pass handles import aliases.
+        for decl in module.decls {
+            self.register_type_alias(decl, p: p)
+        }
+        // Phase 3: register enums and structs in source order. Order
+        // matters here: ast.kod's `Decl` enum has a variant with a
+        // `[StructField]` payload, and StructField is a struct defined
+        // earlier — so we need the struct registered before the enum
+        // that references it. Interleaving in source order preserves
+        // that natural dependency.
         for decl in module.decls {
             self.register_enum(decl, prefix: prefix, p: p)
             self.register_struct(decl, prefix: prefix, p: p)
         }
-        // Phase 3: now that structs are also registered, resolve the
+        // Phase 4: now that structs are also registered, resolve the
         // interface method signatures (which may reference struct types).
         for decl in module.decls {
             self.resolve_interface_methods(decl, p: p)
@@ -3398,34 +3442,24 @@ type Codegen = struct {
         for decl in module.decls {
             self.register_interface(decl, prefix: self.path_prefix, p: self.p)
         }
+        // Type aliases come before enum/struct registration so struct
+        // fields and enum variant payload types can use them. Aliases
+        // targeting *local* structs/enums aren't supported here, but we
+        // don't have any such cases in-tree.
+        for decl in module.decls {
+            self.register_type_alias(decl, p: self.p)
+        }
+        // Interleave enums and structs in source order: a later enum's
+        // variant payload may reference an earlier struct (see ast.kod's
+        // `Decl.Struct(... fields: [StructField] ...)`), and an earlier
+        // struct's field/method sig can reference a later struct only
+        // if that struct already exists as an import — which is fine.
         for decl in module.decls {
             self.register_enum(decl, prefix: self.path_prefix, p: self.p)
-        }
-        for decl in module.decls {
             self.register_struct(decl, prefix: self.path_prefix, p: self.p)
         }
         for decl in module.decls {
             self.resolve_interface_methods(decl, p: self.p)
-        }
-        // Process type aliases now that base types are registered.
-        for decl in module.decls {
-            match decl {
-                .TypeAlias(name, target) -> {
-                    let kind = self.resolve_type(target)
-                    match kind {
-                        .KStruct(idx) -> {
-                            self.struct_alias_name += [name]
-                            self.struct_alias_target += [idx]
-                        }
-                        .KEnum(idx) -> {
-                            self.enum_alias_name += [name]
-                            self.enum_alias_target += [idx]
-                        }
-                        else none
-                    }
-                }
-                else none
-            }
         }
 
         for decl in module.decls {
