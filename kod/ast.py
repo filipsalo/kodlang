@@ -1,6 +1,7 @@
 """Abstract syntax tree."""
 
 import dataclasses
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Optional, Self, Union
 
@@ -804,8 +805,11 @@ class Module(ASTNode):
     body: list[Statement]
     span: Span
 
-    @property
+    @cached_property
     def names(self):
+        # Memoized: looked up tens of millions of times during compilation
+        # and was the single hottest function in the interpreter profile.
+        # The body is never mutated after parse, so it's safe to compute once.
         names = {}
         for statement in self.body:
             match statement:

@@ -355,9 +355,14 @@ class Interpreter:
             case ast.ThrowStatement(expression):
                 value = self.evaluate_expression(module, expression)
                 raise ThrownError(value)
-            case ast.Import(name, local_name):
-                path = module.resolve_import(name)
-                module.names[local_name] = self.program.get_module(path)
+            case ast.Import():
+                # The body scan in `Module.names` already binds local_name
+                # to the Import statement; `lookup` resolves that to the
+                # actual Module on the fly. Overwriting names here would
+                # replace the Import with the Module object and break the
+                # iface/enum search loops below that rely on the Import
+                # marker.
+                pass
             case ast.InterfaceDeclaration():
                 pass
             case ast.FunctionDeclaration(name) | ast.ExternalFunctionDeclaration(name):
