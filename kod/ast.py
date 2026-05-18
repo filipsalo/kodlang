@@ -262,6 +262,11 @@ class FunctionCallParam(ASTNode):
                 assert isinstance(expr, Name)
                 label = expr
                 expr = Expression.parse(parser)
+            elif isinstance(expr, Name):
+                # Shorthand: `name` is sugar for `name: name` so the call
+                # site doesn't have to repeat the identifier just to satisfy
+                # a labeled parameter.
+                label = expr
         return cls(label, expr, span)
 
 
