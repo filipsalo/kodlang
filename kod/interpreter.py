@@ -524,6 +524,62 @@ class Interpreter:
             return ctypes.c_int
         raise ValueError(f"Unknown type {type_!r}")
 
+    def _map_dict_key(self, value):
+        """Turn a Kod value into a hashable Python key for the Map fast
+        path. Bytes/int/bool participate in value equality; everything
+        else falls back to identity (matches the compiled side's pointer
+        equality for non-interned structured keys)."""
+        if isinstance(value, types.String):
+            return ("str", value.value)
+        if isinstance(value, types.Int64):
+            return ("int", value.value)
+        if isinstance(value, types.Bool):
+            return ("bool", value.value)
+        return ("id", id(value))
+
+    def _map_py_dict(self, map_instance) -> dict:
+        """Lazily attach a Python dict mirror to a Map instance. The
+        dense keys/values arrays are kept as the source of truth for
+        iteration order; the dict only serves O(1) lookup."""
+        cached = getattr(map_instance, "_py_dict", None)
+        if cached is not None:
+            return cached
+        d: dict = {}
+        keys = getattr(map_instance, "keys", None)
+        values = getattr(map_instance, "values", None)
+        if keys is not None and values is not None:
+            for k, v in zip(keys.value, values.value):
+                d[self._map_dict_key(k)] = v
+        map_instance._py_dict = d
+        return d
+
+    def _fast_map_method(self, name: str, receiver, args):
+        d = self._map_py_dict(receiver)
+        if name in ("get", "op_index"):
+            py_key = self._map_dict_key(args[0])
+            if py_key in d:
+                return d[py_key]
+            return types.none_value
+        if name in ("set", "op_index_set"):
+            key, value = args[0], args[1]
+            py_key = self._map_dict_key(key)
+            if py_key in d:
+                # Update existing entry: locate by key in the dense
+                # array and overwrite values[i]. Rare path (most sets
+                # are new inserts), so the linear scan is fine.
+                for i, existing in enumerate(receiver.keys.value):
+                    if self._map_dict_key(existing) == py_key:
+                        receiver.values.value[i] = value
+                        break
+            else:
+                receiver.keys.value.append(key)
+                receiver.values.value.append(value)
+            d[py_key] = value
+            return types.none_value
+        if name == "contains":
+            return types.Bool(self._map_dict_key(args[0]) in d)
+        raise ValueError(f"unknown Map method {name!r}")
+
     def _hash_value(self, value) -> "types.Int64":
         """Hash a Kod value to an int64. Used to implement the `hash(x)`
         intrinsic. Content-based for primitives; pointer-id for anything
@@ -588,7 +644,20 @@ class Interpreter:
 
         if isinstance(func, BoundMethod):
             receiver = func.receiver
-            func = func.func
+            method = func.func
+            # Map fast path: short-circuit the interpreted compact-dict
+            # logic with a real Python dict. Otherwise every probe step
+            # inside Map.get/set/contains becomes dozens of interpreted
+            # statements, which dominates bootstrap time.
+            if getattr(method, "struct_name", None) == "Map" and method.name in (
+                "get",
+                "set",
+                "contains",
+                "op_index",
+                "op_index_set",
+            ):
+                return self._fast_map_method(method.name, receiver, args)
+            func = method
             explicit_params = list(func.params)[1:]  # skip self
             frame = {
                 param.variable.id: (
