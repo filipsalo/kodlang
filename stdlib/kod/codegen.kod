@@ -152,6 +152,10 @@ type Codegen = struct {
     // upcast"; we emit one vtable per unique pair.
     vtable_struct_idx: [int64]
     vtable_iface_idx: [int64]
+    // Same idea for primitives: each (kind, iface) means "kind conforms
+    // to iface and was observed in an upcast". One vtable per unique pair.
+    prim_vtable_kinds: [TypeKind]
+    prim_vtable_iface_idx: [int64]
 
     // Type-alias maps: `type X = Y` adds an entry pointing X's name to
     // Y's struct/enum index. find_struct_idx / find_enum_idx consult
@@ -489,6 +493,49 @@ type Codegen = struct {
         self.vtable_struct_idx += [struct_idx]
         self.vtable_iface_idx += [iface_idx]
         return self.vtable_label(struct_idx, iface_idx)
+    }
+
+    // Hardcoded module prefix for each primitive type. Used to compose
+    // primitive vtable labels and to mangle primitive method symbols.
+    func prim_module_prefix(self, kind: TypeKind) -> str {
+        match kind {
+            .KInt64 -> return "primitives$int64"
+            .KStr -> return "primitives$str"
+            .KBool -> return "primitives$bool"
+            else return ""
+        }
+    }
+
+    // The label of the vtable for a primitive type acting as an interface.
+    func prim_vtable_label(self, kind: TypeKind, anon iface_idx: int64) -> str {
+        let iface_info = self.interfaces[iface_idx]
+        let prim_prefix = self.prim_module_prefix(kind)
+        return f"${iface_info.module_prefix}${iface_info.name}$for${prim_prefix}$vtable"
+    }
+
+    // Register a (primitive_kind, interface) pair so its vtable is emitted
+    // at the end of compile_module. Returns the vtable label.
+    func register_prim_vtable(self, kind: TypeKind, anon iface_idx: int64) -> str {
+        let k = 0
+        for k < len(self.prim_vtable_kinds) {
+            if self.prim_vtable_iface_idx[k] == iface_idx {
+                let stored = self.prim_vtable_kinds[k]
+                let matches = false
+                match kind {
+                    .KInt64 -> if stored is .KInt64 { matches = true }
+                    .KStr -> if stored is .KStr { matches = true }
+                    .KBool -> if stored is .KBool { matches = true }
+                    else none
+                }
+                if matches {
+                    return self.prim_vtable_label(kind, iface_idx)
+                }
+            }
+            k = k + 1
+        }
+        self.prim_vtable_kinds += [kind]
+        self.prim_vtable_iface_idx += [iface_idx]
+        return self.prim_vtable_label(kind, iface_idx)
     }
 
     // Find the cached signature for a function by name. Returns an empty
@@ -2115,8 +2162,39 @@ type Codegen = struct {
     // and return the new register. Otherwise returns the input register.
     func maybe_box_for_iface(self, anon arg_reg: str, actual: TypeKind, expected: TypeKind) -> str {
         let .KInterface(iface_idx) = expected else { return arg_reg }
-        let .KStruct(struct_idx, _struct_type_args) = actual else { return arg_reg }
-        return self.emit_iface_box(arg_reg, struct_idx: struct_idx, iface_idx: iface_idx)
+        match actual {
+            .KStruct(struct_idx, _struct_type_args) -> return self.emit_iface_box(arg_reg, struct_idx: struct_idx, iface_idx: iface_idx)
+            .KInt64 -> return self.emit_prim_iface_box(arg_reg, kind: .KInt64, iface_idx: iface_idx)
+            .KStr -> return self.emit_prim_iface_box(arg_reg, kind: .KStr, iface_idx: iface_idx)
+            .KBool -> return self.emit_prim_iface_box(arg_reg, kind: .KBool, iface_idx: iface_idx)
+            else return arg_reg
+        }
+    }
+
+    // Box a primitive value (int64 / str / bool) into a {data, vtable}
+    // iface cell. The primitive value is stored *directly* in the data
+    // slot — vtable methods receive it as `self` in x0. Mirrors
+    // emit_iface_box but reaches a primitive's vtable.
+    func emit_prim_iface_box(self, anon arg_reg: str, kind: TypeKind, iface_idx: int64) -> str {
+        let vt_lbl = self.register_prim_vtable(kind, iface_idx)
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {arg_reg}, [sp]")
+        self.free_reg(arg_reg)
+        self.emit("mov x0, #16")
+        self.emit("bl _arena_alloc")
+        let data_r = self.alloc_reg()
+        self.emit(f"ldr {data_r}, [sp]")
+        self.emit("add sp, sp, #16")
+        self.emit(f"str {data_r}, [x0]")
+        self.free_reg(data_r)
+        let vt_r = self.alloc_reg()
+        self.emit(f"adrp {vt_r}, {vt_lbl}@PAGE")
+        self.emit(f"add {vt_r}, {vt_r}, {vt_lbl}@PAGEOFF")
+        self.emit(f"str {vt_r}, [x0, #8]")
+        self.free_reg(vt_r)
+        let cell_r = self.alloc_reg()
+        self.emit(f"mov {cell_r}, x0")
+        return cell_r
     }
 
     func prepare_args(self, anon args: [ast.CallArg]) -> none {
@@ -3739,6 +3817,25 @@ type Codegen = struct {
             }
             i = i + 1
         }
+        // Primitive vtables: same layout, but methods come from the
+        // primitive method table populated by register_primitive_module.
+        let pi = 0
+        for pi < len(self.prim_vtable_kinds) {
+            let kind = self.prim_vtable_kinds[pi]
+            let iface_idx = self.prim_vtable_iface_idx[pi]
+            let iface_info = self.interfaces[iface_idx]
+            print("\t.p2align 3")
+            print(f"{self.prim_vtable_label(kind, iface_idx)}:")
+            for method_name in iface_info.method_names {
+                let pm_idx = self.find_prim_method(kind, method_name)
+                if pm_idx >= 0 {
+                    print(f"\t.quad {self.prim_method_labels[pm_idx]}")
+                } else {
+                    print(f"\t.quad 0")
+                }
+            }
+            pi = pi + 1
+        }
     }
 
     func module_name_to_prefix(self, anon module_name: str) -> str {
@@ -3865,6 +3962,8 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let interfaces: [IfaceInfo] = []
     let vtable_struct_idx: [int64] = []
     let vtable_iface_idx: [int64] = []
+    let prim_vtable_kinds: [TypeKind] = []
+    let prim_vtable_iface_idx: [int64] = []
     let struct_alias_name: [str] = []
     let struct_alias_target: [int64] = []
     let enum_alias_name: [str] = []
@@ -3891,5 +3990,5 @@ func make_codegen(p: parser.Parser, path_prefix: str) -> Codegen {
     let subst_names: [str] = []
     let subst_args: [TypeKind] = []
     let interned: StrMap = StrMap(keys: [], values: [], indices: [])
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, prim_method_kinds: prim_method_kinds, prim_method_names: prim_method_names, prim_method_labels: prim_method_labels, prim_method_sigs: prim_method_sigs, subst_names: subst_names, subst_args: subst_args)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, prim_vtable_kinds: prim_vtable_kinds, prim_vtable_iface_idx: prim_vtable_iface_idx, struct_alias_name: struct_alias_name, struct_alias_target: struct_alias_target, enum_alias_name: enum_alias_name, enum_alias_target: enum_alias_target, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, prim_method_kinds: prim_method_kinds, prim_method_names: prim_method_names, prim_method_labels: prim_method_labels, prim_method_sigs: prim_method_sigs, subst_names: subst_names, subst_args: subst_args)
 }
