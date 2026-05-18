@@ -200,11 +200,19 @@ class Name(ASTNode):
 
 @dataclasses.dataclass
 class FunctionParam(ASTNode):
-    """A function parameter."""
+    """A function parameter.
+
+    `variable.id` is the binding name visible inside the function body.
+    `label` is the external argument label used at call sites. For
+    `func greet(who person: str)` label is "who" and the binding is
+    "person". With a single identifier the parser sets label to the
+    same string as the binding. Anon params have label = None.
+    """
 
     variable: Variable
     anonymous: bool
     span: Span
+    label: Optional[str] = None
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
@@ -213,8 +221,21 @@ class FunctionParam(ASTNode):
             anonymous = False
             if parser.try_consume(tokens.Anon):
                 anonymous = True
-            variable = Variable.parse(parser)
-        return cls(variable, anonymous, span)
+            first = parser.consume(tokens.Identifier)
+            # Optional second identifier: Swift-style label / binding split.
+            second = None
+            if parser.peeking_at(tokens.Identifier):
+                second = parser.consume(tokens.Identifier)
+            type_ = None
+            if parser.try_consume(tokens.Colon):
+                type_ = parser.parse_type()
+            if second is not None:
+                label = None if anonymous else first.value
+                variable = Variable(second.value, type_, span=second.span)
+            else:
+                label = None if anonymous else first.value
+                variable = Variable(first.value, type_, span=first.span)
+        return cls(variable, anonymous, span, label)
 
 
 @dataclasses.dataclass

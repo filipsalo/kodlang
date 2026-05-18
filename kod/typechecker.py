@@ -263,8 +263,9 @@ class TypeChecker:
 
         for arg, param in zip(arguments, params):
             if not arg.label and not param.anonymous:
+                expected = param.label or param.variable.id
                 self.error(
-                    f"Expected argument '{param.variable.id}' to be labeled",
+                    f"Expected argument '{expected}' to be labeled",
                     arg.span,
                 )
             if isinstance(arg.expression, ast.Name):
