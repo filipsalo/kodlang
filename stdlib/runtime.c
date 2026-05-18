@@ -74,6 +74,18 @@ char *int_to_str(int64_t n) {
     return result;
 }
 
+// FNV-1a 64-bit hash. Used for the `hash(s)` intrinsic on strings so
+// Map[str, V] finds keys by content rather than pointer identity.
+int64_t kod_str_hash(const char *s) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    while (*s) {
+        h ^= (uint8_t)(*s);
+        h *= 0x100000001b3ULL;
+        s++;
+    }
+    return (int64_t)h;
+}
+
 void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
