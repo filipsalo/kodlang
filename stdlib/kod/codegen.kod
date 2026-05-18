@@ -37,9 +37,11 @@ type TypeKind = enum {
 
 // Pre-resolved function signature. Filled in once at registration time
 // against the owning module's parser, so call sites never need to look at
-// raw type_expr arena ids again.
+// raw type_expr arena ids again. `param_labels[i]` is the call-site
+// label for parameter i, or empty string when the parameter is anon.
 type SigInfo = struct {
     param_kinds: [TypeKind]
+    param_labels: [str]
     return_kind: TypeKind
 }
 
@@ -297,6 +299,65 @@ type Codegen = struct {
     func print_errors(self) -> none {
         for msg in self.errors {
             kod_eprint(msg)
+        }
+    }
+
+    // Verify call-site arguments line up with a declared parameter list.
+    // `param_labels[i]` is "" for an anon parameter, otherwise the
+    // expected label. Reports one error per mismatch and keeps going so
+    // a wrong call produces all its errors in a single compile.
+    //
+    // `skip` is the number of leading param_labels entries to ignore —
+    // 1 for method calls (skip self), 0 for free functions.
+    func check_call_args(self, anon args: [ast.CallArg], param_labels: [str], skip: int64, call_name: str, call_span: ast.Span) -> none {
+        let expected_count: int64 = len(param_labels) - skip
+        if len(args) != expected_count {
+            self.report_error(f"codegen: `{call_name}` takes {self.itos(expected_count)} arguments, got {self.itos(len(args))}", span: call_span)
+            return none
+        }
+        let i: int64 = 0
+        for i < len(args) {
+            let arg = args[i]
+            let expected = param_labels[i + skip]
+            if len(expected) == 0 {
+                if arg.inferred == false and len(arg.label) > 0 {
+                    self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` is anon; remove label `{arg.label}`", span: arg.label_span)
+                }
+            } else {
+                let effective: str = arg.label
+                if arg.inferred and arg.label != expected {
+                    effective = ""
+                }
+                if len(effective) == 0 {
+                    self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` requires label `{expected}`", span: self.p.expr_spans[arg.value])
+                } else {
+                    if effective != expected {
+                        self.report_error(f"codegen: parameter {self.itos(i)} of `{call_name}` expected label `{expected}`, got `{arg.label}`", span: arg.label_span)
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Check that a function declaration's parameter list places anon
+    // parameters before any labeled ones. Reports one error per
+    // out-of-order anon param. The implicit `self` receiver of a method
+    // doesn't count as a labeled parameter for ordering purposes.
+    func check_param_order(self, anon func_decl: ast.FuncDecl, anon name: str) -> none {
+        let seen_labeled: bool = false
+        for param in func_decl.params {
+            if param.name == "self" {
+                continue
+            }
+            if param.anonymous {
+                if seen_labeled {
+                    let span: ast.Span = ast.Span(start: 0)
+                    self.report_error(f"codegen: in `{name}`, anon parameter `{param.name}` cannot follow a labeled parameter", span: span)
+                }
+            } else {
+                seen_labeled = true
+            }
         }
     }
 
@@ -626,8 +687,9 @@ type Codegen = struct {
         if m.get(name) is Some(idx) {
             return self.func_sigs[idx]
         }
-        let empty: [TypeKind] = []
-        return SigInfo(param_kinds: empty, return_kind: .KVoid)
+        let empty_kinds: [TypeKind] = []
+        let empty_labels: [str] = []
+        return SigInfo(param_kinds: empty_kinds, param_labels: empty_labels, return_kind: .KVoid)
     }
 
     func find_import_fn_sig(self, anon local_mod: str, anon name: str) -> SigInfo {
@@ -638,8 +700,9 @@ type Codegen = struct {
             }
             i = i + 1
         }
-        let empty: [TypeKind] = []
-        return SigInfo(param_kinds: empty, return_kind: .KVoid)
+        let empty_kinds: [TypeKind] = []
+        let empty_labels: [str] = []
+        return SigInfo(param_kinds: empty_kinds, param_labels: empty_labels, return_kind: .KVoid)
     }
 
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
@@ -745,11 +808,17 @@ type Codegen = struct {
         for method_id in template.method_decl_ids {
             let fd = template.src_p.func_decls[method_id]
             let pk: [TypeKind] = []
+            let pl: [str] = []
             for param in fd.params {
                 pk += [self.resolve_type(param.typ)]
+                if param.anonymous {
+                    pl += [""]
+                } else {
+                    pl += [param.label]
+                }
             }
             let rk = self.resolve_type(fd.return_typ)
-            cloned_sigs += [SigInfo(param_kinds: pk, return_kind: rk)]
+            cloned_sigs += [SigInfo(param_kinds: pk, param_labels: pl, return_kind: rk)]
         }
         self.p = saved_p
         self.subst_names = saved_names
@@ -846,14 +915,18 @@ type Codegen = struct {
         let saved_p = self.p
         self.p = p
         let param_kinds: [TypeKind] = []
-        let i = 0
-        for i < len(func_decl.params) {
-            param_kinds += [self.resolve_type(func_decl.params[i].typ)]
-            i = i + 1
+        let param_labels: [str] = []
+        for param in func_decl.params {
+            param_kinds += [self.resolve_type(param.typ)]
+            if param.anonymous {
+                param_labels += [""]
+            } else {
+                param_labels += [param.label]
+            }
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
         self.p = saved_p
-        return SigInfo(param_kinds: param_kinds, return_kind: return_kind)
+        return SigInfo(param_kinds: param_kinds, param_labels: param_labels, return_kind: return_kind)
     }
 
     // Same as resolve_sig but for an Extern decl, whose params/return_typ
@@ -862,14 +935,18 @@ type Codegen = struct {
         let saved_p = self.p
         self.p = p
         let param_kinds: [TypeKind] = []
-        let i = 0
-        for i < len(params) {
-            param_kinds += [self.resolve_type(params[i].typ)]
-            i = i + 1
+        let param_labels: [str] = []
+        for param in params {
+            param_kinds += [self.resolve_type(param.typ)]
+            if param.anonymous {
+                param_labels += [""]
+            } else {
+                param_labels += [param.label]
+            }
         }
         let return_kind = self.resolve_type(return_typ)
         self.p = saved_p
-        return SigInfo(param_kinds: param_kinds, return_kind: return_kind)
+        return SigInfo(param_kinds: param_kinds, param_labels: param_labels, return_kind: return_kind)
     }
 
     func func_label(self, anon name: str) -> str {
@@ -1975,6 +2052,7 @@ type Codegen = struct {
                 }
                 let func_lookup = self.func_idx
                 if func_lookup.get(name) is Some(idx) {
+                    self.check_call_args(args, param_labels: self.func_sigs[idx].param_labels, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     self.prepare_args_with_kinds(args, expected_kinds: self.func_sigs[idx].param_kinds)
                     self.emit(f"bl {self.func_labels[idx]}")
                     return .VReg(name: "x0")
@@ -2159,6 +2237,7 @@ type Codegen = struct {
 
         let method_lbl = ""
         let sig_params: [TypeKind] = []
+        let sig_labels: [str] = []
         match var_kind {
             .KStruct(idx, _struct_type_args) -> {
                 let method_idx = 0
@@ -2166,6 +2245,7 @@ type Codegen = struct {
                     if self.structs[idx].method_names[method_idx] == method_name {
                         method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
                         sig_params = self.structs[idx].method_sigs[method_idx].param_kinds
+                        sig_labels = self.structs[idx].method_sigs[method_idx].param_labels
                         method_idx = len(self.structs[idx].method_names)
                     } else {
                         method_idx = method_idx + 1
@@ -2181,12 +2261,14 @@ type Codegen = struct {
             if prim_idx >= 0 {
                 method_lbl = self.prim_method_labels[prim_idx]
                 sig_params = self.prim_method_sigs[prim_idx].param_kinds
+                sig_labels = self.prim_method_sigs[prim_idx].param_labels
             }
         }
         if len(method_lbl) == 0 {
             self.report_error(f"codegen: unknown method `{method_name}` on `{obj_name}`", span: span)
             return .VImm(value: 0)
         }
+        // self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method_name, call_span: span)
 
         // Stash self and each compiled arg on the stack so that arg
         // expressions (which may issue bl calls) don't clobber preceding
@@ -3732,6 +3814,9 @@ type Codegen = struct {
 
     func compile_func(self, fd_id: int64, struct_name: str) -> none {
         let func_decl = self.p.func_decls[fd_id]
+        // TODO: re-enable once the existing stdlib has been migrated to
+        // put anon parameters first.
+        // self.check_param_order(func_decl, name: func_decl.name)
         self.vars = []
         self.frame_slots = 0
         self.free_regs = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
