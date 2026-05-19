@@ -194,6 +194,15 @@ class Builder:
         asm = self.compile_module(module)
         return self._build(module.mangled_name, asm, out_dir=out_dir)
 
+    def _mangled_module_prefix(self, file: FileWrapper) -> str:
+        """Mirror of kodc.kod:path_to_prefix — turn a canonical path into
+        the symbol prefix codegen uses. Strips leading `stdlib/` so
+        modules under stdlib match `import "kod/foo"` style resolution."""
+        parts = file.canonical_path.with_suffix("").parts
+        if parts and parts[0] == "stdlib":
+            parts = parts[1:]
+        return "$".join(parts)
+
     def compose_runtime_main_asm(self, file: FileWrapper) -> str:
         """Compose the runtime _main shim for the given entry file. The
         shape depends on whether main takes argv and whether it returns
@@ -204,7 +213,7 @@ class Builder:
             for s in module.body
             if isinstance(s, ast.FunctionDeclaration) and s.name == "main"
         )
-        mangled = "$".join(file.canonical_path.with_suffix("").parts)
+        mangled = self._mangled_module_prefix(file)
         # If main returns `T or Error`, the call result is a Result cell ptr:
         # {discriminant, payload}. On Ok, we unwrap the payload as the exit
         # code; on Err, we call _kod_panic (prints the message and exits 1).
@@ -302,7 +311,7 @@ class Builder:
         contains `test` blocks). The dispatcher returns 0 on success,
         non-zero if any test failed; we propagate that as the process
         exit code."""
-        mangled = "$".join(file.canonical_path.with_suffix("").parts)
+        mangled = self._mangled_module_prefix(file)
         return f"""
             .text
             .globl _main
