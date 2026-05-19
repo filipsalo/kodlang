@@ -77,19 +77,19 @@ $(STAGE1)/sh_kodc: $(STAGE1_OBJS) $(STAGE0_OBJS)
 # driving kodc.kod) to produce a .s, which we then assemble.
 $(STAGE1)/lexing.s: stdlib/kod/lexing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) interpret kodc.kod $< > $@
+	$(KOD) _interpret kodc.kod $< > $@
 
 $(STAGE1)/parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) interpret kodc.kod $< > $@
+	$(KOD) _interpret kodc.kod $< > $@
 
 $(STAGE1)/codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) interpret kodc.kod $< > $@
+	$(KOD) _interpret kodc.kod $< > $@
 
 $(STAGE1)/kodc.s: kodc.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) interpret kodc.kod $< > $@
+	$(KOD) _interpret kodc.kod $< > $@
 
 $(STAGE1)/runtime_main.s: kodc.kod kod/builder.py
 	mkdir -p $(STAGE1)

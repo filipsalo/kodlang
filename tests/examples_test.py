@@ -14,7 +14,7 @@ import pytest
 def run_interpreted(path: str) -> subprocess.CompletedProcess:
     """Run a program in the interpreter."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "interpret", path],
+        [sys.executable, "-m", "kod", "_interpret", path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -39,7 +39,7 @@ def run_compiled(path: str) -> subprocess.CompletedProcess:
 def compile_to_assembly(path: str) -> subprocess.CompletedProcess:
     """Compile a program to assembly."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "compile", path],
+        [sys.executable, "-m", "kod", "_emit-asm", path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -133,7 +133,7 @@ def test_selfhost_matches_interpreter(sh_kodc):
             "-m",
             "kod",
             "--no-type-check",
-            "interpret",
+            "_interpret",
             "kodc.kod",
             target,
         ],

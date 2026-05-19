@@ -108,7 +108,7 @@ class Builder:
                 "-m",
                 "kod",
                 "--no-type-check",
-                "interpret",
+                "_interpret",
                 str(kodc_path),
                 str(rel_path),
             ]
