@@ -42,7 +42,43 @@ def main():
     build_parser = subparsers.add_parser("build")
     build_parser.add_argument("file", type=str)
 
+    # Internal: emit the runtime _main shim for an entry file. Used by the
+    # Makefile to wire up stage1 (sh_kodc) without duplicating the shim asm.
+    emit_rm_parser = subparsers.add_parser("_emit-runtime-main")
+    emit_rm_parser.add_argument("file", type=str)
+    emit_rm_parser.add_argument("out", type=str)
+
+    # Internal: build the shared stage0 objects (arena, runtime, builtins,
+    # primitives) into build/stage0/. Used by the Makefile to seed the
+    # link step that produces sh_kodc.
+    subparsers.add_parser("_build-stage0")
+
     args = parser.parse_args()
+
+    if args.command == "_build-stage0":
+        stdlib_path = find_stdlib_path()
+        stdlib_fs = FileSystem(stdlib_path)
+        project_fs = FileSystem(Path.cwd())
+        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
+        bob.build_stage0()
+        return 0
+
+    if args.command == "_emit-runtime-main":
+        stdlib_path = find_stdlib_path()
+        stdlib_fs = FileSystem(stdlib_path)
+        project_fs = FileSystem(Path.cwd())
+        entry_path = Path(args.file).absolute()
+        entry_module = project_fs.open(entry_path)
+        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
+        try:
+            bob.parse_program(entry_module)
+        except KodError as err:
+            print(err, file=sys.stderr)
+            return 1
+        asm = bob.compose_runtime_main_asm(entry_module)
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(asm)
+        return 0
 
     stdlib_path = find_stdlib_path()
     stdlib_fs = FileSystem(stdlib_path)

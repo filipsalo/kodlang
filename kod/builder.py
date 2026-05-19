@@ -1,6 +1,5 @@
 """Building/compiling stuff"""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,8 +14,21 @@ from kod.program import Program
 class Builder:
     """Build the project."""
 
-    def __init__(self, *, project_fs: FileSystem, stdlib_fs: FileSystem):
+    def __init__(
+        self,
+        *,
+        project_fs: FileSystem,
+        stdlib_fs: FileSystem,
+        build_root: Path | None = None,
+    ):
         self.program = Program(project_fs, stdlib_fs)
+        # Where outputs go. Layout:
+        #   {build_root}/stage0/  shared stdlib objects (arena, runtime, builtins,
+        #                         primitives) — produced once, reused by stage1
+        #                         and every app build
+        #   {build_root}/stage1/  the self-hosted compiler (sh_kodc) + its parts
+        #   {build_root}/apps/<stem>/  per-app outputs
+        self.build_root = build_root or (project_fs.root_path / "build")
         self.program.builtins = self.parse_builtins()
         # Primitive-type modules live in stdlib/primitives/. They're parsed
         # and added to the program so the build pipeline produces a .o for
@@ -73,7 +85,7 @@ class Builder:
 
     def compile_module(self, module: ast.Module) -> str:
         """Compile a module with the self-hosted compiler. Prefers the
-        pre-built native binary at build/sh_kodc (fast); falls back to running
+        pre-built native binary at build/stage1/sh_kodc (fast); falls back to running
         kodc.kod through the Python interpreter (slow, used to bootstrap)."""
         root_path = self.program.root_fs.root_path
         kodc_path = root_path / "kodc.kod"
@@ -87,7 +99,7 @@ class Builder:
         except ValueError:
             rel_path = module_path
 
-        sh_kodc = root_path / "build" / "sh_kodc"
+        sh_kodc = self.build_root / "stage1" / "sh_kodc"
         if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
             cmd = [str(sh_kodc), str(rel_path)]
         else:
@@ -134,10 +146,11 @@ class Builder:
                 continue
         return False
 
-    def _build_c(self, c_path: Path) -> Path:
+    def _build_c(self, c_path: Path, out_dir: Path) -> Path:
         """Compile a C source file to an object file."""
         root_path = self.program.root_fs.root_path
-        obj_path = (root_path / "build" / c_path.stem).with_suffix(".o")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = (out_dir / c_path.stem).with_suffix(".o")
         cmd = [
             "clang",
             "-c",
@@ -149,10 +162,11 @@ class Builder:
         subprocess.run(cmd, check=True, cwd=root_path)
         return obj_path
 
-    def _build(self, module_name: str, asm: str) -> Path:
+    def _build(self, module_name: str, asm: str, out_dir: Path) -> Path:
         """Build an object file."""
         root_path = self.program.root_fs.root_path
-        asm_path = (root_path / "build" / module_name).with_suffix(".s")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        asm_path = (out_dir / module_name).with_suffix(".s")
         obj_path = asm_path.with_suffix(".o")
         print(
             f"\033[2mWriting assembly to \033[22;1;36m{asm_path}\033[0m",
@@ -171,17 +185,19 @@ class Builder:
         subprocess.run(cmd, check=True, cwd=root_path)
         return obj_path
 
-    def build_module(self, module: ast.Module) -> Path:
+    def build_module(self, module: ast.Module, out_dir: Path) -> Path:
         """Build a module."""
         print(
             f"\033[2mBuilding module \033[22;1;36m{module.source_file.path}\033[0m",
             file=sys.stderr,
         )
         asm = self.compile_module(module)
-        return self._build(module.mangled_name, asm)
+        return self._build(module.mangled_name, asm, out_dir=out_dir)
 
-    def build_runtime_main(self, file: FileWrapper) -> Path:
-        """Build the runtime main function."""
+    def compose_runtime_main_asm(self, file: FileWrapper) -> str:
+        """Compose the runtime _main shim for the given entry file. The
+        shape depends on whether main takes argv and whether it returns
+        `T or Error`."""
         module = self.program.get_module(file.canonical_path.with_suffix(""))
         main_decl = next(
             s
@@ -214,7 +230,7 @@ class Builder:
             unwrap = ""
         if len(main_decl.params) == 0:
             if returns_result:
-                asm = f"""
+                return f"""
                     .text
                     .globl _main
                     _main:
@@ -225,16 +241,14 @@ class Builder:
                         ldp x29, x30, [sp], #16
                         ret
                 """
-            else:
-                asm = f"""
-                    .text
-                    .globl _main
-                    _main:
-                        b ${mangled}$main
-                """
-            return self._build("runtime_main", asm)
+            return f"""
+                .text
+                .globl _main
+                _main:
+                    b ${mangled}$main
+            """
         # Param-form (main accepts argv).
-        asm = f"""
+        return f"""
             .text
             .globl _main
             _main:
@@ -276,28 +290,68 @@ class Builder:
                 ldp x29, x30, [sp], #64
                 ret
         """
-        return self._build("runtime_main", asm)
+
+    def build_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
+        """Build the runtime _main object file into `out_dir`."""
+        asm = self.compose_runtime_main_asm(file)
+        return self._build("runtime_main", asm, out_dir=out_dir)
+
+    def _is_stdlib_module(self, module: ast.Module) -> bool:
+        stdlib_path = self.program.stdlib_fs.root_path
+        try:
+            module.source_file.path.resolve().relative_to(stdlib_path.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def build_stage0(self) -> list[Path]:
+        """Build the shared stage0 objects: arena.o, runtime.o, plus every
+        stdlib module currently loaded into the program (builtins +
+        primitives). Returns the list of object file paths."""
+        stage0_dir = self.build_root / "stage0"
+        stdlib_root = self.program.stdlib_fs.root_path
+        outputs = []
+        for module in self.program:
+            if self._is_stdlib_module(module):
+                outputs.append(self.build_module(module, out_dir=stage0_dir))
+        outputs.append(self._build_c(stdlib_root / "arena.c", out_dir=stage0_dir))
+        outputs.append(self._build_c(stdlib_root / "runtime.c", out_dir=stage0_dir))
+        return outputs
 
     def build_executable(self, file: FileWrapper) -> Path:
-        """Build an executable."""
+        """Build an executable. Stdlib modules + arena/runtime land in
+        build/stage0/ (shared across all apps); project modules and the
+        runtime_main shim land in build/apps/<stem>/; the final executable
+        is build/apps/<stem>/<stem>."""
         root_path = self.program.root_fs.root_path
-        build_dir = root_path / "build"
-        os.makedirs(build_dir, exist_ok=True)
-        executable = build_dir / file.path.stem
+        app_dir = self.build_root / "apps" / file.path.stem
+        stage0_dir = self.build_root / "stage0"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        stage0_dir.mkdir(parents=True, exist_ok=True)
+        executable = app_dir / file.path.stem
         print(
             f"\033[2mBuilding executable \033[22;1;36m{executable}\033[0m",
             file=sys.stderr,
         )
         object_files = []
         for module in self.program:
-            object_files.append(self.build_module(module).relative_to(root_path))
-        object_files.append(self.build_runtime_main(file).relative_to(root_path))
+            out_dir = stage0_dir if self._is_stdlib_module(module) else app_dir
+            object_files.append(
+                self.build_module(module, out_dir=out_dir).relative_to(root_path)
+            )
+        object_files.append(
+            self.build_runtime_main(file, out_dir=app_dir).relative_to(root_path)
+        )
         stdlib_root = self.program.stdlib_fs.root_path
         object_files.append(
-            self._build_c(stdlib_root / "arena.c").relative_to(root_path)
+            self._build_c(stdlib_root / "arena.c", out_dir=stage0_dir).relative_to(
+                root_path
+            )
         )
         object_files.append(
-            self._build_c(stdlib_root / "runtime.c").relative_to(root_path)
+            self._build_c(stdlib_root / "runtime.c", out_dir=stage0_dir).relative_to(
+                root_path
+            )
         )
         macos_version = subprocess.check_output(
             ["sw_vers", "-productVersion"], text=True

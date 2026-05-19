@@ -25,7 +25,7 @@ def run_interpreted(path: str) -> subprocess.CompletedProcess:
 
 def run_compiled(path: str) -> subprocess.CompletedProcess:
     """Run a program compiled to an executable. The Builder picks the native
-    self-hosted compiler at build/sh_kodc automatically when it exists."""
+    self-hosted compiler at build/stage1/sh_kodc automatically when it exists."""
     result = subprocess.run(
         [sys.executable, "-m", "kod", "run", path],
         stdout=subprocess.PIPE,
