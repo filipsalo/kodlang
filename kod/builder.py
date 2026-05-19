@@ -203,6 +203,15 @@ class Builder:
             parts = parts[1:]
         return "$".join(parts)
 
+    def _modules_with_tests(self) -> list[ast.Module]:
+        """Modules in the program (entry + transitive imports) that
+        declare at least one `test "..." { ... }` block."""
+        result = []
+        for module in self.program:
+            if any(isinstance(d, ast.TestDeclaration) for d in module.body):
+                result.append(module)
+        return result
+
     def compose_runtime_main_asm(self, file: FileWrapper) -> str:
         """Compose the runtime _main shim for the given entry file. The
         shape depends on whether main takes argv and whether it returns
@@ -306,19 +315,24 @@ class Builder:
         return self._build("runtime_main", asm, out_dir=out_dir)
 
     def compose_test_runtime_main_asm(self, file: FileWrapper) -> str:
-        """Compose a runtime _main that calls the entry module's
-        `__run_tests` dispatcher (emitted by codegen when the module
-        contains `test` blocks). The dispatcher returns 0 on success,
-        non-zero if any test failed; we propagate that as the process
-        exit code."""
-        mangled = self._mangled_module_prefix(file)
+        """Compose a runtime _main that calls every test-bearing module's
+        `__run_tests` dispatcher (entry file + transitive imports), then
+        prints the aggregate summary and exits with the failure count
+        (capped at 1). Each per-module dispatcher just runs its own
+        tests; the summary is hoisted here so the totals roll up."""
+        test_modules = self._modules_with_tests()
+        calls = "\n                ".join(
+            f"bl ${self._mangled_module_prefix(m.source_file)}$__run_tests"
+            for m in test_modules
+        )
         return f"""
             .text
             .globl _main
             _main:
                 stp x29, x30, [sp, #-16]!
                 mov x29, sp
-                bl ${mangled}$__run_tests
+                {calls}
+                bl _kod_test_summary
                 ldp x29, x30, [sp], #16
                 ret
         """
