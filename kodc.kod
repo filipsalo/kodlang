@@ -86,7 +86,130 @@ func resolve_import(target_path: str, module_name: str) -> Resolved {
     return Resolved(file: std_file, prefix: std_prefix)
 }
 
+// Build the runtime _main shim for an entry module whose main has the
+// given signature shape. Mirrors kod/builder.py:compose_runtime_main_asm.
+// The output is fed straight to `as`; whitespace details don't matter.
+func build_runtime_main_asm(anon mangled: str, has_argv: bool, returns_result: bool) -> str {
+    let unwrap: str = ""
+    if returns_result {
+        unwrap = unwrap + "        ldr x9, [x0, #0]\n"
+        unwrap = unwrap + "        cbz x9, Lmain_ok\n"
+        unwrap = unwrap + "        ldr x0, [x0, #8]\n"
+        unwrap = unwrap + "        ldr x1, [x0, #8]\n"
+        unwrap = unwrap + "        ldr x9, [x1, #0]\n"
+        unwrap = unwrap + "        ldr x0, [x0, #0]\n"
+        unwrap = unwrap + "        blr x9\n"
+        unwrap = unwrap + "        bl _kod_panic\n"
+        unwrap = unwrap + "    Lmain_ok:\n"
+        unwrap = unwrap + "        ldr x0, [x0, #8]\n"
+    }
+    let asm: str = "\t.text\n"
+    asm = asm + "\t.globl _main\n"
+    asm = asm + "_main:\n"
+    if has_argv == false {
+        if returns_result == false {
+            // Simplest case: tail-call into user main.
+            asm = asm + f"\tb ${mangled}$main\n"
+            return asm
+        }
+        asm = asm + "\tstp x29, x30, [sp, #-16]!\n"
+        asm = asm + "\tmov x29, sp\n"
+        asm = asm + f"\tbl ${mangled}$main\n"
+        asm = asm + unwrap
+        asm = asm + "\tldp x29, x30, [sp], #16\n"
+        asm = asm + "\tret\n"
+        return asm
+    }
+    // argv form: marshal (argc, argv) into a Kod string array before
+    // calling main. Optional Result unwrap inlines after the call.
+    asm = asm + "\tstp x29, x30, [sp, #-64]!\n"
+    asm = asm + "\tmov x29, sp\n"
+    asm = asm + "\tstp x19, x20, [sp, #16]\n"
+    asm = asm + "\tstp x21, x22, [sp, #32]\n"
+    asm = asm + "\tstr x23, [sp, #48]\n"
+    asm = asm + "\tmov x19, x0\n"
+    asm = asm + "\tmov x20, x1\n"
+    asm = asm + "\tlsl x0, x19, #3\n"
+    asm = asm + "\tbl _arena_alloc\n"
+    asm = asm + "\tmov x21, x0\n"
+    asm = asm + "\tmov x22, #0\n"
+    asm = asm + "Lloop:\n"
+    asm = asm + "\tcmp x22, x19\n"
+    asm = asm + "\tb.ge Ldone\n"
+    asm = asm + "\tldr x23, [x20, x22, lsl #3]\n"
+    asm = asm + "\tstr x23, [x21, x22, lsl #3]\n"
+    asm = asm + "\tadd x22, x22, #1\n"
+    asm = asm + "\tb Lloop\n"
+    asm = asm + "Ldone:\n"
+    asm = asm + "\tmov x0, #24\n"
+    asm = asm + "\tbl _arena_alloc\n"
+    asm = asm + "\tstr x21, [x0]\n"
+    asm = asm + "\tstr x19, [x0, #8]\n"
+    asm = asm + "\tstr x19, [x0, #16]\n"
+    asm = asm + f"\tbl ${mangled}$main\n"
+    asm = asm + unwrap
+    asm = asm + "\tldr x23, [sp, #48]\n"
+    asm = asm + "\tldp x21, x22, [sp, #32]\n"
+    asm = asm + "\tldp x19, x20, [sp, #16]\n"
+    asm = asm + "\tldp x29, x30, [sp], #64\n"
+    asm = asm + "\tret\n"
+    return asm
+}
+
+// `sh_kodc _emit-runtime-main <entry.kod> <out.s>` — parse the entry,
+// inspect `func main`'s shape (argv / Result), write the runtime _main
+// shim asm to <out.s>.
+func emit_runtime_main(entry_path: str, out_path: str) -> int64 {
+    let p: parsing.Parser = parse_file(entry_path)
+    let module: ast.Module = p.parse_module()
+
+    let main_decl_id: int64 = -1
+    for decl in module.decls {
+        match decl {
+            .Func(decl_id) -> {
+                // Bind to a local before the str compare: inline
+                // `p.func_decls[decl_id].name == "main"` currently
+                // mis-infers the chained-Index-then-Dot lhs as int64
+                // and compiles `==` as an integer compare. The local
+                // binding pins the type to str.
+                let nm: str = p.func_decls[decl_id].name
+                if nm == "main" {
+                    main_decl_id = decl_id
+                }
+            }
+            else none
+        }
+    }
+    if main_decl_id < 0 {
+        kod_eprint(f"_emit-runtime-main: no `main` function in {entry_path}")
+        return 1
+    }
+
+    let main_decl: ast.FuncDecl = p.func_decls[main_decl_id]
+    let returns_result: bool = false
+    if main_decl.return_typ != 0 {
+        // Bind to a local so the `is` check sees a known TypeExpr,
+        // not an inline indexed lookup (same workaround as the
+        // FuncDecl.name comparison above).
+        let ret_te: ast.TypeExpr = p.type_exprs[main_decl.return_typ]
+        if ret_te is .Throws(_inner) {
+            returns_result = true
+        }
+    }
+    let has_argv: bool = len(main_decl.params) > 0
+    let mangled: str = path_to_prefix(entry_path)
+    let asm: str = build_runtime_main_asm(mangled, has_argv: has_argv, returns_result: returns_result)
+    if write_file(out_path, asm) != 0 {
+        kod_eprint(f"_emit-runtime-main: failed to write {out_path}")
+        return 1
+    }
+    return 0
+}
+
 func main(argv: [str]) -> int64 {
+    if len(argv) >= 4 and argv[1] == "_emit-runtime-main" {
+        return emit_runtime_main(entry_path: argv[2], out_path: argv[3])
+    }
     let path: str = argv[1]
 
     let builtins_parser: parsing.Parser = parse_file("stdlib/builtins.kod")

@@ -60,6 +60,18 @@ int64_t kod_test_summary(void) {
     return g_kod_test_failures > 0 ? 1 : 0;
 }
 
+// Write `content` to `path`, replacing the file if it exists. Parent
+// directory must already exist. Returns 0 on success, -1 on any failure
+// (open or write). Mirrors read_file's bare naming convention.
+int64_t write_file(const char *path, const char *content) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+    size_t len = strlen(content);
+    size_t written = fwrite(content, 1, len, fp);
+    fclose(fp);
+    return written == len ? 0 : -1;
+}
+
 char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return "";

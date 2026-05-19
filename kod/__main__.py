@@ -159,11 +159,30 @@ def main():
         return 1
 
     if args.command == "_emit-runtime-main":
-        bob, _, entry_module = _open_program(args.file)
-        asm = bob.compose_runtime_main_asm(entry_module)
+        # Delegate to sh_kodc when it's available and fresh — that's the
+        # Kod-native composer. Fall back to the Python composer during
+        # bootstrap (sh_kodc doesn't exist yet) or when the binary is
+        # stale relative to its sources.
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(asm)
+        stdlib_fs = FileSystem(find_stdlib_path())
+        project_fs = FileSystem(Path.cwd())
+        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
+        sh_kodc = bob.build_root / "stage1" / "sh_kodc"
+        if sh_kodc.exists() and not bob._sh_kodc_stale(sh_kodc):
+            result = subprocess.run(
+                [str(sh_kodc), "_emit-runtime-main", args.file, str(out)],
+                check=False,
+            )
+            return result.returncode
+        # Python fallback.
+        entry_module = project_fs.open(Path(args.file).absolute())
+        try:
+            bob.parse_program(entry_module)
+        except KodError as err:
+            print(err, file=sys.stderr)
+            return 1
+        out.write_text(bob.compose_runtime_main_asm(entry_module))
         return 0
 
     bob, program, entry_module = _open_program(args.file)
