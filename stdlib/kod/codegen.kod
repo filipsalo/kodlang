@@ -1327,6 +1327,7 @@ type Codegen = struct {
                 }
             }
             .Throw(value) -> self.collect_expr_vars(value)
+            .Assert(expr, _source_text, _span) -> self.collect_expr_vars(expr)
             .ExprStmt(expr) -> self.collect_expr_vars(expr)
             .If(cond, then_body, else_body) -> {
                 self.collect_expr_vars(cond)
@@ -2805,6 +2806,7 @@ type Codegen = struct {
             .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
             .LetElse(pattern, value, else_body) -> self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
             .Throw(value) -> self.compile_throw(value)
+            .Assert(expr, source_text, span) -> self.compile_assert(expr, source_text: source_text, span: span)
         }
     }
 
@@ -3458,6 +3460,44 @@ type Codegen = struct {
 
     // `throw expr` — box `expr` as an Error (fat pointer with vtable) and
     // return a Result.Err cell {1, error_ptr} from the enclosing function.
+    // Compute `path:line:col` for an error message from a byte offset
+    // into self.p.source.
+    func format_position(self, anon offset: int64) -> str {
+        let source = self.p.source
+        let line = 1
+        let col = 1
+        let i = 0
+        for i < offset and i < len(source) {
+            if source[i] == '\n' {
+                line = line + 1
+                col = 1
+            } else {
+                col = col + 1
+            }
+            i = i + 1
+        }
+        return f"{self.p.path}:{line.to_str()}:{col.to_str()}"
+    }
+
+    // `assert <expr>` — runtime check inside a test. When the expression
+    // is false, call _kod_test_fail with a message that pins down both
+    // the source location and the original expression text (captured by
+    // the parser).
+    func compile_assert(self, anon expr_id: int64, source_text: str, span: ast.Span) -> none {
+        let val = self.compile_expr(expr_id)
+        let reg = self.load(val)
+        let ok_lbl = self.fresh("Lassert_ok")
+        self.emit(f"cbnz {reg}, {ok_lbl}")
+        self.free_reg(reg)
+        let pos = self.format_position(span.start)
+        let msg = f"{pos}: assertion failed: {source_text}"
+        let msg_lbl = self.intern_str(msg)
+        self.emit(f"adrp x0, {msg_lbl}@PAGE")
+        self.emit(f"add x0, x0, {msg_lbl}@PAGEOFF")
+        self.emit("bl _kod_test_fail")
+        self.emit_label(ok_lbl)
+    }
+
     func compile_throw(self, anon value_id: int64) -> none {
         let iface_idx = self.find_iface_idx("Error")
         let actual = self.infer_kind(value_id)

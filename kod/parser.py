@@ -12,6 +12,7 @@ from kod.span import Span
 from kod.tokens import (
     EOF,
     EOL,
+    Assert,
     BooleanLiteral,
     Break,
     CloseBracket,
@@ -216,6 +217,8 @@ class Parser:
                 stmt = ast.Return.parse(self)
             case Throw():
                 stmt = ast.ThrowStatement.parse(self)
+            case Assert():
+                stmt = ast.AssertStatement.parse(self)
             case If():
                 stmt = ast.IfStatement.parse(self)
             case For():

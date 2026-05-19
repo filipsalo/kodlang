@@ -466,6 +466,23 @@ class ThrowStatement(ASTNode):
 
 
 @dataclasses.dataclass
+class AssertStatement(ASTNode):
+    """`assert expr` — inside a test, mark the test failed when `expr`
+    evaluates to false. The Python interpreter doesn't run tests, so
+    this is parsed and ignored here; codegen.kod has the real handling."""
+
+    expression: ASTNode
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Assert)
+            expression = Expression.parse(parser)
+        return cls(expression, span)
+
+
+@dataclasses.dataclass
 class TryExpression(ASTNode):
     """`try expr` — unwrap or propagate the Err."""
 

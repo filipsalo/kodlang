@@ -318,6 +318,11 @@ class Test(Token):
 
 
 @dataclasses.dataclass
+class Assert(Token):
+    """An assert keyword token."""
+
+
+@dataclasses.dataclass
 class Interface(Token):
     """An interface token"""
 
