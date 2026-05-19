@@ -80,6 +80,39 @@ def _make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_DIR_TEST_RUNNER = ".kod_test_runner.kod"
+
+
+def _run_dir_tests(directory: Path) -> int:
+    """Walk `directory` for `*_test.kod`, build them all into a single
+    executable via a temporary aggregator file at the project root,
+    run it, return the exit code. Cleans up the aggregator on the way
+    out (even if compilation fails)."""
+    test_files = sorted(directory.rglob("*_test.kod"))
+    if not test_files:
+        print(f"kod test: no `*_test.kod` files under {directory}", file=sys.stderr)
+        return 1
+
+    cwd = Path.cwd()
+    aggregator_path = cwd / _DIR_TEST_RUNNER
+    # Each test file gets imported via a path relative to the project root
+    # (`./stdlib/map_test`). The aggregator has no test blocks of its own;
+    # the runtime_main walks the program for every module that does.
+    imports = []
+    for test_file in test_files:
+        rel = test_file.resolve().relative_to(cwd).with_suffix("")
+        imports.append(f'import "./{rel}"')
+    aggregator_path.write_text("\n".join(imports) + "\n")
+    try:
+        bob, _, entry_module = _open_program(str(aggregator_path))
+        executable = bob.build_test_executable(entry_module)
+        result = subprocess.run([executable], check=False)
+        return result.returncode
+    finally:
+        if aggregator_path.exists():
+            aggregator_path.unlink()
+
+
 def _open_program(file: str):
     """Resolve stdlib + project FS, parse program from `file`, return
     (builder, program, entry_module). Exits non-zero on parse errors."""
@@ -108,17 +141,15 @@ def main():
 
     if args.command == "test":
         # `kod test <file>` builds the file with a runtime_main that
-        # calls the codegen-emitted __run_tests dispatcher (one per
-        # module that contains test blocks), then runs the resulting
+        # calls every test-bearing module's __run_tests dispatcher
+        # (entry file + transitive imports), then runs the resulting
         # binary and propagates its exit code.
-        path_arg = args.path
-        if path_arg == ".":
-            print(
-                "kod test: directory mode not yet implemented; pass a .kod file",
-                file=sys.stderr,
-            )
-            return 1
-        bob, _, entry_module = _open_program(path_arg)
+        # `kod test <dir>` walks <dir> for `*_test.kod` files and runs
+        # all of them in one binary via a temporary aggregator module.
+        path = Path(args.path)
+        if path.is_dir():
+            return _run_dir_tests(path)
+        bob, _, entry_module = _open_program(args.path)
         executable = bob.build_test_executable(entry_module)
         result = subprocess.run([executable], check=False)
         return result.returncode
