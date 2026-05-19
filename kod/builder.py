@@ -296,6 +296,28 @@ class Builder:
         asm = self.compose_runtime_main_asm(file)
         return self._build("runtime_main", asm, out_dir=out_dir)
 
+    def compose_test_runtime_main_asm(self, file: FileWrapper) -> str:
+        """Compose a runtime _main that calls the entry module's
+        `__run_tests` dispatcher (emitted by codegen when the module
+        contains `test` blocks). The dispatcher returns 0 on success,
+        non-zero if any test failed; we propagate that as the process
+        exit code."""
+        mangled = "$".join(file.canonical_path.with_suffix("").parts)
+        return f"""
+            .text
+            .globl _main
+            _main:
+                stp x29, x30, [sp, #-16]!
+                mov x29, sp
+                bl ${mangled}$__run_tests
+                ldp x29, x30, [sp], #16
+                ret
+        """
+
+    def build_test_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
+        asm = self.compose_test_runtime_main_asm(file)
+        return self._build("runtime_main", asm, out_dir=out_dir)
+
     def _is_stdlib_module(self, module: ast.Module) -> bool:
         stdlib_path = self.program.stdlib_fs.root_path
         try:
@@ -318,17 +340,21 @@ class Builder:
         outputs.append(self._build_c(stdlib_root / "runtime.c", out_dir=stage0_dir))
         return outputs
 
-    def build_executable(self, file: FileWrapper) -> Path:
-        """Build an executable. Stdlib modules + arena/runtime land in
-        build/stage0/ (shared across all apps); project modules and the
-        runtime_main shim land in build/apps/<stem>/; the final executable
-        is build/apps/<stem>/<stem>."""
+    def _build_executable_with_runtime_main(
+        self,
+        file: FileWrapper,
+        executable_name: str,
+        compose_runtime_main: callable,
+    ) -> Path:
+        """Compile every module to .o, build the runtime_main shim (composed
+        by the caller), drive the linker. Used by both `kod build` and
+        `kod test` — they differ only in the shim."""
         root_path = self.program.root_fs.root_path
         app_dir = self.build_root / "apps" / file.path.stem
         stage0_dir = self.build_root / "stage0"
         app_dir.mkdir(parents=True, exist_ok=True)
         stage0_dir.mkdir(parents=True, exist_ok=True)
-        executable = app_dir / file.path.stem
+        executable = app_dir / executable_name
         print(
             f"\033[2mBuilding executable \033[22;1;36m{executable}\033[0m",
             file=sys.stderr,
@@ -339,8 +365,9 @@ class Builder:
             object_files.append(
                 self.build_module(module, out_dir=out_dir).relative_to(root_path)
             )
+        rm_asm = compose_runtime_main(file)
         object_files.append(
-            self.build_runtime_main(file, out_dir=app_dir).relative_to(root_path)
+            self._build("runtime_main", rm_asm, out_dir=app_dir).relative_to(root_path)
         )
         stdlib_root = self.program.stdlib_fs.root_path
         object_files.append(
@@ -370,3 +397,25 @@ class Builder:
         print(f"=> \033[2m{" ".join(map(str, cmd))}\033[0m", file=sys.stderr)
         subprocess.run(cmd, check=True, cwd=root_path)
         return executable
+
+    def build_executable(self, file: FileWrapper) -> Path:
+        """Build a normal executable. Stdlib modules + arena/runtime land
+        in build/stage0/ (shared across all apps); project modules and the
+        runtime_main shim land in build/apps/<stem>/; the final executable
+        is build/apps/<stem>/<stem>."""
+        return self._build_executable_with_runtime_main(
+            file,
+            executable_name=file.path.stem,
+            compose_runtime_main=self.compose_runtime_main_asm,
+        )
+
+    def build_test_executable(self, file: FileWrapper) -> Path:
+        """Build a test runner: same as build_executable but the
+        runtime_main shim calls the codegen-emitted `__run_tests`
+        dispatcher instead of the user's `main`. The executable is named
+        `<stem>_test` to coexist with a regular `build` of the same file."""
+        return self._build_executable_with_runtime_main(
+            file,
+            executable_name=f"{file.path.stem}_test",
+            compose_runtime_main=self.compose_test_runtime_main_asm,
+        )

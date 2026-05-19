@@ -3900,7 +3900,7 @@ type Codegen = struct {
     }
 
 
-    func compile_func(self, fd_id: int64, struct_name: str) -> none {
+    func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.check_param_order(func_decl, name: func_decl.name)
         self.vars = []
@@ -3931,6 +3931,9 @@ type Codegen = struct {
         let func_lbl = f"${self.path_prefix}${func_decl.name}"
         if len(struct_name) > 0 {
             func_lbl = f"${self.path_prefix}${struct_name}${func_decl.name}"
+        }
+        if len(override_lbl) > 0 {
+            func_lbl = override_lbl
         }
         self.ret_lbl = f"{func_lbl}$end"
         self.return_kind = self.resolve_type(func_decl.return_typ)
@@ -4012,14 +4015,53 @@ type Codegen = struct {
 
         for decl in module.decls {
             match decl {
-                .Func(decl_id) -> self.compile_func(decl_id, "")
+                .Func(decl_id) -> self.compile_func(decl_id, "", override_lbl: "")
                 .Struct(name, _struct_type_params, fields, methods) -> {
                     for method_id in methods {
-                        self.compile_func(method_id, name)
+                        self.compile_func(method_id, name, override_lbl: "")
                     }
                 }
                 else none
             }
+        }
+
+        // Compile any `test "..." { ... }` blocks. Each becomes a normal
+        // function with a synthesized label `<prefix>$__test_N`, plus a
+        // per-module dispatcher `<prefix>$__run_tests` that resets the
+        // failure flag, calls each test, reports the outcome, and finally
+        // prints a summary. The dispatcher is what `kod test` links its
+        // runtime_main against.
+        let test_displays: [str] = []
+        let test_labels: [str] = []
+        for decl in module.decls {
+            if decl is .Test(display, test_decl_id) {
+                let lbl: str = f"${self.path_prefix}$__test_{len(test_labels).to_str()}"
+                self.compile_func(test_decl_id, "", override_lbl: lbl)
+                test_displays += [display]
+                test_labels += [lbl]
+            }
+        }
+        if len(test_labels) > 0 {
+            let run_lbl: str = f"${self.path_prefix}$__run_tests"
+            self.emit_globl(run_lbl)
+            self.emit_label(run_lbl)
+            self.emit("sub sp, sp, #16")
+            self.emit("stp fp, lr, [sp]")
+            self.emit("add fp, sp, #0")
+            let i: int64 = 0
+            for i < len(test_labels) {
+                let name_lbl: str = self.intern_str(test_displays[i])
+                self.emit("bl _kod_test_reset")
+                self.emit(f"bl {test_labels[i]}")
+                self.emit(f"adrp x0, {name_lbl}@PAGE")
+                self.emit(f"add x0, x0, {name_lbl}@PAGEOFF")
+                self.emit("bl _kod_test_report")
+                i = i + 1
+            }
+            self.emit("bl _kod_test_summary")
+            self.emit("ldp fp, lr, [sp]")
+            self.emit("add sp, sp, #16")
+            self.emit("ret")
         }
 
         // Emit method bodies for every monomorphised struct instantiation
@@ -4038,7 +4080,7 @@ type Codegen = struct {
                 self.subst_names = template.type_param_names
                 self.subst_args = s.template_args
                 for method_id in s.method_decl_ids {
-                    self.compile_func(method_id, s.name)
+                    self.compile_func(method_id, s.name, override_lbl: "")
                 }
                 self.p = saved_p
                 self.subst_names = saved_names

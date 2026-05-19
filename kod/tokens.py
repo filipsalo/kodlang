@@ -313,6 +313,11 @@ class Must(Token):
 
 
 @dataclasses.dataclass
+class Test(Token):
+    """A test keyword token."""
+
+
+@dataclasses.dataclass
 class Interface(Token):
     """An interface token"""
 

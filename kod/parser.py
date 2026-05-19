@@ -38,6 +38,7 @@ from kod.tokens import (
     Question,
     Return,
     Struct,
+    Test,
     Throw,
     Token,
     Type,
@@ -229,6 +230,8 @@ class Parser:
                 stmt = ast.ExternalFunctionDeclaration.parse(self)
             case Func():
                 stmt = ast.FunctionDeclaration.parse(self)
+            case Test():
+                stmt = ast.TestDeclaration.parse(self)
             case Break():
                 stmt = ast.BreakStatement.parse(self)
             case Continue():

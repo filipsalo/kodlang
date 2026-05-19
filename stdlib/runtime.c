@@ -26,6 +26,40 @@ void kod_eprint(const char *msg) {
     fprintf(stderr, "%s\n", msg);
 }
 
+// Test framework state. The per-module `__run_tests` dispatcher emitted
+// by the codegen calls kod_test_reset before each test, the test body
+// calls kod_test_fail (from `testing.fail(msg)`) on a failure, and the
+// dispatcher calls kod_test_report afterwards to print the outcome and
+// roll into the aggregate counters. kod_test_summary is called once at
+// the very end; its return value (number of failures) is what the
+// process exits with.
+static int g_kod_test_failed;
+static int g_kod_test_total;
+static int g_kod_test_failures;
+
+void kod_test_reset(void) { g_kod_test_failed = 0; }
+
+void kod_test_fail(const char *msg) {
+    g_kod_test_failed = 1;
+    fprintf(stderr, "    %s\n", msg);
+}
+
+void kod_test_report(const char *name) {
+    g_kod_test_total++;
+    if (g_kod_test_failed) {
+        g_kod_test_failures++;
+        printf("FAIL %s\n", name);
+    } else {
+        printf("ok   %s\n", name);
+    }
+}
+
+int64_t kod_test_summary(void) {
+    printf("\n%d/%d passed\n",
+           g_kod_test_total - g_kod_test_failures, g_kod_test_total);
+    return g_kod_test_failures > 0 ? 1 : 0;
+}
+
 char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return "";

@@ -496,6 +496,30 @@ class MustExpression(ASTNode):
 
 
 @dataclasses.dataclass
+class TestDeclaration(ASTNode):
+    """A `test "description" { ... }` block. The Python frontend parses
+    the body just enough not to choke; codegen.kod is the source of
+    truth for what tests actually do at runtime. The interpreter
+    silently skips tests."""
+
+    display: str
+    body: list
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        with parser.span() as span:
+            parser.consume(tokens.Test)
+            display = StringLiteral.parse(parser).value.to_py_str()
+            parser.consume(tokens.OpenCurly)
+            body = []
+            while not parser.try_consume(tokens.CloseCurly):
+                if statement := parser.parse_statement():
+                    body.append(statement)
+        return cls(display, body, span)
+
+
+@dataclasses.dataclass
 class InterfaceDeclaration(ASTNode):
     """An interface declaration. The compiler enforces conformance; the
     interpreter is permissive and relies on dynamic method lookup."""

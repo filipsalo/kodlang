@@ -107,8 +107,21 @@ def main():
         return 0
 
     if args.command == "test":
-        print("kod test: not yet implemented", file=sys.stderr)
-        return 1
+        # `kod test <file>` builds the file with a runtime_main that
+        # calls the codegen-emitted __run_tests dispatcher (one per
+        # module that contains test blocks), then runs the resulting
+        # binary and propagates its exit code.
+        path_arg = args.path
+        if path_arg == ".":
+            print(
+                "kod test: directory mode not yet implemented; pass a .kod file",
+                file=sys.stderr,
+            )
+            return 1
+        bob, _, entry_module = _open_program(path_arg)
+        executable = bob.build_test_executable(entry_module)
+        result = subprocess.run([executable], check=False)
+        return result.returncode
 
     if args.command == "fmt":
         print("kod fmt: not yet implemented", file=sys.stderr)
