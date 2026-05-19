@@ -2091,7 +2091,7 @@ type Codegen = struct {
             self.emit(f"bl {lbl}")
             return .VReg(name: "x0")
         }
-        return self.compile_method_call(args, obj_name: mod_or_obj, method_name, span: self.p.expr_spans[callee_lhs])
+        return self.compile_method_call(args, receiver_id: callee_lhs, method_name, span: self.p.expr_spans[callee_lhs])
     }
 
     func compile_call(self, anon args: [ast.CallArg], callee_id: int64) -> Val {
@@ -2143,6 +2143,13 @@ type Codegen = struct {
                         }
                         if self.try_two_part_call(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
+                        }
+                        // Fallback: receiver is a non-Ident expression
+                        // (literal, field access, call result, ...). Dispatch
+                        // via the general method-call path using the receiver
+                        // expression directly.
+                        if self.p.exprs[rhs] is .Ident(method_name) {
+                            return self.compile_method_call(args, receiver_id: lhs, method_name, span: self.p.expr_spans[lhs])
                         }
                     }
                     else none
@@ -2209,7 +2216,7 @@ type Codegen = struct {
     // Dispatch on an interface value: the variable holds a pointer to an
     // arena cell {data_ptr at 0, vtable_ptr at 8}. The method index in the
     // vtable matches its order in the interface declaration.
-    func compile_iface_method_call(self, anon args: [ast.CallArg], obj_off: int64, iface_idx: int64, method_name: str) -> Val {
+    func compile_iface_method_call(self, anon args: [ast.CallArg], receiver_id: int64, iface_idx: int64, method_name: str) -> Val {
         let i = 0
         let method_idx = -1
         for i < len(self.interfaces[iface_idx].method_names) {
@@ -2235,7 +2242,8 @@ type Codegen = struct {
         }
         self.emit(f"sub sp, sp, #{self.itos(padded)}")
         // Load cell ptr -> x0; data_ptr -> sp[0]; vtable -> x1; method ptr -> sp[n*8].
-        self.emit_ldr(obj_off, reg: "x0")
+        let recv_val = self.compile_expr(receiver_id)
+        self.mov_to(recv_val, dest: "x0")
         let cell_r = self.alloc_reg()
         self.emit(f"mov {cell_r}, x0")
         self.emit(f"ldr x9, [{cell_r}]")
@@ -2301,19 +2309,18 @@ type Codegen = struct {
         return -1
     }
 
-    func compile_method_call(self, anon args: [ast.CallArg], obj_name: str, method_name: str, span: ast.Span) -> Val {
-        let var_kind = self.find_var_kind(obj_name)
-        let obj_off = self.find_var_offset(obj_name)
+    func compile_method_call(self, anon args: [ast.CallArg], receiver_id: int64, method_name: str, span: ast.Span) -> Val {
+        let recv_kind = self.infer_kind(receiver_id)
 
         // Interface dispatch: load vtable from the cell, then indirect call.
-        if var_kind is .KInterface(iface_idx) {
-            return self.compile_iface_method_call(args, obj_off, iface_idx, method_name)
+        if recv_kind is .KInterface(iface_idx) {
+            return self.compile_iface_method_call(args, receiver_id, iface_idx, method_name)
         }
 
         let method_lbl = ""
         let sig_params: [TypeKind] = []
         let sig_labels: [str] = []
-        match var_kind {
+        match recv_kind {
             .KStruct(idx, _struct_type_args) -> {
                 let method_idx = 0
                 for method_idx < len(self.structs[idx].method_names) {
@@ -2332,7 +2339,7 @@ type Codegen = struct {
         // Primitive method dispatch (int64.to_str etc.) for non-struct
         // receivers — looked up against stdlib/primitives/<kind>.kod.
         if len(method_lbl) == 0 {
-            let prim_idx = self.find_prim_method(method_name, kind: var_kind)
+            let prim_idx = self.find_prim_method(method_name, kind: recv_kind)
             if prim_idx >= 0 {
                 method_lbl = self.prim_method_labels[prim_idx]
                 sig_params = self.prim_method_sigs[prim_idx].param_kinds
@@ -2340,7 +2347,11 @@ type Codegen = struct {
             }
         }
         if len(method_lbl) == 0 {
-            self.report_error(f"error: unknown method `{method_name}` on `{obj_name}`", span: span)
+            let recv_desc: str = "receiver"
+            if self.p.exprs[receiver_id] is .Ident(recv_name) {
+                recv_desc = recv_name
+            }
+            self.report_error(f"error: unknown method `{method_name}` on `{recv_desc}`", span: span)
             return .VImm(value: 0)
         }
         // self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method_name, call_span: span)
@@ -2355,7 +2366,8 @@ type Codegen = struct {
             padded = padded + 8
         }
         self.emit(f"sub sp, sp, #{self.itos(padded)}")
-        self.emit_ldr(obj_off, reg: "x0")
+        let recv_val = self.compile_expr(receiver_id)
+        self.mov_to(recv_val, dest: "x0")
         self.emit("str x0, [sp]")
         let i = 0
         for i < len(args) {
