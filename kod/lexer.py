@@ -196,7 +196,12 @@ class Lexer:
                 self.pos += 1
             return self.build(StringLiteral)
         while self.peek() != '"':
-            self.pos += 1
+            if self.peek() == "\\":
+                self.pos += 1
+                if self.peek() != "":
+                    self.pos += 1
+            else:
+                self.pos += 1
         self.consume('"')
         string: StringLiteral = self.build(StringLiteral)
         string.value = string.value.encode().decode("unicode-escape")
@@ -237,6 +242,11 @@ class Lexer:
             if ch == '"' and depth == 0:
                 self.pos += 1
                 break
+            if ch == "\\":
+                self.pos += 1
+                if self.peek() != "":
+                    self.pos += 1
+                continue
             if ch == "{":
                 depth += 1
             elif ch == "}":
