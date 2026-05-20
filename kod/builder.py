@@ -53,6 +53,12 @@ class Builder:
                 if isinstance(decl, ast.FunctionDeclaration):
                     decl.module = module
                     type_cls.methods[decl.name] = decl
+        # Eagerly-loaded stdlib modules (their .o becomes part of stage0
+        # so sh_kodc links them, even though user code still needs an
+        # explicit `import "io"` / `import "process"` to use them).
+        for name in ("io", "process"):
+            module = self.parse_module(self.program.resolve_import(name))
+            self.program.add_module(module)
 
     def parse_builtins(self) -> ast.Module:
         """Parse the builtins module."""
@@ -186,11 +192,34 @@ class Builder:
         return obj_path
 
     def build_module(self, module: ast.Module, out_dir: Path) -> Path:
-        """Build a module."""
+        """Build a module to a .o file. When sh_kodc is available, lets it
+        drive both codegen and `as` in one subprocess (`_compile`).
+        Falls back to the two-step Python-orchestrated path during
+        bootstrap or when sh_kodc is stale."""
         print(
             f"\033[2mBuilding module \033[22;1;36m{module.source_file.path}\033[0m",
             file=sys.stderr,
         )
+        root_path = self.program.root_fs.root_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = (out_dir / module.mangled_name).with_suffix(".o")
+        sh_kodc = self.build_root / "stage1" / "sh_kodc"
+        if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
+            try:
+                rel_src = module.source_file.path.relative_to(root_path)
+            except ValueError:
+                rel_src = module.source_file.path
+            cmd = [
+                str(sh_kodc),
+                "_compile",
+                str(rel_src),
+                str(obj_path.relative_to(root_path)),
+            ]
+            print(f"=> \033[2m{' '.join(cmd)}\033[0m", file=sys.stderr)
+            result = subprocess.run(cmd, check=False, cwd=root_path)
+            if result.returncode == 0:
+                return obj_path
+        # Fallback: Python interpreter drives kodc.kod → captured .s → `as`.
         asm = self.compile_module(module)
         return self._build(module.mangled_name, asm, out_dir=out_dir)
 

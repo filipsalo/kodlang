@@ -60,6 +60,21 @@ int64_t kod_test_summary(void) {
     return g_kod_test_failures > 0 ? 1 : 0;
 }
 
+// Reopen stdout against `path`, so subsequent prints go to the file.
+// Used by sh_kodc to capture codegen output to a .s file in a single
+// process (rather than parent-captured stdout). Returns 0 on success,
+// -1 on failure.
+int64_t redirect_stdout(const char *path) {
+    if (!freopen(path, "w", stdout)) return -1;
+    return 0;
+}
+
+// Flush stdout. Needed after a `redirect_stdout` block to make sure
+// the on-disk file is complete before another process reads it.
+void flush_stdout(void) {
+    fflush(stdout);
+}
+
 // Write `content` to `path`, replacing the file if it exists. Parent
 // directory must already exist. Returns 0 on success, -1 on any failure
 // (open or write). Mirrors read_file's bare naming convention.
