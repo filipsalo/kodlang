@@ -74,7 +74,7 @@ Pattern matching on enums, integers, and strings. See [Pattern matching](pattern
 match direction {
     Direction.North -> print("north")
     Direction.South -> print("south")
-    _ -> print("other")
+    else -> print("other")
 }
 ```
 

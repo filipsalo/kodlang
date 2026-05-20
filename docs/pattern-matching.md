@@ -21,13 +21,21 @@ Arms are tested top-to-bottom. The first matching arm executes.
 
 ## Pattern kinds
 
-### Wildcard
+### Catch-all (`else`)
 
-`_` matches any value:
+`else` matches any value the other arms didn't cover. It must be the
+last arm. The arrow is optional after `else`:
 
 ```kod
 match x {
-    _ -> print("anything")
+    1    -> print("one")
+    2    -> print("two")
+    else -> print("other")    // arrow form
+}
+
+match x {
+    1 -> print("one")
+    else { print("other") }   // block form
 }
 ```
 
@@ -35,9 +43,9 @@ match x {
 
 ```kod
 match n {
-    0 -> print("zero")
-    1 -> print("one")
-    _ -> print("other")
+    0    -> print("zero")
+    1    -> print("one")
+    else -> print("other")
 }
 ```
 
@@ -47,7 +55,7 @@ match n {
 match s {
     "hello" -> print("greeting")
     "bye"   -> print("farewell")
-    _       -> print("unknown")
+    else    -> print("unknown")
 }
 ```
 
@@ -170,13 +178,13 @@ match c {
 }
 ```
 
-Add the missing arm or a wildcard:
+Add the missing arm or an `else` catch-all:
 
 ```kod
 match c {
     .Red -> print("red")
     .Green -> print("green")
-    _ -> print("other")
+    else -> print("other")
 }
 ```
 
@@ -184,10 +192,10 @@ The single-arm sugar (`if X is .V(b) { ... }` and `let .V(b) = X else
 { ... }`) is not subject to exhaustiveness — they're explicitly
 one-variant checks.
 
-A `match` on `int64` or `str` must include a wildcard (`_`) arm —
-the compiler reports an error otherwise. (`int64` and `str` have too
-many possible values to enumerate; the wildcard makes the
-fall-through explicit.)
+A `match` on `int64` or `str` must include an `else` arm — the
+compiler reports an error otherwise. (`int64` and `str` have too many
+possible values to enumerate; the `else` makes the fall-through
+explicit.)
 
 ## Other limitations
 

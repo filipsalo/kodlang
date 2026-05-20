@@ -43,7 +43,7 @@ Inside a `match` arm, the enum name can be omitted when the type is unambiguous:
 match d {
     .North -> print("north")
     .South -> print("south")
-    _ -> {}
+    else -> {}
 }
 ```
 
@@ -65,14 +65,13 @@ match m {
         print_int(x)
         print_int(y)
     }
-    _ -> {}
+    else -> {}
 }
 ```
 
 - Bindings in payload patterns (`content`, `x`, `y`) capture the field values
-- `_` is a wildcard that matches anything
+- `else` is the catch-all arm; matches whatever the other arms didn't
 - Arm bodies can be a single expression (after `->`) or a block (`{ ... }`)
-- No exhaustiveness checking yet
 
 ## Memory layout (compiler)
 
