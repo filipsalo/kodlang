@@ -1,0 +1,329 @@
+// Minimal JSON parse + emit. Numbers are int64 only (no floats);
+// string escapes are limited to the common ones (`\n \t \r \" \\ \/`);
+// parse failure panics (no error-typed variant yet). Good enough for
+// LSP-style protocol traffic and tests; intentionally not a
+// general-purpose JSON library.
+
+type Value = enum {
+    Null
+    Bool(value: bool)
+    Number(value: int64)
+    Str(value: str)
+    Array(items: [Value])
+    // Parallel arrays — `keys[i]` is the key for `values[i]`. Stored
+    // this way (rather than as a separate `Entry` struct) so the type
+    // doesn't need a mutual-recursive definition.
+    Object(keys: [str], values: [Value])
+}
+
+// Object lookup. Returns Null if the key is missing or `v` isn't an
+// Object — lets callers chain `get(get(v, "a"), "b")` without
+// intermediate destructuring. Free function rather than a method
+// because Kod doesn't yet support methods on enums.
+func get(anon v: Value, key: str) -> Value {
+    match v {
+        .Object(keys, values) -> {
+            let i: int64 = 0
+            for i < len(keys) {
+                if keys[i] == key {
+                    return values[i]
+                }
+                i = i + 1
+            }
+            return .Null
+        }
+        else return .Null
+    }
+}
+
+func as_str(anon v: Value) -> str? {
+    match v {
+        .Str(s) -> return s
+        else return none
+    }
+}
+
+// NOTE: hits a current compiler limitation — when an optional-returning
+// function returns 0 (or false) directly, the wrap path treats that
+// payload as `none` rather than `Some(0)`. So `as_int(.Number(0))` and
+// `as_bool(.Bool(false))` both round-trip to `none`. Untested for now;
+// will work once the codegen's optional-return wrap stops short-
+// circuiting on a zero value.
+func as_int(anon v: Value) -> int64? {
+    match v {
+        .Number(n) -> return n
+        else return none
+    }
+}
+
+// See `as_int` — same wrap-on-zero limitation, so `as_bool(.Bool(false))`
+// currently round-trips to `none`.
+func as_bool(anon v: Value) -> bool? {
+    match v {
+        .Bool(b) -> return b
+        else return none
+    }
+}
+
+// ── Parser ────────────────────────────────────────────────────────────────────
+//
+// Recursive-descent. `pos` advances through `src`; each parse_* leaves
+// pos pointing at the character after the value it consumed. Whitespace
+// (spaces, tabs, newlines) is skipped between values.
+
+type Parser = struct {
+    src: str
+    pos: int64
+
+    func peek(self) -> int64 {
+        if self.pos >= len(self.src) {
+            return 0
+        }
+        return self.src[self.pos]
+    }
+
+    func advance(self) -> int64 {
+        let c: int64 = self.peek()
+        self.pos = self.pos + 1
+        return c
+    }
+
+    func skip_ws(self) -> none {
+        for self.pos < len(self.src) {
+            let c: int64 = self.peek()
+            if c == ' ' or c == '\t' or c == '\n' or c == '\r' {
+                self.pos = self.pos + 1
+            } else {
+                return none
+            }
+        }
+    }
+
+    func expect(self, anon c: int64) -> none {
+        if self.peek() != c {
+            kod_panic("json.parse: unexpected character")
+        }
+        self.pos = self.pos + 1
+    }
+
+    // Check if `lit` matches at the current position and consume it.
+    func consume_literal(self, anon lit: str) -> bool {
+        if self.pos + len(lit) > len(self.src) {
+            return false
+        }
+        let i: int64 = 0
+        for i < len(lit) {
+            if self.src[self.pos + i] != lit[i] {
+                return false
+            }
+            i = i + 1
+        }
+        self.pos = self.pos + len(lit)
+        return true
+    }
+
+    func parse_value(self) -> Value {
+        self.skip_ws()
+        let c: int64 = self.peek()
+        if c == '"' {
+            return .Str(value: self.parse_string())
+        }
+        if c == '{' {
+            return self.parse_object()
+        }
+        if c == '[' {
+            return self.parse_array()
+        }
+        if c == 't' or c == 'f' {
+            return .Bool(value: self.parse_bool())
+        }
+        if c == 'n' {
+            if self.consume_literal("null") {
+                return .Null
+            }
+            kod_panic("json.parse: expected `null`")
+            return .Null
+        }
+        // number — leading '-' or a digit
+        return .Number(value: self.parse_number())
+    }
+
+    func parse_string(self) -> str {
+        self.expect('"')
+        let out: str = ""
+        for self.pos < len(self.src) {
+            let c: int64 = self.advance()
+            if c == '"' {
+                return out
+            }
+            if c == '\\' {
+                let esc: int64 = self.advance()
+                if esc == 'n' { out = out + "\n" }
+                if esc == 't' { out = out + "\t" }
+                if esc == 'r' { out = out + "\r" }
+                if esc == '"' { out = out + "\"" }
+                if esc == '\\' { out = out + "\\" }
+                if esc == '/' { out = out + "/" }
+            } else {
+                let ch: str = self.src[self.pos-1:self.pos]
+                out = out + ch
+            }
+        }
+        kod_panic("json.parse: unterminated string")
+        return out
+    }
+
+    func parse_number(self) -> int64 {
+        let negative: bool = false
+        if self.peek() == '-' {
+            negative = true
+            self.pos = self.pos + 1
+        }
+        let n: int64 = 0
+        let any_digit: bool = false
+        for self.pos < len(self.src) {
+            let c: int64 = self.peek()
+            if c >= '0' and c <= '9' {
+                n = n * 10 + (c - '0')
+                any_digit = true
+                self.pos = self.pos + 1
+            } else {
+                if any_digit == false {
+                    kod_panic("json.parse: expected digit")
+                }
+                if negative { return 0 - n }
+                return n
+            }
+        }
+        if any_digit == false {
+            kod_panic("json.parse: expected digit")
+        }
+        if negative { return 0 - n }
+        return n
+    }
+
+    func parse_bool(self) -> bool {
+        if self.consume_literal("true") {
+            return true
+        }
+        if self.consume_literal("false") {
+            return false
+        }
+        kod_panic("json.parse: expected `true` or `false`")
+        return false
+    }
+
+    func parse_array(self) -> Value {
+        self.expect('[')
+        let items: [Value] = []
+        self.skip_ws()
+        if self.peek() == ']' {
+            self.pos = self.pos + 1
+            return .Array(items: items)
+        }
+        for true {
+            items += [self.parse_value()]
+            self.skip_ws()
+            if self.peek() == ',' {
+                self.pos = self.pos + 1
+                self.skip_ws()
+            } else {
+                self.expect(']')
+                return .Array(items: items)
+            }
+        }
+        return .Array(items: items)
+    }
+
+    func parse_object(self) -> Value {
+        self.expect('{')
+        let keys: [str] = []
+        let values: [Value] = []
+        self.skip_ws()
+        if self.peek() == '}' {
+            self.pos = self.pos + 1
+            return .Object(keys: keys, values: values)
+        }
+        for true {
+            self.skip_ws()
+            let key: str = self.parse_string()
+            self.skip_ws()
+            self.expect(':')
+            let v: Value = self.parse_value()
+            keys += [key]
+            values += [v]
+            self.skip_ws()
+            if self.peek() == ',' {
+                self.pos = self.pos + 1
+            } else {
+                self.expect('}')
+                return .Object(keys: keys, values: values)
+            }
+        }
+        return .Object(keys: keys, values: values)
+    }
+}
+
+func parse(anon src: str) -> Value {
+    let p: Parser = Parser(src: src, pos: 0)
+    return p.parse_value()
+}
+
+// ── Emitter ───────────────────────────────────────────────────────────────────
+
+func escape_string(anon s: str) -> str {
+    let out: str = "\""
+    let i: int64 = 0
+    for i < len(s) {
+        let c: int64 = s[i]
+        if c == '"' {
+            out = out + "\\\""
+        } else if c == '\\' {
+            out = out + "\\\\"
+        } else if c == '\n' {
+            out = out + "\\n"
+        } else if c == '\t' {
+            out = out + "\\t"
+        } else if c == '\r' {
+            out = out + "\\r"
+        } else {
+            out = out + s[i:i+1]
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+func emit(anon v: Value) -> str {
+    match v {
+        .Null -> return "null"
+        .Bool(b) -> {
+            if b { return "true" }
+            return "false"
+        }
+        .Number(n) -> return n.to_str()
+        .Str(s) -> return escape_string(s)
+        .Array(items) -> {
+            let out: str = "["
+            let i: int64 = 0
+            for i < len(items) {
+                if i > 0 { out = out + "," }
+                out = out + emit(items[i])
+                i = i + 1
+            }
+            return out + "]"
+        }
+        .Object(keys, values) -> {
+            let out: str = "{"
+            let i: int64 = 0
+            for i < len(keys) {
+                if i > 0 { out = out + "," }
+                out = out + escape_string(keys[i])
+                out = out + ":"
+                out = out + emit(values[i])
+                i = i + 1
+            }
+            return out + "}"
+        }
+    }
+}
