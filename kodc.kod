@@ -200,6 +200,86 @@ func build_runtime_main_asm(anon mangled: str, has_argv: bool, returns_result: b
         """
 }
 
+// True if any declaration in `module` is a `test "..." { ... }` block.
+func module_has_tests(anon module: ast.Module) -> bool {
+    for d in module.decls {
+        if d is .Test(_display, _decl) {
+            return true
+        }
+    }
+    return false
+}
+
+// Walk the import graph from `module` (which lives at `importer_path`)
+// and collect the mangled prefixes of every reachable test-bearing
+// module. `loaded` and `prefixes` are accumulators threaded through
+// the recursion; returns the updated prefixes list.
+func collect_test_modules(module: ast.Module, importer_path: str, loaded: [str], prefixes: [str]) -> [str] {
+    for d in module.decls {
+        match d {
+            ast.Decl.Import(module_name, _local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: importer_path, module_name)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        let p: parsing.Parser = parse_file(resolved.file)
+                        let im: ast.Module = p.parse_module()
+                        if module_has_tests(im) {
+                            prefixes += [resolved.prefix]
+                        }
+                        prefixes = collect_test_modules(module: im, importer_path: resolved.file, loaded, prefixes)
+                    }
+                }
+            }
+            else none
+        }
+    }
+    return prefixes
+}
+
+// `sh_kodc _emit-test-runtime-main <entry.kod> <out.s>` — parse the
+// entry + every transitively imported module, emit a runtime `_main`
+// that calls `__run_tests` on each module with `test` blocks (entry
+// first, then deps), then `_kod_test_summary` once at the end. The
+// summary's return value (the failure count, capped at 1) becomes
+// the process exit code.
+func emit_test_runtime_main(entry_path: str, out_path: str) -> int64 {
+    let entry_parser: parsing.Parser = parse_file(entry_path)
+    let entry_module: ast.Module = entry_parser.parse_module()
+    let prefixes: [str] = []
+    if module_has_tests(entry_module) {
+        prefixes += [path_to_prefix(entry_path)]
+    }
+    let loaded: [str] = []
+    prefixes = collect_test_modules(module: entry_module, importer_path: entry_path, loaded, prefixes)
+
+    let calls: str = ""
+    for prefix in prefixes {
+        calls = calls + f"    bl ${prefix}$__run_tests\n"
+    }
+    let asm: str = f"""
+        .text
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+        {calls}    bl _kod_test_summary
+            ldp x29, x30, [sp], #16
+            ret
+        """
+    if io.write_file(out_path, asm) != 0 {
+        kod_eprint(f"_emit-test-runtime-main: failed to write {out_path}")
+        return 1
+    }
+    return 0
+}
+
 // `sh_kodc _emit-runtime-main <entry.kod> <out.s>` — parse the entry,
 // inspect `func main`'s shape (argv / Result), write the runtime _main
 // shim asm to <out.s>.
@@ -233,7 +313,7 @@ func emit_runtime_main(entry_path: str, out_path: str) -> int64 {
     let has_argv: bool = len(main_decl.params) > 0
     let mangled: str = path_to_prefix(entry_path)
     let asm: str = build_runtime_main_asm(mangled, has_argv: has_argv, returns_result: returns_result)
-    if write_file(out_path, asm) != 0 {
+    if io.write_file(out_path, asm) != 0 {
         kod_eprint(f"_emit-runtime-main: failed to write {out_path}")
         return 1
     }
@@ -243,6 +323,9 @@ func emit_runtime_main(entry_path: str, out_path: str) -> int64 {
 func main(argv: [str]) -> int64 {
     if len(argv) >= 4 and argv[1] == "_emit-runtime-main" {
         return emit_runtime_main(entry_path: argv[2], out_path: argv[3])
+    }
+    if len(argv) >= 4 and argv[1] == "_emit-test-runtime-main" {
+        return emit_test_runtime_main(entry_path: argv[2], out_path: argv[3])
     }
     let path: str = argv[1]
 

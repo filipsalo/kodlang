@@ -82,9 +82,18 @@ print(len(m).to_str())   // 2
 
 ## I/O
 
+The `io` module wraps the filesystem primitives. Both calls require
+`import "io"` — touching the filesystem is explicit at the import line.
+
 ```kod
 import "io"
+
+// Read whole file. Returns "" if the file can't be opened.
 let contents: str = io.read_file("data.txt")
+
+// Write a file, replacing it if it exists. Returns 0 on success,
+// -1 on failure. The parent directory must already exist.
+let rc: int64 = io.write_file("out.txt", "hello\n")
 ```
 
 For subprocess support, see `stdlib/process.kod`:

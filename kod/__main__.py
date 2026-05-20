@@ -75,6 +75,10 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("file", type=str)
     p.add_argument("out", type=str)
 
+    p = subparsers.add_parser("_emit-test-runtime-main")
+    p.add_argument("file", type=str)
+    p.add_argument("out", type=str)
+
     subparsers.add_parser("_build-stage0")
 
     return parser
@@ -183,6 +187,30 @@ def main():
             print(err, file=sys.stderr)
             return 1
         out.write_text(bob.compose_runtime_main_asm(entry_module))
+        return 0
+
+    if args.command == "_emit-test-runtime-main":
+        # Mirrors _emit-runtime-main: prefers sh_kodc when fresh,
+        # falls back to the Python composer during bootstrap.
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        stdlib_fs = FileSystem(find_stdlib_path())
+        project_fs = FileSystem(Path.cwd())
+        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
+        sh_kodc = bob.build_root / "stage1" / "sh_kodc"
+        if sh_kodc.exists() and not bob._sh_kodc_stale(sh_kodc):
+            result = subprocess.run(
+                [str(sh_kodc), "_emit-test-runtime-main", args.file, str(out)],
+                check=False,
+            )
+            return result.returncode
+        entry_module = project_fs.open(Path(args.file).absolute())
+        try:
+            bob.parse_program(entry_module)
+        except KodError as err:
+            print(err, file=sys.stderr)
+            return 1
+        out.write_text(bob.compose_test_runtime_main_asm(entry_module))
         return 0
 
     bob, program, entry_module = _open_program(args.file)

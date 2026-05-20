@@ -6,13 +6,13 @@ pinpoint location, or where the locus might move.
 
 ## Self-hosting / build pipeline
 
-- [ ] **Port `compose_test_runtime_main_asm` to Kod.** The test variant
-      needs to find every module with `test` blocks across the import
-      graph. (Transitive walking landed; this is now unblocked.)
-- [ ] **Route the integrated `kod build` path through sh_kodc** for
-      `compose_runtime_main_asm`. Currently only the CLI handler in
-      `kod/__main__.py` delegates; `kod/builder.py:build_runtime_main`
-      still uses the Python composer in-process.
+- [ ] **Route the integrated `kod build` / `kod test` paths through
+      sh_kodc** for `compose_runtime_main_asm` /
+      `compose_test_runtime_main_asm`. The CLI handlers in
+      `kod/__main__.py` now delegate to sh_kodc when fresh, but the
+      in-process composers in `kod/builder.py` are still called
+      directly. The Kod-side composers exist (kodc.kod) and produce
+      assembler-equivalent output; just need to switch the call.
 
 ## Codegen
 
