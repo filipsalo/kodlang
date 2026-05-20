@@ -1,15 +1,74 @@
-// Helpers for compiler tests written in Kod. Each test that needs to
-// assert on compiler diagnostics writes a source snippet (typically as
-// a triple-quoted string), passes it to `compile_source`, and inspects
-// the captured exit code / stdout / stderr.
+// Helpers for compiler tests written in Kod. Two layers:
+//
+//  - `try_compile(src)` runs lexer + parser + dry-run codegen
+//    in-process and returns the codegen's accumulated error list.
+//    Fast (no subprocess); limited to single-file snippets (no
+//    imports). Use for typecheck-style tests.
+//
+//  - `compile_source(src)` writes `src` to a scratch file and spawns
+//    sh_kodc on it, returning the captured ProcessResult. Slower,
+//    but supports the full compile pipeline including codegen for
+//    multi-module setups. Use when `try_compile` isn't enough.
 
 import "io"
 import "process"
+import "kod/lexing"
+import "kod/parsing"
+import "kod/ast"
+import "kod/codegen"
 
-// Write `src` to a scratch file in the project root, invoke sh_kodc on
-// it, return the captured process result. The scratch path is the same
-// for every call; tests that run in sequence (the default) are fine,
-// concurrent test runs would race.
+func parse_kod(anon path: str) -> parsing.Parser {
+    let source: str = io.read_file(path)
+    let lxr: lexing.Lexer = lexing.Lexer(source: source, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    return parsing.make_parser(tokens, path: path, source: source)
+}
+
+// Lex + parse + run a dry-run codegen over `src`. Returns the
+// codegen's error list — empty when the snippet compiled cleanly.
+// Only suitable for single-file snippets; cross-module behaviour needs
+// `compile_source` (subprocess + temp file).
+func try_compile(anon src: str) -> [str] {
+    let builtins_parser: parsing.Parser = parse_kod("stdlib/builtins.kod")
+    let builtins_module: ast.Module = builtins_parser.parse_module()
+    let int64_parser: parsing.Parser = parse_kod("stdlib/primitives/int64.kod")
+    let int64_module: ast.Module = int64_parser.parse_module()
+    let str_parser: parsing.Parser = parse_kod("stdlib/primitives/str.kod")
+    let str_module: ast.Module = str_parser.parse_module()
+    let bool_parser: parsing.Parser = parse_kod("stdlib/primitives/bool.kod")
+    let bool_module: ast.Module = bool_parser.parse_module()
+
+    let lxr: lexing.Lexer = lexing.Lexer(source: src, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    let p: parsing.Parser = parsing.make_parser(tokens, path: "<test>", source: src)
+    let module: ast.Module = p.parse_module()
+
+    let cg: codegen.Codegen = codegen.make_codegen(p, "test")
+    cg.dry_run = true
+    cg.register_module_funcs(builtins_module, prefix: "builtins", p: builtins_parser)
+    cg.register_module_types(builtins_module, prefix: "builtins", p: builtins_parser)
+    cg.register_primitive_module(int64_module, kind: .KInt64, prefix: "primitives$int64", p: int64_parser)
+    cg.register_primitive_module(str_module, kind: .KStr, prefix: "primitives$str", p: str_parser)
+    cg.register_primitive_module(bool_module, kind: .KBool, prefix: "primitives$bool", p: bool_parser)
+    cg.resolve_field_kinds()
+    cg.compile_module(module)
+    return cg.errors
+}
+
+// True if any string in `errs` contains `needle`.
+func any_contains(anon errs: [str], needle: str) -> bool {
+    for e in errs {
+        if e.contains(needle) {
+            return true
+        }
+    }
+    return false
+}
+
+// Subprocess path: write `src` to a scratch file at the project root
+// and invoke sh_kodc on it. Returns the captured ProcessResult so
+// tests can inspect status / stdout / stderr. Use when `try_compile`
+// is not enough (e.g. cross-module).
 func compile_source(anon src: str) -> process.ProcessResult {
     let scratch: str = ".kod_compile_test.kod"
     io.write_file(scratch, src)
