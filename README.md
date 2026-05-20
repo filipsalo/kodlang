@@ -4,24 +4,28 @@ Kod is a toy language that compiles to AArch64 machine code for macOS.
 
 ## Example
 
-```go
+```kod
 // hello.kod
-func main() -> int32 {
+func main() -> int64 {
     // This is a comment
     print("Hello, world!")
+    return 0
 }
 ```
 
 ### Compiling
 
 ```shell
-# python -m kod build hello.kod
-# ./build/hello
+# uv run kod build hello.kod
+# ./build/apps/hello/hello
 Hello, world!
 ```
 
-### Output the AST
+### Running tests
 
 ```shell
-# python -m kod parse hello.kod
+# uv run kod test stdlib    # all tests under stdlib/
+# uv run kod test .         # everything under the project
 ```
+
+See `docs/` for the full language reference.

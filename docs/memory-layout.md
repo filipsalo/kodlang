@@ -58,13 +58,16 @@ q.x = 10               // also modifies p.x
 
 ## Enum values
 
-Enums are currently **stack-allocated** (a future change will make them
-arena-allocated like structs). A stack slot holds the full enum inline:
+Enums are **arena-allocated**, like structs. A stack slot holds an 8-byte
+pointer; the cell at the pointer is:
 
 ```
-[offset 0]  discriminant : int64  (8 bytes, variant index starting from 0)
+[offset 0]  discriminant : int64  (variant index starting from 0)
 [offset 8]  payload      : max(variant payload sizes) bytes
 ```
+
+Because enum variables are pointers, they fit in a single register and pass
+through the ARM64 calling convention without any multi-word ABI gymnastics.
 
 See `docs/enums.md` for details.
 

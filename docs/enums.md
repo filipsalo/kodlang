@@ -104,9 +104,21 @@ Direction.North == Direction.South  // false
 
 In the compiler this is a single integer comparison on the discriminant.
 
+## `match` as an expression
+
+A match can produce a value when every arm body is an expression:
+
+```kod
+let label: str = match d {
+    .North -> "north"
+    .South -> "south"
+    .East  -> "east"
+    .West  -> "west"
+}
+```
+
 ## Current limitations
 
-- Enums cannot be passed as function arguments in compiled mode (multi-word ABI not yet implemented)
-- No exhaustiveness checking
-- No nested patterns
-- `match` is a statement, not an expression
+- No exhaustiveness checking — a match that doesn't cover every variant just falls through silently.
+- No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value).
+- No guard clauses on match arms.

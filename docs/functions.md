@@ -20,24 +20,55 @@ Parameters are `name: Type`. The return type follows `->`. Functions that return
 let result: int64 = add(1, 2)
 ```
 
-Arguments are passed positionally.
+## Call labels
 
-## Anonymous parameters
+Calls use labeled arguments by default; the parameter name *is* the label:
 
-Mark a parameter `anon` to allow callers to pass it without a label:
+```kod
+func greet(name: str) -> none {
+    print(f"Hello, {name}!")
+}
+
+greet(name: "Alice")
+```
+
+`anon` removes the label requirement for that parameter:
 
 ```kod
 func double(anon n: int64) -> int64 {
     return n * 2
 }
 
-let x: int64 = double(5)   // no label needed
+double(5)
 ```
 
-Without `anon`, the parameter name becomes a required label at the call site. This only applies when calling functions — the parameter still has a name inside the function body.
+Convention: when calling, label every parameter except 1–2 of a single shared
+type (e.g. `slice(arr, from: 0, to: 3)` is fine; passing a label for `arr`
+is just noise).
 
-!!! note
-    Currently all parameters behave as positional (no labeled call syntax at call sites yet). `anon` is a declaration hint used by the type system.
+If a passed argument is a bare identifier with the same name as the
+parameter, the label can be elided:
+
+```kod
+let name: str = "Alice"
+greet(name)           // shorthand for greet(name: name)
+```
+
+## Label / binding split
+
+A parameter can have two names — an external *label* used at call sites and
+an internal *binding* used inside the function body:
+
+```kod
+func greet(who person: str) -> none {
+    print(f"Hello, {person}!")
+}
+
+greet(who: "Alice")
+```
+
+Useful for prepositions that make call sites read naturally without forcing
+short variable names inside the function.
 
 ## `main`
 

@@ -15,33 +15,27 @@ func main() -> int64 {
 }
 ```
 
-**Interpret** (fast, no compilation step):
+**Build** and run:
 
 ```shell
-$ python -m kod interpret hello.kod
+$ uv run kod build hello.kod
+$ ./build/apps/hello/hello
 Hello, world!
 ```
 
-**Compile** to a native binary:
-
-```shell
-$ python -m kod build hello.kod
-$ ./build/hello
-Hello, world!
-```
+`uv run kod run hello.kod` does both in one step.
 
 ## A real program
 
 ```kod
-func greet(name: str) -> none {
+func greet(anon name: str) -> none {
     print(f"Hello, {name}!")
 }
 
 func main() -> int64 {
     let names: [str] = ["Alice", "Bob", "Carol"]
-    for i < len(names) {
-        greet(names[i])
-        i = i + 1
+    for name in names {
+        greet(name)
     }
     return 0
 }
@@ -49,7 +43,7 @@ func main() -> int64 {
 
 ## Variables
 
-Variables are declared with `let` and require a type annotation:
+Variables are declared with `let`. A type annotation is usually required:
 
 ```kod
 let x: int64 = 42
@@ -63,8 +57,30 @@ Reassignment uses `=`:
 x = x + 1
 ```
 
+## A test file
+
+```kod
+// arithmetic_test.kod
+test "addition" {
+    assert 2 + 2 == 4
+}
+
+test "subtraction" {
+    assert 10 - 3 == 7
+}
+```
+
+```shell
+$ uv run kod test arithmetic_test.kod
+ok   addition
+ok   subtraction
+
+2/2 passed
+```
+
 ## Next steps
 
 - [Types](types.md) — the full type system
 - [Functions](functions.md) — declaration, parameters, return types
 - [Control flow](control-flow.md) — `if`, `for`, `match`
+- [Testing](testing.md) — the `test` and `assert` syntax

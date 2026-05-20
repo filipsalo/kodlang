@@ -117,7 +117,7 @@ if x is not none {
 
 ## Match as expression
 
-`match` can be used as an expression in some contexts:
+A `match` produces a value when every arm body is a single expression:
 
 ```kod
 let label: str = match direction {
@@ -128,8 +128,30 @@ let label: str = match direction {
 }
 ```
 
-!!! note
-    Match expressions are supported in the interpreter. Compiler support is partial.
+For multi-statement arm bodies, use a match statement and assign or
+return from inside.
+
+## `if X is .Variant(bindings) { ... }`
+
+When you want a one-arm match with bindings in scope for the body, the
+`if`/`is` sugar is shorter than a full `match`:
+
+```kod
+if module.decls[i] is .Func(decl_id) {
+    // decl_id is in scope here
+}
+```
+
+## `let .Pattern(bindings) = expr else { ... }`
+
+Destructure with an early-exit on the non-matching case. The `else`
+block must exit the enclosing scope (return / throw / panic) so the
+bindings are guaranteed-in-scope below:
+
+```kod
+let .Some(v) = m.get(key) else { return -1 }
+// v is in scope here
+```
 
 ## Limitations
 

@@ -52,15 +52,23 @@ let x: int64? = none
 let y: int64? = 42
 ```
 
-Test with `is`:
+Test with `is` and destructure with `Some(binding)`:
 
 ```kod
 if x is none {
     print("nothing")
 }
-if y is not none {
-    print_int(y!)   // ! unwraps
+match y {
+    Some(v) -> print_int(v)
+    none -> print("nothing")
 }
+```
+
+Or peel off the `Some` with `let .Some(v) = y else { ... }`:
+
+```kod
+let .Some(v) = y else { return -1 }
+// v is in scope and has type int64
 ```
 
 ## Arrays
@@ -99,3 +107,55 @@ type Shape = enum {
 ```
 
 See [Enums](enums.md).
+
+## Generics
+
+Type-parametric structs are monomorphised at compile time:
+
+```kod
+type Pair[A, B] = struct {
+    first: A
+    second: B
+}
+
+let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
+```
+
+`Map[K, V]` (in `builtins`) is the canonical example.
+
+## Interfaces
+
+Method-based contracts that types can opt into by declaring the right methods. Primitives implement them implicitly via boxing.
+
+```kod
+interface Stringable {
+    func to_str(self) -> str
+}
+
+func show(anon x: Stringable) -> none {
+    print(x.to_str())
+}
+
+show(42)        // works — int64 implements Stringable via primitives/int64.kod
+show(true)      // same for bool
+```
+
+## Fallible types: `T or Error`
+
+A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
+
+```kod
+type IoError = struct {
+    message: str
+    func to_str(self) -> str { return self.message }
+}
+
+func read_size(anon path: str) -> int64 or Error {
+    throw IoError(message: f"file not found: {path}")
+}
+
+func main() -> int64 {
+    let n: int64 = must read_size("missing.txt")  // panics on Err
+    return n
+}
+```

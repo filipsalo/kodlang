@@ -4,71 +4,81 @@ icon: lucide/terminal
 
 # CLI reference
 
-Invoke Kod via `python -m kod <command> <file>`.
+The CLI is `kod` (installed as a [project script](install.md)). Run via `uv run kod ...` from the project, or install globally with `uv tool install .`.
 
-## Commands
+## Public commands
 
-### `interpret`
+### `kod build <file>`
 
-Run a program through the Python interpreter. No compilation step — fast for development.
-
-```shell
-python -m kod interpret hello.kod
-```
-
-### `run`
-
-Alias for `interpret`.
-
-### `build`
-
-Compile a program to a native ARM64 binary. Output goes to `build/<name>`.
+Compile a Kod source file to a native ARM64 binary.
 
 ```shell
-python -m kod build hello.kod
-./build/hello
+uv run kod build hello.kod
+./build/apps/hello/hello
 ```
 
-The build process:
+Build pipeline:
 
-1. Parse all modules
-2. Compile each module to ARM64 assembly (`.s` files in `build/`)
-3. Assemble with `as`
-4. Link with `ld` against the runtime (`arena.c`, `runtime.c`)
+1. Parse all transitively-imported modules.
+2. Emit ARM64 assembly for each module (via `sh_kodc` when available, Python interpreter as fallback during bootstrap).
+3. Assemble each `.s` with `as`.
+4. Compile `stdlib/{arena,runtime}.c` with `clang`.
+5. Generate the `_main` runtime shim that calls the user's `main`.
+6. Link everything with `ld`.
 
-### `compile`
+### `kod run <file>`
 
-Emit assembly for a single module to stdout without assembling:
+`kod build` + execute. Arguments after the file are passed to the program.
 
 ```shell
-python -m kod compile hello.kod
+uv run kod run hello.kod
 ```
 
-Useful for inspecting the generated ARM64 assembly.
+### `kod test <path>`
 
-### `parse`
+Run `test "..." { ... }` blocks. Path can be a file or a directory.
 
-Parse a file and dump the AST to stdout:
+- File: builds the file + all transitively-imported modules that contain tests, runs everything in one binary, prints a rolled-up summary.
+- Directory: walks for `*_test.kod` and runs them all together via a temporary aggregator.
 
 ```shell
-python -m kod parse hello.kod
+uv run kod test stdlib/map_test.kod
+uv run kod test stdlib            # everything under stdlib/
+uv run kod test .                 # everything in the project
 ```
 
-## Options
+See [Testing](testing.md) for the syntax.
 
-| Flag | Description |
+### `kod check <file>`
+
+Run the full compile pipeline through codegen, report errors, but write no artifacts and skip the link step. Exits non-zero on any error.
+
+```shell
+uv run kod check src/foo.kod
+```
+
+### `kod fmt <file>`
+
+Not yet implemented.
+
+## Build outputs
+
+| Path | Description |
 |------|-------------|
-| `--no-type-check` | Skip type checking (interpreter mode only) |
+| `build/stage0/` | Shared stdlib objects: `arena.o`, `runtime.o`, `_builtins.o`, `_int64.o`, `_str.o`, `_bool.o`. Reused by `sh_kodc` and every app. |
+| `build/stage1/` | The self-hosted compiler `sh_kodc` and its parts (`lexing.{s,o}`, `parsing.{s,o}`, `codegen.{s,o}`, `kodc.{s,o}`, `runtime_main.{s,o}`). |
+| `build/apps/<stem>/` | Per-app artifacts: each module's `.s` and `.o`, the runtime_main shim, and the final executable (or `<stem>_test` for `kod test`). |
 
-## Output files
+`make clean-apps`, `make clean-stage1`, `make clean` give scoped cleanup.
 
-`build/` is created in the project root and contains:
+## Internal / debug commands
 
-| File | Description |
-|------|-------------|
-| `build/<name>` | Final executable |
-| `build/<module>.s` | Assembly source for each module |
-| `build/<module>.o` | Object file for each module |
-| `build/runtime_main.s` | Generated `_main` trampoline |
-| `build/arena.o` | Compiled arena allocator |
-| `build/runtime.o` | Compiled string/array runtime |
+These exist to support the bootstrap and for debugging. Their shape may change.
+
+| Command | Purpose |
+|---------|---------|
+| `kod _interpret <file>` | Run via the Python interpreter (slow; used by sh_kodc's bootstrap). |
+| `kod _emit-asm <file>` | Print the assembly for the entry module to stdout. |
+| `kod _dump-ast <file>` | Pretty-print the parsed AST. |
+| `kod _emit-runtime-main <entry.kod> <out.s>` | Write the `_main` shim for the given entry. Delegates to sh_kodc when available. |
+| `kod _build-stage0` | Build the shared stage0 objects without producing an executable. |

@@ -7,8 +7,8 @@ icon: lucide/download
 ## Requirements
 
 - macOS on Apple Silicon (AArch64)
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Python 3.13+
+- [uv](https://docs.astral.sh/uv/) (recommended)
 - Xcode Command Line Tools (`xcode-select --install`) — provides `as`, `ld`, and `clang`
 
 ## From source
@@ -19,17 +19,31 @@ cd kod
 uv sync
 ```
 
+## Building the self-hosted compiler
+
+The Makefile bootstraps everything from scratch:
+
+```shell
+make bootstrap   # clean rebuild of stage0 + stage1 (sh_kodc)
+make stage1      # incremental rebuild
+make test        # run pytest
+```
+
 ## Running
 
-Use `uv run` to invoke the `kod` module:
+`kod` is installed as a `uv run` script:
 
 ```shell
-uv run python -m kod interpret hello.kod   # interpret
-uv run python -m kod build hello.kod       # compile to native binary
+uv run kod build hello.kod   # compile to a native binary
+uv run kod run hello.kod     # build + execute
+uv run kod test hello.kod    # run any `test "..." {}` blocks
+uv run kod check hello.kod   # parse + codegen; report errors but emit nothing
 ```
 
-Or add a shell alias:
+For a global install:
 
 ```shell
-alias kod='uv run python -m kod'
+uv tool install .   # puts `kod` on your PATH
 ```
+
+See [CLI reference](cli.md) for the full command surface.

@@ -74,9 +74,32 @@ Call methods with dot notation:
 ```kod
 let p: Point = Point(x: 3, y: 4)
 print_int(p.distance_sq())   // 25
-p.translate(1, 0)
+p.translate(dx: 1, dy: 0)
 print_int(p.x)               // 4
 ```
+
+Methods can also be invoked on non-`Ident` receivers — `0.to_str()`,
+`p.field.method()`, `f().bar()`, etc.
+
+## Generic structs
+
+Type parameters in square brackets after the name; each unique
+instantiation is monomorphised:
+
+```kod
+type Pair[A, B] = struct {
+    first: A
+    second: B
+
+    func swap(self) -> Pair[B, A] {
+        return Pair[B, A](first: self.second, second: self.first)
+    }
+}
+
+let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
+```
+
+The built-in `Map[K, V]` is the canonical example.
 
 ## Memory layout (compiler)
 

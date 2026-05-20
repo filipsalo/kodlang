@@ -23,17 +23,16 @@ let name: str = "world"
 print(f"hello, {name}!")          // hello, world!
 
 let n: int64 = 42
-print(f"the answer is {int_to_str(n)}")
+print(f"the answer is {n}")       // the answer is 42
 ```
 
-Anything inside `{ }` is a Kod expression. Multiple interpolations:
+Anything inside `{ }` is a Kod expression. Non-`str` values are auto-converted via their `to_str` method:
 
 ```kod
-print(f"{a} + {b} = {int_to_str(a + b)}")
+print(f"{a} + {b} = {a + b}")
+print(f"flag={true}")             // flag=true
+print(f"items: {items.len()}")    // any type with to_str works
 ```
-
-!!! note
-    `int64` values must be converted to `str` explicitly (e.g. `int_to_str(n)`) before interpolation. There is no implicit conversion.
 
 ## Concatenation
 
@@ -84,8 +83,14 @@ String equality compares contents, not identity.
 
 ## Conversion
 
+Primitives have a `to_str` method:
+
 ```kod
-let s: str = int_to_str(42)    // "42"
+let s: str = 42.to_str()           // "42"
+let t: str = true.to_str()         // "true"
+let u: str = "hi".to_str()         // identity
 ```
+
+Structs can opt in by declaring `func to_str(self) -> str`. F-string interpolation calls `to_str` automatically.
 
 See [Built-ins](builtins.md) for the full list of string-related functions.
