@@ -153,8 +153,42 @@ let .Some(v) = m.get(key) else { return -1 }
 // v is in scope here
 ```
 
-## Limitations
+## Exhaustiveness
 
-- No exhaustiveness checking — unmatched values fall through silently
+A `match` on an enum (or on `T?`) must cover every variant. The
+compiler reports an error if any variant is missing and no wildcard
+arm is present.
+
+```kod
+type Color = enum { Red, Green, Blue }
+
+let c: Color = .Red
+// error: match on Color doesn't cover variant Blue
+match c {
+    .Red -> print("red")
+    .Green -> print("green")
+}
+```
+
+Add the missing arm or a wildcard:
+
+```kod
+match c {
+    .Red -> print("red")
+    .Green -> print("green")
+    _ -> print("other")
+}
+```
+
+The single-arm sugar (`if X is .V(b) { ... }` and `let .V(b) = X else
+{ ... }`) is not subject to exhaustiveness — they're explicitly
+one-variant checks.
+
+Integer and string matches don't get exhaustiveness checking;
+unmatched values fall through silently (will become a wildcard-arm
+requirement in a future change).
+
+## Other limitations
+
 - No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value)
 - No guard clauses (`if` conditions on arms)

@@ -376,6 +376,69 @@ type Codegen = struct {
         }
     }
 
+    // Exhaustiveness check for matches whose subject is an enum or
+    // optional. A wildcard arm satisfies coverage; otherwise every
+    // variant (or both `Some` and `none` for optionals) must appear
+    // in at least one arm. Reports one error per uncovered variant
+    // so a partial match surfaces every gap in a single pass.
+    // Matches on primitives (int64, str, bool) aren't checked here —
+    // see TODO.md.
+    func check_match_exhaustive(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
+        let has_wildcard: bool = false
+        for pid in pattern_ids {
+            if self.p.patterns[pid] is .Wildcard {
+                has_wildcard = true
+            }
+        }
+        if has_wildcard {
+            return none
+        }
+        let subj_kind = self.infer_kind(subject_id)
+        if subj_kind is .KEnum(enum_idx) {
+            let enum_info = self.enums[enum_idx]
+            for variant in enum_info.variants {
+                let covered: bool = false
+                for pid in pattern_ids {
+                    match self.p.patterns[pid] {
+                        .EnumPat(_enum_name, variant_name, _bindings) -> {
+                            if variant_name == variant.name {
+                                covered = true
+                            }
+                        }
+                        .ImplicitEnumPat(variant_name, _bindings) -> {
+                            if variant_name == variant.name {
+                                covered = true
+                            }
+                        }
+                        else none
+                    }
+                }
+                if covered == false {
+                    self.report_error(f"error: match on `{enum_info.name}` doesn't cover variant `{variant.name}`", span: self.p.expr_spans[subject_id])
+                }
+            }
+        }
+        if subj_kind is .KOptional(_inner) {
+            let has_some: bool = false
+            let has_none: bool = false
+            for pid in pattern_ids {
+                let pat = self.p.patterns[pid]
+                if pat is .SomePat(_b) {
+                    has_some = true
+                }
+                if pat is .NonePat {
+                    has_none = true
+                }
+            }
+            if has_some == false {
+                self.report_error("error: match on optional doesn't cover `Some(_)`", span: self.p.expr_spans[subject_id])
+            }
+            if has_none == false {
+                self.report_error("error: match on optional doesn't cover `none`", span: self.p.expr_spans[subject_id])
+            }
+        }
+    }
+
     // Check that a function declaration's parameter list places anon
     // parameters before any labeled ones. Reports one error per
     // out-of-order anon param. The implicit `self` receiver of a method
@@ -2568,6 +2631,11 @@ type Codegen = struct {
     }
 
     func compile_match_expr(self, anon arms: [int64], subject_id: int64) -> Val {
+        let expr_patterns: [int64] = []
+        for arm_id in arms {
+            expr_patterns += [self.p.match_expr_arms[arm_id].pattern]
+        }
+        self.check_match_exhaustive(subject_id, pattern_ids: expr_patterns)
         let done_lbl = self.fresh("Lmexpr_done")
         let subj_val = self.compile_expr(subject_id)
         let sptr_r = self.load(subj_val)
@@ -3884,6 +3952,11 @@ type Codegen = struct {
 
     func compile_match_stmt(self, anon arms: [int64], subject_id: int64) -> none {
         self.check_match_subject(subject_id, arms)
+        let stmt_patterns: [int64] = []
+        for arm_id in arms {
+            stmt_patterns += [self.p.match_arms[arm_id].pattern]
+        }
+        self.check_match_exhaustive(subject_id, pattern_ids: stmt_patterns)
         let done_lbl = self.fresh("Lmatch_done")
         // Evaluate subject once; stash its pointer on the stack so pattern
         // bindings can read fields off the subject after disc_r is consumed.

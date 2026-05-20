@@ -46,8 +46,10 @@ pinpoint location, or where the locus might move.
 
 ## Match / enums
 
-- [ ] Exhaustiveness checking for match — the codegen accepts a match
-      that doesn't cover every variant and just falls through.
+- [ ] Wildcard-arm requirement for `int64` and `str` matches. Today
+      they silently fall through on unmatched values; future change
+      either requires a `_` arm at compile time or inserts a runtime
+      panic for the no-arm case.
 
 ## Build process
 

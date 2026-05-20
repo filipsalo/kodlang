@@ -119,6 +119,5 @@ let label: str = match d {
 
 ## Current limitations
 
-- No exhaustiveness checking — a match that doesn't cover every variant just falls through silently.
 - No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value).
 - No guard clauses on match arms.
