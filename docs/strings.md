@@ -48,6 +48,45 @@ buf += "  two\n"
 
 `+=` works on struct fields too: `obj.message += " (cont.)"`.
 
+## Multi-line strings
+
+Triple-quoted strings span multiple lines:
+
+```kod
+let preamble: str = """
+    .text
+    .globl _main
+    _main:
+    """
+```
+
+The closing `"""` must sit on its own line. Its indent anchors the
+dedent — every content line has at least that many leading spaces (or
+tabs) stripped. The newline immediately after the opening `"""` is
+not part of the value; the newline before the closing `"""` is. So
+the example above produces:
+
+```
+.text
+.globl _main
+_main:
+```
+
+(four-space indent gone; trailing newline kept).
+
+Combine with `f` for interpolation:
+
+```kod
+let asm: str = f"""
+    bl ${mangled}$main
+    ret
+    """
+```
+
+Escape sequences (`\n`, `\t`, `\\`) work the same as regular strings.
+Each content line must be indented at least as far as the closing
+`"""`; a content line with less indent is a lex error.
+
 ## Length
 
 ```kod

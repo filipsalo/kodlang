@@ -54,6 +54,28 @@ class Literal:
     span: Span
 
 
+def _dedent_triple_body(body: str) -> str:
+    """Dedent a triple-quoted string body (the text between opening
+    and closing triple quotes). The first line up to and including
+    the first newline is discarded; the indent of the closing-line
+    is stripped from each subsequent line that starts with it."""
+    first_nl = body.find("\n")
+    if first_nl == -1:
+        return ""
+    content_start = first_nl + 1
+    last_nl = body.rfind("\n")
+    if last_nl < content_start:
+        return ""
+    indent = body[last_nl + 1 :]
+    content = body[content_start : last_nl + 1]
+    out = []
+    for line in content.splitlines(keepends=True):
+        if len(line) >= len(indent) + 1 and line.startswith(indent):
+            line = line[len(indent) :]
+        out.append(line)
+    return "".join(out)
+
+
 @dataclasses.dataclass
 class StringLiteral(ASTNode, Literal):
     """A string literal."""
@@ -63,9 +85,15 @@ class StringLiteral(ASTNode, Literal):
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
-        """Parse a string literal."""
+        # Parses both `"..."` and triple-quoted forms.
         token = parser.consume(tokens.StringLiteral)
-        bytes_ = token.value.strip('"').encode("utf8")
+        raw = token.value
+        if len(raw) >= 6 and raw.startswith('"""') and raw.endswith('"""'):
+            body = _dedent_triple_body(raw[3:-3])
+            text = body.encode().decode("unicode-escape")
+            bytes_ = text.encode("utf8")
+        else:
+            bytes_ = raw.strip('"').encode("utf8")
         value = types.String(bytes_)
         return cls(value, span=token.span)
 
@@ -75,8 +103,11 @@ def _parse_fstring(parser: Parser) -> ASTNode:
     from kod.lexer import Lexer
 
     token = parser.consume(tokens.FStringLiteral)
-    # token.value is the raw source: f"hello {name} world"
-    inner = token.value[2:-1]  # strip f" and trailing "
+    raw = token.value
+    if len(raw) >= 7 and raw.startswith('f"""') and raw.endswith('"""'):
+        inner = _dedent_triple_body(raw[4:-3])
+    else:
+        inner = raw[2:-1]  # strip f" and trailing "
     span = token.span
 
     def make_str(text: str) -> StringLiteral:

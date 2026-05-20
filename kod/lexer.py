@@ -168,9 +168,33 @@ class Lexer:
         token.value = str(ord(char))
         return token
 
+    def _peek_at(self, offset: int) -> str:
+        i = self.pos + offset
+        if i < len(self.source):
+            return self.source[i]
+        return ""
+
     def lex_string(self) -> StringLiteral:
-        """Lex a quoted string."""
+        # Lex a quoted string. Both single and triple-quoted forms.
         self.consume('"')
+        # Triple-quoted? Dedent + escape processing happen in the parser.
+        if self.peek() == '"' and self._peek_at(1) == '"':
+            self.consume('"')
+            self.consume('"')
+            while True:
+                if self.peek() == "":
+                    raise self.error("Unterminated triple-quoted string")
+                if (
+                    self.peek() == '"'
+                    and self._peek_at(1) == '"'
+                    and self._peek_at(2) == '"'
+                ):
+                    self.consume('"')
+                    self.consume('"')
+                    self.consume('"')
+                    break
+                self.pos += 1
+            return self.build(StringLiteral)
         while self.peek() != '"':
             self.pos += 1
         self.consume('"')
@@ -179,8 +203,32 @@ class Lexer:
         return string
 
     def lex_fstring(self) -> FStringLiteral:
-        """Lex an f-string literal f"...{expr}..."."""
+        # Lex an f-string literal — both single-line and triple-quoted forms.
         self.consume('"')
+        if self.peek() == '"' and self._peek_at(1) == '"':
+            self.consume('"')
+            self.consume('"')
+            depth = 0
+            while True:
+                ch = self.peek()
+                if ch == "":
+                    raise self.error("Unterminated triple-quoted f-string")
+                if (
+                    ch == '"'
+                    and depth == 0
+                    and self._peek_at(1) == '"'
+                    and self._peek_at(2) == '"'
+                ):
+                    self.consume('"')
+                    self.consume('"')
+                    self.consume('"')
+                    break
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                self.pos += 1
+            return self.build(FStringLiteral)
         depth = 0
         while True:
             ch = self.peek()
