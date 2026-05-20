@@ -46,10 +46,6 @@ The stdlib lives under `stdlib/` in the repository.
 
 Circular imports are not supported. The dependency graph must be a DAG.
 
-## Transitive imports
-
-The current driver registers modules the entry file imports *directly*. If A imports B and B imports a type from C, the entry must also import C explicitly until the transitive walk lands. See `TODO.md`.
-
 ## Visibility
 
 All top-level declarations (functions, types, variables) are visible to importing modules. There is no explicit `pub`/`private` distinction yet.

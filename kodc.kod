@@ -86,6 +86,39 @@ func resolve_import(target_path: str, module_name: str) -> Resolved {
     return Resolved(file: std_file, prefix: std_prefix)
 }
 
+// Recursively register types from a module's own imports. The
+// transitively-loaded modules don't get import aliases or function
+// exports — they're loaded purely so the codegen can resolve types
+// they define when those types appear in fields of structs the entry
+// does use. `loaded` is the running set of already-loaded file paths;
+// returned so the caller can keep deduplicating.
+func load_transitive(cg: codegen.Codegen, module: ast.Module, importer_path: str, loaded: [str]) -> [str] {
+    for d in module.decls {
+        match d {
+            ast.Decl.Import(module_name, _local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: importer_path, module_name)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        let import_parser: parsing.Parser = parse_file(resolved.file)
+                        let im: ast.Module = import_parser.parse_module()
+                        cg.register_module_types(im, prefix: resolved.prefix, p: import_parser)
+                        loaded = load_transitive(cg, module: im, importer_path: resolved.file, loaded)
+                    }
+                }
+            }
+            else none
+        }
+    }
+    return loaded
+}
+
 // Build the runtime _main shim for an entry module whose main has the
 // given signature shape. Mirrors kod/builder.py:compose_runtime_main_asm.
 // The output is fed straight to `as`; whitespace details don't matter.
@@ -225,13 +258,13 @@ func main(argv: [str]) -> int64 {
     cg.register_primitive_module(str_module, kind: .KStr, prefix: "primitives$str", p: str_parser)
     cg.register_primitive_module(bool_module, kind: .KBool, prefix: "primitives$bool", p: bool_parser)
 
-    // Walk the target module's imports and register each one.
-    // TODO: walk imports transitively. If module A imports B and B
-    // imports C, C isn't loaded unless A also explicitly imports it.
-    // resolve_field_kinds below patches up registration-order issues
-    // *within* the set we do load, but it can't conjure structs from
-    // unloaded modules. Users currently work around it by re-stating
-    // every transitively-needed import at the entry. See TODO.md.
+    // Walk the entry's imports. For direct imports we always register
+    // the alias + the explicitly-named items (`register_import_module`
+    // and `register_imported_items` — both bind names into the entry's
+    // scope, so they must run even when the module was already loaded
+    // via someone else's transitive walk). Types registration and
+    // transitive descent are deduplicated through `loaded`.
+    let loaded: [str] = []
     let d: int64 = 0
     for d < len(module.decls) {
         match module.decls[d] {
@@ -241,8 +274,18 @@ func main(argv: [str]) -> int64 {
                     let import_parser: parsing.Parser = parse_file(resolved.file)
                     let im: ast.Module = import_parser.parse_module()
                     cg.register_import_module(im, local_mod: local_name, prefix: resolved.prefix, p: import_parser)
-                    cg.register_module_types(im, prefix: resolved.prefix, p: import_parser)
                     cg.register_imported_items(items, im, prefix: resolved.prefix, p: import_parser)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        cg.register_module_types(im, prefix: resolved.prefix, p: import_parser)
+                        loaded = load_transitive(cg, module: im, importer_path: resolved.file, loaded)
+                    }
                 }
             }
             else none

@@ -6,15 +6,9 @@ pinpoint location, or where the locus might move.
 
 ## Self-hosting / build pipeline
 
-- [ ] **Walk imports transitively in `kodc.kod`'s entry loader.** Today
-      only modules the entry file imports directly are registered. If
-      A imports B and B imports C, C isn't loaded unless A also
-      imports it. `resolve_field_kinds` patches up registration-order
-      within the loaded set but can't conjure structs from unloaded
-      modules. See the TODO at `kodc.kod`'s import-walk loop.
-- [ ] **Port `compose_test_runtime_main_asm` to Kod.** Depends on the
-      transitive-import item above (the test variant needs to find
-      every module with `test` blocks across the import graph).
+- [ ] **Port `compose_test_runtime_main_asm` to Kod.** The test variant
+      needs to find every module with `test` blocks across the import
+      graph. (Transitive walking landed; this is now unblocked.)
 - [ ] **Route the integrated `kod build` path through sh_kodc** for
       `compose_runtime_main_asm`. Currently only the CLI handler in
       `kod/__main__.py` delegates; `kod/builder.py:build_runtime_main`
