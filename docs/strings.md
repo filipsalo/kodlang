@@ -36,11 +36,17 @@ print(f"items: {items.len()}")    // any type with to_str works
 
 ## Concatenation
 
-Use `+` to concatenate strings:
+Use `+` to concatenate strings, or `+=` to append in place:
 
 ```kod
 let greeting: str = "hello" + ", " + name + "!"
+
+let buf: str = "lines:\n"
+buf += "  one\n"
+buf += "  two\n"
 ```
+
+`+=` works on struct fields too: `obj.message += " (cont.)"`.
 
 ## Length
 
