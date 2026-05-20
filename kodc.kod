@@ -167,13 +167,7 @@ func emit_runtime_main(entry_path: str, out_path: str) -> int64 {
     for decl in module.decls {
         match decl {
             .Func(decl_id) -> {
-                // Bind to a local before the str compare: inline
-                // `p.func_decls[decl_id].name == "main"` currently
-                // mis-infers the chained-Index-then-Dot lhs as int64
-                // and compiles `==` as an integer compare. The local
-                // binding pins the type to str.
-                let nm: str = p.func_decls[decl_id].name
-                if nm == "main" {
+                if p.func_decls[decl_id].name == "main" {
                     main_decl_id = decl_id
                 }
             }
@@ -188,11 +182,7 @@ func emit_runtime_main(entry_path: str, out_path: str) -> int64 {
     let main_decl: ast.FuncDecl = p.func_decls[main_decl_id]
     let returns_result: bool = false
     if main_decl.return_typ != 0 {
-        // Bind to a local so the `is` check sees a known TypeExpr,
-        // not an inline indexed lookup (same workaround as the
-        // FuncDecl.name comparison above).
-        let ret_te: ast.TypeExpr = p.type_exprs[main_decl.return_typ]
-        if ret_te is .Throws(_inner) {
+        if p.type_exprs[main_decl.return_typ] is .Throws(_inner) {
             returns_result = true
         }
     }
@@ -236,6 +226,12 @@ func main(argv: [str]) -> int64 {
     cg.register_primitive_module(bool_module, kind: .KBool, prefix: "primitives$bool", p: bool_parser)
 
     // Walk the target module's imports and register each one.
+    // TODO: walk imports transitively. If module A imports B and B
+    // imports C, C isn't loaded unless A also explicitly imports it.
+    // resolve_field_kinds below patches up registration-order issues
+    // *within* the set we do load, but it can't conjure structs from
+    // unloaded modules. Users currently work around it by re-stating
+    // every transitively-needed import at the entry. See TODO.md.
     let d: int64 = 0
     for d < len(module.decls) {
         match module.decls[d] {
@@ -253,6 +249,14 @@ func main(argv: [str]) -> int64 {
         }
         d = d + 1
     }
+
+    // Re-resolve struct field kinds now that every imported module has
+    // been registered. If an earlier-registered struct had a field
+    // whose element type came from a later-registered module, its kind
+    // was recorded as a plain KArray (no element). Re-resolving with
+    // the full registry in place pins down the right kind so downstream
+    // chained access (`p.func_decls[0].name`) infers correctly.
+    cg.resolve_field_kinds()
 
     cg.compile_module(module)
     if cg.had_errors() {
