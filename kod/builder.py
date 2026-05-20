@@ -310,9 +310,15 @@ class Builder:
         """
 
     def build_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
-        """Build the runtime _main object file into `out_dir`."""
-        asm = self.compose_runtime_main_asm(file)
-        return self._build("runtime_main", asm, out_dir=out_dir)
+        """Build the runtime _main object file into `out_dir`. Delegates to
+        sh_kodc when available; falls back to the Python composer during
+        bootstrap (when sh_kodc doesn't yet exist or is stale)."""
+        return self._build_runtime_main(
+            file,
+            out_dir,
+            "_emit-runtime-main",
+            self.compose_runtime_main_asm,
+        )
 
     def compose_test_runtime_main_asm(self, file: FileWrapper) -> str:
         """Compose a runtime _main that calls every test-bearing module's
@@ -338,8 +344,58 @@ class Builder:
         """
 
     def build_test_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
-        asm = self.compose_test_runtime_main_asm(file)
-        return self._build("runtime_main", asm, out_dir=out_dir)
+        return self._build_runtime_main(
+            file,
+            out_dir,
+            "_emit-test-runtime-main",
+            self.compose_test_runtime_main_asm,
+        )
+
+    def _build_runtime_main(
+        self,
+        file: FileWrapper,
+        out_dir: Path,
+        subcommand: str,
+        python_compose,
+    ) -> Path:
+        """Write a runtime_main.s via sh_kodc when fresh, else via the
+        Python composer (bootstrap fallback). Assemble and return the
+        resulting .o path."""
+        root_path = self.program.root_fs.root_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        asm_path = (out_dir / "runtime_main").with_suffix(".s")
+        sh_kodc = self.build_root / "stage1" / "sh_kodc"
+        used_sh_kodc = False
+        if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
+            try:
+                rel_file = file.path.relative_to(root_path)
+            except ValueError:
+                rel_file = file.path
+            result = subprocess.run(
+                [str(sh_kodc), subcommand, str(rel_file), str(asm_path)],
+                check=False,
+                cwd=root_path,
+            )
+            used_sh_kodc = result.returncode == 0
+        if not used_sh_kodc:
+            asm_path.write_text(python_compose(file))
+        return self._assemble(asm_path)
+
+    def _assemble(self, asm_path: Path) -> Path:
+        """Run `as` on a .s file and return the sibling .o path."""
+        root_path = self.program.root_fs.root_path
+        obj_path = asm_path.with_suffix(".o")
+        cmd = [
+            "as",
+            "-target",
+            "arm64-apple-darwin",
+            "-o",
+            obj_path.relative_to(root_path),
+            asm_path.relative_to(root_path),
+        ]
+        print(f"=> \033[2m{' '.join(map(str, cmd))}\033[0m", file=sys.stderr)
+        subprocess.run(cmd, check=True, cwd=root_path)
+        return obj_path
 
     def _is_stdlib_module(self, module: ast.Module) -> bool:
         stdlib_path = self.program.stdlib_fs.root_path
@@ -367,11 +423,11 @@ class Builder:
         self,
         file: FileWrapper,
         executable_name: str,
-        compose_runtime_main: callable,
+        build_runtime_main,
     ) -> Path:
-        """Compile every module to .o, build the runtime_main shim (composed
-        by the caller), drive the linker. Used by both `kod build` and
-        `kod test` — they differ only in the shim."""
+        """Compile every module to .o, build the runtime_main shim (via the
+        caller's builder fn), drive the linker. Used by both `kod build` and
+        `kod test` — they differ only in which shim builder runs."""
         root_path = self.program.root_fs.root_path
         app_dir = self.build_root / "apps" / file.path.stem
         stage0_dir = self.build_root / "stage0"
@@ -388,10 +444,7 @@ class Builder:
             object_files.append(
                 self.build_module(module, out_dir=out_dir).relative_to(root_path)
             )
-        rm_asm = compose_runtime_main(file)
-        object_files.append(
-            self._build("runtime_main", rm_asm, out_dir=app_dir).relative_to(root_path)
-        )
+        object_files.append(build_runtime_main(file, app_dir).relative_to(root_path))
         stdlib_root = self.program.stdlib_fs.root_path
         object_files.append(
             self._build_c(stdlib_root / "arena.c", out_dir=stage0_dir).relative_to(
@@ -429,7 +482,7 @@ class Builder:
         return self._build_executable_with_runtime_main(
             file,
             executable_name=file.path.stem,
-            compose_runtime_main=self.compose_runtime_main_asm,
+            build_runtime_main=self.build_runtime_main,
         )
 
     def build_test_executable(self, file: FileWrapper) -> Path:
@@ -440,5 +493,5 @@ class Builder:
         return self._build_executable_with_runtime_main(
             file,
             executable_name=f"{file.path.stem}_test",
-            compose_runtime_main=self.compose_test_runtime_main_asm,
+            build_runtime_main=self.build_test_runtime_main,
         )

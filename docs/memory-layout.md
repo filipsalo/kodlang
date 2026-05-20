@@ -1,3 +1,7 @@
+---
+icon: lucide/memory-stick
+---
+
 # Memory Layout
 
 This document describes how Kod values are represented in memory at runtime.
@@ -7,13 +11,12 @@ This document describes how Kod values are represented in memory at runtime.
 Primitive values are stored directly — on the stack in local variables, or
 passed by value in registers.
 
-| Type    | Width | Representation              |
-|---------|-------|-----------------------------|
-| `int64` | 8     | Two's-complement 64-bit int |
+| Type    | Width | Representation                                         |
+| ------- | ----- | ------------------------------------------------------ |
+| `int64` | 8     | Two's-complement 64-bit int                            |
 | `str`   | 8     | Pointer to null-terminated C string in `.data` section |
-| `bool`  | 1     | 0 (false) or 1 (true) |
-| `none`  | 8     | Always 0 (null sentinel)    |
-
+| `bool`  | 1     | 0 (false) or 1 (true)                                  |
+| `none`  | 8     | Always 0 (null sentinel)                               |
 
 ## Struct values
 
@@ -55,7 +58,6 @@ let q: Point = p        // q and p point to the same object
 q.x = 10               // also modifies p.x
 ```
 
-
 ## Enum values
 
 Enums are **arena-allocated**, like structs. A stack slot holds an 8-byte
@@ -70,7 +72,6 @@ Because enum variables are pointers, they fit in a single register and pass
 through the ARM64 calling convention without any multi-word ABI gymnastics.
 
 See `docs/enums.md` for details.
-
 
 ## The global arena
 
@@ -96,7 +97,6 @@ void *arena_alloc(int64_t size);
 
 Called internally by the compiler whenever a struct is constructed. Not
 exposed to Kod programs directly.
-
 
 ## Calling convention (ARM64, macOS)
 

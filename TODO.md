@@ -6,13 +6,10 @@ pinpoint location, or where the locus might move.
 
 ## Self-hosting / build pipeline
 
-- [ ] **Route the integrated `kod build` / `kod test` paths through
-      sh_kodc** for `compose_runtime_main_asm` /
-      `compose_test_runtime_main_asm`. The CLI handlers in
-      `kod/__main__.py` now delegate to sh_kodc when fresh, but the
-      in-process composers in `kod/builder.py` are still called
-      directly. The Kod-side composers exist (kodc.kod) and produce
-      assembler-equivalent output; just need to switch the call.
+- [ ] **Move more orchestration into sh_kodc.** runtime_main composition
+      lives in Kod and runs via sh_kodc. The next pieces — driving `as`,
+      `clang`, `ld`, walking modules — are still in Python. Subprocess
+      support is there (`process.run`); just needs the pieces ported.
 
 ## Codegen
 
