@@ -184,9 +184,10 @@ The single-arm sugar (`if X is .V(b) { ... }` and `let .V(b) = X else
 { ... }`) is not subject to exhaustiveness — they're explicitly
 one-variant checks.
 
-Integer and string matches don't get exhaustiveness checking;
-unmatched values fall through silently (will become a wildcard-arm
-requirement in a future change).
+A `match` on `int64` or `str` must include a wildcard (`_`) arm —
+the compiler reports an error otherwise. (`int64` and `str` have too
+many possible values to enumerate; the wildcard makes the
+fall-through explicit.)
 
 ## Other limitations
 

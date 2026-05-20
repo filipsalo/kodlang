@@ -43,10 +43,8 @@ pinpoint location, or where the locus might move.
 
 ## Match / enums
 
-- [ ] Wildcard-arm requirement for `int64` and `str` matches. Today
-      they silently fall through on unmatched values; future change
-      either requires a `_` arm at compile time or inserts a runtime
-      panic for the no-arm case.
+- [ ] Bool match exhaustiveness — `match b { true -> ..., false -> ... }`
+      isn't currently exhaustiveness-checked (no `BoolPat` in the AST).
 
 ## Build process
 
