@@ -86,6 +86,11 @@ type StructInfo = struct {
     method_names: [str]
     method_decl_ids: [int64]
     method_sigs: [SigInfo]
+    // Side index: method name → position in method_names / _decl_ids /
+    // _sigs. Built alongside method_names so dispatch lookups don't have
+    // to scan ~100 entries for every `obj.method()` call (Codegen has
+    // ~100). Iteration sites still use the parallel arrays unchanged.
+    method_idx: FuncIdx
     data_width: int64
     // See EnumInfo.module_prefix.
     module_prefix: str
@@ -983,7 +988,10 @@ type Codegen = struct {
         self.subst_names = saved_names
         self.subst_args = saved_args
         let empty_params: [str] = []
-        self.structs += [StructInfo(name: canonical, fields: cloned_fields, method_names: template.method_names, method_decl_ids: template.method_decl_ids, method_sigs: cloned_sigs, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, template_idx: template_idx, template_args: type_args)]
+        // Monomorphised instance: method names match the template, so
+        // share its name → index map (positions in method_* arrays are
+        // identical to the template's).
+        self.structs += [StructInfo(name: canonical, fields: cloned_fields, method_names: template.method_names, method_decl_ids: template.method_decl_ids, method_sigs: cloned_sigs, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, template_idx: template_idx, template_args: type_args)]
         return len(self.structs) - 1
     }
 
@@ -1219,10 +1227,14 @@ type Codegen = struct {
                 let method_names: [str] = []
                 let method_decl_ids: [int64] = []
                 let method_sigs: [SigInfo] = []
+                let method_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
+                let mi: int64 = 0
                 for method_id in methods {
                     let func_decl = p.func_decls[method_id]
                     method_names += [func_decl.name]
                     method_decl_ids += [method_id]
+                    method_idx.set(func_decl.name, mi)
+                    mi = mi + 1
                 }
                 // Restore parser before resolve_sig (which swaps internally).
                 self.p = saved_p
@@ -1230,7 +1242,7 @@ type Codegen = struct {
                     method_sigs += [self.resolve_sig(p.func_decls[method_id], p: p)]
                 }
                 let no_template_args: [TypeKind] = []
-                self.structs += [StructInfo(name: name, fields: field_infos, method_names: method_names, method_decl_ids: method_decl_ids, method_sigs: method_sigs, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
+                self.structs += [StructInfo(name: name, fields: field_infos, method_names: method_names, method_decl_ids: method_decl_ids, method_sigs: method_sigs, method_idx: method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
             }
             else none
         }
@@ -1768,17 +1780,7 @@ type Codegen = struct {
         // Struct with op_index — dispatch as a method call.
         match lhs_kind {
             .KStruct(idx, _struct_type_args) -> {
-                let method_idx = 0
-                let found = false
-                for method_idx < len(self.structs[idx].method_names) {
-                    if self.structs[idx].method_names[method_idx] == "op_index" {
-                        found = true
-                        method_idx = len(self.structs[idx].method_names)
-                    } else {
-                        method_idx = method_idx + 1
-                    }
-                }
-                if found {
+                if self.structs[idx].method_idx.get("op_index") is Some(_mi) {
                     let key_val = self.compile_expr(rhs)
                     let key_reg = self.alloc_reg()
                     self.mov_to(key_val, dest: key_reg)
@@ -2078,16 +2080,12 @@ type Codegen = struct {
                 return .VReg(name: "x0")
             }
             .KStruct(struct_idx, _struct_type_args) -> {
-                let method_idx = 0
-                for method_idx < len(self.structs[struct_idx].method_names) {
-                    if self.structs[struct_idx].method_names[method_idx] == "to_str" {
-                        let val = self.compile_expr(expr_id)
-                        self.mov_to(val, dest: "x0")
-                        let struct_info = self.structs[struct_idx]
-                        self.emit(f"bl ${struct_info.module_prefix}${struct_info.name}$to_str")
-                        return .VReg(name: "x0")
-                    }
-                    method_idx = method_idx + 1
+                if self.structs[struct_idx].method_idx.get("to_str") is Some(_mi) {
+                    let val = self.compile_expr(expr_id)
+                    self.mov_to(val, dest: "x0")
+                    let struct_info = self.structs[struct_idx]
+                    self.emit(f"bl ${struct_info.module_prefix}${struct_info.name}$to_str")
+                    return .VReg(name: "x0")
                 }
                 return self.compile_expr(expr_id)
             }
@@ -2365,19 +2363,9 @@ type Codegen = struct {
                 // if one exists, dispatch to it. Lets `len(map)` work the
                 // same way `len(array)` and `len(str)` do.
                 let s = self.structs[struct_idx]
-                let i = 0
-                let method_lbl = ""
-                for i < len(s.method_names) {
-                    if s.method_names[i] == "len" {
-                        method_lbl = f"${s.module_prefix}${s.name}$len"
-                        i = len(s.method_names)
-                    } else {
-                        i = i + 1
-                    }
-                }
-                if len(method_lbl) > 0 {
+                if s.method_idx.get("len") is Some(_mi) {
                     self.mov_to(arg_val, dest: "x0")
-                    self.emit(f"bl {method_lbl}")
+                    self.emit(f"bl ${s.module_prefix}${s.name}$len")
                     return .VReg(name: "x0")
                 }
                 self.report_error(f"error: len() not defined for struct `{s.name}` (no `len` method)", span: self.p.expr_spans[arg_id])
@@ -2499,16 +2487,10 @@ type Codegen = struct {
         let sig_labels: [str] = []
         match recv_kind {
             .KStruct(idx, _struct_type_args) -> {
-                let method_idx = 0
-                for method_idx < len(self.structs[idx].method_names) {
-                    if self.structs[idx].method_names[method_idx] == method_name {
-                        method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
-                        sig_params = self.structs[idx].method_sigs[method_idx].param_kinds
-                        sig_labels = self.structs[idx].method_sigs[method_idx].param_labels
-                        method_idx = len(self.structs[idx].method_names)
-                    } else {
-                        method_idx = method_idx + 1
-                    }
+                if self.structs[idx].method_idx.get(method_name) is Some(mi) {
+                    method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
+                    sig_params = self.structs[idx].method_sigs[mi].param_kinds
+                    sig_labels = self.structs[idx].method_sigs[mi].param_labels
                 }
             }
             else none
@@ -2804,12 +2786,8 @@ type Codegen = struct {
             return none
         }
         if obj_kind is .KStruct(sidx, _struct_type_args) {
-            let method_idx = 0
-            for method_idx < len(self.structs[sidx].method_names) {
-                if self.structs[sidx].method_names[method_idx] == method_name {
-                    return self.structs[sidx].method_sigs[method_idx].return_kind
-                }
-                method_idx = method_idx + 1
+            if self.structs[sidx].method_idx.get(method_name) is Some(mi) {
+                return self.structs[sidx].method_sigs[mi].return_kind
             }
             return none
         }
@@ -2937,12 +2915,8 @@ type Codegen = struct {
                             .KArrayStr -> return .KStr
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
-                                let method_idx = 0
-                                for method_idx < len(self.structs[sidx].method_names) {
-                                    if self.structs[sidx].method_names[method_idx] == "op_index" {
-                                        return self.structs[sidx].method_sigs[method_idx].return_kind
-                                    }
-                                    method_idx = method_idx + 1
+                                if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
+                                    return self.structs[sidx].method_sigs[mi].return_kind
                                 }
                                 return .KInt64
                             }
@@ -3287,12 +3261,8 @@ type Codegen = struct {
 
     // Look up `op_index_set` on a struct, returning its mangled label.
     func struct_index_setter_label(self, struct_idx: int64) -> str? {
-        let method_idx = 0
-        for method_idx < len(self.structs[struct_idx].method_names) {
-            if self.structs[struct_idx].method_names[method_idx] == "op_index_set" {
-                return f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
-            }
-            method_idx = method_idx + 1
+        if self.structs[struct_idx].method_idx.get("op_index_set") is Some(_mi) {
+            return f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
         }
         return none
     }
@@ -3591,15 +3561,26 @@ type Codegen = struct {
             else none
         }
         if needs_wrap {
-            // Conditional wrap: if the value is 0 (none), return 0 directly;
-            // otherwise allocate a cell holding the value. This lets a match
-            // expression whose arms include `else none` produce a real none.
+            // A match expression whose arms include `else -> none` produces
+            // a 0 value that we must NOT re-wrap (would yield Some(NULL)).
+            // For any other expression, infer_kind already established this
+            // is a concrete non-optional value (bool/int/etc.) — a literal 0
+            // or `false` MUST still wrap, or `return 0` from an `int64?`
+            // function silently becomes `none` (the same bug used to bite
+            // `as_int(.Number(0))` and `Map[K, int64].get` on its first entry).
+            let conditional: bool = false
+            match self.p.exprs[value_id] {
+                .MatchExpr(_subject, _arms) -> conditional = true
+                else none
+            }
             let val = self.compile_expr(value_id)
             let reg = self.load(val)
             let skip_lbl = self.fresh("Lwrap_skip")
             let done_lbl = self.fresh("Lwrap_done")
-            self.emit(f"cmp {reg}, #0")
-            self.emit(f"beq {skip_lbl}")
+            if conditional {
+                self.emit(f"cmp {reg}, #0")
+                self.emit(f"beq {skip_lbl}")
+            }
             self.emit("sub sp, sp, #16")
             self.emit(f"str {reg}, [sp]")
             self.free_reg(reg)
@@ -3610,10 +3591,12 @@ type Codegen = struct {
             self.emit("add sp, sp, #16")
             self.emit(f"str {tmp}, [x0]")
             self.free_reg(tmp)
-            self.emit(f"b {done_lbl}")
-            self.emit_label(skip_lbl)
-            self.emit("mov x0, #0")
-            self.emit_label(done_lbl)
+            if conditional {
+                self.emit(f"b {done_lbl}")
+                self.emit_label(skip_lbl)
+                self.emit("mov x0, #0")
+                self.emit_label(done_lbl)
+            }
         } else {
             let val = self.compile_expr(value_id)
             self.mov_to(val, dest: "x0")
