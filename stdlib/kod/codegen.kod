@@ -80,16 +80,22 @@ type FieldInfo = struct {
     type_expr: int64
 }
 
+// One method on a struct (or interface — `decl_id` is -1 for interfaces,
+// which don't carry the source FuncDecl id).
+type MethodInfo = struct {
+    name: str
+    decl_id: int64
+    sig: SigInfo
+}
+
 type StructInfo = struct {
     name: str
     fields: [FieldInfo]
-    method_names: [str]
-    method_decl_ids: [int64]
-    method_sigs: [SigInfo]
-    // Side index: method name → position in method_names / _decl_ids /
-    // _sigs. Built alongside method_names so dispatch lookups don't have
-    // to scan ~100 entries for every `obj.method()` call (Codegen has
-    // ~100). Iteration sites still use the parallel arrays unchanged.
+    methods: [MethodInfo]
+    // Side index: method name → position in `methods`. Built alongside
+    // it so dispatch lookups don't have to scan ~100 entries for every
+    // `obj.method()` call (Codegen has ~100). Iteration sites use
+    // `methods` directly.
     method_idx: FuncIdx
     data_width: int64
     // See EnumInfo.module_prefix.
@@ -109,13 +115,11 @@ type StructInfo = struct {
     template_args: [TypeKind]
 }
 
-// Interface metadata. method_sigs is parallel to method_names and records
-// each method's resolved param + return kinds. Interface values are an
-// 8-byte pointer to an arena cell {data_ptr, vtable_ptr}.
+// Interface metadata. Interface values are an 8-byte pointer to an arena
+// cell {data_ptr, vtable_ptr}.
 type IfaceInfo = struct {
     name: str
-    method_names: [str]
-    method_sigs: [SigInfo]
+    methods: [MethodInfo]
     module_prefix: str
 }
 
@@ -955,9 +959,12 @@ type Codegen = struct {
             let new_kind = self.resolve_type(field.type_expr)
             cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr)]
         }
-        let cloned_sigs: [SigInfo] = []
-        for method_id in template.method_decl_ids {
-            let fd = template.src_p.func_decls[method_id]
+        // Re-resolve each method's sig with the new substitution context;
+        // names + decl_ids stay the same as the template, so we build
+        // fresh MethodInfo entries that copy those across.
+        let cloned_methods: [MethodInfo] = []
+        for m in template.methods {
+            let fd = template.src_p.func_decls[m.decl_id]
             let pk: [TypeKind] = []
             let pl: [str] = []
             for param in fd.params {
@@ -969,16 +976,16 @@ type Codegen = struct {
                 }
             }
             let rk = self.resolve_type(fd.return_typ)
-            cloned_sigs += [SigInfo(param_kinds: pk, param_labels: pl, return_kind: rk)]
+            let sig: SigInfo = SigInfo(param_kinds: pk, param_labels: pl, return_kind: rk)
+            cloned_methods += [MethodInfo(name: m.name, decl_id: m.decl_id, sig: sig)]
         }
         self.p = saved_p
         self.subst_names = saved_names
         self.subst_args = saved_args
         let empty_params: [str] = []
-        // Monomorphised instance: method names match the template, so
-        // share its name → index map (positions in method_* arrays are
-        // identical to the template's).
-        self.structs += [StructInfo(name: canonical, fields: cloned_fields, method_names: template.method_names, method_decl_ids: template.method_decl_ids, method_sigs: cloned_sigs, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, template_idx: template_idx, template_args: type_args)]
+        // Monomorphised instance: method names + positions match the template,
+        // so share its name → index map directly.
+        self.structs += [StructInfo(name: canonical, fields: cloned_fields, methods: cloned_methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, template_idx: template_idx, template_args: type_args)]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
         return new_idx
@@ -1214,25 +1221,22 @@ type Codegen = struct {
                     field_infos += [FieldInfo(name: field.name, offset: offset, kind: field_kind, type_expr: field.typ)]
                     offset = offset + 8
                 }
-                let method_names: [str] = []
-                let method_decl_ids: [int64] = []
-                let method_sigs: [SigInfo] = []
+                // Restore parser before resolve_sig (which swaps to p
+                // internally). One pass: append the fully-built MethodInfo
+                // and record its position in method_idx in the same step.
+                self.p = saved_p
                 let method_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
+                let method_infos: [MethodInfo] = []
                 let mi: int64 = 0
                 for method_id in methods {
                     let func_decl = p.func_decls[method_id]
-                    method_names += [func_decl.name]
-                    method_decl_ids += [method_id]
+                    let sig = self.resolve_sig(func_decl, p: p)
+                    method_infos += [MethodInfo(name: func_decl.name, decl_id: method_id, sig: sig)]
                     method_idx.set(func_decl.name, mi)
                     mi = mi + 1
                 }
-                // Restore parser before resolve_sig (which swaps internally).
-                self.p = saved_p
-                for method_id in methods {
-                    method_sigs += [self.resolve_sig(p.func_decls[method_id], p: p)]
-                }
                 let no_template_args: [TypeKind] = []
-                self.structs += [StructInfo(name: name, fields: field_infos, method_names: method_names, method_decl_ids: method_decl_ids, method_sigs: method_sigs, method_idx: method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
+                self.structs += [StructInfo(name: name, fields: field_infos, methods: method_infos, method_idx: method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
                 self.struct_idx.set(name, len(self.structs) - 1)
             }
             else none
@@ -1240,39 +1244,46 @@ type Codegen = struct {
     }
 
     // First pass: register interface NAME so it's findable by name during
-    // struct method sig resolution. method_sigs is left empty for now; a
-    // second pass (resolve_interface_methods) fills it in once all types
+    // struct method sig resolution. Method sigs are left empty for now; a
+    // second pass (resolve_interface_methods) fills them in once all types
     // are registered.
     func register_interface(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
             .Interface(name, methods) -> {
-                let method_names: [str] = []
-                let method_sigs: [SigInfo] = []
+                let empty_kinds: [TypeKind] = []
+                let empty_labels: [str] = []
+                let empty_sig: SigInfo = SigInfo(param_kinds: empty_kinds, param_labels: empty_labels, return_kind: .KVoid)
+                let method_infos: [MethodInfo] = []
                 for method_id in methods {
                     let func_decl = p.func_decls[method_id]
-                    method_names += [func_decl.name]
+                    // decl_id is -1 for interface methods (they don't carry
+                    // a concrete FuncDecl id beyond the parse). Sig is left
+                    // empty here; resolve_interface_methods fills it in a
+                    // second pass once all types are registered.
+                    method_infos += [MethodInfo(name: func_decl.name, decl_id: -1, sig: empty_sig)]
                 }
-                self.interfaces += [IfaceInfo(name: name, method_names: method_names, method_sigs: method_sigs, module_prefix: prefix)]
+                self.interfaces += [IfaceInfo(name: name, methods: method_infos, module_prefix: prefix)]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
             }
             else none
         }
     }
 
-    // Second pass: resolve method signatures for an interface declaration.
-    // Builds the [SigInfo] list locally and assigns it onto the existing
-    // IfaceInfo. (`+= [...]` against a nested array isn't currently
-    // supported, but plain field assignment via array index is.)
+    // Second pass: resolve method signatures for an interface declaration
+    // once all types are registered, then write the fully-populated
+    // MethodInfo array onto the existing IfaceInfo.
     func resolve_interface_methods(self, anon decl: ast.Decl, p: parsing.Parser) -> none {
         match decl {
             .Interface(name, methods) -> {
                 let iface_idx = self.find_iface_idx(name)
                 if iface_idx >= 0 {
-                    let sigs: [SigInfo] = []
+                    let new_methods: [MethodInfo] = []
                     for method_id in methods {
-                        sigs += [self.resolve_sig(p.func_decls[method_id], p: p)]
+                        let func_decl = p.func_decls[method_id]
+                        let sig = self.resolve_sig(func_decl, p: p)
+                        new_methods += [MethodInfo(name: func_decl.name, decl_id: -1, sig: sig)]
                     }
-                    self.interfaces[iface_idx].method_sigs = sigs
+                    self.interfaces[iface_idx].methods = new_methods
                 }
             }
             else none
@@ -2374,17 +2385,17 @@ type Codegen = struct {
     func compile_iface_method_call(self, anon args: [ast.CallArg], receiver_id: int64, iface_idx: int64, method_name: str) -> Val {
         let i = 0
         let method_idx = -1
-        for i < len(self.interfaces[iface_idx].method_names) {
-            if self.interfaces[iface_idx].method_names[i] == method_name {
+        for i < len(self.interfaces[iface_idx].methods) {
+            if self.interfaces[iface_idx].methods[i].name == method_name {
                 method_idx = i
-                i = len(self.interfaces[iface_idx].method_names)
+                i = len(self.interfaces[iface_idx].methods)
             } else {
                 i = i + 1
             }
         }
         let sig_params: [TypeKind] = []
         if method_idx >= 0 {
-            sig_params = self.interfaces[iface_idx].method_sigs[method_idx].param_kinds
+            sig_params = self.interfaces[iface_idx].methods[method_idx].sig.param_kinds
         }
         // Stash self (data_ptr) and each compiled arg, plus the method ptr,
         // so arg compilation doesn't clobber x0..x7. Layout in the spill
@@ -2471,8 +2482,8 @@ type Codegen = struct {
             .KStruct(idx, _struct_type_args) -> {
                 if self.structs[idx].method_idx.get(method_name) is Some(mi) {
                     method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
-                    sig_params = self.structs[idx].method_sigs[mi].param_kinds
-                    sig_labels = self.structs[idx].method_sigs[mi].param_labels
+                    sig_params = self.structs[idx].methods[mi].sig.param_kinds
+                    sig_labels = self.structs[idx].methods[mi].sig.param_labels
                 }
             }
             else none
@@ -2760,9 +2771,9 @@ type Codegen = struct {
         let obj_kind = self.infer_kind(callee_lhs)
         if obj_kind is .KInterface(iidx) {
             let method_idx = 0
-            for method_idx < len(self.interfaces[iidx].method_names) {
-                if self.interfaces[iidx].method_names[method_idx] == method_name {
-                    return self.interfaces[iidx].method_sigs[method_idx].return_kind
+            for method_idx < len(self.interfaces[iidx].methods) {
+                if self.interfaces[iidx].methods[method_idx].name == method_name {
+                    return self.interfaces[iidx].methods[method_idx].sig.return_kind
                 }
                 method_idx = method_idx + 1
             }
@@ -2770,7 +2781,7 @@ type Codegen = struct {
         }
         if obj_kind is .KStruct(sidx, _struct_type_args) {
             if self.structs[sidx].method_idx.get(method_name) is Some(mi) {
-                return self.structs[sidx].method_sigs[mi].return_kind
+                return self.structs[sidx].methods[mi].sig.return_kind
             }
             return none
         }
@@ -2899,7 +2910,7 @@ type Codegen = struct {
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
                                 if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
-                                    return self.structs[sidx].method_sigs[mi].return_kind
+                                    return self.structs[sidx].methods[mi].sig.return_kind
                                 }
                                 return .KInt64
                             }
@@ -4287,8 +4298,8 @@ type Codegen = struct {
                 self.p = s.src_p
                 self.subst_names = template.type_param_names
                 self.subst_args = s.template_args
-                for method_id in s.method_decl_ids {
-                    self.compile_func(method_id, s.name, override_lbl: "")
+                for m in s.methods {
+                    self.compile_func(m.decl_id, s.name, override_lbl: "")
                 }
                 self.p = saved_p
                 self.subst_names = saved_names
@@ -4322,24 +4333,11 @@ type Codegen = struct {
             let iface_info = self.interfaces[iface_idx]
             self.println("\t.p2align 3")
             self.println(f"{self.vtable_label(struct_idx, iface_idx)}:")
-            let method_idx = 0
-            for method_idx < len(iface_info.method_names) {
-                let method_name = iface_info.method_names[method_idx]
-                let j = 0
-                let found = false
-                for j < len(struct_info.method_names) {
-                    if struct_info.method_names[j] == method_name {
-                        self.println(f"\t.quad ${struct_info.module_prefix}${struct_info.name}${method_name}")
-                        j = len(struct_info.method_names)
-                        found = true
-                    } else {
-                        j = j + 1
-                    }
+            for m in iface_info.methods {
+                match struct_info.method_idx.get(m.name) {
+                    Some(_mi) -> self.println(f"\t.quad ${struct_info.module_prefix}${struct_info.name}${m.name}")
+                    none -> self.println(f"\t.quad 0")
                 }
-                if found == false {
-                    self.println(f"\t.quad 0")
-                }
-                method_idx = method_idx + 1
             }
             i = i + 1
         }
@@ -4352,8 +4350,8 @@ type Codegen = struct {
             let iface_info = self.interfaces[iface_idx]
             self.println("\t.p2align 3")
             self.println(f"{self.prim_vtable_label(iface_idx, kind)}:")
-            for method_name in iface_info.method_names {
-                let pm_idx = self.find_prim_method(method_name, kind)
+            for m in iface_info.methods {
+                let pm_idx = self.find_prim_method(m.name, kind)
                 if pm_idx >= 0 {
                     self.println(f"\t.quad {self.prim_methods[pm_idx].label}")
                 } else {
