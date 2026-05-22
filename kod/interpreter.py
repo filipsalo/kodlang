@@ -639,6 +639,25 @@ class Interpreter:
                 msg = args[0].value.decode("utf8")
                 sys.stderr.write(f"{msg}\n")
                 return types.none_value
+            if func.name == "read_stdin_line":
+                # Mirror runtime read_stdin_line: read one '\n'-terminated
+                # line, strip a trailing '\r', empty string on EOF.
+                line = sys.stdin.readline()
+                if line.endswith("\n"):
+                    line = line[:-1]
+                if line.endswith("\r"):
+                    line = line[:-1]
+                return types.String(line.encode("utf8"))
+            if func.name == "read_stdin_exact":
+                # Mirror runtime read_stdin_exact: read exactly n bytes,
+                # truncated on EOF (caller length-checks).
+                n = int(args[0].value)
+                buf = (
+                    sys.stdin.buffer.read(n)
+                    if hasattr(sys.stdin, "buffer")
+                    else sys.stdin.read(n).encode("utf8")
+                )
+                return types.String(buf)
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]

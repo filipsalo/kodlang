@@ -276,3 +276,54 @@ void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     lhs->len = total;
     return lhs;
 }
+
+// Read one '\n'-terminated line from stdin, NUL-terminate it, strip a
+// trailing '\r' if present, and return the body. Returns an empty
+// string on EOF with no bytes buffered. Used by LSP-style framing:
+// callers read Content-Length headers line-by-line and then switch to
+// read_stdin_exact for the body.
+char *read_stdin_line(void) {
+    int64_t cap = 64;
+    int64_t len = 0;
+    char *buf = (char *)arena_alloc(cap);
+    while (1) {
+        int ch = getchar();
+        if (ch == EOF) {
+            break;
+        }
+        if (ch == '\n') {
+            break;
+        }
+        if (len + 1 >= cap) {
+            int64_t new_cap = cap * 2;
+            char *new_buf = (char *)arena_alloc(new_cap);
+            for (int64_t i = 0; i < len; i++) new_buf[i] = buf[i];
+            buf = new_buf;
+            cap = new_cap;
+        }
+        buf[len++] = (char)ch;
+    }
+    if (len > 0 && buf[len - 1] == '\r') {
+        len--;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+// Read exactly `n` bytes from stdin into a NUL-terminated arena buffer
+// and return it. On a short read (EOF before n bytes), returns the
+// truncated content; callers detect the truncation by length-checking
+// against `n`. Used for LSP message bodies after Content-Length headers.
+char *read_stdin_exact(int64_t n) {
+    char *buf = (char *)arena_alloc(n + 1);
+    int64_t got = 0;
+    while (got < n) {
+        size_t r = fread(buf + got, 1, (size_t)(n - got), stdin);
+        if (r == 0) {
+            break;
+        }
+        got += (int64_t)r;
+    }
+    buf[got] = '\0';
+    return buf;
+}
