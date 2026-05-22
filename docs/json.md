@@ -58,7 +58,3 @@ let .Some(id) = json.as_int(json.get(req, key: "id")) else { return }
 - String escapes: `\n \t \r \" \\ \/`. No `\uXXXX`.
 - Strict JSON: no trailing commas, no comments.
 - Parse failure currently panics rather than returning an error type.
-- `as_int(.Number(0))` and `as_bool(.Bool(false))` round-trip to `none`
-  rather than `Some(0)` / `Some(false)` — the codegen's optional-return
-  wrap currently treats a zero payload as a literal `none`. Match on
-  the `Value` directly until that's fixed.
