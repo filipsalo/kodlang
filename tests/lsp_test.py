@@ -147,7 +147,12 @@ def test_unknown_identifier_diagnostic(lsp_binary):
     ]
     assert len(diag_msgs) == 1
     diags = diag_msgs[0]["params"]["diagnostics"]
-    assert any("unknown name `xy`" in d["message"] for d in diags)
+    diag = next(d for d in diags if "unknown name `xy`" in d["message"])
+    # Range widens to the full identifier (was always one-character wide).
+    start = diag["range"]["start"]
+    end = diag["range"]["end"]
+    assert start["line"] == 2 and start["character"] == 9
+    assert end["line"] == 2 and end["character"] == 11
 
 
 def test_did_change_republishes_diagnostics(lsp_binary):
