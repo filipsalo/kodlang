@@ -116,6 +116,40 @@ def test_did_open_with_error_emits_diagnostic(lsp_binary):
     assert d["range"]["start"]["character"] == 2
 
 
+def test_unknown_identifier_diagnostic(lsp_binary):
+    # Typo'd identifier — the most common "broken while typing" mistake.
+    # Used to slip past the compiler silently (just emitted 0); the LSP
+    # would then publish an empty diagnostics list and the editor would
+    # show nothing.
+    bad_source = "func main() -> int64 {\n  let x: int64 = 0\n  return xy\n}\n"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/typo.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": bad_source,
+                    }
+                },
+            },
+            {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    diag_msgs = [
+        r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
+    ]
+    assert len(diag_msgs) == 1
+    diags = diag_msgs[0]["params"]["diagnostics"]
+    assert any("unknown name `xy`" in d["message"] for d in diags)
+
+
 def test_did_change_republishes_diagnostics(lsp_binary):
     responses = drive(
         lsp_binary,
