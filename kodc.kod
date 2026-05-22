@@ -348,23 +348,27 @@ func run_codegen(anon path: str) -> int64 {
     cg.register_primitive_module(str_module, kind: .KStr, prefix: "primitives$str", p: str_parser)
     cg.register_primitive_module(bool_module, kind: .KBool, prefix: "primitives$bool", p: bool_parser)
 
-    // Walk the entry's imports. For direct imports we always register
-    // the alias + the explicitly-named items (`register_import_module`
-    // and `register_imported_items` — both bind names into the entry's
-    // scope, so they must run even when the module was already loaded
-    // via someone else's transitive walk). Types registration and
-    // transitive descent are deduplicated through `loaded`.
+    // Two-pass import walk. Pass 1 parses every import, registers its
+    // alias, and registers the module's *types* (with transitive
+    // descent), so the type registry is complete before any function
+    // sig is resolved against it. Pass 2 then binds the function sigs
+    // and the named imported items. Without the split, a sig that
+    // returns an enum from a later-walked module captures KInt64 (the
+    // find_enum_idx fallback) and stays wrong forever — `infer_kind`
+    // on `mod.fn(...)` would then fail to dereference an enum match
+    // subject. Pass 2 re-parses each import; parsing is cheap compared
+    // to codegen, and `parsing.Parser` values aren't easy to stash in
+    // a typed local here.
     let loaded: [str] = []
     let d: int64 = 0
     for d < len(module.decls) {
         match module.decls[d] {
-            ast.Decl.Import(module_name, local_name, items) -> {
+            ast.Decl.Import(module_name, local_name, _items) -> {
                 if len(module_name) > 0 {
                     let resolved: Resolved = resolve_import(target_path: path, module_name)
                     let import_parser: parsing.Parser = parse_file(resolved.file)
                     let im: ast.Module = import_parser.parse_module()
-                    cg.register_import_module(im, local_mod: local_name, prefix: resolved.prefix, p: import_parser)
-                    cg.register_imported_items(items, im, prefix: resolved.prefix, p: import_parser)
+                    cg.register_import_module_alias(local_name, prefix: resolved.prefix)
                     let already: bool = false
                     for lp in loaded {
                         if lp == resolved.file {
@@ -390,6 +394,25 @@ func run_codegen(anon path: str) -> int64 {
     // the full registry in place pins down the right kind so downstream
     // chained access (`p.func_decls[0].name`) infers correctly.
     cg.resolve_field_kinds()
+
+    // Pass 2: every imported module's enums/structs are now registered,
+    // so resolve import function sigs and named imported items.
+    let d2: int64 = 0
+    for d2 < len(module.decls) {
+        match module.decls[d2] {
+            ast.Decl.Import(module_name, local_name, items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: path, module_name)
+                    let ip: parsing.Parser = parse_file(resolved.file)
+                    let im: ast.Module = ip.parse_module()
+                    cg.register_import_module_funcs(im, local_mod: local_name, prefix: resolved.prefix, p: ip)
+                    cg.register_imported_items(items, im, prefix: resolved.prefix, p: ip)
+                }
+            }
+            else none
+        }
+        d2 = d2 + 1
+    }
 
     cg.compile_module(module)
     if cg.had_errors() {
