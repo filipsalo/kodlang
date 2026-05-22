@@ -1,0 +1,200 @@
+// A minimal Language Server for Kod. Speaks JSON-RPC 2.0 over stdin/stdout
+// with the LSP framing in stdlib/jsonrpc, and right now only does one
+// useful thing: compile each open document and republish the resulting
+// errors as `textDocument/publishDiagnostics`.
+//
+// Run with:
+//   build/apps/lsp/lsp        # editor pipes LSP over stdin/stdout
+//
+// Editors point to the binary directly. The protocol surface implemented
+// is intentionally tiny — initialize, the open / change document
+// lifecycle, shutdown / exit. Anything else is acknowledged where the
+// spec requires a response and otherwise dropped.
+import "io"
+import "json"
+import "jsonrpc"
+import "kod/codegen"
+import "kod/test_support"
+
+// Per-document content keyed by URI. LSP guarantees `didOpen` arrives
+// before any `didChange` / `didClose` so we can treat unknown URIs as a
+// hard error rather than tracking it; for now we just no-op.
+type DocStore = Map[str, str]
+
+func main() -> int64 {
+    let docs: DocStore = DocStore(keys: [], values: [], indices: [])
+    let shutdown_received: bool = false
+    for true {
+        match jsonrpc.read_message() {
+            none -> return 0
+            Some(body) -> {
+                let req: json.Value = json.parse(body)
+                let method: str = ""
+                match json.as_str(json.get(req, key: "method")) {
+                    Some(m) -> method = m
+                    none -> {}
+                }
+                // `id` is present on requests, absent on notifications.
+                let id_val: json.Value = json.get(req, key: "id")
+                let has_id: bool = false
+                match id_val {
+                    .Null -> {}
+                    else has_id = true
+                }
+                if method == "initialize" {
+                    write_initialize_response(id_val)
+                } else if method == "initialized" {
+                    // Notification — nothing to do.
+                } else if method == "shutdown" {
+                    shutdown_received = true
+                    write_shutdown_response(id_val)
+                } else if method == "exit" {
+                    if shutdown_received {
+                        return 0
+                    }
+                    return 1
+                } else if method == "textDocument/didOpen" {
+                    handle_did_open(docs, params: json.get(req, key: "params"))
+                } else if method == "textDocument/didChange" {
+                    handle_did_change(docs, params: json.get(req, key: "params"))
+                } else if method == "textDocument/didClose" {
+                    handle_did_close(docs, params: json.get(req, key: "params"))
+                } else if has_id {
+                    // Request we don't implement — reply with MethodNotFound
+                    // (the spec requires *some* response for every request).
+                    write_method_not_found(id_val, method)
+                }
+                // Everything else (unknown notifications, $/ messages, …)
+                // is intentionally dropped.
+            }
+        }
+    }
+    return 0
+}
+
+func handle_did_open(docs: DocStore, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    let text: str = str_or_empty(json.get(td, key: "text"))
+    docs.set(uri, text)
+    publish_diagnostics(uri, text)
+}
+
+// `textDocument/didChange` with full sync mode: each notification carries
+// the whole new document body as the only entry in `contentChanges`.
+// Incremental sync (per-range edits) isn't supported yet.
+func handle_did_change(docs: DocStore, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    let changes: json.Value = json.get(params, key: "contentChanges")
+    let text: str = ""
+    match changes {
+        .Array(items) -> {
+            if len(items) > 0 {
+                let first: json.Value = items[0]
+                text = str_or_empty(json.get(first, key: "text"))
+            }
+        }
+        else none
+    }
+    docs.set(uri, text)
+    publish_diagnostics(uri, text)
+}
+
+func handle_did_close(docs: DocStore, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    docs.set(uri, "")
+    let empty: [json.Value] = []
+    publish_raw(uri, diagnostics: empty)
+}
+
+// Compile `text` with the in-process pipeline (no subprocess), turn each
+// codegen error into an LSP Diagnostic, and publish.
+func publish_diagnostics(uri: str, text: str) -> none {
+    let errors: [codegen.Error] = test_support.try_compile(text)
+    let diags: [json.Value] = []
+    for e in errors {
+        diags += [diagnostic_value(e)]
+    }
+    publish_raw(uri, diagnostics: diags)
+}
+
+func publish_raw(uri: str, diagnostics: [json.Value]) -> none {
+    let params_keys: [str] = ["uri", "diagnostics"]
+    let params_vals: [json.Value] = [json.Value.Str(value: uri), json.Value.Array(items: diagnostics)]
+    let params: json.Value = json.Value.Object(keys: params_keys, values: params_vals)
+    write_notification(method: "textDocument/publishDiagnostics", params: params)
+}
+
+// Build the LSP Diagnostic JSON for one codegen error. The codegen
+// reports 1-indexed line/col; LSP wants 0-indexed. We don't track token
+// end yet, so the range covers a single character at the start position.
+func diagnostic_value(anon e: codegen.Error) -> json.Value {
+    let line0: int64 = e.line - 1
+    let col0: int64 = e.col - 1
+    let start: json.Value = position_value(line: line0, character: col0)
+    let end: json.Value = position_value(line: line0, character: col0 + 1)
+    let range_keys: [str] = ["start", "end"]
+    let range_vals: [json.Value] = [start, end]
+    let range: json.Value = json.Value.Object(keys: range_keys, values: range_vals)
+    let diag_keys: [str] = ["range", "severity", "source", "message"]
+    let diag_vals: [json.Value] = [range, json.Value.Number(value: 1), json.Value.Str(value: "kod"), json.Value.Str(value: e.message)]
+    return json.Value.Object(keys: diag_keys, values: diag_vals)
+}
+
+func position_value(line: int64, character: int64) -> json.Value {
+    let keys: [str] = ["line", "character"]
+    let vals: [json.Value] = [json.Value.Number(value: line), json.Value.Number(value: character)]
+    return json.Value.Object(keys: keys, values: vals)
+}
+
+func write_initialize_response(id_val: json.Value) -> none {
+    // Full document sync (1) — the client sends the entire text on every
+    // change. Cheap to implement, fine for files that fit in memory.
+    let sync_keys: [str] = ["textDocumentSync"]
+    let sync_vals: [json.Value] = [json.Value.Number(value: 1)]
+    let caps: json.Value = json.Value.Object(keys: sync_keys, values: sync_vals)
+    let info_keys: [str] = ["name", "version"]
+    let info_vals: [json.Value] = [json.Value.Str(value: "kod-lsp"), json.Value.Str(value: "0.1")]
+    let info: json.Value = json.Value.Object(keys: info_keys, values: info_vals)
+    let result_keys: [str] = ["capabilities", "serverInfo"]
+    let result_vals: [json.Value] = [caps, info]
+    let result: json.Value = json.Value.Object(keys: result_keys, values: result_vals)
+    write_response(id_val, result: result)
+}
+
+func write_shutdown_response(id_val: json.Value) -> none {
+    write_response(id_val, result: json.Value.Null)
+}
+
+func write_method_not_found(id_val: json.Value, method: str) -> none {
+    let err_keys: [str] = ["code", "message"]
+    let err_vals: [json.Value] = [json.Value.Number(value: 0 - 32601), json.Value.Str(value: f"unknown method: {method}")]
+    let err: json.Value = json.Value.Object(keys: err_keys, values: err_vals)
+    let keys: [str] = ["jsonrpc", "id", "error"]
+    let vals: [json.Value] = [json.Value.Str(value: "2.0"), id_val, err]
+    let msg: json.Value = json.Value.Object(keys: keys, values: vals)
+    jsonrpc.write_message(json.emit(msg))
+}
+
+func write_response(id_val: json.Value, result: json.Value) -> none {
+    let keys: [str] = ["jsonrpc", "id", "result"]
+    let vals: [json.Value] = [json.Value.Str(value: "2.0"), id_val, result]
+    let msg: json.Value = json.Value.Object(keys: keys, values: vals)
+    jsonrpc.write_message(json.emit(msg))
+}
+
+func write_notification(method: str, params: json.Value) -> none {
+    let keys: [str] = ["jsonrpc", "method", "params"]
+    let vals: [json.Value] = [json.Value.Str(value: "2.0"), json.Value.Str(value: method), params]
+    let msg: json.Value = json.Value.Object(keys: keys, values: vals)
+    jsonrpc.write_message(json.emit(msg))
+}
+
+func str_or_empty(anon v: json.Value) -> str {
+    match json.as_str(v) {
+        Some(s) -> return s
+        none -> return ""
+    }
+}
