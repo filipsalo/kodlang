@@ -119,6 +119,17 @@ type IfaceInfo = struct {
     module_prefix: str
 }
 
+// One method on a primitive type (int64.to_str, str.hash, etc.).
+// Held in a single `prim_methods: [PrimMethodInfo]` keyed by (kind, name);
+// the lookup is a short linear scan (N ≈ 20), so a map would lose to
+// the strcmp / cache-locality of the array.
+type PrimMethodInfo = struct {
+    kind: TypeKind
+    name: str
+    label: str
+    sig: SigInfo
+}
+
 // ── Per-variable stack slot ───────────────────────────────────────────────────
 
 type VarSlot = struct {
@@ -235,10 +246,9 @@ type Codegen = struct {
     // Methods registered against primitive types via stdlib/primitives/
     // modules. Parallel arrays: kind, name, label, sig. Method dispatch
     // on a primitive receiver finds the entry whose kind + name match.
-    prim_method_kinds: [TypeKind]
-    prim_method_names: [str]
-    prim_method_labels: [str]
-    prim_method_sigs: [SigInfo]
+    // Methods on primitive types, one entry per (kind, name). See
+    // PrimMethodInfo. Was four parallel arrays.
+    prim_methods: [PrimMethodInfo]
 
     // Active type-parameter substitution. While compiling a specialised
     // method (e.g. Map[str, str].get) `subst_names` holds the template's
@@ -2427,26 +2437,18 @@ type Codegen = struct {
     // method named `name`.
     func find_prim_method(self, anon name: str, kind: TypeKind) -> int64 {
         let i = 0
-        for i < len(self.prim_method_names) {
-            if self.prim_method_names[i] == name {
-                let stored = self.prim_method_kinds[i]
+        for i < len(self.prim_methods) {
+            let pm = self.prim_methods[i]
+            if pm.name == name {
+                let matches: bool = false
                 match kind {
-                    .KInt64 -> {
-                        if stored is .KInt64 {
-                            return i
-                        }
-                    }
-                    .KStr -> {
-                        if stored is .KStr {
-                            return i
-                        }
-                    }
-                    .KBool -> {
-                        if stored is .KBool {
-                            return i
-                        }
-                    }
+                    .KInt64 -> if pm.kind is .KInt64 { matches = true }
+                    .KStr -> if pm.kind is .KStr { matches = true }
+                    .KBool -> if pm.kind is .KBool { matches = true }
                     else none
+                }
+                if matches {
+                    return i
                 }
             }
             i = i + 1
@@ -2480,9 +2482,10 @@ type Codegen = struct {
         if len(method_lbl) == 0 {
             let prim_idx = self.find_prim_method(method_name, kind: recv_kind)
             if prim_idx >= 0 {
-                method_lbl = self.prim_method_labels[prim_idx]
-                sig_params = self.prim_method_sigs[prim_idx].param_kinds
-                sig_labels = self.prim_method_sigs[prim_idx].param_labels
+                let pm = self.prim_methods[prim_idx]
+                method_lbl = pm.label
+                sig_params = pm.sig.param_kinds
+                sig_labels = pm.sig.param_labels
             }
         }
         if len(method_lbl) == 0 {
@@ -2775,7 +2778,7 @@ type Codegen = struct {
         // the primitive method table.
         let prim_idx = self.find_prim_method(method_name, kind: obj_kind)
         if prim_idx >= 0 {
-            return self.prim_method_sigs[prim_idx].return_kind
+            return self.prim_methods[prim_idx].sig.return_kind
         }
         return none
     }
@@ -4352,7 +4355,7 @@ type Codegen = struct {
             for method_name in iface_info.method_names {
                 let pm_idx = self.find_prim_method(method_name, kind)
                 if pm_idx >= 0 {
-                    self.println(f"\t.quad {self.prim_method_labels[pm_idx]}")
+                    self.println(f"\t.quad {self.prim_methods[pm_idx].label}")
                 } else {
                     self.println(f"\t.quad 0")
                 }
@@ -4395,10 +4398,7 @@ type Codegen = struct {
                     let func_decl = p.func_decls[decl_id]
                     let lbl = f"${prefix}${func_decl.name}"
                     let sig = self.resolve_sig(func_decl, p: p)
-                    self.prim_method_kinds += [kind]
-                    self.prim_method_names += [func_decl.name]
-                    self.prim_method_labels += [lbl]
-                    self.prim_method_sigs += [sig]
+                    self.prim_methods += [PrimMethodInfo(kind: kind, name: func_decl.name, label: lbl, sig: sig)]
                 }
                 else none
             }
@@ -4490,14 +4490,11 @@ func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     let struct_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
     let enum_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
     let iface_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
-    let prim_method_kinds: [TypeKind] = []
-    let prim_method_names: [str] = []
-    let prim_method_labels: [str] = []
-    let prim_method_sigs: [SigInfo] = []
+    let prim_methods: [PrimMethodInfo] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
     let subst_names: [str] = []
     let subst_args: [TypeKind] = []
     let interned: StrMap = StrMap(keys: [], values: [], indices: [])
     let errors: [Error] = []
-    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, prim_vtable_kinds: prim_vtable_kinds, prim_vtable_iface_idx: prim_vtable_iface_idx, struct_idx: struct_idx, enum_idx: enum_idx, iface_idx: iface_idx, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, prim_method_kinds: prim_method_kinds, prim_method_names: prim_method_names, prim_method_labels: prim_method_labels, prim_method_sigs: prim_method_sigs, subst_names: subst_names, subst_args: subst_args, errors: errors, in_test: false, dry_run: false)
+    return Codegen(p: p, path_prefix: path_prefix, enums: enums, structs: structs, interfaces: interfaces, vtable_struct_idx: vtable_struct_idx, vtable_iface_idx: vtable_iface_idx, prim_vtable_kinds: prim_vtable_kinds, prim_vtable_iface_idx: prim_vtable_iface_idx, struct_idx: struct_idx, enum_idx: enum_idx, iface_idx: iface_idx, import_local: import_local, import_prefix: import_prefix, import_fn_module: import_fn_module, import_fn_name: import_fn_name, import_fn_label: import_fn_label, import_fn_sigs: import_fn_sigs, vars: vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, free_regs: free_regs, loop_stack: loop_stack, str_labels: str_labels, str_values: str_values, interned: interned, label_count: 0, func_names: func_names, func_labels: func_labels, func_sigs: func_sigs, func_idx: func_idx, prim_methods: prim_methods, subst_names: subst_names, subst_args: subst_args, errors: errors, in_test: false, dry_run: false)
 }
