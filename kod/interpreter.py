@@ -658,6 +658,12 @@ class Interpreter:
                     else sys.stdin.read(n).encode("utf8")
                 )
                 return types.String(buf)
+            if func.name == "write_stdout":
+                # Mirror runtime write_stdout: raw write, no newline,
+                # no flush.
+                msg = args[0].value.decode("utf8")
+                sys.stdout.write(msg)
+                return types.none_value
             c_func = getattr(libc, func.name)
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]

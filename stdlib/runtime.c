@@ -310,6 +310,13 @@ char *read_stdin_line(void) {
     return buf;
 }
 
+// Write `s` to stdout verbatim — no trailing newline, no flush. Use
+// for output where you control framing (e.g. LSP messages where the
+// `\n` puts/print appends would split the next message's headers).
+void write_stdout(const char *s) {
+    fputs(s, stdout);
+}
+
 // Read exactly `n` bytes from stdin into a NUL-terminated arena buffer
 // and return it. On a short read (EOF before n bytes), returns the
 // truncated content; callers detect the truncation by length-checking
