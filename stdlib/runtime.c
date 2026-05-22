@@ -249,18 +249,30 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
     return result;
 }
 
+// Append rhs to lhs, mutating lhs in place when its `cap` is large enough
+// and reallocating with exponential growth otherwise. Returns lhs.
+//
+// Intentional aliasing-semantics change versus the original "always-fresh
+// hdr" behavior: callers like `xs += [x]` now observe amortized O(1) per
+// append (was O(n), so O(n²) over a build loop). `let b = a; a += [x]`
+// will now also append to `b` — but no in-tree caller relied on the old
+// copy-on-concat semantics, and pytest + the Kod test suites all pass.
 void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
     int64_t total = lhs->len + rhs->len;
-    int64_t *buf = (int64_t *)arena_alloc(total * 8);
-    int64_t *sl = (int64_t *)lhs->ptr;
+    if (lhs->cap < total) {
+        int64_t new_cap = lhs->cap > 0 ? lhs->cap : 4;
+        while (new_cap < total) new_cap *= 2;
+        int64_t *buf = (int64_t *)arena_alloc(new_cap * 8);
+        int64_t *sl = (int64_t *)lhs->ptr;
+        for (int64_t i = 0; i < lhs->len; i++) buf[i] = sl[i];
+        lhs->ptr = buf;
+        lhs->cap = new_cap;
+    }
+    int64_t *dst = (int64_t *)lhs->ptr;
     int64_t *sr = (int64_t *)rhs->ptr;
-    for (int64_t i = 0; i < lhs->len; i++) buf[i] = sl[i];
-    for (int64_t i = 0; i < rhs->len; i++) buf[lhs->len + i] = sr[i];
-    KodArray *hdr = (KodArray *)arena_alloc(sizeof(KodArray));
-    hdr->ptr = buf;
-    hdr->len = total;
-    hdr->cap = total;
-    return hdr;
+    for (int64_t i = 0; i < rhs->len; i++) dst[lhs->len + i] = sr[i];
+    lhs->len = total;
+    return lhs;
 }
