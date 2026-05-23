@@ -58,6 +58,12 @@ type VariantInfo = struct {
     field_names: [str]
     field_offsets: [int64]
     field_kinds: [TypeKind]
+    // Raw AST type-expression ids for each field, parallel to
+    // `field_kinds`. Kept so resolve_variant_field_kinds can re-resolve
+    // after all imports are registered — captures the self-recursive
+    // case where a variant field refers to its own enum, which isn't
+    // in the registry yet at register_enum time.
+    field_type_exprs: [int64]
 }
 
 type EnumInfo = struct {
@@ -68,6 +74,10 @@ type EnumInfo = struct {
     // Local enums use the current module's prefix; imported ones use
     // the source module's prefix (e.g. "builtins").
     module_prefix: str
+    // Parser that owns the variant field type_exprs. Same role as
+    // StructInfo.src_p: needed so resolve_variant_field_kinds can swap
+    // in the right parser when re-resolving the type ids.
+    src_p: parsing.Parser
 }
 
 type FieldInfo = struct {
@@ -1206,23 +1216,25 @@ type Codegen = struct {
                     let field_names: [str] = []
                     let field_offsets: [int64] = []
                     let field_kinds: [TypeKind] = []
+                    let field_type_exprs: [int64] = []
                     let j = 0
                     for j < len(variant.fields) {
                         field_names += [variant.fields[j].name]
                         field_offsets += [j * 8]
                         field_kinds += [self.resolve_type(variant.fields[j].typ)]
+                        field_type_exprs += [variant.fields[j].typ]
                         j = j + 1
                     }
                     let payload = len(variant.fields) * 8
                     if payload > max_payload {
                         max_payload = payload
                     }
-                    variant_infos += [VariantInfo(name: variant.name, discriminant: disc, :field_names, :field_offsets, :field_kinds)]
+                    variant_infos += [VariantInfo(name: variant.name, discriminant: disc, :field_names, :field_offsets, :field_kinds, :field_type_exprs)]
                     disc = disc + 1
                 }
                 self.p = saved_p
                 let data_width = 8 + max_payload
-                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix)]
+                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p)]
                 self.enum_idx.set(name, len(self.enums) - 1)
             }
             else none
@@ -1392,6 +1404,33 @@ type Codegen = struct {
                 new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr)]
             }
             self.structs[i].fields = new_fields
+            self.p = saved_p
+            i = i + 1
+        }
+    }
+
+    // Mirror of resolve_field_kinds for enum variant fields. Self-
+    // recursive enums (e.g. `Value = enum { Array(items: [Value]) }`)
+    // capture plain KArray at register_enum time because Value isn't
+    // in self.enums yet. Re-resolving once every type is registered
+    // pins the right kind (KArrayEnum) so downstream `items[i]` infers
+    // correctly instead of falling back to KInt64.
+    func resolve_variant_field_kinds(self) -> none {
+        let i: int64 = 0
+        for i < len(self.enums) {
+            let saved_p = self.p
+            self.p = self.enums[i].src_p
+            let new_variants: [VariantInfo] = []
+            for v in self.enums[i].variants {
+                let new_kinds: [TypeKind] = []
+                let j: int64 = 0
+                for j < len(v.field_type_exprs) {
+                    new_kinds += [self.resolve_type(v.field_type_exprs[j])]
+                    j = j + 1
+                }
+                new_variants += [VariantInfo(name: v.name, discriminant: v.discriminant, field_names: v.field_names, field_offsets: v.field_offsets, field_kinds: new_kinds, field_type_exprs: v.field_type_exprs)]
+            }
+            self.enums[i].variants = new_variants
             self.p = saved_p
             i = i + 1
         }
