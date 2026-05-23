@@ -1,0 +1,269 @@
+// Shared compile pipeline. The CLI driver in `kodc.kod` and the
+// language server in `tools/lsp.kod` both need to take a Kod source
+// file, walk its transitive imports, register everything in a fresh
+// codegen, and run codegen.compile_module. This module owns that
+// orchestration so neither caller has to repeat the import-walk
+// boilerplate. Callers differ only in:
+//   - whether they start from a path on disk (kodc) or an in-memory
+//     buffer (lsp), so the entry parser/module are passed in;
+//   - whether they want asm side effects, which is controlled by
+//     codegen.Codegen.dry_run.
+import "io"
+import "kod/lexing"
+import "kod/parsing"
+import "kod/ast"
+import "kod/codegen"
+
+func starts_with(anon s: str, prefix: str) -> bool {
+    if len(prefix) > len(s) {
+        return false
+    }
+    let i: int64 = 0
+    for i < len(prefix) {
+        if s[i] != prefix[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func dirname(anon path: str) -> str {
+    // Returns the directory portion (including trailing slash) or "" if none.
+    let i: int64 = len(path) - 1
+    for i >= 0 {
+        if path[i] == '/' {
+            return path[0:i+1]
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+func path_to_prefix(anon path: str) -> str {
+    // Strip .kod suffix, and drop the leading 'stdlib/' if present so the
+    // prefix matches what 'import "kod/foo"' resolves to.
+    let name: str = path[0:len(path)-4]
+    if len(name) > 7 and name[0:7] == "stdlib/" {
+        name = name[7:len(name)]
+    }
+    let result: str = ""
+    let i: int64 = 0
+    for i < len(name) {
+        if name[i] == '/' {
+            result = f"{result}$"
+        } else {
+            result = result + name[i:i+1]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+func parse_file(anon path: str) -> parsing.Parser {
+    let source: str = io.read_file(path)
+    let lxr: lexing.Lexer = lexing.Lexer(source: source, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    return parsing.make_parser(tokens, path: path, source: source)
+}
+
+// Resolve an import's module_name to (file_path, codegen_prefix).
+type Resolved = struct {
+    file: str
+    prefix: str
+}
+
+func resolve_import(target_path: str, module_name: str) -> Resolved {
+    if starts_with(module_name, prefix: "./") {
+        let rel: str = module_name[2:len(module_name)]
+        let dir: str = dirname(target_path)
+        let rel_file: str = f"{dir}{rel}.kod"
+        return Resolved(file: rel_file, prefix: path_to_prefix(rel_file))
+    }
+    // stdlib import: prefix drops the stdlib/ root
+    let std_file: str = f"stdlib/{module_name}.kod"
+    let std_prefix: str = ""
+    let i: int64 = 0
+    for i < len(module_name) {
+        if module_name[i] == '/' {
+            std_prefix = f"{std_prefix}$"
+        } else {
+            std_prefix = std_prefix + module_name[i:i+1]
+        }
+        i = i + 1
+    }
+    return Resolved(file: std_file, prefix: std_prefix)
+}
+
+// Recursively register types from a module's own imports. The
+// transitively-loaded modules don't get import aliases or function
+// exports — they're loaded purely so the codegen can resolve types
+// they define when those types appear in fields of structs the entry
+// does use. `loaded` is the running set of already-loaded file paths;
+// returned so the caller can keep deduplicating.
+func load_transitive(cg: codegen.Codegen, module: ast.Module, importer_path: str, loaded: [str]) -> [str] {
+    for d in module.decls {
+        match d {
+            ast.Decl.Import(module_name, _local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: importer_path, module_name)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        let import_parser: parsing.Parser = parse_file(resolved.file)
+                        let im: ast.Module = import_parser.parse_module()
+                        cg.register_module_types(im, prefix: resolved.prefix, p: import_parser)
+                        loaded = load_transitive(cg, module: im, importer_path: resolved.file, loaded)
+                    }
+                }
+            }
+            else none
+        }
+    }
+    return loaded
+}
+
+func module_has_tests(anon module: ast.Module) -> bool {
+    for d in module.decls {
+        if d is .Test(_display, _decl) {
+            return true
+        }
+    }
+    return false
+}
+
+// Walk the import graph from `module` (which lives at `importer_path`)
+// and collect the mangled prefixes of every reachable test-bearing
+// module. `loaded` and `prefixes` are accumulators threaded through
+// the recursion; returns the updated prefixes list.
+func collect_test_modules(module: ast.Module, importer_path: str, loaded: [str], prefixes: [str]) -> [str] {
+    for d in module.decls {
+        match d {
+            ast.Decl.Import(module_name, _local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: importer_path, module_name)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        let p: parsing.Parser = parse_file(resolved.file)
+                        let im: ast.Module = p.parse_module()
+                        if module_has_tests(im) {
+                            prefixes += [resolved.prefix]
+                        }
+                        prefixes = collect_test_modules(module: im, importer_path: resolved.file, loaded, prefixes)
+                    }
+                }
+            }
+            else none
+        }
+    }
+    return prefixes
+}
+
+// Compile the already-parsed entry module against the full stdlib +
+// the transitive import graph rooted at `entry_path`. The caller
+// supplies the parsed entry so it can come from an editor buffer
+// (LSP) instead of disk (kodc). Returns the configured codegen so
+// the caller can read `cg.errors`, `cg.print_errors()`, etc.
+//
+// `dry_run = true` suppresses asm emission — what the LSP wants.
+// `dry_run = false` is the kodc.kod path.
+//
+// `entry_path` matters for two things: relative-import resolution
+// (`./foo`) walks from its directory, and codegen.Error stamps it as
+// `error.path` for errors that came from the entry module.
+func compile_program(entry_parser: parsing.Parser, entry_module: ast.Module, entry_path: str, dry_run: bool) -> codegen.Codegen {
+    let builtins_parser: parsing.Parser = parse_file("stdlib/builtins.kod")
+    let builtins_module: ast.Module = builtins_parser.parse_module()
+
+    // Primitive type modules: their functions are registered as
+    // methods on the corresponding TypeKind, not as global names.
+    let int64_parser: parsing.Parser = parse_file("stdlib/primitives/int64.kod")
+    let int64_module: ast.Module = int64_parser.parse_module()
+    let str_parser: parsing.Parser = parse_file("stdlib/primitives/str.kod")
+    let str_module: ast.Module = str_parser.parse_module()
+    let bool_parser: parsing.Parser = parse_file("stdlib/primitives/bool.kod")
+    let bool_module: ast.Module = bool_parser.parse_module()
+
+    let prefix: str = path_to_prefix(entry_path)
+    let cg: codegen.Codegen = codegen.make_codegen(entry_parser, prefix)
+    cg.dry_run = dry_run
+    cg.register_module_funcs(builtins_module, prefix: "builtins", p: builtins_parser)
+    cg.register_module_types(builtins_module, prefix: "builtins", p: builtins_parser)
+    cg.register_primitive_module(int64_module, kind: .KInt64, prefix: "primitives$int64", p: int64_parser)
+    cg.register_primitive_module(str_module, kind: .KStr, prefix: "primitives$str", p: str_parser)
+    cg.register_primitive_module(bool_module, kind: .KBool, prefix: "primitives$bool", p: bool_parser)
+
+    // Two-pass import walk. Pass 1 parses every import, registers its
+    // alias, and registers the module's *types* (with transitive
+    // descent), so the type registry is complete before any function
+    // sig is resolved against it. Pass 2 then binds the function sigs
+    // and the named imported items. Without the split, a sig that
+    // returns an enum from a later-walked module captures KInt64 (the
+    // find_enum_idx fallback) and stays wrong forever — `infer_kind`
+    // on `mod.fn(...)` would then fail to dereference an enum match
+    // subject. Pass 2 re-parses each import; parsing is cheap compared
+    // to codegen, and `parsing.Parser` values aren't easy to stash in
+    // a typed local here.
+    let loaded: [str] = []
+    for d in entry_module.decls {
+        match d {
+            ast.Decl.Import(module_name, local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: entry_path, module_name)
+                    let import_parser: parsing.Parser = parse_file(resolved.file)
+                    let im: ast.Module = import_parser.parse_module()
+                    cg.register_import_module_alias(local_name, prefix: resolved.prefix)
+                    let already: bool = false
+                    for lp in loaded {
+                        if lp == resolved.file {
+                            already = true
+                        }
+                    }
+                    if already == false {
+                        loaded += [resolved.file]
+                        cg.register_module_types(im, prefix: resolved.prefix, p: import_parser)
+                        loaded = load_transitive(cg, module: im, importer_path: resolved.file, loaded)
+                    }
+                }
+            }
+            else none
+        }
+    }
+
+    // Re-resolve struct field kinds now that every imported module has
+    // been registered. If an earlier-registered struct had a field
+    // whose element type came from a later-registered module, its kind
+    // was recorded as a plain KArray (no element). Re-resolving with
+    // the full registry in place pins down the right kind so downstream
+    // chained access (`p.func_decls[0].name`) infers correctly.
+    cg.resolve_field_kinds()
+
+    for d2 in entry_module.decls {
+        match d2 {
+            ast.Decl.Import(module_name, local_name, items) -> {
+                if len(module_name) > 0 {
+                    let resolved: Resolved = resolve_import(target_path: entry_path, module_name)
+                    let ip: parsing.Parser = parse_file(resolved.file)
+                    let im: ast.Module = ip.parse_module()
+                    cg.register_import_module_funcs(im, local_mod: local_name, prefix: resolved.prefix, p: ip)
+                    cg.register_imported_items(items, im, prefix: resolved.prefix, p: ip)
+                }
+            }
+            else none
+        }
+    }
+
+    cg.compile_module(entry_module)
+    return cg
+}

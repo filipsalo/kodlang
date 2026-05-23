@@ -13,8 +13,11 @@
 import "io"
 import "json"
 import "jsonrpc"
+import "kod/lexing"
+import "kod/parsing"
+import "kod/ast"
 import "kod/codegen"
-import "kod/test_support"
+import "kod/build"
 
 // Per-document content keyed by URI. LSP guarantees `didOpen` arrives
 // before any `didChange` / `didClose` so we can treat unknown URIs as a
@@ -109,15 +112,35 @@ func handle_did_close(docs: DocStore, params: json.Value) -> none {
     publish_raw(uri, diagnostics: empty)
 }
 
-// Compile `text` with the in-process pipeline (no subprocess), turn each
-// codegen error into an LSP Diagnostic, and publish.
+// Compile `text` against the full stdlib + its transitive imports
+// (read from disk relative to CWD — Zed launches the LSP with the
+// workspace root as CWD, so `import "io"` etc. resolve normally).
+// Errors from imported modules carry their own .path; we publish only
+// those that came from the buffer the user is editing.
 func publish_diagnostics(uri: str, text: str) -> none {
-    let errors: [codegen.Error] = test_support.try_compile(text)
+    let entry_path: str = uri_to_path(uri)
+    let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
+    let module: ast.Module = p.parse_module()
+    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, entry_path: entry_path, dry_run: true)
     let diags: [json.Value] = []
-    for e in errors {
-        diags += [diagnostic_value(e)]
+    for e in cg.errors {
+        if e.path == entry_path {
+            diags += [diagnostic_value(e)]
+        }
     }
     publish_raw(uri, diagnostics: diags)
+}
+
+// `file:///abs/path` → `/abs/path`. Any other scheme is returned as-is;
+// the codegen will fail loudly on the unusable path, which is preferable
+// to silently compiling a different file.
+func uri_to_path(anon uri: str) -> str {
+    if len(uri) > 7 and uri[0:7] == "file://" {
+        return uri[7:len(uri)]
+    }
+    return uri
 }
 
 func publish_raw(uri: str, diagnostics: [json.Value]) -> none {
