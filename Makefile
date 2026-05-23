@@ -45,12 +45,14 @@ COMPILER_KOD := \
     stdlib/kod/lexing.kod \
     stdlib/kod/parsing.kod \
     stdlib/kod/codegen.kod \
+    stdlib/kod/build.kod \
     kodc.kod
 
 STAGE1_OBJS := \
     $(STAGE1)/lexing.o \
     $(STAGE1)/parsing.o \
     $(STAGE1)/codegen.o \
+    $(STAGE1)/build.o \
     $(STAGE1)/kodc.o \
     $(STAGE1)/runtime_main.o
 
@@ -88,6 +90,10 @@ $(STAGE1)/parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
 	$(KOD) _interpret kodc.kod $< > $@
 
 $(STAGE1)/codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE1)
+	$(KOD) _interpret kodc.kod $< > $@
+
+$(STAGE1)/build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
 	$(KOD) _interpret kodc.kod $< > $@
 
