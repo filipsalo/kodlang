@@ -155,6 +155,43 @@ def test_unknown_identifier_diagnostic(lsp_binary):
     assert end["line"] == 2 and end["character"] == 11
 
 
+def test_parse_error_emits_diagnostic(lsp_binary):
+    # The self-hosted parser used to advance silently past unexpected
+    # tokens, so syntactically bad input fed a garbage AST to codegen
+    # and the LSP either reported nothing or some confusing downstream
+    # error. With the structured ParseError path, `expect()` records
+    # `expected X, got Y` and the LSP publishes it as a diagnostic.
+    bad_source = 'func main() -> int64 {\n  print("hi"\n  return 0\n}\n'
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/parse.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": bad_source,
+                    }
+                },
+            },
+            {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    diag_msgs = [
+        r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
+    ]
+    assert len(diag_msgs) == 1
+    diags = diag_msgs[0]["params"]["diagnostics"]
+    assert any(
+        "expected `)`" in d["message"] for d in diags
+    ), f"no `expected )` in diags: {diags}"
+
+
 def test_cross_module_import_resolves(lsp_binary):
     # Buffer that pulls in stdlib `io` and uses io.read_file should
     # compile cleanly. The previous LSP only loaded builtins +

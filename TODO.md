@@ -13,10 +13,6 @@ pinpoint location, or where the locus might move.
 
 ## Codegen
 
-- [ ] **Enum variant field kinds aren't re-resolved.**
-      `resolve_field_kinds` only fixes struct fields. Enum variants
-      could have the same registration-order issue; no in-tree case
-      bites today.
 - [ ] **`mov xN, #imm` outside `load`/`mov_to`.** Several emit sites
       use `mov reg, #N` for buffer sizes, enum discriminants, etc.
       They pass small controlled values today, but should route
@@ -32,10 +28,12 @@ pinpoint location, or where the locus might move.
 ## Parser
 
 - [ ] Python parser raises on the first error rather than recovering and
-      reporting the rest. The self-hosted parser doesn't report errors
-      at all — `expect()` just `advance()`s without checking the kind,
-      so syntactically bad input ends up as garbage AST that the codegen
-      then trips over with confusing messages.
+      reporting the rest. (The self-hosted parser's `expect()` now
+      records a structured `ParseError` on mismatch, advances past
+      the bad token, and keeps going — those errors are folded into
+      `cg.errors` so `kodc`, the LSP, and `try_compile` all see them.
+      Could do error recovery / synchronization next; right now we
+      report each `expect()` failure individually.)
 - [ ] Python AST nodes still carry `type[types.Type]` references (Python
       class objects) in fields like `FunctionDeclaration.return_type`.
       Keep the AST data-only so the Python frontend doesn't drift away

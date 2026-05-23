@@ -123,6 +123,24 @@ func parse_string_value(anon raw: str) -> str {
 	return unescape_str(raw[1:len(raw)-1])
 }
 
+// ParseError is the structured diagnostic the parser produces when
+// `expect()` finds a token kind that doesn't match. Same field shape
+// as codegen.Error so callers can fold parser errors into the codegen's
+// error list without re-formatting (see kodc.kod / tools/lsp.kod).
+type ParseError = struct {
+	path: str
+	line: int64
+	col: int64
+	end_col: int64
+	message: str
+	source_line: str
+	caret: str
+
+	func to_str(self) -> str {
+		return f"{self.path}:{self.line.to_str()}:{self.col.to_str()}: {self.message}"
+	}
+}
+
 type Parser = struct {
 	// Path of the source file this parser was built from. Used by
 	// the codegen's error reporter to produce `path:line:col` prefixes.
@@ -144,6 +162,13 @@ type Parser = struct {
 	match_arms: [ast.MatchArm]
 	match_expr_arms: [ast.MatchExprArm]
 	func_decls: [ast.FuncDecl]
+
+	// Errors accumulated by `expect`/`expect_identifier` when the
+	// next token doesn't have the expected kind. Empty means the
+	// input parsed cleanly. Inspect this after `parse_module` —
+	// the parser advances past the bad token and keeps going so
+	// downstream errors don't cascade off the original cause.
+	errors: [ParseError]
 
 	func peek(self) -> lexing.Token {
 		return self.tokens[self.pos]
@@ -180,11 +205,73 @@ type Parser = struct {
 	}
 
 	func expect(self, anon kind: lexing.TokenKind) -> lexing.Token {
+		if self.peek_kind() != kind {
+			self.record_unexpected(expected: lexing.kind_name(kind), got: self.peek())
+		}
 		return self.advance()
 	}
 
 	func expect_identifier(self) -> str {
+		if self.peek_kind() != .Identifier {
+			self.record_unexpected(expected: "identifier", got: self.peek())
+		}
 		return self.advance().value
+	}
+
+	// Push a structured ParseError onto self.errors. Mirrors the
+	// line/col/source_line/caret computation in codegen.report_error so
+	// callers can render parse errors the same way (and the LSP can
+	// publish them as Diagnostics without reformatting).
+	func record_unexpected(self, expected: str, got: lexing.Token) -> none {
+		let offset: int64 = got.start
+		let line: int64 = 1
+		let col: int64 = 1
+		let line_start: int64 = 0
+		let i: int64 = 0
+		for i < offset and i < len(self.source) {
+			if self.source[i] == '\n' {
+				line = line + 1
+				col = 1
+				line_start = i + 1
+			} else {
+				col = col + 1
+			}
+			i = i + 1
+		}
+		let line_end: int64 = line_start
+		for line_end < len(self.source) and self.source[line_end] != '\n' {
+			line_end = line_end + 1
+		}
+		let raw_line: str = self.source[line_start:line_end]
+		let line_text: str = ""
+		let li: int64 = 0
+		for li < len(raw_line) {
+			if raw_line[li] == '\t' {
+				line_text = line_text + "    "
+			} else {
+				line_text = line_text + raw_line[li:li+1]
+			}
+			li = li + 1
+		}
+		let caret: str = ""
+		let s: int64 = 0
+		for s < col - 1 {
+			if line_start + s < len(self.source) and self.source[line_start + s] == '\t' {
+				caret = caret + "    "
+			} else {
+				caret = caret + " "
+			}
+			s = s + 1
+		}
+		caret = caret + "^"
+		// Use the token's own width for the end_col, falling back to one.
+		let width: int64 = got.end - got.start
+		if width < 1 {
+			width = 1
+		}
+		let end_col: int64 = col + width
+		let message: str = f"error: expected {expected}, got {lexing.kind_name(got.kind)}"
+		self.errors += [ParseError(path: self.path, :line, :col, :end_col, :message, source_line: line_text, :caret)]
 	}
 
 	func skip_newlines(self) -> none {
@@ -253,7 +340,16 @@ type Parser = struct {
 			self.expect(.CloseBracket)
 			return self.alloc_type(ast.TypeExpr.Array(:inner))
 		}
-		let name: str = self.expect_identifier()
+		// `none` doubles as both the keyword for the absent optional and
+		// the void-return type. The lexer always lex's it as KwNone, so
+		// accept it here without going through expect_identifier (which
+		// would otherwise report "expected identifier, got `none`").
+		let name: str = ""
+		if self.try_consume(.KwNone) {
+			name = "none"
+		} else {
+			name = self.expect_identifier()
+		}
 		// Module-qualified type: 'mod.Name' — we use the unqualified name
 		// since all imported types are registered globally in the codegen's
 		// struct/enum tables.
@@ -1140,5 +1236,6 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
 	let dummy_params: [ast.Param] = []
 	let dummy_body: [int64] = []
 	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", params: dummy_params, return_typ: 0, body: dummy_body)]
-	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls)
+	let errors: [ParseError] = []
+	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls, :errors)
 }
