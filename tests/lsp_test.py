@@ -387,6 +387,77 @@ def test_cross_module_import_resolves(lsp_binary):
     ), f"unexpected diagnostics: {diag_msgs[0]['params']['diagnostics']}"
 
 
+def test_debounce_coalesces_typing_burst(lsp_binary):
+    # 30 rapid didChange notifications followed by a 350ms idle period
+    # (> the 250ms debounce window). The LSP should compile + publish
+    # exactly once after the burst settles, not once per change.
+    import subprocess as _sp
+    import time
+
+    process = _sp.Popen(
+        [str(lsp_binary)],
+        stdin=_sp.PIPE,
+        stdout=_sp.PIPE,
+        stderr=_sp.PIPE,
+        cwd=ROOT,
+    )
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///tmp/burst.kod",
+                    "languageId": "kod",
+                    "version": 1,
+                    "text": "func main() -> int64 { return 0 }\n",
+                }
+            },
+        },
+    ]
+    for i in range(30):
+        msgs.append(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/burst.kod", "version": i + 2},
+                    "contentChanges": [
+                        {"text": f"func main() -> int64 {{ return {i} }}\n"}
+                    ],
+                },
+            }
+        )
+    process.stdin.write(b"".join(frame(m) for m in msgs))
+    process.stdin.flush()
+    time.sleep(0.35)  # > debounce_ms (250). Lets the LSP idle out.
+    process.stdin.write(
+        b"".join(
+            frame(m)
+            for m in [
+                {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None},
+                {"jsonrpc": "2.0", "method": "exit", "params": None},
+            ]
+        )
+    )
+    process.stdin.close()
+    stdout, _ = process.communicate(timeout=10)
+    assert process.returncode == 0
+    responses = parse_frames(stdout)
+    diag_msgs = [
+        r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
+    ]
+    # Debounce coalesces. We're tolerant of small fragmentation in
+    # the pipe buffer between the test process and the LSP — what we
+    # really want to assert is "many fewer compiles than didChanges."
+    # 30 didChanges should produce a small handful of publishes at
+    # most, never 30. Each one carries the final empty diagnostics.
+    assert 1 <= len(diag_msgs) <= 5
+    for d in diag_msgs:
+        assert d["params"]["diagnostics"] == []
+
+
 def test_did_change_republishes_diagnostics(lsp_binary):
     responses = drive(
         lsp_binary,
@@ -418,10 +489,14 @@ def test_did_change_republishes_diagnostics(lsp_binary):
             {"jsonrpc": "2.0", "method": "exit", "params": None},
         ],
     )
+    # Debounce coalesces the didOpen + didChange burst into a single
+    # publish for the final buffer state. The test pipes both
+    # notifications back-to-back, so the LSP never sees an idle gap;
+    # the shutdown handler flushes the still-pending publish on the
+    # way out, which is what we observe here.
     diag_msgs = [
         r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
     ]
-    assert len(diag_msgs) == 2
-    assert diag_msgs[0]["params"]["diagnostics"] == []
-    second_diags = diag_msgs[1]["params"]["diagnostics"]
-    assert any("oops" in d["message"] for d in second_diags)
+    assert len(diag_msgs) == 1
+    diags = diag_msgs[0]["params"]["diagnostics"]
+    assert any("oops" in d["message"] for d in diags)

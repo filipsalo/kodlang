@@ -30,17 +30,37 @@ type DocStore = Map[str, str]
 // for the same (uri, text) reuses `cg`, otherwise we recompile and
 // overwrite. Only one cached buffer at a time — fine for the typical
 // "active editor" pattern.
+//
+// `publish_pending` is set by didOpen / didChange to defer the
+// (expensive) compile-and-publish-diagnostics step. The main loop
+// fires it once stdin has been idle long enough to coalesce a typing
+// burst; a hover / definition request firing in the meantime also
+// flushes it as a side effect of compiling.
 type CompileCache = struct {
     uri: str
     text: str
     cg: codegen.Codegen?
+    publish_pending: bool
 }
 
 func main() -> int64 {
     let docs: DocStore = DocStore(keys: [], values: [], indices: [])
-    let cache: CompileCache = CompileCache(uri: "", text: "", cg: none)
+    let cache: CompileCache = CompileCache(uri: "", text: "", cg: none, publish_pending: false)
     let shutdown_received: bool = false
+    // Debounce window: typing bursts inside this idle gap coalesce
+    // into a single compile. 250 ms matches the rhythm of fast typing
+    // without making the gap noticeable when the user actually pauses.
+    let debounce_ms: int64 = 250
     for true {
+        if cache.publish_pending {
+            if io.stdin_data_ready(debounce_ms) == 0 {
+                let pending_text: str = cache.text
+                let pending_uri: str = cache.uri
+                let cg: codegen.Codegen = compile_or_cached(:cache, uri: pending_uri, text: pending_text)
+                publish_from_cg(uri: pending_uri, :cg)
+                cache.publish_pending = false
+            }
+        }
         match jsonrpc.read_message() {
             none -> return 0
             Some(body) -> {
@@ -62,6 +82,12 @@ func main() -> int64 {
                 } else if method == "initialized" {
                     // Notification — nothing to do.
                 } else if method == "shutdown" {
+                    // Force-flush any deferred publish so the client's
+                    // final view matches the latest edit before we go
+                    // unresponsive.
+                    if cache.publish_pending {
+                        let cg: codegen.Codegen = compile_or_cached(:cache, uri: cache.uri, text: cache.text)
+                    }
                     shutdown_received = true
                     write_shutdown_response(:id_val)
                 } else if method == "exit" {
@@ -97,11 +123,7 @@ func handle_did_open(docs: DocStore, cache: CompileCache, params: json.Value) ->
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let text: str = str_or_empty(json.get(td, key: "text"))
     docs.set(uri, text)
-    let cg: codegen.Codegen = compile_buffer(:uri, :text)
-    publish_from_cg(:uri, :cg)
-    cache.uri = uri
-    cache.text = text
-    cache.cg = wrap_codegen(cg)
+    mark_dirty(:cache, :uri, :text)
 }
 
 // `textDocument/didChange` with full sync mode: each notification carries
@@ -122,11 +144,7 @@ func handle_did_change(docs: DocStore, cache: CompileCache, params: json.Value) 
         else none
     }
     docs.set(uri, text)
-    let cg: codegen.Codegen = compile_buffer(:uri, :text)
-    publish_from_cg(:uri, :cg)
-    cache.uri = uri
-    cache.text = text
-    cache.cg = wrap_codegen(cg)
+    mark_dirty(:cache, :uri, :text)
 }
 
 func handle_did_close(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
@@ -139,7 +157,19 @@ func handle_did_close(docs: DocStore, cache: CompileCache, params: json.Value) -
         cache.uri = ""
         cache.text = ""
         cache.cg = none
+        cache.publish_pending = false
     }
+}
+
+// Record the latest buffer state and schedule a compile + diagnostics
+// publish for the next idle moment. Invalidates `cache.cg` so the next
+// hover / definition has to recompile (the cached one was for the old
+// text); the recompile path will also flush the pending publish.
+func mark_dirty(cache: CompileCache, uri: str, text: str) -> none {
+    cache.uri = uri
+    cache.text = text
+    cache.cg = none
+    cache.publish_pending = true
 }
 
 // Compile `text` against the full stdlib + its transitive imports
@@ -316,7 +346,10 @@ func number_or_zero(anon v: json.Value) -> int64 {
 // Cache hit when the request is for the same (uri, text) we last
 // compiled. Cursor-move hovers and the request stream during a long
 // `kod test` are typical hits. On miss, recompile and refresh the
-// cache so the *next* request hits.
+// cache so the *next* request hits. If a publish was pending for this
+// uri (e.g. a fresh didChange that the debounce loop hasn't reached
+// yet), this compile flushes it — the user gets diagnostics as a
+// side effect of asking for hover / definition.
 func compile_or_cached(cache: CompileCache, uri: str, text: str) -> codegen.Codegen {
     if cache.uri == uri and cache.text == text {
         match cache.cg {
@@ -328,6 +361,10 @@ func compile_or_cached(cache: CompileCache, uri: str, text: str) -> codegen.Code
     cache.uri = uri
     cache.text = text
     cache.cg = wrap_codegen(cg)
+    if cache.publish_pending and cache.uri == uri {
+        publish_from_cg(:uri, :cg)
+        cache.publish_pending = false
+    }
     return cg
 }
 

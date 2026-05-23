@@ -277,6 +277,20 @@ void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     return lhs;
 }
 
+// Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
+// timeout, -1 on error. Used by the LSP loop to detect typing pauses:
+// after a didChange, wait a short window for the next message; if it
+// doesn't arrive, the user has paused and it's worth doing the
+// expensive compile + diagnostics publish.
+int64_t stdin_data_ready(int64_t timeout_ms) {
+    struct pollfd pfd = { .fd = 0, .events = POLLIN };
+    int n = poll(&pfd, 1, (int)timeout_ms);
+    if (n < 0) {
+        return -1;
+    }
+    return n > 0 ? 1 : 0;
+}
+
 // Read one '\n'-terminated line from stdin, NUL-terminate it, strip a
 // trailing '\r' if present, and return the body. Returns an empty
 // string on EOF with no bytes buffered. Used by LSP-style framing:
