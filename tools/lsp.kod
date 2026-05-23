@@ -22,10 +22,45 @@ import "kod/build"
 // Per-document content keyed by URI. LSP guarantees `didOpen` arrives
 // before any `didChange` / `didClose` so we can treat unknown URIs as a
 // hard error rather than tracking it; for now we just no-op.
-type DocStore = Map[str, str]
+//
+// Implemented as parallel arrays with linear-scan lookup rather than
+// Map[str, str]: Map's K equality is bit-identical (pointer eq) by
+// design, but URIs arrive as freshly-parsed JSON strings — different
+// allocations per request, so the pointer never matches across the
+// didOpen → definition boundary. A handful of open files is the
+// realistic scale; the linear scan is fine.
+type DocStore = struct {
+    keys: [str]
+    values: [str]
+
+    func get(self, anon key: str) -> str? {
+        let i: int64 = 0
+        for i < len(self.keys) {
+            if self.keys[i] == key {
+                return self.values[i]
+            }
+            i = i + 1
+        }
+        return none
+    }
+
+    func set(self, anon key: str, anon value: str) -> none {
+        let i: int64 = 0
+        for i < len(self.keys) {
+            if self.keys[i] == key {
+                let vals = self.values
+                vals[i] = value
+                return none
+            }
+            i = i + 1
+        }
+        self.keys += [key]
+        self.values += [value]
+    }
+}
 
 func main() -> int64 {
-    let docs: DocStore = DocStore(keys: [], values: [], indices: [])
+    let docs: DocStore = DocStore(keys: [], values: [])
     let shutdown_received: bool = false
     for true {
         match jsonrpc.read_message() {
@@ -62,6 +97,8 @@ func main() -> int64 {
                     handle_did_change(:docs, params: json.get(req, key: "params"))
                 } else if method == "textDocument/didClose" {
                     handle_did_close(:docs, params: json.get(req, key: "params"))
+                } else if method == "textDocument/definition" {
+                    handle_definition(:id_val, :docs, params: json.get(req, key: "params"))
                 } else if has_id {
                     // Request we don't implement — reply with MethodNotFound
                     // (the spec requires *some* response for every request).
@@ -143,6 +180,183 @@ func uri_to_path(anon uri: str) -> str {
     return uri
 }
 
+// `/abs/path` → `file:///abs/path`. Inverse of uri_to_path. Used to
+// stamp the URI on Location responses from go-to-definition.
+func path_to_uri(anon path: str) -> str {
+    if len(path) > 0 and path[0] == '/' {
+        return f"file://{path}"
+    }
+    // Relative path (stdlib reads from CWD): assume CWD is the project
+    // root and let the editor resolve. Best-effort; the workspace root
+    // would have to be threaded through initialize for the right answer.
+    return f"file:///{path}"
+}
+
+// Convert an LSP 0-indexed (line, character) into a byte offset in
+// `source`. Out-of-range coordinates clamp to the source length so a
+// stale cursor doesn't crash the server.
+func position_to_offset(source: str, line: int64, character: int64) -> int64 {
+    let i: int64 = 0
+    let cur_line: int64 = 0
+    let cur_char: int64 = 0
+    for i < len(source) {
+        if cur_line == line and cur_char == character {
+            return i
+        }
+        if source[i] == '\n' {
+            if cur_line == line {
+                return i
+            }
+            cur_line = cur_line + 1
+            cur_char = 0
+        } else {
+            cur_char = cur_char + 1
+        }
+        i = i + 1
+    }
+    return i
+}
+
+// True for chars that can appear inside an identifier — letters, digits,
+// underscore. Used by word-at-offset scanning.
+func is_ident_char(anon c: int64) -> bool {
+    if c >= 'a' and c <= 'z' { return true }
+    if c >= 'A' and c <= 'Z' { return true }
+    if c >= '0' and c <= '9' { return true }
+    return c == '_'
+}
+
+// Extract the identifier under `offset` in `source`. Returns "" if the
+// offset isn't on an identifier char. Walks left to the start of the
+// run and right to the end.
+func word_at_offset(source: str, offset: int64) -> str {
+    if offset < 0 or offset >= len(source) {
+        return ""
+    }
+    if is_ident_char(source[offset]) == false {
+        return ""
+    }
+    let start: int64 = offset
+    for start > 0 and is_ident_char(source[start - 1]) {
+        start = start - 1
+    }
+    let end: int64 = offset
+    for end < len(source) and is_ident_char(source[end]) {
+        end = end + 1
+    }
+    return source[start:end]
+}
+
+// Compile the buffer (same path as publish_diagnostics — full stdlib +
+// transitive imports), look up the identifier under the cursor, and
+// write an LSP Location response. Returns null when the cursor isn't
+// on a known free function or `mod.fn` import target. Methods, type
+// names, struct fields, and variant constructors aren't resolved yet.
+func handle_definition(id_val: json.Value, docs: DocStore, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    let pos: json.Value = json.get(params, key: "position")
+    let line: int64 = number_or_zero(json.get(pos, key: "line"))
+    let character: int64 = number_or_zero(json.get(pos, key: "character"))
+    let text: str = ""
+    match docs.get(uri) {
+        Some(t) -> text = t
+        none -> {}
+    }
+    if len(text) == 0 {
+        write_response(:id_val, result: json.Value.Null)
+        return none
+    }
+    let offset: int64 = position_to_offset(source: text, :line, :character)
+    let word: str = word_at_offset(source: text, :offset)
+    if len(word) == 0 {
+        write_response(:id_val, result: json.Value.Null)
+        return none
+    }
+    let entry_path: str = uri_to_path(uri)
+    let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
+    let module: ast.Module = p.parse_module()
+    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    // Same-module + named-import resolution: cg.func_idx covers both.
+    // Map[str, int64]'s K equality is bit-identical, which doesn't work
+    // for our string keys: the word at the cursor and the func_decl.name
+    // are slices of different buffers (the live buffer text vs the
+    // parser's `source` field, which is a copy after lexing). Walk the
+    // parallel func_names array instead, comparing content.
+    let i: int64 = 0
+    for i < len(cg.func_names) {
+        if cg.func_names[i] == word {
+            let def_path: str = cg.func_def_paths[i]
+            let def_span: ast.Span = cg.func_def_spans[i]
+            if len(def_path) > 0 {
+                write_definition_response(:id_val, :def_path, :def_span, buffer_path: entry_path, buffer_text: text)
+                return none
+            }
+        }
+        i = i + 1
+    }
+    // Cross-module call `mod.fn(...)`: cursor on `fn` resolves to the
+    // import_fns entry for the matching name. (Cursor on `mod` would
+    // resolve to the import statement itself — left as a follow-up.)
+    for f in cg.import_fns {
+        if f.name == word and len(f.def_path) > 0 {
+            write_definition_response(:id_val, def_path: f.def_path, def_span: f.def_span, buffer_path: entry_path, buffer_text: text)
+            return none
+        }
+    }
+    write_response(:id_val, result: json.Value.Null)
+}
+
+func number_or_zero(anon v: json.Value) -> int64 {
+    match json.as_int(v) {
+        Some(n) -> return n
+        none -> return 0
+    }
+}
+
+// Build a Location { uri, range: { start, end } } JSON value pointing
+// at the identifier whose source byte offset is `def_span.start`.
+// Walks the source to translate the offset into line/character. When
+// the def lives in the buffer the user is currently editing, we use
+// the live `buffer_text` instead of reading from disk (the URI may
+// even be a file:// path that doesn't exist on disk, like a scratch).
+func write_definition_response(id_val: json.Value, def_path: str, def_span: ast.Span, buffer_path: str, buffer_text: str) -> none {
+    let source: str = ""
+    if def_path == buffer_path {
+        source = buffer_text
+    } else {
+        source = io.read_file(def_path)
+    }
+    let line: int64 = 0
+    let character: int64 = 0
+    let i: int64 = 0
+    for i < def_span.start and i < len(source) {
+        if source[i] == '\n' {
+            line = line + 1
+            character = 0
+        } else {
+            character = character + 1
+        }
+        i = i + 1
+    }
+    let end_char: int64 = character
+    for i < len(source) and is_ident_char(source[i]) {
+        end_char = end_char + 1
+        i = i + 1
+    }
+    let start: json.Value = position_value(:line, :character)
+    let end: json.Value = position_value(:line, character: end_char)
+    let range_keys: [str] = ["start", "end"]
+    let range_vals: [json.Value] = [start, end]
+    let range: json.Value = json.Value.Object(keys: range_keys, values: range_vals)
+    let loc_keys: [str] = ["uri", "range"]
+    let loc_vals: [json.Value] = [json.Value.Str(value: path_to_uri(def_path)), range]
+    let loc: json.Value = json.Value.Object(keys: loc_keys, values: loc_vals)
+    write_response(:id_val, result: loc)
+}
+
 func publish_raw(uri: str, diagnostics: [json.Value]) -> none {
     let params_keys: [str] = ["uri", "diagnostics"]
     let params_vals: [json.Value] = [json.Value.Str(value: uri), json.Value.Array(items: diagnostics)]
@@ -177,8 +391,11 @@ func position_value(line: int64, character: int64) -> json.Value {
 func write_initialize_response(id_val: json.Value) -> none {
     // Full document sync (1) — the client sends the entire text on every
     // change. Cheap to implement, fine for files that fit in memory.
-    let sync_keys: [str] = ["textDocumentSync"]
-    let sync_vals: [json.Value] = [json.Value.Number(value: 1)]
+    // definitionProvider: free-function targets (same-module + `mod.fn`
+    // import calls) are supported today; method/type/field targets fall
+    // through to null.
+    let sync_keys: [str] = ["textDocumentSync", "definitionProvider"]
+    let sync_vals: [json.Value] = [json.Value.Number(value: 1), json.Value.Bool(value: true)]
     let caps: json.Value = json.Value.Object(keys: sync_keys, values: sync_vals)
     let info_keys: [str] = ["name", "version"]
     let info_vals: [json.Value] = [json.Value.Str(value: "kod-lsp"), json.Value.Str(value: "0.1")]

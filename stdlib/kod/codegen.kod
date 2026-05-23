@@ -146,12 +146,15 @@ type PrimMethodInfo = struct {
 
 // One function exported by an imported module. `module` is the local
 // alias the call site uses (`json` in `json.parse(...)`). `label` is the
-// mangled symbol the call lowers to.
+// mangled symbol the call lowers to. `def_path`/`def_span` point at the
+// function's name in its source file — used by go-to-definition.
 type ImportFn = struct {
     module: str
     name: str
     label: str
     sig: SigInfo
+    def_path: str
+    def_span: ast.Span
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
@@ -265,6 +268,13 @@ type Codegen = struct {
     // SigInfo (zero-length param_kinds, .KVoid return_kind) for externs
     // that haven't been registered with full signature info.
     func_sigs: [SigInfo]
+    // Parallel to func_names: the source path and span of the function's
+    // name identifier in its declaration. Used by go-to-definition.
+    // Extern functions, primitives, and other registrations without a
+    // user-visible source location get an empty path; the LSP filters
+    // those out before responding.
+    func_def_paths: [str]
+    func_def_spans: [ast.Span]
     // Name → index into the parallel func_* arrays. Replaces what would
     // otherwise be an O(n) linear scan per call-site lookup.
     func_idx: FuncIdx
@@ -4309,12 +4319,16 @@ type Codegen = struct {
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${self.path_prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(func_decl, p: self.p)]
+                    self.func_def_paths += [self.p.path]
+                    self.func_def_spans += [func_decl.name_span]
                 }
-                .Extern(name, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ) -> {
                     idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
                     self.func_sigs += [self.resolve_extern_sig(params, :return_typ, p: self.p)]
+                    self.func_def_paths += [self.p.path]
+                    self.func_def_spans += [name_span]
                 }
                 else none
             }
@@ -4467,12 +4481,16 @@ type Codegen = struct {
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(func_decl, :p)]
+                    self.func_def_paths += [p.path]
+                    self.func_def_spans += [func_decl.name_span]
                 }
-                .Extern(name, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ) -> {
                     idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [f"_{name}"]
                     self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p)]
+                    self.func_def_paths += [p.path]
+                    self.func_def_spans += [name_span]
                 }
                 else none
             }
@@ -4512,14 +4530,18 @@ type Codegen = struct {
                             self.func_names += [func_decl.name]
                             self.func_labels += [f"${prefix}${func_decl.name}"]
                             self.func_sigs += [self.resolve_sig(func_decl, :p)]
+                            self.func_def_paths += [p.path]
+                            self.func_def_spans += [func_decl.name_span]
                         }
                     }
-                    .Extern(name, params, return_typ) -> {
+                    .Extern(name, name_span, params, return_typ) -> {
                         if name == want {
                             idx_m.set(name, len(self.func_names))
                             self.func_names += [name]
                             self.func_labels += [f"_{name}"]
                             self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p)]
+                            self.func_def_paths += [p.path]
+                            self.func_def_spans += [name_span]
                         }
                     }
                     else none
@@ -4549,11 +4571,11 @@ type Codegen = struct {
                 .Func(decl_id) -> {
                     let func_decl = p.func_decls[decl_id]
                     let sig = self.resolve_sig(func_decl, :p)
-                    self.import_fns += [ImportFn(module: local_mod, name: func_decl.name, label: f"${prefix}${func_decl.name}", :sig)]
+                    self.import_fns += [ImportFn(module: local_mod, name: func_decl.name, label: f"${prefix}${func_decl.name}", :sig, def_path: p.path, def_span: func_decl.name_span)]
                 }
-                .Extern(name, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ) -> {
                     let sig = self.resolve_extern_sig(params, :return_typ, :p)
-                    self.import_fns += [ImportFn(module: local_mod, :name, label: f"_{name}", :sig)]
+                    self.import_fns += [ImportFn(module: local_mod, :name, label: f"_{name}", :sig, def_path: p.path, def_span: name_span)]
                 }
                 else none
             }
@@ -4599,6 +4621,8 @@ func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     let func_names: [str] = []
     let func_labels: [str] = []
     let func_sigs: [SigInfo] = []
+    let func_def_paths: [str] = []
+    let func_def_spans: [ast.Span] = []
     let func_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
     let struct_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
     let enum_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
@@ -4609,5 +4633,5 @@ func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     let subst_args: [TypeKind] = []
     let interned: StrMap = StrMap(keys: [], values: [], indices: [])
     let errors: [Error] = []
-    return Codegen(:p, :path_prefix, :enums, :structs, :interfaces, :vtable_struct_idx, :vtable_iface_idx, :prim_vtable_kinds, :prim_vtable_iface_idx, :struct_idx, :enum_idx, :iface_idx, :import_local, :import_prefix, :import_fns, :vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, :free_regs, :loop_stack, :str_labels, :str_values, :interned, label_count: 0, :func_names, :func_labels, :func_sigs, :func_idx, :prim_methods, :subst_names, :subst_args, :errors, in_test: false, dry_run: false)
+    return Codegen(:p, :path_prefix, :enums, :structs, :interfaces, :vtable_struct_idx, :vtable_iface_idx, :prim_vtable_kinds, :prim_vtable_iface_idx, :struct_idx, :enum_idx, :iface_idx, :import_local, :import_prefix, :import_fns, :vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, :free_regs, :loop_stack, :str_labels, :str_values, :interned, label_count: 0, :func_names, :func_labels, :func_sigs, :func_def_paths, :func_def_spans, :func_idx, :prim_methods, :subst_names, :subst_args, :errors, in_test: false, dry_run: false)
 }

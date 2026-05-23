@@ -155,6 +155,109 @@ def test_unknown_identifier_diagnostic(lsp_binary):
     assert end["line"] == 2 and end["character"] == 11
 
 
+def test_definition_resolves_same_module_function(lsp_binary):
+    # A call site `helper()` should resolve to its `func helper(...)`
+    # decl in the same buffer. Exercises the cg.func_idx path rather
+    # than the cross-module import_fns one.
+    source = (
+        "func helper() -> int64 {\n"
+        "  return 42\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  return helper()\n"
+        "}\n"
+    )
+    # Line 4 (0-indexed), character 11 lands inside `helper()`.
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/same.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/same.kod"},
+                    "position": {"line": 4, "character": 11},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    defn = next(r for r in responses if r.get("id") == 2)
+    loc = defn["result"]
+    assert loc is not None
+    assert loc["uri"].endswith("/tmp/same.kod")
+    # `func helper()` decl is on line 0, name identifier starts at col 5.
+    assert loc["range"]["start"] == {"line": 0, "character": 5}
+
+
+def test_definition_resolves_cross_module_function(lsp_binary):
+    # `io.read_file(...)` should resolve to `func read_file(...)` in
+    # stdlib/io.kod. The LSP compiles the buffer, looks up `read_file`
+    # in cg.import_fns, and returns a Location pointing at the decl.
+    source = (
+        'import "io"\n'
+        "func main() -> int64 {\n"
+        '  let s: str = io.read_file("/dev/null")\n'
+        "  return 0\n"
+        "}\n"
+    )
+    # Cursor in the middle of `read_file` on line 2 (0-indexed),
+    # character 20 lands inside the identifier.
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/gtd.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/gtd.kod"},
+                    "position": {"line": 2, "character": 20},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    init = next(r for r in responses if r.get("id") == 1)
+    assert init["result"]["capabilities"]["definitionProvider"] is True
+    defn = next(r for r in responses if r.get("id") == 2)
+    loc = defn["result"]
+    assert loc is not None, "expected a Location, got null"
+    assert loc["uri"].endswith("stdlib/io.kod"), loc["uri"]
+    # io.kod's `func read_file(...)` is on a known line; the LSP returns
+    # the span of the name identifier so we expect a non-zero column.
+    assert loc["range"]["start"]["character"] > 0
+
+
 def test_parse_error_emits_diagnostic(lsp_binary):
     # The self-hosted parser used to advance silently past unexpected
     # tokens, so syntactically bad input fed a garbage AST to codegen
