@@ -346,6 +346,109 @@ def test_definition_resolves_enum_type(lsp_binary):
     assert loc["range"]["start"] == {"line": 0, "character": 5}
 
 
+def test_definition_resolves_method(lsp_binary):
+    # Cursor on `bump` in `c.bump()` should jump to the
+    # `func bump(self) -> none` decl on the Counter struct.
+    source = (
+        "type Counter = struct {\n"
+        "  value: int64\n"
+        "  func bump(self) -> none {\n"
+        "    self.value = self.value + 1\n"
+        "  }\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  let c: Counter = Counter(value: 0)\n"
+        "  c.bump()\n"
+        "  return c.value\n"
+        "}\n"
+    )
+    # Cursor on `bump` in `c.bump()` — line 8 (0-indexed), char 4.
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/method.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/method.kod"},
+                    "position": {"line": 8, "character": 4},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    defn = next(r for r in responses if r.get("id") == 2)
+    loc = defn["result"]
+    assert loc is not None
+    # `func bump(self)` is on line 2, name `bump` starts at column 7.
+    assert loc["range"]["start"] == {"line": 2, "character": 7}
+
+
+def test_hover_renders_method_signature(lsp_binary):
+    source = (
+        "type Counter = struct {\n"
+        "  value: int64\n"
+        "  func bump(self, anon by: int64) -> int64 {\n"
+        "    self.value = self.value + by\n"
+        "    return self.value\n"
+        "  }\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  let c: Counter = Counter(value: 0)\n"
+        "  return c.bump(3)\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/methodhover.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/methodhover.kod"},
+                    "position": {"line": 9, "character": 11},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    hover = next(r for r in responses if r.get("id") == 2)
+    assert hover["result"] is not None
+    value = hover["result"]["contents"]["value"]
+    assert "Counter.bump" in value
+    assert "int64" in value
+
+
 def test_definition_resolves_same_module_function(lsp_binary):
     # A call site `helper()` should resolve to its `func helper(...)`
     # decl in the same buffer. Exercises the cg.func_idx path rather
