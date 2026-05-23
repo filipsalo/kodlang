@@ -78,6 +78,9 @@ type EnumInfo = struct {
     // StructInfo.src_p: needed so resolve_variant_field_kinds can swap
     // in the right parser when re-resolving the type ids.
     src_p: parsing.Parser
+    // Source path + name-identifier span — see StructInfo.def_path.
+    def_path: str
+    def_span: ast.Span
 }
 
 type FieldInfo = struct {
@@ -123,6 +126,11 @@ type StructInfo = struct {
     // The concrete type arguments used to monomorphise this struct.
     // Empty for templates and non-generic structs.
     template_args: [TypeKind]
+    // Source path + name-identifier span for go-to-definition / hover.
+    // Empty path for monomorphised instances (the template carries the
+    // original location).
+    def_path: str
+    def_span: ast.Span
 }
 
 // Interface metadata. Interface values are an 8-byte pointer to an arena
@@ -131,6 +139,8 @@ type IfaceInfo = struct {
     name: str
     methods: [MethodInfo]
     module_prefix: str
+    def_path: str
+    def_span: ast.Span
 }
 
 // One method on a primitive type (int64.to_str, str.hash, etc.).
@@ -989,6 +999,63 @@ type Codegen = struct {
         }
     }
 
+    // `type Name = struct { field: kind, ... }` — for hover on a
+    // struct type name. Methods are intentionally elided to keep the
+    // tooltip short; users can jump to the source for the full body.
+    func struct_display(self, anon idx: int64) -> str {
+        let s: StructInfo = self.structs[idx]
+        // Concatenate the `{` rather than embed in an f-string —
+        // Kod's f-string parser has no brace escape today.
+        let result: str = f"type {s.name} = struct " + "{"
+        let i: int64 = 0
+        for i < len(s.fields) {
+            if i == 0 {
+                result = result + " "
+            } else {
+                result = result + ", "
+            }
+            result = result + f"{s.fields[i].name}: {self.kind_display(s.fields[i].kind)}"
+            i = i + 1
+        }
+        if len(s.fields) > 0 {
+            result = result + " "
+        }
+        return result + "}"
+    }
+
+    // `type Name = enum { Variant, Variant(field: kind), ... }`.
+    func enum_display(self, anon idx: int64) -> str {
+        let e: EnumInfo = self.enums[idx]
+        let result: str = f"type {e.name} = enum " + "{"
+        let i: int64 = 0
+        for i < len(e.variants) {
+            let v: VariantInfo = e.variants[i]
+            if i == 0 {
+                result = result + " "
+            } else {
+                result = result + ", "
+            }
+            result = result + v.name
+            if len(v.field_names) > 0 {
+                result = result + "("
+                let j: int64 = 0
+                for j < len(v.field_names) {
+                    if j > 0 {
+                        result = result + ", "
+                    }
+                    result = result + f"{v.field_names[j]}: {self.kind_display(v.field_kinds[j])}"
+                    j = j + 1
+                }
+                result = result + ")"
+            }
+            i = i + 1
+        }
+        if len(e.variants) > 0 {
+            result = result + " "
+        }
+        return result + "}"
+    }
+
     // `func name(label: T, anon: T, ...) -> Ret` — for hover.
     func func_signature_display(self, name: str, sig: SigInfo) -> str {
         let result: str = f"func {name}("
@@ -1083,7 +1150,7 @@ type Codegen = struct {
         let empty_params: [str] = []
         // Monomorphised instance: method names + positions match the template,
         // so share its name → index map directly.
-        self.structs += [StructInfo(name: canonical, fields: cloned_fields, methods: cloned_methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args)]
+        self.structs += [StructInfo(name: canonical, fields: cloned_fields, methods: cloned_methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0))]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
         return new_idx
@@ -1273,7 +1340,7 @@ type Codegen = struct {
 
     func register_enum(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
-            .Enum(name, variants) -> {
+            .Enum(name, name_span, variants) -> {
                 let saved_p = self.p
                 self.p = p
                 let variant_infos: [VariantInfo] = []
@@ -1301,7 +1368,7 @@ type Codegen = struct {
                 }
                 self.p = saved_p
                 let data_width = 8 + max_payload
-                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p)]
+                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span)]
                 self.enum_idx.set(name, len(self.enums) - 1)
             }
             else none
@@ -1310,7 +1377,7 @@ type Codegen = struct {
 
     func register_struct(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
-            .Struct(name, type_params, fields, methods) -> {
+            .Struct(name, name_span, type_params, fields, methods) -> {
                 let field_infos: [FieldInfo] = []
                 let offset = 0
                 // Temporarily swap parser so resolve_type reads field type
@@ -1337,7 +1404,7 @@ type Codegen = struct {
                     mi = mi + 1
                 }
                 let no_template_args: [TypeKind] = []
-                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
+                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span)]
                 self.struct_idx.set(name, len(self.structs) - 1)
             }
             else none
@@ -1350,7 +1417,7 @@ type Codegen = struct {
     // are registered.
     func register_interface(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
-            .Interface(name, methods) -> {
+            .Interface(name, name_span, methods) -> {
                 let empty_kinds: [TypeKind] = []
                 let empty_labels: [str] = []
                 let empty_sig: SigInfo = SigInfo(param_kinds: empty_kinds, param_labels: empty_labels, return_kind: .KVoid)
@@ -1363,7 +1430,7 @@ type Codegen = struct {
                     // second pass once all types are registered.
                     method_infos += [MethodInfo(name: func_decl.name, decl_id: -1, sig: empty_sig)]
                 }
-                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix)]
+                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span)]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
             }
             else none
@@ -1375,7 +1442,7 @@ type Codegen = struct {
     // MethodInfo array onto the existing IfaceInfo.
     func resolve_interface_methods(self, anon decl: ast.Decl, p: parsing.Parser) -> none {
         match decl {
-            .Interface(name, methods) -> {
+            .Interface(name, name_span, methods) -> {
                 let iface_idx = self.find_iface_idx(name)
                 if iface_idx >= 0 {
                     let new_methods: [MethodInfo] = []
@@ -4410,7 +4477,7 @@ type Codegen = struct {
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
-                .Struct(name, _struct_type_params, fields, methods) -> {
+                .Struct(name, _name_span, _struct_type_params, fields, methods) -> {
                     for method_id in methods {
                         self.compile_func(fd_id: method_id, struct_name: name, override_lbl: "")
                     }

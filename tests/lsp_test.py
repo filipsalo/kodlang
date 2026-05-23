@@ -205,6 +205,147 @@ def test_hover_renders_signature(lsp_binary):
     assert "str" in value
 
 
+def test_definition_resolves_struct_type(lsp_binary):
+    # Cursor on `Box` in `let b: Box = ...` should jump to the
+    # `type Box = struct { ... }` decl.
+    source = (
+        "type Box = struct { x: int64 }\n"
+        "func main() -> int64 {\n"
+        "  let b: Box = Box(x: 5)\n"
+        "  return b.x\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/structdef.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            # Cursor on the `Box` in the type annotation on line 2.
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/structdef.kod"},
+                    "position": {"line": 2, "character": 10},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    defn = next(r for r in responses if r.get("id") == 2)
+    loc = defn["result"]
+    assert loc is not None
+    # `type Box = ...` — name `Box` is at column 5 of line 0.
+    assert loc["range"]["start"] == {"line": 0, "character": 5}
+
+
+def test_hover_renders_struct_decl(lsp_binary):
+    source = (
+        "type Box = struct {\n"
+        "  x: int64\n"
+        "  name: str\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        '  let b: Box = Box(x: 5, name: "a")\n'
+        "  return b.x\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/structhover.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/structhover.kod"},
+                    # `let b: Box` is now on line 5 (after the
+                    # multi-line struct decl). Box starts at col 9.
+                    "position": {"line": 5, "character": 10},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    hover = next(r for r in responses if r.get("id") == 2)
+    assert hover["result"] is not None
+    value = hover["result"]["contents"]["value"]
+    assert "type Box = struct" in value
+    assert "x: int64" in value
+    assert "name: str" in value
+
+
+def test_definition_resolves_enum_type(lsp_binary):
+    source = (
+        "type Color = enum { Red, Green, Blue }\n"
+        "func main() -> int64 {\n"
+        "  let c: Color = Color.Red\n"
+        "  return 0\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/enumdef.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/enumdef.kod"},
+                    "position": {"line": 2, "character": 10},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    defn = next(r for r in responses if r.get("id") == 2)
+    loc = defn["result"]
+    assert loc is not None
+    # `type Color = ...` — name at column 5 of line 0.
+    assert loc["range"]["start"] == {"line": 0, "character": 5}
+
+
 def test_definition_resolves_same_module_function(lsp_binary):
     # A call site `helper()` should resolve to its `func helper(...)`
     # decl in the same buffer. Exercises the cg.func_idx path rather
