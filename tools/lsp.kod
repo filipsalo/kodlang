@@ -24,8 +24,21 @@ import "kod/build"
 // hard error rather than tracking it; for now we just no-op.
 type DocStore = Map[str, str]
 
+// Holds the most recent compile so hover / definition requests don't
+// have to re-parse the whole stdlib + import graph on every keystroke.
+// `uri` and `text` are checked against the incoming request: a request
+// for the same (uri, text) reuses `cg`, otherwise we recompile and
+// overwrite. Only one cached buffer at a time — fine for the typical
+// "active editor" pattern.
+type CompileCache = struct {
+    uri: str
+    text: str
+    cg: codegen.Codegen?
+}
+
 func main() -> int64 {
     let docs: DocStore = DocStore(keys: [], values: [], indices: [])
+    let cache: CompileCache = CompileCache(uri: "", text: "", cg: none)
     let shutdown_received: bool = false
     for true {
         match jsonrpc.read_message() {
@@ -57,15 +70,15 @@ func main() -> int64 {
                     }
                     return 1
                 } else if method == "textDocument/didOpen" {
-                    handle_did_open(:docs, params: json.get(req, key: "params"))
+                    handle_did_open(:docs, :cache, params: json.get(req, key: "params"))
                 } else if method == "textDocument/didChange" {
-                    handle_did_change(:docs, params: json.get(req, key: "params"))
+                    handle_did_change(:docs, :cache, params: json.get(req, key: "params"))
                 } else if method == "textDocument/didClose" {
-                    handle_did_close(:docs, params: json.get(req, key: "params"))
+                    handle_did_close(:docs, :cache, params: json.get(req, key: "params"))
                 } else if method == "textDocument/definition" {
-                    handle_definition(:id_val, :docs, params: json.get(req, key: "params"))
+                    handle_definition(:id_val, :docs, :cache, params: json.get(req, key: "params"))
                 } else if method == "textDocument/hover" {
-                    handle_hover(:id_val, :docs, params: json.get(req, key: "params"))
+                    handle_hover(:id_val, :docs, :cache, params: json.get(req, key: "params"))
                 } else if has_id {
                     // Request we don't implement — reply with MethodNotFound
                     // (the spec requires *some* response for every request).
@@ -79,18 +92,22 @@ func main() -> int64 {
     return 0
 }
 
-func handle_did_open(docs: DocStore, params: json.Value) -> none {
+func handle_did_open(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let text: str = str_or_empty(json.get(td, key: "text"))
     docs.set(uri, text)
-    publish_diagnostics(:uri, :text)
+    let cg: codegen.Codegen = compile_buffer(:uri, :text)
+    publish_from_cg(:uri, :cg)
+    cache.uri = uri
+    cache.text = text
+    cache.cg = wrap_codegen(cg)
 }
 
 // `textDocument/didChange` with full sync mode: each notification carries
 // the whole new document body as the only entry in `contentChanges`.
 // Incremental sync (per-range edits) isn't supported yet.
-func handle_did_change(docs: DocStore, params: json.Value) -> none {
+func handle_did_change(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let changes: json.Value = json.get(params, key: "contentChanges")
@@ -105,29 +122,46 @@ func handle_did_change(docs: DocStore, params: json.Value) -> none {
         else none
     }
     docs.set(uri, text)
-    publish_diagnostics(:uri, :text)
+    let cg: codegen.Codegen = compile_buffer(:uri, :text)
+    publish_from_cg(:uri, :cg)
+    cache.uri = uri
+    cache.text = text
+    cache.cg = wrap_codegen(cg)
 }
 
-func handle_did_close(docs: DocStore, params: json.Value) -> none {
+func handle_did_close(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     docs.set(uri, "")
     let empty: [json.Value] = []
     publish_raw(:uri, diagnostics: empty)
+    if cache.uri == uri {
+        cache.uri = ""
+        cache.text = ""
+        cache.cg = none
+    }
 }
 
 // Compile `text` against the full stdlib + its transitive imports
 // (read from disk relative to CWD — Zed launches the LSP with the
 // workspace root as CWD, so `import "io"` etc. resolve normally).
-// Errors from imported modules carry their own .path; we publish only
-// those that came from the buffer the user is editing.
-func publish_diagnostics(uri: str, text: str) -> none {
+// Returns the configured codegen; callers consult `cg.errors` for
+// diagnostics and `cg.func_names` / `cg.import_fns` for go-to-def and
+// hover.
+func compile_buffer(uri: str, text: str) -> codegen.Codegen {
     let entry_path: str = uri_to_path(uri)
     let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
     let tokens: [lexing.Token] = lxr.lex()
     let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
     let module: ast.Module = p.parse_module()
-    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    return build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+}
+
+// Publish only the errors that came from the buffer the user is
+// editing — imports report their own errors via cg.errors with their
+// own .path, but those go to other URIs.
+func publish_from_cg(uri: str, cg: codegen.Codegen) -> none {
+    let entry_path: str = uri_to_path(uri)
     let diags: [json.Value] = []
     for e in cg.errors {
         if e.path == entry_path {
@@ -219,7 +253,7 @@ func word_at_offset(source: str, offset: int64) -> str {
 // write an LSP Location response. Returns null when the cursor isn't
 // on a known free function or `mod.fn` import target. Methods, type
 // names, struct fields, and variant constructors aren't resolved yet.
-func handle_definition(id_val: json.Value, docs: DocStore, params: json.Value) -> none {
+func handle_definition(id_val: json.Value, docs: DocStore, cache: CompileCache, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let pos: json.Value = json.get(params, key: "position")
@@ -241,11 +275,7 @@ func handle_definition(id_val: json.Value, docs: DocStore, params: json.Value) -
         return none
     }
     let entry_path: str = uri_to_path(uri)
-    let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
-    let tokens: [lexing.Token] = lxr.lex()
-    let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
-    let module: ast.Module = p.parse_module()
-    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    let cg: codegen.Codegen = compile_or_cached(:cache, :uri, :text)
     // Same-module + named-import resolution: cg.func_idx covers both.
     // Map[str, int64]'s K equality is bit-identical, which doesn't work
     // for our string keys: the word at the cursor and the func_decl.name
@@ -283,13 +313,38 @@ func number_or_zero(anon v: json.Value) -> int64 {
     }
 }
 
+// Cache hit when the request is for the same (uri, text) we last
+// compiled. Cursor-move hovers and the request stream during a long
+// `kod test` are typical hits. On miss, recompile and refresh the
+// cache so the *next* request hits.
+func compile_or_cached(cache: CompileCache, uri: str, text: str) -> codegen.Codegen {
+    if cache.uri == uri and cache.text == text {
+        match cache.cg {
+            Some(cg) -> return cg
+            none -> {}
+        }
+    }
+    let cg: codegen.Codegen = compile_buffer(:uri, :text)
+    cache.uri = uri
+    cache.text = text
+    cache.cg = wrap_codegen(cg)
+    return cg
+}
+
+// Implicit-wrap helper: returning a Codegen from a Codegen?-typed
+// function performs the wrap at the return site, which a bare
+// `cache.cg = cg` assignment does not.
+func wrap_codegen(anon cg: codegen.Codegen) -> codegen.Codegen? {
+    return cg
+}
+
 // Compile the buffer, find the identifier under the cursor, and write
 // an LSP Hover response with the function's rendered signature in a
 // Kod-fenced code block. Same lookup surface as handle_definition:
 // free functions and `mod.fn` import targets. Returns null for any
 // other token (locals, struct fields, methods, type names — future
 // work).
-func handle_hover(id_val: json.Value, docs: DocStore, params: json.Value) -> none {
+func handle_hover(id_val: json.Value, docs: DocStore, cache: CompileCache, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let pos: json.Value = json.get(params, key: "position")
@@ -310,12 +365,7 @@ func handle_hover(id_val: json.Value, docs: DocStore, params: json.Value) -> non
         write_response(:id_val, result: json.Value.Null)
         return none
     }
-    let entry_path: str = uri_to_path(uri)
-    let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
-    let tokens: [lexing.Token] = lxr.lex()
-    let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
-    let module: ast.Module = p.parse_module()
-    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    let cg: codegen.Codegen = compile_or_cached(:cache, :uri, :text)
     let signature: str = ""
     let i: int64 = 0
     for i < len(cg.func_names) {
