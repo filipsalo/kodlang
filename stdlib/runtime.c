@@ -19,6 +19,16 @@ void kod_panic(const char *msg) {
     exit(1);
 }
 
+// Called by the codegen's array-indexing bounds check on a miss.
+// Negative indices are already normalised (idx += len) before this
+// runs, so any out-of-range value here is genuinely out of bounds.
+void kod_index_oob(int64_t idx, int64_t len) {
+    fprintf(stderr,
+            "panic: index %lld out of bounds for array of length %lld\n",
+            (long long)idx, (long long)len);
+    exit(1);
+}
+
 // Print to stderr without exiting. Used by the codegen to surface
 // user-facing errors (unknown method, etc.) while continuing to
 // scan the rest of the module for additional errors.
