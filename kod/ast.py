@@ -310,23 +310,16 @@ class FunctionCallParam(ASTNode):
         """Parse a function call parameter."""
         with parser.span() as span:
             label: Optional[Name] = None
-            # Leading-colon shorthand: `:name` is sugar for `name: name`.
-            # The explicit `:` flags the call site as a labeled arg rather
-            # than leaving it ambiguous with an anonymous identifier arg.
+            # `:name` is sugar for `name: name`. The explicit colon
+            # disambiguates a labeled arg from a plain anonymous one.
             if parser.try_consume(tokens.Colon):
                 name = Name.parse(parser)
-                label = name
-                expr = name
-                return cls(label, expr, span)
+                return cls(name, name, span)
             expr = Expression.parse(parser)
             if parser.try_consume(tokens.Colon):
                 assert isinstance(expr, Name)
                 label = expr
                 expr = Expression.parse(parser)
-            elif isinstance(expr, Name):
-                # Legacy shorthand: bare `name` also expands to `name: name`.
-                # Will be removed once all call sites are migrated to `:name`.
-                label = expr
         return cls(label, expr, span)
 
 
