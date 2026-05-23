@@ -64,6 +64,8 @@ func main() -> int64 {
                     handle_did_close(:docs, params: json.get(req, key: "params"))
                 } else if method == "textDocument/definition" {
                     handle_definition(:id_val, :docs, params: json.get(req, key: "params"))
+                } else if method == "textDocument/hover" {
+                    handle_hover(:id_val, :docs, params: json.get(req, key: "params"))
                 } else if has_id {
                     // Request we don't implement — reply with MethodNotFound
                     // (the spec requires *some* response for every request).
@@ -281,6 +283,79 @@ func number_or_zero(anon v: json.Value) -> int64 {
     }
 }
 
+// Compile the buffer, find the identifier under the cursor, and write
+// an LSP Hover response with the function's rendered signature in a
+// Kod-fenced code block. Same lookup surface as handle_definition:
+// free functions and `mod.fn` import targets. Returns null for any
+// other token (locals, struct fields, methods, type names — future
+// work).
+func handle_hover(id_val: json.Value, docs: DocStore, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    let pos: json.Value = json.get(params, key: "position")
+    let line: int64 = number_or_zero(json.get(pos, key: "line"))
+    let character: int64 = number_or_zero(json.get(pos, key: "character"))
+    let text: str = ""
+    match docs.get(uri) {
+        Some(t) -> text = t
+        none -> {}
+    }
+    if len(text) == 0 {
+        write_response(:id_val, result: json.Value.Null)
+        return none
+    }
+    let offset: int64 = position_to_offset(source: text, :line, :character)
+    let word: str = word_at_offset(source: text, :offset)
+    if len(word) == 0 {
+        write_response(:id_val, result: json.Value.Null)
+        return none
+    }
+    let entry_path: str = uri_to_path(uri)
+    let lxr: lexing.Lexer = lexing.Lexer(source: text, pos: 0, start: 0)
+    let tokens: [lexing.Token] = lxr.lex()
+    let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
+    let module: ast.Module = p.parse_module()
+    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    let signature: str = ""
+    let i: int64 = 0
+    for i < len(cg.func_names) {
+        if cg.func_names[i] == word {
+            signature = cg.func_signature_display(name: word, sig: cg.func_sigs[i])
+            i = len(cg.func_names)
+        } else {
+            i = i + 1
+        }
+    }
+    if len(signature) == 0 {
+        for f in cg.import_fns {
+            if f.name == word {
+                signature = cg.func_signature_display(name: f"{f.module}.{f.name}", sig: f.sig)
+            }
+        }
+    }
+    if len(signature) == 0 {
+        write_response(:id_val, result: json.Value.Null)
+        return none
+    }
+    write_hover_response(:id_val, :signature)
+}
+
+// Hover response shape:
+//   { contents: { kind: "markdown", value: "```kod\n...\n```" } }
+// The Kod-fenced code block gives editors a chance to syntax-highlight
+// the signature; clients that don't honour the language tag still get
+// readable monospaced text.
+func write_hover_response(id_val: json.Value, signature: str) -> none {
+    let body: str = f"```kod\n{signature}\n```"
+    let contents_keys: [str] = ["kind", "value"]
+    let contents_vals: [json.Value] = [json.Value.Str(value: "markdown"), json.Value.Str(value: body)]
+    let contents: json.Value = json.Value.Object(keys: contents_keys, values: contents_vals)
+    let result_keys: [str] = ["contents"]
+    let result_vals: [json.Value] = [contents]
+    let result: json.Value = json.Value.Object(keys: result_keys, values: result_vals)
+    write_response(:id_val, :result)
+}
+
 // Build a Location { uri, range: { start, end } } JSON value pointing
 // at the identifier whose source byte offset is `def_span.start`.
 // Walks the source to translate the offset into line/character. When
@@ -356,11 +431,11 @@ func position_value(line: int64, character: int64) -> json.Value {
 func write_initialize_response(id_val: json.Value) -> none {
     // Full document sync (1) — the client sends the entire text on every
     // change. Cheap to implement, fine for files that fit in memory.
-    // definitionProvider: free-function targets (same-module + `mod.fn`
-    // import calls) are supported today; method/type/field targets fall
-    // through to null.
-    let sync_keys: [str] = ["textDocumentSync", "definitionProvider"]
-    let sync_vals: [json.Value] = [json.Value.Number(value: 1), json.Value.Bool(value: true)]
+    // definitionProvider + hoverProvider: free-function targets (same-
+    // module + `mod.fn` import calls) are supported today; method /
+    // type / field / variable targets fall through to null.
+    let sync_keys: [str] = ["textDocumentSync", "definitionProvider", "hoverProvider"]
+    let sync_vals: [json.Value] = [json.Value.Number(value: 1), json.Value.Bool(value: true), json.Value.Bool(value: true)]
     let caps: json.Value = json.Value.Object(keys: sync_keys, values: sync_vals)
     let info_keys: [str] = ["name", "version"]
     let info_vals: [json.Value] = [json.Value.Str(value: "kod-lsp"), json.Value.Str(value: "0.1")]

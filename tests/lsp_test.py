@@ -155,6 +155,56 @@ def test_unknown_identifier_diagnostic(lsp_binary):
     assert end["line"] == 2 and end["character"] == 11
 
 
+def test_hover_renders_signature(lsp_binary):
+    # Cursor on `read_file` in `io.read_file(...)` should yield a Hover
+    # with the function's signature in a Kod-fenced code block. Same
+    # lookup as go-to-def; just renders SigInfo instead of a Location.
+    source = (
+        'import "io"\n'
+        "func main() -> int64 {\n"
+        '  let s: str = io.read_file("/dev/null")\n'
+        "  return 0\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/hover.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/hover.kod"},
+                    "position": {"line": 2, "character": 20},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    init = next(r for r in responses if r.get("id") == 1)
+    assert init["result"]["capabilities"]["hoverProvider"] is True
+    hover = next(r for r in responses if r.get("id") == 2)
+    assert hover["result"] is not None, "expected a Hover, got null"
+    value = hover["result"]["contents"]["value"]
+    # io.read_file: extern func read_file(anon path: str) -> str
+    assert "io.read_file" in value
+    assert "str" in value
+
+
 def test_definition_resolves_same_module_function(lsp_binary):
     # A call site `helper()` should resolve to its `func helper(...)`
     # decl in the same buffer. Exercises the cg.func_idx path rather
