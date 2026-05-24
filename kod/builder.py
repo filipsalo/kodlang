@@ -316,8 +316,9 @@ class Builder:
             Lloop:
                 cmp x22, x19
                 b.ge Ldone
-                ldr x23, [x20, x22, lsl #3]
-                str x23, [x21, x22, lsl #3]
+                ldr x0, [x20, x22, lsl #3]
+                bl _kod_str_from_cstr
+                str x0, [x21, x22, lsl #3]
                 add x22, x22, #1
                 b Lloop
             Ldone:

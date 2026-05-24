@@ -2055,7 +2055,31 @@ type Codegen = struct {
             self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
             self.free_reg(hdr)
         } else {
-            self.emit(f"ldrb w{result[1:len(result)]}, [{ptr_r}, {idx_r}]")
+            // KStr indexing. ptr_r is the `{ buf, len }` struct pointer.
+            // Load buf and len, normalise negative, bounds-check, then
+            // a one-byte read from buf — same shape as the array path.
+            let len_r = self.alloc_reg()
+            self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
+            let buf_r = self.alloc_reg()
+            self.emit(f"ldr {buf_r}, [{ptr_r}]")
+            let pos_lbl = self.fresh("Lidx_pos")
+            self.emit(f"cmp {idx_r}, #0")
+            self.emit(f"bge {pos_lbl}")
+            self.emit(f"add {idx_r}, {idx_r}, {len_r}")
+            self.emit_label(pos_lbl)
+            let ok_lbl = self.fresh("Lidx_ok")
+            let oob_lbl = self.fresh("Lidx_oob")
+            self.emit(f"cmp {idx_r}, {len_r}")
+            self.emit(f"b.hs {oob_lbl}")
+            self.emit(f"b {ok_lbl}")
+            self.emit_label(oob_lbl)
+            self.emit(f"mov x0, {idx_r}")
+            self.emit(f"mov x1, {len_r}")
+            self.emit("bl _kod_index_oob")
+            self.emit_label(ok_lbl)
+            self.free_reg(len_r)
+            self.emit(f"ldrb w{result[1:len(result)]}, [{buf_r}, {idx_r}]")
+            self.free_reg(buf_r)
         }
         self.free_reg(ptr_r)
         self.free_reg(idx_r)
@@ -2272,7 +2296,11 @@ type Codegen = struct {
         self.emit("add sp, sp, #16")
         self.emit(f"mov x1, {rhs_reg}")
         self.free_reg(rhs_reg)
-        self.emit("bl _strcmp")
+        // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
+        // like memcmp. Replaces the previous `_strcmp` call, which
+        // would have compared struct headers byte-by-byte (and stopped
+        // at the first 0 in the embedded len field).
+        self.emit("bl _kod_str_cmp")
         let result = self.alloc_reg()
         self.emit("cmp x0, #0")
         if negate {
@@ -2585,9 +2613,11 @@ type Codegen = struct {
                 return .VReg(name: reg)
             }
             .KStr -> {
-                self.mov_to(arg_val, dest: "x0")
-                self.emit("bl _strlen")
-                return .VReg(name: "x0")
+                // A str is a `{ buf, len }` struct pointer; len lives
+                // at offset 8. One load — no `bl _strlen` walk.
+                let reg = self.load(arg_val)
+                self.emit(f"ldr {reg}, [{reg}, #8]")
+                return .VReg(name: reg)
             }
             .KStruct(struct_idx, _struct_type_args) -> {
                 // Look for a `len(self) -> int64` method on the struct;
@@ -2919,8 +2949,10 @@ type Codegen = struct {
                     let slbl = self.intern_str(value)
                     self.emit(f"adrp x0, {slbl}@PAGE")
                     self.emit(f"add x0, x0, {slbl}@PAGEOFF")
-                    self.emit(f"mov x1, {disc_r}")
-                    self.emit("bl _strcmp")
+                    // Reload from subj_slot — disc_r may have been clobbered
+                    // by a prior arm's `bl _kod_str_cmp`.
+                    self.emit_ldr(subj_slot, reg: "x1")
+                    self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
                     let body_val = self.compile_expr(arm.body)
@@ -4296,10 +4328,12 @@ type Codegen = struct {
                 }
                 .StrPat(value) -> {
                     let slbl = self.intern_str(value)
-                    self.emit(f"mov x0, {disc_r}")
+                    // Reload from subj_slot — disc_r may have been clobbered
+                    // by a prior arm's `bl _kod_str_cmp`.
+                    self.emit_ldr(subj_slot, reg: "x0")
                     self.emit(f"adrp x1, {slbl}@PAGE")
                     self.emit(f"add x1, x1, {slbl}@PAGEOFF")
-                    self.emit("bl _strcmp")
+                    self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
                     for stmt_id in arm.body {
@@ -4596,10 +4630,19 @@ type Codegen = struct {
 
         if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 {
             self.println(".data")
+            // Each `str` literal is a KodStr struct (`{ buf, len }`) plus
+            // a byte buffer. The 8-aligned struct header is what the
+            // label points at — adrp / add returns the struct pointer.
             let i = 0
             for i < len(self.str_labels) {
-                self.println(f"{self.str_labels[i]}:")
-                self.emit_asciz(self.str_values[i])
+                let lbl: str = self.str_labels[i]
+                let value: str = self.str_values[i]
+                self.println("\t.p2align 3")
+                self.println(f"{lbl}:")
+                self.println(f"\t.quad {lbl}$buf")
+                self.println(f"\t.quad {len(value).to_str()}")
+                self.println(f"{lbl}$buf:")
+                self.emit_asciz(value)
                 i = i + 1
             }
             self.emit_vtables()

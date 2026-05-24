@@ -634,6 +634,14 @@ class Interpreter:
                 msg = args[0].value.decode("utf8")
                 sys.stderr.write(f"panic: {msg}\n")
                 sys.exit(1)
+            if func.name == "kod_puts":
+                # Used to dispatch as libc puts; the runtime now ships
+                # its own `kod_puts` wrapper. Route via libc.puts so
+                # this still shares the libc stdout buffer that
+                # putchar / printf write into — Python's sys.stdout
+                # has its own buffer and would interleave wrong.
+                libc.puts(args[0].value)
+                return types.Int64(0)
             if func.name == "kod_eprint":
                 # Mirror runtime kod_eprint: write to stderr, no exit.
                 msg = args[0].value.decode("utf8")
@@ -680,6 +688,17 @@ class Interpreter:
             and len(args) == 1
             and isinstance(args[0], types.ArrayType)
         ):
+            return types.Int64(len(args[0].value))
+        if (
+            isinstance(func, ast.FunctionDeclaration)
+            and func.name == "len"
+            and len(args) == 1
+            and isinstance(args[0], types.String)
+        ):
+            # str's `len` used to live in builtins.kod as a wrapper
+            # around the libc strlen extern. The compile path now reads
+            # the str struct's header directly; we mirror it here so
+            # the interpreter doesn't fall back to a vanished function.
             return types.Int64(len(args[0].value))
 
         if isinstance(func, BoundMethod):

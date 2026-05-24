@@ -12,10 +12,51 @@ extern char **environ;
 
 void *arena_alloc(int64_t size);
 
+// A Kod `str` value is a pointer to one of these. `buf` points at a
+// byte buffer of `len` bytes plus an explicit NUL terminator (kept
+// for cheap libc interop — pass `buf` directly into puts/fopen-style
+// APIs). All str-handling externs return / accept `KodStr *`; the
+// codegen passes the struct pointer in `x0` without unwrapping.
+typedef struct {
+    char *buf;
+    int64_t len;
+} KodStr;
+
+// Allocate a fresh KodStr plus a `len`-byte NUL-terminated buffer in
+// a single arena allocation. Caller fills `buf` before returning.
+static KodStr *kod_str_alloc(int64_t len) {
+    int64_t header = (int64_t)sizeof(KodStr);
+    // Keep the byte buffer 8-aligned for the simple memcpy-into-it
+    // paths even though no field needs that alignment.
+    int64_t total = header + len + 1;
+    char *block = (char *)arena_alloc(total);
+    KodStr *s = (KodStr *)block;
+    s->buf = block + header;
+    s->len = len;
+    s->buf[len] = '\0';
+    return s;
+}
+
+// Build a KodStr from a NUL-terminated C string (e.g. argv[i]). Copies
+// the bytes; cheap enough for the rare libc-boundary case.
+KodStr *kod_str_from_cstr(const char *cstr) {
+    int64_t len = (int64_t)strlen(cstr);
+    KodStr *s = kod_str_alloc(len);
+    memcpy(s->buf, cstr, len);
+    return s;
+}
+
+// Empty Kod string with the right header layout.
+static KodStr *kod_empty_str(void) {
+    return kod_str_alloc(0);
+}
+
 // Called by `must expr` when the expression evaluates to an error.
 // `msg` is the result of calling the error's to_str method.
-void kod_panic(const char *msg) {
-    fprintf(stderr, "panic: %s\n", msg);
+void kod_panic(KodStr *msg) {
+    fwrite("panic: ", 1, 7, stderr);
+    fwrite(msg->buf, 1, msg->len, stderr);
+    fputc('\n', stderr);
     exit(1);
 }
 
@@ -32,9 +73,19 @@ void kod_index_oob(int64_t idx, int64_t len) {
 // Print to stderr without exiting. Used by the codegen to surface
 // user-facing errors (unknown method, etc.) while continuing to
 // scan the rest of the module for additional errors.
-void kod_eprint(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
+void kod_eprint(KodStr *msg) {
+    fwrite(msg->buf, 1, msg->len, stderr);
+    fputc('\n', stderr);
 }
+
+// Kod-side `puts` extern — len-aware, won't fool itself on embedded
+// NULs. Trailing newline matches libc puts.
+int64_t kod_puts(KodStr *s) {
+    fwrite(s->buf, 1, s->len, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
+
 
 // Test framework state. The per-module `__run_tests` dispatcher emitted
 // by the codegen calls kod_test_reset before each test, the test body
@@ -49,19 +100,23 @@ static int g_kod_test_failures;
 
 void kod_test_reset(void) { g_kod_test_failed = 0; }
 
-void kod_test_fail(const char *msg) {
+void kod_test_fail(KodStr *msg) {
     g_kod_test_failed = 1;
-    fprintf(stderr, "    %s\n", msg);
+    fwrite("    ", 1, 4, stderr);
+    fwrite(msg->buf, 1, msg->len, stderr);
+    fputc('\n', stderr);
 }
 
-void kod_test_report(const char *name) {
+void kod_test_report(KodStr *name) {
     g_kod_test_total++;
     if (g_kod_test_failed) {
         g_kod_test_failures++;
-        printf("FAIL %s\n", name);
+        fwrite("FAIL ", 1, 5, stdout);
     } else {
-        printf("ok   %s\n", name);
+        fwrite("ok   ", 1, 5, stdout);
     }
+    fwrite(name->buf, 1, name->len, stdout);
+    fputc('\n', stdout);
 }
 
 int64_t kod_test_summary(void) {
@@ -74,8 +129,8 @@ int64_t kod_test_summary(void) {
 // Used by sh_kodc to capture codegen output to a .s file in a single
 // process (rather than parent-captured stdout). Returns 0 on success,
 // -1 on failure.
-int64_t redirect_stdout(const char *path) {
-    if (!freopen(path, "w", stdout)) return -1;
+int64_t redirect_stdout(KodStr *path) {
+    if (!freopen(path->buf, "w", stdout)) return -1;
     return 0;
 }
 
@@ -88,45 +143,50 @@ void flush_stdout(void) {
 // Write `content` to `path`, replacing the file if it exists. Parent
 // directory must already exist. Returns 0 on success, -1 on any failure
 // (open or write). Mirrors read_file's bare naming convention.
-int64_t write_file(const char *path, const char *content) {
-    FILE *fp = fopen(path, "wb");
+int64_t write_file(KodStr *path, KodStr *content) {
+    FILE *fp = fopen(path->buf, "wb");
     if (!fp) return -1;
-    size_t len = strlen(content);
-    size_t written = fwrite(content, 1, len, fp);
+    size_t written = fwrite(content->buf, 1, (size_t)content->len, fp);
     fclose(fp);
-    return written == len ? 0 : -1;
+    return written == (size_t)content->len ? 0 : -1;
 }
 
-char *read_file(const char *path) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return "";
+KodStr *read_file(KodStr *path) {
+    FILE *fp = fopen(path->buf, "rb");
+    if (!fp) return kod_empty_str();
     fseek(fp, 0, SEEK_END);
     int64_t size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)arena_alloc(size + 1);
-    fread(buf, 1, size, fp);
-    buf[size] = '\0';
+    KodStr *s = kod_str_alloc(size);
+    fread(s->buf, 1, size, fp);
     fclose(fp);
-    return buf;
+    return s;
 }
 
-char *kod_str_slice(const char *s, int64_t start, int64_t end) {
+KodStr *kod_str_slice(KodStr *s, int64_t start, int64_t end) {
     int64_t len = end - start;
     if (len < 0) len = 0;
-    char *buf = (char *)arena_alloc(len + 1);
-    for (int64_t i = 0; i < len; i++) buf[i] = s[start + i];
-    buf[len] = '\0';
-    return buf;
+    KodStr *out = kod_str_alloc(len);
+    memcpy(out->buf, s->buf + start, len);
+    return out;
 }
 
-char *kod_str_concat(const char *a, const char *b) {
-    int64_t la = strlen(a);
-    int64_t lb = strlen(b);
-    char *buf = (char *)arena_alloc(la + lb + 1);
-    for (int64_t i = 0; i < la; i++) buf[i] = a[i];
-    for (int64_t i = 0; i < lb; i++) buf[la + i] = b[i];
-    buf[la + lb] = '\0';
-    return buf;
+KodStr *kod_str_concat(KodStr *a, KodStr *b) {
+    KodStr *out = kod_str_alloc(a->len + b->len);
+    memcpy(out->buf, a->buf, a->len);
+    memcpy(out->buf + a->len, b->buf, b->len);
+    return out;
+}
+
+// Lexicographic compare on the byte buffers, with length-difference
+// tiebreaker (matches memcmp / strcmp semantics). Replaces the
+// previous direct `_strcmp` call inside compile_str_eq, which would
+// have read past struct headers under the new layout.
+int64_t kod_str_cmp(KodStr *a, KodStr *b) {
+    int64_t min_len = a->len < b->len ? a->len : b->len;
+    int rc = memcmp(a->buf, b->buf, (size_t)min_len);
+    if (rc != 0) return rc;
+    return a->len - b->len;
 }
 
 typedef struct {
@@ -136,11 +196,12 @@ typedef struct {
 } KodArray;
 
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`
-// struct's field order (each slot 8 bytes).
+// struct's field order (each slot 8 bytes). The two `*` slots hold
+// Kod `str` values (i.e. pointers to KodStr structs).
 typedef struct {
     int64_t status;
-    char *stdout_buf;
-    char *stderr_buf;
+    KodStr *stdout_buf;
+    KodStr *stderr_buf;
 } KodProcessResult;
 
 // Append `n` bytes from `src` onto a growable arena-backed buffer.
@@ -170,8 +231,10 @@ static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
 KodProcessResult *kod_run_process(KodArray *argv_arr) {
     int64_t argc = argv_arr->len;
     char **argv = (char **)arena_alloc((argc + 1) * sizeof(char *));
-    char **kod_argv = (char **)argv_arr->ptr;
-    for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i];
+    KodStr **kod_argv = (KodStr **)argv_arr->ptr;
+    // argv passed to posix_spawnp wants NUL-terminated C strings, not
+    // KodStr — pull the underlying `buf` field out of each entry.
+    for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i]->buf;
     argv[argc] = NULL;
 
     KodProcessResult *result =
@@ -180,10 +243,8 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
     int out_pipe[2], err_pipe[2];
     if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
         result->status = -1;
-        result->stdout_buf = (char *)arena_alloc(1);
-        result->stdout_buf[0] = '\0';
-        result->stderr_buf = (char *)arena_alloc(1);
-        result->stderr_buf[0] = '\0';
+        result->stdout_buf = kod_empty_str();
+        result->stderr_buf = kod_empty_str();
         return result;
     }
 
@@ -206,10 +267,8 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
         close(out_pipe[0]);
         close(err_pipe[0]);
         result->status = -1;
-        result->stdout_buf = (char *)arena_alloc(1);
-        result->stdout_buf[0] = '\0';
-        result->stderr_buf = (char *)arena_alloc(1);
-        result->stderr_buf[0] = '\0';
+        result->stdout_buf = kod_empty_str();
+        result->stderr_buf = kod_empty_str();
         return result;
     }
 
@@ -246,16 +305,21 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
             }
         }
     }
-    out_buf[out_len] = '\0';
-    err_buf[err_len] = '\0';
+    // Copy the raw capture buffers into properly-headed Kod strings.
+    // append_to_buf grows storage without leaving room for a KodStr
+    // header, so we can't hand the raw buffers back as Kod strs.
+    KodStr *out_str = kod_str_alloc(out_len);
+    memcpy(out_str->buf, out_buf, out_len);
+    KodStr *err_str = kod_str_alloc(err_len);
+    memcpy(err_str->buf, err_buf, err_len);
 
     int status;
     waitpid(pid, &status, 0);
     int exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 
     result->status = exit_status;
-    result->stdout_buf = out_buf;
-    result->stderr_buf = err_buf;
+    result->stdout_buf = out_str;
+    result->stderr_buf = err_str;
     return result;
 }
 
@@ -306,10 +370,12 @@ int64_t stdin_data_ready(int64_t timeout_ms) {
 // string on EOF with no bytes buffered. Used by LSP-style framing:
 // callers read Content-Length headers line-by-line and then switch to
 // read_stdin_exact for the body.
-char *read_stdin_line(void) {
+KodStr *read_stdin_line(void) {
+    // Read into a scratch buffer first (length unknown up front), then
+    // copy into a properly-headed KodStr at the end.
     int64_t cap = 64;
     int64_t len = 0;
-    char *buf = (char *)arena_alloc(cap);
+    char *scratch = (char *)arena_alloc(cap);
     while (1) {
         int ch = getchar();
         if (ch == EOF) {
@@ -321,40 +387,44 @@ char *read_stdin_line(void) {
         if (len + 1 >= cap) {
             int64_t new_cap = cap * 2;
             char *new_buf = (char *)arena_alloc(new_cap);
-            for (int64_t i = 0; i < len; i++) new_buf[i] = buf[i];
-            buf = new_buf;
+            for (int64_t i = 0; i < len; i++) new_buf[i] = scratch[i];
+            scratch = new_buf;
             cap = new_cap;
         }
-        buf[len++] = (char)ch;
+        scratch[len++] = (char)ch;
     }
-    if (len > 0 && buf[len - 1] == '\r') {
+    if (len > 0 && scratch[len - 1] == '\r') {
         len--;
     }
-    buf[len] = '\0';
-    return buf;
+    KodStr *s = kod_str_alloc(len);
+    memcpy(s->buf, scratch, len);
+    return s;
 }
 
 // Write `s` to stdout verbatim — no trailing newline, no flush. Use
 // for output where you control framing (e.g. LSP messages where the
 // `\n` puts/print appends would split the next message's headers).
-void write_stdout(const char *s) {
-    fputs(s, stdout);
+void write_stdout(KodStr *s) {
+    fwrite(s->buf, 1, (size_t)s->len, stdout);
 }
 
-// Read exactly `n` bytes from stdin into a NUL-terminated arena buffer
-// and return it. On a short read (EOF before n bytes), returns the
-// truncated content; callers detect the truncation by length-checking
-// against `n`. Used for LSP message bodies after Content-Length headers.
-char *read_stdin_exact(int64_t n) {
-    char *buf = (char *)arena_alloc(n + 1);
+// Read exactly `n` bytes from stdin into a fresh KodStr. On a short
+// read (EOF before n bytes), the header's `len` is shrunk to match
+// what was actually read — callers length-check against `n`. Used
+// for LSP message bodies after Content-Length headers.
+KodStr *read_stdin_exact(int64_t n) {
+    KodStr *s = kod_str_alloc(n);
     int64_t got = 0;
     while (got < n) {
-        size_t r = fread(buf + got, 1, (size_t)(n - got), stdin);
+        size_t r = fread(s->buf + got, 1, (size_t)(n - got), stdin);
         if (r == 0) {
             break;
         }
         got += (int64_t)r;
     }
-    buf[got] = '\0';
-    return buf;
+    if (got != n) {
+        s->len = got;
+        s->buf[got] = '\0';
+    }
+    return s;
 }
