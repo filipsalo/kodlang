@@ -98,17 +98,21 @@ int64_t kod_puts(KodStr *s) {
 static int g_kod_test_failed;
 static int g_kod_test_total;
 static int g_kod_test_failures;
-/* Captured on the first kod_test_reset call (which the codegen-emitted
- * dispatcher fires before each test) so kod_test_summary can report
- * total elapsed time. Negative means "not yet set". */
+/* `start_ns` captures the first reset's timestamp so the summary can
+ * report total wall time; `case_start_ns` is refreshed on every reset
+ * and consumed by the matching report call to print a per-test
+ * duration. Negative means "not yet set". */
 static int64_t g_kod_test_start_ns = -1;
+static int64_t g_kod_test_case_start_ns = -1;
 
 int64_t kod_monotonic_ns(void);
 
 void kod_test_reset(void) {
+    int64_t now = kod_monotonic_ns();
     if (g_kod_test_start_ns < 0) {
-        g_kod_test_start_ns = kod_monotonic_ns();
+        g_kod_test_start_ns = now;
     }
+    g_kod_test_case_start_ns = now;
     g_kod_test_failed = 0;
 }
 
@@ -117,6 +121,42 @@ void kod_test_fail(KodStr *msg) {
     fwrite("    ", 1, 4, stderr);
     fwrite(msg->buf, 1, msg->len, stderr);
     fputc('\n', stderr);
+}
+
+/* Format `ns` in (ns / μs / ms / s) with 3 significant figures, e.g.:
+ *   0 ns             → "<0.00 ns"   (below clock resolution — two
+ *                                    consecutive monotonic reads
+ *                                    landed in the same ns slot, so
+ *                                    the actual value is > 0 and we
+ *                                    flag it rather than claim zero)
+ *   873 ns           → "873 ns"
+ *   1234 ns          → "1.23 μs"
+ *   45678 ns         → "45.7 μs"
+ *   123456 ns        → "123 μs"
+ *   1234567 ns       → "1.23 ms"
+ *   12345678 ns      → "12.3 ms"
+ *   1234567890 ns    → "1.23 s"
+ *
+ * Keeps numbers readable across the wide range a test suite spans —
+ * tens of nanoseconds for trivial assertions, seconds for the
+ * compile-heavy tests. Used by both `kod_test_report` (per-test) and
+ * `kod_test_summary` (total).
+ */
+static void format_duration(int64_t ns, char *out, size_t out_size) {
+    if (ns == 0) {
+        snprintf(out, out_size, "<0.00 ns");
+        return;
+    }
+    double v;
+    const char *unit;
+    if (ns < 1000)              { v = (double)ns;                unit = "ns"; }
+    else if (ns < 1000000)      { v = (double)ns / 1000.0;       unit = "μs"; }
+    else if (ns < 1000000000)   { v = (double)ns / 1000000.0;    unit = "ms"; }
+    else                        { v = (double)ns / 1000000000.0; unit = "s";  }
+    const char *fmt = v < 10  ? "%.2f %s"
+                    : v < 100 ? "%.1f %s"
+                    :           "%.0f %s";
+    snprintf(out, out_size, fmt, v, unit);
 }
 
 void kod_test_report(KodStr *name) {
@@ -128,17 +168,20 @@ void kod_test_report(KodStr *name) {
         fwrite("ok   ", 1, 5, stdout);
     }
     fwrite(name->buf, 1, name->len, stdout);
-    fputc('\n', stdout);
+    char dur[32];
+    format_duration(kod_monotonic_ns() - g_kod_test_case_start_ns, dur, sizeof dur);
+    printf(" (%s)\n", dur);
 }
 
 int64_t kod_test_summary(void) {
-    int64_t elapsed_ms = 0;
+    int64_t elapsed_ns = 0;
     if (g_kod_test_start_ns >= 0) {
-        elapsed_ms = (kod_monotonic_ns() - g_kod_test_start_ns) / 1000000;
+        elapsed_ns = kod_monotonic_ns() - g_kod_test_start_ns;
     }
-    printf("\n%d/%d passed in %lld.%03llds\n",
-           g_kod_test_total - g_kod_test_failures, g_kod_test_total,
-           (long long)(elapsed_ms / 1000), (long long)(elapsed_ms % 1000));
+    char dur[32];
+    format_duration(elapsed_ns, dur, sizeof dur);
+    printf("\n%d/%d passed in %s\n",
+           g_kod_test_total - g_kod_test_failures, g_kod_test_total, dur);
     return g_kod_test_failures > 0 ? 1 : 0;
 }
 
