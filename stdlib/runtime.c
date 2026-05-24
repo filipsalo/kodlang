@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -97,8 +98,19 @@ int64_t kod_puts(KodStr *s) {
 static int g_kod_test_failed;
 static int g_kod_test_total;
 static int g_kod_test_failures;
+/* Captured on the first kod_test_reset call (which the codegen-emitted
+ * dispatcher fires before each test) so kod_test_summary can report
+ * total elapsed time. Negative means "not yet set". */
+static int64_t g_kod_test_start_ns = -1;
 
-void kod_test_reset(void) { g_kod_test_failed = 0; }
+int64_t kod_monotonic_ns(void);
+
+void kod_test_reset(void) {
+    if (g_kod_test_start_ns < 0) {
+        g_kod_test_start_ns = kod_monotonic_ns();
+    }
+    g_kod_test_failed = 0;
+}
 
 void kod_test_fail(KodStr *msg) {
     g_kod_test_failed = 1;
@@ -120,8 +132,13 @@ void kod_test_report(KodStr *name) {
 }
 
 int64_t kod_test_summary(void) {
-    printf("\n%d/%d passed\n",
-           g_kod_test_total - g_kod_test_failures, g_kod_test_total);
+    int64_t elapsed_ms = 0;
+    if (g_kod_test_start_ns >= 0) {
+        elapsed_ms = (kod_monotonic_ns() - g_kod_test_start_ns) / 1000000;
+    }
+    printf("\n%d/%d passed in %lld.%03llds\n",
+           g_kod_test_total - g_kod_test_failures, g_kod_test_total,
+           (long long)(elapsed_ms / 1000), (long long)(elapsed_ms % 1000));
     return g_kod_test_failures > 0 ? 1 : 0;
 }
 
@@ -576,4 +593,25 @@ void lsp_cache_store(KodStr *uri, KodStr *text, void *cg) {
  * and stay valid — only the cg pointer is invalidated. */
 void lsp_cache_invalidate(void) {
     g_lsp_cached_cg = NULL;
+}
+
+/* ── Time ─────────────────────────────────────────────────────────────
+ *
+ * Two primitives: a monotonic clock (origin is unspecified — only
+ * differences are meaningful, but it never goes backwards) and a
+ * wall clock (nanoseconds since the Unix epoch). Both return int64
+ * to avoid carrying a time-struct around at the language level;
+ * users do the arithmetic. Sufficient for ~292 years of nanoseconds,
+ * comfortably past any test-runner timing or "is this stale?" use.
+ */
+int64_t kod_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+}
+
+int64_t kod_unix_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
 }

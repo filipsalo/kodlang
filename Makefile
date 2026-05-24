@@ -44,7 +44,8 @@ STAGE0_OBJS := \
     $(STAGE0)/_str.o \
     $(STAGE0)/_bool.o \
     $(STAGE0)/_io.o \
-    $(STAGE0)/_process.o
+    $(STAGE0)/_process.o \
+    $(STAGE0)/_time.o
 
 STAGE0_SOURCES := \
     stdlib/arena.c \
@@ -54,7 +55,8 @@ STAGE0_SOURCES := \
     stdlib/primitives/str.kod \
     stdlib/primitives/bool.kod \
     stdlib/io.kod \
-    stdlib/process.kod
+    stdlib/process.kod \
+    stdlib/time.kod
 
 COMPILER_KOD := \
     stdlib/kod/ast.kod \

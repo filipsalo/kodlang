@@ -56,7 +56,7 @@ class Builder:
         # Eagerly-loaded stdlib modules (their .o becomes part of stage0
         # so sh_kodc links them, even though user code still needs an
         # explicit `import "io"` / `import "process"` to use them).
-        for name in ("io", "process"):
+        for name in ("io", "process", "time"):
             module = self.parse_module(self.program.resolve_import(name))
             self.program.add_module(module)
 
