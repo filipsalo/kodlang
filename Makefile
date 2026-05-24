@@ -1,21 +1,37 @@
 # Kod build chain.
 #
 # Targets:
-#   make             same as `make stage1` (build sh_kodc, the self-hosted compiler)
-#   make stage0      build shared stdlib objects under build/stage0/
-#   make stage1      build sh_kodc under build/stage1/
-#   make bootstrap   wipe build/ and rebuild stage0 + stage1 from scratch
-#   make test        run pytest
-#   make clean-apps  drop build/apps/ (per-app outputs)
-#   make clean       drop build/ entirely
+#   make                  same as `make stage1` (build sh_kodc, the self-hosted compiler)
+#   make stage0           build shared stdlib objects under build/stage0/
+#   make stage1           build sh_kodc under build/stage1/
+#   make bootstrap        wipe build/ and rebuild stage0 + stage1 from scratch
+#   make bootstrap-snapshot
+#                         force the slow Python path end-to-end and copy the
+#                         resulting sh_kodc to bootstrap/sh_kodc. Run after
+#                         changes that the checked-in snapshot can no longer
+#                         handle (parser format, runtime ABI, …) and commit.
+#   make test             run pytest
+#   make clean-apps       drop build/apps/ (per-app outputs)
+#   make clean            drop build/ entirely (keeps bootstrap/sh_kodc)
 #
 # Layout:
-#   build/stage0/  arena.o, runtime.o, _builtins.o, _int64.o, _str.o, _bool.o
-#   build/stage1/  the compiler-source .{s,o}, runtime_main.{s,o}, sh_kodc
-#   build/apps/<stem>/  per-app artifacts + final executable
+#   bootstrap/sh_kodc     arm64-darwin sh_kodc snapshot — checked in so a
+#                         fresh clone (or `make clean`) can rebuild stage1
+#                         in seconds instead of ~165 s in the Python interp.
+#   build/stage0/         arena.o, runtime.o, _builtins.o, _int64.o, _str.o, _bool.o
+#   build/stage1/         the compiler-source .{s,o}, runtime_main.{s,o}, sh_kodc
+#   build/apps/<stem>/    per-app artifacts + final executable
 
 PY := uv run python
 KOD := $(PY) -m kod
+
+# Compiler used to lower stage1 sources to .s. The checked-in snapshot
+# is ~30× faster than the Python interpreter on a cold stage1 build;
+# falls back to Python when the snapshot is missing (first build before
+# the binary lands, or `make bootstrap-snapshot`).
+BOOTSTRAP_SH_KODC := bootstrap/sh_kodc
+KODC := $(if $(wildcard $(BOOTSTRAP_SH_KODC)),./$(BOOTSTRAP_SH_KODC),$(KOD) _interpret kodc.kod)
+KODC_EMIT_MAIN := $(if $(wildcard $(BOOTSTRAP_SH_KODC)),./$(BOOTSTRAP_SH_KODC) _emit-runtime-main,$(KOD) _emit-runtime-main)
 
 STAGE0 := build/stage0
 STAGE1 := build/stage1
@@ -60,7 +76,7 @@ LDFLAGS := -lc -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib
 MACOS_VERSION := $(shell sw_vers -productVersion)
 AS := as -target arm64-apple-darwin
 
-.PHONY: all stage0 stage1 bootstrap test clean clean-apps clean-stage1
+.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot test clean clean-apps clean-stage1
 
 all: stage1
 
@@ -79,31 +95,32 @@ $(STAGE1)/sh_kodc: $(STAGE1_OBJS) $(STAGE0_OBJS)
 	ld -macos_version_min $(MACOS_VERSION) $(LDFLAGS) -o $@ \
 	    $(STAGE0_OBJS) $(STAGE1_OBJS)
 
-# Each compiler-source .kod file is interpreted via stage0 (Python interpreter
-# driving kodc.kod) to produce a .s, which we then assemble.
+# Each compiler-source .kod file is lowered to .s by $(KODC) — the
+# checked-in arm64-darwin snapshot when present, the Python interpreter
+# driving kodc.kod otherwise.
 $(STAGE1)/lexing.s: stdlib/kod/lexing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) _interpret kodc.kod $< > $@
+	$(KODC) $< > $@
 
 $(STAGE1)/parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) _interpret kodc.kod $< > $@
+	$(KODC) $< > $@
 
 $(STAGE1)/codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) _interpret kodc.kod $< > $@
+	$(KODC) $< > $@
 
 $(STAGE1)/build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) _interpret kodc.kod $< > $@
+	$(KODC) $< > $@
 
 $(STAGE1)/kodc.s: kodc.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
-	$(KOD) _interpret kodc.kod $< > $@
+	$(KODC) $< > $@
 
 $(STAGE1)/runtime_main.s: kodc.kod kod/builder.py
 	mkdir -p $(STAGE1)
-	$(KOD) _emit-runtime-main kodc.kod $@
+	$(KODC_EMIT_MAIN) kodc.kod $@
 
 $(STAGE1)/%.o: $(STAGE1)/%.s
 	$(AS) -o $@ $<
@@ -111,6 +128,22 @@ $(STAGE1)/%.o: $(STAGE1)/%.s
 bootstrap:
 	rm -rf build
 	$(MAKE) stage1
+
+# Rebuild the checked-in arm64-darwin snapshot from scratch via the
+# Python interpreter, then drop the result into bootstrap/. Run this
+# after a change that the current snapshot can't compile (parser
+# format, runtime ABI, codegen shape, …) and commit the new binary.
+# Hiding the snapshot first forces the slow Python path; the recursive
+# `make stage1` reruns the Makefile so KODC re-evaluates to the
+# Python form.
+bootstrap-snapshot:
+	@echo "==> Rebuilding bootstrap snapshot via Python interpreter (slow)..."
+	rm -f $(BOOTSTRAP_SH_KODC)
+	rm -rf build/stage0 build/stage1
+	$(MAKE) stage1
+	@mkdir -p $(dir $(BOOTSTRAP_SH_KODC))
+	cp build/stage1/sh_kodc $(BOOTSTRAP_SH_KODC)
+	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Verify, then commit it."
 
 test: stage1
 	uv run pytest tests/

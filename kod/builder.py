@@ -105,8 +105,8 @@ class Builder:
         except ValueError:
             rel_path = module_path
 
-        sh_kodc = self.build_root / "stage1" / "sh_kodc"
-        if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
+        sh_kodc = self._find_sh_kodc()
+        if sh_kodc is not None:
             cmd = [str(sh_kodc), str(rel_path)]
         else:
             cmd = [
@@ -151,6 +151,29 @@ class Builder:
             except OSError:
                 continue
         return False
+
+    def _find_sh_kodc(self) -> Path | None:
+        """Locate a usable sh_kodc, in order of preference:
+
+          1. build/stage1/sh_kodc, when freshly built — the canonical
+             self-hosted compiler we just produced.
+          2. bootstrap/sh_kodc — a checked-in arm64-darwin snapshot
+             that exists so a fresh clone (or `make clean`) doesn't
+             need to wait ~165 s on the Python interpreter. Refresh
+             with `make bootstrap-snapshot`.
+
+        Returns None when neither is present, so callers can fall
+        back to the Python interpreter. The bootstrap is intentionally
+        not subject to `_sh_kodc_stale` — its whole job is to compile
+        source newer than itself.
+        """
+        fresh = self.build_root / "stage1" / "sh_kodc"
+        if fresh.exists() and not self._sh_kodc_stale(fresh):
+            return fresh
+        bootstrap = self.program.root_fs.root_path / "bootstrap" / "sh_kodc"
+        if bootstrap.exists():
+            return bootstrap
+        return None
 
     def _build_c(self, c_path: Path, out_dir: Path) -> Path:
         """Compile a C source file to an object file."""
@@ -203,8 +226,8 @@ class Builder:
         root_path = self.program.root_fs.root_path
         out_dir.mkdir(parents=True, exist_ok=True)
         obj_path = (out_dir / module.mangled_name).with_suffix(".o")
-        sh_kodc = self.build_root / "stage1" / "sh_kodc"
-        if sh_kodc.exists() and not self._sh_kodc_stale(sh_kodc):
+        sh_kodc = self._find_sh_kodc()
+        if sh_kodc is not None:
             try:
                 rel_src = module.source_file.path.relative_to(root_path)
             except ValueError:
