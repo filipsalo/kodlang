@@ -118,9 +118,26 @@ void kod_test_reset(void) {
 
 void kod_test_fail(KodStr *msg) {
     g_kod_test_failed = 1;
-    fwrite("    ", 1, 4, stderr);
+    /* 6-space indent: 2 for the per-module nesting, 4 more so failure
+     * messages clearly belong to the test rather than the group. */
+    fwrite("      ", 1, 6, stderr);
     fwrite(msg->buf, 1, msg->len, stderr);
     fputc('\n', stderr);
+}
+
+/* Called once at the top of each module's `__run_tests` dispatcher
+ * (the codegen emits the call with the module's source path). Prints
+ * the path on its own line so subsequent per-test `ok` / `FAIL`
+ * lines (indented by `kod_test_report`) read as a group. Separates
+ * groups with a blank line; the first group prints without one. */
+static int g_kod_test_group_seen = 0;
+void kod_test_module_begin(KodStr *path) {
+    if (g_kod_test_group_seen) {
+        fputc('\n', stdout);
+    }
+    g_kod_test_group_seen = 1;
+    fwrite(path->buf, 1, path->len, stdout);
+    fputc('\n', stdout);
 }
 
 /* Format `ns` in (ns / μs / ms / s) with 3 significant figures, e.g.:
@@ -161,11 +178,13 @@ static void format_duration(int64_t ns, char *out, size_t out_size) {
 
 void kod_test_report(KodStr *name) {
     g_kod_test_total++;
+    /* Two-space indent so the per-test lines visibly nest under the
+     * module-path header from `kod_test_module_begin`. */
     if (g_kod_test_failed) {
         g_kod_test_failures++;
-        fwrite("FAIL ", 1, 5, stdout);
+        fwrite("  FAIL ", 1, 7, stdout);
     } else {
-        fwrite("ok   ", 1, 5, stdout);
+        fwrite("  ok   ", 1, 7, stdout);
     }
     fwrite(name->buf, 1, name->len, stdout);
     char dur[32];
