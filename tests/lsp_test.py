@@ -854,3 +854,140 @@ def test_completion_module_qualified_returns_imports_exports(lsp_binary):
     assert "write_file" in labels
     # `helper` is a global free function — not exported by `io`.
     assert "helper" not in labels
+
+
+def test_completion_str_methods_on_typed_variable(lsp_binary):
+    # After `s.`, where `s: str` was declared above, completions should
+    # include the methods registered on str (to_str, hash, code_points,
+    # char_at, contains, …).
+    source = (
+        "func main() -> int64 {\n"
+        '  let s: str = "hello"\n'
+        "  s.\n"
+        "  return 0\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/recvstr.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/recvstr.kod"},
+                    # Line 2 is `  s.`; column 4 is just past the dot.
+                    "position": {"line": 2, "character": 4},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "to_str" in labels
+    assert "hash" in labels
+    assert "contains" in labels
+    assert "char_at" in labels
+
+
+def test_completion_struct_methods_and_fields_on_typed_variable(lsp_binary):
+    # After `p.` where `p: Point`, completions include the struct's
+    # methods (distance) and fields (x, y).
+    source = (
+        "type Point = struct {\n"
+        "  x: int64\n"
+        "  y: int64\n"
+        "  func distance(self) -> int64 { return 0 }\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  let p: Point = Point(x: 1, y: 2)\n"
+        "  p.\n"
+        "  return 0\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/recvstruct.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/recvstruct.kod"},
+                    # Line 7 is `  p.`; column 4 is just past the dot.
+                    "position": {"line": 7, "character": 4},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "distance" in labels
+    assert "x" in labels
+    assert "y" in labels
+
+
+def test_completion_receiver_through_function_param(lsp_binary):
+    # The receiver's type can also come from a function parameter
+    # annotation, not just a `let`. After `s.`, get str methods.
+    source = "func helper(s: str) -> int64 {\n  s.\n  return 0\n}\n"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/recvparam.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/recvparam.kod"},
+                    "position": {"line": 1, "character": 4},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "to_str" in labels
+    assert "char_at" in labels
