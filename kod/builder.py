@@ -251,6 +251,12 @@ class Builder:
         the symbol prefix codegen uses. Strips leading `stdlib/` so
         modules under stdlib match `import "kod/foo"` style resolution."""
         parts = file.canonical_path.with_suffix("").parts
+        # Drop the filesystem root ('/' on posix) so an absolute path
+        # like /tmp/foo.kod doesn't produce '/$tmp$foo' — the codegen
+        # joins prefix + name as `${prefix}${name}`, which would yield
+        # an invalid '/$tmp$foo$main' assembler symbol.
+        if parts and parts[0] == "/":
+            parts = parts[1:]
         if parts and parts[0] == "stdlib":
             parts = parts[1:]
         return "$".join(parts)
