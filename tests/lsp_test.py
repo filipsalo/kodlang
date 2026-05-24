@@ -201,8 +201,10 @@ def test_hover_renders_signature(lsp_binary):
     assert hover["result"] is not None, "expected a Hover, got null"
     value = hover["result"]["contents"]["value"]
     # io.read_file: extern func read_file(anon path: str) -> str
+    # The anon param's binding name (`path`) should be in the hover so
+    # the user can tell what each positional argument represents.
     assert "io.read_file" in value
-    assert "str" in value
+    assert "anon path: str" in value
 
 
 def test_definition_resolves_struct_type(lsp_binary):
