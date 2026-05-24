@@ -1020,7 +1020,7 @@ type Parser = struct {
 	}
 
 
-	func parse_func_decl(self) -> ast.FuncDecl {
+	func parse_func_decl(self, doc: str) -> ast.FuncDecl {
 		self.expect(.KwFunc)
 		let name_span: ast.Span = self.here()
 		let name: str = self.expect_identifier()
@@ -1030,11 +1030,11 @@ type Parser = struct {
 			return_typ = self.parse_type_expr()
 		}
 		let body: [int64] = self.parse_block()
-		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body)
+		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc)
 	}
 
 	// Interface method signature: `func name(params) -> ret` (no body).
-	func parse_func_sig(self) -> ast.FuncDecl {
+	func parse_func_sig(self, doc: str) -> ast.FuncDecl {
 		self.expect(.KwFunc)
 		let name_span: ast.Span = self.here()
 		let name: str = self.expect_identifier()
@@ -1044,7 +1044,7 @@ type Parser = struct {
 			return_typ = self.parse_type_expr()
 		}
 		let body: [int64] = []
-		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body)
+		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc)
 	}
 
 	func parse_struct_fields(self) -> [ast.StructField] {
@@ -1087,7 +1087,7 @@ type Parser = struct {
 		return variants
 	}
 
-	func parse_decl(self) -> ast.Decl {
+	func parse_decl(self, doc: str) -> ast.Decl {
 		self.skip_newlines()
 
 		// import "path" or import "path" { Name1, Name2, ... }
@@ -1136,7 +1136,7 @@ type Parser = struct {
 
 		// func
 		if self.at(.KwFunc) {
-			let func_decl: ast.FuncDecl = self.parse_func_decl()
+			let func_decl: ast.FuncDecl = self.parse_func_decl(:doc)
 			let id: int64 = self.alloc_func_decl(func_decl)
 			self.skip_newlines()
 			return ast.Decl.Func(decl: id)
@@ -1150,7 +1150,7 @@ type Parser = struct {
 			self.skip_newlines()
 			let methods: [int64] = []
 			for self.at(.KwFunc) {
-				let module: ast.FuncDecl = self.parse_func_sig()
+				let module: ast.FuncDecl = self.parse_func_sig(doc: "")
 				methods += [self.alloc_func_decl(module)]
 				self.skip_newlines()
 			}
@@ -1168,7 +1168,7 @@ type Parser = struct {
 			let display: str = parse_string_value(raw)
 			let body: [int64] = self.parse_block()
 			let empty_params: [ast.Param] = []
-			let func_decl: ast.FuncDecl = ast.FuncDecl(name: "test", name_span: ast.Span(start: tok.start), params: empty_params, return_typ: 0, :body)
+			let func_decl: ast.FuncDecl = ast.FuncDecl(name: "test", name_span: ast.Span(start: tok.start), params: empty_params, return_typ: 0, :body, doc: "")
 			let id: int64 = self.alloc_func_decl(func_decl)
 			self.skip_newlines()
 			return ast.Decl.Test(:display, decl: id)
@@ -1198,7 +1198,7 @@ type Parser = struct {
 				let fields: [ast.StructField] = self.parse_struct_fields()
 				let methods: [int64] = []
 				for self.at(.KwFunc) {
-					let module: ast.FuncDecl = self.parse_func_decl()
+					let module: ast.FuncDecl = self.parse_func_decl(doc: "")
 					methods += [self.alloc_func_decl(module)]
 					self.skip_newlines()
 				}
@@ -1229,14 +1229,78 @@ type Parser = struct {
 	func parse_module(self) -> ast.Module {
 		let decls: [ast.Decl] = []
 		for self.peek_kind() != .EOF {
-			self.skip_newlines()
+			// Eat blank lines, then collect any contiguous `//` doc
+			// comments immediately above the next decl. A blank line
+			// between comments and the decl breaks the association.
+			for self.at(.EOL) {
+				self.advance()
+			}
 			if self.peek_kind() == .EOF {
 				break
 			}
-			decls += [self.parse_decl()]
+			let doc: str = self.consume_doc_comments()
+			if self.peek_kind() == .EOF {
+				break
+			}
+			decls += [self.parse_decl(:doc)]
 		}
 		return ast.Module(:decls)
 	}
+
+	// Consume any contiguous `//` comments immediately before the next
+	// non-comment token. Returns the joined doc text with the `//` and
+	// one trailing space stripped from each line; "" when no comments
+	// precede the decl, or when a blank line separates them from it.
+	func consume_doc_comments(self) -> str {
+		let lines: [str] = []
+		for self.at(.Comment) {
+			let tok: lexing.Token = self.advance()
+			lines += [strip_comment_marker(tok.value)]
+			// Allow exactly one EOL between comments (the natural line
+			// break). A second EOL is a blank line — the comments
+			// stop being docs for what follows.
+			if self.at(.EOL) == false {
+				break
+			}
+			self.advance()
+			if self.at(.EOL) {
+				// Blank line — discard collected and start over so any
+				// later comment block can still attach as docs.
+				lines = []
+				for self.at(.EOL) {
+					self.advance()
+				}
+			}
+		}
+		if len(lines) == 0 {
+			return ""
+		}
+		let s: str = ""
+		let i: int64 = 0
+		for i < len(lines) {
+			if i > 0 {
+				s = s + "\n"
+			}
+			s = s + lines[i]
+			i = i + 1
+		}
+		return s
+	}
+}
+
+// Strip a leading `//` and one trailing space from a comment token's
+// raw value. The lexer already skipped the indentation up to `//`,
+// so the value starts with the slashes themselves.
+func strip_comment_marker(anon raw: str) -> str {
+	let n: int64 = len(raw)
+	if n < 2 or raw[0:2] != "//" {
+		return raw
+	}
+	let s: int64 = 2
+	if s < n and raw[s] == ' ' {
+		s = s + 1
+	}
+	return raw[s:n]
 }
 
 func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser {
@@ -1253,7 +1317,7 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
 	let match_expr_arms: [ast.MatchExprArm] = [ast.MatchExprArm(pattern: 0, body: 0)]
 	let dummy_params: [ast.Param] = []
 	let dummy_body: [int64] = []
-	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", name_span: ast.Span(start: 0), params: dummy_params, return_typ: 0, body: dummy_body)]
+	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", name_span: ast.Span(start: 0), params: dummy_params, return_typ: 0, body: dummy_body, doc: "")]
 	let errors: [ParseError] = []
 	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls, :errors)
 }

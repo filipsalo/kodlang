@@ -1077,3 +1077,53 @@ def test_completion_shows_underscore_methods_when_partial_starts_with_underscore
     # Internal helpers now visible
     assert "_utf8_width_at" in labels
     assert "_utf8_value_at" in labels
+
+
+def test_hover_includes_leading_doc_comment(lsp_binary):
+    # `func helper` has a leading `//` comment block — the hover
+    # response should render those lines as a markdown paragraph
+    # above the fenced signature.
+    source = (
+        "// Helper that returns the answer.\n"
+        "// Spans two lines on purpose.\n"
+        "func helper() -> int64 { return 42 }\n"
+        "func main() -> int64 {\n"
+        "  return helper()\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/dochover.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/dochover.kod"},
+                    # `helper` on line 4: index 0 = `func`, …, 9 = `h`.
+                    "position": {"line": 4, "character": 11},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    hover = next(r for r in responses if r.get("id") == 2)
+    value = hover["result"]["contents"]["value"]
+    assert "Helper that returns the answer." in value
+    assert "Spans two lines on purpose." in value
+    assert "```kod" in value
+    assert "func helper()" in value
