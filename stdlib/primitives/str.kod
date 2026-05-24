@@ -42,9 +42,12 @@ func hash(self: str) -> int64 {
 	return h
 }
 
-// Decode `self` as UTF-8 and return the sequence of code points.
+// Internal: byte width (1..4) of the UTF-8 sequence starting at
+// byte offset `i`. Returns 1 for any sequence we can't classify as
+// valid — that's the permissive-decode contract: "consume one byte,
+// emit it as its own code point, move on."
 //
-// Encoding sketch (`b1` is the start byte; continuation bytes are
+// Encoding (`b1` is the start byte; continuation bytes match
 // `10xxxxxx` = decimal 128..192):
 //
 //     0xxxxxxx                     → 1 byte,  code points 0..127
@@ -52,97 +55,89 @@ func hash(self: str) -> int64 {
 //     1110xxxx 10xxxxxx 10xxxxxx   → 3 bytes, 2048..65535
 //     11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
 //                                  → 4 bytes, 65536..1114111
-//
-// Invalid sequences (a start byte whose continuation bytes are
-// missing or malformed, a bare continuation byte, etc.) fall back
-// to "emit `b1` as a code point and advance one byte" — the decoder
-// never panics, and round-tripping non-UTF-8 bytes through
-// `code_points` ↔ a UTF-8 encoder would round-trip the bytes too.
+func _utf8_width_at(self: str, anon i: int64) -> int64 {
+    let n: int64 = len(self)
+    let b: int64 = self[i]
+    if b < 192 {
+        // ASCII (< 128) or a bare continuation byte (128..192).
+        return 1
+    }
+    if b < 224 {
+        if i + 1 < n {
+            let b2: int64 = self[i + 1]
+            if b2 >= 128 and b2 < 192 {
+                return 2
+            }
+        }
+        return 1
+    }
+    if b < 240 {
+        if i + 2 < n {
+            let b2: int64 = self[i + 1]
+            let b3: int64 = self[i + 2]
+            if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
+                return 3
+            }
+        }
+        return 1
+    }
+    if b < 248 {
+        if i + 3 < n {
+            let b2: int64 = self[i + 1]
+            let b3: int64 = self[i + 2]
+            let b4: int64 = self[i + 3]
+            if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
+                return 4
+            }
+        }
+        return 1
+    }
+    return 1
+}
+
+// Internal: decode the code-point value at byte offset `i`, given the
+// already-classified `width`. Caller must have obtained `width` from
+// `_utf8_width_at` (or otherwise guaranteed its accuracy); passing a
+// bogus width skips the classification and yields garbage.
+func _utf8_value_at(self: str, anon i: int64, anon width: int64) -> int64 {
+    let b: int64 = self[i]
+    if width == 1 {
+        return b
+    }
+    if width == 2 {
+        return (b - 192) * 64 + (self[i + 1] - 128)
+    }
+    if width == 3 {
+        return (b - 224) * 4096 + (self[i + 1] - 128) * 64 + (self[i + 2] - 128)
+    }
+    return (b - 240) * 262144 + (self[i + 1] - 128) * 4096 + (self[i + 2] - 128) * 64 + (self[i + 3] - 128)
+}
+
+// Decode `self` as UTF-8 and return the sequence of code points.
+// See `_utf8_width_at` for the encoding sketch and the
+// permissive-decode contract on invalid input.
 func code_points(self: str) -> [int64] {
     let result: [int64] = []
     let n: int64 = len(self)
     let i: int64 = 0
     for i < n {
-        let b: int64 = self[i]
-        let cp: int64 = b
-        let width: int64 = 1
-        if b >= 192 and b < 224 {
-            // 2-byte start. Need one continuation byte.
-            if i + 1 < n {
-                let b2: int64 = self[i + 1]
-                if b2 >= 128 and b2 < 192 {
-                    cp = (b - 192) * 64 + (b2 - 128)
-                    width = 2
-                }
-            }
-        } else if b >= 224 and b < 240 {
-            // 3-byte start. Need two continuation bytes.
-            if i + 2 < n {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
-                    cp = (b - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
-                    width = 3
-                }
-            }
-        } else if b >= 240 and b < 248 {
-            // 4-byte start. Need three continuation bytes.
-            if i + 3 < n {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                let b4: int64 = self[i + 3]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
-                    cp = (b - 240) * 262144 + (b2 - 128) * 4096 + (b3 - 128) * 64 + (b4 - 128)
-                    width = 4
-                }
-            }
-        }
-        // Any other case (b < 128, bare continuation byte, missing
-        // tail) falls through with the default cp = b, width = 1.
-        result += [cp]
+        let width: int64 = self._utf8_width_at(i)
+        result += [self._utf8_value_at(i, width)]
         i = i + width
     }
     return result
 }
 
-// Count UTF-8 code points without materialising the array. Same
-// classification rules as `code_points`; only the byte width of
-// each encoding is needed here, so the value-decoding arithmetic
-// is skipped.
+// Count UTF-8 code points without materialising the array — only the
+// per-code-point byte width is needed here, so the value-decoding
+// arithmetic is skipped.
 func char_count(self: str) -> int64 {
     let n: int64 = len(self)
     let i: int64 = 0
     let count: int64 = 0
     for i < n {
-        let b: int64 = self[i]
-        let width: int64 = 1
-        if b >= 192 and b < 224 {
-            if i + 1 < n {
-                let b2: int64 = self[i + 1]
-                if b2 >= 128 and b2 < 192 {
-                    width = 2
-                }
-            }
-        } else if b >= 224 and b < 240 {
-            if i + 2 < n {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
-                    width = 3
-                }
-            }
-        } else if b >= 240 and b < 248 {
-            if i + 3 < n {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                let b4: int64 = self[i + 3]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
-                    width = 4
-                }
-            }
-        }
+        i = i + self._utf8_width_at(i)
         count = count + 1
-        i = i + width
     }
     return count
 }
@@ -164,39 +159,9 @@ func char_at(self: str, anon n: int64) -> int64 {
     let i: int64 = 0
     let cur: int64 = 0
     for i < len_bytes {
-        let b: int64 = self[i]
-        let cp: int64 = b
-        let width: int64 = 1
-        if b >= 192 and b < 224 {
-            if i + 1 < len_bytes {
-                let b2: int64 = self[i + 1]
-                if b2 >= 128 and b2 < 192 {
-                    cp = (b - 192) * 64 + (b2 - 128)
-                    width = 2
-                }
-            }
-        } else if b >= 224 and b < 240 {
-            if i + 2 < len_bytes {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
-                    cp = (b - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
-                    width = 3
-                }
-            }
-        } else if b >= 240 and b < 248 {
-            if i + 3 < len_bytes {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                let b4: int64 = self[i + 3]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
-                    cp = (b - 240) * 262144 + (b2 - 128) * 4096 + (b3 - 128) * 64 + (b4 - 128)
-                    width = 4
-                }
-            }
-        }
+        let width: int64 = self._utf8_width_at(i)
         if cur == n {
-            return cp
+            return self._utf8_value_at(i, width)
         }
         cur = cur + 1
         i = i + width
@@ -215,7 +180,6 @@ func char_at(self: str, anon n: int64) -> int64 {
 //
 // Walks the bytes once. For each code-point boundary we either
 // (a) record the byte offset for `a` or `b`, or (b) keep walking.
-// Same UTF-8 width classification as `code_points` / `char_at`.
 func char_slice(self: str, anon a: int64, anon b: int64) -> str {
     let total: int64 = self.char_count()
     if a < 0 {
@@ -247,34 +211,7 @@ func char_slice(self: str, anon a: int64, anon b: int64) -> str {
             b_byte = i
             break
         }
-        let bb: int64 = self[i]
-        let width: int64 = 1
-        if bb >= 192 and bb < 224 {
-            if i + 1 < len_bytes {
-                let b2: int64 = self[i + 1]
-                if b2 >= 128 and b2 < 192 {
-                    width = 2
-                }
-            }
-        } else if bb >= 224 and bb < 240 {
-            if i + 2 < len_bytes {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
-                    width = 3
-                }
-            }
-        } else if bb >= 240 and bb < 248 {
-            if i + 3 < len_bytes {
-                let b2: int64 = self[i + 1]
-                let b3: int64 = self[i + 2]
-                let b4: int64 = self[i + 3]
-                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
-                    width = 4
-                }
-            }
-        }
-        i = i + width
+        i = i + self._utf8_width_at(i)
         cur = cur + 1
     }
     return self[a_byte:b_byte]
