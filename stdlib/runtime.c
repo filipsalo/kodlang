@@ -468,6 +468,12 @@ void write_stdout(KodStr *s) {
     fwrite(s->buf, 1, (size_t)s->len, stdout);
 }
 
+// Same for stderr — used by the kod-side build/run driver to forward
+// a child process's captured stderr without an extra newline.
+void write_stderr(KodStr *s) {
+    fwrite(s->buf, 1, (size_t)s->len, stderr);
+}
+
 // Read exactly `n` bytes from stdin into a fresh KodStr. On a short
 // read (EOF before n bytes), the header's `len` is shrunk to match
 // what was actually read — callers length-check against `n`. Used

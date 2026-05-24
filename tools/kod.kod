@@ -1,0 +1,234 @@
+// Native `kod` driver: `kod build <file>` and `kod run <file>`.
+// Mirrors what kod/builder.py + kod/__main__.py do for those two
+// subcommands, but runs as a kod-compiled binary so a normal user
+// build doesn't have to go through the Python entry point.
+//
+// The Python `kod` stays as the universal fallback and as the
+// bootstrap path — the very first sh_kodc on a fresh clone is
+// always built via `python -m kod _interpret`.
+//
+// Pipeline (mirrors builder.py):
+//   1. Parse the entry, walk its imports transitively.
+//   2. `sh_kodc _compile` each module to a .o.
+//   3. `sh_kodc _emit-runtime-main` for the entry; `as` it to a .o.
+//   4. `ld` everything together with the prebuilt stage0 .o set.
+//
+// Assumes stage0 has been built (`make stage0`) and `build/stage1/sh_kodc`
+// exists. Both are true after a normal `make stage1`. No incremental
+// build today — every invocation does the full compile + link.
+import "io"
+import "process"
+import "kod/parsing"
+import "kod/ast"
+import "kod/build"
+
+// Stage0 stdlib modules, in the order they should be linked. Each
+// has a prebuilt `build/stage0/_<basename>.o`. Mirrors `STAGE0_OBJS`
+// in the Makefile and the eager loads in kod/builder.py. Update all
+// three when a new stdlib module joins stage0. (Kod doesn't have
+// module-level `let`s, so this is a nullary function returning the
+// list each time — cheap.)
+func stage0_module_paths() -> [str] {
+    return ["stdlib/builtins.kod", "stdlib/primitives/int64.kod", "stdlib/primitives/str.kod", "stdlib/primitives/bool.kod", "stdlib/io.kod", "stdlib/process.kod", "stdlib/time.kod"]
+}
+
+func main(argv: [str]) -> int64 {
+    if len(argv) < 2 {
+        return usage()
+    }
+    let cmd: str = argv[1]
+    if cmd == "build" {
+        if len(argv) < 3 {
+            return usage()
+        }
+        let exe: str = build_executable(argv[2])
+        if len(exe) == 0 {
+            return 1
+        }
+        return 0
+    }
+    if cmd == "run" {
+        if len(argv) < 3 {
+            return usage()
+        }
+        let exe: str = build_executable(argv[2])
+        if len(exe) == 0 {
+            return 1
+        }
+        let child_argv: [str] = [exe]
+        let i: int64 = 3
+        for i < len(argv) {
+            child_argv += [argv[i]]
+            i = i + 1
+        }
+        let r: process.ProcessResult = process.run(child_argv)
+        io.write_stdout(r.stdout)
+        io.write_stderr(r.stderr)
+        return r.status
+    }
+    return usage()
+}
+
+func usage() -> int64 {
+    kod_eprint("usage: kod build <file>")
+    kod_eprint("       kod run <file> [args...]")
+    return 1
+}
+
+// Walk the entry's import graph and return the full list of .kod
+// files that need their own .o, in load order. The entry is the
+// first element; stdlib eager-loads (builtins, primitives, io,
+// process, time) are *not* included — those already have prebuilt
+// .o files under build/stage0/ and are added separately at link time.
+func collect_user_modules(anon entry_path: str) -> [str] {
+    let result: [str] = [entry_path]
+    let p: parsing.Parser = build.parse_file(entry_path)
+    let module: ast.Module = p.parse_module()
+    walk_imports(module: module, importer_path: entry_path, modules: result)
+    return result
+}
+
+func walk_imports(module: ast.Module, importer_path: str, modules: [str]) -> none {
+    for d in module.decls {
+        match d {
+            ast.Decl.Import(module_name, _local_name, _items) -> {
+                if len(module_name) > 0 {
+                    let resolved: build.Resolved = build.resolve_import(target_path: importer_path, :module_name)
+                    if is_stage0(resolved.file) == false {
+                        let already: bool = false
+                        for m in modules {
+                            if m == resolved.file {
+                                already = true
+                            }
+                        }
+                        if already == false {
+                            modules += [resolved.file]
+                            let p: parsing.Parser = build.parse_file(resolved.file)
+                            let im: ast.Module = p.parse_module()
+                            walk_imports(module: im, importer_path: resolved.file, :modules)
+                        }
+                    }
+                }
+            }
+            else none
+        }
+    }
+}
+
+func is_stage0(anon path: str) -> bool {
+    for s in stage0_module_paths() {
+        if s == path {
+            return true
+        }
+    }
+    return false
+}
+
+// Strip directory + `.kod` extension. `tests/hello.kod` → `hello`,
+// `stdlib/primitives/int64.kod` → `int64`. Used both for derived .o
+// names (`_<basename>.o`) and for the per-app output directory under
+// `build/apps/<basename>/`.
+func basename_no_ext(anon path: str) -> str {
+    let last_slash: int64 = -1
+    let i: int64 = 0
+    for i < len(path) {
+        if path[i] == '/' {
+            last_slash = i
+        }
+        i = i + 1
+    }
+    let after_slash: int64 = last_slash + 1
+    let end: int64 = len(path)
+    // Strip a `.kod` suffix if present.
+    if end - after_slash >= 4 and path[end-4:end] == ".kod" {
+        end = end - 4
+    }
+    return path[after_slash:end]
+}
+
+// `sw_vers -productVersion` — needed for `ld -macos_version_min`.
+// Cached on first call so a build doesn't pay for it twice.
+func macos_version() -> str {
+    let r: process.ProcessResult = process.run(["sw_vers", "-productVersion"])
+    // Trim a trailing newline if present.
+    let v: str = r.stdout
+    let n: int64 = len(v)
+    if n > 0 and v[n-1] == '\n' {
+        v = v[0:n-1]
+    }
+    return v
+}
+
+// Run a process, forwarding its stderr to ours when it fails so the
+// user sees the underlying tool's diagnostic. Returns the exit
+// status (0 on success).
+func run_check(anon argv: [str]) -> int64 {
+    let r: process.ProcessResult = process.run(argv)
+    if r.status != 0 {
+        io.write_stderr(r.stderr)
+    }
+    return r.status
+}
+
+// Drive the whole pipeline for one entry. Returns the executable
+// path on success, "" on failure (the underlying tool already
+// printed the diagnostic via `run_check`).
+func build_executable(anon entry_path: str) -> str {
+    let stem: str = basename_no_ext(entry_path)
+    let app_dir: str = f"build/apps/{stem}"
+    let mkdir_rc: int64 = run_check(["mkdir", "-p", app_dir])
+    if mkdir_rc != 0 {
+        return ""
+    }
+    let exe_path: str = f"{app_dir}/{stem}"
+    let sh_kodc: str = "build/stage1/sh_kodc"
+
+    // 1. User modules: entry + transitive imports (skipping stage0).
+    let user_modules: [str] = collect_user_modules(entry_path)
+    let user_objs: [str] = []
+    for m in user_modules {
+        let obj: str = f"{app_dir}/_{basename_no_ext(m)}.o"
+        let rc: int64 = run_check([sh_kodc, "_compile", m, obj])
+        if rc != 0 {
+            return ""
+        }
+        user_objs += [obj]
+    }
+
+    // 2. Runtime main shim.
+    let main_s: str = f"{app_dir}/runtime_main.s"
+    let main_o: str = f"{app_dir}/runtime_main.o"
+    let rc_main: int64 = run_check([sh_kodc, "_emit-runtime-main", entry_path, main_s])
+    if rc_main != 0 {
+        return ""
+    }
+    let rc_as: int64 = run_check(["as", "-target", "arm64-apple-darwin", "-o", main_o, main_s])
+    if rc_as != 0 {
+        return ""
+    }
+
+    // 3. Stage0 set: one .o per eagerly-loaded stdlib module, plus
+    //    the two C runtime objects. `make stage0` is responsible for
+    //    keeping these fresh; we don't try to rebuild them here.
+    let stage0_objs: [str] = []
+    for s in stage0_module_paths() {
+        stage0_objs += [f"build/stage0/_{basename_no_ext(s)}.o"]
+    }
+    stage0_objs += ["build/stage0/arena.o"]
+    stage0_objs += ["build/stage0/runtime.o"]
+
+    // 4. Link.
+    let link_argv: [str] = ["ld", "-macos_version_min", macos_version(), "-lc", "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib", "-o", exe_path]
+    for o in stage0_objs {
+        link_argv += [o]
+    }
+    for o in user_objs {
+        link_argv += [o]
+    }
+    link_argv += [main_o]
+    let rc_ld: int64 = run_check(link_argv)
+    if rc_ld != 0 {
+        return ""
+    }
+    return exe_path
+}

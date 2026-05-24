@@ -78,9 +78,17 @@ LDFLAGS := -lc -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib
 MACOS_VERSION := $(shell sw_vers -productVersion)
 AS := as -target arm64-apple-darwin
 
-.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot test clean clean-apps clean-stage1
+.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test clean clean-apps clean-stage1
 
 all: stage1
+
+# Native `kod` driver — `kod build / run` orchestration written in kod
+# itself. Built into build/apps/kod/kod by the Python `kod build`
+# (which is the bootstrap path). Once present, users can prefer
+# `./build/apps/kod/kod build foo.kod` over `uv run kod build foo.kod`
+# to skip the Python startup tax.
+kod: stage1
+	$(KOD) build tools/kod.kod
 
 stage0: $(STAGE0_OBJS)
 
