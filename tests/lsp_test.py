@@ -746,3 +746,111 @@ def test_did_change_republishes_diagnostics(lsp_binary):
     assert len(diag_msgs) == 1
     diags = diag_msgs[0]["params"]["diagnostics"]
     assert any("oops" in d["message"] for d in diags)
+
+
+def _completion_labels(responses, response_id):
+    """Extract the list of completion labels from a completion response."""
+    resp = next(r for r in responses if r.get("id") == response_id)
+    assert resp["result"] is not None, f"expected a CompletionList, got null: {resp}"
+    return [item["label"] for item in resp["result"]["items"]]
+
+
+def test_completion_offers_globals_at_bare_identifier(lsp_binary):
+    # Cursor on the blank line inside main() — globals, imports, types
+    # should all be present in the offered completions.
+    source = (
+        'import "io"\n'
+        "func helper() -> int64 {\n"
+        "  return 0\n"
+        "}\n"
+        "type Widget = struct {\n"
+        "  size: int64\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  \n"
+        "  return 0\n"
+        "}\n"
+    )
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/comp.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/comp.kod"},
+                    # Line 7 is the blank line inside main(); col 2 is
+                    # after the 2-space indent.
+                    "position": {"line": 7, "character": 2},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    init = next(r for r in responses if r.get("id") == 1)
+    cap = init["result"]["capabilities"]
+    assert (
+        cap.get("completionProvider") is not None
+    ), "completionProvider not advertised"
+
+    labels = _completion_labels(responses, 2)
+    assert "helper" in labels  # free function
+    assert "io" in labels  # import alias
+    assert "Widget" in labels  # struct type name
+
+
+def test_completion_module_qualified_returns_imports_exports(lsp_binary):
+    # After `io.`, completions should be io's exported functions.
+    source = 'import "io"\n' "func main() -> int64 {\n" "  io.\n" "  return 0\n" "}\n"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/compdot.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/compdot.kod"},
+                    # Position immediately after the `.` on line 2.
+                    "position": {"line": 2, "character": 5},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    # io.kod exports these (externs are still functions from the
+    # caller's perspective).
+    assert "read_file" in labels
+    assert "write_file" in labels
+    # `helper` is a global free function — not exported by `io`.
+    assert "helper" not in labels

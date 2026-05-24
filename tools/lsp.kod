@@ -111,6 +111,8 @@ func main() -> int64 {
                     handle_definition(:id_val, params: json.get(req, key: "params"))
                 } else if method == "textDocument/hover" {
                     handle_hover(:id_val, params: json.get(req, key: "params"))
+                } else if method == "textDocument/completion" {
+                    handle_completion(:id_val, params: json.get(req, key: "params"))
                 } else if has_id {
                     // Request we don't implement — reply with MethodNotFound
                     // (the spec requires *some* response for every request).
@@ -510,6 +512,106 @@ func handle_hover(id_val: json.Value, params: json.Value) -> none {
     write_hover_response(:id_val, :signature)
 }
 
+// LSP `CompletionItemKind` values we use. The spec defines a larger
+// enum; we map to whatever best fits a given symbol. Numeric literals
+// in the items below correspond to:
+//   3  = Function
+//   9  = Module
+//   13 = Enum
+//   22 = Struct
+
+// Find the qualifier identifier before `.` at `offset`, if any. The
+// cursor may be in the middle of a partial identifier (e.g. `io.rea`)
+// — skip the word being typed, look for `.`, then walk back through
+// the qualifier's identifier characters. Returns "" when the cursor
+// isn't in a `qualifier.` position.
+func qualifier_before_dot(source: str, offset: int64) -> str {
+    let i: int64 = offset
+    for i > 0 and is_ident_char(source[i - 1]) {
+        i = i - 1
+    }
+    if i <= 0 {
+        return ""
+    }
+    if source[i - 1] != '.' {
+        return ""
+    }
+    let end: int64 = i - 1
+    let start: int64 = end
+    for start > 0 and is_ident_char(source[start - 1]) {
+        start = start - 1
+    }
+    if start == end {
+        return ""
+    }
+    return source[start:end]
+}
+
+func completion_item(label: str, kind: int64) -> json.Value {
+    let keys: [str] = ["label", "kind"]
+    let vals: [json.Value] = [json.Value.Str(value: label), json.Value.Number(value: kind)]
+    return json.Value.Object(:keys, values: vals)
+}
+
+func completion_list(items: [json.Value]) -> json.Value {
+    let keys: [str] = ["isIncomplete", "items"]
+    let vals: [json.Value] = [json.Value.Bool(value: false), json.Value.Array(items: items)]
+    return json.Value.Object(:keys, values: vals)
+}
+
+// `textDocument/completion`. Two modes:
+//   - Qualified: cursor sits at `mod.[partial]` — return that
+//     import's exported functions (its `import_fns` entries).
+//   - Bare: anywhere else — return globals (free functions),
+//     import aliases, and user-defined struct / enum names.
+// No filtering by prefix here; LSP clients filter by `label` on the
+// way to the popup, so the server can ship a static "everything in
+// scope" list and let the client narrow.
+func handle_completion(id_val: json.Value, params: json.Value) -> none {
+    let td: json.Value = json.get(params, key: "textDocument")
+    let uri: str = str_or_empty(json.get(td, key: "uri"))
+    let pos: json.Value = json.get(params, key: "position")
+    let line: int64 = number_or_zero(json.get(pos, key: "line"))
+    let character: int64 = number_or_zero(json.get(pos, key: "character"))
+    let text: str = lsp_docs_get(uri)
+    if len(text) == 0 {
+        let empty: [json.Value] = []
+        write_response(:id_val, result: completion_list(items: empty))
+        return none
+    }
+    let offset: int64 = position_to_offset(source: text, :line, :character)
+    let qualifier: str = qualifier_before_dot(source: text, :offset)
+    let cg: codegen.Codegen = compile_or_cached(:uri)
+    let items: [json.Value] = []
+    if len(qualifier) > 0 {
+        for f in cg.import_fns {
+            if f.module == qualifier {
+                items += [completion_item(label: f.name, kind: 3)]
+            }
+        }
+    } else {
+        for n in cg.func_names {
+            items += [completion_item(label: n, kind: 3)]
+        }
+        for alias in cg.import_local {
+            items += [completion_item(label: alias, kind: 9)]
+        }
+        // Skip monomorphised struct entries — their canonical names
+        // contain `$`-separated type args and aren't user-typeable.
+        for s in cg.structs {
+            if len(s.def_path) > 0 {
+                items += [completion_item(label: s.name, kind: 22)]
+            }
+        }
+        for e in cg.enums {
+            if len(e.def_path) > 0 {
+                items += [completion_item(label: e.name, kind: 13)]
+            }
+        }
+    }
+    write_response(:id_val, result: completion_list(:items))
+}
+
 // Hover response shape:
 //   { contents: { kind: "markdown", value: "```kod\n...\n```" } }
 // The Kod-fenced code block gives editors a chance to syntax-highlight
@@ -604,8 +706,15 @@ func write_initialize_response(id_val: json.Value) -> none {
     // definitionProvider + hoverProvider: free-function targets (same-
     // module + `mod.fn` import calls) are supported today; method /
     // type / field / variable targets fall through to null.
-    let sync_keys: [str] = ["textDocumentSync", "definitionProvider", "hoverProvider"]
-    let sync_vals: [json.Value] = [json.Value.Number(value: 1), json.Value.Bool(value: true), json.Value.Bool(value: true)]
+    // completionProvider with `.` as a trigger character: covers bare
+    // identifier completion (globals, import aliases, type names) and
+    // `mod.` qualified completion (the import's exports).
+    let trigger_chars: [json.Value] = [json.Value.Str(value: ".")]
+    let comp_keys: [str] = ["triggerCharacters"]
+    let comp_vals: [json.Value] = [json.Value.Array(items: trigger_chars)]
+    let comp_provider: json.Value = json.Value.Object(keys: comp_keys, values: comp_vals)
+    let sync_keys: [str] = ["textDocumentSync", "definitionProvider", "hoverProvider", "completionProvider"]
+    let sync_vals: [json.Value] = [json.Value.Number(value: 1), json.Value.Bool(value: true), json.Value.Bool(value: true), comp_provider]
     let caps: json.Value = json.Value.Object(keys: sync_keys, values: sync_vals)
     let info_keys: [str] = ["name", "version"]
     let info_vals: [json.Value] = [json.Value.Str(value: "kod-lsp"), json.Value.Str(value: "0.1")]
