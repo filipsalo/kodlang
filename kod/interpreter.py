@@ -85,6 +85,17 @@ class Interpreter:
                 return
         raise ValueError(f"Unknown name {name!r}")
 
+    def _resolve_import(self, module, imp):
+        """Memoise the resolved module on the Import node so subsequent
+        references skip the Path construction + dict-hash pathlib walk.
+        Stage1 codegen.kod otherwise resolves ~900k imports."""
+        cached = getattr(imp, "_resolved_module", None)
+        if cached is None:
+            path = module.resolve_import(imp.module_name)
+            cached = self.program.get_module(path)
+            imp._resolved_module = cached
+        return cached
+
     def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
         match name:
@@ -96,8 +107,7 @@ class Interpreter:
                 if isinstance(value, ast.StringLiteral):
                     value = value.value
                 elif isinstance(value, ast.Import):
-                    path = module.resolve_import(value.module_name)
-                    return self.program.get_module(path)
+                    return self._resolve_import(module, value)
                 return value
         raise ValueError(f"Unknown name {name!r}")
 
@@ -252,9 +262,9 @@ class Interpreter:
                     for val in module.names.values():
                         if isinstance(val, ast.Import):
                             try:
-                                path = module.resolve_import(val.module_name)
-                                imported = self.program.get_module(path)
-                                search_scopes.append(imported.names)
+                                search_scopes.append(
+                                    self._resolve_import(module, val).names
+                                )
                             except Exception:
                                 pass
                     for scope in search_scopes:
@@ -282,9 +292,9 @@ class Interpreter:
                 for val in module.names.values():
                     if isinstance(val, ast.Import):
                         try:
-                            path = module.resolve_import(val.module_name)
-                            imported = self.program.get_module(path)
-                            search_scopes.append(imported.names)
+                            search_scopes.append(
+                                self._resolve_import(module, val).names
+                            )
                         except Exception:
                             pass
                 for scope in search_scopes:
