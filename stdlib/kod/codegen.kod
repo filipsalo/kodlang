@@ -371,20 +371,6 @@ type Codegen = struct {
             }
             li = li + 1
         }
-        // Pre-caret indent mirrors the tab expansion: any tab among the
-        // bytes before the column counts as four spaces; everything else
-        // counts as one.
-        let caret: str = ""
-        let s: int64 = 0
-        for s < col - 1 {
-            if line_start + s < len(source) and source[line_start + s] == '\t' {
-                caret = caret + "    "
-            } else {
-                caret = caret + " "
-            }
-            s = s + 1
-        }
-        caret = caret + "^"
         // Widen the squiggly: if the start offset lands on an identifier
         // char (letter / digit / underscore), scan forward through more
         // identifier chars to get the token's end. Otherwise fall back
@@ -398,6 +384,30 @@ type Codegen = struct {
                 scan = scan + 1
             }
             end_col = col + (scan - offset)
+        }
+        // Pre-caret indent mirrors the tab expansion: any tab among the
+        // bytes before the column counts as four spaces; everything else
+        // counts as one. Then `^^^…^` spans the full token width so the
+        // squiggly visually covers the offending range rather than
+        // pointing at a single column.
+        let caret: str = ""
+        let s: int64 = 0
+        for s < col - 1 {
+            if line_start + s < len(source) and source[line_start + s] == '\t' {
+                caret = caret + "    "
+            } else {
+                caret = caret + " "
+            }
+            s = s + 1
+        }
+        let span_width: int64 = end_col - col
+        if span_width < 1 {
+            span_width = 1
+        }
+        let k: int64 = 0
+        for k < span_width {
+            caret = caret + "^"
+            k = k + 1
         }
         self.errors += [Error(path: self.p.path, :line, :col, :end_col, message: msg, source_line: line_text, :caret)]
     }
@@ -891,6 +901,39 @@ type Codegen = struct {
     // Find the cached signature for a function by name. Returns an empty
     // SigInfo (no params, void return) if the name isn't registered or
     // wasn't resolved with full signature info.
+    // Return the closest name in `candidates` to `typo` within
+    // `max_distance` Levenshtein edits, or "" if none qualifies.
+    // Used to attach "did you mean X?" hints to unknown-identifier
+    // diagnostics — small candidate lists (a few hundred entries at
+    // most), tiny inputs (identifier-length), so the O(n*m) DP cost
+    // is irrelevant for the handful of errors a single compile reports.
+    func find_closest(self, anon typo: str, candidates: [str], max_distance: int64) -> str {
+        let best: str = ""
+        let best_dist: int64 = max_distance + 1
+        let i: int64 = 0
+        for i < len(candidates) {
+            let d: int64 = typo.distance(candidates[i])
+            if d < best_dist {
+                best_dist = d
+                best = candidates[i]
+            }
+            i = i + 1
+        }
+        return best
+    }
+
+    // Build an `error: <msg>. did you mean `<X>`?` message when a
+    // near-match exists in `candidates`, or just `error: <msg>` when
+    // it doesn't. Centralises the suggestion-or-not branch so each
+    // call site stays a one-liner.
+    func with_suggestion(self, anon msg: str, typo: str, candidates: [str]) -> str {
+        let s: str = self.find_closest(typo, :candidates, max_distance: 2)
+        if len(s) > 0 {
+            return f"{msg}. did you mean `{s}`?"
+        }
+        return msg
+    }
+
     func find_func_sig(self, anon name: str) -> SigInfo {
         let m = self.func_idx
         if m.get(name) is Some(idx) {
@@ -1913,7 +1956,20 @@ type Codegen = struct {
             }
             .Ident(name) -> {
                 if self.var_declared(name) == false {
-                    self.report_error(f"error: unknown name `{name}`", span: self.p.expr_spans[expr_id])
+                    // Candidates for the typo hint: in-scope variables
+                    // plus visible function names. Type and import
+                    // names also live in the global namespace but
+                    // can't appear in a value position, so leaving
+                    // them out keeps the suggestions relevant.
+                    let cands: [str] = []
+                    for v in self.vars {
+                        cands += [v.name]
+                    }
+                    for n in self.func_names {
+                        cands += [n]
+                    }
+                    let msg: str = self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands)
+                    self.report_error(msg, span: self.p.expr_spans[expr_id])
                     return .VImm(value: 0)
                 }
                 let off = self.find_var_offset(name)
@@ -2564,7 +2620,8 @@ type Codegen = struct {
                     self.emit(f"bl {self.func_labels[idx]}")
                     return .VReg(name: "x0")
                 }
-                self.report_error(f"error: unknown function `{name}`", span: self.p.expr_spans[callee_id])
+                let msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.func_names)
+                self.report_error(msg, span: self.p.expr_spans[callee_id])
                 return .VImm(value: 0)
             }
             .Binary(lhs, op, rhs) -> {
@@ -2784,7 +2841,34 @@ type Codegen = struct {
             if self.p.exprs[receiver_id] is .Ident(recv_name) {
                 recv_desc = recv_name
             }
-            self.report_error(f"error: unknown method `{method_name}` on `{recv_desc}`", :span)
+            // Collect candidate method names for the typo hint: the
+            // receiver's struct methods (if any) plus the primitive
+            // methods registered for its kind.
+            let cands: [str] = []
+            match recv_kind {
+                .KStruct(idx, _ta) -> {
+                    for m in self.structs[idx].methods {
+                        cands += [m.name]
+                    }
+                }
+                else none
+            }
+            // Inline the (kind, kind) match — TypeKind is an enum and
+            // pairwise comparison needs a destructure of both sides.
+            for pm in self.prim_methods {
+                let same: bool = false
+                match recv_kind {
+                    .KInt64 -> if pm.kind is .KInt64 { same = true }
+                    .KStr -> if pm.kind is .KStr { same = true }
+                    .KBool -> if pm.kind is .KBool { same = true }
+                    else none
+                }
+                if same {
+                    cands += [pm.name]
+                }
+            }
+            let msg: str = self.with_suggestion(f"error: unknown method `{method_name}` on `{recv_desc}`", typo: method_name, candidates: cands)
+            self.report_error(msg, :span)
             return .VImm(value: 0)
         }
         self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method_name, call_span: span)
