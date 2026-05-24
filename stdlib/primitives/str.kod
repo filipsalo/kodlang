@@ -1,5 +1,29 @@
 // Methods on the str primitive type. The compiler dispatches
 // `s.to_str()`, `s.hash()` etc. for str receivers to these functions.
+//
+// ── Encoding contract ──────────────────────────────────────────────
+// A `str` is a sequence of bytes (UTF-8 by convention, but the runtime
+// imposes no validation). The "raw" operations work in bytes:
+//
+//   - `len(s)`     → byte count
+//   - `s[i]`       → the byte at offset i (an int64 in 0..255)
+//   - `s[a:b]`     → byte-range slice
+//   - `s == s'`    → bytewise compare
+//
+// The Unicode-aware operations work in code points and assume the
+// bytes are valid UTF-8. They use a permissive decoder: any invalid
+// byte sequence falls back to "emit the byte as a code point in
+// 0..255 and advance by one." That means concatenating two valid
+// UTF-8 strings is still well-defined, garbage stays garbage, and
+// no operation ever panics on a malformed input.
+//
+//   - `s.code_points()`  → [int64] of decoded code points
+//   - `s.char_count()`   → number of code points
+//
+// Long-term direction: `str` becomes Unicode-shaped (indexing and
+// length speak code points by default, byte access moves to a
+// separate type). The byte ops stay the source of truth until then;
+// new code that handles user text should prefer `code_points`.
 
 func to_str(self: str) -> str {
 	return self
@@ -16,6 +40,111 @@ func hash(self: str) -> int64 {
 		i = i + 1
 	}
 	return h
+}
+
+// Decode `self` as UTF-8 and return the sequence of code points.
+//
+// Encoding sketch (`b1` is the start byte; continuation bytes are
+// `10xxxxxx` = decimal 128..192):
+//
+//     0xxxxxxx                     → 1 byte,  code points 0..127
+//     110xxxxx 10xxxxxx            → 2 bytes, 128..2047
+//     1110xxxx 10xxxxxx 10xxxxxx   → 3 bytes, 2048..65535
+//     11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+//                                  → 4 bytes, 65536..1114111
+//
+// Invalid sequences (a start byte whose continuation bytes are
+// missing or malformed, a bare continuation byte, etc.) fall back
+// to "emit `b1` as a code point and advance one byte" — the decoder
+// never panics, and round-tripping non-UTF-8 bytes through
+// `code_points` ↔ a UTF-8 encoder would round-trip the bytes too.
+func code_points(self: str) -> [int64] {
+    let result: [int64] = []
+    let n: int64 = len(self)
+    let i: int64 = 0
+    for i < n {
+        let b: int64 = self[i]
+        let cp: int64 = b
+        let width: int64 = 1
+        if b >= 192 and b < 224 {
+            // 2-byte start. Need one continuation byte.
+            if i + 1 < n {
+                let b2: int64 = self[i + 1]
+                if b2 >= 128 and b2 < 192 {
+                    cp = (b - 192) * 64 + (b2 - 128)
+                    width = 2
+                }
+            }
+        } else if b >= 224 and b < 240 {
+            // 3-byte start. Need two continuation bytes.
+            if i + 2 < n {
+                let b2: int64 = self[i + 1]
+                let b3: int64 = self[i + 2]
+                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
+                    cp = (b - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+                    width = 3
+                }
+            }
+        } else if b >= 240 and b < 248 {
+            // 4-byte start. Need three continuation bytes.
+            if i + 3 < n {
+                let b2: int64 = self[i + 1]
+                let b3: int64 = self[i + 2]
+                let b4: int64 = self[i + 3]
+                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
+                    cp = (b - 240) * 262144 + (b2 - 128) * 4096 + (b3 - 128) * 64 + (b4 - 128)
+                    width = 4
+                }
+            }
+        }
+        // Any other case (b < 128, bare continuation byte, missing
+        // tail) falls through with the default cp = b, width = 1.
+        result += [cp]
+        i = i + width
+    }
+    return result
+}
+
+// Count UTF-8 code points without materialising the array. Same
+// classification rules as `code_points`; only the byte width of
+// each encoding is needed here, so the value-decoding arithmetic
+// is skipped.
+func char_count(self: str) -> int64 {
+    let n: int64 = len(self)
+    let i: int64 = 0
+    let count: int64 = 0
+    for i < n {
+        let b: int64 = self[i]
+        let width: int64 = 1
+        if b >= 192 and b < 224 {
+            if i + 1 < n {
+                let b2: int64 = self[i + 1]
+                if b2 >= 128 and b2 < 192 {
+                    width = 2
+                }
+            }
+        } else if b >= 224 and b < 240 {
+            if i + 2 < n {
+                let b2: int64 = self[i + 1]
+                let b3: int64 = self[i + 2]
+                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 {
+                    width = 3
+                }
+            }
+        } else if b >= 240 and b < 248 {
+            if i + 3 < n {
+                let b2: int64 = self[i + 1]
+                let b3: int64 = self[i + 2]
+                let b4: int64 = self[i + 3]
+                if b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192 and b4 >= 128 and b4 < 192 {
+                    width = 4
+                }
+            }
+        }
+        count = count + 1
+        i = i + width
+    }
+    return count
 }
 
 // True if `needle` appears anywhere in `self`. Empty needle is always
