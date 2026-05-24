@@ -991,3 +991,89 @@ def test_completion_receiver_through_function_param(lsp_binary):
     labels = _completion_labels(responses, 2)
     assert "to_str" in labels
     assert "char_at" in labels
+
+
+def test_completion_hides_underscore_methods_by_default(lsp_binary):
+    # After `s.`, internal helpers (names starting with `_`) should
+    # NOT appear in the offered completions.
+    source = 'func main() -> int64 {\n  let s: str = "hi"\n  s.\n  return 0\n}\n'
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/hideund.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/hideund.kod"},
+                    "position": {"line": 2, "character": 4},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    # Public methods still present
+    assert "to_str" in labels
+    assert "char_at" in labels
+    # Internal helpers omitted
+    assert "_utf8_width_at" not in labels
+    assert "_utf8_value_at" not in labels
+
+
+def test_completion_shows_underscore_methods_when_partial_starts_with_underscore(
+    lsp_binary,
+):
+    # If the user has typed `s._`, they are explicitly looking at
+    # internal names — show them.
+    source = 'func main() -> int64 {\n  let s: str = "hi"\n  s._\n  return 0\n}\n'
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///tmp/showund.kod",
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": "file:///tmp/showund.kod"},
+                    # Position right after `s._`
+                    "position": {"line": 2, "character": 5},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    # Public methods still appear too (the client filters)
+    assert "to_str" in labels
+    # Internal helpers now visible
+    assert "_utf8_width_at" in labels
+    assert "_utf8_value_at" in labels
