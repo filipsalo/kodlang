@@ -132,8 +132,34 @@ def _open_program(file: str):
     return bob, program, entry_module
 
 
+_NATIVE_DELEGATED = {"build", "run", "test", "check"}
+
+
+def _maybe_delegate_to_native() -> int | None:
+    """If `build/apps/kod/kod` exists and the user is invoking one of
+    the subcommands the native binary implements, exec it directly with
+    the same argv. The native path is ~5× faster on cold builds — most
+    of the Python `kod` startup is import+import-cache overhead the
+    native binary doesn't pay. The Python path stays valid as the
+    fallback when the native binary is missing (fresh clone before
+    `make kod`) or when the user has explicitly asked for a Python-only
+    subcommand (anything not in `_NATIVE_DELEGATED`)."""
+    if len(sys.argv) < 2 or sys.argv[1] not in _NATIVE_DELEGATED:
+        return None
+    native = Path.cwd() / "build" / "apps" / "kod" / "kod"
+    if not native.exists():
+        return None
+    import os
+
+    os.execv(str(native), [str(native), *sys.argv[1:]])
+
+
 def main():
     """Main entry point."""
+    rc = _maybe_delegate_to_native()
+    if rc is not None:
+        return rc
+
     args = _make_parser().parse_args()
 
     # Commands that bypass the usual parse-program flow.
