@@ -81,3 +81,101 @@ func compile_source(anon src: str) -> process.ProcessResult {
     io.write_file(scratch, src)
     return process.run(["build/stage1/sh_kodc", scratch])
 }
+
+// Stage0 stdlib modules whose .o lives at build/stage0/_<basename>.o.
+// Must stay in sync with the same list in tools/kod.kod and the
+// Makefile's STAGE0_OBJS. Kod doesn't support module-level lets, so
+// this is a nullary function returning the list each call.
+func _stage0_module_paths() -> [str] {
+    return ["stdlib/builtins.kod", "stdlib/primitives/int64.kod", "stdlib/primitives/str.kod", "stdlib/primitives/bool.kod", "stdlib/io.kod", "stdlib/process.kod", "stdlib/time.kod"]
+}
+
+// Strip directory + `.kod` suffix from a path: "tests/foo.kod" → "foo".
+// Used to derive the .o name and the build/apps/<stem>/ directory.
+func _basename_no_ext(anon path: str) -> str {
+    let last_slash: int64 = -1
+    let i: int64 = 0
+    for i < len(path) {
+        if path[i] == '/' {
+            last_slash = i
+        }
+        i = i + 1
+    }
+    let after: int64 = last_slash + 1
+    let end: int64 = len(path)
+    if end - after >= 4 and path[end-4:end] == ".kod" {
+        end = end - 4
+    }
+    return path[after:end]
+}
+
+func _macos_version() -> str {
+    let r: process.ProcessResult = process.run(["sw_vers", "-productVersion"])
+    let v: str = r.stdout
+    let n: int64 = len(v)
+    if n > 0 and v[n-1] == '\n' {
+        v = v[0:n-1]
+    }
+    return v
+}
+
+// Full compile + link + run pipeline, kod-side. Writes `src` to a
+// scratch file, drives sh_kodc + `as` + `ld` with the same stage0
+// .o set tools/kod.kod uses, runs the result, returns the captured
+// ProcessResult. Mirrors tools/kod.kod's `build_executable` —
+// duplicated rather than shared so test_support stays a single
+// self-contained module that any *_test.kod can import without
+// pulling tools/kod.kod into the test program.
+//
+// Returns the build's ProcessResult on a build/link failure (status
+// non-zero, stderr carries the compiler's diagnostic); otherwise the
+// child program's ProcessResult.
+//
+// Best-effort cleanup: scratch files removed at the end even when
+// the build or the run failed.
+func build_and_run(anon src: str) -> process.ProcessResult {
+    let stem: str = ".kod_test_build"
+    let scratch: str = f"{stem}.kod"
+    if io.write_file(scratch, src) != 0 {
+        return process.ProcessResult(status: 1, stdout: "", stderr: f"build_and_run: failed to write {scratch}\n")
+    }
+    let app_dir: str = f"build/apps/{stem}"
+    process.run(["mkdir", "-p", app_dir])
+    let sh_kodc: str = "build/stage1/sh_kodc"
+
+    let scratch_o: str = f"{app_dir}/_{stem}.o"
+    let compile_r: process.ProcessResult = process.run([sh_kodc, "_compile", scratch, scratch_o])
+    if compile_r.status != 0 {
+        process.run(["rm", "-f", scratch])
+        return compile_r
+    }
+    let main_s: str = f"{app_dir}/runtime_main.s"
+    let main_o: str = f"{app_dir}/runtime_main.o"
+    let main_r: process.ProcessResult = process.run([sh_kodc, "_emit-runtime-main", scratch, main_s])
+    if main_r.status != 0 {
+        process.run(["rm", "-f", scratch])
+        return main_r
+    }
+    let as_r: process.ProcessResult = process.run(["as", "-target", "arm64-apple-darwin", "-o", main_o, main_s])
+    if as_r.status != 0 {
+        process.run(["rm", "-f", scratch])
+        return as_r
+    }
+    let exe: str = f"{app_dir}/{stem}"
+    let link_argv: [str] = ["ld", "-macos_version_min", _macos_version(), "-lc", "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib", "-o", exe]
+    for s in _stage0_module_paths() {
+        link_argv += [f"build/stage0/_{_basename_no_ext(s)}.o"]
+    }
+    link_argv += ["build/stage0/arena.o"]
+    link_argv += ["build/stage0/runtime.o"]
+    link_argv += [scratch_o]
+    link_argv += [main_o]
+    let link_r: process.ProcessResult = process.run(link_argv)
+    if link_r.status != 0 {
+        process.run(["rm", "-f", scratch])
+        return link_r
+    }
+    let run_r: process.ProcessResult = process.run([exe])
+    process.run(["rm", "-f", scratch])
+    return run_r
+}
