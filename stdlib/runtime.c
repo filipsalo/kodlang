@@ -428,3 +428,152 @@ KodStr *read_stdin_exact(int64_t n) {
     }
     return s;
 }
+
+/* ── LSP state surviving arena_reset ──────────────────────────────────
+ *
+ * The LSP recompiles between debounced didChange bursts and would
+ * otherwise leak the previous compile's tokens / AST / codegen state
+ * into the arena forever — every edit adds tens of MB. To keep memory
+ * bounded the LSP calls `arena_reset` before each compile, but its
+ * own per-document state (open document texts, the active URI, the
+ * cached compile pointer) lives here in C-owned memory so it survives
+ * the reset. Getters copy bytes back into a fresh arena KodStr.
+ */
+
+typedef struct LspDoc {
+    char *uri;
+    int64_t uri_len;
+    char *text;
+    int64_t text_len;
+    struct LspDoc *next;
+} LspDoc;
+
+static LspDoc *g_lsp_docs = NULL;
+static char *g_lsp_active_uri = NULL;
+static int64_t g_lsp_active_uri_len = 0;
+static int g_lsp_publish_pending = 0;
+/* Cached compile result. The pointer lives in the arena, so we null
+ * it out at the start of `arena_reset` — anything that wants it must
+ * grab it before triggering a reset. */
+static void *g_lsp_cached_cg = NULL;
+static char *g_lsp_cached_uri = NULL;
+static int64_t g_lsp_cached_uri_len = 0;
+static char *g_lsp_cached_text = NULL;
+static int64_t g_lsp_cached_text_len = 0;
+
+static int lsp_bytes_eq(const char *a, int64_t alen, const char *b, int64_t blen) {
+    if (alen != blen) return 0;
+    return memcmp(a, b, (size_t)alen) == 0;
+}
+
+static LspDoc *lsp_docs_find(KodStr *uri) {
+    for (LspDoc *d = g_lsp_docs; d; d = d->next) {
+        if (lsp_bytes_eq(d->uri, d->uri_len, uri->buf, uri->len)) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+void lsp_docs_set(KodStr *uri, KodStr *text) {
+    LspDoc *d = lsp_docs_find(uri);
+    if (d) {
+        free(d->text);
+        d->text = (char *)malloc((size_t)text->len);
+        if (text->len > 0) memcpy(d->text, text->buf, (size_t)text->len);
+        d->text_len = text->len;
+        return;
+    }
+    d = (LspDoc *)malloc(sizeof(LspDoc));
+    d->uri = (char *)malloc((size_t)uri->len);
+    if (uri->len > 0) memcpy(d->uri, uri->buf, (size_t)uri->len);
+    d->uri_len = uri->len;
+    d->text = (char *)malloc((size_t)text->len);
+    if (text->len > 0) memcpy(d->text, text->buf, (size_t)text->len);
+    d->text_len = text->len;
+    d->next = g_lsp_docs;
+    g_lsp_docs = d;
+}
+
+/* Returns the empty string if the URI isn't tracked. Caller can't
+ * distinguish "no entry" from "empty document"; for the LSP that's
+ * fine because a closed doc is treated the same as never-opened. */
+KodStr *lsp_docs_get(KodStr *uri) {
+    LspDoc *d = lsp_docs_find(uri);
+    if (!d) return kod_empty_str();
+    KodStr *s = kod_str_alloc(d->text_len);
+    if (d->text_len > 0) memcpy(s->buf, d->text, (size_t)d->text_len);
+    return s;
+}
+
+void lsp_docs_remove(KodStr *uri) {
+    LspDoc **slot = &g_lsp_docs;
+    while (*slot) {
+        if (lsp_bytes_eq((*slot)->uri, (*slot)->uri_len, uri->buf, uri->len)) {
+            LspDoc *dead = *slot;
+            *slot = dead->next;
+            free(dead->uri);
+            free(dead->text);
+            free(dead);
+            return;
+        }
+        slot = &(*slot)->next;
+    }
+}
+
+void lsp_set_active_uri(KodStr *uri) {
+    free(g_lsp_active_uri);
+    g_lsp_active_uri = (char *)malloc((size_t)uri->len);
+    if (uri->len > 0) memcpy(g_lsp_active_uri, uri->buf, (size_t)uri->len);
+    g_lsp_active_uri_len = uri->len;
+}
+
+KodStr *lsp_get_active_uri(void) {
+    KodStr *s = kod_str_alloc(g_lsp_active_uri_len);
+    if (g_lsp_active_uri_len > 0) {
+        memcpy(s->buf, g_lsp_active_uri, (size_t)g_lsp_active_uri_len);
+    }
+    return s;
+}
+
+int64_t lsp_get_publish_pending(void) { return g_lsp_publish_pending; }
+void lsp_set_publish_pending(int64_t v) { g_lsp_publish_pending = v ? 1 : 0; }
+
+/* Cache lookup, two-step. `lsp_cache_lookup` returns 1 when (uri, text)
+ * match the last successful compile *and* the cached cg pointer is
+ * still valid (no `arena_reset` since); `lsp_cache_get_cg` then returns
+ * the cg. The split keeps the Kod-side simple — calling a Codegen
+ * field through an extern that might return null is awkward, so the
+ * caller is expected to check `lsp_cache_lookup` first.
+ *
+ * The cg pointer is into the arena, so it's only valid until the
+ * next `arena_reset` — which nulls it via `lsp_cache_invalidate`. */
+int64_t lsp_cache_lookup(KodStr *uri, KodStr *text) {
+    if (!g_lsp_cached_cg) return 0;
+    if (!lsp_bytes_eq(g_lsp_cached_uri, g_lsp_cached_uri_len, uri->buf, uri->len)) return 0;
+    if (!lsp_bytes_eq(g_lsp_cached_text, g_lsp_cached_text_len, text->buf, text->len)) return 0;
+    return 1;
+}
+
+void *lsp_cache_get_cg(void) {
+    return g_lsp_cached_cg;
+}
+
+void lsp_cache_store(KodStr *uri, KodStr *text, void *cg) {
+    free(g_lsp_cached_uri);
+    g_lsp_cached_uri = (char *)malloc((size_t)uri->len);
+    if (uri->len > 0) memcpy(g_lsp_cached_uri, uri->buf, (size_t)uri->len);
+    g_lsp_cached_uri_len = uri->len;
+    free(g_lsp_cached_text);
+    g_lsp_cached_text = (char *)malloc((size_t)text->len);
+    if (text->len > 0) memcpy(g_lsp_cached_text, text->buf, (size_t)text->len);
+    g_lsp_cached_text_len = text->len;
+    g_lsp_cached_cg = cg;
+}
+
+/* Called by the LSP just before `arena_reset` to clear the dangling
+ * arena pointer in the cache. The uri/text byte buffers are malloc'd
+ * and stay valid — only the cg pointer is invalidated. */
+void lsp_cache_invalidate(void) {
+    g_lsp_cached_cg = NULL;
+}

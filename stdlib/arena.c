@@ -32,3 +32,18 @@ void *arena_alloc(int64_t size) {
     current_block->current += size;
     return ptr;
 }
+
+/* Free every block. Caller is responsible for ensuring no live Kod-side
+ * pointers reference arena-allocated data — anything previously returned
+ * by `arena_alloc` is dangling once this returns. Used by the LSP to
+ * recover the parse-tree / codegen memory of the previous compile
+ * before starting a new one. */
+void arena_reset(void) {
+    Block *b = current_block;
+    while (b) {
+        Block *next = b->next;
+        free(b);
+        b = next;
+    }
+    current_block = NULL;
+}

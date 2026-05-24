@@ -19,46 +19,46 @@ import "kod/ast"
 import "kod/codegen"
 import "kod/build"
 
-// Per-document content keyed by URI. LSP guarantees `didOpen` arrives
-// before any `didChange` / `didClose` so we can treat unknown URIs as a
-// hard error rather than tracking it; for now we just no-op.
-type DocStore = Map[str, str]
-
-// Holds the most recent compile so hover / definition requests don't
-// have to re-parse the whole stdlib + import graph on every keystroke.
-// `uri` and `text` are checked against the incoming request: a request
-// for the same (uri, text) reuses `cg`, otherwise we recompile and
-// overwrite. Only one cached buffer at a time — fine for the typical
-// "active editor" pattern.
+// LSP-state externs in stdlib/runtime.c. The LSP holds documents and a
+// compile cache here (in C-owned malloc'd memory) so they survive an
+// `arena_reset` — the parse trees / codegen state we drop between
+// recompiles otherwise leak gigabytes after a long editing session.
 //
-// `publish_pending` is set by didOpen / didChange to defer the
-// (expensive) compile-and-publish-diagnostics step. The main loop
-// fires it once stdin has been idle long enough to coalesce a typing
-// burst; a hover / definition request firing in the meantime also
-// flushes it as a side effect of compiling.
-type CompileCache = struct {
-    uri: str
-    text: str
-    cg: codegen.Codegen?
-    publish_pending: bool
-}
+// `arena_reset` frees every arena block; `lsp_cache_invalidate` must
+// be called immediately before to null the dangling cached `cg`
+// pointer. Doc texts / active URI / publish-pending flag live in C
+// memory and are unaffected by either call.
+extern func arena_reset() -> none
+extern func lsp_cache_invalidate() -> none
+extern func lsp_docs_set(anon uri: str, anon text: str) -> none
+extern func lsp_docs_get(anon uri: str) -> str
+extern func lsp_docs_remove(anon uri: str) -> none
+extern func lsp_set_active_uri(anon uri: str) -> none
+extern func lsp_get_active_uri() -> str
+extern func lsp_get_publish_pending() -> bool
+extern func lsp_set_publish_pending(anon v: bool) -> none
+extern func lsp_cache_lookup(anon uri: str, anon text: str) -> bool
+extern func lsp_cache_get_cg() -> codegen.Codegen
+extern func lsp_cache_store(anon uri: str, anon text: str, anon cg: codegen.Codegen) -> none
 
 func main() -> int64 {
-    let docs: DocStore = DocStore(keys: [], values: [], indices: [])
-    let cache: CompileCache = CompileCache(uri: "", text: "", cg: none, publish_pending: false)
     let shutdown_received: bool = false
     // Debounce window: typing bursts inside this idle gap coalesce
     // into a single compile. 250 ms matches the rhythm of fast typing
     // without making the gap noticeable when the user actually pauses.
     let debounce_ms: int64 = 250
     for true {
-        if cache.publish_pending {
+        if lsp_get_publish_pending() {
             if io.stdin_data_ready(debounce_ms) == 0 {
-                let pending_text: str = cache.text
-                let pending_uri: str = cache.uri
-                let cg: codegen.Codegen = compile_or_cached(:cache, uri: pending_uri, text: pending_text)
-                publish_from_cg(uri: pending_uri, :cg)
-                cache.publish_pending = false
+                let pending_uri: str = lsp_get_active_uri()
+                if len(pending_uri) > 0 and len(lsp_docs_get(pending_uri)) > 0 {
+                    // compile_or_cached flushes the pending publish
+                    // itself once it has a cg in hand, then clears the
+                    // flag. The empty-doc branch still clears it.
+                    let cg: codegen.Codegen = compile_or_cached(uri: pending_uri)
+                } else {
+                    lsp_set_publish_pending(false)
+                }
             }
         }
         match jsonrpc.read_message() {
@@ -84,9 +84,15 @@ func main() -> int64 {
                 } else if method == "shutdown" {
                     // Force-flush any deferred publish so the client's
                     // final view matches the latest edit before we go
-                    // unresponsive.
-                    if cache.publish_pending {
-                        let cg: codegen.Codegen = compile_or_cached(:cache, uri: cache.uri, text: cache.text)
+                    // unresponsive. compile_or_cached flushes on its
+                    // own once it has a cg.
+                    if lsp_get_publish_pending() {
+                        let pending_uri: str = lsp_get_active_uri()
+                        if len(pending_uri) > 0 and len(lsp_docs_get(pending_uri)) > 0 {
+                            let cg: codegen.Codegen = compile_or_cached(uri: pending_uri)
+                        } else {
+                            lsp_set_publish_pending(false)
+                        }
                     }
                     shutdown_received = true
                     write_shutdown_response(:id_val)
@@ -96,15 +102,15 @@ func main() -> int64 {
                     }
                     return 1
                 } else if method == "textDocument/didOpen" {
-                    handle_did_open(:docs, :cache, params: json.get(req, key: "params"))
+                    handle_did_open(params: json.get(req, key: "params"))
                 } else if method == "textDocument/didChange" {
-                    handle_did_change(:docs, :cache, params: json.get(req, key: "params"))
+                    handle_did_change(params: json.get(req, key: "params"))
                 } else if method == "textDocument/didClose" {
-                    handle_did_close(:docs, :cache, params: json.get(req, key: "params"))
+                    handle_did_close(params: json.get(req, key: "params"))
                 } else if method == "textDocument/definition" {
-                    handle_definition(:id_val, :docs, :cache, params: json.get(req, key: "params"))
+                    handle_definition(:id_val, params: json.get(req, key: "params"))
                 } else if method == "textDocument/hover" {
-                    handle_hover(:id_val, :docs, :cache, params: json.get(req, key: "params"))
+                    handle_hover(:id_val, params: json.get(req, key: "params"))
                 } else if has_id {
                     // Request we don't implement — reply with MethodNotFound
                     // (the spec requires *some* response for every request).
@@ -118,18 +124,28 @@ func main() -> int64 {
     return 0
 }
 
-func handle_did_open(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
+// The three document-lifecycle handlers all end with `lsp_cache_invalidate`
+// + `arena_reset`: at this point everything the user cares about (doc
+// text, active URI, publish-pending flag) lives in C-owned memory, and
+// the cached cg is being thrown out anyway (didOpen/didChange replace
+// the buffer; didClose drops it). Resetting here keeps memory bounded
+// — without it, every keystroke leaks the previous compile's parse
+// tree + codegen state.
+func handle_did_open(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let text: str = str_or_empty(json.get(td, key: "text"))
-    docs.set(uri, text)
-    mark_dirty(:cache, :uri, :text)
+    lsp_docs_set(uri, text)
+    lsp_set_active_uri(uri)
+    lsp_set_publish_pending(true)
+    lsp_cache_invalidate()
+    arena_reset()
 }
 
 // `textDocument/didChange` with full sync mode: each notification carries
 // the whole new document body as the only entry in `contentChanges`.
 // Incremental sync (per-range edits) isn't supported yet.
-func handle_did_change(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
+func handle_did_change(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let changes: json.Value = json.get(params, key: "contentChanges")
@@ -143,33 +159,26 @@ func handle_did_change(docs: DocStore, cache: CompileCache, params: json.Value) 
         }
         else none
     }
-    docs.set(uri, text)
-    mark_dirty(:cache, :uri, :text)
+    lsp_docs_set(uri, text)
+    lsp_set_active_uri(uri)
+    lsp_set_publish_pending(true)
+    lsp_cache_invalidate()
+    arena_reset()
 }
 
-func handle_did_close(docs: DocStore, cache: CompileCache, params: json.Value) -> none {
+func handle_did_close(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
-    docs.set(uri, "")
+    lsp_docs_remove(uri)
     let empty: [json.Value] = []
     publish_raw(:uri, diagnostics: empty)
-    if cache.uri == uri {
-        cache.uri = ""
-        cache.text = ""
-        cache.cg = none
-        cache.publish_pending = false
+    let was_active: bool = lsp_get_active_uri() == uri
+    if was_active {
+        lsp_set_active_uri("")
+        lsp_set_publish_pending(false)
     }
-}
-
-// Record the latest buffer state and schedule a compile + diagnostics
-// publish for the next idle moment. Invalidates `cache.cg` so the next
-// hover / definition has to recompile (the cached one was for the old
-// text); the recompile path will also flush the pending publish.
-func mark_dirty(cache: CompileCache, uri: str, text: str) -> none {
-    cache.uri = uri
-    cache.text = text
-    cache.cg = none
-    cache.publish_pending = true
+    lsp_cache_invalidate()
+    arena_reset()
 }
 
 // Compile `text` against the full stdlib + its transitive imports
@@ -283,17 +292,13 @@ func word_at_offset(source: str, offset: int64) -> str {
 // write an LSP Location response. Returns null when the cursor isn't
 // on a known free function or `mod.fn` import target. Methods, type
 // names, struct fields, and variant constructors aren't resolved yet.
-func handle_definition(id_val: json.Value, docs: DocStore, cache: CompileCache, params: json.Value) -> none {
+func handle_definition(id_val: json.Value, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let pos: json.Value = json.get(params, key: "position")
     let line: int64 = number_or_zero(json.get(pos, key: "line"))
     let character: int64 = number_or_zero(json.get(pos, key: "character"))
-    let text: str = ""
-    match docs.get(uri) {
-        Some(t) -> text = t
-        none -> {}
-    }
+    let text: str = lsp_docs_get(uri)
     if len(text) == 0 {
         write_response(:id_val, result: json.Value.Null)
         return none
@@ -305,7 +310,7 @@ func handle_definition(id_val: json.Value, docs: DocStore, cache: CompileCache, 
         return none
     }
     let entry_path: str = uri_to_path(uri)
-    let cg: codegen.Codegen = compile_or_cached(:cache, :uri, :text)
+    let cg: codegen.Codegen = compile_or_cached(:uri)
     // Same-module + named-import resolution: cg.func_idx covers both.
     // Map[str, int64]'s K equality is bit-identical, which doesn't work
     // for our string keys: the word at the cursor and the func_decl.name
@@ -387,34 +392,25 @@ func number_or_zero(anon v: json.Value) -> int64 {
 }
 
 // Cache hit when the request is for the same (uri, text) we last
-// compiled. Cursor-move hovers and the request stream during a long
-// `kod test` are typical hits. On miss, recompile and refresh the
-// cache so the *next* request hits. If a publish was pending for this
-// uri (e.g. a fresh didChange that the debounce loop hasn't reached
-// yet), this compile flushes it — the user gets diagnostics as a
-// side effect of asking for hover / definition.
-func compile_or_cached(cache: CompileCache, uri: str, text: str) -> codegen.Codegen {
-    if cache.uri == uri and cache.text == text {
-        match cache.cg {
-            Some(cg) -> return cg
-            none -> {}
-        }
+// compiled and the cached cg pointer is still valid (no arena_reset
+// since). Miss → recompile and repopulate the cache. We deliberately
+// don't reset the arena here — the caller's frame holds arena refs
+// (id_val, params, etc.) that have to stay live until the response
+// is written. The reset happens at the end of didOpen/didChange/
+// didClose, which is the next natural point where every kod-side
+// arena reference has gone out of scope and the cache is invalidated
+// in the same step.
+func compile_or_cached(uri: str) -> codegen.Codegen {
+    let text: str = lsp_docs_get(uri)
+    if lsp_cache_lookup(uri, text) {
+        return lsp_cache_get_cg()
     }
     let cg: codegen.Codegen = compile_buffer(:uri, :text)
-    cache.uri = uri
-    cache.text = text
-    cache.cg = wrap_codegen(cg)
-    if cache.publish_pending and cache.uri == uri {
+    lsp_cache_store(uri, text, cg)
+    if lsp_get_publish_pending() and lsp_get_active_uri() == uri {
         publish_from_cg(:uri, :cg)
-        cache.publish_pending = false
+        lsp_set_publish_pending(false)
     }
-    return cg
-}
-
-// Implicit-wrap helper: returning a Codegen from a Codegen?-typed
-// function performs the wrap at the return site, which a bare
-// `cache.cg = cg` assignment does not.
-func wrap_codegen(anon cg: codegen.Codegen) -> codegen.Codegen? {
     return cg
 }
 
@@ -424,17 +420,13 @@ func wrap_codegen(anon cg: codegen.Codegen) -> codegen.Codegen? {
 // free functions and `mod.fn` import targets. Returns null for any
 // other token (locals, struct fields, methods, type names — future
 // work).
-func handle_hover(id_val: json.Value, docs: DocStore, cache: CompileCache, params: json.Value) -> none {
+func handle_hover(id_val: json.Value, params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     let pos: json.Value = json.get(params, key: "position")
     let line: int64 = number_or_zero(json.get(pos, key: "line"))
     let character: int64 = number_or_zero(json.get(pos, key: "character"))
-    let text: str = ""
-    match docs.get(uri) {
-        Some(t) -> text = t
-        none -> {}
-    }
+    let text: str = lsp_docs_get(uri)
     if len(text) == 0 {
         write_response(:id_val, result: json.Value.Null)
         return none
@@ -445,7 +437,7 @@ func handle_hover(id_val: json.Value, docs: DocStore, cache: CompileCache, param
         write_response(:id_val, result: json.Value.Null)
         return none
     }
-    let cg: codegen.Codegen = compile_or_cached(:cache, :uri, :text)
+    let cg: codegen.Codegen = compile_or_cached(:uri)
     let signature: str = ""
     let i: int64 = 0
     for i < len(cg.func_names) {
