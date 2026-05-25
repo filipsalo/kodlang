@@ -11,13 +11,6 @@ pinpoint location, or where the locus might move.
       `clang`, `ld`, walking modules — are still in Python. Subprocess
       support is there (`process.run`); just needs the pieces ported.
 
-## Codegen
-
-- [ ] **`mov xN, #imm` outside `load`/`mov_to`.** Several emit sites
-      use `mov reg, #N` for buffer sizes, enum discriminants, etc.
-      They pass small controlled values today, but should route
-      through `emit_load_imm` if any ever exceed 16 bits.
-
 ## Tests
 
 - [ ] **`tests/transitive_entry.kod` / `tests/transitive_dep.kod`** are
