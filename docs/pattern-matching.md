@@ -59,6 +59,15 @@ match s {
 }
 ```
 
+### Bool
+
+```kod
+match b {
+    true  -> print("yes")
+    false -> print("no")
+}
+```
+
 ### Enum variant (explicit)
 
 ```kod
@@ -163,9 +172,9 @@ let .Some(v) = m.get(key) else { return -1 }
 
 ## Exhaustiveness
 
-A `match` on an enum (or on `T?`) must cover every variant. The
-compiler reports an error if any variant is missing and no wildcard
-arm is present.
+A `match` on an enum (or on `T?` or `bool`) must cover every variant.
+The compiler reports an error if any variant is missing and no
+wildcard arm is present.
 
 ```kod
 type Color = enum { Red, Green, Blue }

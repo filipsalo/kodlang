@@ -39,11 +39,6 @@ pinpoint location, or where the locus might move.
       Keep the AST data-only so the Python frontend doesn't drift away
       from the Kod-side AST shape.
 
-## Match / enums
-
-- [ ] Bool match exhaustiveness — `match b { true -> ..., false -> ... }`
-      isn't currently exhaustiveness-checked (no `BoolPat` in the AST).
-
 ## Build process
 
 - [ ] Track which module-level names are actually accessed and skip
