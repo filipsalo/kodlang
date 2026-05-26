@@ -74,7 +74,7 @@ STAGE1_OBJS := \
     $(STAGE1)/kodc.o \
     $(STAGE1)/runtime_main.o
 
-LDFLAGS := -lc -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib
+LDFLAGS := -lc -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib -dead_strip
 MACOS_VERSION := $(shell sw_vers -productVersion)
 AS := as -target arm64-apple-darwin
 

@@ -316,12 +316,14 @@ class Builder:
                         {unwrap}
                         ldp x29, x30, [sp], #16
                         ret
+                    .subsections_via_symbols
                 """
             return f"""
                 .text
                 .globl _main
                 _main:
                     b ${mangled}$main
+                .subsections_via_symbols
             """
         # Param-form (main accepts argv).
         return f"""
@@ -366,6 +368,7 @@ class Builder:
                 ldp x19, x20, [sp, #16]
                 ldp x29, x30, [sp], #64
                 ret
+            .subsections_via_symbols
         """
 
     def build_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
@@ -400,6 +403,7 @@ class Builder:
                 bl _kod_test_summary
                 ldp x29, x30, [sp], #16
                 ret
+            .subsections_via_symbols
         """
 
     def build_test_runtime_main(self, file: FileWrapper, out_dir: Path) -> Path:
@@ -525,6 +529,7 @@ class Builder:
             "-lc",
             "-L",
             "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+            "-dead_strip",
             "-o",
             executable.relative_to(root_path),
             *object_files,
