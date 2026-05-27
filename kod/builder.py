@@ -468,20 +468,6 @@ class Builder:
         except ValueError:
             return False
 
-    def build_stage0(self) -> list[Path]:
-        """Build the shared stage0 objects: arena.o, runtime.o, plus every
-        stdlib module currently loaded into the program (builtins +
-        primitives). Returns the list of object file paths."""
-        stage0_dir = self.build_root / "stage0"
-        stdlib_root = self.program.stdlib_fs.root_path
-        outputs = []
-        for module in self.program:
-            if self._is_stdlib_module(module):
-                outputs.append(self.build_module(module, out_dir=stage0_dir))
-        outputs.append(self._build_c(stdlib_root / "arena.c", out_dir=stage0_dir))
-        outputs.append(self._build_c(stdlib_root / "runtime.c", out_dir=stage0_dir))
-        return outputs
-
     def _build_executable_with_runtime_main(
         self,
         file: FileWrapper,

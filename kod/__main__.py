@@ -14,7 +14,6 @@ Internal/debug commands (subject to change):
     kod _emit-asm <file>           print the assembly for the entry module
     kod _dump-ast <file>           pretty-print the parsed AST
     kod _emit-runtime-main <file> <out.s>
-    kod _build-stage0
 """
 
 import argparse
@@ -78,8 +77,6 @@ def _make_parser() -> argparse.ArgumentParser:
     p = subparsers.add_parser("_emit-test-runtime-main")
     p.add_argument("file", type=str)
     p.add_argument("out", type=str)
-
-    subparsers.add_parser("_build-stage0")
 
     return parser
 
@@ -161,13 +158,6 @@ def main():
         return rc
 
     args = _make_parser().parse_args()
-
-    # Commands that bypass the usual parse-program flow.
-    if args.command == "_build-stage0":
-        stdlib_fs = FileSystem(find_stdlib_path())
-        project_fs = FileSystem(Path.cwd())
-        Builder(project_fs=project_fs, stdlib_fs=stdlib_fs).build_stage0()
-        return 0
 
     if args.command == "test":
         # `kod test <file>` builds the file with a runtime_main that

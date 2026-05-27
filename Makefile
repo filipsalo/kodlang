@@ -47,17 +47,6 @@ STAGE0_OBJS := \
     $(STAGE0)/_process.o \
     $(STAGE0)/_time.o
 
-STAGE0_SOURCES := \
-    stdlib/arena.c \
-    stdlib/runtime.c \
-    stdlib/builtins.kod \
-    stdlib/primitives/int64.kod \
-    stdlib/primitives/str.kod \
-    stdlib/primitives/bool.kod \
-    stdlib/io.kod \
-    stdlib/process.kod \
-    stdlib/time.kod
-
 COMPILER_KOD := \
     stdlib/kod/ast.kod \
     stdlib/kod/lexing.kod \
@@ -92,11 +81,47 @@ kod: stage1
 
 stage0: $(STAGE0_OBJS)
 
-# The stage0 rule builds *all* stage0 objects in one shot via builder.py
-# (which already knows how to assemble each stdlib module). Touching any
-# of the stage0 sources retriggers the bundle.
-$(STAGE0_OBJS): $(STAGE0_SOURCES)
-	$(KOD) _build-stage0
+# C runtime objects: arena (bump allocator) + the rest of the C glue
+# (str/array primitives, panic, test runtime, …).
+$(STAGE0)/arena.o: stdlib/arena.c
+	mkdir -p $(STAGE0)
+	clang -c -o $@ $<
+
+$(STAGE0)/runtime.o: stdlib/runtime.c
+	mkdir -p $(STAGE0)
+	clang -c -o $@ $<
+
+# Stdlib .kod modules — each compiled to its own .o via the
+# bootstrap snapshot (or the Python interpreter when the snapshot
+# is missing, e.g. during bootstrap-snapshot). $(KODC) _compile
+# drives codegen + `as` in a single subprocess.
+$(STAGE0)/_builtins.o: stdlib/builtins.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_int64.o: stdlib/primitives/int64.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_str.o: stdlib/primitives/str.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_bool.o: stdlib/primitives/bool.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_io.o: stdlib/io.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_process.o: stdlib/process.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_time.o: stdlib/time.kod
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
 
 stage1: $(STAGE1)/sh_kodc
 

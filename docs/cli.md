@@ -81,4 +81,3 @@ These exist to support the bootstrap and for debugging. Their shape may change.
 | `kod _emit-asm <file>` | Print the assembly for the entry module to stdout. |
 | `kod _dump-ast <file>` | Pretty-print the parsed AST. |
 | `kod _emit-runtime-main <entry.kod> <out.s>` | Write the `_main` shim for the given entry. Delegates to sh_kodc when available. |
-| `kod _build-stage0` | Build the shared stage0 objects without producing an executable. |
