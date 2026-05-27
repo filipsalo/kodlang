@@ -26,6 +26,8 @@ type TypeKind = enum {
     KArrayStruct(elem_idx: int64)
     KArrayEnum(elem_idx: int64)
     KArrayStr
+    KArrayInterface(elem_idx: int64)
+    KArrayOptional(inner: TypeKind)
     KInterface(idx: int64)
     // Fallible result `T or Error`. Runtime cell is 16 bytes:
     //   {discriminant: 0=Ok|1=Err, payload: inner value or Error iface ptr}.
@@ -1061,6 +1063,8 @@ type Codegen = struct {
             .KArrayStr -> return "[str]"
             .KArrayStruct(elem_idx) -> return f"[{self.structs[elem_idx].name}]"
             .KArrayEnum(elem_idx) -> return f"[{self.enums[elem_idx].name}]"
+            .KArrayInterface(elem_idx) -> return f"[{self.interfaces[elem_idx].name}]"
+            .KArrayOptional(inner_kind) -> return f"[{self.kind_display(inner_kind)}?]"
             .KEnum(idx) -> return self.enums[idx].name
             .KInterface(idx) -> return self.interfaces[idx].name
             .KOptional(inner) -> return f"{self.kind_display(inner)}?"
@@ -1180,6 +1184,8 @@ type Codegen = struct {
             .KArrayStr -> return "arrstr"
             .KArrayStruct(elem_idx) -> return f"arrstruct${self.structs[elem_idx].name}"
             .KArrayEnum(elem_idx) -> return f"arrenum${self.enums[elem_idx].name}"
+            .KArrayInterface(elem_idx) -> return f"arriface${self.interfaces[elem_idx].name}"
+            .KArrayOptional(inner_kind) -> return f"arropt${self.canonical_kind_name(inner_kind)}"
             .KEnum(idx) -> return self.enums[idx].name
             .KInterface(idx) -> return self.interfaces[idx].name
             .KOptional(inner) -> return f"opt${self.canonical_kind_name(inner)}"
@@ -1302,6 +1308,8 @@ type Codegen = struct {
                     .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
                     .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
                     .KStr -> return .KArrayStr
+                    .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
+                    .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
                     else return .KArray
                 }
             }
@@ -2145,6 +2153,8 @@ type Codegen = struct {
             .KArrayStruct(elem_idx) -> array_like = true
             .KArrayEnum(elem_idx) -> array_like = true
             .KArrayStr -> array_like = true
+            .KArrayInterface(elem_idx) -> array_like = true
+            .KArrayOptional(inner_kind) -> array_like = true
             else none
         }
         if array_like {
@@ -2318,6 +2328,8 @@ type Codegen = struct {
                     .KArrayStruct(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayEnum(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayStr -> return self.compile_arr_concat(:lhs_id, :rhs_id)
+                    .KArrayInterface(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
+                    .KArrayOptional(inner_kind) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     else none
                 }
             }
@@ -2533,6 +2545,29 @@ type Codegen = struct {
     }
 
     func compile_array_lit(self, anon elements: [int64]) -> Val {
+        return self.compile_array_lit_typed(elements, expected_elem: .KVoid)
+    }
+
+    // Compile `value_id` into an array Val whose elements are guaranteed
+    // wrapped/boxed for `expected_elem`. If the value is an array literal
+    // we build it element-by-element through compile_array_lit_typed; if
+    // it's anything else (variable, call, etc.) we trust the producer
+    // already laid it out correctly and just compile in the usual way.
+    func compile_typed_array_value(self, anon value_id: int64, expected_elem: TypeKind) -> Val {
+        match self.p.exprs[value_id] {
+            .ArrayLit(elements) -> return self.compile_array_lit_typed(elements, :expected_elem)
+            else none
+        }
+        return self.compile_expr(value_id)
+    }
+
+    // Build an arena-allocated array from `elements`. When `expected_elem`
+    // is KInterface or KOptional, each element is boxed / wrapped to
+    // match before storing — so `let xs: [Greet] = [Cat(), Dog()]`
+    // populates the buf with iface cells, not raw struct pointers.
+    // Pass `.KVoid` for `expected_elem` when there's no contextual
+    // type (the element store is then a plain compile_expr + load).
+    func compile_array_lit_typed(self, anon elements: [int64], expected_elem: TypeKind) -> Val {
         let n = len(elements)
         let item_sz = 8
         // Allocate header (24 bytes) and buf, saving both pointers on
@@ -2549,10 +2584,21 @@ type Codegen = struct {
         self.emit_load_imm("x0", value: buf_sz)
         self.emit("bl _arena_alloc")
         self.emit("str x0, [sp, #8]")
+        let typed = false
+        match expected_elem {
+            .KInterface(_idx) -> typed = true
+            .KOptional(_inner) -> typed = true
+            else none
+        }
         let i = 0
         for i < n {
-            let elem_val = self.compile_expr(elements[i])
-            let elem_reg = self.load(elem_val)
+            let elem_reg = ""
+            if typed {
+                elem_reg = self.compile_value_for_kind(elements[i], expected: expected_elem)
+            } else {
+                let elem_val = self.compile_expr(elements[i])
+                elem_reg = self.load(elem_val)
+            }
             // Reload buf from stack — any bl in compile_expr above would
             // have clobbered a pool-register copy.
             let buf_r = self.alloc_reg()
@@ -2742,6 +2788,16 @@ type Codegen = struct {
                 return .VReg(name: reg)
             }
             .KArrayStr -> {
+                let reg = self.load(arg_val)
+                self.emit(f"ldr {reg}, [{reg}, #8]")
+                return .VReg(name: reg)
+            }
+            .KArrayInterface(elem_idx) -> {
+                let reg = self.load(arg_val)
+                self.emit(f"ldr {reg}, [{reg}, #8]")
+                return .VReg(name: reg)
+            }
+            .KArrayOptional(inner_kind) -> {
                 let reg = self.load(arg_val)
                 self.emit(f"ldr {reg}, [{reg}, #8]")
                 return .VReg(name: reg)
@@ -3304,6 +3360,8 @@ type Codegen = struct {
                     .KStruct(idx, _struct_type_args) -> return .KArrayStruct(elem_idx: idx)
                     .KEnum(idx) -> return .KArrayEnum(elem_idx: idx)
                     .KStr -> return .KArrayStr
+                    .KInterface(idx) -> return .KArrayInterface(elem_idx: idx)
+                    .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
                     else return .KArray
                 }
             }
@@ -3382,6 +3440,8 @@ type Codegen = struct {
                             .KArrayStruct(elem_idx) -> return .KStruct(idx: elem_idx, type_args: [])
                             .KArrayEnum(elem_idx) -> return .KEnum(idx: elem_idx)
                             .KArrayStr -> return .KStr
+                            .KArrayInterface(elem_idx) -> return .KInterface(idx: elem_idx)
+                            .KArrayOptional(inner_kind) -> return .KOptional(inner: inner_kind)
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
                                 if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
@@ -3571,6 +3631,21 @@ type Codegen = struct {
             }
             .KArrayStr -> {
                 let val = self.compile_expr(value_id)
+                let reg = self.load(val)
+                self.emit_str(dest_off, :reg)
+                self.free_reg(reg)
+            }
+            .KArrayInterface(elem_idx) -> {
+                // Array literal needs each element boxed into an iface
+                // cell first; an already-typed array value (from a Call
+                // or a variable) stores as-is.
+                let val = self.compile_typed_array_value(value_id, expected_elem: .KInterface(idx: elem_idx))
+                let reg = self.load(val)
+                self.emit_str(dest_off, :reg)
+                self.free_reg(reg)
+            }
+            .KArrayOptional(inner_kind) -> {
+                let val = self.compile_typed_array_value(value_id, expected_elem: .KOptional(inner: inner_kind))
                 let reg = self.load(val)
                 self.emit_str(dest_off, :reg)
                 self.free_reg(reg)
@@ -4277,6 +4352,8 @@ type Codegen = struct {
             .KArrayStruct(elem_idx) -> elem_kind = .KStruct(idx: elem_idx, type_args: [])
             .KArrayEnum(elem_idx) -> elem_kind = .KEnum(idx: elem_idx)
             .KArrayStr -> elem_kind = .KStr
+            .KArrayInterface(elem_idx) -> elem_kind = .KInterface(idx: elem_idx)
+            .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
             else none
         }
         self.update_var_kind(:name, kind: elem_kind)
