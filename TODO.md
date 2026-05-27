@@ -6,10 +6,13 @@ pinpoint location, or where the locus might move.
 
 ## Self-hosting / build pipeline
 
-- [ ] **Move more orchestration into sh_kodc.** runtime_main composition
-      lives in Kod and runs via sh_kodc. The next pieces — driving `as`,
-      `clang`, `ld`, walking modules — are still in Python. Subprocess
-      support is there (`process.run`); just needs the pieces ported.
+- [ ] **Move kod-tool bootstrap off Python.** `make kod` still uses
+      `python -m kod build tools/kod.kod` to build the native kod
+      binary in the first place; once it exists, every subsequent
+      build (stage0, stage1, user apps) runs through the native
+      path. Could either teach the Makefile to drive sh_kodc + as +
+      ld directly for tools/kod.kod, or thin-wrap the existing
+      kod-tool flow as a Makefile rule.
 
 ## Parser
 
