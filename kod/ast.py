@@ -982,9 +982,19 @@ class IfStatement(ASTNode):
                         continue
                     if stmt := parser.parse_statement():
                         body.append(stmt)
+                # Optional `else { ... }` becomes the wildcard arm's body.
+                # Pattern bindings stay scoped to the matching arm.
+                else_body: list[Statement] = []
+                if parser.try_consume(tokens.Else):
+                    parser.consume(tokens.OpenCurly)
+                    while not parser.try_consume(tokens.CloseCurly):
+                        if parser.try_consume(tokens.EOL):
+                            continue
+                        if stmt := parser.parse_statement():
+                            else_body.append(stmt)
                 arms = [
                     MatchArm(pat, body, span),
-                    MatchArm(WildcardPattern(span), [], span),
+                    MatchArm(WildcardPattern(span), else_body, span),
                 ]
                 return MatchStatement(lhs, arms, span)
             parser.consume(tokens.OpenCurly)
