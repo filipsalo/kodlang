@@ -3447,6 +3447,68 @@ type Codegen = struct {
         self.compile_store(dest_off: off, :kind, value_id: value)
     }
 
+    // Compile `value_id` into a register, applying any kind-specific
+    // wrapping/boxing needed before the result can be stored into a
+    // slot of `expected` kind. The two cases that matter today:
+    //
+    //   - KOptional: a bare `int64?` field assigned `42` must round-trip
+    //     as `Some(42)` — wrap in an arena cell unless the value is
+    //     already optional (a NoneLit, an inferred-Optional expr, or a
+    //     Call return whose kind we don't track).
+    //   - KInterface: assigning a struct value to an iface-typed slot
+    //     needs the {data, vtable} box; storing the raw struct pointer
+    //     would make the next method dispatch load garbage from offset 8.
+    //
+    // All other kinds pass through as plain compile_expr + load.
+    // Returns the register holding the prepared value — the caller does
+    // the actual store and is responsible for freeing the register.
+    func compile_value_for_kind(self, anon value_id: int64, expected: TypeKind) -> str {
+        match expected {
+            .KOptional(inner) -> {
+                let needs_wrap = true
+                match self.p.exprs[value_id] {
+                    .NoneLit -> needs_wrap = false
+                    .Call(callee, args) -> needs_wrap = false
+                    else none
+                }
+                if needs_wrap {
+                    if self.infer_kind(value_id) is .KOptional(inner2) {
+                        needs_wrap = false
+                    }
+                }
+                if needs_wrap == false {
+                    let val = self.compile_expr(value_id)
+                    return self.load(val)
+                }
+                let val = self.compile_expr(value_id)
+                let val_reg = self.load(val)
+                self.emit("sub sp, sp, #16")
+                self.emit(f"str {val_reg}, [sp]")
+                self.free_reg(val_reg)
+                self.emit("mov x0, #8")
+                self.emit("bl _arena_alloc")
+                let ptr_reg = self.alloc_reg()
+                self.emit(f"mov {ptr_reg}, x0")
+                let tmp = self.alloc_reg()
+                self.emit(f"ldr {tmp}, [sp]")
+                self.emit("add sp, sp, #16")
+                self.emit(f"str {tmp}, [{ptr_reg}]")
+                self.free_reg(tmp)
+                return ptr_reg
+            }
+            .KInterface(iface_idx) -> {
+                let val = self.compile_expr(value_id)
+                let reg = self.load(val)
+                let actual = self.infer_kind(value_id)
+                return self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+            }
+            else {
+                let val = self.compile_expr(value_id)
+                return self.load(val)
+            }
+        }
+    }
+
     func compile_store(self, dest_off: int64, kind: TypeKind, value_id: int64) -> none {
         match kind {
             .KEnum(idx) -> {
@@ -3584,12 +3646,13 @@ type Codegen = struct {
                 self.report_error(msg, span: arg.label_span)
             }
             let foff = self.find_field_offset(arg.label, :struct_idx)
+            let field_kind = self.find_field_kind(arg.label, :struct_idx)
             // Stash ptr_r across the call so it survives any bl in the
-            // field expression.
+            // field expression (constructor calls, arena_alloc for
+            // wrapping an optional, etc).
             self.emit("sub sp, sp, #16")
             self.emit(f"str {ptr_r}, [sp]")
-            let field_val = self.compile_expr(arg.value)
-            let field_reg = self.load(field_val)
+            let field_reg = self.compile_value_for_kind(arg.value, expected: field_kind)
             self.emit(f"ldr {ptr_r}, [sp]")
             self.emit("add sp, sp, #16")
             self.emit(f"str {field_reg}, [{ptr_r}, #{self.itos(foff)}]")
@@ -3697,8 +3760,8 @@ type Codegen = struct {
                 for i < len(args) {
                     let arg = args[i]
                     let foff = self.find_field_offset(arg.label, :struct_idx)
-                    let field_val = self.compile_expr(arg.value)
-                    let field_reg = self.load(field_val)
+                    let field_kind = self.find_field_kind(arg.label, :struct_idx)
+                    let field_reg = self.compile_value_for_kind(arg.value, expected: field_kind)
                     let ptr_reg = self.alloc_reg()
                     self.emit_ldr(dest_off, reg: ptr_reg)
                     self.emit(f"str {field_reg}, [{ptr_reg}, #{self.itos(foff)}]")
@@ -3720,12 +3783,16 @@ type Codegen = struct {
             struct_idx = idx
         }
         let foff = 0
+        let field_kind: TypeKind = .KInt64
         if struct_idx >= 0 {
             foff = self.find_field_offset(field_name, :struct_idx)
+            field_kind = self.find_field_kind(field_name, :struct_idx)
         }
-        // Compute rhs first, stash on stack, then compute the lhs pointer.
-        let rhs_val = self.compile_expr(rhs_id)
-        let rhs_reg = self.load(rhs_val)
+        // Compute rhs first (kind-aware, so an int assigned to an
+        // optional field gets wrapped), stash on stack, then compute
+        // the lhs pointer. Stashing matters because the lhs evaluation
+        // can itself hit `bl` (e.g. a method call) and clobber rhs_reg.
+        let rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
         self.emit("sub sp, sp, #16")
         self.emit(f"str {rhs_reg}, [sp]")
         self.free_reg(rhs_reg)
