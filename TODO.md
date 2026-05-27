@@ -11,13 +11,6 @@ pinpoint location, or where the locus might move.
       `clang`, `ld`, walking modules — are still in Python. Subprocess
       support is there (`process.run`); just needs the pieces ported.
 
-## Tests
-
-- [ ] **`tests/transitive_entry.kod` / `tests/transitive_dep.kod`** are
-      manual cross-module fixtures; don't match `*_test.kod` so
-      `kod test .` doesn't pick them up. Leave as fixtures or rename
-      into the auto-run set.
-
 ## Parser
 
 - [ ] Python parser raises on the first error rather than recovering and
