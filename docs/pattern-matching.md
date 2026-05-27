@@ -159,6 +159,18 @@ if module.decls[i] is .Func(decl_id) {
 }
 ```
 
+An optional `else { ... }` runs when the pattern doesn't match.
+Pattern bindings stay scoped to the matching arm — they aren't
+in scope in the `else` block.
+
+```kod
+if v is .Some(x) {
+    print_int(x)
+} else {
+    print("missing")
+}
+```
+
 ## `let .Pattern(bindings) = expr else { ... }`
 
 Destructure with an early-exit on the non-matching case. The `else`
