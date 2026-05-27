@@ -3747,13 +3747,15 @@ type Codegen = struct {
         return none
     }
 
-    // Compile `<arr>[<key>] = <rhs>` for Ident-named arr. Dispatches to
-    // op_index_set when available; otherwise plain array indexed store.
+    // Compile `<arr>[<key>] = <rhs>`. `arr` can be any expression that
+    // yields either a plain array header pointer (foo, self.slots,
+    // obj.list[0].rows, …) or a struct value whose type defines
+    // `op_index_set` (Map, Set, …). The op_index_set dispatch needs the
+    // lhs's inferred struct kind; the plain-array path doesn't care.
     func compile_index_assign(self, lhs: int64, rhs: int64, rhs_id: int64) -> none {
-        let .Ident(arr_name) = self.p.exprs[lhs] else { return }
         let struct_idx = -1
-        if self.find_var_kind(arr_name) is .KStruct(struct_idx, _struct_type_args) {
-            struct_idx = struct_idx
+        if self.infer_kind(lhs) is .KStruct(s_idx, _struct_type_args) {
+            struct_idx = s_idx
         }
         let setter: str? = none
         if struct_idx >= 0 {
@@ -3762,7 +3764,7 @@ type Codegen = struct {
         match setter {
             Some(method_lbl) -> {
                 // Compile rhs first (clean register state), stash, then key,
-                // then load the array and call.
+                // then load the array pointer and call.
                 let rhs_v = self.compile_expr(rhs_id)
                 let rhs_r = self.alloc_reg()
                 self.mov_to(rhs_v, dest: rhs_r)
@@ -3772,8 +3774,8 @@ type Codegen = struct {
                 let key_val = self.compile_expr(rhs)
                 let key_reg = self.alloc_reg()
                 self.mov_to(key_val, dest: key_reg)
-                let arr_off = self.find_var_offset(arr_name)
-                self.emit_ldr(arr_off, reg: "x0")
+                let lhs_val = self.compile_expr(lhs)
+                self.mov_to(lhs_val, dest: "x0")
                 self.emit(f"mov x1, {key_reg}")
                 self.free_reg(key_reg)
                 self.emit("ldr x2, [sp]")
@@ -3781,7 +3783,6 @@ type Codegen = struct {
                 self.emit(f"bl {method_lbl}")
             }
             none -> {
-                let arr_off = self.find_var_offset(arr_name)
                 let idx_v = self.compile_expr(rhs)
                 let idx_r = self.load(idx_v)
                 // Spill the index to the stack before evaluating the RHS.
@@ -3794,13 +3795,23 @@ type Codegen = struct {
                 self.free_reg(idx_r)
                 let rhs_v = self.compile_expr(rhs_id)
                 let rhs_r = self.load(rhs_v)
+                // Stash rhs across the lhs computation too — if the lhs
+                // is `obj.field` and obj's compile chain hits a `bl`,
+                // it'd clobber rhs_r as well.
+                self.emit("sub sp, sp, #16")
+                self.emit(f"str {rhs_r}, [sp]")
+                self.free_reg(rhs_r)
+                let arr_val = self.compile_expr(lhs)
                 let arr_ptr_r = self.alloc_reg()
-                self.emit_ldr(arr_off, reg: arr_ptr_r)
+                self.mov_to(arr_val, dest: arr_ptr_r)
                 let buf_r = self.alloc_reg()
                 self.emit(f"ldr {buf_r}, [{arr_ptr_r}]")
                 let len_r = self.alloc_reg()
                 self.emit(f"ldr {len_r}, [{arr_ptr_r}, #8]")
                 self.free_reg(arr_ptr_r)
+                let reloaded_rhs_r = self.alloc_reg()
+                self.emit(f"ldr {reloaded_rhs_r}, [sp]")
+                self.emit("add sp, sp, #16")
                 let reloaded_idx_r = self.alloc_reg()
                 self.emit(f"ldr {reloaded_idx_r}, [sp]")
                 self.emit("add sp, sp, #16")
@@ -3826,10 +3837,10 @@ type Codegen = struct {
                 self.emit_label(ok_lbl)
                 self.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
-                self.emit(f"str {rhs_r}, [{buf_r}, {reloaded_idx_r}]")
+                self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
                 self.free_reg(buf_r)
                 self.free_reg(reloaded_idx_r)
-                self.free_reg(rhs_r)
+                self.free_reg(reloaded_rhs_r)
             }
         }
     }
