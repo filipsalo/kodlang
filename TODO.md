@@ -4,16 +4,6 @@ For very-specific locations, prefer a `TODO:` comment in the code
 over a line here. This file collects work that doesn't have a single
 pinpoint location, or where the locus might move.
 
-## Self-hosting / build pipeline
-
-- [ ] **Move kod-tool bootstrap off Python.** `make kod` still uses
-      `python -m kod build tools/kod.kod` to build the native kod
-      binary in the first place; once it exists, every subsequent
-      build (stage0, stage1, user apps) runs through the native
-      path. Could either teach the Makefile to drive sh_kodc + as +
-      ld directly for tools/kod.kod, or thin-wrap the existing
-      kod-tool flow as a Makefile rule.
-
 ## Parser
 
 - [ ] Python parser raises on the first error rather than recovering and

@@ -47,6 +47,17 @@ STAGE0_OBJS := \
     $(STAGE0)/_process.o \
     $(STAGE0)/_time.o
 
+# Compiler-library .o files shared by `make stage1` (sh_kodc itself)
+# and `make kod` (the native kod driver). Compiled into build/stage0/
+# so anyone linking against the Kod compiler library reuses the same
+# objects instead of rebuilding per app.
+COMPILER_LIB_OBJS := \
+    $(STAGE0)/_ast.o \
+    $(STAGE0)/_lexing.o \
+    $(STAGE0)/_parsing.o \
+    $(STAGE0)/_codegen.o \
+    $(STAGE0)/_build.o
+
 COMPILER_KOD := \
     stdlib/kod/ast.kod \
     stdlib/kod/lexing.kod \
@@ -56,10 +67,6 @@ COMPILER_KOD := \
     kodc.kod
 
 STAGE1_OBJS := \
-    $(STAGE1)/lexing.o \
-    $(STAGE1)/parsing.o \
-    $(STAGE1)/codegen.o \
-    $(STAGE1)/build.o \
     $(STAGE1)/kodc.o \
     $(STAGE1)/runtime_main.o
 
@@ -71,13 +78,28 @@ AS := as -target arm64-apple-darwin
 
 all: stage1
 
-# Native `kod` driver — `kod build / run` orchestration written in kod
-# itself. Built into build/apps/kod/kod by the Python `kod build`
-# (which is the bootstrap path). Once present, users can prefer
-# `./build/apps/kod/kod build foo.kod` over `uv run kod build foo.kod`
-# to skip the Python startup tax.
-kod: stage1
-	$(KOD) build tools/kod.kod
+# Native `kod` driver — `kod build / run` orchestration written in
+# kod itself. Once built, the Python `kod` CLI (kod/__main__.py)
+# delegates straight to this binary for build / run / test / check
+# so users skip the Python startup tax.
+KOD_APP := build/apps/kod
+kod: $(KOD_APP)/kod
+
+$(KOD_APP)/kod: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o
+	mkdir -p $(KOD_APP)
+	ld -macos_version_min $(MACOS_VERSION) $(LDFLAGS) -o $@ \
+	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o
+
+$(KOD_APP)/_kod.o: tools/kod.kod $(COMPILER_KOD)
+	mkdir -p $(KOD_APP)
+	$(KODC) _compile $< $@
+
+$(KOD_APP)/runtime_main.s: tools/kod.kod
+	mkdir -p $(KOD_APP)
+	$(KODC_EMIT_MAIN) tools/kod.kod $@
+
+$(KOD_APP)/runtime_main.o: $(KOD_APP)/runtime_main.s
+	$(AS) -o $@ $<
 
 stage0: $(STAGE0_OBJS)
 
@@ -123,37 +145,45 @@ $(STAGE0)/_time.o: stdlib/time.kod
 	mkdir -p $(STAGE0)
 	$(KODC) _compile $< $@
 
+# Compiler-library .o files shared between sh_kodc and the kod tool.
+# The $(COMPILER_KOD) dep means a touch to ANY compiler source
+# retriggers the lot — over-conservative but matches how stage1
+# treats the same sources.
+$(STAGE0)/_ast.o: stdlib/kod/ast.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_lexing.o: stdlib/kod/lexing.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_parsing.o: stdlib/kod/parsing.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_codegen.o: stdlib/kod/codegen.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
+$(STAGE0)/_build.o: stdlib/kod/build.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) _compile $< $@
+
 stage1: $(STAGE1)/sh_kodc
 
-$(STAGE1)/sh_kodc: $(STAGE1_OBJS) $(STAGE0_OBJS)
+$(STAGE1)/sh_kodc: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS)
 	mkdir -p $(STAGE1)
 	ld -macos_version_min $(MACOS_VERSION) $(LDFLAGS) -o $@ \
-	    $(STAGE0_OBJS) $(STAGE1_OBJS)
+	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS)
 
-# Each compiler-source .kod file is lowered to .s by $(KODC) — the
-# checked-in arm64-darwin snapshot when present, the Python interpreter
-# driving kodc.kod otherwise.
-$(STAGE1)/lexing.s: stdlib/kod/lexing.kod $(COMPILER_KOD)
-	mkdir -p $(STAGE1)
-	$(KODC) $< > $@
-
-$(STAGE1)/parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
-	mkdir -p $(STAGE1)
-	$(KODC) $< > $@
-
-$(STAGE1)/codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
-	mkdir -p $(STAGE1)
-	$(KODC) $< > $@
-
-$(STAGE1)/build.s: stdlib/kod/build.kod $(COMPILER_KOD)
-	mkdir -p $(STAGE1)
-	$(KODC) $< > $@
-
+# kodc.kod is the only compiler source that's stage1-only — the
+# lexer/parser/codegen/build library lives in stage0/COMPILER_LIB_OBJS
+# and is shared with the kod tool.
 $(STAGE1)/kodc.s: kodc.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE1)
 	$(KODC) $< > $@
 
-$(STAGE1)/runtime_main.s: kodc.kod kod/builder.py
+$(STAGE1)/runtime_main.s: kodc.kod
 	mkdir -p $(STAGE1)
 	$(KODC_EMIT_MAIN) kodc.kod $@
 
