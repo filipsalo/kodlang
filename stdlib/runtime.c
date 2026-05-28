@@ -141,11 +141,13 @@ void kod_test_module_begin(KodStr *path) {
 }
 
 /* Format `ns` in (ns / μs / ms / s) with 3 significant figures, e.g.:
- *   0 ns             → "<0.00 ns"   (below clock resolution — two
+ *   0 ns             → "<1 ns"      (below clock resolution — two
  *                                    consecutive monotonic reads
  *                                    landed in the same ns slot, so
- *                                    the actual value is > 0 and we
- *                                    flag it rather than claim zero)
+ *                                    the actual value is > 0 but under
+ *                                    one ns of measurable difference;
+ *                                    we count in whole ns, so there's
+ *                                    no sub-ns precision to report)
  *   873 ns           → "873 ns"
  *   1234 ns          → "1.23 μs"
  *   45678 ns         → "45.7 μs"
@@ -161,7 +163,7 @@ void kod_test_module_begin(KodStr *path) {
  */
 static void format_duration(int64_t ns, char *out, size_t out_size) {
     if (ns == 0) {
-        snprintf(out, out_size, "<0.00 ns");
+        snprintf(out, out_size, "<1 ns");
         return;
     }
     double v;
