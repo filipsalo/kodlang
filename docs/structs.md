@@ -36,6 +36,14 @@ Pass fields by name using labeled arguments:
 let p: Point = Point(x: 10, y: 20)
 ```
 
+Every field must be supplied unless it has a [default](#field-defaults).
+Omitting a field with no default is a compile error — there's no
+implicit zero/null value:
+
+```kod
+let p: Point = Point(x: 10)   // error: struct `Point` requires field `y`
+```
+
 ## Field defaults
 
 A field may declare a default with `= expr`. When a construction omits

@@ -2662,7 +2662,7 @@ type Codegen = struct {
         if is_import {
             let s_idx = self.find_struct_idx(method_name)
             if s_idx >= 0 {
-                return self.compile_struct_construct(args, struct_idx: s_idx)
+                return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
             }
             let sig = self.find_import_fn_sig(mod_or_obj, method_name)
             self.check_call_args(args, param_labels: sig.param_labels, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
@@ -2703,7 +2703,7 @@ type Codegen = struct {
                 // Struct constructor: StructName(field1: v1, ...)
                 let struct_idx = self.find_struct_idx(name)
                 if struct_idx >= 0 {
-                    return self.compile_struct_construct(args, :struct_idx)
+                    return self.compile_struct_construct(args, :struct_idx, span: self.p.expr_spans[callee_id])
                 }
                 let func_lookup = self.func_idx
                 if func_lookup.get(name) is Some(idx) {
@@ -3689,7 +3689,7 @@ type Codegen = struct {
 
     // Allocate a struct value on the arena and return its pointer in x0.
     // field_args supplies the labelled field values.
-    func compile_struct_construct(self, anon field_args: [ast.CallArg], struct_idx: int64) -> Val {
+    func compile_struct_construct(self, anon field_args: [ast.CallArg], struct_idx: int64, span: ast.Span) -> Val {
         let data_width = self.structs[struct_idx].data_width
         self.emit_load_imm("x0", value: data_width)
         self.emit("bl _arena_alloc")
@@ -3717,15 +3717,34 @@ type Codegen = struct {
             self.emit(f"str {field_reg}, [{ptr_r}, #{self.itos(foff)}]")
             self.free_reg(field_reg)
         }
-        // Fill any field the construction omitted with its default
-        // expression. Defaults live in the struct's defining module
-        // (src_p) and, for a monomorphised instance, resolve under the
-        // template's type-parameter substitution — so swap both in
-        // while compiling them, then restore.
         let provided: [str] = []
         for arg in field_args {
             provided += [arg.label]
         }
+        // Completeness check, in the *consuming* module's context so
+        // report_error's source line points at the construction site:
+        // every field that has no default must be supplied, else the
+        // field would read arena garbage.
+        let ci = 0
+        for ci < len(self.structs[struct_idx].fields) {
+            let cf = self.structs[struct_idx].fields[ci]
+            if cf.default_expr == 0 {
+                let cf_provided = false
+                for pname in provided {
+                    if pname == cf.name {
+                        cf_provided = true
+                    }
+                }
+                if cf_provided == false {
+                    self.report_error(f"error: struct `{self.structs[struct_idx].name}` requires field `{cf.name}` (it has no default)", :span)
+                }
+            }
+            ci = ci + 1
+        }
+        // Fill any omitted field that *does* have a default. Defaults
+        // live in the struct's defining module (src_p) and, for a
+        // monomorphised instance, resolve under the template's
+        // type-parameter substitution — swap both in, then restore.
         let saved_p = self.p
         let saved_names = self.subst_names
         let saved_args = self.subst_args
