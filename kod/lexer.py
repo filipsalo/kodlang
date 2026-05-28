@@ -45,6 +45,7 @@ from kod.tokens import (
     Let,
     Match,
     Minus,
+    MinusEqual,
     Must,
     NoneLiteral,
     NotEqual,
@@ -318,11 +319,14 @@ class Lexer:
         return self.build(Slash)
 
     def lex_arrow_or_minus(self) -> Token:
-        """Lex an arrow (->) or a lone minus (-)."""
+        """Lex an arrow (->), a minus-equal (-=), or a lone minus (-)."""
         self.consume("-")
         if self.peek() == ">":
             self.consume(">")
             return self.build(Arrow)
+        if self.peek() == "=":
+            self.consume("=")
+            return self.build(MinusEqual)
         return self.build(Minus)
 
     def lex_plus_or_plus_equal(self) -> Token:

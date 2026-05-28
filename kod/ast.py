@@ -909,6 +909,11 @@ class Expression(ASTNode):
                         lhs = Assignment(
                             lhs, BinaryOperator(lhs, plus, rhs, span), span
                         )
+                    elif isinstance(op, tokens.MinusEqual):
+                        minus = tokens.Minus(value="-", span=op.span)
+                        lhs = Assignment(
+                            lhs, BinaryOperator(lhs, minus, rhs, span), span
+                        )
                     else:
                         lhs = BinaryOperator(lhs, op, rhs, span)
         return lhs

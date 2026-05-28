@@ -349,6 +349,13 @@ class PlusEqual(BinaryOperator):
     """A += operator."""
 
     precedence = 1
+
+
+@dataclasses.dataclass
+class MinusEqual(BinaryOperator):
+    """A -= operator."""
+
+    precedence = 1
     left_associative = False
 
 

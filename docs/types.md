@@ -22,7 +22,9 @@ let n: int64 = 42
 let m: int64 = -1
 ```
 
-Arithmetic operators: `+`, `-`, `*`, `/`, `%`.
+Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
+`+=` and `-=` update a variable, field, or array element in place
+(`n -= 3` is `n = n - 3`).
 
 ## Boolean literals
 
