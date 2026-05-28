@@ -113,61 +113,68 @@ $(STAGE0)/runtime.o: stdlib/runtime.c
 	mkdir -p $(STAGE0)
 	clang -c -o $@ $<
 
-# Stdlib .kod modules — each compiled to its own .o via the
-# bootstrap snapshot (or the Python interpreter when the snapshot
-# is missing, e.g. during bootstrap-snapshot). $(KODC) _compile
-# drives codegen + `as` in a single subprocess.
-$(STAGE0)/_builtins.o: stdlib/builtins.kod
+# Stdlib .kod modules — each lowered to .s by $(KODC) then assembled.
+# Two steps (codegen to stdout + `as`) rather than `$(KODC) _compile`
+# so the bootstrap fallback works: when the snapshot is missing
+# $(KODC) is the Python interpreter, which can't drive `_compile`
+# (that needs the redirect_stdout / process.run externs, native only).
+$(STAGE0)/_builtins.s: stdlib/builtins.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_int64.o: stdlib/primitives/int64.kod
+$(STAGE0)/_int64.s: stdlib/primitives/int64.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_str.o: stdlib/primitives/str.kod
+$(STAGE0)/_str.s: stdlib/primitives/str.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_bool.o: stdlib/primitives/bool.kod
+$(STAGE0)/_bool.s: stdlib/primitives/bool.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_io.o: stdlib/io.kod
+$(STAGE0)/_io.s: stdlib/io.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_process.o: stdlib/process.kod
+$(STAGE0)/_process.s: stdlib/process.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_time.o: stdlib/time.kod
+$(STAGE0)/_time.s: stdlib/time.kod
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-# Compiler-library .o files shared between sh_kodc and the kod tool.
+# Compiler-library .s files shared between sh_kodc and the kod tool.
 # The $(COMPILER_KOD) dep means a touch to ANY compiler source
 # retriggers the lot — over-conservative but matches how stage1
 # treats the same sources.
-$(STAGE0)/_ast.o: stdlib/kod/ast.kod $(COMPILER_KOD)
+$(STAGE0)/_ast.s: stdlib/kod/ast.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_lexing.o: stdlib/kod/lexing.kod $(COMPILER_KOD)
+$(STAGE0)/_lexing.s: stdlib/kod/lexing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_parsing.o: stdlib/kod/parsing.kod $(COMPILER_KOD)
+$(STAGE0)/_parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_codegen.o: stdlib/kod/codegen.kod $(COMPILER_KOD)
+$(STAGE0)/_codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
 
-$(STAGE0)/_build.o: stdlib/kod/build.kod $(COMPILER_KOD)
+$(STAGE0)/_build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
+
+# Assemble any stage0 .s (stdlib + compiler-lib) to its .o. The C
+# objects (arena.o, runtime.o) have explicit clang rules above and
+# don't match this (no corresponding .s).
+$(STAGE0)/%.o: $(STAGE0)/%.s
+	$(AS) -o $@ $<
 
 stage1: $(STAGE1)/sh_kodc
 
