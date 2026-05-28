@@ -284,11 +284,9 @@ class Builder:
         # If main returns `T or Error`, the call result is a Result cell ptr:
         # {discriminant, payload}. On Ok, we unwrap the payload as the exit
         # code; on Err, we call _kod_panic (prints the message and exits 1).
-        from kod import values as types
-
-        returns_result = isinstance(main_decl.return_type, type) and issubclass(
-            main_decl.return_type, types.ResultType
-        )
+        # `return_type` is the data-only ast.TypeExpr, so this is a pure
+        # syntactic check — no resolution needed.
+        returns_result = isinstance(main_decl.return_type, ast.ResultTypeExpr)
         if returns_result:
             unwrap = """
                     ldr x9, [x0, #0]

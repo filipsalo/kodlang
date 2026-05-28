@@ -11,6 +11,82 @@ from kod.filesys import FileWrapper
 from kod.parser import Parser
 from kod.span import Span
 
+# ── Type expressions (data-only) ─────────────────────────────────────────
+# A syntactic, *unresolved* type. The parser builds these via
+# Parser.parse_type_expr; Parser.resolve_type_expr turns one into a
+# concrete values.Type. `parse_type` is the shim that does both, so most
+# callers still get resolved types. Only positions that genuinely don't
+# need resolution (function / extern return types — read by builder's
+# `main` Result-detection and the interpreter's extern-return mapping)
+# store the data form. Struct fields and params still hold resolved types
+# because struct layout reads `.width` off them.
+#
+# Mirrors the Kod-side type AST shape so the two frontends don't drift.
+
+
+@dataclasses.dataclass(frozen=True)
+class NamedTypeExpr:
+    """A bare type name: int64, str, Foo."""
+
+    name: str
+
+
+@dataclasses.dataclass(frozen=True)
+class QualifiedTypeExpr:
+    """A module-qualified type: mod.Foo."""
+
+    module: str
+    name: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ArrayTypeExpr:
+    """`[T]`."""
+
+    element: "TypeExpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class OptionalTypeExpr:
+    """`T?`."""
+
+    inner: "TypeExpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class ResultTypeExpr:
+    """`T or Error`."""
+
+    inner: "TypeExpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class GenericTypeExpr:
+    """`Base[arg, ...]` — Base is a Named or Qualified type expr."""
+
+    base: "TypeExpr"
+    args: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedTypeExpr:
+    """Escape hatch for type syntax that is resolved eagerly at parse
+    time — inline `struct {...}` / `enum {...}` literals and the bare
+    `none` type. Carries the already-resolved values.Type."""
+
+    resolved: Any
+
+
+TypeExpr = Union[
+    NamedTypeExpr,
+    QualifiedTypeExpr,
+    ArrayTypeExpr,
+    OptionalTypeExpr,
+    ResultTypeExpr,
+    GenericTypeExpr,
+    ResolvedTypeExpr,
+]
+
 
 def dump(node, indent=""):
     """Dump the AST node."""
@@ -367,7 +443,7 @@ class FunctionDeclaration(ASTNode):
     label_name: str
     params: FunctionParamList
     body: list[Statement]
-    return_type: type[types.Type]
+    return_type: TypeExpr
     variables: dict[str, Variable]
     span: Span
     struct_name: Optional[str] = None
@@ -380,7 +456,7 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type()
+            return_type = parser.parse_type_expr()
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
@@ -439,9 +515,9 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             if parser.try_consume(tokens.Arrow):
-                return_type = parser.parse_type()
+                return_type = parser.parse_type_expr()
             else:
-                return_type = types.Type.from_name("none")
+                return_type = ResolvedTypeExpr(types.NoneType)
         variables = {param.variable.id: param.variable for param in params}
         label_name = name
         return cls(name, label_name, params, [], return_type, variables, span)
@@ -454,7 +530,7 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type()
+            return_type = parser.parse_type_expr()
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
@@ -625,7 +701,7 @@ class ExternalFunctionDeclaration(ASTNode):
     label_name: str
     params: FunctionParamList
     body: list[ASTNode]
-    return_type: type[types.Type]
+    return_type: TypeExpr
     span: Span
 
     @classmethod
@@ -637,7 +713,7 @@ class ExternalFunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type()
+            return_type = parser.parse_type_expr()
         label_name = f"_{name}"
         return cls(name, label_name, params, [], return_type, span)
 

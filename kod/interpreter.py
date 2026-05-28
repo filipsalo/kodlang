@@ -686,9 +686,11 @@ class Interpreter:
             c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
             args = [arg.value for arg in args]
             result = c_func(*args)
-            if func.return_type is types.Int64:
+            # return_type is the data-only ast.TypeExpr; extern returns are
+            # always primitive names, so match syntactically.
+            if func.return_type == ast.NamedTypeExpr("int64"):
                 return types.Int64(result)
-            if func.return_type is types.String:
+            if func.return_type == ast.NamedTypeExpr("str"):
                 return types.String(result)
             return types.none_value
 

@@ -107,11 +107,19 @@ class Parser:
         return None
 
     def parse_type(self, name=None) -> type[types.Type]:
-        """Parse a type, including optional T? suffix and trailing `or Error`
-        for fallible results."""
-        base = self._parse_base_type(name)
+        """Parse a type and resolve it to a concrete values.Type. Shim over
+        parse_type_expr + resolve_type_expr, kept so the many callers that
+        want a resolved type (struct layout, params, etc.) are unchanged."""
+        return self.resolve_type_expr(self.parse_type_expr(name))
+
+    def parse_type_expr(self, name=None) -> ast.TypeExpr:
+        """Parse a type into its data-only ast.TypeExpr form, including the
+        optional `T?` suffix and trailing `or Error` for fallible results.
+        No name resolution happens here beyond what's needed to decide
+        token consumption (generic templates require `[...]`)."""
+        base = self._parse_base_type_expr(name)
         if self.try_consume(Question):
-            base = types.OptionalType.make(base)
+            base = ast.OptionalTypeExpr(base)
         # `T or Error` — fallible result. Only the umbrella Error is allowed;
         # idempotent under repetition.
         from kod.tokens import Or as OrTok
@@ -124,11 +132,14 @@ class Parser:
                     f"unsupported `or` clause in type: only `or Error` is allowed, got `or {err_name}`",
                     self.peek().span,
                 )
-            base = types.ResultType.make(base)
+            base = ast.ResultTypeExpr(base)
         return base
 
-    def _parse_base_type(self, name=None) -> type[types.Type]:
-        """Parse a base type without optional suffix."""
+    def _parse_base_type_expr(self, name=None) -> ast.TypeExpr:
+        """Parse a base type (no `?` / `or Error` suffix) into a TypeExpr.
+        Struct / enum literals and bare `none` are resolved eagerly here
+        (struct layout needs field widths) and wrapped in a
+        ResolvedTypeExpr; everything else stays purely syntactic."""
         if self.try_consume(Struct):
             self.consume(OpenCurly)
             fields = []
@@ -142,7 +153,7 @@ class Parser:
                 else:
                     fields.append(ast.Variable.parse(self))
             self.try_consume(EOL)
-            return types.StructType.make(name, fields, methods)
+            return ast.ResolvedTypeExpr(types.StructType.make(name, fields, methods))
         elif self.try_consume(Enum):
             self.consume(OpenCurly)
             variants = []
@@ -158,26 +169,21 @@ class Parser:
                             self.consume(CloseParen)
                             break
                 variants.append((variant_name, fields))
-            return types.EnumType.make(name, variants)
+            return ast.ResolvedTypeExpr(types.EnumType.make(name, variants))
         elif self.try_consume(OpenBracket):
-            item_type = self.parse_type()
+            element = self.parse_type_expr()
             self.consume(CloseBracket)
-            return types.ArrayType.make(item_type)
+            return ast.ArrayTypeExpr(element)
         if self.try_consume(NoneLiteral):
-            return types.NoneType
+            return ast.ResolvedTypeExpr(types.NoneType)
         param_type = ast.Name.parse(self)
         result = self.lookup_type(param_type.id)
         if result is not None:
             if isinstance(result, types.GenericTemplate):
-                self.consume(OpenBracket)
-                type_args = []
-                while True:
-                    type_args.append(self.parse_type())
-                    if self.try_consume(CloseBracket):
-                        break
-                    self.consume(Comma)
-                return result.instantiate(tuple(type_args))
-            return result
+                return ast.GenericTypeExpr(
+                    ast.NamedTypeExpr(param_type.id), self._parse_type_args()
+                )
+            return ast.NamedTypeExpr(param_type.id)
         if (
             self.program is not None
             and param_type.id in self.import_aliases
@@ -190,17 +196,55 @@ class Parser:
             )
             mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
             result = mod.names.get(type_name)
+            qualified = ast.QualifiedTypeExpr(param_type.id, type_name)
             if isinstance(result, types.GenericTemplate):
-                self.consume(OpenBracket)
-                type_args = []
-                while True:
-                    type_args.append(self.parse_type())
-                    if self.try_consume(CloseBracket):
-                        break
-                    self.consume(Comma)
-                return result.instantiate(tuple(type_args))
-            return result
-        return types.Type.from_name(param_type.id)
+                return ast.GenericTypeExpr(qualified, self._parse_type_args())
+            return qualified
+        return ast.NamedTypeExpr(param_type.id)
+
+    def _parse_type_args(self) -> tuple:
+        """Consume `[arg, arg, ...]` and return the args as a tuple of
+        TypeExprs. Caller has already established the base is a generic
+        template (so the bracket is required)."""
+        self.consume(OpenBracket)
+        type_args = []
+        while True:
+            type_args.append(self.parse_type_expr())
+            if self.try_consume(CloseBracket):
+                break
+            self.consume(Comma)
+        return tuple(type_args)
+
+    def resolve_type_expr(self, expr: ast.TypeExpr) -> type[types.Type]:
+        """Resolve a data-only TypeExpr into a concrete values.Type, using
+        the parser's current scope (local type registry, builtins, import
+        aliases). Mirrors the resolution the old parse_type did inline."""
+        if isinstance(expr, ast.ResolvedTypeExpr):
+            return expr.resolved
+        if isinstance(expr, ast.ArrayTypeExpr):
+            return types.ArrayType.make(self.resolve_type_expr(expr.element))
+        if isinstance(expr, ast.OptionalTypeExpr):
+            return types.OptionalType.make(self.resolve_type_expr(expr.inner))
+        if isinstance(expr, ast.ResultTypeExpr):
+            return types.ResultType.make(self.resolve_type_expr(expr.inner))
+        if isinstance(expr, ast.NamedTypeExpr):
+            result = self.lookup_type(expr.name)
+            if result is not None:
+                return result
+            return types.Type.from_name(expr.name)
+        if isinstance(expr, ast.QualifiedTypeExpr):
+            module_name = self.import_aliases[expr.module]
+            import_file = self.program.resolve_import(
+                module_name, relative_to=self.file.path
+            )
+            mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
+            return mod.names.get(expr.name)
+        if isinstance(expr, ast.GenericTypeExpr):
+            template = self.resolve_type_expr(expr.base)
+            return template.instantiate(
+                tuple(self.resolve_type_expr(a) for a in expr.args)
+            )
+        raise self.error(f"cannot resolve type expression {expr!r}", self.peek().span)
 
     def parse_statement(self) -> "Optional[ast.Statement]":
         """Parse a statement."""
