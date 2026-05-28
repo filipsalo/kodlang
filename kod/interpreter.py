@@ -628,7 +628,14 @@ class Interpreter:
         if callable(func):
             if isinstance(func, type) and issubclass(func, types.StructType):
                 arg_names = [field.name for field in dataclasses.fields(func)]
-                return func(**{name: value for name, value in zip(arg_names, args)})
+                kwargs = {name: value for name, value in zip(arg_names, args)}
+                # Fill any field the construction omitted with its default
+                # expression. struct_fields carries the ast.Variable for
+                # each field, with `.default` set when declared `= expr`.
+                for v in getattr(func, "struct_fields", []):
+                    if v.id not in kwargs and v.default is not None:
+                        kwargs[v.id] = self.evaluate_expression(module, v.default)
+                return func(**kwargs)
             return func(*args)
         if isinstance(func, ast.ExternalFunctionDeclaration):
             if func.name == "read_file":

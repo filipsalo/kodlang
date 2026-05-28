@@ -36,6 +36,33 @@ Pass fields by name using labeled arguments:
 let p: Point = Point(x: 10, y: 20)
 ```
 
+## Field defaults
+
+A field may declare a default with `= expr`. When a construction omits
+that field, the default expression is evaluated and stored:
+
+```kod
+type Counter = struct {
+    label: str
+    count: int64 = 0
+    history: [int64] = []
+}
+
+let c: Counter = Counter(label: "hits")   // count = 0, history = []
+let d: Counter = Counter(label: "x", count: 5)
+```
+
+The default is evaluated fresh at each construction (so a `[]` default
+yields a new empty array per instance, not a shared one). Defaults are
+ordinary expressions evaluated in the struct's defining module.
+
+This is what lets the built-in `Map[K, V]` be created with no arguments —
+all three of its fields default to `[]`:
+
+```kod
+let m: Map[str, int64] = Map[str, int64]()
+```
+
 ## Field access
 
 ```kod

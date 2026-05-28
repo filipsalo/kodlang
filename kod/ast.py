@@ -281,6 +281,10 @@ class Variable(ASTNode):
     id: str
     type: Optional[type[types.Type]]
     span: Span
+    # For struct fields: the default-value expression, or None. Set by
+    # the struct-field parse loop, not by Variable.parse (params and
+    # let-bindings never carry one).
+    default: Optional["ASTNode"] = None
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:

@@ -97,6 +97,10 @@ type FieldInfo = struct {
     // the resolved `kind` so generic instantiations can re-resolve the
     // expression in a substitution context (e.g. `K` → `str`).
     type_expr: int64
+    // *Expr id of the field's default value (in the defining module's
+    // parser, `src_p`), or 0 if the field has no default. Used by
+    // compile_struct_construct to fill fields a construction omits.
+    default_expr: int64
 }
 
 // One method on a struct (or interface — `decl_id` is -1 for interfaces,
@@ -1223,7 +1227,7 @@ type Codegen = struct {
         let cloned_fields: [FieldInfo] = []
         for field in template.fields {
             let new_kind = self.resolve_type(field.type_expr)
-            cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr)]
+            cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr, default_expr: field.default_expr)]
         }
         // Re-resolve each method's sig with the new substitution context;
         // names + decl_ids stay the same as the template, so we build
@@ -1495,14 +1499,14 @@ type Codegen = struct {
                 self.p = p
                 for field in fields {
                     let field_kind = self.resolve_type(field.typ)
-                    field_infos += [FieldInfo(name: field.name, :offset, kind: field_kind, type_expr: field.typ)]
+                    field_infos += [FieldInfo(name: field.name, :offset, kind: field_kind, type_expr: field.typ, default_expr: field.default_expr)]
                     offset = offset + 8
                 }
                 // Restore parser before resolve_sig (which swaps to p
                 // internally). One pass: append the fully-built MethodInfo
                 // and record its position in method_idx in the same step.
                 self.p = saved_p
-                let method_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
+                let method_idx: FuncIdx = FuncIdx()
                 let method_infos: [MethodInfo] = []
                 let mi: int64 = 0
                 for method_id in methods {
@@ -1658,7 +1662,7 @@ type Codegen = struct {
             let new_fields: [FieldInfo] = []
             for f in s.fields {
                 let new_kind: TypeKind = self.resolve_type(f.type_expr)
-                new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr)]
+                new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr, default_expr: f.default_expr)]
             }
             self.structs[i].fields = new_fields
             self.p = saved_p
@@ -3713,6 +3717,48 @@ type Codegen = struct {
             self.emit(f"str {field_reg}, [{ptr_r}, #{self.itos(foff)}]")
             self.free_reg(field_reg)
         }
+        // Fill any field the construction omitted with its default
+        // expression. Defaults live in the struct's defining module
+        // (src_p) and, for a monomorphised instance, resolve under the
+        // template's type-parameter substitution — so swap both in
+        // while compiling them, then restore.
+        let provided: [str] = []
+        for arg in field_args {
+            provided += [arg.label]
+        }
+        let saved_p = self.p
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        self.p = self.structs[struct_idx].src_p
+        if self.structs[struct_idx].template_idx >= 0 {
+            self.subst_names = self.structs[self.structs[struct_idx].template_idx].type_param_names
+            self.subst_args = self.structs[struct_idx].template_args
+        }
+        let fi = 0
+        for fi < len(self.structs[struct_idx].fields) {
+            let field = self.structs[struct_idx].fields[fi]
+            if field.default_expr != 0 {
+                let was_provided = false
+                for pname in provided {
+                    if pname == field.name {
+                        was_provided = true
+                    }
+                }
+                if was_provided == false {
+                    self.emit("sub sp, sp, #16")
+                    self.emit(f"str {ptr_r}, [sp]")
+                    let dreg = self.compile_value_for_kind(field.default_expr, expected: field.kind)
+                    self.emit(f"ldr {ptr_r}, [sp]")
+                    self.emit("add sp, sp, #16")
+                    self.emit(f"str {dreg}, [{ptr_r}, #{self.itos(field.offset)}]")
+                    self.free_reg(dreg)
+                }
+            }
+            fi = fi + 1
+        }
+        self.p = saved_p
+        self.subst_names = saved_names
+        self.subst_args = saved_args
         self.emit(f"mov x0, {ptr_r}")
         self.free_reg(ptr_r)
         return .VReg(name: "x0")
@@ -5104,15 +5150,15 @@ func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     let func_def_paths: [str] = []
     let func_def_spans: [ast.Span] = []
     let func_docs: [str] = []
-    let func_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
-    let struct_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
-    let enum_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
-    let iface_idx: FuncIdx = FuncIdx(keys: [], values: [], indices: [])
+    let func_idx: FuncIdx = FuncIdx()
+    let struct_idx: FuncIdx = FuncIdx()
+    let enum_idx: FuncIdx = FuncIdx()
+    let iface_idx: FuncIdx = FuncIdx()
     let prim_methods: [PrimMethodInfo] = []
     let free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
     let subst_names: [str] = []
     let subst_args: [TypeKind] = []
-    let interned: StrMap = StrMap(keys: [], values: [], indices: [])
+    let interned: StrMap = StrMap()
     let errors: [Error] = []
     return Codegen(:p, :path_prefix, :enums, :structs, :interfaces, :vtable_struct_idx, :vtable_iface_idx, :prim_vtable_kinds, :prim_vtable_iface_idx, :struct_idx, :enum_idx, :iface_idx, :import_local, :import_prefix, :import_fns, :vars, frame_slots: 0, ret_lbl: "", return_kind: .KVoid, :free_regs, :loop_stack, :str_labels, :str_values, :interned, label_count: 0, :func_names, :func_labels, :func_sigs, :func_def_paths, :func_def_spans, :func_docs, :func_idx, :prim_methods, :subst_names, :subst_args, :errors, in_test: false, dry_run: false)
 }

@@ -23,6 +23,7 @@ from kod.tokens import (
     Continue,
     Dot,
     Enum,
+    Equal,
     Extern,
     For,
     Func,
@@ -151,7 +152,11 @@ class Parser:
                     method = ast.FunctionDeclaration.parse_method(self, name)
                     methods[method.name] = method
                 else:
-                    fields.append(ast.Variable.parse(self))
+                    field = ast.Variable.parse(self)
+                    # `field: Type = expr` — optional default value.
+                    if self.try_consume(Equal):
+                        field.default = ast.Expression.parse(self)
+                    fields.append(field)
             self.try_consume(EOL)
             return ast.ResolvedTypeExpr(types.StructType.make(name, fields, methods))
         elif self.try_consume(Enum):
