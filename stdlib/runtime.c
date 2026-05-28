@@ -675,8 +675,14 @@ void lsp_cache_invalidate(void) {
  * comfortably past any test-runner timing or "is this stale?" use.
  */
 int64_t kod_monotonic_ns(void) {
+    // CLOCK_MONOTONIC_RAW, not CLOCK_MONOTONIC: the latter is only 1 µs
+    // granular on macOS (clock_getres reports 1000 ns), so durations
+    // came out as whole microseconds with three trailing zeros. The RAW
+    // clock is backed by the hardware timebase (~41 ns/tick on Apple
+    // silicon), giving honest sub-µs resolution. RAW also skips NTP
+    // slewing, which is what we want for measuring elapsed time anyway.
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
 }
 
