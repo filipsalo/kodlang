@@ -140,14 +140,31 @@ void kod_test_module_begin(KodStr *path) {
     fputc('\n', stdout);
 }
 
+/* Resolution of CLOCK_MONOTONIC_RAW in whole ns, cached. ~42 ns on
+ * Apple silicon (24 MHz timebase, 41.67 ns/tick rounded up). This is the
+ * smallest difference two reads can show, so it's the floor we report
+ * for a same-tick (0 ns) measurement. */
+static int64_t monotonic_res_ns(void) {
+    static int64_t cached = 0;
+    if (cached == 0) {
+        struct timespec r;
+        if (clock_getres(CLOCK_MONOTONIC_RAW, &r) == 0) {
+            cached = (int64_t)r.tv_sec * 1000000000 + r.tv_nsec;
+        }
+        if (cached <= 0) {
+            cached = 1;
+        }
+    }
+    return cached;
+}
+
 /* Format `ns` in (ns / μs / ms / s) with 3 significant figures, e.g.:
- *   0 ns             → "<1 ns"      (below clock resolution — two
- *                                    consecutive monotonic reads
- *                                    landed in the same ns slot, so
- *                                    the actual value is > 0 but under
- *                                    one ns of measurable difference;
- *                                    we count in whole ns, so there's
- *                                    no sub-ns precision to report)
+ *   0 ns             → "<42 ns"     (same-tick read — the two monotonic
+ *                                    reads landed in one clock tick, so
+ *                                    the elapsed time is below the clock
+ *                                    resolution. We report that floor
+ *                                    rather than claim a precision the
+ *                                    hardware timebase doesn't have.)
  *   873 ns           → "873 ns"
  *   1234 ns          → "1.23 μs"
  *   45678 ns         → "45.7 μs"
@@ -163,7 +180,7 @@ void kod_test_module_begin(KodStr *path) {
  */
 static void format_duration(int64_t ns, char *out, size_t out_size) {
     if (ns == 0) {
-        snprintf(out, out_size, "<1 ns");
+        snprintf(out, out_size, "<%lld ns", (long long)monotonic_res_ns());
         return;
     }
     double v;
