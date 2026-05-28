@@ -158,35 +158,32 @@ static int64_t monotonic_res_ns(void) {
     return cached;
 }
 
-/* Format `ns` in (ns / μs / ms / s) with 3 significant figures, e.g.:
- *   0 ns             → "<42 ns"     (same-tick read — the two monotonic
- *                                    reads landed in one clock tick, so
- *                                    the elapsed time is below the clock
- *                                    resolution. We report that floor
- *                                    rather than claim a precision the
- *                                    hardware timebase doesn't have.)
- *   873 ns           → "873 ns"
- *   1234 ns          → "1.23 μs"
+/* Format `ns` as μs / ms / s with 3 significant figures. Microseconds is
+ * the finest unit on purpose: the monotonic clock resolves to ~42 ns
+ * (see monotonic_res_ns), so printing bare nanoseconds — especially with
+ * a decimal like "84.0 ns" — would imply precision we don't have. Sub-μs
+ * timings render as e.g. "0.21 μs". Examples:
+ *   0 ns             → "<0.04 μs"   (same-tick read — below the clock
+ *                                    resolution; report that floor in μs
+ *                                    rather than claim a smaller number)
+ *   208 ns           → "0.21 μs"
+ *   3920 ns          → "3.92 μs"
  *   45678 ns         → "45.7 μs"
  *   123456 ns        → "123 μs"
  *   1234567 ns       → "1.23 ms"
  *   12345678 ns      → "12.3 ms"
  *   1234567890 ns    → "1.23 s"
  *
- * Keeps numbers readable across the wide range a test suite spans —
- * tens of nanoseconds for trivial assertions, seconds for the
- * compile-heavy tests. Used by both `kod_test_report` (per-test) and
- * `kod_test_summary` (total).
+ * Used by both `kod_test_report` (per-test) and `kod_test_summary`.
  */
 static void format_duration(int64_t ns, char *out, size_t out_size) {
     if (ns == 0) {
-        snprintf(out, out_size, "<%lld ns", (long long)monotonic_res_ns());
+        snprintf(out, out_size, "<%.2f μs", monotonic_res_ns() / 1000.0);
         return;
     }
     double v;
     const char *unit;
-    if (ns < 1000)              { v = (double)ns;                unit = "ns"; }
-    else if (ns < 1000000)      { v = (double)ns / 1000.0;       unit = "μs"; }
+    if (ns < 1000000)           { v = (double)ns / 1000.0;       unit = "μs"; }
     else if (ns < 1000000000)   { v = (double)ns / 1000000.0;    unit = "ms"; }
     else                        { v = (double)ns / 1000000000.0; unit = "s";  }
     const char *fmt = v < 10  ? "%.2f %s"
