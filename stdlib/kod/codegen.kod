@@ -341,6 +341,13 @@ type Codegen = struct {
     // without polluting stdout with .s output.
     dry_run: bool = false
 
+    // Accumulated output lines. `println` appends here instead of writing
+    // to stdout directly; `flush_out` (called at the end of compile_module)
+    // prints them in one pass. Buffering — rather than streaming — is the
+    // foundation for later post-codegen passes (peephole / register
+    // allocation) that need to see and rewrite the emitted stream.
+    out_buf: [str] = []
+
 
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
@@ -639,12 +646,22 @@ type Codegen = struct {
 
     // Single output gate. In dry-run mode (test_support.try_compile),
     // this becomes a no-op so codegen can run all its checks without
-    // polluting stdout with the generated .s.
+    // polluting stdout with the generated .s. Otherwise the line is
+    // buffered into `out_buf` and emitted by `flush_out`.
     func println(self, anon line: str) -> none {
         if self.dry_run {
             return none
         }
-        print(line)
+        self.out_buf += [line]
+    }
+
+    // Drain the buffered output to stdout, one `print` per line (each
+    // adds the trailing newline, matching the old streaming behaviour).
+    func flush_out(self) -> none {
+        for line in self.out_buf {
+            print(line)
+        }
+        self.out_buf = []
     }
 
     func emit(self, anon line: str) -> none {
@@ -663,50 +680,40 @@ type Codegen = struct {
         if self.dry_run {
             return none
         }
-        putchar(9)   // \t
-        let i = 0
-        let prefix = ".asciz "
-        for i < len(prefix) {
-            putchar(prefix[i])
-            i = i + 1
-        }
-        putchar('"')
+        // Build the escaped body byte-by-byte (value[j:j+1] is a 1-byte
+        // slice), then emit one `\t.asciz "..."` line through println so
+        // it lands in `out_buf` in order with the surrounding directives.
+        let body = ""
         let j = 0
         for j < len(value) {
             let char = value[j]
             let escaped = false
             if char == '\n' {
-                putchar('\\')
-                putchar('n')
+                body = body + "\\n"
                 escaped = true
             }
             if char == '\t' {
-                putchar('\\')
-                putchar('t')
+                body = body + "\\t"
                 escaped = true
             }
             if char == '\r' {
-                putchar('\\')
-                putchar('r')
+                body = body + "\\r"
                 escaped = true
             }
             if char == '\\' {
-                putchar('\\')
-                putchar('\\')
+                body = body + "\\\\"
                 escaped = true
             }
             if char == '"' {
-                putchar('\\')
-                putchar('"')
+                body = body + "\\\""
                 escaped = true
             }
             if escaped == false {
-                putchar(char)
+                body = body + value[j:j+1]
             }
             j = j + 1
         }
-        putchar('"')
-        putchar(10)
+        self.println(f"\t.asciz \"{body}\"")
     }
 
 
@@ -4981,6 +4988,7 @@ type Codegen = struct {
         // nothing reachable refers to. Without this directive, every .o
         // contributes its entire __text/__data wholesale.
         self.println(".subsections_via_symbols")
+        self.flush_out()
     }
 
     // Emit one row per registered (struct, interface) pair. Methods are
