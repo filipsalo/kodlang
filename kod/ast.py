@@ -1145,6 +1145,10 @@ def _pattern_from_is_rhs(cond):
         if isinstance(callee, name_like) and callee.id == "Err":
             binding = arg_names[0] if arg_names else ""
             return ResultErrPattern(binding, span)
+        # Bare type name → interface downcast `value is StructType(binding)`.
+        if isinstance(callee, name_like):
+            binding = arg_names[0] if arg_names else ""
+            return TypePattern(callee.id, binding, span)
         # .Variant(b1, b2)
         if isinstance(callee, ImplicitEnumVariant):
             return ImplicitEnumVariantPattern(callee.variant_name, arg_names, span)
@@ -1168,6 +1172,10 @@ def _pattern_from_is_rhs(cond):
     if isinstance(rhs, BinaryOperator) and isinstance(rhs.op, tokens.Dot):
         if isinstance(rhs.lhs, name_like) and isinstance(rhs.rhs, name_like):
             return EnumVariantPattern(rhs.lhs.id, rhs.rhs.id, [], span)
+    # Bare type name (no binding) — interface downcast `value is StructType`.
+    # Exclude the optional/result markers, which `is` handles directly.
+    if isinstance(rhs, name_like) and rhs.id not in ("Some", "Ok", "Err", "none"):
+        return TypePattern(rhs.id, "", span)
     return None
 
 
@@ -1405,6 +1413,15 @@ class ResultErrPattern:
 
 
 @dataclasses.dataclass
+class TypePattern:
+    """Interface downcast: `StructType` / `StructType(binding)`."""
+
+    type_name: str
+    binding: str  # empty string if no binding
+    span: Span
+
+
+@dataclasses.dataclass
 class MatchExpressionArm:
     pattern: Any  # same patterns as MatchArm
     body: Any  # single expression ASTNode
@@ -1462,23 +1479,33 @@ class MatchExpressionArm:
                 pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
                 first = parser.consume(tokens.Identifier).value
-                parser.consume(tokens.Dot)
-                second = parser.consume(tokens.Identifier).value
-                if parser.peeking_at(tokens.Dot):
-                    parser.consume(tokens.Dot)
-                    variant_name = parser.consume(tokens.Identifier).value
-                    enum_name = second
+                if not parser.peeking_at(tokens.Dot):
+                    # Bare type name → interface downcast.
+                    binding = ""
+                    if parser.try_consume(tokens.OpenParen):
+                        binding = parser.consume(tokens.Identifier).value
+                        parser.consume(tokens.CloseParen)
+                    pattern = TypePattern(first, binding, span)
                 else:
-                    enum_name = first
-                    variant_name = second
-                bindings = []
-                if parser.try_consume(tokens.OpenParen):
-                    while not parser.try_consume(tokens.CloseParen):
-                        bindings.append(parser.consume(tokens.Identifier).value)
-                        if not parser.try_consume(tokens.Comma):
-                            parser.consume(tokens.CloseParen)
-                            break
-                pattern = EnumVariantPattern(enum_name, variant_name, bindings, span)
+                    parser.consume(tokens.Dot)
+                    second = parser.consume(tokens.Identifier).value
+                    if parser.peeking_at(tokens.Dot):
+                        parser.consume(tokens.Dot)
+                        variant_name = parser.consume(tokens.Identifier).value
+                        enum_name = second
+                    else:
+                        enum_name = first
+                        variant_name = second
+                    bindings = []
+                    if parser.try_consume(tokens.OpenParen):
+                        while not parser.try_consume(tokens.CloseParen):
+                            bindings.append(parser.consume(tokens.Identifier).value)
+                            if not parser.try_consume(tokens.Comma):
+                                parser.consume(tokens.CloseParen)
+                                break
+                    pattern = EnumVariantPattern(
+                        enum_name, variant_name, bindings, span
+                    )
             parser.consume(tokens.Arrow)
             body = Expression.parse(parser)
         return cls(pattern, body, span)
@@ -1580,24 +1607,34 @@ class MatchArm:
                 pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
             else:
                 first = parser.consume(tokens.Identifier).value
-                parser.consume(tokens.Dot)
-                second = parser.consume(tokens.Identifier).value
-                # Three-part: module.Enum.Variant — consume the third identifier
-                if parser.peeking_at(tokens.Dot):
-                    parser.consume(tokens.Dot)
-                    variant_name = parser.consume(tokens.Identifier).value
-                    enum_name = second
+                if not parser.peeking_at(tokens.Dot):
+                    # Bare type name → interface downcast.
+                    binding = ""
+                    if parser.try_consume(tokens.OpenParen):
+                        binding = parser.consume(tokens.Identifier).value
+                        parser.consume(tokens.CloseParen)
+                    pattern = TypePattern(first, binding, span)
                 else:
-                    enum_name = first
-                    variant_name = second
-                bindings = []
-                if parser.try_consume(tokens.OpenParen):
-                    while not parser.try_consume(tokens.CloseParen):
-                        bindings.append(parser.consume(tokens.Identifier).value)
-                        if not parser.try_consume(tokens.Comma):
-                            parser.consume(tokens.CloseParen)
-                            break
-                pattern = EnumVariantPattern(enum_name, variant_name, bindings, span)
+                    parser.consume(tokens.Dot)
+                    second = parser.consume(tokens.Identifier).value
+                    # Three-part: module.Enum.Variant — consume the third identifier
+                    if parser.peeking_at(tokens.Dot):
+                        parser.consume(tokens.Dot)
+                        variant_name = parser.consume(tokens.Identifier).value
+                        enum_name = second
+                    else:
+                        enum_name = first
+                        variant_name = second
+                    bindings = []
+                    if parser.try_consume(tokens.OpenParen):
+                        while not parser.try_consume(tokens.CloseParen):
+                            bindings.append(parser.consume(tokens.Identifier).value)
+                            if not parser.try_consume(tokens.Comma):
+                                parser.consume(tokens.CloseParen)
+                                break
+                    pattern = EnumVariantPattern(
+                        enum_name, variant_name, bindings, span
+                    )
             # Parse ->
             parser.consume(tokens.Arrow)
             # Parse body: block or single statement

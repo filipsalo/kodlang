@@ -183,6 +183,16 @@ class Interpreter:
                     if self._is_rhs_name(rhs) == "Ok":
                         return types.Bool(lhs_val.ok)
                     return types.Bool(not lhs_val.ok)
+                # Interface downcast: `value is StructType` — a type name that
+                # isn't the optional `Some`/`none` marker. Interface values are
+                # the raw struct instance, so this is a class-name check.
+                name = self._is_rhs_name(rhs)
+                if name not in ("", "Some", "Ok", "Err") and not isinstance(
+                    rhs, ast.NoneLiteral
+                ):
+                    if isinstance(lhs_val, types.NoneType):
+                        return types.Bool(False)
+                    return types.Bool(type(lhs_val).__name__ == name)
                 is_none = isinstance(lhs_val, types.NoneType)
                 if isinstance(rhs, ast.NoneLiteral):
                     return types.Bool(is_none)
@@ -385,6 +395,11 @@ class Interpreter:
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value.payload
                             return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.TypePattern):
+                        if type(value).__name__ == arm.pattern.type_name:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value
+                            return self.evaluate_expression(module, arm.body)
                     elif isinstance(
                         arm.pattern,
                         (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern),
@@ -563,6 +578,13 @@ class Interpreter:
                         if isinstance(value, types.ResultValue) and not value.ok:
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value.payload
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
+                    elif isinstance(arm.pattern, ast.TypePattern):
+                        if type(value).__name__ == arm.pattern.type_name:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value
                             for stmt in arm.body:
                                 self.execute_statement(module, stmt)
                             break
