@@ -308,7 +308,7 @@ class Interpreter:
                     return self._hash_value(value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
                     variant_name = callee.variant_name
-                    search_scopes = [module.names]
+                    search_scopes = [module.names, self.program.builtins.names]
                     for val in module.names.values():
                         if isinstance(val, ast.Import):
                             try:
@@ -353,7 +353,7 @@ class Interpreter:
                 template = self.lookup(module, name)
                 return template.instantiate(tuple(type_args))
             case ast.ImplicitEnumVariant(variant_name):
-                search_scopes = [module.names]
+                search_scopes = [module.names, self.program.builtins.names]
                 for val in module.names.values():
                     if isinstance(val, ast.Import):
                         try:
