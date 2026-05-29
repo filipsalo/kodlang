@@ -87,6 +87,14 @@ type EnumInfo = struct {
     // Source path + name-identifier span — see StructInfo.def_path.
     def_path: str
     def_span: ast.Span
+    // Template type parameter names (e.g. ["T"] for Option[T]). Empty
+    // for non-generic enums and for monomorphised instantiations.
+    type_param_names: [str]
+    // -1 if this enum is the template (or non-generic); otherwise the
+    // index of the template enum this entry was monomorphised from.
+    template_idx: int64
+    // Concrete type arguments used to monomorphise this enum.
+    template_args: [TypeKind]
 }
 
 type FieldInfo = struct {
@@ -1511,11 +1519,57 @@ type Codegen = struct {
                 }
                 let enum_idx = self.find_enum_idx(name)
                 if enum_idx >= 0 {
-                    return .KEnum(idx: enum_idx)
+                    mut resolved: [TypeKind] = []
+                    for arg in args {
+                        resolved += [self.resolve_type(arg)]
+                    }
+                    let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx)
+                    return .KEnum(idx: inst_idx)
                 }
                 return .KInt64
             }
         }
+    }
+
+    // Instantiate a generic enum template with `type_args`, creating a new
+    // monomorphised enum entry if it doesn't already exist. Mirrors
+    // instantiate_struct: variant field type_exprs are re-resolved under the
+    // template's substitution context so K/V in `Some(T)` become the concrete
+    // kinds. Canonical name is `Template$arg1$arg2` to match struct mangling.
+    func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64) -> int64 {
+        let template = self.enums[template_idx]
+        mut canonical = template.name
+        for ta in type_args {
+            canonical = f"{canonical}${self.canonical_kind_name(ta)}"
+        }
+        let existing = self.find_enum_idx(canonical)
+        if existing >= 0 {
+            return existing
+        }
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        let saved_p = self.p
+        self.subst_names = template.type_param_names
+        self.subst_args = type_args
+        self.p = template.src_p
+        mut new_variants: [VariantInfo] = []
+        for v in template.variants {
+            mut new_kinds: [TypeKind] = []
+            mut j: int64 = 0
+            for j < len(v.field_type_exprs) {
+                new_kinds += [self.resolve_type(v.field_type_exprs[j])]
+                j = j + 1
+            }
+            new_variants += [VariantInfo(name: v.name, discriminant: v.discriminant, field_names: v.field_names, field_offsets: v.field_offsets, field_kinds: new_kinds, field_type_exprs: v.field_type_exprs)]
+        }
+        self.p = saved_p
+        self.subst_names = saved_names
+        self.subst_args = saved_args
+        let empty_params: [str] = []
+        self.enums += [EnumInfo(name: canonical, variants: new_variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args)]
+        let new_idx: int64 = len(self.enums) - 1
+        self.enum_idx.set(canonical, new_idx)
+        return new_idx
     }
 
 
@@ -1629,7 +1683,7 @@ type Codegen = struct {
 
     func register_enum(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
-            .Enum(name, name_span, variants) -> {
+            .Enum(name, name_span, type_params, variants) -> {
                 let saved_p = self.p
                 self.p = p
                 mut variant_infos: [VariantInfo] = []
@@ -1657,7 +1711,8 @@ type Codegen = struct {
                 }
                 self.p = saved_p
                 let data_width = 8 + max_payload
-                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span)]
+                let no_template_args: [TypeKind] = []
+                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
                 self.enum_idx.set(name, len(self.enums) - 1)
             }
             else none
@@ -1858,7 +1913,16 @@ type Codegen = struct {
         mut i: int64 = 0
         for i < len(self.enums) {
             let saved_p = self.p
+            let saved_names = self.subst_names
+            let saved_args = self.subst_args
             self.p = self.enums[i].src_p
+            // Monomorphised enums need the template's substitution context
+            // restored — same reason as resolve_field_kinds for structs.
+            if self.enums[i].template_idx >= 0 {
+                let template = self.enums[self.enums[i].template_idx]
+                self.subst_names = template.type_param_names
+                self.subst_args = self.enums[i].template_args
+            }
             mut new_variants: [VariantInfo] = []
             for v in self.enums[i].variants {
                 mut new_kinds: [TypeKind] = []
@@ -1871,6 +1935,8 @@ type Codegen = struct {
             }
             self.enums[i].variants = new_variants
             self.p = saved_p
+            self.subst_names = saved_names
+            self.subst_args = saved_args
             i = i + 1
         }
     }
@@ -1919,6 +1985,10 @@ type Codegen = struct {
                 if self.infer_kind(subject) is .KResult(rinner) {
                     result_inner = rinner
                 }
+                mut subj_enum_idx: int64 = -1
+                if self.infer_kind(subject) is .KEnum(eidx) {
+                    subj_enum_idx = eidx
+                }
                 mut i = 0
                 for i < len(arms) {
                     let arm = self.p.match_expr_arms[arms[i]]
@@ -1962,7 +2032,10 @@ type Codegen = struct {
                             }
                         }
                         .ImplicitEnumPat(variant_name, bindings) -> {
-                            let enum_idx = self.find_enum_with_variant(variant_name)
+                            mut enum_idx = subj_enum_idx
+                            if enum_idx < 0 {
+                                enum_idx = self.find_enum_with_variant(variant_name)
+                            }
                             mut variant_idx = -1
                             if enum_idx >= 0 {
                                 variant_idx = self.find_variant_idx(variant_name, :enum_idx)
@@ -2071,6 +2144,14 @@ type Codegen = struct {
                 if self.infer_kind(subject) is .KResult(rinner) {
                     result_inner = rinner
                 }
+                // Subject's enum idx, if any — used to pick the right
+                // monomorphised instance for ImplicitEnumPat instead of
+                // falling back to the template (whose variant kinds are
+                // KInt64 stubs for unresolved type-param fields).
+                mut subj_enum_idx: int64 = -1
+                if self.infer_kind(subject) is .KEnum(eidx) {
+                    subj_enum_idx = eidx
+                }
                 mut i = 0
                 for i < len(arms) {
                     let arm = self.p.match_arms[arms[i]]
@@ -2114,7 +2195,10 @@ type Codegen = struct {
                             }
                         }
                         .ImplicitEnumPat(variant_name, bindings) -> {
-                            let enum_idx = self.find_enum_with_variant(variant_name)
+                            mut enum_idx = subj_enum_idx
+                            if enum_idx < 0 {
+                                enum_idx = self.find_enum_with_variant(variant_name)
+                            }
                             mut variant_idx = -1
                             if enum_idx >= 0 {
                                 variant_idx = self.find_variant_idx(variant_name, :enum_idx)
