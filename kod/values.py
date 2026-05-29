@@ -5,6 +5,17 @@ from abc import ABC
 from typing import Any, Self
 
 
+@dataclasses.dataclass
+class ResultValue:
+    """Runtime `T or Error` value. `ok=True` carries an Ok payload, `ok=False`
+    an Err (the thrown Error value). The interpreter materializes these at
+    fallible-call boundaries so `Ok`/`Err` patterns, `try`, and `must` can
+    inspect a result instead of relying on exception propagation alone."""
+
+    ok: bool
+    payload: Any
+
+
 class Type:
     """A type in Kod."""
 

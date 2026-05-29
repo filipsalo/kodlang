@@ -81,7 +81,22 @@ class Interpreter:
             msg = self._coerce_to_str(entry_module, e.value)
             sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
             sys.exit(1)
+        # A fallible `main` returns a ResultValue: an unhandled Err panics.
+        if isinstance(exit_code, types.ResultValue):
+            if not exit_code.ok:
+                msg = self._coerce_to_str(entry_module, exit_code.payload)
+                sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
+                sys.exit(1)
+            exit_code = exit_code.payload
         sys.exit(exit_code.value if exit_code else 0)
+
+    def _is_rhs_name(self, rhs):
+        """The callee/identifier name of an `is` right-hand side: "Ok" for
+        `is Ok(v)` or `is Ok`, "Err" for `is Err(e)`, etc. "" otherwise."""
+        callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
+        if isinstance(callee, (ast.Variable, ast.Name)):
+            return callee.id
+        return ""
 
     def assign(self, module, name, value):
         """Assign a value to a variable"""
@@ -164,6 +179,10 @@ class Interpreter:
                 op_func_name = "op_ge"
             case tokens.Is():
                 lhs_val = self.evaluate_expression(module, lhs)
+                if isinstance(lhs_val, types.ResultValue):
+                    if self._is_rhs_name(rhs) == "Ok":
+                        return types.Bool(lhs_val.ok)
+                    return types.Bool(not lhs_val.ok)
                 is_none = isinstance(lhs_val, types.NoneType)
                 if isinstance(rhs, ast.NoneLiteral):
                     return types.Bool(is_none)
@@ -208,20 +227,32 @@ class Interpreter:
                 return expression
             case types.Type() as instance:
                 return instance
+            case types.ResultValue() as result:
+                return result
             case ast.BinaryOperator(lhs, op, rhs):
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
             case ast.TryExpression(inner):
-                # Letting the ThrownError propagate is exactly the `try`
-                # semantics — the surrounding call_function frame catches
-                # it (or main does).
-                return self.evaluate_expression(module, inner)
+                # A fallible call yields a ResultValue. `try` unwraps Ok or
+                # re-raises Err as a ThrownError, which the enclosing fallible
+                # frame turns back into an Err result (or main reports).
+                value = self.evaluate_expression(module, inner)
+                if isinstance(value, types.ResultValue):
+                    if value.ok:
+                        return value.payload
+                    raise ThrownError(value.payload)
+                return value
             case ast.MustExpression(inner):
                 try:
-                    return self.evaluate_expression(module, inner)
+                    value = self.evaluate_expression(module, inner)
                 except ThrownError as e:
-                    msg = self._coerce_to_str(module, e.value)
+                    value = types.ResultValue(False, e.value)
+                if isinstance(value, types.ResultValue):
+                    if value.ok:
+                        return value.payload
+                    msg = self._coerce_to_str(module, value.payload)
                     sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
                     sys.exit(1)
+                return value
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):
@@ -343,6 +374,16 @@ class Interpreter:
                         if not isinstance(value, types.NoneType):
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value
+                            return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.ResultOkPattern):
+                        if isinstance(value, types.ResultValue) and value.ok:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value.payload
+                            return self.evaluate_expression(module, arm.body)
+                    elif isinstance(arm.pattern, ast.ResultErrPattern):
+                        if isinstance(value, types.ResultValue) and not value.ok:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value.payload
                             return self.evaluate_expression(module, arm.body)
                     elif isinstance(
                         arm.pattern,
@@ -508,6 +549,20 @@ class Interpreter:
                         if not isinstance(value, types.NoneType):
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
+                    elif isinstance(arm.pattern, ast.ResultOkPattern):
+                        if isinstance(value, types.ResultValue) and value.ok:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value.payload
+                            for stmt in arm.body:
+                                self.execute_statement(module, stmt)
+                            break
+                    elif isinstance(arm.pattern, ast.ResultErrPattern):
+                        if isinstance(value, types.ResultValue) and not value.ok:
+                            if arm.pattern.binding:
+                                self.stack[-1][arm.pattern.binding] = value.payload
                             for stmt in arm.body:
                                 self.execute_statement(module, stmt)
                             break
@@ -775,11 +830,20 @@ class Interpreter:
             if all_params and not all_params[0].mutable:
                 param_immutable.add("self")
             self.immutable_stack.append(param_immutable)
+            fallible = isinstance(func.return_type, ast.ResultTypeExpr)
             try:
                 for statement in func.body:
                     self.execute_statement(func.module, statement)
+                if fallible:
+                    return types.ResultValue(True, types.none_value)
             except ReturnValue as return_value:
+                if fallible:
+                    return types.ResultValue(True, return_value.value)
                 return return_value.value
+            except ThrownError as thrown:
+                if fallible:
+                    return types.ResultValue(False, thrown.value)
+                raise
             finally:
                 self.stack.pop()
                 self.immutable_stack.pop()
@@ -796,11 +860,20 @@ class Interpreter:
         self.immutable_stack.append(
             {p.variable.id for p in func.params if not p.mutable}
         )
+        fallible = isinstance(func.return_type, ast.ResultTypeExpr)
         try:
             for statement in func.body:
                 self.execute_statement(func.module, statement)
+            if fallible:
+                return types.ResultValue(True, types.none_value)
         except ReturnValue as return_value:
+            if fallible:
+                return types.ResultValue(True, return_value.value)
             return return_value.value
+        except ThrownError as thrown:
+            if fallible:
+                return types.ResultValue(False, thrown.value)
+            raise
         finally:
             self.stack.pop()
             self.immutable_stack.pop()

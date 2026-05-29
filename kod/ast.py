@@ -1139,6 +1139,12 @@ def _pattern_from_is_rhs(cond):
         if isinstance(callee, name_like) and callee.id == "Some":
             binding = arg_names[0] if arg_names else ""
             return OptionalSomePattern(binding, span)
+        if isinstance(callee, name_like) and callee.id == "Ok":
+            binding = arg_names[0] if arg_names else ""
+            return ResultOkPattern(binding, span)
+        if isinstance(callee, name_like) and callee.id == "Err":
+            binding = arg_names[0] if arg_names else ""
+            return ResultErrPattern(binding, span)
         # .Variant(b1, b2)
         if isinstance(callee, ImplicitEnumVariant):
             return ImplicitEnumVariantPattern(callee.variant_name, arg_names, span)
@@ -1183,6 +1189,13 @@ def _parse_match_pattern(parser, span):
             binding = parser.consume(tokens.Identifier).value
             parser.consume(tokens.CloseParen)
         return OptionalSomePattern(binding, span)
+    if parser.peeking_at(tokens.Identifier) and parser.peek().value in ("Ok", "Err"):
+        kind = parser.consume(tokens.Identifier).value
+        binding = ""
+        if parser.try_consume(tokens.OpenParen):
+            binding = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.CloseParen)
+        return (ResultOkPattern if kind == "Ok" else ResultErrPattern)(binding, span)
     if parser.peeking_at(tokens.Dot):
         parser.consume(tokens.Dot)
         variant_name = parser.consume(tokens.Identifier).value
@@ -1380,6 +1393,18 @@ class OptionalNonePattern:
 
 
 @dataclasses.dataclass
+class ResultOkPattern:
+    binding: str  # empty string if no binding
+    span: Span
+
+
+@dataclasses.dataclass
+class ResultErrPattern:
+    binding: str  # empty string if no binding
+    span: Span
+
+
+@dataclasses.dataclass
 class MatchExpressionArm:
     pattern: Any  # same patterns as MatchArm
     body: Any  # single expression ASTNode
@@ -1412,6 +1437,18 @@ class MatchExpressionArm:
                     binding = parser.consume(tokens.Identifier).value
                     parser.consume(tokens.CloseParen)
                 pattern = OptionalSomePattern(binding, span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value in (
+                "Ok",
+                "Err",
+            ):
+                kind = parser.consume(tokens.Identifier).value
+                binding = ""
+                if parser.try_consume(tokens.OpenParen):
+                    binding = parser.consume(tokens.Identifier).value
+                    parser.consume(tokens.CloseParen)
+                pattern = (ResultOkPattern if kind == "Ok" else ResultErrPattern)(
+                    binding, span
+                )
             elif parser.peeking_at(tokens.Dot):
                 parser.consume(tokens.Dot)
                 variant_name = parser.consume(tokens.Identifier).value
@@ -1518,6 +1555,18 @@ class MatchArm:
                     binding = parser.consume(tokens.Identifier).value
                     parser.consume(tokens.CloseParen)
                 pattern = OptionalSomePattern(binding, span)
+            elif parser.peeking_at(tokens.Identifier) and parser.peek().value in (
+                "Ok",
+                "Err",
+            ):
+                kind = parser.consume(tokens.Identifier).value
+                binding = ""
+                if parser.try_consume(tokens.OpenParen):
+                    binding = parser.consume(tokens.Identifier).value
+                    parser.consume(tokens.CloseParen)
+                pattern = (ResultOkPattern if kind == "Ok" else ResultErrPattern)(
+                    binding, span
+                )
             elif parser.peeking_at(tokens.Dot):
                 parser.consume(tokens.Dot)
                 variant_name = parser.consume(tokens.Identifier).value
