@@ -504,6 +504,7 @@ type Codegen = struct {
     // since `if x is none {...}` lowers to a MatchStmt.
     func check_match_subject(self, anon subject_id: int64, arms: [int64]) -> none {
         mut needs_optional: bool = false
+        mut needs_result: bool = false
         for arm_id in arms {
             let arm = self.p.match_arms[arm_id]
             let pat = self.p.patterns[arm.pattern]
@@ -513,17 +514,31 @@ type Codegen = struct {
             if pat is .SomePat(_binding) {
                 needs_optional = true
             }
-        }
-        if needs_optional == false {
-            return none
+            if pat is .OkPat(_b) {
+                needs_result = true
+            }
+            if pat is .ErrPat(_b) {
+                needs_result = true
+            }
         }
         let subj_kind = self.infer_kind(subject_id)
-        mut is_optional: bool = false
-        if subj_kind is .KOptional(_inner) {
-            is_optional = true
+        if needs_optional {
+            mut is_optional: bool = false
+            if subj_kind is .KOptional(_inner) {
+                is_optional = true
+            }
+            if is_optional == false {
+                self.report_error("error: `is` / `match` with none/Some requires an optional value", span: self.p.expr_spans[subject_id])
+            }
         }
-        if is_optional == false {
-            self.report_error("error: `is` / `match` with none/Some requires an optional value", span: self.p.expr_spans[subject_id])
+        if needs_result {
+            mut is_result: bool = false
+            if subj_kind is .KResult(_inner) {
+                is_result = true
+            }
+            if is_result == false {
+                self.report_error("error: `is` / `match` with Ok/Err requires a `T or Error` value", span: self.p.expr_spans[subject_id])
+            }
         }
     }
 
@@ -586,6 +601,25 @@ type Codegen = struct {
             }
             if has_none == false {
                 self.report_error("error: match on optional doesn't cover `none`", span: self.p.expr_spans[subject_id])
+            }
+        }
+        if subj_kind is .KResult(_inner) {
+            mut has_ok: bool = false
+            mut has_err: bool = false
+            for pid in pattern_ids {
+                let pat = self.p.patterns[pid]
+                if pat is .OkPat(_b) {
+                    has_ok = true
+                }
+                if pat is .ErrPat(_b) {
+                    has_err = true
+                }
+            }
+            if has_ok == false {
+                self.report_error("error: match on `T or Error` doesn't cover `Ok(_)`", span: self.p.expr_spans[subject_id])
+            }
+            if has_err == false {
+                self.report_error("error: match on `T or Error` doesn't cover `Err(_)`", span: self.p.expr_spans[subject_id])
             }
         }
         if subj_kind is .KBool {
@@ -1861,6 +1895,10 @@ type Codegen = struct {
                 if self.infer_kind(subject) is .KOptional(inner) {
                     subj_inner = inner
                 }
+                mut result_inner: TypeKind = .KInt64
+                if self.infer_kind(subject) is .KResult(rinner) {
+                    result_inner = rinner
+                }
                 mut i = 0
                 for i < len(arms) {
                     let arm = self.p.match_expr_arms[arms[i]]
@@ -1868,6 +1906,16 @@ type Codegen = struct {
                         .SomePat(binding) -> {
                             if len(binding) > 0 and self.var_declared(binding) == false {
                                 self.alloc_var(name: binding, kind: subj_inner)
+                            }
+                        }
+                        .OkPat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: result_inner)
+                            }
+                        }
+                        .ErrPat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
                             }
                         }
                         .EnumPat(enum_name, variant_name, bindings) -> {
@@ -1994,6 +2042,10 @@ type Codegen = struct {
                 if self.infer_kind(subject) is .KOptional(inner) {
                     subj_inner = inner
                 }
+                mut result_inner: TypeKind = .KInt64
+                if self.infer_kind(subject) is .KResult(rinner) {
+                    result_inner = rinner
+                }
                 mut i = 0
                 for i < len(arms) {
                     let arm = self.p.match_arms[arms[i]]
@@ -2001,6 +2053,16 @@ type Codegen = struct {
                         .SomePat(binding) -> {
                             if len(binding) > 0 and self.var_declared(binding) == false {
                                 self.alloc_var(name: binding, kind: subj_inner)
+                            }
+                        }
+                        .OkPat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: result_inner)
+                            }
+                        }
+                        .ErrPat(binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
                             }
                         }
                         .EnumPat(enum_name, variant_name, bindings) -> {
@@ -2374,14 +2436,42 @@ type Codegen = struct {
         return .VReg(name: result)
     }
 
+    // The callee/identifier name of an `is` right-hand side, e.g. "Ok" for
+    // `is Ok(v)` or `is Ok`, "" if it isn't a bare name / simple call.
+    func is_pattern_name(self, anon expr_id: int64) -> str {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> return name
+            .Call(callee, _args) -> {
+                if self.p.exprs[callee] is .Ident(name) {
+                    return name
+                }
+            }
+            else none
+        }
+        return ""
+    }
+
     func compile_is(self, lhs: int64, rhs: int64) -> Val {
         let lhs_kind = self.infer_kind(lhs)
+        // `T or Error` result: test the discriminant (0=Ok, 1=Err).
+        if lhs_kind is .KResult(_inner) {
+            let ptr_v = self.compile_expr(lhs)
+            mut reg = self.load(ptr_v)
+            self.emit(f"ldr {reg}, [{reg}]")
+            self.emit(f"cmp {reg}, #0")
+            if self.is_pattern_name(rhs) == "Ok" {
+                self.emit(f"cset {reg}, eq")
+            } else {
+                self.emit(f"cset {reg}, ne")
+            }
+            return .VReg(name: reg)
+        }
         mut is_optional: bool = false
         if lhs_kind is .KOptional(_inner) {
             is_optional = true
         }
         if is_optional == false {
-            self.report_error("error: `is` requires an optional value", span: self.p.expr_spans[lhs])
+            self.report_error("error: `is` requires an optional or `T or Error` value", span: self.p.expr_spans[lhs])
         }
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
@@ -2534,7 +2624,30 @@ type Codegen = struct {
                 self.emit(f"ldr {reg}, [{reg}]")
                 return reg
             }
+            .KResult(inner) -> {
+                // A `T or Error` result is a {disc, payload} cell; its
+                // discriminant (0=Ok, 1=Err) is at offset 0, like an enum's.
+                mut reg = self.load(val)
+                self.emit(f"ldr {reg}, [{reg}]")
+                return reg
+            }
             else return self.load(val)
+        }
+    }
+
+    // Bind an `Ok(x)` / `Err(e)` pattern's payload into `binding`'s slot.
+    // The Result cell pointer is reloaded from subj_slot; the payload lives
+    // at offset 8 (offset 0 is the discriminant). No-op for an empty binding.
+    func bind_result_payload(self, anon binding: str, subj_slot: int64) -> none {
+        if len(binding) > 0 {
+            let boff = self.find_var_offset(binding)
+            let ptr_r = self.alloc_reg()
+            self.emit_ldr(subj_slot, reg: ptr_r)
+            let val_r = self.alloc_reg()
+            self.emit(f"ldr {val_r}, [{ptr_r}, #8]")
+            self.emit_str(boff, reg: val_r)
+            self.free_reg(val_r)
+            self.free_reg(ptr_r)
         }
     }
 
@@ -3330,6 +3443,24 @@ type Codegen = struct {
                         self.free_reg(val_r)
                         self.free_reg(ptr_r)
                     }
+                    let body_val = self.compile_expr(arm.body)
+                    self.mov_to(body_val, dest: result_r)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .OkPat(binding) -> {
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"bne {skip_lbl}")
+                    self.bind_result_payload(binding, :subj_slot)
+                    let body_val = self.compile_expr(arm.body)
+                    self.mov_to(body_val, dest: result_r)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .ErrPat(binding) -> {
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"beq {skip_lbl}")
+                    self.bind_result_payload(binding, :subj_slot)
                     let body_val = self.compile_expr(arm.body)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
@@ -4810,6 +4941,27 @@ type Codegen = struct {
                         self.free_reg(val_r)
                         self.free_reg(ptr_r)
                     }
+                    for stmt_id in arm.body {
+                        self.compile_stmt(stmt_id)
+                    }
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .OkPat(binding) -> {
+                    // Result arms: disc 0=Ok, 1=Err; payload at offset 8.
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"bne {skip_lbl}")
+                    self.bind_result_payload(binding, :subj_slot)
+                    for stmt_id in arm.body {
+                        self.compile_stmt(stmt_id)
+                    }
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .ErrPat(binding) -> {
+                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"beq {skip_lbl}")
+                    self.bind_result_payload(binding, :subj_slot)
                     for stmt_id in arm.body {
                         self.compile_stmt(stmt_id)
                     }
