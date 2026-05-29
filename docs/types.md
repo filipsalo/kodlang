@@ -6,6 +6,26 @@ icon: lucide/layers
 
 Kod is statically typed. Every variable and parameter requires a type annotation.
 
+## Bindings and mutability
+
+A `let` binding is immutable: once set, reassigning the name is a compile
+error. Use `mut` for a binding you need to reassign. `+=` and `-=` count as
+reassignment, so they require `mut` too.
+
+```kod
+let max: int64 = 100
+mut total: int64 = 0
+total += max          // ok — total is mutable
+
+max = 50              // error: cannot reassign immutable binding `max`
+```
+
+Immutability currently applies to **local bindings** only. Function
+parameters and struct fields stay mutable. And because structs and arrays
+are reference values (see [Memory layout](memory-layout.md)), mutating a
+struct through a parameter or `self` is still allowed regardless of how the
+binding holding it was declared.
+
 ## Primitive types
 
 | Type | Description | Example |

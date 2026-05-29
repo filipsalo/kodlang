@@ -9,9 +9,14 @@ from typing import Any
 
 from kod import ast, tokens
 from kod import values as types
+from kod.exceptions import KodError
 from kod.program import Program
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
+
+# Whether reassigning an immutable (`let`) binding is an error. Mirrors
+# codegen.kod's enforce_immutability so both frontends agree.
+_ENFORCE_IMMUTABILITY = True
 
 
 class BreakSignal(Exception):
@@ -52,6 +57,10 @@ class Interpreter:
     def __init__(self, program: Program):
         self.program = program
         self.stack = [{}]
+        # Parallel to self.stack: the set of immutable (`let`, not `mut`)
+        # binding names in each frame. Mirrors the codegen's per-VarSlot
+        # mutable flag so `_interpret` rejects the same reassignments.
+        self.immutable_stack = [set()]
 
     def run(self, file, argv=()):
         """Run the program"""
@@ -384,11 +393,17 @@ class Interpreter:
                     map(partial(self.evaluate_expression, module), statement.args)
                 )
                 self.call_function(module, callee, args)
-            case ast.VariableDeclaration(variable, value):
+            case ast.VariableDeclaration(variable, value, _span, mutable):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self.evaluate_expression(module, value)
                 if len(self.stack) > 1:
                     self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
+                    # Track (re)declared mutability for this frame; most
+                    # recent declaration wins, matching compile_let.
+                    if mutable:
+                        self.immutable_stack[-1].discard(lhs.id)
+                    else:
+                        self.immutable_stack[-1].add(lhs.id)
                 else:
                     module.names[lhs.id] = self.evaluate_expression(module, value)
             case ast.TypeDeclaration(variable, value):
@@ -424,6 +439,16 @@ class Interpreter:
                         obj.value[key_val.value] = rhs_val
                 else:
                     lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
+                    if (
+                        _ENFORCE_IMMUTABILITY
+                        and len(self.stack) > 1
+                        and lhs_val.id in self.immutable_stack[-1]
+                    ):
+                        raise KodError(
+                            f"cannot reassign immutable binding `{lhs_val.id}`; "
+                            "declare it with `mut`",
+                            lhs.span,
+                        )
                     self.assign(module, lhs_val.id, rhs_val)
             case ast.IfStatement(condition, true_branch, false_branch):
                 matched = (
@@ -745,6 +770,7 @@ class Interpreter:
             }
             frame["self"] = receiver
             self.stack.append(frame)
+            self.immutable_stack.append(set())
             try:
                 for statement in func.body:
                     self.execute_statement(func.module, statement)
@@ -752,6 +778,7 @@ class Interpreter:
                 return return_value.value
             finally:
                 self.stack.pop()
+                self.immutable_stack.pop()
             return None
 
         # Map args to params
@@ -762,6 +789,7 @@ class Interpreter:
             for param, arg in zip(func.params, args)
         }
         self.stack.append(args)
+        self.immutable_stack.append(set())
         try:
             for statement in func.body:
                 self.execute_statement(func.module, statement)
@@ -769,3 +797,4 @@ class Interpreter:
             return return_value.value
         finally:
             self.stack.pop()
+            self.immutable_stack.pop()

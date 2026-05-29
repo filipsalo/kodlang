@@ -43,7 +43,8 @@ func main() -> int64 {
 
 ## Variables
 
-Variables are declared with `let`. A type annotation is usually required:
+Bindings are declared with `let` and are **immutable** — the name can't be
+reassigned. A type annotation is usually required:
 
 ```kod
 let x: int64 = 42
@@ -51,10 +52,14 @@ let s: str = "hello"
 let flag: bool = true
 ```
 
-Reassignment uses `=`:
+For a binding you intend to reassign, use `mut`:
 
 ```kod
-x = x + 1
+mut count: int64 = 0
+count = count + 1   // ok
+
+let limit: int64 = 10
+limit = 20          // error: cannot reassign immutable binding `limit`
 ```
 
 ## A test file
