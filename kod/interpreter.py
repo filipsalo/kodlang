@@ -761,7 +761,8 @@ class Interpreter:
             ):
                 return self._fast_map_method(method.name, receiver, args)
             func = method
-            explicit_params = list(func.params)[1:]  # skip self
+            all_params = list(func.params)
+            explicit_params = all_params[1:]  # skip self
             frame = {
                 param.variable.id: (
                     self.lookup(module, arg) if isinstance(arg, ast.Variable) else arg
@@ -770,7 +771,10 @@ class Interpreter:
             }
             frame["self"] = receiver
             self.stack.append(frame)
-            self.immutable_stack.append(set())
+            param_immutable = {p.variable.id for p in explicit_params if not p.mutable}
+            if all_params and not all_params[0].mutable:
+                param_immutable.add("self")
+            self.immutable_stack.append(param_immutable)
             try:
                 for statement in func.body:
                     self.execute_statement(func.module, statement)
@@ -789,7 +793,9 @@ class Interpreter:
             for param, arg in zip(func.params, args)
         }
         self.stack.append(args)
-        self.immutable_stack.append(set())
+        self.immutable_stack.append(
+            {p.variable.id for p in func.params if not p.mutable}
+        )
         try:
             for statement in func.body:
                 self.execute_statement(func.module, statement)

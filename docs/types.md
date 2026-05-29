@@ -20,11 +20,22 @@ total += max          // ok — total is mutable
 max = 50              // error: cannot reassign immutable binding `max`
 ```
 
-Immutability currently applies to **local bindings** only. Function
-parameters and struct fields stay mutable. And because structs and arrays
-are reference values (see [Memory layout](memory-layout.md)), mutating a
-struct through a parameter or `self` is still allowed regardless of how the
-binding holding it was declared.
+Parameters are immutable too — `mut` makes one reassignable inside the
+body (`mut self` for a method receiver). This is **callee-local**: params
+are passed by value, so reassigning one never affects the caller, and the
+call site needs no annotation.
+
+```kod
+func bump(anon mut x: int64) -> int64 {
+    x = x + 1     // ok — local to bump; the caller's value is unchanged
+    return x
+}
+```
+
+Struct fields stay mutable. And because structs and arrays are reference
+values (see [Memory layout](memory-layout.md)), mutating a struct's *fields*
+through a parameter or `self` (`p.field = v`) is still allowed regardless of
+whether the binding is `mut` — `mut` governs only reassigning the name.
 
 ## Primitive types
 
