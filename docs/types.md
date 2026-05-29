@@ -212,3 +212,25 @@ let r = read_size("missing.txt")
 assert r is Err(_)              // it failed
 if r is Err(e) { print(e.to_str()) }
 ```
+
+### Recovering the concrete error type
+
+`Err(e)` binds `e` as the `Error` interface. To get back the concrete error
+struct, downcast with `is StructType` / `is StructType(binding)` — a general
+interface downcast that tests the boxed type and, on a match, binds the
+typed value:
+
+```kod
+match read_size(path) {
+    Ok(n)  -> use(n)
+    Err(e) ->
+        if e is NotFound(nf) {
+            print(f"missing: {nf.path}")
+        } else {
+            print(e.to_str())
+        }
+}
+```
+
+It works in `match`, `if … is`, and the bare `is` operator (a `match` on an
+interface needs an `else`, since its set of implementors isn't enumerable).
