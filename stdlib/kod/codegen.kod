@@ -555,11 +555,7 @@ type Codegen = struct {
             }
         }
         if needs_result {
-            mut is_result: bool = false
-            if subj_kind is .KResult(_inner) {
-                is_result = true
-            }
-            if is_result == false {
+            if self.is_result_kind(subj_kind) == false {
                 self.report_error("error: `is` / `match` with Ok/Err requires a `T or Error` value", span: self.p.expr_spans[subject_id])
             }
         }
@@ -583,6 +579,38 @@ type Codegen = struct {
             return none
         }
         let subj_kind = self.infer_kind(subject_id)
+        // Result-shaped subjects use the OkPat/ErrPat parser shorthand
+        // (in addition to .Ok(_) / .Err(_) implicit-variant arms), so
+        // handle them before the generic KEnum check would mistake the
+        // bespoke patterns for missing coverage.
+        if self.is_result_kind(subj_kind) {
+            mut has_ok: bool = false
+            mut has_err: bool = false
+            for pid in pattern_ids {
+                let pat = self.p.patterns[pid]
+                if pat is .OkPat(_b) {
+                    has_ok = true
+                }
+                if pat is .ErrPat(_b) {
+                    has_err = true
+                }
+                if pat is .ImplicitEnumPat(name, _b2) {
+                    if name == "Ok" {
+                        has_ok = true
+                    }
+                    if name == "Err" {
+                        has_err = true
+                    }
+                }
+            }
+            if has_ok == false {
+                self.report_error("error: match on `T or Error` doesn't cover `Ok(_)`", span: self.p.expr_spans[subject_id])
+            }
+            if has_err == false {
+                self.report_error("error: match on `T or Error` doesn't cover `Err(_)`", span: self.p.expr_spans[subject_id])
+            }
+            return none
+        }
         if subj_kind is .KEnum(enum_idx) {
             let enum_info = self.enums[enum_idx]
             for variant in enum_info.variants {
@@ -624,25 +652,6 @@ type Codegen = struct {
             }
             if has_none == false {
                 self.report_error("error: match on optional doesn't cover `none`", span: self.p.expr_spans[subject_id])
-            }
-        }
-        if subj_kind is .KResult(_inner) {
-            mut has_ok: bool = false
-            mut has_err: bool = false
-            for pid in pattern_ids {
-                let pat = self.p.patterns[pid]
-                if pat is .OkPat(_b) {
-                    has_ok = true
-                }
-                if pat is .ErrPat(_b) {
-                    has_err = true
-                }
-            }
-            if has_ok == false {
-                self.report_error("error: match on `T or Error` doesn't cover `Ok(_)`", span: self.p.expr_spans[subject_id])
-            }
-            if has_err == false {
-                self.report_error("error: match on `T or Error` doesn't cover `Err(_)`", span: self.p.expr_spans[subject_id])
             }
         }
         // An interface's set of implementors isn't enumerable, so a match on
@@ -1044,6 +1053,47 @@ type Codegen = struct {
             return i
         }
         return -1
+    }
+
+    // True if `idx` names the stdlib Result enum — either the template
+    // itself (e.g. when ImplicitEnumVariant resolution falls back to it
+    // for `.Ok` / `.Err`) or any monomorphised instance Result[T, E].
+    func is_result_enum_idx(self, anon idx: int64) -> bool {
+        if idx < 0 or idx >= len(self.enums) {
+            return false
+        }
+        let e = self.enums[idx]
+        if e.template_idx >= 0 {
+            return self.enums[e.template_idx].name == "Result"
+        }
+        return e.name == "Result"
+    }
+
+    // True if `k` represents a fallible result — `T or Error` in the old
+    // KResult form OR a Result[T, E] enum instantiation in the unified
+    // form. Bridge for the in-flight migration off KResult.
+    func is_result_kind(self, anon k: TypeKind) -> bool {
+        if k is .KResult(_inner) {
+            return true
+        }
+        if k is .KEnum(idx) {
+            return self.is_result_enum_idx(idx)
+        }
+        return false
+    }
+
+    // Extract the Ok-payload kind from a Result-shaped TypeKind, or
+    // KVoid if `k` isn't Result-shaped.
+    func result_inner_kind(self, anon k: TypeKind) -> TypeKind {
+        if k is .KResult(inner) {
+            return inner
+        }
+        if k is .KEnum(idx) {
+            if self.is_result_enum_idx(idx) {
+                return self.enums[idx].variants[0].field_kinds[0]
+            }
+        }
+        return .KVoid
     }
 
     func find_struct_idx(self, anon name: str) -> int64 {
@@ -1502,7 +1552,25 @@ type Codegen = struct {
                 }
             }
             .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
-            .Throws(inner) -> return .KResult(inner: self.resolve_type(inner))
+            .Throws(inner) -> {
+                // `T or Error` desugars to Result[T, Error] — a generic
+                // enum instantiation. Falls back to the legacy KResult
+                // kind only if Result hasn't been registered yet (i.e.
+                // while compiling builtins.kod's own preamble).
+                let inner_kind = self.resolve_type(inner)
+                let result_idx = self.find_enum_idx("Result")
+                if result_idx < 0 {
+                    return .KResult(inner: inner_kind)
+                }
+                let error_idx = self.find_iface_idx("Error")
+                if error_idx < 0 {
+                    return .KResult(inner: inner_kind)
+                }
+                let error_kind: TypeKind = .KInterface(idx: error_idx)
+                let type_args: [TypeKind] = [inner_kind, error_kind]
+                let inst_idx = self.instantiate_enum(type_args, template_idx: result_idx)
+                return .KEnum(idx: inst_idx)
+            }
             .Generic(name, args) -> {
                 // Generic instantiation. Monomorphise the template struct
                 // into a fresh concrete entry (Map[str, str] → struct
@@ -1982,8 +2050,8 @@ type Codegen = struct {
                     subj_inner = inner
                 }
                 mut result_inner: TypeKind = .KInt64
-                if self.infer_kind(subject) is .KResult(rinner) {
-                    result_inner = rinner
+                if self.is_result_kind(self.infer_kind(subject)) {
+                    result_inner = self.result_inner_kind(self.infer_kind(subject))
                 }
                 mut subj_enum_idx: int64 = -1
                 if self.infer_kind(subject) is .KEnum(eidx) {
@@ -2141,8 +2209,8 @@ type Codegen = struct {
                     subj_inner = inner
                 }
                 mut result_inner: TypeKind = .KInt64
-                if self.infer_kind(subject) is .KResult(rinner) {
-                    result_inner = rinner
+                if self.is_result_kind(self.infer_kind(subject)) {
+                    result_inner = self.result_inner_kind(self.infer_kind(subject))
                 }
                 // Subject's enum idx, if any — used to pick the right
                 // monomorphised instance for ImplicitEnumPat instead of
@@ -2589,7 +2657,7 @@ type Codegen = struct {
             return .VReg(name: reg)
         }
         // `T or Error` result: test the discriminant (0=Ok, 1=Err).
-        if lhs_kind is .KResult(_inner) {
+        if self.is_result_kind(lhs_kind) {
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
             self.emit(f"ldr {reg}, [{reg}]")
@@ -3853,15 +3921,15 @@ type Codegen = struct {
             }
             .Try(inner) -> {
                 mut k = self.infer_kind(inner)
-                if k is .KResult(inner_kind) {
-                    return inner_kind
+                if self.is_result_kind(k) {
+                    return self.result_inner_kind(k)
                 }
                 return k
             }
             .Must(inner) -> {
                 mut k = self.infer_kind(inner)
-                if k is .KResult(inner_kind) {
-                    return inner_kind
+                if self.is_result_kind(k) {
+                    return self.result_inner_kind(k)
                 }
                 return k
             }
@@ -4504,9 +4572,9 @@ type Codegen = struct {
         }
         // If returning into a Result and the value isn't already a Result,
         // wrap it as .Ok(value) — a 16-byte arena cell {0, value}.
-        if self.return_kind is .KResult(inner) {
+        if self.is_result_kind(self.return_kind) {
             mut already = false
-            if self.infer_kind(value_id) is .KResult(inner2) {
+            if self.is_result_kind(self.infer_kind(value_id)) {
                 already = true
             }
             if already {
