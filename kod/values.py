@@ -80,12 +80,23 @@ class Type:
         return Bool(self.value >= other.value)
 
     def op_mod(self, other: Self) -> Self:
-        """Modulo two integers."""
-        return self.__class__(self.value % other.value)
+        """Modulo two integers. C-style: the result takes the dividend's
+        sign, matching the compiled `sdiv`/`msub` lowering (not Python's
+        floor `%`, which follows the divisor)."""
+        a, b = self.value, other.value
+        q = abs(a) // abs(b)
+        if (a < 0) != (b < 0):
+            q = -q
+        return self.__class__(a - q * b)
 
     def op_div(self, other: Self) -> Self:
-        """Divide two integers."""
-        return self.__class__(self.value // other.value)
+        """Divide two integers, truncating toward zero (ARM64 `sdiv`), not
+        Python's floor division."""
+        a, b = self.value, other.value
+        q = abs(a) // abs(b)
+        if (a < 0) != (b < 0):
+            q = -q
+        return self.__class__(q)
 
     def op_mul(self, other: Self) -> Self:
         """Multiply two integers."""
