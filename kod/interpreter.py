@@ -319,17 +319,32 @@ class Interpreter:
                                 pass
                     for scope in search_scopes:
                         for _, val in scope.items():
+                            # Direct enum type
+                            enum_type = None
                             if (
                                 isinstance(val, type)
                                 and hasattr(val, "variants")
                                 and variant_name in val.variants
                             ):
-                                vinfo = val.variants[variant_name]
+                                enum_type = val
+                            # Generic enum template — the interpreter is
+                            # dynamic, so we can construct the variant off
+                            # the template directly (no monomorphisation
+                            # needed for runtime fields).
+                            elif (
+                                isinstance(val, types.GenericTemplate)
+                                and isinstance(val.template, type)
+                                and hasattr(val.template, "variants")
+                                and variant_name in val.template.variants
+                            ):
+                                enum_type = val.template
+                            if enum_type is not None:
+                                vinfo = enum_type.variants[variant_name]
                                 evaled = [
                                     self.evaluate_expression(module, a) for a in args
                                 ]
                                 fields = {f.id: v for f, v in zip(vinfo.fields, evaled)}
-                                return types.EnumValue(val, variant_name, fields)
+                                return types.EnumValue(enum_type, variant_name, fields)
                     raise ValueError(f"No enum found with variant .{variant_name}")
                 func = self.evaluate_expression(module, callee)
                 args = [self.evaluate_expression(module, arg) for arg in args]
@@ -349,14 +364,24 @@ class Interpreter:
                             pass
                 for scope in search_scopes:
                     for name_, val in scope.items():
+                        enum_type = None
                         if (
                             isinstance(val, type)
                             and hasattr(val, "variants")
                             and variant_name in val.variants
                         ):
-                            variant_info = val.variants[variant_name]
+                            enum_type = val
+                        elif (
+                            isinstance(val, types.GenericTemplate)
+                            and isinstance(val.template, type)
+                            and hasattr(val.template, "variants")
+                            and variant_name in val.template.variants
+                        ):
+                            enum_type = val.template
+                        if enum_type is not None:
+                            variant_info = enum_type.variants[variant_name]
                             if not variant_info.fields:
-                                return types.EnumValue(val, variant_name, {})
+                                return types.EnumValue(enum_type, variant_name, {})
                             raise ValueError(
                                 f"Implicit enum variant .{variant_name} has payload fields; use explicit syntax"
                             )

@@ -440,23 +440,35 @@ def _substitute_type(t, subst: dict):
 
 
 class GenericTemplate:
-    """A parameterized type template (e.g. HashMap[K, V])."""
+    """A parameterized type template (e.g. HashMap[K, V] or Option[T])."""
 
-    def __init__(self, name: str, param_names: list[str], template_struct):
+    def __init__(self, name: str, param_names: list[str], template):
         self.name = name
         self.param_names = param_names
-        self.template_struct = template_struct
+        self.template = template
+        # Back-compat alias for any caller still using the old field name.
+        self.template_struct = template
         self._cache: dict = {}
 
     def instantiate(self, type_args: tuple) -> type:
         if type_args in self._cache:
             return self._cache[type_args]
         subst = dict(zip(self.param_names, type_args))
-        new_fields = [
-            dataclasses.replace(f, type=_substitute_type(f.type, subst))
-            for f in self.template_struct.struct_fields
-        ]
         inst_name = f"{self.name}[{', '.join(t.name for t in type_args)}]"
-        result = StructType.make(inst_name, new_fields, self.template_struct.methods)
+        if isinstance(self.template, type) and issubclass(self.template, EnumType):
+            variants = []
+            for vname, info in self.template.variants.items():
+                new_fields = [
+                    dataclasses.replace(f, type=_substitute_type(f.type, subst))
+                    for f in info.fields
+                ]
+                variants.append((vname, new_fields))
+            result = EnumType.make(inst_name, variants)
+        else:
+            new_fields = [
+                dataclasses.replace(f, type=_substitute_type(f.type, subst))
+                for f in self.template.struct_fields
+            ]
+            result = StructType.make(inst_name, new_fields, self.template.methods)
         self._cache[type_args] = result
         return result
