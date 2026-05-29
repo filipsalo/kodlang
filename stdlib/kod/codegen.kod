@@ -798,6 +798,33 @@ type Codegen = struct {
         }
     }
 
+    // Like spill_across, but for the "stash a value, recycle its register
+    // across a call, then reload into a fresh register" idiom (boxing into
+    // an arena cell, field/index stores). If `reg` is callee-saved the
+    // value survives the call on its own: emit nothing and keep reg
+    // allocated. Otherwise stash to a fresh slot and free reg so the
+    // intervening code can reuse it. Returns whether a spill was emitted;
+    // `preserve_end` then yields the register the value lives in afterward.
+    func preserve_begin(self, anon reg: str) -> bool {
+        if self.is_callee_saved(reg) {
+            return false
+        }
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {reg}, [sp]")
+        self.free_reg(reg)
+        return true
+    }
+
+    func preserve_end(self, anon reg: str, spilled: bool) -> str {
+        if spilled == false {
+            return reg
+        }
+        let r2 = self.alloc_reg()
+        self.emit(f"ldr {r2}, [sp]")
+        self.emit("add sp, sp, #16")
+        return r2
+    }
+
     func free_val(self, anon val: Val) -> none {
         if val is .VReg(name) {
             self.free_reg(name)
@@ -3078,14 +3105,10 @@ type Codegen = struct {
     // input register.
     func emit_iface_box(self, anon arg_reg: str, struct_idx: int64, iface_idx: int64) -> str {
         let vt_lbl = self.register_vtable(struct_idx, iface_idx)
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {arg_reg}, [sp]")
-        self.free_reg(arg_reg)
+        let arg_spilled = self.preserve_begin(arg_reg)
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
-        let data_r = self.alloc_reg()
-        self.emit(f"ldr {data_r}, [sp]")
-        self.emit("add sp, sp, #16")
+        let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.emit(f"str {data_r}, [x0]")
         self.free_reg(data_r)
         let vt_r = self.alloc_reg()
@@ -3118,14 +3141,10 @@ type Codegen = struct {
     // emit_iface_box but reaches a primitive's vtable.
     func emit_prim_iface_box(self, anon arg_reg: str, kind: TypeKind, iface_idx: int64) -> str {
         let vt_lbl = self.register_prim_vtable(iface_idx, :kind)
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {arg_reg}, [sp]")
-        self.free_reg(arg_reg)
+        let arg_spilled = self.preserve_begin(arg_reg)
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
-        let data_r = self.alloc_reg()
-        self.emit(f"ldr {data_r}, [sp]")
-        self.emit("add sp, sp, #16")
+        let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.emit(f"str {data_r}, [x0]")
         self.free_reg(data_r)
         let vt_r = self.alloc_reg()
@@ -3593,16 +3612,12 @@ type Codegen = struct {
                 }
                 let val = self.compile_expr(value_id)
                 let val_reg = self.load(val)
-                self.emit("sub sp, sp, #16")
-                self.emit(f"str {val_reg}, [sp]")
-                self.free_reg(val_reg)
+                let val_spilled = self.preserve_begin(val_reg)
                 self.emit("mov x0, #8")
                 self.emit("bl _arena_alloc")
                 let ptr_reg = self.alloc_reg()
                 self.emit(f"mov {ptr_reg}, x0")
-                let tmp = self.alloc_reg()
-                self.emit(f"ldr {tmp}, [sp]")
-                self.emit("add sp, sp, #16")
+                let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                 self.emit(f"str {tmp}, [{ptr_reg}]")
                 self.free_reg(tmp)
                 return ptr_reg
@@ -3729,17 +3744,13 @@ type Codegen = struct {
                 } else {
                     let wrapped_val = self.compile_expr(value_id)
                     let val_reg = self.load(wrapped_val)
-                    self.emit("sub sp, sp, #16")
-                    self.emit(f"str {val_reg}, [sp]")
-                    self.free_reg(val_reg)
+                    let val_spilled = self.preserve_begin(val_reg)
                     self.emit("mov x0, #8")
                     self.emit("bl _arena_alloc")
                     let ptr_reg = self.alloc_reg()
                     self.emit(f"mov {ptr_reg}, x0")
                     self.emit_str(dest_off, reg: ptr_reg)
-                    let tmp = self.alloc_reg()
-                    self.emit(f"ldr {tmp}, [sp]")
-                    self.emit("add sp, sp, #16")
+                    let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                     self.emit(f"str {tmp}, [{ptr_reg}]")
                     self.free_reg(tmp)
                     self.free_reg(ptr_reg)
@@ -3973,14 +3984,10 @@ type Codegen = struct {
         // the lhs pointer. Stashing matters because the lhs evaluation
         // can itself hit `bl` (e.g. a method call) and clobber rhs_reg.
         let rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {rhs_reg}, [sp]")
-        self.free_reg(rhs_reg)
+        let rhs_spilled = self.preserve_begin(rhs_reg)
         let ptr_val = self.compile_expr(lhs)
         let ptr_reg = self.load(ptr_val)
-        let tmp_reg = self.alloc_reg()
-        self.emit(f"ldr {tmp_reg}, [sp]")
-        self.emit("add sp, sp, #16")
+        let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
         self.emit(f"str {tmp_reg}, [{ptr_reg}, #{self.itos(foff)}]")
         self.free_reg(tmp_reg)
         self.free_reg(ptr_reg)
@@ -4011,9 +4018,7 @@ type Codegen = struct {
                 let rhs_v = self.compile_expr(rhs_id)
                 let rhs_r = self.alloc_reg()
                 self.mov_to(rhs_v, dest: rhs_r)
-                self.emit("sub sp, sp, #16")
-                self.emit(f"str {rhs_r}, [sp]")
-                self.free_reg(rhs_r)
+                let rhs_spilled = self.preserve_begin(rhs_r)
                 let key_val = self.compile_expr(rhs)
                 let key_reg = self.alloc_reg()
                 self.mov_to(key_val, dest: key_reg)
@@ -4021,21 +4026,27 @@ type Codegen = struct {
                 self.mov_to(lhs_val, dest: "x0")
                 self.emit(f"mov x1, {key_reg}")
                 self.free_reg(key_reg)
-                self.emit("ldr x2, [sp]")
-                self.emit("add sp, sp, #16")
+                // rhs is the third arg (x2). If it was spilled, reload from
+                // the slot; if it rode through a callee-saved register, just
+                // move it across.
+                if rhs_spilled {
+                    self.emit("ldr x2, [sp]")
+                    self.emit("add sp, sp, #16")
+                } else {
+                    self.emit(f"mov x2, {rhs_r}")
+                    self.free_reg(rhs_r)
+                }
                 self.emit(f"bl {method_lbl}")
             }
             none -> {
                 let idx_v = self.compile_expr(rhs)
                 let idx_r = self.load(idx_v)
-                // Spill the index to the stack before evaluating the RHS.
-                // If the RHS includes a `bl` (e.g. a struct constructor
-                // calling _arena_alloc) it would clobber whichever reg
-                // idx_r happens to live in, sending the str below to a
-                // wild offset. Reload after the RHS is in hand.
-                self.emit("sub sp, sp, #16")
-                self.emit(f"str {idx_r}, [sp]")
-                self.free_reg(idx_r)
+                // Preserve the index across the RHS *and* the lhs pointer
+                // computation. If either includes a `bl` (e.g. a struct
+                // constructor calling _arena_alloc) it would clobber a
+                // caller-saved idx_r; preserve_begin stashes it then (and
+                // keeps it in a callee-saved register for free otherwise).
+                let idx_spilled = self.preserve_begin(idx_r)
                 // Wrap/box the rhs to match the array's element kind, so
                 // `xs[i] = 42` on a `[int64?]` stores a Some-cell and
                 // `pets[i] = Cat()` on a `[Greet]` stores an iface cell —
@@ -4048,12 +4059,8 @@ type Codegen = struct {
                     else none
                 }
                 let rhs_r = self.compile_value_for_kind(rhs_id, expected: elem_kind)
-                // Stash rhs across the lhs computation too — if the lhs
-                // is `obj.field` and obj's compile chain hits a `bl`,
-                // it'd clobber rhs_r as well.
-                self.emit("sub sp, sp, #16")
-                self.emit(f"str {rhs_r}, [sp]")
-                self.free_reg(rhs_r)
+                // Preserve rhs across the lhs computation too.
+                let rhs_spilled = self.preserve_begin(rhs_r)
                 let arr_val = self.compile_expr(lhs)
                 let arr_ptr_r = self.alloc_reg()
                 self.mov_to(arr_val, dest: arr_ptr_r)
@@ -4062,12 +4069,8 @@ type Codegen = struct {
                 let len_r = self.alloc_reg()
                 self.emit(f"ldr {len_r}, [{arr_ptr_r}, #8]")
                 self.free_reg(arr_ptr_r)
-                let reloaded_rhs_r = self.alloc_reg()
-                self.emit(f"ldr {reloaded_rhs_r}, [sp]")
-                self.emit("add sp, sp, #16")
-                let reloaded_idx_r = self.alloc_reg()
-                self.emit(f"ldr {reloaded_idx_r}, [sp]")
-                self.emit("add sp, sp, #16")
+                let reloaded_rhs_r = self.preserve_end(rhs_r, spilled: rhs_spilled)
+                let reloaded_idx_r = self.preserve_end(idx_r, spilled: idx_spilled)
                 // Normalise negative index: if idx < 0, idx += len.
                 // Then bounds-check via unsigned compare. Mirrors the
                 // read path in compile_index — without the check a
@@ -4219,14 +4222,10 @@ type Codegen = struct {
                 self.emit(f"cmp {reg}, #0")
                 self.emit(f"beq {skip_lbl}")
             }
-            self.emit("sub sp, sp, #16")
-            self.emit(f"str {reg}, [sp]")
-            self.free_reg(reg)
+            let reg_spilled = self.preserve_begin(reg)
             self.emit("mov x0, #8")
             self.emit("bl _arena_alloc")
-            let tmp = self.alloc_reg()
-            self.emit(f"ldr {tmp}, [sp]")
-            self.emit("add sp, sp, #16")
+            let tmp = self.preserve_end(reg, spilled: reg_spilled)
             self.emit(f"str {tmp}, [x0]")
             self.free_reg(tmp)
             if conditional {
@@ -4259,14 +4258,10 @@ type Codegen = struct {
         let val = self.compile_expr(value_id)
         let reg = self.alloc_reg()
         self.mov_to(val, dest: reg)
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {reg}, [sp]")
-        self.free_reg(reg)
+        let reg_spilled = self.preserve_begin(reg)
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
-        let payload = self.alloc_reg()
-        self.emit(f"ldr {payload}, [sp]")
-        self.emit("add sp, sp, #16")
+        let payload = self.preserve_end(reg, spilled: reg_spilled)
         self.emit("str xzr, [x0]")              // discriminant = 0 (Ok)
         self.emit(f"str {payload}, [x0, #8]")   // payload
         self.free_reg(payload)
@@ -4330,14 +4325,10 @@ type Codegen = struct {
             reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
         }
         // Build the Result.Err cell.
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {reg}, [sp]")
-        self.free_reg(reg)
+        let reg_spilled = self.preserve_begin(reg)
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
-        let payload = self.alloc_reg()
-        self.emit(f"ldr {payload}, [sp]")
-        self.emit("add sp, sp, #16")
+        let payload = self.preserve_end(reg, spilled: reg_spilled)
         self.emit("mov x9, #1")
         self.emit("str x9, [x0]")               // discriminant = 1 (Err)
         self.emit(f"str {payload}, [x0, #8]")   // error iface ptr
