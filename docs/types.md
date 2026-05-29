@@ -192,3 +192,23 @@ func main() -> int64 {
     return n
 }
 ```
+
+To inspect a result instead of propagating or panicking, pattern-match it
+with `Ok` / `Err` (the two-armed analog of `Some` / `none`). `Ok`'s binding
+has the result's value type; `Err`'s is the `Error` interface:
+
+```kod
+match read_size("missing.txt") {
+    Ok(n)  -> print_int(n)
+    Err(e) -> print(e.to_str())
+}
+```
+
+The same patterns work with `if … is` and the bare `is` operator, which is
+handy in tests:
+
+```kod
+let r = read_size("missing.txt")
+assert r is Err(_)              // it failed
+if r is Err(e) { print(e.to_str()) }
+```
