@@ -521,7 +521,22 @@ type Codegen = struct {
                 needs_result = true
             }
         }
+        mut needs_interface: bool = false
+        for arm_id in arms {
+            if self.p.patterns[self.p.match_arms[arm_id].pattern] is .TypePat(_t, _b) {
+                needs_interface = true
+            }
+        }
         let subj_kind = self.infer_kind(subject_id)
+        if needs_interface {
+            mut is_iface: bool = false
+            if subj_kind is .KInterface(_idx) {
+                is_iface = true
+            }
+            if is_iface == false {
+                self.report_error("error: `is` / `match` with a type pattern requires an interface value", span: self.p.expr_spans[subject_id])
+            }
+        }
         if needs_optional {
             mut is_optional: bool = false
             if subj_kind is .KOptional(_inner) {
@@ -621,6 +636,11 @@ type Codegen = struct {
             if has_err == false {
                 self.report_error("error: match on `T or Error` doesn't cover `Err(_)`", span: self.p.expr_spans[subject_id])
             }
+        }
+        // An interface's set of implementors isn't enumerable, so a match on
+        // one is only exhaustive with an `else` (handled by the early return).
+        if subj_kind is .KInterface(_idx) {
+            self.report_error("error: match on an interface requires an `else` arm", span: self.p.expr_spans[subject_id])
         }
         if subj_kind is .KBool {
             mut has_true: bool = false
@@ -1918,6 +1938,11 @@ type Codegen = struct {
                                 self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
                             }
                         }
+                        .TypePat(type_name, binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: .KStruct(idx: self.find_struct_idx(type_name), type_args: []))
+                            }
+                        }
                         .EnumPat(enum_name, variant_name, bindings) -> {
                             let enum_idx = self.find_enum_idx(enum_name)
                             mut variant_idx = -1
@@ -2063,6 +2088,11 @@ type Codegen = struct {
                         .ErrPat(binding) -> {
                             if len(binding) > 0 and self.var_declared(binding) == false {
                                 self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
+                            }
+                        }
+                        .TypePat(type_name, binding) -> {
+                            if len(binding) > 0 and self.var_declared(binding) == false {
+                                self.alloc_var(name: binding, kind: .KStruct(idx: self.find_struct_idx(type_name), type_args: []))
                             }
                         }
                         .EnumPat(enum_name, variant_name, bindings) -> {
@@ -2453,6 +2483,27 @@ type Codegen = struct {
 
     func compile_is(self, lhs: int64, rhs: int64) -> Val {
         let lhs_kind = self.infer_kind(lhs)
+        // Interface downcast: `e is StructType` — compare the value's vtable
+        // (cell offset 8) against the (StructType, iface) vtable's address.
+        if lhs_kind is .KInterface(iface_idx) {
+            let type_name = self.is_pattern_name(rhs)
+            let struct_idx = self.find_struct_idx(type_name)
+            if struct_idx < 0 {
+                self.report_error(f"error: `is {type_name}` — `{type_name}` is not a struct type", span: self.p.expr_spans[rhs])
+                return .VImm(value: 0)
+            }
+            let vt_lbl = self.register_vtable(struct_idx, iface_idx)
+            let ptr_v = self.compile_expr(lhs)
+            mut reg = self.load(ptr_v)
+            self.emit(f"ldr {reg}, [{reg}, #8]")
+            let exp = self.alloc_reg()
+            self.emit(f"adrp {exp}, {vt_lbl}@PAGE")
+            self.emit(f"add {exp}, {exp}, {vt_lbl}@PAGEOFF")
+            self.emit(f"cmp {reg}, {exp}")
+            self.emit(f"cset {reg}, eq")
+            self.free_reg(exp)
+            return .VReg(name: reg)
+        }
         // `T or Error` result: test the discriminant (0=Ok, 1=Err).
         if lhs_kind is .KResult(_inner) {
             let ptr_v = self.compile_expr(lhs)
@@ -2649,6 +2700,42 @@ type Codegen = struct {
             self.free_reg(val_r)
             self.free_reg(ptr_r)
         }
+    }
+
+    // Emit a `TypePat` arm's test: compare the interface value's vtable
+    // (cell offset 8) against the (type_name, iface) vtable; branch to
+    // skip_lbl on mismatch. On match, bind the concrete pointer (offset 0)
+    // — typed `KStruct` — into `binding`'s slot.
+    func emit_typepat_test(self, type_name: str, binding: str, subject_id: int64, subj_slot: int64, skip_lbl: str) -> none {
+        let struct_idx = self.find_struct_idx(type_name)
+        if struct_idx < 0 {
+            self.report_error(f"error: `{type_name}` is not a struct type", span: self.p.expr_spans[subject_id])
+            return none
+        }
+        mut iface_idx = -1
+        if self.infer_kind(subject_id) is .KInterface(ii) {
+            iface_idx = ii
+        }
+        let vt_lbl = self.register_vtable(struct_idx, iface_idx)
+        let ptr_r = self.alloc_reg()
+        self.emit_ldr(subj_slot, reg: ptr_r)
+        let vt_r = self.alloc_reg()
+        self.emit(f"ldr {vt_r}, [{ptr_r}, #8]")
+        let exp_r = self.alloc_reg()
+        self.emit(f"adrp {exp_r}, {vt_lbl}@PAGE")
+        self.emit(f"add {exp_r}, {exp_r}, {vt_lbl}@PAGEOFF")
+        self.emit(f"cmp {vt_r}, {exp_r}")
+        self.emit(f"bne {skip_lbl}")
+        self.free_reg(vt_r)
+        self.free_reg(exp_r)
+        if len(binding) > 0 {
+            let boff = self.find_var_offset(binding)
+            let dv_r = self.alloc_reg()
+            self.emit(f"ldr {dv_r}, [{ptr_r}]")
+            self.emit_str(boff, reg: dv_r)
+            self.free_reg(dv_r)
+        }
+        self.free_reg(ptr_r)
     }
 
     func compile_str_eq(self, lhs_id: int64, rhs_id: int64, negate: bool) -> Val {
@@ -3461,6 +3548,13 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
+                    let body_val = self.compile_expr(arm.body)
+                    self.mov_to(body_val, dest: result_r)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .TypePat(type_name, binding) -> {
+                    self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
                     let body_val = self.compile_expr(arm.body)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
@@ -4962,6 +5056,14 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
+                    for stmt_id in arm.body {
+                        self.compile_stmt(stmt_id)
+                    }
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
+                .TypePat(type_name, binding) -> {
+                    self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
                     for stmt_id in arm.body {
                         self.compile_stmt(stmt_id)
                     }
