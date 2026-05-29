@@ -8,6 +8,7 @@ from typing import Any, Optional, Self, Union
 from kod import tokens
 from kod import values as types
 from kod.filesys import FileWrapper
+from kod.lexer import process_escapes
 from kod.parser import Parser
 from kod.span import Span
 
@@ -166,8 +167,7 @@ class StringLiteral(ASTNode, Literal):
         raw = token.value
         if len(raw) >= 6 and raw.startswith('"""') and raw.endswith('"""'):
             body = _dedent_triple_body(raw[3:-3])
-            text = body.encode().decode("unicode-escape")
-            bytes_ = text.encode("utf8")
+            bytes_ = process_escapes(body).encode("utf8")
         else:
             bytes_ = raw.strip('"').encode("utf8")
         value = types.String(bytes_)
@@ -187,8 +187,9 @@ def _parse_fstring(parser: Parser) -> ASTNode:
     span = token.span
 
     def make_str(text: str) -> StringLiteral:
-        raw = text.encode().decode("unicode-escape")
-        return StringLiteral(types.String(raw.encode("utf8")), span=span)
+        return StringLiteral(
+            types.String(process_escapes(text).encode("utf8")), span=span
+        )
 
     def parse_expr(expr_text: str) -> ASTNode:
         sub_tokens = Lexer(expr_text, span.filename).lex()

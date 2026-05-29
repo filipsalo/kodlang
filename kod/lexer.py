@@ -102,6 +102,36 @@ KEYWORDS = {
     "none": NoneLiteral,
 }
 
+_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "\\": "\\",
+    "'": "'",
+    "0": "\0",
+    '"': '"',
+}
+
+
+def process_escapes(s: str) -> str:
+    """Process backslash escapes in a string body, mirroring the self-hosted
+    parsing.kod `unescape_str`. Unlike `s.encode().decode("unicode-escape")`
+    (the old approach), this leaves non-ASCII UTF-8 intact instead of
+    re-decoding each byte as latin-1. Unknown escapes drop both characters
+    and a trailing lone backslash is kept literally — matching unescape_str."""
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            i += 1
+            repl = _ESCAPES.get(s[i])
+            if repl is not None:
+                out.append(repl)
+        else:
+            out.append(s[i])
+        i += 1
+    return "".join(out)
+
 
 class Lexer:
     """A lexer for the kod language."""
@@ -207,7 +237,7 @@ class Lexer:
                 self.pos += 1
         self.consume('"')
         string: StringLiteral = self.build(StringLiteral)
-        string.value = string.value.encode().decode("unicode-escape")
+        string.value = process_escapes(string.value)
         return string
 
     def lex_fstring(self) -> FStringLiteral:
