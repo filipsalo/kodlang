@@ -1501,7 +1501,7 @@ class MatchExpression(ASTNode):
             parser.consume(tokens.OpenCurly)
             arms = []
             while not parser.try_consume(tokens.CloseCurly):
-                if parser.try_consume(tokens.EOL):
+                if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
                     continue
                 arms.append(MatchExpressionArm.parse(parser))
         return cls(expression, arms, span)
@@ -1631,7 +1631,7 @@ class MatchStatement(ASTNode):
             parser.consume(tokens.OpenCurly)
             arms = []
             while not parser.try_consume(tokens.CloseCurly):
-                if parser.try_consume(tokens.EOL):
+                if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
                     continue
                 arms.append(MatchArm.parse(parser))
         return cls(expression, arms, span)
