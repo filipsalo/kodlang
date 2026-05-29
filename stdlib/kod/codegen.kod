@@ -273,8 +273,14 @@ type Codegen = struct {
     ret_lbl: str = ""
     return_kind: TypeKind = .KVoid
 
-    // The general-purpose register pool, most-recently-freed last.
-    free_regs: [str] = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
+    // The general-purpose register pool, most-recently-freed last (alloc
+    // pops the tail). Callee-saved x19-x27 sit at the tail so they're
+    // handed out first: a value in a callee-saved register survives any
+    // `bl` for free (the callee restores it), so the common shallow
+    // expressions never need a spill. Only deeper expressions spill into
+    // the caller-saved x8-x15 at the front, which still get stack-spilled
+    // around calls.
+    free_regs: [str] = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
 
     loop_stack: [LoopLbl] = []
 
@@ -347,6 +353,14 @@ type Codegen = struct {
     // foundation for later post-codegen passes (peephole / register
     // allocation) that need to see and rewrite the emitted stream.
     out_buf: [str] = []
+
+    // Per-function callee-saved register accounting. `cs_in_use` is the
+    // number of callee-saved pool registers (x19-x27) currently allocated;
+    // `cs_high_water` its maximum over the function. compile_func saves
+    // exactly that many in the prologue (so values parked in them survive
+    // calls without per-call spills) and restores them in the epilogue.
+    cs_in_use: int64 = 0
+    cs_high_water: int64 = 0
 
 
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
@@ -717,6 +731,22 @@ type Codegen = struct {
     }
 
 
+    // ARM64 callee-saved general registers we draw from the pool. A value
+    // parked in one of these survives any `bl` we emit — the callee (our
+    // own functions and the C runtime alike) restores them per AAPCS — so
+    // it needs no spill around a call. compile_func saves the ones a
+    // function uses in its prologue. x28 is never pool-allocated; it only
+    // appears as the pad register when an odd number of callee-saved regs
+    // is saved (stp works in pairs).
+    func is_callee_saved(self, anon reg: str) -> bool {
+        return reg == "x19" or reg == "x20" or reg == "x21" or reg == "x22" or reg == "x23" or reg == "x24" or reg == "x25" or reg == "x26" or reg == "x27"
+    }
+
+    func cs_reg(self, anon n: int64) -> str {
+        let names: [str] = ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
+        return names[n]
+    }
+
     func alloc_reg(self) -> str {
         let n = len(self.free_regs)
         let reg = self.free_regs[-1]
@@ -727,6 +757,12 @@ type Codegen = struct {
             i = i + 1
         }
         self.free_regs = new_regs
+        if self.is_callee_saved(reg) {
+            self.cs_in_use = self.cs_in_use + 1
+            if self.cs_in_use > self.cs_high_water {
+                self.cs_high_water = self.cs_in_use
+            }
+        }
         return reg
     }
 
@@ -736,7 +772,30 @@ type Codegen = struct {
         if reg == "x0" or reg == "x1" or reg == "x2" or reg == "x3" or reg == "x4" or reg == "x5" or reg == "x6" or reg == "x7" {
             return
         }
+        if self.is_callee_saved(reg) {
+            self.cs_in_use = self.cs_in_use - 1
+        }
         self.free_regs += [reg]
+    }
+
+    // Stash `reg` to a fresh 16-byte stack slot so its value survives a
+    // call-bearing sub-expression — UNLESS reg is callee-saved, in which
+    // case it's preserved for free and we emit nothing. Returns true iff a
+    // spill was emitted; pass that to the matching `restore_across`.
+    func spill_across(self, anon reg: str) -> bool {
+        if self.is_callee_saved(reg) {
+            return false
+        }
+        self.emit("sub sp, sp, #16")
+        self.emit(f"str {reg}, [sp]")
+        return true
+    }
+
+    func restore_across(self, anon reg: str, spilled: bool) -> none {
+        if spilled {
+            self.emit(f"ldr {reg}, [sp]")
+            self.emit("add sp, sp, #16")
+        }
     }
 
     func free_val(self, anon val: Val) -> none {
@@ -2357,12 +2416,10 @@ type Codegen = struct {
             self.emit(f"mov {lhs_reg}, {lv_r}")
         }
         self.free_reg(lv_r)
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {lhs_reg}, [sp]")
+        let lhs_spilled = self.spill_across(lhs_reg)
         let rhs_val = self.compile_expr(rhs_id)
         let rhs_reg = self.load_enum_or_val(rhs_val, expr_id: rhs_id)
-        self.emit(f"ldr {lhs_reg}, [sp]")
-        self.emit("add sp, sp, #16")
+        self.restore_across(lhs_reg, spilled: lhs_spilled)
         let result = self.alloc_reg()
         match op {
             .Eq -> {
@@ -2435,12 +2492,10 @@ type Codegen = struct {
         self.mov_to(rhs_val, dest: rhs_reg)
         // Stash rhs to the stack so the lhs compilation (which may bl)
         // doesn't clobber rr's pool register.
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {rhs_reg}, [sp]")
+        let rhs_spilled = self.spill_across(rhs_reg)
         let lhs_val = self.compile_expr(lhs_id)
         self.mov_to(lhs_val, dest: "x0")
-        self.emit(f"ldr {rhs_reg}, [sp]")
-        self.emit("add sp, sp, #16")
+        self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
         self.free_reg(rhs_reg)
         // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
@@ -2506,14 +2561,13 @@ type Codegen = struct {
         let rhs_reg = self.alloc_reg()
         self.mov_to(rhs_val, dest: rhs_reg)
         // Save rhs to the stack so it survives any bl calls inside lhs
-        // compilation (pool registers x8-x15 are caller-saved and would
-        // be clobbered by an inner _kod_str_concat for chained concats).
-        self.emit("sub sp, sp, #16")
-        self.emit(f"str {rhs_reg}, [sp]")
+        // compilation (caller-saved pool registers would be clobbered by
+        // an inner _kod_str_concat for chained concats). Callee-saved
+        // registers survive on their own, so spill_across skips the stash.
+        let rhs_spilled = self.spill_across(rhs_reg)
         let lhs_val = self.compile_expr(lhs_id)
         self.mov_to(lhs_val, dest: "x0")
-        self.emit(f"ldr {rhs_reg}, [sp]")
-        self.emit("add sp, sp, #16")
+        self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
         self.free_reg(rhs_reg)
         self.emit("bl _kod_str_concat")
@@ -3722,11 +3776,9 @@ type Codegen = struct {
             // Stash ptr_r across the call so it survives any bl in the
             // field expression (constructor calls, arena_alloc for
             // wrapping an optional, etc).
-            self.emit("sub sp, sp, #16")
-            self.emit(f"str {ptr_r}, [sp]")
+            let ptr_spilled = self.spill_across(ptr_r)
             let field_reg = self.compile_value_for_kind(arg.value, expected: field_kind)
-            self.emit(f"ldr {ptr_r}, [sp]")
-            self.emit("add sp, sp, #16")
+            self.restore_across(ptr_r, spilled: ptr_spilled)
             self.emit(f"str {field_reg}, [{ptr_r}, #{self.itos(foff)}]")
             self.free_reg(field_reg)
         }
@@ -3777,11 +3829,9 @@ type Codegen = struct {
                     }
                 }
                 if was_provided == false {
-                    self.emit("sub sp, sp, #16")
-                    self.emit(f"str {ptr_r}, [sp]")
+                    let dptr_spilled = self.spill_across(ptr_r)
                     let dreg = self.compile_value_for_kind(field.default_expr, expected: field.kind)
-                    self.emit(f"ldr {ptr_r}, [sp]")
-                    self.emit("add sp, sp, #16")
+                    self.restore_across(ptr_r, spilled: dptr_spilled)
                     self.emit(f"str {dreg}, [{ptr_r}, #{self.itos(field.offset)}]")
                     self.free_reg(dreg)
                 }
@@ -3820,11 +3870,9 @@ type Codegen = struct {
                 }
                 // Stash ptr_r across the call so it survives any bl in the
                 // field expression (constructor calls, optional wrap, etc).
-                self.emit("sub sp, sp, #16")
-                self.emit(f"str {ptr_r}, [sp]")
+                let eptr_spilled = self.spill_across(ptr_r)
                 let field_reg = self.compile_value_for_kind(field_args[i].value, expected: field_kind)
-                self.emit(f"ldr {ptr_r}, [sp]")
-                self.emit("add sp, sp, #16")
+                self.restore_across(ptr_r, spilled: eptr_spilled)
                 self.emit(f"str {field_reg}, [{ptr_r}, #{self.itos(8 + foff)}]")
                 self.free_reg(field_reg)
                 i = i + 1
@@ -4756,7 +4804,9 @@ type Codegen = struct {
         self.check_param_order(func_decl, func_decl.name)
         self.vars = []
         self.frame_slots = 0
-        self.free_regs = ["x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19", "x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8"]
+        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+        self.cs_in_use = 0
+        self.cs_high_water = 0
         self.loop_stack = []
 
         for param in func_decl.params {
@@ -4798,6 +4848,16 @@ type Codegen = struct {
 
         self.emit_globl(func_lbl)
         self.emit_label(func_lbl)
+
+        // Compile the body into a private buffer so the callee-saved
+        // save/restore (whose count is only known once `cs_high_water` is
+        // final) can be spliced in around it: pushes go between the label
+        // and the frame prologue, pops go just before `ret`. The pushes
+        // live *outside* the existing frame, so every fp-relative local
+        // and sp-relative spill in the body keeps its exact offset.
+        let saved_buf = self.out_buf
+        self.out_buf = []
+
         self.emit(f"sub sp, sp, #{self.itos(aligned + 16)}")
         self.emit(f"stp fp, lr, [sp, #{self.itos(aligned)}]")
         self.emit(f"add fp, sp, #{self.itos(aligned)}")
@@ -4819,6 +4879,30 @@ type Codegen = struct {
         self.emit_label(self.ret_lbl)
         self.emit(f"ldp fp, lr, [sp, #{self.itos(aligned)}]")
         self.emit(f"add sp, sp, #{self.itos(aligned + 16)}")
+
+        let body_buf = self.out_buf
+        self.out_buf = saved_buf
+
+        // Round the callee-saved count up to an even number of registers
+        // (stp/ldp move pairs); the pad slot uses x28, which is never
+        // pool-allocated, so saving/restoring it is a harmless no-op.
+        let cs = self.cs_high_water
+        if cs % 2 != 0 {
+            cs = cs + 1
+        }
+        let pi = 0
+        for pi < cs {
+            self.emit(f"stp {self.cs_reg(pi)}, {self.cs_reg(pi + 1)}, [sp, #-16]!")
+            pi = pi + 2
+        }
+        for line in body_buf {
+            self.out_buf += [line]
+        }
+        let qi = cs
+        for qi > 0 {
+            self.emit(f"ldp {self.cs_reg(qi - 2)}, {self.cs_reg(qi - 1)}, [sp], #16")
+            qi = qi - 2
+        }
         self.emit("ret")
     }
 
