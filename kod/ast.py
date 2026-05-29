@@ -325,6 +325,7 @@ class FunctionParam(ASTNode):
     anonymous: bool
     span: Span
     label: Optional[str] = None
+    mutable: bool = False
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
@@ -333,6 +334,9 @@ class FunctionParam(ASTNode):
             anonymous = False
             if parser.try_consume(tokens.Anon):
                 anonymous = True
+            # `mut` (after optional `anon`) makes the param binding
+            # reassignable inside the body; callee-local, no call-site effect.
+            mutable = bool(parser.try_consume(tokens.Mut))
             first = parser.consume(tokens.Identifier)
             # Optional second identifier: Swift-style label / binding split.
             second = None
@@ -347,7 +351,7 @@ class FunctionParam(ASTNode):
             else:
                 label = None if anonymous else first.value
                 variable = Variable(first.value, type_, span=first.span)
-        return cls(variable, anonymous, span, label)
+        return cls(variable, anonymous, span, label, mutable=mutable)
 
 
 @dataclasses.dataclass
