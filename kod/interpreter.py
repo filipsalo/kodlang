@@ -98,6 +98,19 @@ class Interpreter:
             return callee.id
         return ""
 
+    def _is_result_value(self, v):
+        """True if `v` is already a fallible-result carrier — the legacy
+        ResultValue dataclass OR an EnumValue of stdlib Result[T, E]
+        (template or any monomorphisation). Used by call_function to
+        avoid double-wrapping `.Ok(...)` / `.Err(...)` returns."""
+        if isinstance(v, types.ResultValue):
+            return True
+        if isinstance(v, types.EnumValue):
+            name = getattr(v.enum_type, "name", "")
+            if name == "Result" or name.startswith("Result["):
+                return True
+        return False
+
     def assign(self, module, name, value):
         """Assign a value to a variable"""
         match name:
@@ -877,7 +890,7 @@ class Interpreter:
             if all_params and not all_params[0].mutable:
                 param_immutable.add("self")
             self.immutable_stack.append(param_immutable)
-            fallible = isinstance(func.return_type, ast.ResultTypeExpr)
+            fallible = ast.is_result_type_expr(func.return_type)
             try:
                 for statement in func.body:
                     self.execute_statement(func.module, statement)
@@ -885,6 +898,8 @@ class Interpreter:
                     return types.ResultValue(True, types.none_value)
             except ReturnValue as return_value:
                 if fallible:
+                    if self._is_result_value(return_value.value):
+                        return return_value.value
                     return types.ResultValue(True, return_value.value)
                 return return_value.value
             except ThrownError as thrown:
@@ -907,7 +922,7 @@ class Interpreter:
         self.immutable_stack.append(
             {p.variable.id for p in func.params if not p.mutable}
         )
-        fallible = isinstance(func.return_type, ast.ResultTypeExpr)
+        fallible = ast.is_result_type_expr(func.return_type)
         try:
             for statement in func.body:
                 self.execute_statement(func.module, statement)
@@ -915,6 +930,8 @@ class Interpreter:
                 return types.ResultValue(True, types.none_value)
         except ReturnValue as return_value:
             if fallible:
+                if self._is_result_value(return_value.value):
+                    return return_value.value
                 return types.ResultValue(True, return_value.value)
             return return_value.value
         except ThrownError as thrown:

@@ -134,7 +134,15 @@ class Parser:
                     f"unsupported `or` clause in type: only `or Error` is allowed, got `or {err_name}`",
                     self.peek().span,
                 )
-            base = ast.ResultTypeExpr(base)
+            # `T or Error` desugars to Result[T, Error] — the unified
+            # tagged-sum representation. Idempotent under repetition:
+            # `(T or Error) or Error` collapses back to the same shape.
+            if ast.is_result_type_expr(base):
+                continue
+            base = ast.GenericTypeExpr(
+                ast.NamedTypeExpr("Result"),
+                (base, ast.NamedTypeExpr("Error")),
+            )
         return base
 
     def _parse_base_type_expr(self, name=None) -> ast.TypeExpr:

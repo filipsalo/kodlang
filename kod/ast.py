@@ -89,6 +89,21 @@ TypeExpr = Union[
 ]
 
 
+def is_result_type_expr(expr) -> bool:
+    """True if `expr` denotes a fallible-result type — either the legacy
+    ResultTypeExpr or a generic instantiation `Result[T, Error]`. Bridge
+    for the in-flight unification of `T or Error` onto the stdlib Result
+    enum; once ResultTypeExpr goes away this collapses to the GenericTypeExpr
+    check."""
+    if isinstance(expr, ResultTypeExpr):
+        return True
+    if isinstance(expr, GenericTypeExpr):
+        base = expr.base
+        if isinstance(base, NamedTypeExpr) and base.name == "Result":
+            return True
+    return False
+
+
 def dump(node, indent=""):
     """Dump the AST node."""
     print(f"{indent}{node.__class__.__name__}(")
