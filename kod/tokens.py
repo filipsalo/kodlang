@@ -233,6 +233,11 @@ class Let(Token):
 
 
 @dataclasses.dataclass
+class Mut(Token):
+    """A mut statement (mutable binding)."""
+
+
+@dataclasses.dataclass
 class Anon(Token):
     """An anon specifier."""
 

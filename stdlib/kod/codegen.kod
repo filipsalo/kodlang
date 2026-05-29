@@ -183,6 +183,10 @@ type VarSlot = struct {
     name: str
     offset: int64
     kind: TypeKind
+    // Whether bare reassignment (`name = …`) is allowed. Defaults to true so
+    // params, pattern/loop bindings, and synthesized slots stay mutable; only
+    // an immutable `let` binding flips this to false (set in compile_let).
+    mutable: bool = true
 }
 
 // ── Expression result (what compile_expr returns) ─────────────────────────────
@@ -948,6 +952,27 @@ type Codegen = struct {
             }
             i = i + 1
         }
+        return false
+    }
+
+    // Whether the most-recently-declared slot for `name` permits bare
+    // reassignment. Returns true when not found so missing-variable
+    // diagnostics stay the responsibility of the offset lookup.
+    func find_var_mutable(self, anon name: str) -> bool {
+        let i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].mutable
+            }
+            i = i - 1
+        }
+        return true
+    }
+
+    // Master switch for immutable-binding enforcement. Flipped to true in
+    // the enforcement phase once the codebase has been migrated to `mut`;
+    // while false, codegen output is unchanged.
+    func enforce_immutability(self) -> bool {
         return false
     }
 
@@ -1893,7 +1918,7 @@ type Codegen = struct {
 
     func collect_stmt_vars(self, stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
-            .Let(name, typ, value) -> {
+            .Let(name, typ, value, _mutable) -> {
                 if self.var_declared(name) == false {
                     let kind = self.resolve_type(typ)
                     // No annotation: infer the kind now so downstream
@@ -3538,7 +3563,7 @@ type Codegen = struct {
 
     func compile_stmt(self, anon stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
-            .Let(name, typ, value) -> self.compile_let(:name, :typ, :value)
+            .Let(name, typ, value, mutable) -> self.compile_let(:name, :typ, :value, :mutable)
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
             .PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs_id: lhs, rhs_id: rhs)
             .MinusAssign(lhs, rhs) -> self.compile_minus_assign(lhs_id: lhs, rhs_id: rhs)
@@ -3559,16 +3584,21 @@ type Codegen = struct {
         }
     }
 
-    func compile_let(self, name: str, typ: int64, value: int64) -> none {
+    func compile_let(self, name: str, typ: int64, value: int64, mutable: bool) -> none {
         let off = self.find_var_offset(name)
         let kind = self.resolve_type(typ)
         if kind is .KVoid {
             kind = self.infer_kind(value)
         }
+        // Update the slot's kind and mutability for this (re)declaration.
+        // The flat per-function slot model means a re-`let`/`mut` of the same
+        // name reuses the slot, so the most recent declaration wins — which
+        // is what we want for the assignment check that follows in source order.
         let i = 0
         for i < len(self.vars) {
             if self.vars[i].name == name {
                 self.vars[i].kind = kind
+                self.vars[i].mutable = mutable
                 i = len(self.vars)
             } else {
                 i = i + 1
@@ -4104,6 +4134,10 @@ type Codegen = struct {
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         match self.p.exprs[lhs_id] {
             .Ident(name) -> {
+                if self.enforce_immutability() and self.find_var_mutable(name) == false {
+                    self.report_error("cannot reassign immutable binding `" + name + "`; declare it with `mut`", span: self.p.expr_spans[lhs_id])
+                    return none
+                }
                 let off = self.find_var_offset(name)
                 let kind = self.find_var_kind(name)
                 self.compile_store(dest_off: off, :kind, value_id: rhs_id)

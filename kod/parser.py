@@ -33,6 +33,7 @@ from kod.tokens import (
     Interface,
     Let,
     Match,
+    Mut,
     NoneLiteral,
     OpenBracket,
     OpenCurly,
@@ -272,7 +273,7 @@ class Parser:
                 stmt = ast.IfStatement.parse(self)
             case For():
                 stmt = ast.ForStatement.parse(self)
-            case Let():
+            case Let() | Mut():
                 stmt = ast.VariableDeclaration.parse(self)
             case Type():
                 stmt = ast.TypeDeclaration.parse(self)

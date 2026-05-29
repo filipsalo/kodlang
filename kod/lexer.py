@@ -47,6 +47,7 @@ from kod.tokens import (
     Minus,
     MinusEqual,
     Must,
+    Mut,
     NoneLiteral,
     NotEqual,
     OpenBracket,
@@ -72,6 +73,7 @@ from kod.tokens import (
 KEYWORDS = {
     "import": Import,
     "let": Let,
+    "mut": Mut,
     "extern": Extern,
     "func": Func,
     "anon": Anon,

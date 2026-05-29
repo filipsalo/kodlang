@@ -729,14 +729,22 @@ class VariableDeclaration(ASTNode):
     variable: Variable
     value: ASTNode
     span: Span
+    mutable: bool = False
 
     @classmethod
     def parse(cls, parser: Parser) -> "VariableDeclaration | LetElseStatement":
         """Parse a variable declaration, or a `let .Pat = expr else { ... }`."""
         with parser.span() as span:
-            parser.consume(tokens.Let)
-            # Refutable form: `let .Variant(b1, b2, ...) = expr else { ... }`.
-            if parser.peeking_at(tokens.Dot):
+            if parser.peeking_at(tokens.Mut):
+                parser.consume(tokens.Mut)
+                mutable = True
+            else:
+                parser.consume(tokens.Let)
+                mutable = False
+            # Refutable form (`let .Variant(...) = expr else {...}`) is
+            # let-only; `mut .Pat` falls through to Variable.parse, which
+            # errors on the `.` just like the self-hosted parser.
+            if not mutable and parser.peeking_at(tokens.Dot):
                 parser.consume(tokens.Dot)
                 variant_name = parser.consume(tokens.Identifier).value
                 bindings = []
@@ -764,7 +772,7 @@ class VariableDeclaration(ASTNode):
             parser.stack[-1][variable.id] = variable
             parser.consume(tokens.Equal)
             value = Expression.parse(parser)
-        return cls(variable, value, span)
+        return cls(variable, value, span, mutable=mutable)
 
 
 @dataclasses.dataclass
