@@ -29,10 +29,6 @@ type TypeKind = enum {
     KArrayInterface(elem_idx: int64)
     KArrayOptional(inner: TypeKind)
     KInterface(idx: int64)
-    // Fallible result `T or Error`. Runtime cell is 16 bytes:
-    //   {discriminant: 0=Ok|1=Err, payload: inner value or Error iface ptr}.
-    // Variables of this type hold an arena pointer to that cell.
-    KResult(inner: TypeKind)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -1069,13 +1065,9 @@ type Codegen = struct {
         return e.name == "Result"
     }
 
-    // True if `k` represents a fallible result — `T or Error` in the old
-    // KResult form OR a Result[T, E] enum instantiation in the unified
-    // form. Bridge for the in-flight migration off KResult.
+    // True if `k` represents a fallible result — i.e. an instantiation
+    // of the stdlib Result enum, which is what `T or Error` desugars to.
     func is_result_kind(self, anon k: TypeKind) -> bool {
-        if k is .KResult(_inner) {
-            return true
-        }
         if k is .KEnum(idx) {
             return self.is_result_enum_idx(idx)
         }
@@ -1085,9 +1077,6 @@ type Codegen = struct {
     // Extract the Ok-payload kind from a Result-shaped TypeKind, or
     // KVoid if `k` isn't Result-shaped.
     func result_inner_kind(self, anon k: TypeKind) -> TypeKind {
-        if k is .KResult(inner) {
-            return inner
-        }
         if k is .KEnum(idx) {
             if self.is_result_enum_idx(idx) {
                 return self.enums[idx].variants[0].field_kinds[0]
@@ -1306,7 +1295,6 @@ type Codegen = struct {
             .KEnum(idx) -> return self.enums[idx].name
             .KInterface(idx) -> return self.interfaces[idx].name
             .KOptional(inner) -> return f"{self.kind_display(inner)}?"
-            .KResult(inner) -> return f"{self.kind_display(inner)} or Error"
             .KStruct(idx, type_args) -> {
                 let base: str = self.structs[idx].name
                 if len(type_args) == 0 {
@@ -1427,7 +1415,6 @@ type Codegen = struct {
             .KEnum(idx) -> return self.enums[idx].name
             .KInterface(idx) -> return self.interfaces[idx].name
             .KOptional(inner) -> return f"opt${self.canonical_kind_name(inner)}"
-            .KResult(inner) -> return f"res${self.canonical_kind_name(inner)}"
             .KStruct(idx, type_args) -> {
                 mut name = self.structs[idx].name
                 for ta in type_args {
@@ -1552,25 +1539,6 @@ type Codegen = struct {
                 }
             }
             .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
-            .Throws(inner) -> {
-                // `T or Error` desugars to Result[T, Error] — a generic
-                // enum instantiation. Falls back to the legacy KResult
-                // kind only if Result hasn't been registered yet (i.e.
-                // while compiling builtins.kod's own preamble).
-                let inner_kind = self.resolve_type(inner)
-                let result_idx = self.find_enum_idx("Result")
-                if result_idx < 0 {
-                    return .KResult(inner: inner_kind)
-                }
-                let error_idx = self.find_iface_idx("Error")
-                if error_idx < 0 {
-                    return .KResult(inner: inner_kind)
-                }
-                let error_kind: TypeKind = .KInterface(idx: error_idx)
-                let type_args: [TypeKind] = [inner_kind, error_kind]
-                let inst_idx = self.instantiate_enum(type_args, template_idx: result_idx)
-                return .KEnum(idx: inst_idx)
-            }
             .Generic(name, args) -> {
                 // Generic instantiation. Monomorphise the template struct
                 // into a fresh concrete entry (Map[str, str] → struct
@@ -2823,13 +2791,6 @@ type Codegen = struct {
     func load_enum_or_val(self, anon val: Val, expr_id: int64) -> str {
         match self.infer_kind(expr_id) {
             .KEnum(idx) -> {
-                mut reg = self.load(val)
-                self.emit(f"ldr {reg}, [{reg}]")
-                return reg
-            }
-            // A `T or Error` result is a {disc, payload} cell; its
-            // discriminant (0=Ok, 1=Err) lives at offset 0, like an enum's.
-            .KResult(inner) -> {
                 mut reg = self.load(val)
                 self.emit(f"ldr {reg}, [{reg}]")
                 return reg
