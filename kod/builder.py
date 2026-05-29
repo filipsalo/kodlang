@@ -286,7 +286,7 @@ class Builder:
         # code; on Err, we call _kod_panic (prints the message and exits 1).
         # `return_type` is the data-only ast.TypeExpr, so this is a pure
         # syntactic check — no resolution needed.
-        returns_result = isinstance(main_decl.return_type, ast.ResultTypeExpr)
+        returns_result = ast.is_result_type_expr(main_decl.return_type)
         if returns_result:
             unwrap = """
                     ldr x9, [x0, #0]

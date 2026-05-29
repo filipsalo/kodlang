@@ -55,13 +55,6 @@ class OptionalTypeExpr:
 
 
 @dataclasses.dataclass(frozen=True)
-class ResultTypeExpr:
-    """`T or Error`."""
-
-    inner: "TypeExpr"
-
-
-@dataclasses.dataclass(frozen=True)
 class GenericTypeExpr:
     """`Base[arg, ...]` — Base is a Named or Qualified type expr."""
 
@@ -83,20 +76,14 @@ TypeExpr = Union[
     QualifiedTypeExpr,
     ArrayTypeExpr,
     OptionalTypeExpr,
-    ResultTypeExpr,
     GenericTypeExpr,
     ResolvedTypeExpr,
 ]
 
 
 def is_result_type_expr(expr) -> bool:
-    """True if `expr` denotes a fallible-result type — either the legacy
-    ResultTypeExpr or a generic instantiation `Result[T, Error]`. Bridge
-    for the in-flight unification of `T or Error` onto the stdlib Result
-    enum; once ResultTypeExpr goes away this collapses to the GenericTypeExpr
-    check."""
-    if isinstance(expr, ResultTypeExpr):
-        return True
+    """True if `expr` denotes a fallible-result type — an instantiation
+    of the stdlib Result enum, which is what `T or Error` desugars to."""
     if isinstance(expr, GenericTypeExpr):
         base = expr.base
         if isinstance(base, NamedTypeExpr) and base.name == "Result":

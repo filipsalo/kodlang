@@ -239,8 +239,6 @@ class Parser:
             return types.ArrayType.make(self.resolve_type_expr(expr.element))
         if isinstance(expr, ast.OptionalTypeExpr):
             return types.OptionalType.make(self.resolve_type_expr(expr.inner))
-        if isinstance(expr, ast.ResultTypeExpr):
-            return types.ResultType.make(self.resolve_type_expr(expr.inner))
         if isinstance(expr, ast.NamedTypeExpr):
             result = self.lookup_type(expr.name)
             if result is not None:

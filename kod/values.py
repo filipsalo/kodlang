@@ -322,29 +322,6 @@ class OptionalType(Type):
         return Bool(not self.op_eq(other).value)
 
 
-class ResultType(Type):
-    """A fallible result: `T or Error`. The Python interpreter doesn't
-    actually wrap returned values — it propagates Err through Python
-    exceptions — but we need a named type so `parse_type` produces
-    something inhabitable. Width matches a pointer (the compiled
-    representation is a single arena pointer)."""
-
-    name = "ResultType"
-
-    @classmethod
-    def make(cls, inner):
-        return type(
-            f"{inner.name}Result",
-            (cls,),
-            {
-                "name": f"{inner.name} or Error",
-                "inner_type": inner,
-                "width": 8,
-                "data_width": 16,  # discriminant + payload
-            },
-        )
-
-
 class EnumType:
     """Base class for dynamically-created enum types."""
 
