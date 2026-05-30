@@ -234,6 +234,29 @@ type Error = struct {
     }
 }
 
+// ── Instruction buffer ────────────────────────────────────────────────────────
+//
+// `out_buf` holds typed instruction records instead of pre-formatted text
+// lines. The motivation is a future register-allocation pass: once operands
+// are structured (rather than baked into strings), a pass between emission
+// and final asm-formatting can rewrite registers, drop dead moves, etc.
+//
+// Step 1 keeps the surface API the same — `emit`/`println`/`emit_globl` etc.
+// all push `Insn.Raw(text)` lines that the asm formatter prints verbatim.
+// Only labels travel as a structured variant (`Insn.Label`), and only to
+// pay down the format-prefix string ("L:") at the typed boundary. Step 2
+// will add an `Op` variant whose operands carry virtual register ids that
+// a regalloc pass can rewrite before formatting.
+
+type Insn = enum {
+    // `<name>:` line.
+    Label(name: str)
+    // Verbatim line (already includes its own leading tab if any).
+    // Escape hatch for directives and call sites not yet migrated to a
+    // structured variant.
+    Raw(text: str)
+}
+
 // ── Codegen struct ────────────────────────────────────────────────────────────
 
 type Codegen = struct {
@@ -355,12 +378,12 @@ type Codegen = struct {
     // without polluting stdout with .s output.
     dry_run: bool = false
 
-    // Accumulated output lines. `println` appends here instead of writing
-    // to stdout directly; `flush_out` (called at the end of compile_module)
-    // prints them in one pass. Buffering — rather than streaming — is the
-    // foundation for later post-codegen passes (peephole / register
-    // allocation) that need to see and rewrite the emitted stream.
-    out_buf: [str] = []
+    // Accumulated output instructions. `println` appends here instead of
+    // writing to stdout directly; `flush_out` (called at the end of
+    // compile_module) formats and prints them in one pass. Buffering —
+    // rather than streaming — is the foundation for the IR + regalloc
+    // passes that sit between emission and final asm-formatting.
+    out_buf: [Insn] = []
 
     // Per-function callee-saved register accounting. `cs_in_use` is the
     // number of callee-saved pool registers (x19-x27) currently allocated;
@@ -728,19 +751,30 @@ type Codegen = struct {
     // Single output gate. In dry-run mode (test_support.try_compile),
     // this becomes a no-op so codegen can run all its checks without
     // polluting stdout with the generated .s. Otherwise the line is
-    // buffered into `out_buf` and emitted by `flush_out`.
+    // buffered into `out_buf` and formatted by `flush_out`. This wraps
+    // the line in `Insn.Raw`; emitters that produce a structured `Insn`
+    // value (currently just `emit_label`) push directly to `out_buf`.
     func println(self, anon line: str) -> none {
         if self.dry_run {
             return none
         }
-        self.out_buf += [line]
+        self.out_buf += [Insn.Raw(text: line)]
     }
 
     // Drain the buffered output to stdout, one `print` per line (each
     // adds the trailing newline, matching the old streaming behaviour).
+    // Note: the typed buffer is intentionally formatted inline rather
+    // than via a helper method. The current self-host backend has a
+    // codegen bug around handing an enum-with-payload cell from a
+    // for-each iteration variable across a method-call boundary; the
+    // resulting binary hangs on the second iteration. Doing the match
+    // inline sidesteps it without changing the architectural shape.
     func flush_out(self) -> none {
-        for line in self.out_buf {
-            print(line)
+        for insn in self.out_buf {
+            match insn {
+                .Raw(text) -> print(text)
+                .Label(name) -> print(name + ":")
+            }
         }
         self.out_buf = []
     }
@@ -750,7 +784,10 @@ type Codegen = struct {
     }
 
     func emit_label(self, anon lbl: str) -> none {
-        self.println(f"{lbl}:")
+        if self.dry_run {
+            return none
+        }
+        self.out_buf += [Insn.Label(name: lbl)]
     }
 
     func emit_globl(self, anon lbl: str) -> none {
