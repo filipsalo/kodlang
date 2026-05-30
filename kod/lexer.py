@@ -286,11 +286,30 @@ class Lexer:
         return self.build(FStringLiteral)
 
     def lex_number(self) -> IntegerLiteral:
-        """Lex a number."""
-        while char := self.peek():
-            if char not in "0123456789":
-                break
+        """Lex a number, with optional thousands grouping (`1 000 000`).
+        The grouped form is a 1-3 digit head followed by zero or more
+        `<space><exactly-3-digits>` groups; the lexer eats the spaces
+        as part of the token. Bare digit runs of any length stay valid
+        (`1234567`)."""
+        head_start = self.pos
+        while (c := self.peek()) and c.isdigit():
             self.pos += 1
+        head_len = self.pos - head_start
+        if 1 <= head_len <= 3:
+            # Try to consume `<space><3 digits>` groups. Strict on the
+            # group size — 2 or 4 digits after the space stops the loop
+            # so a typo like `1 2345` doesn't get glued into one number.
+            while (
+                self.peek() == " "
+                and (d1 := self._peek_at(1))
+                and d1.isdigit()
+                and (d2 := self._peek_at(2))
+                and d2.isdigit()
+                and (d3 := self._peek_at(3))
+                and d3.isdigit()
+                and not ((d4 := self._peek_at(4)) and d4.isdigit())
+            ):
+                self.pos += 4
         return self.build(IntegerLiteral)
 
     def lex_single_char(self, token_type) -> Token:
