@@ -425,8 +425,21 @@ class Interpreter:
             case ast.StringSlice(string, start, end):
                 s = self.evaluate_expression(module, string)
                 i = self.evaluate_expression(module, start)
-                j = self.evaluate_expression(module, end)
-                return types.String(s.value[i.value : j.value])
+                # `end` is None when the source omitted hi (`s[lo..]`);
+                # default to len(s) so the slice runs to the end.
+                if end is None:
+                    if isinstance(s, types.String):
+                        j_val = len(s.value)
+                    else:
+                        j_val = len(s.value)
+                else:
+                    j_val = self.evaluate_expression(module, end).value
+                if isinstance(s, types.String):
+                    return types.String(s.value[i.value : j_val])
+                # Array slice: preserve the element type so the result
+                # behaves like the source for `for x in arr[lo..hi]`.
+                arr_type = type(s)
+                return arr_type(s.value[i.value : j_val])
             case ast.MatchExpression(subject, arms):
                 value = self.evaluate_expression(module, subject)
                 for arm in arms:

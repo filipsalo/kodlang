@@ -23,6 +23,7 @@ from kod.tokens import (
     Comment,
     Continue,
     Dot,
+    DotDot,
     Else,
     Enum,
     Equal,
@@ -431,7 +432,14 @@ class Lexer:
                 case "]":
                     yield self.lex_single_char(CloseBracket)
                 case ".":
-                    yield self.lex_single_char(Dot)
+                    if self._peek_at(1) == ".":
+                        # Two-character `..` range separator.
+                        start = self.pos
+                        self.pos += 2
+                        self.start = start
+                        yield self.build(DotDot)
+                    else:
+                        yield self.lex_single_char(Dot)
                 case ":":
                     yield self.lex_single_char(Colon)
                 case ",":

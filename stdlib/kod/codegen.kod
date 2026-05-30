@@ -3033,10 +3033,31 @@ type Codegen = struct {
         // issue bl into len/strlen/etc.) don't clobber prior args still held
         // in caller-saved pool registers or in x0.
         self.emit("sub sp, sp, #32")
-        let hi_v = self.compile_expr(hi_id)
-        let hi_r = self.load(hi_v)
-        self.emit(f"str {hi_r}, [sp, #16]")
-        self.free_reg(hi_r)
+        // For an open-ended slice (`s[lo..]`) the parser stores hi=0; treat
+        // that as len(s) at runtime so the slice extends to the end. We
+        // emit `bl _len_<runtime>` only when the source actually omitted hi.
+        mut hi_omitted: bool = false
+        if hi_id == 0 {
+            hi_omitted = true
+        }
+        if hi_omitted {
+            // Push len(s) — the helpers expect the subject in x0 and
+            // return its length in x0. Both kod_str / kod_array share
+            // the {ptr, len, …} layout, so a direct ldr at offset 8
+            // works for either; we don't need a separate `bl` here.
+            let subj_for_len: Val = self.compile_expr(s_id)
+            let sr0: str = self.load(subj_for_len)
+            let lr: str = self.alloc_reg()
+            self.emit(f"ldr {lr}, [{sr0}, #8]")
+            self.emit(f"str {lr}, [sp, #16]")
+            self.free_reg(lr)
+            self.free_reg(sr0)
+        } else {
+            let hi_v = self.compile_expr(hi_id)
+            let hi_r = self.load(hi_v)
+            self.emit(f"str {hi_r}, [sp, #16]")
+            self.free_reg(hi_r)
+        }
         let lo_v = self.compile_expr(lo_id)
         let lo_r = self.load(lo_v)
         self.emit(f"str {lo_r}, [sp, #8]")
@@ -3049,7 +3070,13 @@ type Codegen = struct {
         self.emit("ldr x1, [sp, #8]")
         self.emit("ldr x2, [sp, #16]")
         self.emit("add sp, sp, #32")
-        self.emit("bl _kod_str_slice")
+        // Dispatch to the runtime that matches the subject. Strings and
+        // arrays have different cell layouts; the str routine returns
+        // a KodStr while the array routine returns a KodArray.
+        match self.infer_kind(s_id) {
+            .KStr -> self.emit("bl _kod_str_slice")
+            else self.emit("bl _kod_array_slice")
+        }
         return .VReg(name: "x0")
     }
 
@@ -3868,7 +3895,23 @@ type Codegen = struct {
                     else return .KArray
                 }
             }
-            .Slice(s, lo, hi) -> return .KStr
+            // Slice preserves the subject's kind — `str[lo..hi]` is `str`,
+            // `[T][lo..hi]` is `[T]` — except when we don't have a known
+            // kind, in which case fall back to `str` (the historically
+            // assumed shape from when only strings were sliceable).
+            .Slice(s, lo, hi) -> {
+                let k = self.infer_kind(s)
+                match k {
+                    .KStr -> return .KStr
+                    .KArray -> return .KArray
+                    .KArrayStr -> return .KArrayStr
+                    .KArrayStruct(_idx) -> return k
+                    .KArrayEnum(_idx) -> return k
+                    .KArrayInterface(_idx) -> return k
+                    .KArrayOptional(_inner) -> return k
+                    else return .KStr
+                }
+            }
             .ImplicitVariant(name) -> {
                 let enum_idx = self.find_enum_with_variant(name)
                 if enum_idx >= 0 {

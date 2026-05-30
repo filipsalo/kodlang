@@ -426,6 +426,25 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
 // append (was O(n), so O(n²) over a build loop). `let b = a; a += [x]`
 // will now also append to `b` — but no in-tree caller relied on the old
 // copy-on-concat semantics, and pytest + the Kod test suites all pass.
+// Slice copy: returns a fresh array with elements [start, end). Every
+// element in a Kod array is 8 bytes (pointer-or-int64), so a flat
+// memcpy is enough — no per-element rewrap needed. Negative `end - start`
+// clamps to a zero-length slice. Explicit range checking is the caller's
+// job (the codegen could emit a `len` check; today we don't).
+void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
+    KodArray *src = (KodArray *)src_raw;
+    int64_t len = end - start;
+    if (len < 0) len = 0;
+    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
+    out->ptr = arena_alloc(len > 0 ? len * 8 : 8);
+    out->len = len;
+    out->cap = len;
+    if (len > 0) {
+        memcpy(out->ptr, (char *)src->ptr + start * 8, len * 8);
+    }
+    return out;
+}
+
 void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;

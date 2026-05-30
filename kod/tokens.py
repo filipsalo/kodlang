@@ -45,6 +45,11 @@ class Dot(BinaryOperator):
 
 
 @dataclasses.dataclass
+class DotDot(Token):
+    """Range separator `..` used in slice expressions `[lo..hi]`."""
+
+
+@dataclasses.dataclass
 class Percent(BinaryOperator):
     """A percent sign."""
 
