@@ -393,6 +393,22 @@ type Codegen = struct {
     cs_in_use: int64 = 0
     cs_high_water: int64 = 0
 
+    // Virtual-register pool. `alloc_reg` hands out vregs (encoded as
+    // strings of the form `v<id>`) that callers thread through emitted
+    // asm; `flush_out` substitutes each vreg with `vreg_phys[id]` at
+    // format time. Ids are program-global (never reset across functions)
+    // so a vreg created in one function and read out in `flush_out`
+    // resolves to the same physical register regardless of when the
+    // module's output is drained.
+    //
+    // Today the assignment is identity — `alloc_reg` picks a physical
+    // from the free pool and immediately records it as `vreg_phys[id]`,
+    // matching the previous behaviour byte-for-byte. A later regalloc
+    // pass will recompute `vreg_phys` after the full instruction stream
+    // is buffered, driven by live-range analysis instead of the stack
+    // discipline.
+    vreg_phys: [str] = []
+
 
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
@@ -772,11 +788,68 @@ type Codegen = struct {
     func flush_out(self) -> none {
         for insn in self.out_buf {
             match insn {
-                .Raw(text) -> print(text)
+                .Raw(text) -> print(self.subst_vregs(text))
                 .Label(name) -> print(name + ":")
             }
         }
         self.out_buf = []
+    }
+
+    // Walk `text` and replace every `v<digits>` token with the physical
+    // register recorded in `vreg_phys`. A token is a `v`/`w` not preceded
+    // by an alphanumeric character followed by one or more digits; if the
+    // run lands on alphanumeric (e.g. inside an identifier like `Lv1_end`)
+    // it's left alone.
+    //
+    // `w<id>` is the 32-bit alias form — a handful of byte-load sites
+    // write `ldrb w{vreg[1..]}, …` to get the w-prefixed name. We honor
+    // that by substituting the physical's w-form (e.g. `v17` → `x21` →
+    // `w21`) when the input token starts with `w`.
+    func subst_vregs(self, anon text: str) -> str {
+        mut out: str = ""
+        mut i: int64 = 0
+        let n: int64 = len(text)
+        mut prev_alnum: bool = false
+        for i < n {
+            let c: int64 = text[i]
+            let is_vreg_prefix: bool = (c == 'v' or c == 'w') and prev_alnum == false and i + 1 < n and lexing.is_digit(text[i + 1])
+            if is_vreg_prefix {
+                mut j: int64 = i + 1
+                mut id: int64 = 0
+                for j < n and lexing.is_digit(text[j]) {
+                    id = id * 10 + text[j] - '0'
+                    j = j + 1
+                }
+                // Only substitute if the run ended on a non-alnum (or EOF)
+                // — otherwise it's part of a longer identifier and not a
+                // vreg. Also bound-check against `vreg_phys` so a literal
+                // `w1`/`v0` in a label remains intact.
+                mut ended_clean: bool = true
+                if j < n and lexing.is_alnum(text[j]) {
+                    ended_clean = false
+                }
+                if ended_clean and id < len(self.vreg_phys) {
+                    let phys: str = self.vreg_phys[id]
+                    if c == 'w' {
+                        // x-form → w-form: same number, different prefix.
+                        out = out + "w" + phys[1..len(phys)]
+                    } else {
+                        out = out + phys
+                    }
+                    i = j
+                    prev_alnum = true
+                } else {
+                    out = out + text[i..j]
+                    i = j
+                    prev_alnum = lexing.is_alnum(text[j - 1])
+                }
+            } else {
+                out = out + text[i..i+1]
+                prev_alnum = lexing.is_alnum(c)
+                i = i + 1
+            }
+        }
+        return out
     }
 
     func emit(self, anon line: str) -> none {
@@ -850,8 +923,17 @@ type Codegen = struct {
     // function uses in its prologue. x28 is never pool-allocated; it only
     // appears as the pad register when an odd number of callee-saved regs
     // is saved (stp works in pairs).
+    //
+    // Accepts either a physical register name or a vreg name — vregs
+    // resolve through `vreg_phys` so call-spill / pool-discipline checks
+    // continue to ask "is this value safe across a `bl`?" in the same way
+    // they did before vregs were threaded through emit.
     func is_callee_saved(self, anon reg: str) -> bool {
-        return reg == "x19" or reg == "x20" or reg == "x21" or reg == "x22" or reg == "x23" or reg == "x24" or reg == "x25" or reg == "x26" or reg == "x27"
+        mut phys: str = reg
+        if self.is_vreg_name(reg) {
+            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        }
+        return phys == "x19" or phys == "x20" or phys == "x21" or phys == "x22" or phys == "x23" or phys == "x24" or phys == "x25" or phys == "x26" or phys == "x27"
     }
 
     func cs_reg(self, anon n: int64) -> str {
@@ -859,9 +941,16 @@ type Codegen = struct {
         return names[n]
     }
 
+    // Allocate a fresh virtual register backed by a physical from the
+    // free pool. The returned string is a vreg name (`v<id>`) that the
+    // emit layer threads into asm; `flush_out` substitutes it back to
+    // the physical recorded in `vreg_phys[id]`. Today the assignment is
+    // fixed at alloc time so the produced asm matches the pre-vreg path
+    // byte-for-byte; a later regalloc pass replaces `vreg_phys` after
+    // walking the buffered instructions.
     func alloc_reg(self) -> str {
         let n = len(self.free_regs)
-        mut reg = self.free_regs[-1]
+        mut phys = self.free_regs[-1]
         mut new_regs: [str] = []
         mut i = 0
         for i < n - 1 {
@@ -869,25 +958,63 @@ type Codegen = struct {
             i = i + 1
         }
         self.free_regs = new_regs
-        if self.is_callee_saved(reg) {
+        if self.is_callee_saved(phys) {
             self.cs_in_use = self.cs_in_use + 1
             if self.cs_in_use > self.cs_high_water {
                 self.cs_high_water = self.cs_in_use
             }
         }
-        return reg
+        let id: int64 = len(self.vreg_phys)
+        self.vreg_phys += [phys]
+        return f"v{id}"
     }
 
+    // Return a register to the pool. Accepts either a vreg name (from
+    // `alloc_reg`) or a physical name passed in directly by sites that
+    // hardcode ABI registers (e.g. freeing `x0` after a `bl`). For the
+    // hardcoded path, x0–x7 are skipped — they hold call args/results
+    // and never enter the pool.
     func free_reg(self, anon reg: str) -> none {
+        mut phys: str = reg
+        if self.is_vreg_name(reg) {
+            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        }
         // Only return pool registers (x8-x15, x19-x27) to the free list.
         // Argument registers (x0-x7) hold call results/args and must not be pooled.
-        if reg == "x0" or reg == "x1" or reg == "x2" or reg == "x3" or reg == "x4" or reg == "x5" or reg == "x6" or reg == "x7" {
+        if phys == "x0" or phys == "x1" or phys == "x2" or phys == "x3" or phys == "x4" or phys == "x5" or phys == "x6" or phys == "x7" {
             return
         }
-        if self.is_callee_saved(reg) {
+        if self.is_callee_saved(phys) {
             self.cs_in_use = self.cs_in_use - 1
         }
-        self.free_regs += [reg]
+        self.free_regs += [phys]
+    }
+
+    // True if `s` is a vreg name (the `v<digits>` form `alloc_reg`
+    // returns). Anything else — a physical register name, an asm
+    // literal — falls through unchanged.
+    func is_vreg_name(self, anon s: str) -> bool {
+        if len(s) < 2 or s[0] != 'v' {
+            return false
+        }
+        mut i: int64 = 1
+        for i < len(s) {
+            if lexing.is_digit(s[i]) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    func parse_vreg_id(self, anon vreg: str) -> int64 {
+        mut id: int64 = 0
+        mut i: int64 = 1
+        for i < len(vreg) {
+            id = id * 10 + vreg[i] - '0'
+            i = i + 1
+        }
+        return id
     }
 
     // Stash `reg` to a fresh 16-byte stack slot so its value survives a
