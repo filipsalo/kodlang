@@ -286,19 +286,30 @@ class Lexer:
         return self.build(FStringLiteral)
 
     def lex_number(self) -> IntegerLiteral:
-        """Lex a number, with optional thousands grouping (`1 000 000`).
-        The grouped form is a 1-3 digit head followed by zero or more
+        """Lex a number. Base-prefix forms (`0x…`, `0o…`, `0b…`) read
+        digits of the relevant base. Decimal supports optional thousands
+        grouping (`1 000 000`) — 1-3 digit head + zero or more
         `<space><exactly-3-digits>` groups; the lexer eats the spaces
-        as part of the token. Bare digit runs of any length stay valid
-        (`1234567`)."""
+        as part of the token. Bare digit runs (`1234567`) keep working."""
+        if self.peek() == "0":
+            nxt = self._peek_at(1)
+            if nxt in ("x", "o", "b"):
+                self.pos += 2
+                digits = {
+                    "x": "0123456789abcdefABCDEF",
+                    "o": "01234567",
+                    "b": "01",
+                }[nxt]
+                while (c := self.peek()) and c in digits:
+                    self.pos += 1
+                return self.build(IntegerLiteral)
         head_start = self.pos
         while (c := self.peek()) and c.isdigit():
             self.pos += 1
         head_len = self.pos - head_start
         if 1 <= head_len <= 3:
-            # Try to consume `<space><3 digits>` groups. Strict on the
-            # group size — 2 or 4 digits after the space stops the loop
-            # so a typo like `1 2345` doesn't get glued into one number.
+            # Strict on the group size — 2 or 4 digits after the space
+            # stops the loop so a typo like `1 2345` doesn't get glued.
             while (
                 self.peek() == " "
                 and (d1 := self._peek_at(1))

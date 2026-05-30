@@ -245,11 +245,11 @@ class IntegerLiteral(ASTNode, Literal):
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
-        """Parse an integer literal. `int()` doesn't handle the embedded
-        spaces from thousands-grouped literals (`1 000 000`); the lexer
-        has already validated grouping, so strip them here."""
+        """Parse an integer literal. Handles thousands-grouping (strip
+        spaces — `int()` doesn't accept them) and base-prefix forms
+        (`0x…`, `0o…`, `0b…` — `int(s, 0)` auto-detects)."""
         token = parser.consume(tokens.IntegerLiteral)
-        value = types.Int64(int(token.value.replace(" ", "")))
+        value = types.Int64(int(token.value.replace(" ", ""), 0))
         return cls(value, span=token.span)
 
 
@@ -1191,7 +1191,7 @@ def _parse_match_pattern(parser, span):
     """Parse a single match pattern (the bit before `->`)."""
     if parser.peeking_at(tokens.IntegerLiteral):
         tok = parser.consume(tokens.IntegerLiteral)
-        return IntegerPattern(int(tok.value.replace(" ", "")), span)
+        return IntegerPattern(int(tok.value.replace(" ", ""), 0), span)
     if parser.peeking_at(tokens.StringLiteral):
         tok = StringLiteral.parse(parser)
         return StringPattern(tok.value.to_py_str(), span)
