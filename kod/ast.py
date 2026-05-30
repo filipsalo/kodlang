@@ -171,7 +171,10 @@ class StringLiteral(ASTNode, Literal):
             body = _dedent_triple_body(raw[3:-3])
             bytes_ = process_escapes(body).encode("utf8")
         else:
-            bytes_ = raw.strip('"').encode("utf8")
+            # Strip exactly one leading and one trailing quote — `raw.strip('"')`
+            # would eat *every* surrounding `"`, so a `"\""` literal (body =
+            # one `"` after escape processing) becomes the empty string.
+            bytes_ = raw[1:-1].encode("utf8")
         value = types.String(bytes_)
         return cls(value, span=token.span)
 

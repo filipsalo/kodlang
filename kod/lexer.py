@@ -191,9 +191,7 @@ class Lexer:
             self.pos += 1
             escape = self.peek()
             self.pos += 1
-            char = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'"}.get(
-                escape, escape
-            )
+            char = _ESCAPES.get(escape, escape)
         else:
             self.pos += 1
         self.consume("'")
