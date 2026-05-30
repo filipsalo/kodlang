@@ -331,6 +331,11 @@ class EnumType:
         variant_infos = {}
         max_payload_width = 0
 
+        # Discriminants start at 1, not 0. Disc 0 is reserved globally
+        # as the "None" sentinel for nullable contexts so `T?` (when T
+        # is an enum) can reuse T's cell layout with disc 0 meaning none.
+        # The Python interpreter doesn't dispatch on the numeric disc,
+        # but kept consistent with the self-hosted backend for parity.
         for i, (variant_name, fields) in enumerate(variants):
             field_offsets = {}
             offset = 0
@@ -342,7 +347,7 @@ class EnumType:
             variant_infos[variant_name] = EnumVariantInfo(
                 name=variant_name,
                 fields=fields,
-                discriminant=i,
+                discriminant=i + 1,
                 field_offsets=field_offsets,
                 payload_width=payload_width,
             )

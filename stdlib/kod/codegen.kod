@@ -1085,6 +1085,27 @@ type Codegen = struct {
         return .KVoid
     }
 
+    // Runtime discriminant for Result's Ok variant. Looked up dynamically
+    // rather than hardcoded so the disc-shift (variants start at 1) stays
+    // localised in register_enum; callers that emit `cmp disc, #N` against
+    // an Ok/Err result cell use this instead of literal 0/1.
+    func result_ok_disc(self) -> int64 {
+        let idx = self.find_enum_idx("Result")
+        if idx >= 0 {
+            return self.enums[idx].variants[0].discriminant
+        }
+        return 1
+    }
+
+    // Runtime discriminant for Result's Err variant.
+    func result_err_disc(self) -> int64 {
+        let idx = self.find_enum_idx("Result")
+        if idx >= 0 {
+            return self.enums[idx].variants[1].discriminant
+        }
+        return 2
+    }
+
     func find_struct_idx(self, anon name: str) -> int64 {
         if self.struct_idx.get(name) is Some(i) {
             return i
@@ -1723,7 +1744,11 @@ type Codegen = struct {
                 let saved_p = self.p
                 self.p = p
                 mut variant_infos: [VariantInfo] = []
-                mut disc = 0
+                // Discriminants start at 1, not 0. Disc 0 is reserved
+                // globally as the "None" sentinel for nullable contexts
+                // (`T?` where T is an enum can reuse T's cell layout with
+                // disc 0 meaning none). See union-design memory.
+                mut disc = 1
                 mut max_payload = 0
                 for variant in variants {
                     mut field_names: [str] = []
@@ -2624,12 +2649,12 @@ type Codegen = struct {
             self.free_reg(exp)
             return .VReg(name: reg)
         }
-        // `T or Error` result: test the discriminant (0=Ok, 1=Err).
+        // `T or Error` result: test the discriminant against Ok's disc.
         if self.is_result_kind(lhs_kind) {
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
             self.emit(f"ldr {reg}, [{reg}]")
-            self.emit(f"cmp {reg}, #0")
+            self.emit(f"cmp {reg}, #{self.itos(self.result_ok_disc())}")
             if self.is_pattern_name(rhs) == "Ok" {
                 self.emit(f"cset {reg}, eq")
             } else {
@@ -3649,7 +3674,7 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .OkPat(binding) -> {
-                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"cmp {disc_r}, #{self.itos(self.result_ok_disc())}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
                     let body_val = self.compile_expr(arm.body)
@@ -3658,7 +3683,7 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .ErrPat(binding) -> {
-                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"cmp {disc_r}, #{self.itos(self.result_ok_disc())}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
                     let body_val = self.compile_expr(arm.body)
@@ -4634,7 +4659,10 @@ type Codegen = struct {
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
         let payload = self.preserve_end(reg, spilled: reg_spilled)
-        self.emit("str xzr, [x0]")              // discriminant = 0 (Ok)
+        let disc_r = self.alloc_reg()
+        self.emit_load_imm(disc_r, value: self.result_ok_disc())
+        self.emit(f"str {disc_r}, [x0]")
+        self.free_reg(disc_r)
         self.emit(f"str {payload}, [x0, #8]")   // payload
         self.free_reg(payload)
     }
@@ -4701,8 +4729,8 @@ type Codegen = struct {
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
         let payload = self.preserve_end(reg, spilled: reg_spilled)
-        self.emit("mov x9, #1")
-        self.emit("str x9, [x0]")               // discriminant = 1 (Err)
+        self.emit(f"mov x9, #{self.itos(self.result_err_disc())}")
+        self.emit("str x9, [x0]")
         self.emit(f"str {payload}, [x0, #8]")   // error iface ptr
         self.free_reg(payload)
         self.emit(f"b {self.ret_lbl}")
@@ -4720,7 +4748,7 @@ type Codegen = struct {
         self.emit(f"ldr {disc}, [x0]")
         let ok_lbl = self.fresh("Lresult_ok")
         let done_lbl = self.fresh("Lresult_done")
-        self.emit(f"cmp {disc}, #0")
+        self.emit(f"cmp {disc}, #{self.itos(self.result_ok_disc())}")
         self.free_reg(disc)
         self.emit(f"beq {ok_lbl}")
         // Err path.
@@ -5154,9 +5182,11 @@ type Codegen = struct {
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
-                // Result arms: disc 0=Ok, 1=Err; payload at offset 8.
+                // Result arms: payload at offset 8; disc looked up
+                // dynamically since variant discs start at 1 (disc 0
+                // reserved as None for nullable contexts).
                 .OkPat(binding) -> {
-                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"cmp {disc_r}, #{self.itos(self.result_ok_disc())}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
                     for stmt_id in arm.body {
@@ -5166,7 +5196,7 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .ErrPat(binding) -> {
-                    self.emit(f"cmp {disc_r}, #0")
+                    self.emit(f"cmp {disc_r}, #{self.itos(self.result_ok_disc())}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
                     for stmt_id in arm.body {
