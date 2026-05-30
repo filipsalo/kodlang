@@ -941,18 +941,13 @@ class Expression(ASTNode):
                     lhs = FunctionCall(lhs, rhs, span)
                 elif isinstance(op, tokens.OpenBracket):
                     parser.consume(tokens.OpenBracket)
-                    # Three forms: `[idx]` index, `[lo..hi]` slice (either
+                    # Two forms: `[idx]` index and `[lo..hi]` slice (either
                     # endpoint omitted defaults — `[..hi]` for lo=0,
-                    # `[lo..]` for hi=len), and the legacy `[lo:hi]`
-                    # slice with the older separator. The colon form is
-                    # accepted while the codebase migrates; once removed
-                    # this can drop the Colon arm.
-                    if parser.peeking_at(tokens.DotDot) or parser.peeking_at(
-                        tokens.Colon
-                    ):
-                        # `[..hi]` / `[:hi]`: omitted lo.
+                    # `[lo..]` for hi=len).
+                    if parser.peeking_at(tokens.DotDot):
+                        # `[..hi]`: omitted lo.
                         zero = IntegerLiteral(types.Int64(0), span=span)
-                        parser.consume(type(parser.peek()))
+                        parser.consume(tokens.DotDot)
                         if parser.try_consume(tokens.CloseBracket):
                             end = None
                         else:
@@ -961,9 +956,7 @@ class Expression(ASTNode):
                         lhs = StringSlice(lhs, zero, end, span)
                     else:
                         start = Expression.parse(parser)
-                        if parser.try_consume(tokens.DotDot) or parser.try_consume(
-                            tokens.Colon
-                        ):
+                        if parser.try_consume(tokens.DotDot):
                             if parser.try_consume(tokens.CloseBracket):
                                 end = None
                             else:
