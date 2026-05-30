@@ -2016,6 +2016,11 @@ type Codegen = struct {
                 self.collect_expr_vars(lhs)
                 self.collect_expr_vars(rhs)
             }
+            .Chain(exprs, ops) -> {
+                for e in exprs {
+                    self.collect_expr_vars(e)
+                }
+            }
             .Call(callee, args) -> {
                 self.collect_expr_vars(callee)
                 mut i = 0
@@ -2405,6 +2410,7 @@ type Codegen = struct {
                 return self.compile_enum_construct(empty, :enum_idx, :variant_idx)
             }
             .Binary(lhs, op, rhs) -> return self.compile_binary(:lhs, :op, :rhs)
+            .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
             .Call(callee, args) -> return self.compile_call(args, callee_id: callee)
             .ArrayLit(elements) -> return self.compile_array_lit(elements)
             .MatchExpr(subject, arms) -> return self.compile_match_expr(arms, subject_id: subject)
@@ -2438,6 +2444,49 @@ type Codegen = struct {
         if vi3 < 0 { return none }
         let empty: [ast.CallArg] = []
         return self.compile_enum_construct(empty, enum_idx: ei3, variant_idx: vi3)
+    }
+
+    // Python-style chained comparison: `a < b < c` evaluates as
+    // `(a < b) and (b < c)` with `b` computed once. Strategy: stash each
+    // middle operand in a fresh local, build synthetic Binary(prev, op,
+    // next) pairs that share the temp idents, and AND them with
+    // short-circuit branches so the rhs of an early-falsifying link
+    // never runs.
+    func compile_chain(self, exprs: [int64], ops: [ast.Op]) -> Val {
+        let span: ast.Span = self.p.expr_spans[exprs[0]]
+        // Bind each middle operand (everything except the first and last)
+        // to a fresh local so the value is computed exactly once.
+        mut operand_exprs: [int64] = [exprs[0]]
+        mut i: int64 = 1
+        for i < len(exprs) - 1 {
+            let name: str = self.fresh("__chain")
+            let kind: TypeKind = self.infer_kind(exprs[i])
+            let off: int64 = self.alloc_var(:name, :kind)
+            self.compile_store(dest_off: off, :kind, value_id: exprs[i])
+            operand_exprs += [self.p.alloc_expr(ast.Expr.Ident(:name), :span)]
+            i = i + 1
+        }
+        operand_exprs += [exprs[len(exprs) - 1]]
+        // Emit each link as `if (lhs op rhs) == false { goto false }`.
+        let false_lbl: str = self.fresh("Lchain_false")
+        let done_lbl: str = self.fresh("Lchain_done")
+        mut k: int64 = 0
+        for k < len(ops) {
+            let pair: int64 = self.p.alloc_expr(ast.Expr.Binary(lhs: operand_exprs[k], op: ops[k], rhs: operand_exprs[k + 1]), :span)
+            let v: Val = self.compile_expr(pair)
+            mut r: str = self.load(v)
+            self.emit(f"cmp {r}, #0")
+            self.emit(f"beq {false_lbl}")
+            self.free_reg(r)
+            k = k + 1
+        }
+        mut result: str = self.alloc_reg()
+        self.emit(f"mov {result}, #1")
+        self.emit(f"b {done_lbl}")
+        self.emit_label(false_lbl)
+        self.emit(f"mov {result}, #0")
+        self.emit_label(done_lbl)
+        return .VReg(name: result)
     }
 
     // Try `EnumName.Variant` — bare two-part unit-variant access.
@@ -3870,6 +3919,7 @@ type Codegen = struct {
                 }
                 return .KInt64
             }
+            .Chain(_exprs, _ops) -> return .KBool
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Dot -> {

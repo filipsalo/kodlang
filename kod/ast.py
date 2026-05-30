@@ -807,6 +807,36 @@ class BinaryOperator(ASTNode):
     span: Span
 
 
+_CHAIN_OPS = (
+    tokens.EqualEqual,
+    tokens.NotEqual,
+    tokens.LessThan,
+    tokens.LessEqual,
+    tokens.GreaterThan,
+    tokens.GreaterEqual,
+)
+
+
+def _is_chain_op(token):
+    """True if `token` is a comparison operator that participates in
+    Python-style chained comparisons. `is` shares the same precedence
+    in this parser but is a pattern-shaped operator, not a magnitude
+    comparison, so it doesn't chain."""
+    return isinstance(token, _CHAIN_OPS)
+
+
+@dataclasses.dataclass
+class ChainComparison(ASTNode):
+    """A Python-style chained comparison: `a < b < c` parses to a single
+    ChainComparison([a, b, c], [<, <]) rather than `((a < b) < c)`.
+    Lowered as a short-circuit `(a < b) and (b < c)` with the middle
+    operand evaluated once."""
+
+    operands: list
+    ops: list
+    span: Span
+
+
 @dataclasses.dataclass
 class ArrayLiteral(ASTNode):
     """An array literal like [1, 2, 3]."""
@@ -934,6 +964,20 @@ class Expression(ASTNode):
                         lhs = Assignment(
                             lhs, BinaryOperator(lhs, minus, rhs, span), span
                         )
+                    elif _is_chain_op(op) and _is_chain_op(parser.peek()):
+                        # Python-style chained comparison: collect the
+                        # remaining comparison links into one node.
+                        operands = [lhs, rhs]
+                        chain_ops = [op]
+                        while _is_chain_op(parser.peek()):
+                            nop = parser.peek()
+                            parser.consume(type(nop))
+                            nrhs = cls.parse(
+                                parser, nop.precedence + nop.left_associative
+                            )
+                            operands.append(nrhs)
+                            chain_ops.append(nop)
+                        lhs = ChainComparison(operands, chain_ops, span)
                     else:
                         lhs = BinaryOperator(lhs, op, rhs, span)
         return lhs

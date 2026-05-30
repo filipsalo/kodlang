@@ -254,6 +254,29 @@ class Interpreter:
                 return result
             case ast.BinaryOperator(lhs, op, rhs):
                 return self.evaluate_binary_operator(module, op, lhs, rhs, as_lvalue)
+            case ast.ChainComparison(operands, ops):
+                # `a < b < c …` — evaluate each middle operand once, then
+                # short-circuit-AND each pairwise comparison. As soon as
+                # any link is false, the result is false and the remaining
+                # operands aren't evaluated. evaluate_binary_operator
+                # expects unevaluated AST nodes, so dispatch by method
+                # name directly on the evaluated values here.
+                cmp_methods = {
+                    tokens.EqualEqual: "op_eq",
+                    tokens.NotEqual: "op_ne",
+                    tokens.LessThan: "op_lt",
+                    tokens.LessEqual: "op_le",
+                    tokens.GreaterThan: "op_gt",
+                    tokens.GreaterEqual: "op_ge",
+                }
+                prev = self.evaluate_expression(module, operands[0])
+                for i, op in enumerate(ops):
+                    nxt = self.evaluate_expression(module, operands[i + 1])
+                    method = getattr(prev, cmp_methods[type(op)])
+                    if not method(nxt).to_bool().value:
+                        return types.Bool(False)
+                    prev = nxt
+                return types.Bool(True)
             case ast.TryExpression(inner):
                 # A fallible call yields a ResultValue. `try` unwraps Ok or
                 # re-raises Err as a ThrownError, which the enclosing fallible
