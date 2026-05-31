@@ -108,3 +108,170 @@ func deflate_fixed(anon data: str) -> [int64] {
     bw.flush_byte()
     return bw.bytes
 }
+
+// ── LZ77 + fixed Huffman ──────────────────────────────────────────────
+//
+// RFC 1951 §3.2.5 length / distance encoding tables. The deflate
+// stream packs each match as a length code (literal/length code
+// 257-285) + extra bits + distance code (0-29) + extra bits. The
+// extra-bit count grows in steps of 2/4/8/… so each code covers an
+// increasingly-wide range of lengths/distances.
+
+// Length-code metadata for length 3..258. Returns the code (offset
+// from 257), the base length, and the number of extra bits.
+type LenCode = struct {
+    code: int64
+    base: int64
+    extra: int64
+}
+
+func length_code(anon length: int64) -> LenCode {
+    if length <= 10 {
+        // Codes 257-264: lengths 3-10 (1 each), 0 extra bits.
+        return LenCode(code: 257 + length - 3, base: length, extra: 0)
+    }
+    if length == 258 {
+        // Maximum match — RFC 1951 special-cases it as code 285.
+        return LenCode(code: 285, base: 258, extra: 0)
+    }
+    // The remaining codes group lengths in powers-of-two ranges.
+    // The table below mirrors RFC 1951 §3.2.5's "extra bits" /
+    // "lengths" columns for codes 265-284.
+    let bases: [int64] = [11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227]
+    let extras: [int64] = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
+    mut i: int64 = 0
+    for i < len(bases) {
+        let next_base: int64 = bases[i] + (1 << extras[i])
+        if length < next_base {
+            return LenCode(code: 265 + i, base: bases[i], extra: extras[i])
+        }
+        i = i + 1
+    }
+    // Fallback (unreachable for length 3..258).
+    return LenCode(code: 285, base: 258, extra: 0)
+}
+
+type DistCode = struct {
+    code: int64
+    base: int64
+    extra: int64
+}
+
+func distance_code(anon distance: int64) -> DistCode {
+    if distance <= 4 {
+        // Codes 0-3: distances 1-4 (1 each), 0 extra bits.
+        return DistCode(code: distance - 1, base: distance, extra: 0)
+    }
+    let bases: [int64] = [5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    let extras: [int64] = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    mut i: int64 = 0
+    for i < len(bases) {
+        let next_base: int64 = bases[i] + (1 << extras[i])
+        if distance < next_base {
+            return DistCode(code: 4 + i, base: bases[i], extra: extras[i])
+        }
+        i = i + 1
+    }
+    // Fallback (unreachable for distance 1..32768).
+    return DistCode(code: 29, base: 24577, extra: 13)
+}
+
+// Three-byte hash used as the LZ77 index key. Maps any 3-byte window
+// onto a 15-bit slot (the hash table has 32768 entries) — collisions
+// are tolerated because we only keep the most recent position with a
+// given hash, so a false-positive hash hit just makes us find a
+// shorter (or no) match.
+func lz_hash(anon b0: int64, anon b1: int64, anon b2: int64) -> int64 {
+    return ((b0 << 16) | (b1 << 8) | b2) & 0x7fff
+}
+
+// LZ77 + fixed-Huffman Deflate. Slides a 32 KB window over `data`,
+// finds back-references at each position via a 15-bit hash table
+// (most-recent only — no chain), emits matches of length ≥ 3 through
+// the length/distance codes, falls back to literals otherwise.
+func deflate_lz77_fixed(anon data: str) -> [int64] {
+    let bw: BitWriter = make_bitwriter()
+    bw.write_bits(1, 1)         // BFINAL
+    bw.write_bits(1, 2)         // BTYPE = 01 (fixed Huffman)
+
+    let n: int64 = len(data)
+    // hash[h] = most recent position where 3-byte prefix hashed to h.
+    // Initialised to -1; positions are compared as `pos - prev` so the
+    // distance check rejects -1 implicitly when the input's short.
+    mut hash_table: [int64] = []
+    mut h_init: int64 = 0
+    for h_init < 32768 {
+        hash_table += [-1]
+        h_init = h_init + 1
+    }
+
+    mut i: int64 = 0
+    for i < n {
+        // Need at least 3 bytes left for a match attempt.
+        if i + 2 >= n {
+            bw.write_huffman(fixed_lit_code(data[i]), fixed_lit_bits(data[i]))
+            i = i + 1
+            continue
+        }
+        let h: int64 = lz_hash(data[i], data[i + 1], data[i + 2])
+        let prev: int64 = hash_table[h]
+        hash_table[h] = i
+        // Distance must be in [1, 32768] and the prefix must actually
+        // match (hash collisions land here too).
+        let dist: int64 = i - prev
+        mut match_len: int64 = 0
+        if prev >= 0 and dist <= 32768 {
+            // Count how far the match extends, up to 258 bytes or
+            // end-of-input.
+            mut max_match: int64 = n - i
+            if max_match > 258 {
+                max_match = 258
+            }
+            mut m: int64 = 0
+            for m < max_match {
+                if data[i + m] != data[prev + m] {
+                    m = max_match
+                } else {
+                    match_len = m + 1
+                    m = m + 1
+                }
+            }
+            if match_len < 3 {
+                match_len = 0
+            }
+        }
+        if match_len >= 3 {
+            // Emit length code + extra bits.
+            let lc: LenCode = length_code(match_len)
+            bw.write_huffman(fixed_lit_code(lc.code), fixed_lit_bits(lc.code))
+            if lc.extra > 0 {
+                bw.write_bits(match_len - lc.base, lc.extra)
+            }
+            // Emit 5-bit fixed distance code + extra bits.
+            let dc: DistCode = distance_code(dist)
+            bw.write_huffman(dc.code, 5)
+            if dc.extra > 0 {
+                bw.write_bits(dist - dc.base, dc.extra)
+            }
+            // Advance past the match. Update hash for every position
+            // inside the match (other than the first, which we already
+            // recorded above) so future matches can reach into it.
+            mut k: int64 = 1
+            for k < match_len {
+                let p: int64 = i + k
+                if p + 2 < n {
+                    let hp: int64 = lz_hash(data[p], data[p + 1], data[p + 2])
+                    hash_table[hp] = p
+                }
+                k = k + 1
+            }
+            i = i + match_len
+        } else {
+            bw.write_huffman(fixed_lit_code(data[i]), fixed_lit_bits(data[i]))
+            i = i + 1
+        }
+    }
+    bw.write_huffman(fixed_lit_code(256), fixed_lit_bits(256))
+    bw.flush_byte()
+    return bw.bytes
+}
