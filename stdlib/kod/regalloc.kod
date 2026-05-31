@@ -1,0 +1,364 @@
+// Linear-scan register allocator over the buffered instruction stream
+// of a single function. The codegen hands out alloc-time physicals
+// while emitting (so the produced asm reads naturally), but those
+// initial assignments stack-discipline-only — they don't reuse a
+// phys once its previous holder's last use is past. This pass walks
+// the buffered body to compute per-vreg live intervals, then
+// reassigns each vreg from a per-class free pool, expiring intervals
+// whose last_use is at-or-before the current def line.
+//
+// The pass is constrained: a callee-saved vreg can only be rewritten
+// to another callee-saved phys, and same for caller-saved. That
+// preservation matters because every emit-time decision that asked
+// `is_callee_saved(vreg)` (e.g. `spill_across` skipping the stash
+// when the value lives in a callee-saved reg) must still get the
+// same answer after rewriting.
+//
+// `pack` is a small follow-up that collapses the chosen callee-saved
+// set into a dense `x19..x{19+N-1}` prefix and returns the new
+// callee-saved high-water mark; the function prologue saves exactly
+// that many registers instead of over-saving to cover gaps.
+
+import "kod/lexing"
+
+// One line in a function's instruction buffer. `Label` lines hold a
+// symbol, not asm, so the scan skips them; `Raw` lines hold the
+// actual asm text and are what `subst_vregs` later rewrites at flush
+// time. The variant is here (rather than alongside the codegen
+// emitters that produce it) because the allocator is the only thing
+// that has to *look at* the line structure — emitters just append.
+type Insn = enum {
+    Label(name: str)
+    Raw(text: str)
+}
+
+// Mnemonics whose first operand is the destination — for those a
+// vreg at op-position 0 (outside brackets) is a def, not a use.
+// Everything else treats all vreg operands as reads. ldp/stp don't
+// appear with vregs in our codegen (only hardcoded sp/fp/lr/cs regs).
+//
+// Missing an entry here causes a silent miscompile: regalloc never
+// sees the destination as a def, so the def_line stays -1 and the
+// vreg keeps its alloc-time phys — but downstream vregs may end up
+// sharing that phys because regalloc thinks the slot is free.
+func is_writer_mnemonic(anon mn: str) -> bool {
+    return mn == "mov" or mn == "add" or mn == "sub" or mn == "mul" or mn == "sdiv" or mn == "lsl" or mn == "lsr" or mn == "asr" or mn == "and" or mn == "orr" or mn == "eor" or mn == "adrp" or mn == "cset" or mn == "ldr" or mn == "ldrb"
+}
+
+func is_callee_saved_phys(anon phys: str) -> bool {
+    return phys == "x19" or phys == "x20" or phys == "x21" or phys == "x22" or phys == "x23" or phys == "x24" or phys == "x25" or phys == "x26" or phys == "x27"
+}
+
+// Dense callee-saved name by 0-based slot. `pack` writes back via
+// these so the prologue can save `cs_reg(0)..cs_reg(N-1)` in order.
+func cs_reg(anon n: int64) -> str {
+    let names: [str] = ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
+    return names[n]
+}
+
+// True if `p` already appears in `list`. Used to dedupe the pool of
+// available physicals — alloc_reg may have handed out the same phys
+// to two non-overlapping vregs already, so the alloc-time set is
+// smaller than the raw vreg-by-vreg list.
+func str_in(anon list: [str], p: str) -> bool {
+    mut i: int64 = 0
+    for i < len(list) {
+        if list[i] == p {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Scan one Raw line, mutating `def_line` / `last_use` for any vreg
+// tokens it contains. A vreg token is `v<digits>` or `w<digits>` at
+// a word boundary; the `w` form is the 32-bit alias used by the
+// single byte-load site. A vreg in the first operand of a writer
+// mnemonic (outside brackets) is a def; everything else is a use.
+func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64]) -> none {
+    let n: int64 = len(text)
+    mut i: int64 = 0
+    for i < n and (text[i] == '\t' or text[i] == ' ') {
+        i = i + 1
+    }
+    let mn_start: int64 = i
+    for i < n and lexing.is_alpha(text[i]) {
+        i = i + 1
+    }
+    if i == mn_start {
+        return none
+    }
+    let mnemonic: str = text[mn_start..i]
+    let writes_first: bool = is_writer_mnemonic(mnemonic)
+    mut op_index: int64 = 0
+    mut bracket_depth: int64 = 0
+    for i < n {
+        let c: int64 = text[i]
+        if c == '[' {
+            bracket_depth = bracket_depth + 1
+            i = i + 1
+        } else if c == ']' {
+            bracket_depth = bracket_depth - 1
+            i = i + 1
+        } else if c == ',' and bracket_depth == 0 {
+            op_index = op_index + 1
+            i = i + 1
+        } else if (c == 'v' or c == 'w') and i + 1 < n and lexing.is_digit(text[i + 1]) {
+            mut boundary: bool = true
+            if i > 0 and lexing.is_alnum(text[i - 1]) {
+                boundary = false
+            }
+            if boundary == false {
+                i = i + 1
+                continue
+            }
+            mut j: int64 = i + 1
+            mut id: int64 = 0
+            for j < n and lexing.is_digit(text[j]) {
+                id = id * 10 + text[j] - '0'
+                j = j + 1
+            }
+            mut ends_clean: bool = true
+            if j < n and lexing.is_alnum(text[j]) {
+                ends_clean = false
+            }
+            if ends_clean == false or id < vreg_start or id >= vreg_start + n_local {
+                i = j
+                continue
+            }
+            let local_id: int64 = id - vreg_start
+            let is_def: bool = writes_first and op_index == 0 and bracket_depth == 0
+            if is_def and def_line[local_id] == -1 {
+                def_line[local_id] = line_idx
+            }
+            last_use[local_id] = line_idx
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Constrained linear scan for one function's vregs. Vregs are
+// partitioned by alloc-time class; each class's pool is the set of
+// distinct alloc-time physicals from that class. Walk vregs in
+// def_line order; expire intervals that ended before the current
+// def; pop a free phys (preferring reuse). Mutates `vreg_phys` in
+// place over `[vreg_start, len(vreg_phys))`.
+func run(body_buf: [Insn], vreg_phys: [str], vreg_start: int64) -> none {
+    let vreg_end: int64 = len(vreg_phys)
+    let n_local: int64 = vreg_end - vreg_start
+    if n_local <= 0 {
+        return none
+    }
+
+    mut def_line: [int64] = []
+    mut last_use: [int64] = []
+    mut k: int64 = 0
+    for k < n_local {
+        def_line += [-1]
+        last_use += [-1]
+        k = k + 1
+    }
+
+    mut line_idx: int64 = 0
+    for insn in body_buf {
+        match insn {
+            .Raw(text) -> scan_line(text, :line_idx, :vreg_start, :n_local, :def_line, :last_use)
+            .Label(_name) -> {
+                // Label lines hold a symbol, not asm — no vregs.
+            }
+        }
+        line_idx = line_idx + 1
+    }
+
+    // Snapshot alloc-time phys per local vreg; this is also the
+    // pool we draw from (deduped, partitioned by class).
+    mut alloc_phys: [str] = []
+    k = 0
+    for k < n_local {
+        alloc_phys += [vreg_phys[vreg_start + k]]
+        k = k + 1
+    }
+
+    mut free_callee: [str] = []
+    mut free_caller: [str] = []
+    k = 0
+    for k < n_local {
+        let p: str = alloc_phys[k]
+        if is_callee_saved_phys(p) {
+            if str_in(free_callee, :p) == false {
+                free_callee += [p]
+            }
+        } else {
+            if str_in(free_caller, :p) == false {
+                free_caller += [p]
+            }
+        }
+        k = k + 1
+    }
+
+    // Sort vreg indices by def_line ascending. Insertion sort; n_local
+    // is typically small per function.
+    mut order: [int64] = []
+    k = 0
+    for k < n_local {
+        order += [k]
+        k = k + 1
+    }
+    mut s: int64 = 1
+    for s < n_local {
+        mut t: int64 = s
+        for t > 0 and def_line[order[t - 1]] > def_line[order[t]] {
+            let tmp: int64 = order[t]
+            order[t] = order[t - 1]
+            order[t - 1] = tmp
+            t = t - 1
+        }
+        s = s + 1
+    }
+
+    // Walk vregs in def order; maintain active list (alive intervals).
+    mut active_id: [int64] = []
+    mut active_use: [int64] = []
+    mut active_phys: [str] = []
+    mut new_phys: [str] = []
+    k = 0
+    for k < n_local {
+        new_phys += [alloc_phys[k]]
+        k = k + 1
+    }
+
+    mut oi: int64 = 0
+    for oi < n_local {
+        let local_id: int64 = order[oi]
+        let d: int64 = def_line[local_id]
+        if d == -1 {
+            // Allocated but never defined in the emitted body — keep
+            // its alloc-time phys (the safe default).
+            oi = oi + 1
+            continue
+        }
+        let cls_callee: bool = is_callee_saved_phys(alloc_phys[local_id])
+
+        // Expire actives whose last_use <= this def line. The `<=`
+        // (vs `<`) lets a `mov vDst, vSrc` whose vSrc dies at the mov
+        // hand its phys to vDst on the spot — the mov substitutes to
+        // `mov xN, xN` (self-mov) which `flush_out` drops. ARM64 reads
+        // all sources before writing the dest, so sharing a phys
+        // between dying-source and just-defined-dest on the same line
+        // is well-defined for every mnemonic we emit.
+        mut na_id: [int64] = []
+        mut na_use: [int64] = []
+        mut na_phys: [str] = []
+        mut ai: int64 = 0
+        for ai < len(active_id) {
+            if active_use[ai] <= d {
+                let ap: str = active_phys[ai]
+                if is_callee_saved_phys(ap) {
+                    free_callee += [ap]
+                } else {
+                    free_caller += [ap]
+                }
+            } else {
+                na_id += [active_id[ai]]
+                na_use += [active_use[ai]]
+                na_phys += [active_phys[ai]]
+            }
+            ai = ai + 1
+        }
+        active_id = na_id
+        active_use = na_use
+        active_phys = na_phys
+
+        // Pop a phys from the matching class's free pool.
+        mut chosen: str = ""
+        if cls_callee {
+            if len(free_callee) > 0 {
+                chosen = free_callee[len(free_callee) - 1]
+                mut nfc: [str] = []
+                mut fi: int64 = 0
+                for fi < len(free_callee) - 1 {
+                    nfc += [free_callee[fi]]
+                    fi = fi + 1
+                }
+                free_callee = nfc
+            }
+        } else {
+            if len(free_caller) > 0 {
+                chosen = free_caller[len(free_caller) - 1]
+                mut nfc2: [str] = []
+                mut fi2: int64 = 0
+                for fi2 < len(free_caller) - 1 {
+                    nfc2 += [free_caller[fi2]]
+                    fi2 = fi2 + 1
+                }
+                free_caller = nfc2
+            }
+        }
+        if len(chosen) == 0 {
+            // Shouldn't happen — pool size equals alloc-time pressure.
+            // Fall back to the alloc-time phys.
+            chosen = alloc_phys[local_id]
+        }
+        new_phys[local_id] = chosen
+        active_id += [local_id]
+        active_use += [last_use[local_id]]
+        active_phys += [chosen]
+        oi = oi + 1
+    }
+
+    // Write back.
+    k = 0
+    for k < n_local {
+        vreg_phys[vreg_start + k] = new_phys[k]
+        k = k + 1
+    }
+}
+
+// Pack the function's actually-used callee-saved registers into a
+// dense `x19..x{19+N-1}` prefix and return `N` (the new
+// callee-saved high-water mark).
+//
+// The prologue/epilogue saves the FIRST `N` callee-saved registers
+// (cs_reg(0)=x19, cs_reg(1)=x20, …); regalloc can leave gaps in that
+// sequence (e.g. use x19 and x21 but skip x20), and the alloc-time
+// high-water mark over-saves to cover them. Packing makes the saved
+// set match the used set exactly, dropping unnecessary stp/ldp pairs
+// from the prologue.
+//
+// Safe because all reassignments stay inside the callee-saved class —
+// every site that asked `is_callee_saved(vreg)` at emit time still
+// gets the same answer, so spill_across decisions remain correct.
+func pack(vreg_phys: [str], vreg_start: int64) -> int64 {
+    let vreg_end: int64 = len(vreg_phys)
+    mut used: [str] = []
+    mut i: int64 = vreg_start
+    for i < vreg_end {
+        let p: str = vreg_phys[i]
+        if is_callee_saved_phys(p) and str_in(used, :p) == false {
+            used += [p]
+        }
+        i = i + 1
+    }
+    i = vreg_start
+    for i < vreg_end {
+        let p: str = vreg_phys[i]
+        if is_callee_saved_phys(p) {
+            mut j: int64 = 0
+            mut found: int64 = -1
+            for j < len(used) and found < 0 {
+                if used[j] == p {
+                    found = j
+                }
+                j = j + 1
+            }
+            if found >= 0 {
+                vreg_phys[i] = cs_reg(found)
+            }
+        }
+        i = i + 1
+    }
+    return len(used)
+}

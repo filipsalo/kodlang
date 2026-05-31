@@ -55,6 +55,7 @@ COMPILER_LIB_OBJS := \
     $(STAGE0)/_ast.o \
     $(STAGE0)/_lexing.o \
     $(STAGE0)/_parsing.o \
+    $(STAGE0)/_regalloc.o \
     $(STAGE0)/_codegen.o \
     $(STAGE0)/_build.o
 
@@ -62,6 +63,7 @@ COMPILER_KOD := \
     stdlib/kod/ast.kod \
     stdlib/kod/lexing.kod \
     stdlib/kod/parsing.kod \
+    stdlib/kod/regalloc.kod \
     stdlib/kod/codegen.kod \
     stdlib/kod/build.kod \
     kodc.kod
@@ -159,6 +161,10 @@ $(STAGE0)/_lexing.s: stdlib/kod/lexing.kod $(COMPILER_KOD)
 	$(KODC) $< > $@
 
 $(STAGE0)/_parsing.s: stdlib/kod/parsing.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) $< > $@
+
+$(STAGE0)/_regalloc.s: stdlib/kod/regalloc.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
 
