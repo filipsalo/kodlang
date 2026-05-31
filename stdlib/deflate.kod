@@ -1,0 +1,110 @@
+// Deflate compression (RFC 1951). Currently only the fixed-Huffman
+// path (BTYPE=01) with literals only — no LZ77 back-references yet,
+// so the output is slightly larger than the input (~6% on average).
+// Real LZ77 matching is the next step.
+
+// Bit-level output buffer. Deflate packs data and Huffman codes into
+// a byte stream with two different orderings (RFC 1951 §3.1.1):
+//
+//   - Non-Huffman data: least-significant bit of each element first.
+//   - Huffman codes:    most-significant bit of each code first.
+//
+// `write_bits` handles the LSB-first path. `write_huffman` reverses
+// the code's bit order and reuses the same accumulator.
+type BitWriter = struct {
+    bytes: [int64]
+    cur: int64
+    n_bits: int64
+
+    // Append `n` low bits of `v` to the stream, LSB-first.
+    func write_bits(self, anon v: int64, anon n: int64) -> none {
+        let mask: int64 = (1 << n) - 1
+        let masked: int64 = v & mask
+        let shifted: int64 = masked << self.n_bits
+        self.cur = self.cur | shifted
+        self.n_bits = self.n_bits + n
+        for self.n_bits >= 8 {
+            self.bytes += [self.cur & 0xff]
+            self.cur = self.cur >> 8
+            self.n_bits = self.n_bits - 8
+        }
+    }
+
+    // Append an `n`-bit Huffman code, MSB-first within the code. We
+    // reverse the bits so the LSB-first stream emits them in the
+    // right order.
+    func write_huffman(self, anon code: int64, anon n: int64) -> none {
+        mut reversed: int64 = 0
+        mut i: int64 = 0
+        for i < n {
+            let bit: int64 = (code >> i) & 1
+            reversed = (reversed << 1) | bit
+            i = i + 1
+        }
+        self.write_bits(reversed, n)
+    }
+
+    // Flush any partial byte by padding with zero bits.
+    func flush_byte(self) -> none {
+        if self.n_bits > 0 {
+            self.bytes += [self.cur & 0xff]
+            self.cur = 0
+            self.n_bits = 0
+        }
+    }
+}
+
+func make_bitwriter() -> BitWriter {
+    return BitWriter(bytes: [], cur: 0, n_bits: 0)
+}
+
+// RFC 1951 §3.2.6: fixed Huffman code for literal/length value 0-287.
+// Returns the raw code; the bit length varies by range.
+func fixed_lit_code(anon n: int64) -> int64 {
+    if n <= 143 {
+        return 0x30 + n
+    }
+    if n <= 255 {
+        return 0x190 + n - 144
+    }
+    if n <= 279 {
+        return n - 256
+    }
+    return 0xC0 + n - 280
+}
+
+func fixed_lit_bits(anon n: int64) -> int64 {
+    if n <= 143 {
+        return 8
+    }
+    if n <= 255 {
+        return 9
+    }
+    if n <= 279 {
+        return 7
+    }
+    return 8
+}
+
+// Encode `data` as a single fixed-Huffman block (BTYPE=01) — every
+// input byte goes through the literal/length Huffman code, then the
+// end-of-block marker (256). No LZ77 matching, so output is slightly
+// larger than input.
+func deflate_fixed(anon data: str) -> [int64] {
+    let bw: BitWriter = make_bitwriter()
+    // 3-bit block header: BFINAL=1 (low bit) then BTYPE=01 (next 2),
+    // both packed LSB-first.
+    bw.write_bits(1, 1)
+    bw.write_bits(1, 2)
+    mut i: int64 = 0
+    let n: int64 = len(data)
+    for i < n {
+        let byte: int64 = data[i]
+        bw.write_huffman(fixed_lit_code(byte), fixed_lit_bits(byte))
+        i = i + 1
+    }
+    // End-of-block marker (literal/length code 256, 7 bits).
+    bw.write_huffman(fixed_lit_code(256), fixed_lit_bits(256))
+    bw.flush_byte()
+    return bw.bytes
+}
