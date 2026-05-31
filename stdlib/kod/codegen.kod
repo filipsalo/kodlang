@@ -5773,6 +5773,51 @@ type Codegen = struct {
         }
     }
 
+    // Pack the function's actually-used callee-saved registers into a
+    // dense `x19..x{19+N-1}` prefix and reset `cs_high_water` to `N`.
+    //
+    // The prologue/epilogue in `compile_func` saves the FIRST cs_high_water
+    // callee-saved registers (cs_reg(0)=x19, cs_reg(1)=x20, …); regalloc
+    // can leave gaps in that sequence (e.g. use x19 and x21 but skip x20),
+    // and the alloc-time `cs_high_water` over-saves to cover them. Packing
+    // makes the saved set match the used set exactly, dropping unnecessary
+    // stp/ldp pairs from the prologue.
+    //
+    // Safe because all reassignments stay inside the callee-saved class —
+    // every site that asked `is_callee_saved(vreg)` at emit time still
+    // gets the same answer, so spill_across decisions remain correct.
+    func pack_callee_saved(self, anon vreg_start: int64) -> none {
+        let vreg_end: int64 = len(self.vreg_phys)
+        mut used: [str] = []
+        mut i: int64 = vreg_start
+        for i < vreg_end {
+            let p: str = self.vreg_phys[i]
+            if self.ra_is_callee_saved_phys(p) and self.ra_str_in(used, :p) == false {
+                used += [p]
+            }
+            i = i + 1
+        }
+        i = vreg_start
+        for i < vreg_end {
+            let p: str = self.vreg_phys[i]
+            if self.ra_is_callee_saved_phys(p) {
+                mut j: int64 = 0
+                mut found: int64 = -1
+                for j < len(used) and found < 0 {
+                    if used[j] == p {
+                        found = j
+                    }
+                    j = j + 1
+                }
+                if found >= 0 {
+                    self.vreg_phys[i] = self.cs_reg(found)
+                }
+            }
+            i = i + 1
+        }
+        self.cs_high_water = len(used)
+    }
+
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.check_param_order(func_decl, func_decl.name)
@@ -5865,9 +5910,12 @@ type Codegen = struct {
         // Run linear-scan regalloc over the function's vregs, reusing
         // the alloc-time pool. Updates `vreg_phys` for this function's
         // range; the substitution at flush_out time picks up the new
-        // assignments. cs_high_water is left alone — the alloc-time count
-        // bounds the actual usage, so the prologue can only over-save.
+        // assignments. Then `pack_callee_saved` collapses regalloc's
+        // chosen callee-saved set into a dense `x19..` prefix and rewrites
+        // `cs_high_water` so the prologue saves exactly the registers the
+        // body actually uses.
         self.regalloc_func(:body_buf, :vreg_start)
+        self.pack_callee_saved(vreg_start)
 
         // Round the callee-saved count up to an even number of registers
         // (stp/ldp move pairs); the pad slot uses x28, which is never
