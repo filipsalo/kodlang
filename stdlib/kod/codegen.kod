@@ -2277,6 +2277,12 @@ type Codegen = struct {
                 }
             }
             .OptionalDot(value, _field) -> self.collect_expr_vars(value)
+            .OptionalMethodCall(value, _method, args) -> {
+                self.collect_expr_vars(value)
+                for arg in args {
+                    self.collect_expr_vars(arg.value)
+                }
+            }
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
                 mut subj_inner: TypeKind = .KInt64
@@ -2651,6 +2657,7 @@ type Codegen = struct {
             .Must(inner) -> return self.compile_must(inner)
             .UnwrapOpt(value, default) -> return self.compile_unwrap_opt(value_id: value, default_id: default)
             .OptionalDot(value, field) -> return self.compile_optional_dot(value_id: value, :field)
+            .OptionalMethodCall(value, method, args) -> return self.compile_optional_method_call(value_id: value, :method, :args)
         }
     }
 
@@ -4266,6 +4273,17 @@ type Codegen = struct {
                 }
                 return .KInt64
             }
+            .OptionalMethodCall(value, method, _args) -> {
+                // `x?.method(args)` returns U?: look up the method on the
+                // value's inner struct and re-wrap its return type.
+                let struct_idx = self.find_struct_idx_of_optional(value)
+                if struct_idx >= 0 {
+                    if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
+                        return .KOptional(inner: self.structs[struct_idx].methods[mi].sig.return_kind)
+                    }
+                }
+                return .KInt64
+            }
             else return .KInt64
         }
     }
@@ -4925,14 +4943,8 @@ type Codegen = struct {
         match self.return_kind {
             .KOptional(inner) -> {
                 mut assume_optional = false
-                match self.p.exprs[value_id] {
-                    .NoneLit -> assume_optional = true
-                    .Call(callee, args) -> {
-                        if self.p.exprs[callee] is .Ident(name) {
-                            assume_optional = true
-                        }
-                    }
-                    else none
+                if self.p.exprs[value_id] is .NoneLit {
+                    assume_optional = true
                 }
                 if assume_optional == false {
                     match self.infer_kind(value_id) {
@@ -5215,6 +5227,92 @@ type Codegen = struct {
         self.free_reg(ptr)
         self.emit_label(done_lbl)
         return .VReg(name: reg)
+    }
+
+    // `x?.method(args)` — short-circuit method call on a `T?` struct.
+    // If x is none, the whole expression is none. Otherwise dereference
+    // the Optional cell to get the struct pointer, dispatch the method,
+    // and wrap the return value into a fresh Some cell.
+    func compile_optional_method_call(self, value_id: int64, method: str, args: [ast.CallArg]) -> Val {
+        let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
+        if struct_idx < 0 {
+            self.report_error(f"error: `?.{method}(...)` requires a `T?` value where T is a struct", span: self.p.expr_spans[value_id])
+            return .VImm(value: 0)
+        }
+        mut method_lbl: str = ""
+        mut sig_params: [TypeKind] = []
+        mut sig_labels: [str] = []
+        if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
+            method_lbl = f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}${method}"
+            sig_params = self.structs[struct_idx].methods[mi].sig.param_kinds
+            sig_labels = self.structs[struct_idx].methods[mi].sig.param_labels
+        }
+        if len(method_lbl) == 0 {
+            self.report_error(f"error: struct `{self.structs[struct_idx].name}` has no method `{method}`", span: self.p.expr_spans[value_id])
+            return .VImm(value: 0)
+        }
+        self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method, call_span: self.p.expr_spans[value_id])
+        let result = self.alloc_reg()
+        let val = self.compile_expr(value_id)
+        mut reg = self.load(val)
+        let some_lbl = self.fresh("Lopt_call_some")
+        let done_lbl = self.fresh("Lopt_call_done")
+        self.emit(f"cbnz {reg}, {some_lbl}")
+        // none path: result stays 0.
+        self.emit(f"mov {result}, #0")
+        self.emit(f"b {done_lbl}")
+        self.emit_label(some_lbl)
+        // Dereference the Optional cell — reg now holds the struct pointer
+        // (the method's `self`).
+        self.emit(f"ldr {reg}, [{reg}]")
+        // Park the struct pointer + each arg on the stack so the inner
+        // bls (arg wrapping, method dispatch itself) can't clobber them.
+        let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let n: int64 = len(args) + 1
+        mut padded: int64 = n * 8
+        if padded % 16 != 0 {
+            padded = padded + 8
+        }
+        self.emit(f"sub sp, sp, #{padded}")
+        self.emit(f"str {reg}, [sp]")
+        self.free_reg(reg)
+        mut i: int64 = 0
+        for i < len(args) {
+            mut arg_reg: str = ""
+            let param_idx: int64 = i + 1
+            if param_idx < len(sig_params) {
+                arg_reg = self.compile_value_for_kind(args[i].value, expected: sig_params[param_idx])
+            } else {
+                let arg_val = self.compile_expr(args[i].value)
+                arg_reg = self.load(arg_val)
+            }
+            self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
+            self.free_reg(arg_reg)
+            i = i + 1
+        }
+        mut k: int64 = 0
+        for k < n {
+            self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
+            k = k + 1
+        }
+        self.emit(f"add sp, sp, #{padded}")
+        self.emit(f"bl {method_lbl}")
+        // Wrap the return value (now in x0) into a fresh Some cell.
+        let ret_reg = self.alloc_reg()
+        self.emit(f"mov {ret_reg}, x0")
+        let val_spilled = self.preserve_begin(ret_reg)
+        self.emit("mov x0, #8")
+        self.emit("bl _arena_alloc")
+        let ptr = self.alloc_reg()
+        self.emit(f"mov {ptr}, x0")
+        let tmp = self.preserve_end(ret_reg, spilled: val_spilled)
+        self.emit(f"str {tmp}, [{ptr}]")
+        self.free_reg(tmp)
+        self.emit(f"mov {result}, {ptr}")
+        self.free_reg(ptr)
+        self.free_reg(ret_reg)
+        self.emit_label(done_lbl)
+        return .VReg(name: result)
     }
 
     func compile_if(self, cond_id: int64, then_body: [int64], else_body: [int64]) -> none {

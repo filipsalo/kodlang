@@ -312,6 +312,14 @@ class Interpreter:
                 if isinstance(v, types.NoneType):
                     return types.none_value
                 return getattr(v, field)
+            case ast.OptionalMethodCall(value, method, args, _span):
+                v = self.evaluate_expression(module, value)
+                if isinstance(v, types.NoneType):
+                    return types.none_value
+                methods = getattr(type(v), "methods", {})
+                bound = BoundMethod(methods[method], v)
+                arg_values = [self.evaluate_expression(module, p.value) for p in args]
+                return self.call_function(module, bound, arg_values)
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):

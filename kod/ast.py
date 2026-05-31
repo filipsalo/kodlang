@@ -657,6 +657,18 @@ class OptionalDot(ASTNode):
 
 
 @dataclasses.dataclass
+class OptionalMethodCall(ASTNode):
+    """`value?.method(args)` — short-circuit method call on a `T?`
+    struct. If `value` is none, the whole expression is none; otherwise
+    the method runs on the unwrapped value and the result is wrapped."""
+
+    value: ASTNode
+    method: str
+    args: "FunctionCallParamList"
+    span: Span
+
+
+@dataclasses.dataclass
 class TestDeclaration(ASTNode):
     """A `test "description" { ... }` block. The Python frontend parses
     the body just enough not to choke; codegen.kod is the source of
@@ -962,12 +974,17 @@ class Expression(ASTNode):
                     lhs = FunctionCall(lhs, rhs, span)
                 elif isinstance(op, tokens.Question):
                     # Postfix `?`: unwrap an Optional. `expr?` panics on
-                    # none; `expr? or default` substitutes default; `expr?.field`
-                    # short-circuits a field access.
+                    # none; `expr? or default` substitutes default;
+                    # `expr?.field` short-circuits a field access;
+                    # `expr?.method(args)` short-circuits a method call.
                     parser.consume(tokens.Question)
                     if parser.try_consume(tokens.Dot):
-                        field = parser.consume(tokens.Identifier).value
-                        lhs = OptionalDot(lhs, field, span)
+                        name = parser.consume(tokens.Identifier).value
+                        if parser.peeking_at(tokens.OpenParen):
+                            args = FunctionCallParamList.parse(parser)
+                            lhs = OptionalMethodCall(lhs, name, args, span)
+                        else:
+                            lhs = OptionalDot(lhs, name, span)
                     elif parser.try_consume(tokens.Or):
                         # Parse the default above `or`'s precedence so a
                         # subsequent `or` isn't folded into our default.
