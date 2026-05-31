@@ -788,11 +788,57 @@ type Codegen = struct {
     func flush_out(self) -> none {
         for insn in self.out_buf {
             match insn {
-                .Raw(text) -> print(self.subst_vregs(text))
+                .Raw(text) -> {
+                    let s: str = self.subst_vregs(text)
+                    if self.is_self_mov(s) == false {
+                        print(s)
+                    }
+                }
                 .Label(name) -> print(name + ":")
             }
         }
         self.out_buf = []
+    }
+
+    // True if `s` is `\tmov xN, xN` for some register N — the no-op
+    // pattern coalescing leaves behind once vDst and vSrc share a phys.
+    func is_self_mov(self, anon s: str) -> bool {
+        let n: int64 = len(s)
+        if n < 8 or s[0] != '\t' or s[1] != 'm' or s[2] != 'o' or s[3] != 'v' or s[4] != ' ' {
+            return false
+        }
+        mut i: int64 = 5
+        // First operand: `xN` or `wN`.
+        if i >= n or (s[i] != 'x' and s[i] != 'w') {
+            return false
+        }
+        let start_a: int64 = i
+        i = i + 1
+        for i < n and lexing.is_digit(s[i]) {
+            i = i + 1
+        }
+        let end_a: int64 = i
+        if i >= n or s[i] != ',' {
+            return false
+        }
+        i = i + 1
+        for i < n and s[i] == ' ' {
+            i = i + 1
+        }
+        // Second operand: same prefix + digits, exact match.
+        if i >= n or (s[i] != 'x' and s[i] != 'w') {
+            return false
+        }
+        let start_b: int64 = i
+        i = i + 1
+        for i < n and lexing.is_digit(s[i]) {
+            i = i + 1
+        }
+        let end_b: int64 = i
+        if i != n {
+            return false
+        }
+        return s[start_a..end_a] == s[start_b..end_b]
     }
 
     // Walk `text` and replace every `v<digits>` token with the physical
@@ -5704,13 +5750,19 @@ type Codegen = struct {
             }
             let cls_callee: bool = self.ra_is_callee_saved_phys(alloc_phys[local_id])
 
-            // Expire actives whose last_use < this def line.
+            // Expire actives whose last_use <= this def line. The `<=`
+            // (vs `<`) lets a `mov vDst, vSrc` whose vSrc dies at the mov
+            // hand its phys to vDst on the spot — the mov substitutes to
+            // `mov xN, xN` (self-mov) which `flush_out` drops. ARM64 reads
+            // all sources before writing the dest, so sharing a phys
+            // between dying-source and just-defined-dest on the same line
+            // is well-defined for every mnemonic we emit.
             mut na_id: [int64] = []
             mut na_use: [int64] = []
             mut na_phys: [str] = []
             mut ai: int64 = 0
             for ai < len(active_id) {
-                if active_use[ai] < d {
+                if active_use[ai] <= d {
                     let ap: str = active_phys[ai]
                     if self.ra_is_callee_saved_phys(ap) {
                         free_callee += [ap]
