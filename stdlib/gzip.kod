@@ -1,0 +1,98 @@
+// Stored-only gzip writer — produces valid `.gz` output that any
+// gunzip-compatible decoder accepts, but does no actual compression.
+// Useful as a framing-only baseline and as a reference for the more
+// involved Deflate-with-fixed-Huffman variant that'll follow.
+//
+// Format (RFC 1952):
+//   - 10-byte header: magic 1f 8b, method 08 (deflate), flags 00,
+//     mtime (4 LE bytes, we emit 0), xfl 00, os 03 (Unix).
+//   - One or more stored-block headers + payloads (RFC 1951 §3.2.4):
+//       BFINAL+BTYPE byte (with 5 padding bits to byte-align),
+//       LEN (2 LE), NLEN (2 LE, ones-complement of LEN),
+//       N raw payload bytes. Max LEN per block is 65535.
+//   - 8-byte trailer: CRC-32 of uncompressed data (4 LE),
+//     ISIZE = uncompressed length mod 2^32 (4 LE).
+
+import "crc32"
+
+// Max length of a single deflate stored block (RFC 1951 §3.2.4): the
+// LEN field is 16-bit, so the largest representable payload size is
+// 2^16 - 1.
+func max_block() -> int64 {
+    return 65535
+}
+
+// Append the low 8 bits of `v` to `out`.
+func emit_byte(anon mut out: [int64], anon v: int64) -> none {
+    out += [v & 0xff]
+}
+
+// Append a 16-bit little-endian value.
+func emit_le16(anon mut out: [int64], anon v: int64) -> none {
+    out += [v & 0xff]
+    out += [(v >> 8) & 0xff]
+}
+
+// Append a 32-bit little-endian value.
+func emit_le32(anon mut out: [int64], anon v: int64) -> none {
+    out += [v & 0xff]
+    out += [(v >> 8) & 0xff]
+    out += [(v >> 16) & 0xff]
+    out += [(v >> 24) & 0xff]
+}
+
+// One stored block — header + payload bytes. `is_final` sets BFINAL.
+// `data` is the input string; `start..start+block_len` is the slice.
+func emit_stored_block(mut out: [int64], data: str, start: int64, block_len: int64, is_final: bool) -> none {
+    mut bfinal: int64 = 0
+    if is_final {
+        bfinal = 1
+    }
+    // Bottom 3 bits: BFINAL + BTYPE=00 (stored). Top 5 bits pad to byte.
+    emit_byte(out, bfinal)
+    emit_le16(out, block_len)
+    emit_le16(out, block_len ^ 0xffff)
+    mut i: int64 = 0
+    for i < block_len {
+        out += [data[start + i]]
+        i = i + 1
+    }
+}
+
+// Store `data` into a valid gzip stream (no compression, just framing).
+func compress(anon data: str) -> str {
+    mut out: [int64] = []
+    // Header.
+    emit_byte(out, 0x1f)        // magic
+    emit_byte(out, 0x8b)
+    emit_byte(out, 0x08)        // method = deflate
+    emit_byte(out, 0x00)        // flags
+    emit_le32(out, 0)           // mtime = 0 (unknown)
+    emit_byte(out, 0x00)        // xfl
+    emit_byte(out, 0x03)        // os = Unix
+
+    // Body. Empty input still needs one final empty stored block —
+    // otherwise the trailing CRC/ISIZE wouldn't be a valid stream.
+    let total: int64 = len(data)
+    if total == 0 {
+        emit_stored_block(out: out, data: data, start: 0, block_len: 0, is_final: true)
+    } else {
+        mut start: int64 = 0
+        for start < total {
+            mut chunk: int64 = total - start
+            if chunk > max_block() {
+                chunk = max_block()
+            }
+            let is_final: bool = (start + chunk) == total
+            emit_stored_block(out: out, data: data, start: start, block_len: chunk, :is_final)
+            start = start + chunk
+        }
+    }
+
+    // Trailer.
+    let crc: int64 = crc32.compute(data)
+    emit_le32(out, crc)
+    emit_le32(out, total & 0xffffffff)
+
+    return kod_str_from_bytes(out)
+}
