@@ -299,6 +299,14 @@ class Interpreter:
                     sys.stderr.write(f"panic: {msg.value.decode('utf8')}\n")
                     sys.exit(1)
                 return value
+            case ast.OptionalUnwrap(value, default, _span):
+                v = self.evaluate_expression(module, value)
+                if not isinstance(v, types.NoneType):
+                    return v
+                if default is not None:
+                    return self.evaluate_expression(module, default)
+                sys.stderr.write("panic: unwrap on none\n")
+                sys.exit(1)
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):

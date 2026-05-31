@@ -370,5 +370,9 @@ class MinusEqual(BinaryOperator):
 
 
 @dataclasses.dataclass
-class Question(Token):
-    """A question mark."""
+class Question(BinaryOperator):
+    """A question mark. In type position it marks `T?` optionals; in
+    expression position it's the postfix unwrap operator (`x?`, optionally
+    followed by `or default`)."""
+
+    precedence = 20

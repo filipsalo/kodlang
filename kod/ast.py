@@ -636,6 +636,16 @@ class MustExpression(ASTNode):
 
 
 @dataclasses.dataclass
+class OptionalUnwrap(ASTNode):
+    """`expr?` on a `T?` value. `default is None` means panic on none;
+    otherwise `default` is the `or default` substitute."""
+
+    value: ASTNode
+    default: ASTNode | None
+    span: Span
+
+
+@dataclasses.dataclass
 class TestDeclaration(ASTNode):
     """A `test "description" { ... }` block. The Python frontend parses
     the body just enough not to choke; codegen.kod is the source of
@@ -939,6 +949,17 @@ class Expression(ASTNode):
                 if isinstance(op, tokens.OpenParen):
                     rhs = FunctionCallParamList.parse(parser)
                     lhs = FunctionCall(lhs, rhs, span)
+                elif isinstance(op, tokens.Question):
+                    # Postfix `?`: unwrap an Optional. `expr?` panics on
+                    # none; `expr? or default` substitutes default.
+                    parser.consume(tokens.Question)
+                    if parser.try_consume(tokens.Or):
+                        # Parse the default above `or`'s precedence so a
+                        # subsequent `or` isn't folded into our default.
+                        default = Expression.parse(parser, tokens.Or.precedence + 1)
+                    else:
+                        default = None
+                    lhs = OptionalUnwrap(lhs, default, span)
                 elif isinstance(op, tokens.OpenBracket):
                     parser.consume(tokens.OpenBracket)
                     # Two forms: `[idx]` index and `[lo..hi]` slice (either

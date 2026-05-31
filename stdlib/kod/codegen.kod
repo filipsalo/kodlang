@@ -2270,6 +2270,12 @@ type Codegen = struct {
             }
             .Try(inner) -> self.collect_expr_vars(inner)
             .Must(inner) -> self.collect_expr_vars(inner)
+            .UnwrapOpt(value, default) -> {
+                self.collect_expr_vars(value)
+                if default != 0 {
+                    self.collect_expr_vars(default)
+                }
+            }
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
                 mut subj_inner: TypeKind = .KInt64
@@ -2642,6 +2648,7 @@ type Codegen = struct {
             .Slice(s, lo, hi) -> return self.compile_slice(s_id: s, lo_id: lo, hi_id: hi)
             .Try(inner) -> return self.compile_try(inner)
             .Must(inner) -> return self.compile_must(inner)
+            .UnwrapOpt(value, default) -> return self.compile_unwrap_opt(value_id: value, default_id: default)
         }
     }
 
@@ -4241,6 +4248,13 @@ type Codegen = struct {
                 }
                 return k
             }
+            .UnwrapOpt(value, _default) -> {
+                let k = self.infer_kind(value)
+                if k is .KOptional(inner) {
+                    return inner
+                }
+                return k
+            }
             else return .KInt64
         }
     }
@@ -5103,6 +5117,37 @@ type Codegen = struct {
 
     func compile_must(self, anon inner_id: int64) -> Val {
         return self.compile_try_or_must(inner_id, is_must: true)
+    }
+
+    // `expr?` on a `T?` value. Optional values are represented as nullable
+    // pointers: `none` is the 0 word, `Some(v)` is a pointer to a one-slot
+    // cell whose contents is `v`. We test the pointer against zero;
+    // non-null dereferences to the payload, null either panics (no `or
+    // default`) or evaluates `default_id`.
+    func compile_unwrap_opt(self, value_id: int64, default_id: int64) -> Val {
+        let val = self.compile_expr(value_id)
+        mut reg = self.load(val)
+        let some_lbl = self.fresh("Lopt_some")
+        let done_lbl = self.fresh("Lopt_done")
+        self.emit(f"cbnz {reg}, {some_lbl}")
+        // none path
+        if default_id == 0 {
+            let pos = self.format_position(self.p.expr_spans[value_id].start)
+            let msg = f"{pos}: unwrap on none"
+            let msg_lbl = self.intern_str(msg)
+            self.emit(f"adrp x0, {msg_lbl}@PAGE")
+            self.emit(f"add x0, x0, {msg_lbl}@PAGEOFF")
+            self.emit("bl _kod_panic")
+        } else {
+            let dval = self.compile_expr(default_id)
+            self.mov_to(dval, dest: reg)
+            self.emit(f"b {done_lbl}")
+        }
+        self.emit_label(some_lbl)
+        // Some(v) path: dereference the cell to get v.
+        self.emit(f"ldr {reg}, [{reg}]")
+        self.emit_label(done_lbl)
+        return .VReg(name: reg)
     }
 
     func compile_if(self, cond_id: int64, then_body: [int64], else_body: [int64]) -> none {
