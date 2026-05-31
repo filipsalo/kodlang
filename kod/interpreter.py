@@ -307,6 +307,11 @@ class Interpreter:
                     return self.evaluate_expression(module, default)
                 sys.stderr.write("panic: unwrap on none\n")
                 sys.exit(1)
+            case ast.OptionalDot(value, field, _span):
+                v = self.evaluate_expression(module, value)
+                if isinstance(v, types.NoneType):
+                    return types.none_value
+                return getattr(v, field)
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
             case ast.Literal(value):

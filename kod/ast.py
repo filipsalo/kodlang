@@ -646,6 +646,17 @@ class OptionalUnwrap(ASTNode):
 
 
 @dataclasses.dataclass
+class OptionalDot(ASTNode):
+    """`value?.field` — short-circuit field access on a `T?` struct.
+    If `value` is none, the whole expression is none; otherwise the
+    field is read from the unwrapped value and wrapped as Some."""
+
+    value: ASTNode
+    field: str
+    span: Span
+
+
+@dataclasses.dataclass
 class TestDeclaration(ASTNode):
     """A `test "description" { ... }` block. The Python frontend parses
     the body just enough not to choke; codegen.kod is the source of
@@ -951,15 +962,19 @@ class Expression(ASTNode):
                     lhs = FunctionCall(lhs, rhs, span)
                 elif isinstance(op, tokens.Question):
                     # Postfix `?`: unwrap an Optional. `expr?` panics on
-                    # none; `expr? or default` substitutes default.
+                    # none; `expr? or default` substitutes default; `expr?.field`
+                    # short-circuits a field access.
                     parser.consume(tokens.Question)
-                    if parser.try_consume(tokens.Or):
+                    if parser.try_consume(tokens.Dot):
+                        field = parser.consume(tokens.Identifier).value
+                        lhs = OptionalDot(lhs, field, span)
+                    elif parser.try_consume(tokens.Or):
                         # Parse the default above `or`'s precedence so a
                         # subsequent `or` isn't folded into our default.
                         default = Expression.parse(parser, tokens.Or.precedence + 1)
+                        lhs = OptionalUnwrap(lhs, default, span)
                     else:
-                        default = None
-                    lhs = OptionalUnwrap(lhs, default, span)
+                        lhs = OptionalUnwrap(lhs, None, span)
                 elif isinstance(op, tokens.OpenBracket):
                     parser.consume(tokens.OpenBracket)
                     # Two forms: `[idx]` index and `[lo..hi]` slice (either

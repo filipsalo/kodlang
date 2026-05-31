@@ -2276,6 +2276,7 @@ type Codegen = struct {
                     self.collect_expr_vars(default)
                 }
             }
+            .OptionalDot(value, _field) -> self.collect_expr_vars(value)
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
                 mut subj_inner: TypeKind = .KInt64
@@ -2649,6 +2650,7 @@ type Codegen = struct {
             .Try(inner) -> return self.compile_try(inner)
             .Must(inner) -> return self.compile_must(inner)
             .UnwrapOpt(value, default) -> return self.compile_unwrap_opt(value_id: value, default_id: default)
+            .OptionalDot(value, field) -> return self.compile_optional_dot(value_id: value, :field)
         }
     }
 
@@ -4255,6 +4257,15 @@ type Codegen = struct {
                 }
                 return k
             }
+            .OptionalDot(value, field) -> {
+                // `x?.field` returns U?: look through the value's Optional
+                // to its inner struct, find the field's kind, and re-wrap.
+                let struct_idx = self.find_struct_idx_of_optional(value)
+                if struct_idx >= 0 {
+                    return .KOptional(inner: self.find_field_kind(field, struct_idx: struct_idx))
+                }
+                return .KInt64
+            }
             else return .KInt64
         }
     }
@@ -4327,7 +4338,6 @@ type Codegen = struct {
                 mut needs_wrap = true
                 match self.p.exprs[value_id] {
                     .NoneLit -> needs_wrap = false
-                    .Call(callee, args) -> needs_wrap = false
                     else none
                 }
                 if needs_wrap {
@@ -4457,7 +4467,6 @@ type Codegen = struct {
                 mut needs_wrap = true
                 match self.p.exprs[value_id] {
                     .NoneLit -> needs_wrap = false
-                    .Call(callee, args) -> needs_wrap = false
                     else none
                 }
                 if needs_wrap {
@@ -5146,6 +5155,64 @@ type Codegen = struct {
         self.emit_label(some_lbl)
         // Some(v) path: dereference the cell to get v.
         self.emit(f"ldr {reg}, [{reg}]")
+        self.emit_label(done_lbl)
+        return .VReg(name: reg)
+    }
+
+    // If `expr_id`'s inferred kind is `KOptional(KStruct(idx, _))`,
+    // return idx; otherwise -1. Folded out of `compile_optional_dot` /
+    // the `infer_kind` arm to keep both copies of the pattern in lockstep.
+    func find_struct_idx_of_optional(self, anon expr_id: int64) -> int64 {
+        mut inner_kind: TypeKind = .KVoid
+        mut is_opt: bool = false
+        if self.infer_kind(expr_id) is .KOptional(u) {
+            inner_kind = u
+            is_opt = true
+        }
+        if is_opt == false {
+            return -1
+        }
+        if inner_kind is .KStruct(idx, _args) {
+            return idx
+        }
+        return -1
+    }
+
+    // `x?.field` — short-circuit field access on a `T?` struct. If x is
+    // none, the whole expression is none. Otherwise we dereference to get
+    // the struct pointer, read .field, and wrap the value into a fresh
+    // Some cell so the result is `U?` (U = field's type).
+    func compile_optional_dot(self, value_id: int64, field: str) -> Val {
+        let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
+        if struct_idx < 0 {
+            self.report_error(f"error: `?.{field}` requires a `T?` value where T is a struct", span: self.p.expr_spans[value_id])
+            return .VImm(value: 0)
+        }
+        let foff: int64 = self.find_field_offset(field, :struct_idx)
+        let val = self.compile_expr(value_id)
+        mut reg = self.load(val)
+        let some_lbl = self.fresh("Lopt_dot_some")
+        let done_lbl = self.fresh("Lopt_dot_done")
+        self.emit(f"cbnz {reg}, {some_lbl}")
+        // none path: result stays 0.
+        self.emit(f"b {done_lbl}")
+        self.emit_label(some_lbl)
+        // Dereference the Optional cell to get the struct pointer, then
+        // load the field at its known offset.
+        self.emit(f"ldr {reg}, [{reg}]")
+        self.emit(f"ldr {reg}, [{reg}, #{foff}]")
+        // Wrap the field value into a fresh Some cell: arena_alloc 8 +
+        // store the value. Preserves the field value across `bl`.
+        let val_spilled = self.preserve_begin(reg)
+        self.emit("mov x0, #8")
+        self.emit("bl _arena_alloc")
+        let ptr = self.alloc_reg()
+        self.emit(f"mov {ptr}, x0")
+        let tmp = self.preserve_end(reg, spilled: val_spilled)
+        self.emit(f"str {tmp}, [{ptr}]")
+        self.free_reg(tmp)
+        self.emit(f"mov {reg}, {ptr}")
+        self.free_reg(ptr)
         self.emit_label(done_lbl)
         return .VReg(name: reg)
     }
