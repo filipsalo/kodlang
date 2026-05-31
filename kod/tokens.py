@@ -147,6 +147,51 @@ class Or(BinaryOperator):
     precedence = 8
 
 
+# Bitwise operators. Self-hosted codegen orders these between boolean
+# and comparison (BitOr/Xor/And: 4/5/6; shifts: 8) following C; the
+# Python frontend's wider precedence scale doesn't have the gaps, so
+# we cluster the OR/XOR/AND group at one level above `And` and put
+# shifts at one level above comparisons. User parens disambiguate.
+@dataclasses.dataclass
+class Pipe(BinaryOperator):
+    """Bitwise OR."""
+
+    precedence = 11
+
+
+@dataclasses.dataclass
+class Caret(BinaryOperator):
+    """Bitwise XOR."""
+
+    precedence = 11
+
+
+@dataclasses.dataclass
+class Ampersand(BinaryOperator):
+    """Bitwise AND."""
+
+    precedence = 11
+
+
+@dataclasses.dataclass
+class ShiftLeft(BinaryOperator):
+    """Left shift."""
+
+    precedence = 14
+
+
+@dataclasses.dataclass
+class ShiftRight(BinaryOperator):
+    """Logical (unsigned) right shift."""
+
+    precedence = 14
+
+
+@dataclasses.dataclass
+class Tilde(Token):
+    """Bitwise NOT (prefix)."""
+
+
 @dataclasses.dataclass
 class EOF(Token):
     """The end of the file."""

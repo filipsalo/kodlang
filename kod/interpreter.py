@@ -231,6 +231,16 @@ class Interpreter:
                 op_func_name = "op_div"
             case tokens.Star():
                 op_func_name = "op_mul"
+            case tokens.Ampersand():
+                op_func_name = "op_band"
+            case tokens.Pipe():
+                op_func_name = "op_bor"
+            case tokens.Caret():
+                op_func_name = "op_bxor"
+            case tokens.ShiftLeft():
+                op_func_name = "op_shl"
+            case tokens.ShiftRight():
+                op_func_name = "op_shr"
             case _:
                 raise ValueError(f"Don't know how to evaluate binary operator {op}")
         lhs = self.evaluate_expression(module, lhs)

@@ -9,12 +9,14 @@ from kod.span import Span
 from kod.tokens import (
     EOF,
     EOL,
+    Ampersand,
     And,
     Anon,
     Arrow,
     Assert,
     BooleanLiteral,
     Break,
+    Caret,
     CloseBracket,
     CloseCurly,
     CloseParen,
@@ -56,16 +58,20 @@ from kod.tokens import (
     OpenParen,
     Or,
     Percent,
+    Pipe,
     Plus,
     PlusEqual,
     Question,
     Return,
+    ShiftLeft,
+    ShiftRight,
     Slash,
     Star,
     StringLiteral,
     Struct,
     Test,
     Throw,
+    Tilde,
     Token,
     Try,
     Type,
@@ -352,19 +358,25 @@ class Lexer:
         return self.build(NotEqual)
 
     def lex_less_than_or_equal(self) -> Token:
-        """Lex < or <=."""
+        """Lex `<`, `<=`, or `<<`."""
         self.consume("<")
         if self.peek() == "=":
             self.consume("=")
             return self.build(LessEqual)
+        if self.peek() == "<":
+            self.consume("<")
+            return self.build(ShiftLeft)
         return self.build(LessThan)
 
     def lex_greater_than_or_equal(self) -> Token:
-        """Lex > or >=."""
+        """Lex `>`, `>=`, or `>>`."""
         self.consume(">")
         if self.peek() == "=":
             self.consume("=")
             return self.build(GreaterEqual)
+        if self.peek() == ">":
+            self.consume(">")
+            return self.build(ShiftRight)
         return self.build(GreaterThan)
 
     def lex_slash_or_comment(self) -> Token:
@@ -470,5 +482,13 @@ class Lexer:
                     yield self.lex_slash_or_comment()
                 case "?":
                     yield self.lex_single_char(Question)
+                case "&":
+                    yield self.lex_single_char(Ampersand)
+                case "|":
+                    yield self.lex_single_char(Pipe)
+                case "^":
+                    yield self.lex_single_char(Caret)
+                case "~":
+                    yield self.lex_single_char(Tilde)
                 case _:
                     yield self.lex_identifier()

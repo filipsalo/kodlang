@@ -102,6 +102,28 @@ class Type:
         """Multiply two integers."""
         return self.__class__(self.value * other.value)
 
+    def op_band(self, other: Self) -> Self:
+        """Bitwise AND."""
+        return self.__class__(self.value & other.value)
+
+    def op_bor(self, other: Self) -> Self:
+        """Bitwise OR."""
+        return self.__class__(self.value | other.value)
+
+    def op_bxor(self, other: Self) -> Self:
+        """Bitwise XOR."""
+        return self.__class__(self.value ^ other.value)
+
+    def op_shl(self, other: Self) -> Self:
+        """Left shift, masked to 64 bits to match compiled semantics."""
+        return self.__class__((self.value << other.value) & 0xFFFFFFFFFFFFFFFF)
+
+    def op_shr(self, other: Self) -> Self:
+        """Logical (unsigned) right shift — masks to 64 bits before
+        shifting so negative values shift like a 2's-complement bit
+        pattern, matching the compiled `lsr`."""
+        return self.__class__((self.value & 0xFFFFFFFFFFFFFFFF) >> other.value)
+
 
 class Bool(Type):
     """A boolean."""
