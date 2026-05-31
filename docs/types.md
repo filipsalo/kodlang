@@ -53,6 +53,23 @@ let n: int64 = 42
 let m: int64 = -1
 ```
 
+Base prefixes for non-decimal forms:
+
+```kod
+let hex: int64 = 0xff           // 255
+let oct: int64 = 0o755          // 493
+let bin: int64 = 0b1010         // 10
+```
+
+Decimal literals may use a space as a thousands separator. The
+grouping is strict — a head of 1-3 digits followed by space-prefixed
+groups of exactly 3 digits each:
+
+```kod
+let pop: int64 = 1 000 000      // ok
+let bad: int64 = 1 23 456       // lex error — middle group isn't 3 digits
+```
+
 Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
 `+=` and `-=` update a variable, field, or array element in place
 (`n -= 3` is `n = n - 3`).
@@ -65,6 +82,8 @@ let other: bool = false
 ```
 
 Logical operators: `and`, `or`, `not` (prefix). Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`.
+
+Chained comparisons are supported Python-style: `a < b < c` evaluates `b` once and is equivalent to `(a < b) and (b < c)`. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
 
 ## `none`
 
@@ -103,6 +122,24 @@ Or peel off the `Some` with `let .Some(v) = y else { ... }`:
 let .Some(v) = y else { return -1 }
 // v is in scope and has type int64
 ```
+
+### Postfix `?`
+
+`expr?` on a `T?` value evaluates to `T`. Without a trailing clause it
+panics on `none`; with `or default` it substitutes the default
+instead:
+
+```kod
+let n: int64? = find("hello", 'l')
+let idx: int64       = n?           // panics if none
+let idx2: int64      = n? or -1     // -1 if none
+```
+
+The default is evaluated lazily (only when the value is `none`), and
+its type must match the unwrapped `T`. A following `or` outside the
+unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
+`(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
+error unless `T` is `bool`).
 
 ## Arrays
 

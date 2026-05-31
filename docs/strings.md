@@ -110,8 +110,10 @@ let last: int64 = s[-1]
 ## Slicing
 
 ```kod
-let sub: str = s[2:5]   // bytes at positions 2, 3, 4
+let sub: str = s[2..5]   // bytes at positions 2, 3, 4
 ```
+
+Either endpoint may be omitted: `s[..k]` is `s[0..k]` and `s[k..]` is `s[k..len(s)]`. `s[..]` returns a copy.
 
 ## Comparison
 

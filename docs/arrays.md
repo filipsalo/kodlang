@@ -30,6 +30,17 @@ Negative indices wrap around: `arr[-1]` is equivalent to `arr[len(arr) - 1]`.
 let n: int64 = len(nums)
 ```
 
+## Slicing
+
+```kod
+let sub: [int64] = nums[1..4]   // elements 1, 2, 3
+let prefix: [int64] = nums[..3]  // first three
+let suffix: [int64] = nums[3..]  // from index 3 onward
+let copy: [int64] = nums[..]     // shallow copy
+```
+
+Both endpoints clamp to `[0, len]`; out-of-range bounds yield an empty slice.
+
 ## Concatenation
 
 Use `+=` to append elements or extend with another array:
