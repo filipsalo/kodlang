@@ -850,61 +850,67 @@ type Codegen = struct {
         return s[start_a..end_a] == s[start_b..end_b]
     }
 
-    // Walk `text` and replace every `v<digits>` token with the physical
-    // register recorded in `vreg_phys`. A token is a `v`/`w` not preceded
-    // by an alphanumeric character followed by one or more digits; if the
-    // run lands on alphanumeric (e.g. inside an identifier like `Lv1_end`)
-    // it's left alone.
+    // Walk `text` and replace every `v<digits>` (or `w<digits>`) token
+    // with the physical register recorded in `vreg_phys`. A token is a
+    // `v`/`w` not preceded by an alphanumeric character followed by one
+    // or more digits and trailing on a non-alphanumeric byte; runs that
+    // land inside a longer identifier (`Lv1_end`) are left alone.
     //
-    // `w<id>` is the 32-bit alias form — a handful of byte-load sites
-    // write `ldrb w{vreg[1..]}, …` to get the w-prefixed name. We honor
-    // that by substituting the physical's w-form (e.g. `v17` → `x21` →
-    // `w21`) when the input token starts with `w`.
+    // The output is built by concatenating verbatim chunks of `text`
+    // around the substitution sites — O(n) per line, vs the char-by-char
+    // accumulator pattern's O(n²). `flush_start` marks the beginning of
+    // the next pending chunk; whenever we replace a vreg, we append
+    // `text[flush_start..vreg_start]` followed by the substitution and
+    // advance `flush_start` past the vreg. Lines with no substitutions
+    // return the original `text` unchanged.
     func subst_vregs(self, anon text: str) -> str {
-        mut out: str = ""
-        mut i: int64 = 0
         let n: int64 = len(text)
-        mut prev_alnum: bool = false
+        mut out: str = ""
+        mut flush_start: int64 = 0
+        mut i: int64 = 0
         for i < n {
             let c: int64 = text[i]
-            let is_vreg_prefix: bool = (c == 'v' or c == 'w') and prev_alnum == false and i + 1 < n and lexing.is_digit(text[i + 1])
-            if is_vreg_prefix {
+            if (c == 'v' or c == 'w') and i + 1 < n and lexing.is_digit(text[i + 1]) {
+                mut boundary: bool = true
+                if i > 0 and lexing.is_alnum(text[i - 1]) {
+                    boundary = false
+                }
+                if boundary == false {
+                    i = i + 1
+                    continue
+                }
                 mut j: int64 = i + 1
                 mut id: int64 = 0
                 for j < n and lexing.is_digit(text[j]) {
                     id = id * 10 + text[j] - '0'
                     j = j + 1
                 }
-                // Only substitute if the run ended on a non-alnum (or EOF)
-                // — otherwise it's part of a longer identifier and not a
-                // vreg. Also bound-check against `vreg_phys` so a literal
-                // `w1`/`v0` in a label remains intact.
-                mut ended_clean: bool = true
                 if j < n and lexing.is_alnum(text[j]) {
-                    ended_clean = false
-                }
-                if ended_clean and id < len(self.vreg_phys) {
-                    let phys: str = self.vreg_phys[id]
-                    if c == 'w' {
-                        // x-form → w-form: same number, different prefix.
-                        out = out + "w" + phys[1..len(phys)]
-                    } else {
-                        out = out + phys
-                    }
                     i = j
-                    prev_alnum = true
+                    continue
+                }
+                if id >= len(self.vreg_phys) {
+                    i = j
+                    continue
+                }
+                let phys: str = self.vreg_phys[id]
+                out = out + text[flush_start..i]
+                if c == 'w' {
+                    // x-form → w-form: same number, different prefix.
+                    out = out + "w" + phys[1..len(phys)]
                 } else {
-                    out = out + text[i..j]
-                    i = j
-                    prev_alnum = lexing.is_alnum(text[j - 1])
+                    out = out + phys
                 }
+                flush_start = j
+                i = j
             } else {
-                out = out + text[i..i+1]
-                prev_alnum = lexing.is_alnum(c)
                 i = i + 1
             }
         }
-        return out
+        if flush_start == 0 {
+            return text
+        }
+        return out + text[flush_start..n]
     }
 
     func emit(self, anon line: str) -> none {
