@@ -1021,6 +1021,14 @@ class Expression(ASTNode):
                             lhs = BinaryOperator(lhs, op, start, span)
                 else:
                     parser.consume(type(op))
+                    # `is not Pat` — synthesize an IsNot operator so the
+                    # rest of the parse + interp dispatch handle it as a
+                    # single binary op rather than a sequence.
+                    if isinstance(op, tokens.Is) and isinstance(
+                        parser.peek(), tokens.Not
+                    ):
+                        not_tok = parser.consume(tokens.Not)
+                        op = tokens.IsNot(value="is not", span=op.span | not_tok.span)
                     rhs = cls.parse(parser, op.precedence + op.left_associative)
                     if isinstance(op, tokens.Equal):
                         lhs = Assignment(lhs, rhs, span)
@@ -1211,10 +1219,18 @@ class IfStatement(ASTNode):
                             continue
                         if stmt := parser.parse_statement():
                             else_body.append(stmt)
-                arms = [
-                    MatchArm(pat, body, span),
-                    MatchArm(WildcardPattern(span), else_body, span),
-                ]
+                # `is not` swaps arms: body runs when the pattern does
+                # NOT match; pattern bindings only see else_body.
+                if isinstance(condition.op, tokens.IsNot):
+                    arms = [
+                        MatchArm(pat, else_body, span),
+                        MatchArm(WildcardPattern(span), body, span),
+                    ]
+                else:
+                    arms = [
+                        MatchArm(pat, body, span),
+                        MatchArm(WildcardPattern(span), else_body, span),
+                    ]
                 return MatchStatement(lhs, arms, span)
             parser.consume(tokens.OpenCurly)
             while not parser.try_consume(tokens.CloseCurly):
@@ -1236,13 +1252,14 @@ class IfStatement(ASTNode):
 
 
 def _pattern_from_is_rhs(cond):
-    """If `cond` is `<lhs> is <rhs>` where rhs is a binding pattern shape
-    (Some(v), .Variant(b), Enum.Variant(b)), return the corresponding
-    Pattern node. Otherwise return None — the if-stmt keeps its bool
-    semantics."""
+    """If `cond` is `<lhs> is <rhs>` or `<lhs> is not <rhs>` where rhs
+    is a binding pattern shape (Some(v), .Variant(b), Enum.Variant(b)),
+    return the corresponding Pattern node. Otherwise return None —
+    the if-stmt keeps its bool semantics. The caller checks `cond.op`
+    to know whether arms should be swapped (for `is not`)."""
     if not isinstance(cond, BinaryOperator):
         return None
-    if not isinstance(cond.op, tokens.Is):
+    if not isinstance(cond.op, (tokens.Is, tokens.IsNot)):
         return None
     rhs = cond.rhs
     span = cond.span

@@ -190,12 +190,12 @@ class Interpreter:
                 op_func_name = "op_gt"
             case tokens.GreaterEqual():
                 op_func_name = "op_ge"
-            case tokens.Is():
+            case tokens.Is() | tokens.IsNot():
+                negate = isinstance(op, tokens.IsNot)
                 lhs_val = self.evaluate_expression(module, lhs)
                 if isinstance(lhs_val, types.ResultValue):
-                    if self._is_rhs_name(rhs) == "Ok":
-                        return types.Bool(lhs_val.ok)
-                    return types.Bool(not lhs_val.ok)
+                    matches = (self._is_rhs_name(rhs) == "Ok") == bool(lhs_val.ok)
+                    return types.Bool(matches != negate)
                 # Interface downcast: `value is StructType` — a type name that
                 # isn't the optional `Some`/`none` marker. Interface values are
                 # the raw struct instance, so this is a class-name check.
@@ -204,13 +204,14 @@ class Interpreter:
                     rhs, ast.NoneLiteral
                 ):
                     if isinstance(lhs_val, types.NoneType):
-                        return types.Bool(False)
-                    return types.Bool(type(lhs_val).__name__ == name)
+                        return types.Bool(negate)
+                    matches = type(lhs_val).__name__ == name
+                    return types.Bool(matches != negate)
                 is_none = isinstance(lhs_val, types.NoneType)
                 if isinstance(rhs, ast.NoneLiteral):
-                    return types.Bool(is_none)
+                    return types.Bool(is_none != negate)
                 else:
-                    return types.Bool(not is_none)
+                    return types.Bool((not is_none) != negate)
             case tokens.EqualEqual():
                 op_func_name = "op_eq"
             case tokens.And():

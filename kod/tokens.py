@@ -400,6 +400,22 @@ class Is(BinaryOperator):
 
 
 @dataclasses.dataclass
+class Not(Token):
+    """A `not` keyword. Today only meaningful as the second word of
+    the `is not` operator; reserved for a future unary boolean
+    negation."""
+
+
+@dataclasses.dataclass
+class IsNot(BinaryOperator):
+    """The `is not` two-word operator — `is` with its result negated.
+    Synthesised by the parser when it sees `is` followed by `not`;
+    shares precedence with `Is`."""
+
+    precedence = 12
+
+
+@dataclasses.dataclass
 class PlusEqual(BinaryOperator):
     """A += operator."""
 

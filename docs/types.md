@@ -110,11 +110,20 @@ Test with `is` and destructure with `Some(binding)`:
 if x is none {
     print("nothing")
 }
+if y is not none {
+    print("got something")
+}
 match y {
     Some(v) -> print_int(v)
     none -> print("nothing")
 }
 ```
+
+`is not Pat` reads as one operator — `is` negated by the trailing
+`not` — and works anywhere `is Pat` does (expression context and
+the `if … is …` form). It's the predicate spelling of "does this
+not match"; for the `if` form, the body runs when the pattern *does
+not* match.
 
 Or peel off the `Some` with `let .Some(v) = y else { ... }`:
 
