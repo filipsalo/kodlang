@@ -12,7 +12,11 @@
 extern char **environ;
 
 void *arena_alloc(int64_t size);
-static void kod_print_backtrace(void);
+// Defined in stdlib/kod/inspect.kod. Both panic handlers call it
+// inline with `__builtin_frame_address(0)` (NOT through a wrapper —
+// see the longer note where the asm-label declaration lives).
+extern void kod_inspect_print_backtrace_from(int64_t fp)
+    __asm__("$kod$inspect$print_backtrace_from");
 
 // A Kod `str` value is a pointer to one of these. `buf` points at a
 // byte buffer of `len` bytes plus an explicit NUL terminator (kept
@@ -59,111 +63,54 @@ void kod_panic(KodStr *msg) {
     fwrite("panic: ", 1, 7, stderr);
     fwrite(msg->buf, 1, msg->len, stderr);
     fputc('\n', stderr);
-    kod_print_backtrace();
+    kod_inspect_print_backtrace_from(
+        (int64_t)(uintptr_t)__builtin_frame_address(0));
     exit(1);
+}
+
+// Backtrace generation lives in kod (stdlib/kod/inspect.kod) — the
+// C runtime keeps just the primitives the kod walker needs (raw
+// memory reads, c-string lift, section-bounds accessors) plus a
+// small wrapper that captures the panic-handler's own fp and hands
+// it to the kod entry point.
+
+// Mach-O linker-synthesised bounds for the per-function symbol
+// rows the codegen emits via emit_symtab_entry.
+extern const char kod_symtab_section_start[]
+    __asm__("section$start$__DATA$__kod_symtab");
+extern const char kod_symtab_section_end[]
+    __asm__("section$end$__DATA$__kod_symtab");
+
+int64_t _inspect_read_i64(int64_t addr) { return *(int64_t *)addr; }
+int64_t _inspect_read_i32(int64_t addr) { return *(int32_t *)addr; }
+// Used by `inspect.print_backtrace()` (the user-facing zero-arg
+// form): __builtin_frame_address(1) is the caller's fp. The kod
+// caller's frame is what we want to start walking from — so the
+// trace's first row is the user function that called print_backtrace,
+// not inspect.print_backtrace itself. `noinline` keeps the wrapper
+// frame distinct so fa(1) does the right thing.
+__attribute__((noinline)) int64_t _inspect_caller_fp(void) {
+    return (int64_t)(uintptr_t)__builtin_frame_address(1);
+}
+KodStr *_inspect_cstr_to_str(int64_t addr) {
+    return kod_str_from_cstr((const char *)addr);
+}
+int64_t _inspect_symtab_start(void) {
+    return (int64_t)(uintptr_t)kod_symtab_section_start;
+}
+int64_t _inspect_symtab_end(void) {
+    return (int64_t)(uintptr_t)kod_symtab_section_end;
 }
 
 // Called by the codegen's array-indexing bounds check on a miss.
 // Negative indices are already normalised (idx += len) before this
 // runs, so any out-of-range value here is genuinely out of bounds.
-// Per-statement line marker — one row in the per-function block of
-// __DATA,__kod_lines that `kod_symtab_entry.lines_start/end`
-// brackets.
-typedef struct {
-    void *pc;
-    int32_t line;
-    int32_t _pad;
-} kod_line_entry;
-
-// Each kod function's codegen contributes one row of this shape into
-// the __DATA,__kod_symtab section. The linker concatenates all rows;
-// `kod_symtab_start` / `kod_symtab_end` (Mach-O linker-synthesised
-// section bounds) bracket them at runtime.
-//   +0   addr        — function entry-point address
-//   +8   name        — c-string, e.g. "Codegen.compile_func"
-//  +16   file        — c-string, e.g. "stdlib/kod/codegen.kod"
-//  +24   decl_line   — 1-indexed line of the func name identifier
-//  +28   pad         — kept at zero
-//  +32   lines_start — start of per-function (pc, line) rows
-//  +40   lines_end   — end of per-function (pc, line) rows
-typedef struct {
-    void *addr;
-    const char *name;
-    const char *file;
-    int32_t decl_line;
-    int32_t _pad;
-    const kod_line_entry *lines_start;
-    const kod_line_entry *lines_end;
-} kod_symtab_entry;
-extern const kod_symtab_entry kod_symtab_start[]
-    __asm__("section$start$__DATA$__kod_symtab");
-extern const kod_symtab_entry kod_symtab_end[]
-    __asm__("section$end$__DATA$__kod_symtab");
-
-// Linear scan: return the entry with the largest addr ≤ `lr`, or
-// NULL if `lr` is below every entry. The linker concatenates module
-// .o files in arbitrary order, so the table isn't sorted; we don't
-// pre-sort because a panic-time loop over a few-thousand-entry table
-// is fast enough and the alternative requires either an init pass
-// or accepting some unwritten order from `ld`.
-static const kod_symtab_entry *kod_symtab_lookup(void *lr) {
-    const kod_symtab_entry *best = NULL;
-    for (const kod_symtab_entry *e = kod_symtab_start; e < kod_symtab_end; e++) {
-        if (e->addr <= lr && (best == NULL || e->addr > best->addr)) {
-            best = e;
-        }
-    }
-    return best;
-}
-
-// Walk the ARM64 frame pointer chain. Apple's AAPCS-on-Darwin layout
-// stores [fp] = previous fp, [fp, #8] = saved lr; the kod codegen's
-// standard prologue (`stp fp, lr, [sp, #aligned]; add fp, sp, #aligned`)
-// produces this exact shape, so the unwinder needs nothing custom.
-// Stop on null fp or on a non-forward-progress fp (corrupted chain).
-static void kod_print_backtrace(void) {
-    void **fp = __builtin_frame_address(0);
-    fputs("backtrace:\n", stderr);
-    // Skip the topmost frame (this very function) so the trace
-    // starts at the panic-handler's caller, not at the unwinder.
-    if (fp != NULL) fp = (void **)fp[0];
-    for (int i = 0; i < 32 && fp != NULL; i++) {
-        void *lr = fp[1];
-        const kod_symtab_entry *sym = kod_symtab_lookup(lr);
-        // A huge offset means `lr` belongs to a non-kod function
-        // (most often dyld's `start`, just above `main`): we matched
-        // the closest preceding kod symbol but the real callee is
-        // far away. Stop walking — there's nothing useful past this.
-        ptrdiff_t off = sym ? (char *)lr - (char *)sym->addr : 0;
-        if (sym == NULL || off > 0x100000) break;
-        // `lr` points to the instruction AFTER the call, so look up
-        // `lr - 1` to land in the bl/blr range rather than past it.
-        // The line table is per-statement: largest pc ≤ (lr - 1)
-        // gives the statement enclosing the call. Falls back to the
-        // function's declaration line when no statement marker fits.
-        int line = sym->decl_line;
-        void *probe = (void *)((char *)lr - 1);
-        const kod_line_entry *best = NULL;
-        for (const kod_line_entry *e = sym->lines_start;
-             e < sym->lines_end; e++) {
-            if (e->pc <= probe && (best == NULL || e->pc > best->pc)) {
-                best = e;
-            }
-        }
-        if (best != NULL) line = best->line;
-        fprintf(stderr, "  #%d  %s (%s:%d)\n",
-                i, sym->name, sym->file, line);
-        void **next = (void **)fp[0];
-        if (next == NULL || (uintptr_t)next < (uintptr_t)fp) break;
-        fp = next;
-    }
-}
-
 void kod_index_oob(int64_t idx, int64_t len) {
     fprintf(stderr,
             "panic: index %lld out of bounds for array of length %lld\n",
             (long long)idx, (long long)len);
-    kod_print_backtrace();
+    kod_inspect_print_backtrace_from(
+        (int64_t)(uintptr_t)__builtin_frame_address(0));
     exit(1);
 }
 

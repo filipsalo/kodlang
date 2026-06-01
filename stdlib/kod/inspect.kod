@@ -1,0 +1,171 @@
+// Self-introspection for the running process. Today: backtrace
+// generation — walk the ARM64 frame-pointer chain and resolve each
+// return address to a kod function name, source file, and the
+// per-statement source line via the `__kod_symtab` / `__kod_lines`
+// Mach-O sections the codegen emits alongside every function.
+//
+// Called from the C runtime's `kod_panic` / `kod_index_oob` paths
+// — they print the panic banner, then hand control here with the
+// caller's frame pointer for the walk's starting point. Everything
+// past that header line lives in kod.
+
+// Raw memory primitives. These are intentionally not in builtins
+// — they exist purely to plumb the backtrace walker, and exposing
+// arbitrary `*(int64*)addr` to ordinary code would invite
+// trouble. Each takes a numeric address (kod has no pointer type)
+// and returns the value at that address.
+extern func _inspect_read_i64(anon addr: int64) -> int64
+extern func _inspect_read_i32(anon addr: int64) -> int64
+// Wrap a NUL-terminated C string at `addr` into a kod `str` by
+// copying the bytes. Used to lift symbol-name / file-path entries
+// out of the __TEXT,__cstring section.
+extern func _inspect_cstr_to_str(anon addr: int64) -> str
+// Mach-O linker-synthesised bounds for the per-binary symbol
+// table. Each entry is `_symtab_row_size` bytes; layout matches
+// the C-side `kod_symtab_entry` struct (see stdlib/runtime.c).
+extern func _inspect_symtab_start() -> int64
+extern func _inspect_symtab_end() -> int64
+// Returns the caller's frame pointer (i.e. the fp of whatever kod
+// function called us via this extern). Used by `print_backtrace`
+// so user code can capture its own fp without writing a C wrapper.
+extern func _inspect_caller_fp() -> int64
+
+// One frame in a backtrace. `addr` is the captured return address
+// (the instruction after the call site); the other fields are
+// resolved via the symtab.
+type Frame = struct {
+    addr: int64
+    name: str
+    file: str
+    line: int64
+}
+
+// Layout constants for the codegen-emitted rows. Must stay in
+// sync with `emit_symtab_entry` in kod/codegen.
+func _symtab_row_size() -> int64 { return 48 }
+func _lines_row_size() -> int64 { return 16 }
+
+// Find the symtab row whose `addr` is the largest one ≤ `lr`.
+// Linear scan — at the few-thousand-entry tables we emit, a panic-
+// time scan is microseconds; sorting would buy us nothing.
+// Returns the row's address, or -1 if no entry's `addr` is ≤ `lr`
+// (e.g. lr fell outside any kod-emitted function — most often
+// dyld's `start`).
+func _find_sym(anon lr: int64) -> int64 {
+    let start: int64 = _inspect_symtab_start()
+    let end: int64 = _inspect_symtab_end()
+    let row_size: int64 = _symtab_row_size()
+    mut best: int64 = -1
+    mut best_addr: int64 = 0
+    mut row: int64 = start
+    for row < end {
+        let entry_addr: int64 = _inspect_read_i64(row)
+        if entry_addr <= lr {
+            if best < 0 or entry_addr > best_addr {
+                best = row
+                best_addr = entry_addr
+            }
+        }
+        row = row + row_size
+    }
+    return best
+}
+
+// Resolve the precise statement-level source line covering `lr`
+// via the function's per-row `__kod_lines` sub-table. Falls back
+// to the function's declaration line when no statement marker
+// covers the lr (e.g. lr lands in the prologue before the first
+// stmt-line label was emitted).
+func _line_for(anon sym_row: int64, anon lr: int64) -> int64 {
+    let decl_line: int64 = _inspect_read_i32(sym_row + 24)
+    let lines_start: int64 = _inspect_read_i64(sym_row + 32)
+    let lines_end: int64 = _inspect_read_i64(sym_row + 40)
+    // `lr` points one instruction past the call; probe `lr - 1`
+    // so we land in the bl/blr range rather than past it.
+    let probe: int64 = lr - 1
+    mut best_line: int64 = decl_line
+    mut best_pc: int64 = 0
+    mut found: bool = false
+    let row_size: int64 = _lines_row_size()
+    mut row: int64 = lines_start
+    for row < lines_end {
+        let pc: int64 = _inspect_read_i64(row)
+        if pc <= probe {
+            if found == false or pc > best_pc {
+                best_line = _inspect_read_i32(row + 8)
+                best_pc = pc
+                found = true
+            }
+        }
+        row = row + row_size
+    }
+    return best_line
+}
+
+// Walk the frame-pointer chain starting at `start_fp`, returning
+// one Frame per resolvable kod call. Apple's AAPCS-on-Darwin
+// layout: `[fp]` = previous fp, `[fp+8]` = saved lr. Stops on:
+//   - null fp (off the bottom of the stack)
+//   - non-forward-progress fp (corrupted chain)
+//   - an lr that doesn't resolve to a kod symbol (left kod code)
+//   - a resolved offset > 1 MB (the closest kod symbol's so far
+//     away it can't be the real callee; almost always dyld's
+//     `start` above main)
+func backtrace_from(anon start_fp: int64) -> [Frame] {
+    mut frames: [Frame] = []
+    mut fp: int64 = start_fp
+    mut i: int64 = 0
+    for fp != 0 and i < 32 {
+        let lr: int64 = _inspect_read_i64(fp + 8)
+        let sym_row: int64 = _find_sym(lr)
+        if sym_row < 0 {
+            break
+        }
+        let sym_addr: int64 = _inspect_read_i64(sym_row)
+        let off: int64 = lr - sym_addr
+        if off > 1048576 {
+            break
+        }
+        let name_addr: int64 = _inspect_read_i64(sym_row + 8)
+        let file_addr: int64 = _inspect_read_i64(sym_row + 16)
+        let line: int64 = _line_for(sym_row, lr)
+        let name: str = _inspect_cstr_to_str(name_addr)
+        let file: str = _inspect_cstr_to_str(file_addr)
+        frames += [Frame(addr: lr, :name, :file, :line)]
+        let next_fp: int64 = _inspect_read_i64(fp)
+        if next_fp == 0 or next_fp <= fp {
+            break
+        }
+        fp = next_fp
+        i = i + 1
+    }
+    return frames
+}
+
+// Format the backtrace to stderr — one line per frame. The C
+// runtime's panic handlers call this directly via the kod symbol
+// `$kod$inspect$print_backtrace_from`, passing their own
+// `__builtin_frame_address(0)` so the walk starts at the panicking
+// function (the handler's frame is below us in the chain).
+func print_backtrace_from(anon start_fp: int64) -> none {
+    let frames: [Frame] = backtrace_from(start_fp)
+    kod_eprint("backtrace:")
+    mut i: int64 = 0
+    for f in frames {
+        kod_eprint(f"  #{i}  {f.name} ({f.file}:{f.line})")
+        i = i + 1
+    }
+}
+
+// Zero-arg form for user code: returns the current call stack as
+// a list of Frames starting at the caller of this function.
+func backtrace() -> [Frame] {
+    return backtrace_from(_inspect_caller_fp())
+}
+
+// Zero-arg form for user code: prints the current call stack to
+// stderr starting at the caller. Useful for ad-hoc debug prints
+// without provoking a panic.
+func print_backtrace() -> none {
+    print_backtrace_from(_inspect_caller_fp())
+}

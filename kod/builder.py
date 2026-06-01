@@ -68,6 +68,14 @@ class Builder:
         """Parse the program starting at `file`."""
         main = self.parse_module(file)
         self.program.add_module(main)
+        # `kod/inspect` is referenced by `stdlib/runtime.c`'s panic
+        # handlers, so every linked binary needs its symbols even when
+        # user code doesn't `import "kod/inspect"`. Parse it eagerly
+        # so the build loop compiles and links its .o.
+        inspect_file = self.program.resolve_import("kod/inspect")
+        key = inspect_file.canonical_path.with_suffix("")
+        if key not in self.program.modules:
+            self.program.add_module(self.parse_module(inspect_file))
         return self.program
 
     def parse_module(self, file: FileWrapper) -> ast.Module:

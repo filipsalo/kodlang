@@ -45,7 +45,8 @@ STAGE0_OBJS := \
     $(STAGE0)/_bool.o \
     $(STAGE0)/_io.o \
     $(STAGE0)/_process.o \
-    $(STAGE0)/_time.o
+    $(STAGE0)/_time.o \
+    $(STAGE0)/_inspect.o
 
 # Compiler-library .o files shared by `make stage1` (sh_kodc itself)
 # and `make kod` (the native kod driver). Compiled into build/stage0/
@@ -145,6 +146,10 @@ $(STAGE0)/_process.s: stdlib/process.kod
 	$(KODC) $< > $@
 
 $(STAGE0)/_time.s: stdlib/time.kod
+	mkdir -p $(STAGE0)
+	$(KODC) $< > $@
+
+$(STAGE0)/_inspect.s: stdlib/kod/inspect.kod
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
 
