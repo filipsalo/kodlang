@@ -1,12 +1,23 @@
+// Apple gates `ucontext_t` behind _XOPEN_SOURCE (the POSIX-deprecated
+// API set) — needed by the sampling profiler's SIGPROF handler in
+// kod_prof_handler. _DARWIN_C_SOURCE re-enables the BSD extensions
+// (CLOCK_MONOTONIC_RAW, environ, etc.) that _XOPEN_SOURCE would
+// otherwise shadow.
+#define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE
+
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -782,4 +793,90 @@ int64_t kod_unix_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+}
+
+// ── Sampling profiler ─────────────────────────────────────────────────
+//
+// SIGPROF-driven sampler: every `interval_us` of CPU time the kernel
+// delivers SIGPROF and the handler records the call stack (return
+// addresses) into a fixed buffer. `stdlib/kod/profiling.kod` exposes
+// start/stop/report; aggregation + name resolution happen in kod after
+// sampling stops, so the signal handler stays async-signal-safe (no
+// allocation, no libc calls, just memory reads + counter increments).
+//
+// Sample storage is a flat 2D array `[KOD_PROF_MAX_SAMPLES *
+// KOD_PROF_MAX_FRAMES]` of return addresses, plus a parallel array of
+// per-sample depths. Each handler entry walks at most KOD_PROF_MAX_FRAMES
+// frames; entries past the limit truncate (we lose the bottom of deep
+// stacks but never over-run). When the sample buffer fills, further
+// handler entries no-op — the report shows what we captured.
+//
+// The captured chain is `[PC, lr_of_F, lr_of_caller(F), ...]`. The
+// first entry is the program counter at signal time (interrupted
+// instruction); the rest come from walking fp[8] / fp[0] off the
+// ucontext-supplied fp register, same shape as inspect's panic walker.
+
+#define KOD_PROF_MAX_FRAMES 32
+// 4096 samples × 32 frames × 8 bytes = 1 MiB. At 1 ms sampling that's
+// ~4 s of capture before the buffer fills.
+#define KOD_PROF_MAX_SAMPLES 4096
+
+static int64_t kod_prof_frames[KOD_PROF_MAX_SAMPLES * KOD_PROF_MAX_FRAMES];
+static int32_t kod_prof_depths[KOD_PROF_MAX_SAMPLES];
+static volatile int64_t kod_prof_count = 0;
+
+static void kod_prof_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)sig;
+    (void)info;
+    if (kod_prof_count >= KOD_PROF_MAX_SAMPLES) return;
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    int64_t slot = kod_prof_count;
+    int64_t *row = &kod_prof_frames[slot * KOD_PROF_MAX_FRAMES];
+    int depth = 0;
+    row[depth++] = (int64_t)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+    void **fp = (void **)uc->uc_mcontext->__ss.__fp;
+    while (fp != NULL && depth < KOD_PROF_MAX_FRAMES) {
+        void *lr = fp[1];
+        if (lr == NULL) break;
+        row[depth++] = (int64_t)(uintptr_t)lr;
+        void *next = fp[0];
+        if (next == NULL || (uintptr_t)next <= (uintptr_t)fp) break;
+        fp = (void **)next;
+    }
+    kod_prof_depths[slot] = depth;
+    kod_prof_count = slot + 1;
+}
+
+void _profiling_start(int64_t interval_us) {
+    kod_prof_count = 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = kod_prof_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, NULL);
+    struct itimerval timer;
+    timer.it_value.tv_sec = interval_us / 1000000;
+    timer.it_value.tv_usec = interval_us % 1000000;
+    timer.it_interval = timer.it_value;
+    setitimer(ITIMER_PROF, &timer, NULL);
+}
+
+void _profiling_stop(void) {
+    struct itimerval timer;
+    memset(&timer, 0, sizeof(timer));
+    setitimer(ITIMER_PROF, &timer, NULL);
+}
+
+int64_t _profiling_n_samples(void) { return kod_prof_count; }
+
+int64_t _profiling_sample_depth(int64_t idx) {
+    if (idx < 0 || idx >= kod_prof_count) return 0;
+    return kod_prof_depths[idx];
+}
+
+int64_t _profiling_sample_frame(int64_t sample_idx, int64_t frame_idx) {
+    if (sample_idx < 0 || sample_idx >= kod_prof_count) return 0;
+    if (frame_idx < 0 || frame_idx >= kod_prof_depths[sample_idx]) return 0;
+    return kod_prof_frames[sample_idx * KOD_PROF_MAX_FRAMES + frame_idx];
 }

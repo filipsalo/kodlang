@@ -1,0 +1,111 @@
+// Sampling profiler. `start(interval_us)` arms an ITIMER_PROF
+// timer; every `interval_us` of CPU time the kernel delivers
+// SIGPROF and the C runtime's handler walks the current fp chain
+// into a fixed-size buffer (see kod_prof_handler in
+// stdlib/runtime.c). `stop()` disarms the timer; `report()`
+// resolves the captured addresses to function names via
+// kod/inspect and prints a flat self-time summary.
+//
+// Tiny and deliberate: no flame graphs, no inclusive-time roll-up,
+// no per-line attribution. Per-sample only the leaf (`frame 0`)
+// is counted toward a function's tally — answering "where was
+// the program when the timer fired" rather than "which call
+// chains were hot". Good enough to spot a slow loop or a function
+// that's chewing more time than expected.
+
+import "kod/inspect"
+
+extern func _profiling_start(anon interval_us: int64) -> none
+extern func _profiling_stop() -> none
+extern func _profiling_n_samples() -> int64
+extern func _profiling_sample_depth(anon sample_idx: int64) -> int64
+extern func _profiling_sample_frame(anon sample_idx: int64, anon frame_idx: int64) -> int64
+
+// Arm SIGPROF at the given interval (in microseconds of CPU
+// time). 1 ms is a reasonable default for short benchmarks;
+// drop to 100 µs if you need finer resolution on a sub-second
+// workload. Resets the sample buffer.
+func start(interval_us: int64) -> none {
+    _profiling_start(interval_us)
+}
+
+// Disarm the timer. Samples taken so far remain in the buffer
+// — call `report()` afterward (or pass them to `samples()` for
+// custom processing) without losing data.
+func stop() -> none {
+    _profiling_stop()
+}
+
+// Number of samples captured since the last `start()`. Caps at
+// the runtime buffer size (4096 today); subsequent ticks no-op
+// rather than overwrite.
+func n_samples() -> int64 {
+    return _profiling_n_samples()
+}
+
+// Print a self-time table: count + percentage per leaf function,
+// sorted descending by sample count. Unresolvable addresses
+// (samples that landed in C runtime / libc / dyld) accumulate
+// under a single "<unresolved>" bucket so the totals add up.
+func report() -> none {
+    let total: int64 = _profiling_n_samples()
+    if total == 0 {
+        print("profile: no samples captured")
+        return none
+    }
+    mut names: [str] = []
+    mut counts: [int64] = []
+    mut i: int64 = 0
+    for i < total {
+        let lr: int64 = _profiling_sample_frame(i, 0)
+        mut key: str = "<unresolved>"
+        if inspect.resolve(addr: lr) is Some(frame) {
+            key = f"{frame.name} ({frame.file}:{frame.line})"
+        }
+        // Linear scan to find existing bucket — for small
+        // function counts this is cheaper than a Map and keeps
+        // the module dependency-light.
+        mut idx: int64 = -1
+        mut j: int64 = 0
+        for j < len(names) {
+            if names[j] == key {
+                idx = j
+            }
+            j = j + 1
+        }
+        if idx < 0 {
+            names += [key]
+            counts += [1]
+        } else {
+            counts[idx] = counts[idx] + 1
+        }
+        i = i + 1
+    }
+
+    // Sort by count, descending. Insertion sort — bucket counts
+    // are at most function-count, in the hundreds for any
+    // realistic profile.
+    mut order: [int64] = []
+    mut k: int64 = 0
+    for k < len(names) {
+        order += [k]
+        k = k + 1
+    }
+    mut s: int64 = 1
+    for s < len(order) {
+        mut t: int64 = s
+        for t > 0 and counts[order[t - 1]] < counts[order[t]] {
+            let tmp: int64 = order[t]
+            order[t] = order[t - 1]
+            order[t - 1] = tmp
+            t = t - 1
+        }
+        s = s + 1
+    }
+
+    print(f"profile: {total} samples")
+    for oi in order {
+        let pct: int64 = (counts[oi] * 100) / total
+        print(f"  {pct}%  {counts[oi]} samples  {names[oi]}")
+    }
+}
