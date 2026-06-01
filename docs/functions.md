@@ -113,6 +113,31 @@ c.increment()
 print_int(c.get())
 ```
 
+## Function-pointer types
+
+Functions are values. Use `func(T1, T2) -> R` as a type to store,
+pass, or return them — the runtime representation is an 8-byte
+pointer to the function's code, same as a C function pointer.
+
+```kod
+func double(x: int64) -> int64 { return x * 2 }
+func triple(x: int64) -> int64 { return x * 3 }
+
+func apply(anon f: func(int64) -> int64, anon x: int64) -> int64 {
+    return f(x)
+}
+
+let g: func(int64) -> int64 = double
+print_int(g(21))             // 42 — indirect call through g
+print_int(apply(triple, 14)) // 42 — function passed as callback
+```
+
+Plain named functions only — no anonymous functions (lambdas) or
+closures yet. A bare identifier in value position resolves to the
+function's address when it isn't shadowed by a local variable; a
+call site `f(args)` does an indirect `blr` when `f` is a local of
+function type, falling through to the direct `bl` otherwise.
+
 ## Extern functions
 
 Declare external C functions with `extern`:

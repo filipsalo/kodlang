@@ -522,6 +522,11 @@ class Interpreter:
                                 self.stack[-1][binding_name] = field_value
                             return self.evaluate_expression(module, arm.body)
                 raise ValueError("Non-exhaustive match expression")
+            case ast.FunctionDeclaration():
+                # Function-as-value: `let f = foo` binds the function
+                # declaration as the value. Subsequent indirect calls
+                # (`f(x)`) feed it back through call_function.
+                return expression
             case _:
                 raise ValueError(
                     f"Don't know how to evaluate expression {expression!r}"

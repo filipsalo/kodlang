@@ -188,6 +188,22 @@ class Parser:
             element = self.parse_type_expr()
             self.consume(CloseBracket)
             return ast.ArrayTypeExpr(element)
+        elif self.try_consume(Func):
+            # `func(T1, T2, ...) -> R` — function-pointer type. The
+            # `(` immediately after `func` disambiguates from a
+            # declaration site (which never appears in type position).
+            self.consume(OpenParen)
+            params: list = []
+            while not self.try_consume(CloseParen):
+                params.append(self.parse_type_expr())
+                if not self.try_consume(Comma):
+                    self.consume(CloseParen)
+                    break
+            from kod.tokens import Arrow
+
+            self.consume(Arrow)
+            return_typ = self.parse_type_expr()
+            return ast.FuncTypeExpr(tuple(params), return_typ)
         if self.try_consume(NoneLiteral):
             return ast.ResolvedTypeExpr(types.NoneType)
         param_type = ast.Name.parse(self)
@@ -256,6 +272,10 @@ class Parser:
             return template.instantiate(
                 tuple(self.resolve_type_expr(a) for a in expr.args)
             )
+        if isinstance(expr, ast.FuncTypeExpr):
+            params = tuple(self.resolve_type_expr(p) for p in expr.params)
+            ret = self.resolve_type_expr(expr.return_typ)
+            return types.FunctionType.make(params, ret)
         raise self.error(f"cannot resolve type expression {expr!r}", self.peek().span)
 
     def parse_statement(self) -> "Optional[ast.Statement]":

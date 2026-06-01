@@ -63,6 +63,16 @@ class GenericTypeExpr:
 
 
 @dataclasses.dataclass(frozen=True)
+class FuncTypeExpr:
+    """`func(T1, T2) -> R` — function-pointer type. `params` is a
+    tuple of TypeExprs; `return_typ` is one. Resolves to a
+    `values.FunctionType` (width 8 — same as a C function pointer)."""
+
+    params: tuple
+    return_typ: "TypeExpr"
+
+
+@dataclasses.dataclass(frozen=True)
 class ResolvedTypeExpr:
     """Escape hatch for type syntax that is resolved eagerly at parse
     time — inline `struct {...}` / `enum {...}` literals and the bare
@@ -77,6 +87,7 @@ TypeExpr = Union[
     ArrayTypeExpr,
     OptionalTypeExpr,
     GenericTypeExpr,
+    FuncTypeExpr,
     ResolvedTypeExpr,
 ]
 

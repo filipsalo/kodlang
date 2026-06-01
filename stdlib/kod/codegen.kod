@@ -30,6 +30,10 @@ type TypeKind = enum {
     KArrayInterface(elem_idx: int64)
     KArrayOptional(inner: TypeKind)
     KInterface(idx: int64)
+    // Function-typed value: an 8-byte pointer to a top-level
+    // function. `param_kinds` and `return_kind` carry the signature
+    // for call-site type checks.
+    KFunc(param_kinds: [TypeKind], return_kind: TypeKind)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -1460,6 +1464,18 @@ type Codegen = struct {
                 }
                 return f"{result}]"
             }
+            .KFunc(param_kinds, return_kind) -> {
+                mut result: str = "func("
+                mut i: int64 = 0
+                for i < len(param_kinds) {
+                    if i > 0 {
+                        result = result + ", "
+                    }
+                    result = result + self.kind_display(param_kinds[i])
+                    i = i + 1
+                }
+                return f"{result}) -> {self.kind_display(return_kind)}"
+            }
         }
     }
 
@@ -1570,6 +1586,13 @@ type Codegen = struct {
                     name = f"{name}${self.canonical_kind_name(ta)}"
                 }
                 return name
+            }
+            .KFunc(param_kinds, return_kind) -> {
+                mut name: str = "func"
+                for pk in param_kinds {
+                    name = f"{name}${self.canonical_kind_name(pk)}"
+                }
+                return f"{name}$ret${self.canonical_kind_name(return_kind)}"
             }
         }
     }
@@ -1688,6 +1711,13 @@ type Codegen = struct {
                 }
             }
             .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
+            .Func(params, return_typ) -> {
+                mut pkinds: [TypeKind] = []
+                for p in params {
+                    pkinds += [self.resolve_type(p)]
+                }
+                return .KFunc(param_kinds: pkinds, return_kind: self.resolve_type(return_typ))
+            }
             .Generic(name, args) -> {
                 // Generic instantiation. Monomorphise the template struct
                 // into a fresh concrete entry (Map[str, str] → struct
@@ -2510,6 +2540,20 @@ type Codegen = struct {
             }
             .Ident(name) -> {
                 if self.var_declared(name) == false {
+                    // Not a variable — see if it's a function name in
+                    // value position (function-pointer reference, not a
+                    // call). Direct calls go through compile_call's
+                    // Ident path; landing here with a function name
+                    // means the user wrote `let f = foo` or passed
+                    // `foo` as a callback.
+                    let func_lookup = self.func_idx
+                    if func_lookup.get(name) is Some(idx) {
+                        let lbl: str = self.func_labels[idx]
+                        let reg: str = self.pool.alloc_reg()
+                        self.emit(f"adrp {reg}, {lbl}@PAGE")
+                        self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
+                        return .VReg(name: reg)
+                    }
                     // Candidates for the typo hint: in-scope variables
                     // plus visible function names. Type and import
                     // names also live in the global namespace but
@@ -3411,6 +3455,22 @@ type Codegen = struct {
                 if struct_idx >= 0 {
                     return self.compile_struct_construct(args, :struct_idx, span: self.p.expr_spans[callee_id])
                 }
+                // Local var of function type — indirect call via the
+                // stored function pointer (`let f = double; f(21)`).
+                // Take this path BEFORE the func_idx lookup so a local
+                // var shadowing a function name wins.
+                if self.var_declared(name) {
+                    let var_kind = self.find_var_kind(name)
+                    if var_kind is .KFunc(param_kinds, _return_kind) {
+                        self.prepare_args_with_kinds(args, expected_kinds: param_kinds)
+                        let off: int64 = self.find_var_offset(name)
+                        let reg: str = self.pool.alloc_reg()
+                        self.emit_ldr(off, :reg)
+                        self.emit(f"blr {reg}")
+                        self.pool.free_reg(reg)
+                        return .VReg(name: "x0")
+                    }
+                }
                 let func_lookup = self.func_idx
                 if func_lookup.get(name) is Some(idx) {
                     self.check_call_args(args, param_labels: self.func_sigs[idx].param_labels, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
@@ -4051,7 +4111,20 @@ type Codegen = struct {
             .BoolLit(value) -> return .KBool
             .StrLit(value) -> return .KStr
             .NoneLit -> return .KOptional(inner: .KVoid)
-            .Ident(name) -> return self.find_var_kind(name)
+            .Ident(name) -> {
+                if self.var_declared(name) {
+                    return self.find_var_kind(name)
+                }
+                // Function-as-value reference: synthesise a KFunc
+                // from the function's pre-resolved signature so
+                // `let f = foo` infers `f: func(...) -> R`.
+                let func_lookup = self.func_idx
+                if func_lookup.get(name) is Some(idx) {
+                    let sig: SigInfo = self.func_sigs[idx]
+                    return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
+                }
+                return .KVoid
+            }
             .ArrayLit(elements) -> {
                 // Peek at the first element so `for x in [s]` knows the
                 // element type — otherwise the foreach falls back to

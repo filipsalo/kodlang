@@ -419,6 +419,34 @@ class InterfaceType(Type):
     width = 8
 
 
+class FunctionType(Type):
+    """A function-pointer type: `func(T1, T2) -> R`. The interpreter
+    never inspects the param/return shapes at runtime — calls
+    dispatch directly on the wrapped FunctionDeclaration — but the
+    type exists so the typechecker can validate annotations and
+    distinguish function-typed slots from generic pointer slots."""
+
+    name = "FunctionType"
+    width = 8
+    param_types: tuple = ()
+    return_type: "type[Type] | None" = None
+
+    @classmethod
+    def make(cls, params: tuple, return_type) -> "type[FunctionType]":
+        param_names = ", ".join(getattr(p, "name", repr(p)) for p in params)
+        ret_name = getattr(return_type, "name", repr(return_type))
+        return type(
+            f"FunctionType_{ret_name}",
+            (cls,),
+            {
+                "name": f"func({param_names}) -> {ret_name}",
+                "param_types": params,
+                "return_type": return_type,
+                "width": 8,
+            },
+        )
+
+
 class TypeParam(Type):
     """A type parameter placeholder used during generic type parsing."""
 
