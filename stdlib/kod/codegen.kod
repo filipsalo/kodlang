@@ -301,6 +301,17 @@ type Codegen = struct {
     // callee-saved high-water tracking. See `regalloc.RegPool`.
     pool: regalloc.RegPool = regalloc.RegPool()
 
+    // Per-function (label, line) pairs for the backtrace line table.
+    // `compile_stmt` emits a fresh label and records `(label, line)`
+    // before delegating to the per-variant compiler; `compile_func`
+    // drains the list at the end into __DATA,__kod_lines and stamps
+    // the symtab entry with start/end pointers. The last-recorded
+    // line is kept around so we can skip duplicate markers when a
+    // statement maps to the same source line as its predecessor.
+    func_lines_labels: [str] = []
+    func_lines_values: [int64] = []
+    last_marked_line: int64 = 0
+
     loop_stack: [LoopLbl] = []
 
     str_labels: [str] = []
@@ -889,6 +900,176 @@ type Codegen = struct {
 
     func emit_globl(self, anon lbl: str) -> none {
         self.println(f"\t.globl {lbl}")
+    }
+
+    // Record a line marker for the current statement's source line.
+    // Emits `Lline_N:` into the buffered text section so the linker
+    // assigns it the address of the next instruction the statement
+    // emits, and stashes (label, line) for `emit_func_lines_table`
+    // to drain into __DATA,__kod_lines at the end of compile_func.
+    // Skips when the line hasn't changed since the previous marker
+    // (the bounds-check arm and other intra-statement asm can
+    // synthesise repeated entries that the runtime lookup doesn't
+    // need).
+    func mark_stmt_line(self, anon stmt_id: int64) -> none {
+        if self.dry_run {
+            return none
+        }
+        let off: int64 = self.stmt_offset(stmt_id)
+        if off == 0 {
+            return none
+        }
+        let line: int64 = self.line_of_offset(off)
+        if line == self.last_marked_line {
+            return none
+        }
+        let lbl: str = self.fresh("Lline")
+        self.emit_label(lbl)
+        self.func_lines_labels += [lbl]
+        self.func_lines_values += [line]
+        self.last_marked_line = line
+    }
+
+    // Best-guess source offset of a statement's first token. Used by
+    // per-statement backtrace markers to attach a line to the
+    // instructions a statement emits. Statements without a useful
+    // embedded span (Break, Continue) return 0; the line falls back
+    // to whatever the previous marker recorded, which is the right
+    // behaviour for a panic inside a Break/Continue (it points at
+    // the immediately preceding statement).
+    func stmt_offset(self, anon stmt_id: int64) -> int64 {
+        match self.p.stmts[stmt_id] {
+            .Let(_n, _t, value, _m) -> {
+                if value != 0 {
+                    return self.p.expr_spans[value].start
+                }
+                return 0
+            }
+            .Assign(lhs, _r) -> return self.p.expr_spans[lhs].start
+            .PlusAssign(lhs, _r) -> return self.p.expr_spans[lhs].start
+            .MinusAssign(lhs, _r) -> return self.p.expr_spans[lhs].start
+            .Return(value) -> {
+                if value != 0 {
+                    return self.p.expr_spans[value].start
+                }
+                return 0
+            }
+            .If(cond, _t, _e) -> return self.p.expr_spans[cond].start
+            .For(cond, _b) -> {
+                if cond != 0 {
+                    return self.p.expr_spans[cond].start
+                }
+                return 0
+            }
+            .ForEach(_n, iter, _b) -> return self.p.expr_spans[iter].start
+            .ExprStmt(expr) -> return self.p.expr_spans[expr].start
+            .MatchStmt(subject, _a) -> return self.p.expr_spans[subject].start
+            .LetElse(_p, value, _e) -> return self.p.expr_spans[value].start
+            .Throw(value) -> return self.p.expr_spans[value].start
+            .Assert(expr, _s, _sp) -> return self.p.expr_spans[expr].start
+            else return 0
+        }
+    }
+
+    // Convert a byte offset into the current parser's source into a
+    // 1-indexed line number. The parser caches a `line_starts` array
+    // (byte offsets of each line's first character) on first call;
+    // subsequent calls are an O(log n) binary search. Important for
+    // per-statement backtrace emission, which hits this on every
+    // compile_stmt — was O(n) per call before the cache.
+    func line_of_offset(self, anon offset: int64) -> int64 {
+        let p: parsing.Parser = self.p
+        if len(p.line_starts) == 0 {
+            let source: str = p.source
+            p.line_starts += [0]
+            mut i: int64 = 0
+            for i < len(source) {
+                if source[i] == '\n' {
+                    p.line_starts += [i + 1]
+                }
+                i = i + 1
+            }
+        }
+        // Binary search for the largest line_starts[k] ≤ offset.
+        // line number is k + 1 (1-indexed).
+        let starts: [int64] = p.line_starts
+        mut lo: int64 = 0
+        mut hi: int64 = len(starts) - 1
+        for lo < hi {
+            let mid: int64 = (lo + hi + 1) / 2
+            if starts[mid] <= offset {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        return lo + 1
+    }
+
+    // Emit a symtab row for `func_lbl` so the runtime panic handler
+    // can map a return address back to a function name + source
+    // location, plus a per-function lines sub-table for resolving
+    // the precise call-site line within the function.
+    //
+    //   __TEXT,__cstring : Lkodsym_N_name: .asciz "Codegen.compile_func"
+    //                       Lkodsym_N_file: .asciz "stdlib/kod/codegen.kod"
+    //   __DATA,__kod_lines  : Lkodlines_N_start: <function's (pc, line) rows>
+    //                          Lkodlines_N_end:
+    //   __DATA,__kod_symtab :
+    //     .quad <func_lbl>          -- addr (function entry)
+    //     .quad Lkodsym_N_name      -- display name
+    //     .quad Lkodsym_N_file      -- source path
+    //     .long <decl_line>         -- 1-indexed line of `func name` ident
+    //     .long 0                   -- padding to keep entry 8-aligned
+    //     .quad Lkodlines_N_start   -- start of per-function (pc, line) rows
+    //     .quad Lkodlines_N_end     -- end of per-function (pc, line) rows
+    //
+    // The runtime in stdlib/runtime.c queries
+    // `section$start$__DATA$__kod_symtab` / `section$end$...` (the
+    // Mach-O linker-synthesised bounds) and linear-scans for the
+    // entry whose address is the largest one ≤ the return address;
+    // then walks the linked lines table for the precise stmt-level
+    // line covering that lr.
+    //
+    // Lines rows are { void *pc; int32 line; int32 _pad; } = 16 bytes.
+    func emit_symtab_entry(self, anon func_lbl: str, name: str, file: str, line: int64) -> none {
+        if self.dry_run {
+            self.func_lines_labels = []
+            self.func_lines_values = []
+            return none
+        }
+        let name_lbl: str = self.fresh("Lkodsym")
+        let file_lbl: str = self.fresh("Lkodsym")
+        let lines_start: str = self.fresh("Lkodlines_start")
+        let lines_end: str = self.fresh("Lkodlines_end")
+        self.println("\t.section __TEXT,__cstring,cstring_literals")
+        self.emit_label(name_lbl)
+        self.emit_asciz(name)
+        self.emit_label(file_lbl)
+        self.emit_asciz(file)
+        self.println("\t.section __DATA,__kod_lines,regular,no_dead_strip")
+        self.println("\t.p2align 3")
+        self.emit_label(lines_start)
+        mut i: int64 = 0
+        for i < len(self.func_lines_labels) {
+            self.println(f"\t.quad {self.func_lines_labels[i]}")
+            self.println(f"\t.long {self.func_lines_values[i]}")
+            self.println("\t.long 0")
+            i = i + 1
+        }
+        self.emit_label(lines_end)
+        self.println("\t.section __DATA,__kod_symtab,regular,no_dead_strip")
+        self.println("\t.p2align 3")
+        self.println(f"\t.quad {func_lbl}")
+        self.println(f"\t.quad {name_lbl}")
+        self.println(f"\t.quad {file_lbl}")
+        self.println(f"\t.long {line}")
+        self.println("\t.long 0")
+        self.println(f"\t.quad {lines_start}")
+        self.println(f"\t.quad {lines_end}")
+        self.println("\t.text")
+        self.func_lines_labels = []
+        self.func_lines_values = []
     }
 
     func emit_asciz(self, anon value: str) -> none {
@@ -4295,6 +4476,7 @@ type Codegen = struct {
 
 
     func compile_stmt(self, anon stmt_id: int64) -> none {
+        self.mark_stmt_line(stmt_id)
         match self.p.stmts[stmt_id] {
             .Let(name, typ, value, mutable) -> self.compile_let(:name, :typ, :value, :mutable)
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
@@ -5775,6 +5957,9 @@ type Codegen = struct {
         self.frame_slots = 0
         self.pool.reset()
         self.loop_stack = []
+        self.func_lines_labels = []
+        self.func_lines_values = []
+        self.last_marked_line = 0
 
         for param in func_decl.params {
             mut kind = self.resolve_type(param.typ)
@@ -5819,6 +6004,11 @@ type Codegen = struct {
 
         self.emit_globl(func_lbl)
         self.emit_label(func_lbl)
+        mut display_name: str = func_decl.name
+        if len(struct_name) > 0 {
+            display_name = f"{struct_name}.{func_decl.name}"
+        }
+        let decl_line: int64 = self.line_of_offset(func_decl.name_span.start)
 
         // Compile the body into a private buffer so the callee-saved
         // save/restore (whose count is only known once `cs_high_water` is
@@ -5886,6 +6076,7 @@ type Codegen = struct {
             qi = qi - 2
         }
         self.emit("ret")
+        self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
     }
 
 
