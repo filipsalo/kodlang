@@ -32,6 +32,125 @@ type Insn = enum {
     Raw(text: str)
 }
 
+// The pool of physical registers handed out as virtual registers
+// during emission, plus the alloc-time mapping that the linear-scan
+// pass (`run`) later refines. One `RegPool` lives on the codegen
+// across the whole module; `reset` clears per-function state at the
+// start of every `compile_func`.
+//
+// The free-pool order is intentional: callee-saved x19-x27 sit at
+// the tail so `alloc_reg` (popping the tail) hands them out first.
+// A value parked in a callee-saved reg survives any `bl` for free
+// (the callee restores it), so the common shallow expressions never
+// need a spill. Only deeper expressions spill into the caller-saved
+// x8-x15 at the front, which still get stack-spilled around calls.
+type RegPool = struct {
+    // Indexed by vreg id; entries accumulate across all functions
+    // in a module so `subst_vregs` at flush-out time can resolve
+    // any vreg consistently. NOT reset by `reset` — the ids are
+    // program-global by design.
+    vreg_phys: [str] = []
+
+    // Per-function state — `reset` clears these at the start of
+    // every compile_func.
+    free_regs: [str] = []
+    cs_in_use: int64 = 0
+    cs_high_water: int64 = 0
+
+    // Reset per-function state. `vreg_phys` is intentionally left
+    // alone — its ids stay valid across the whole module.
+    func reset(self) -> none {
+        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+        self.cs_in_use = 0
+        self.cs_high_water = 0
+    }
+
+    // Allocate a fresh virtual register backed by a physical from
+    // the free pool. The returned string is a vreg name (`v<id>`)
+    // that the emit layer threads into asm; `subst_vregs` later
+    // resolves it to `vreg_phys[id]`. The initial alloc-time
+    // assignment is just whatever phys was at the tail of the pool;
+    // `run` may rewrite it (within the same class) once the body
+    // is buffered.
+    func alloc_reg(self) -> str {
+        let n = len(self.free_regs)
+        mut phys = self.free_regs[-1]
+        mut new_regs: [str] = []
+        mut i = 0
+        for i < n - 1 {
+            new_regs += [self.free_regs[i]]
+            i = i + 1
+        }
+        self.free_regs = new_regs
+        if self.is_callee_saved(phys) {
+            self.cs_in_use = self.cs_in_use + 1
+            if self.cs_in_use > self.cs_high_water {
+                self.cs_high_water = self.cs_in_use
+            }
+        }
+        let id: int64 = len(self.vreg_phys)
+        self.vreg_phys += [phys]
+        return f"v{id}"
+    }
+
+    // Return a register to the pool. Accepts either a vreg name
+    // (from `alloc_reg`) or a physical name passed in directly by
+    // sites that hardcode ABI registers (e.g. freeing `x0` after a
+    // `bl`). For the hardcoded path, x0-x7 are skipped — they hold
+    // call args/results and never enter the pool.
+    func free_reg(self, anon reg: str) -> none {
+        mut phys: str = reg
+        if self.is_vreg_name(reg) {
+            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        }
+        if phys == "x0" or phys == "x1" or phys == "x2" or phys == "x3" or phys == "x4" or phys == "x5" or phys == "x6" or phys == "x7" {
+            return
+        }
+        if self.is_callee_saved(phys) {
+            self.cs_in_use = self.cs_in_use - 1
+        }
+        self.free_regs += [phys]
+    }
+
+    // True if `reg` is (or resolves to) a callee-saved physical.
+    // Accepts vreg names too — the alloc-time class is the one
+    // recorded in `vreg_phys[id]`.
+    func is_callee_saved(self, anon reg: str) -> bool {
+        mut phys: str = reg
+        if self.is_vreg_name(reg) {
+            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        }
+        return is_callee_saved_phys(phys)
+    }
+
+    // True if `s` is a vreg name (the `v<digits>` form `alloc_reg`
+    // returns). Anything else — a physical register name, an asm
+    // literal — falls through unchanged.
+    func is_vreg_name(self, anon s: str) -> bool {
+        if len(s) < 2 or s[0] != 'v' {
+            return false
+        }
+        mut i: int64 = 1
+        for i < len(s) {
+            if lexing.is_digit(s[i]) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    func parse_vreg_id(self, anon vreg: str) -> int64 {
+        mut id: int64 = 0
+        mut i: int64 = 1
+        for i < len(vreg) {
+            id = id * 10 + vreg[i] - '0'
+            i = i + 1
+        }
+        return id
+    }
+}
+
 // Mnemonics whose first operand is the destination — for those a
 // vreg at op-position 0 (outside brackets) is a def, not a use.
 // Everything else treats all vreg operands as reads. ldp/stp don't
@@ -144,9 +263,10 @@ func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int6
 // partitioned by alloc-time class; each class's pool is the set of
 // distinct alloc-time physicals from that class. Walk vregs in
 // def_line order; expire intervals that ended before the current
-// def; pop a free phys (preferring reuse). Mutates `vreg_phys` in
-// place over `[vreg_start, len(vreg_phys))`.
-func run(body_buf: [Insn], vreg_phys: [str], vreg_start: int64) -> none {
+// def; pop a free phys (preferring reuse). Mutates `pool.vreg_phys`
+// in place over `[vreg_start, len(pool.vreg_phys))`.
+func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
+    let vreg_phys: [str] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
     let n_local: int64 = vreg_end - vreg_start
     if n_local <= 0 {
@@ -331,7 +451,8 @@ func run(body_buf: [Insn], vreg_phys: [str], vreg_start: int64) -> none {
 // Safe because all reassignments stay inside the callee-saved class —
 // every site that asked `is_callee_saved(vreg)` at emit time still
 // gets the same answer, so spill_across decisions remain correct.
-func pack(vreg_phys: [str], vreg_start: int64) -> int64 {
+func pack(pool: RegPool, vreg_start: int64) -> int64 {
+    let vreg_phys: [str] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
     mut used: [str] = []
     mut i: int64 = vreg_start

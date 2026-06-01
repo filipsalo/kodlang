@@ -293,14 +293,9 @@ type Codegen = struct {
     ret_lbl: str = ""
     return_kind: TypeKind = .KVoid
 
-    // The general-purpose register pool, most-recently-freed last (alloc
-    // pops the tail). Callee-saved x19-x27 sit at the tail so they're
-    // handed out first: a value in a callee-saved register survives any
-    // `bl` for free (the callee restores it), so the common shallow
-    // expressions never need a spill. Only deeper expressions spill into
-    // the caller-saved x8-x15 at the front, which still get stack-spilled
-    // around calls.
-    free_regs: [str] = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+    // The register pool: free list, vreg→phys mapping, and
+    // callee-saved high-water tracking. See `regalloc.RegPool`.
+    pool: regalloc.RegPool = regalloc.RegPool()
 
     loop_stack: [LoopLbl] = []
 
@@ -373,31 +368,6 @@ type Codegen = struct {
     // rather than streaming — is the foundation for the IR + regalloc
     // passes that sit between emission and final asm-formatting.
     out_buf: [regalloc.Insn] = []
-
-    // Per-function callee-saved register accounting. `cs_in_use` is the
-    // number of callee-saved pool registers (x19-x27) currently allocated;
-    // `cs_high_water` its maximum over the function. compile_func saves
-    // exactly that many in the prologue (so values parked in them survive
-    // calls without per-call spills) and restores them in the epilogue.
-    cs_in_use: int64 = 0
-    cs_high_water: int64 = 0
-
-    // Virtual-register pool. `alloc_reg` hands out vregs (encoded as
-    // strings of the form `v<id>`) that callers thread through emitted
-    // asm; `flush_out` substitutes each vreg with `vreg_phys[id]` at
-    // format time. Ids are program-global (never reset across functions)
-    // so a vreg created in one function and read out in `flush_out`
-    // resolves to the same physical register regardless of when the
-    // module's output is drained.
-    //
-    // Today the assignment is identity — `alloc_reg` picks a physical
-    // from the free pool and immediately records it as `vreg_phys[id]`,
-    // matching the previous behaviour byte-for-byte. A later regalloc
-    // pass will recompute `vreg_phys` after the full instruction stream
-    // is buffered, driven by live-range analysis instead of the stack
-    // discipline.
-    vreg_phys: [str] = []
-
 
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
@@ -878,11 +848,11 @@ type Codegen = struct {
                     i = j
                     continue
                 }
-                if id >= len(self.vreg_phys) {
+                if id >= len(self.pool.vreg_phys) {
                     i = j
                     continue
                 }
-                let phys: str = self.vreg_phys[id]
+                let phys: str = self.pool.vreg_phys[id]
                 out = out + text[flush_start..i]
                 if c == 'w' {
                     // x-form → w-form: same number, different prefix.
@@ -972,107 +942,16 @@ type Codegen = struct {
     // it needs no spill around a call. compile_func saves the ones a
     // function uses in its prologue. x28 is never pool-allocated; it only
     // appears as the pad register when an odd number of callee-saved regs
-    // is saved (stp works in pairs).
-    //
-    // Accepts either a physical register name or a vreg name — vregs
-    // resolve through `vreg_phys` so call-spill / pool-discipline checks
-    // continue to ask "is this value safe across a `bl`?" in the same way
-    // they did before vregs were threaded through emit.
-    func is_callee_saved(self, anon reg: str) -> bool {
-        mut phys: str = reg
-        if self.is_vreg_name(reg) {
-            phys = self.vreg_phys[self.parse_vreg_id(reg)]
-        }
-        return phys == "x19" or phys == "x20" or phys == "x21" or phys == "x22" or phys == "x23" or phys == "x24" or phys == "x25" or phys == "x26" or phys == "x27"
-    }
-
-    func cs_reg(self, anon n: int64) -> str {
-        let names: [str] = ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
-        return names[n]
-    }
-
-    // Allocate a fresh virtual register backed by a physical from the
-    // free pool. The returned string is a vreg name (`v<id>`) that the
-    // emit layer threads into asm; `flush_out` substitutes it back to
-    // the physical recorded in `vreg_phys[id]`. Today the assignment is
-    // fixed at alloc time so the produced asm matches the pre-vreg path
-    // byte-for-byte; a later regalloc pass replaces `vreg_phys` after
-    // walking the buffered instructions.
-    func alloc_reg(self) -> str {
-        let n = len(self.free_regs)
-        mut phys = self.free_regs[-1]
-        mut new_regs: [str] = []
-        mut i = 0
-        for i < n - 1 {
-            new_regs += [self.free_regs[i]]
-            i = i + 1
-        }
-        self.free_regs = new_regs
-        if self.is_callee_saved(phys) {
-            self.cs_in_use = self.cs_in_use + 1
-            if self.cs_in_use > self.cs_high_water {
-                self.cs_high_water = self.cs_in_use
-            }
-        }
-        let id: int64 = len(self.vreg_phys)
-        self.vreg_phys += [phys]
-        return f"v{id}"
-    }
-
-    // Return a register to the pool. Accepts either a vreg name (from
-    // `alloc_reg`) or a physical name passed in directly by sites that
-    // hardcode ABI registers (e.g. freeing `x0` after a `bl`). For the
-    // hardcoded path, x0–x7 are skipped — they hold call args/results
-    // and never enter the pool.
-    func free_reg(self, anon reg: str) -> none {
-        mut phys: str = reg
-        if self.is_vreg_name(reg) {
-            phys = self.vreg_phys[self.parse_vreg_id(reg)]
-        }
-        // Only return pool registers (x8-x15, x19-x27) to the free list.
-        // Argument registers (x0-x7) hold call results/args and must not be pooled.
-        if phys == "x0" or phys == "x1" or phys == "x2" or phys == "x3" or phys == "x4" or phys == "x5" or phys == "x6" or phys == "x7" {
-            return
-        }
-        if self.is_callee_saved(phys) {
-            self.cs_in_use = self.cs_in_use - 1
-        }
-        self.free_regs += [phys]
-    }
-
-    // True if `s` is a vreg name (the `v<digits>` form `alloc_reg`
-    // returns). Anything else — a physical register name, an asm
-    // literal — falls through unchanged.
-    func is_vreg_name(self, anon s: str) -> bool {
-        if len(s) < 2 or s[0] != 'v' {
-            return false
-        }
-        mut i: int64 = 1
-        for i < len(s) {
-            if lexing.is_digit(s[i]) == false {
-                return false
-            }
-            i = i + 1
-        }
-        return true
-    }
-
-    func parse_vreg_id(self, anon vreg: str) -> int64 {
-        mut id: int64 = 0
-        mut i: int64 = 1
-        for i < len(vreg) {
-            id = id * 10 + vreg[i] - '0'
-            i = i + 1
-        }
-        return id
-    }
+    // is saved (stp works in pairs). The actual pool + alloc/free + the
+    // "is callee-saved" predicate live in `regalloc.RegPool`, accessed
+    // via `self.pool`.
 
     // Stash `reg` to a fresh 16-byte stack slot so its value survives a
     // call-bearing sub-expression — UNLESS reg is callee-saved, in which
     // case it's preserved for free and we emit nothing. Returns true iff a
     // spill was emitted; pass that to the matching `restore_across`.
     func spill_across(self, anon reg: str) -> bool {
-        if self.is_callee_saved(reg) {
+        if self.pool.is_callee_saved(reg) {
             return false
         }
         self.emit("sub sp, sp, #16")
@@ -1095,12 +974,12 @@ type Codegen = struct {
     // intervening code can reuse it. Returns whether a spill was emitted;
     // `preserve_end` then yields the register the value lives in afterward.
     func preserve_begin(self, anon reg: str) -> bool {
-        if self.is_callee_saved(reg) {
+        if self.pool.is_callee_saved(reg) {
             return false
         }
         self.emit("sub sp, sp, #16")
         self.emit(f"str {reg}, [sp]")
-        self.free_reg(reg)
+        self.pool.free_reg(reg)
         return true
     }
 
@@ -1108,7 +987,7 @@ type Codegen = struct {
         if spilled == false {
             return reg
         }
-        let r2 = self.alloc_reg()
+        let r2 = self.pool.alloc_reg()
         self.emit(f"ldr {r2}, [sp]")
         self.emit("add sp, sp, #16")
         return r2
@@ -1116,7 +995,7 @@ type Codegen = struct {
 
     func free_val(self, anon val: Val) -> none {
         if val is .VReg(name) {
-            self.free_reg(name)
+            self.pool.free_reg(name)
         }
     }
 
@@ -1125,17 +1004,17 @@ type Codegen = struct {
         match val {
             .VReg(name) -> return name
             .VImm(value) -> {
-                mut reg = self.alloc_reg()
+                mut reg = self.pool.alloc_reg()
                 self.emit_load_imm(reg, :value)
                 return reg
             }
             .VStack(offset) -> {
-                mut reg = self.alloc_reg()
+                mut reg = self.pool.alloc_reg()
                 self.emit_ldr(offset, :reg)
                 return reg
             }
             .VStrLbl(page) -> {
-                mut reg = self.alloc_reg()
+                mut reg = self.pool.alloc_reg()
                 self.emit(f"adrp {reg}, {page}@PAGE")
                 self.emit(f"add {reg}, {reg}, {page}@PAGEOFF")
                 return reg
@@ -1148,7 +1027,7 @@ type Codegen = struct {
             .VReg(name) -> {
                 if name != dest {
                     self.emit(f"mov {dest}, {name}")
-                    self.free_reg(name)
+                    self.pool.free_reg(name)
                 }
                 return dest
             }
@@ -2707,10 +2586,10 @@ type Codegen = struct {
             mut r: str = self.load(v)
             self.emit(f"cmp {r}, #0")
             self.emit(f"beq {false_lbl}")
-            self.free_reg(r)
+            self.pool.free_reg(r)
             k = k + 1
         }
-        mut result: str = self.alloc_reg()
+        mut result: str = self.pool.alloc_reg()
         self.emit(f"mov {result}, #1")
         self.emit(f"b {done_lbl}")
         self.emit_label(false_lbl)
@@ -2747,14 +2626,14 @@ type Codegen = struct {
                 if self.infer_kind(lhs) is .KStruct(struct_idx, _struct_type_args) {
                     field_off = self.find_field_offset(field_name, :struct_idx)
                 }
-                mut result = self.alloc_reg()
+                mut result = self.pool.alloc_reg()
                 self.emit(f"ldr {result}, [{ptr_r}, #{field_off}]")
-                self.free_reg(ptr_r)
+                self.pool.free_reg(ptr_r)
                 return .VReg(name: result)
             }
             else none
         }
-        self.free_reg(ptr_r)
+        self.pool.free_reg(ptr_r)
         return .VImm(value: 0)
     }
 
@@ -2772,12 +2651,12 @@ type Codegen = struct {
             .KStruct(idx, _struct_type_args) -> {
                 if self.structs[idx].method_idx.get("op_index") is Some(_mi) {
                     let key_val = self.compile_expr(rhs)
-                    let key_reg = self.alloc_reg()
+                    let key_reg = self.pool.alloc_reg()
                     self.mov_to(key_val, dest: key_reg)
                     let ov = self.compile_expr(lhs)
                     self.mov_to(ov, dest: "x0")
                     self.emit(f"mov x1, {key_reg}")
-                    self.free_reg(key_reg)
+                    self.pool.free_reg(key_reg)
                     mut method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}$op_index"
                     self.emit(f"bl {method_lbl}")
                     return .VReg(name: "x0")
@@ -2789,7 +2668,7 @@ type Codegen = struct {
         let idx_v = self.compile_expr(rhs)
         let ptr_r = self.load(ptr_v)
         let idx_r = self.load(idx_v)
-        mut result = self.alloc_reg()
+        mut result = self.pool.alloc_reg()
         mut array_like = false
         match lhs_kind {
             .KArray -> array_like = true
@@ -2803,7 +2682,7 @@ type Codegen = struct {
         if array_like {
             // Normalise negative index: if idx < 0, idx += len.
             let pos_lbl = self.fresh("Lidx_pos")
-            let len_r = self.alloc_reg()
+            let len_r = self.pool.alloc_reg()
             self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
             self.emit(f"cmp {idx_r}, #0")
             self.emit(f"bge {pos_lbl}")
@@ -2823,20 +2702,20 @@ type Codegen = struct {
             self.emit(f"mov x1, {len_r}")
             self.emit("bl _kod_index_oob")
             self.emit_label(ok_lbl)
-            self.free_reg(len_r)
+            self.pool.free_reg(len_r)
 
-            let hdr = self.alloc_reg()
+            let hdr = self.pool.alloc_reg()
             self.emit(f"ldr {hdr}, [{ptr_r}]")
             self.emit(f"lsl {idx_r}, {idx_r}, #3")
             self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
-            self.free_reg(hdr)
+            self.pool.free_reg(hdr)
         } else {
             // KStr indexing. ptr_r is the `{ buf, len }` struct pointer.
             // Load buf and len, normalise negative, bounds-check, then
             // a one-byte read from buf — same shape as the array path.
-            let len_r = self.alloc_reg()
+            let len_r = self.pool.alloc_reg()
             self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
-            let buf_r = self.alloc_reg()
+            let buf_r = self.pool.alloc_reg()
             self.emit(f"ldr {buf_r}, [{ptr_r}]")
             let pos_lbl = self.fresh("Lidx_pos")
             self.emit(f"cmp {idx_r}, #0")
@@ -2853,18 +2732,18 @@ type Codegen = struct {
             self.emit(f"mov x1, {len_r}")
             self.emit("bl _kod_index_oob")
             self.emit_label(ok_lbl)
-            self.free_reg(len_r)
+            self.pool.free_reg(len_r)
             self.emit(f"ldrb w{result[1..len(result)]}, [{buf_r}, {idx_r}]")
-            self.free_reg(buf_r)
+            self.pool.free_reg(buf_r)
         }
-        self.free_reg(ptr_r)
-        self.free_reg(idx_r)
+        self.pool.free_reg(ptr_r)
+        self.pool.free_reg(idx_r)
         return .VReg(name: result)
     }
 
     func compile_and(self, lhs: int64, rhs: int64) -> Val {
         let done = self.fresh("Land")
-        mut result = self.alloc_reg()
+        mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
@@ -2880,7 +2759,7 @@ type Codegen = struct {
 
     func compile_or(self, lhs: int64, rhs: int64) -> Val {
         let done = self.fresh("Lor")
-        mut result = self.alloc_reg()
+        mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
@@ -2924,12 +2803,12 @@ type Codegen = struct {
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
             self.emit(f"ldr {reg}, [{reg}, #8]")
-            let exp = self.alloc_reg()
+            let exp = self.pool.alloc_reg()
             self.emit(f"adrp {exp}, {vt_lbl}@PAGE")
             self.emit(f"add {exp}, {exp}, {vt_lbl}@PAGEOFF")
             self.emit(f"cmp {reg}, {exp}")
             self.emit(f"cset {reg}, eq")
-            self.free_reg(exp)
+            self.pool.free_reg(exp)
             return .VReg(name: reg)
         }
         // `T or Error` result: test the discriminant against Ok's disc.
@@ -3032,16 +2911,16 @@ type Codegen = struct {
         // compilation so its value survives any bl calls in rhs.
         let lhs_val = self.compile_expr(lhs_id)
         let lv_r = self.load_enum_or_val(lhs_val, expr_id: lhs_id)
-        let lhs_reg = self.alloc_reg()
+        let lhs_reg = self.pool.alloc_reg()
         if lv_r != lhs_reg {
             self.emit(f"mov {lhs_reg}, {lv_r}")
         }
-        self.free_reg(lv_r)
+        self.pool.free_reg(lv_r)
         let lhs_spilled = self.spill_across(lhs_reg)
         let rhs_val = self.compile_expr(rhs_id)
         let rhs_reg = self.load_enum_or_val(rhs_val, expr_id: rhs_id)
         self.restore_across(lhs_reg, spilled: lhs_spilled)
-        mut result = self.alloc_reg()
+        mut result = self.pool.alloc_reg()
         match op {
             .Eq -> {
                 self.emit(f"cmp {lhs_reg}, {rhs_reg}")
@@ -3080,11 +2959,11 @@ type Codegen = struct {
                 self.emit(f"sdiv {result}, {lhs_reg}, {rhs_reg}")
             }
             .Mod -> {
-                let tmp2 = self.alloc_reg()
+                let tmp2 = self.pool.alloc_reg()
                 self.emit(f"sdiv {result}, {lhs_reg}, {rhs_reg}")
                 self.emit(f"mul {tmp2}, {result}, {rhs_reg}")
                 self.emit(f"sub {result}, {lhs_reg}, {tmp2}")
-                self.free_reg(tmp2)
+                self.pool.free_reg(tmp2)
             }
             .BitAnd -> {
                 self.emit(f"and {result}, {lhs_reg}, {rhs_reg}")
@@ -3110,8 +2989,8 @@ type Codegen = struct {
                 self.emit(f"cset {result}, eq")
             }
         }
-        self.free_reg(lhs_reg)
-        self.free_reg(rhs_reg)
+        self.pool.free_reg(lhs_reg)
+        self.pool.free_reg(rhs_reg)
         return .VReg(name: result)
     }
 
@@ -3132,13 +3011,13 @@ type Codegen = struct {
     func bind_result_payload(self, anon binding: str, subj_slot: int64) -> none {
         if len(binding) > 0 {
             let boff = self.find_var_offset(binding)
-            let ptr_r = self.alloc_reg()
+            let ptr_r = self.pool.alloc_reg()
             self.emit_ldr(subj_slot, reg: ptr_r)
-            let val_r = self.alloc_reg()
+            let val_r = self.pool.alloc_reg()
             self.emit(f"ldr {val_r}, [{ptr_r}, #8]")
             self.emit_str(boff, reg: val_r)
-            self.free_reg(val_r)
-            self.free_reg(ptr_r)
+            self.pool.free_reg(val_r)
+            self.pool.free_reg(ptr_r)
         }
     }
 
@@ -3157,30 +3036,30 @@ type Codegen = struct {
             iface_idx = ii
         }
         let vt_lbl = self.register_vtable(struct_idx, iface_idx)
-        let ptr_r = self.alloc_reg()
+        let ptr_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: ptr_r)
-        let vt_r = self.alloc_reg()
+        let vt_r = self.pool.alloc_reg()
         self.emit(f"ldr {vt_r}, [{ptr_r}, #8]")
-        let exp_r = self.alloc_reg()
+        let exp_r = self.pool.alloc_reg()
         self.emit(f"adrp {exp_r}, {vt_lbl}@PAGE")
         self.emit(f"add {exp_r}, {exp_r}, {vt_lbl}@PAGEOFF")
         self.emit(f"cmp {vt_r}, {exp_r}")
         self.emit(f"bne {skip_lbl}")
-        self.free_reg(vt_r)
-        self.free_reg(exp_r)
+        self.pool.free_reg(vt_r)
+        self.pool.free_reg(exp_r)
         if len(binding) > 0 {
             let boff = self.find_var_offset(binding)
-            let dv_r = self.alloc_reg()
+            let dv_r = self.pool.alloc_reg()
             self.emit(f"ldr {dv_r}, [{ptr_r}]")
             self.emit_str(boff, reg: dv_r)
-            self.free_reg(dv_r)
+            self.pool.free_reg(dv_r)
         }
-        self.free_reg(ptr_r)
+        self.pool.free_reg(ptr_r)
     }
 
     func compile_str_eq(self, lhs_id: int64, rhs_id: int64, negate: bool) -> Val {
         let rhs_val = self.compile_expr(rhs_id)
-        let rhs_reg = self.alloc_reg()
+        let rhs_reg = self.pool.alloc_reg()
         self.mov_to(rhs_val, dest: rhs_reg)
         // Stash rhs to the stack so the lhs compilation (which may bl)
         // doesn't clobber rr's pool register.
@@ -3189,13 +3068,13 @@ type Codegen = struct {
         self.mov_to(lhs_val, dest: "x0")
         self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
-        self.free_reg(rhs_reg)
+        self.pool.free_reg(rhs_reg)
         // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
         // like memcmp. Replaces the previous `_strcmp` call, which
         // would have compared struct headers byte-by-byte (and stopped
         // at the first 0 in the embedded len field).
         self.emit("bl _kod_str_cmp")
-        mut result = self.alloc_reg()
+        mut result = self.pool.alloc_reg()
         self.emit("cmp x0, #0")
         if negate {
             self.emit(f"cset {result}, ne")
@@ -3250,7 +3129,7 @@ type Codegen = struct {
         // explicit conversion (`one + str(other)` or, equivalently, an
         // f-string `f"{one}{other}"`).
         let rhs_val = self.compile_expr(rhs_id)
-        let rhs_reg = self.alloc_reg()
+        let rhs_reg = self.pool.alloc_reg()
         self.mov_to(rhs_val, dest: rhs_reg)
         // Save rhs to the stack so it survives any bl calls inside lhs
         // compilation (caller-saved pool registers would be clobbered by
@@ -3261,7 +3140,7 @@ type Codegen = struct {
         self.mov_to(lhs_val, dest: "x0")
         self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
-        self.free_reg(rhs_reg)
+        self.pool.free_reg(rhs_reg)
         self.emit("bl _kod_str_concat")
         return .VReg(name: "x0")
     }
@@ -3272,7 +3151,7 @@ type Codegen = struct {
         let lhs_val = self.compile_expr(lhs_id)
         self.mov_to(lhs_val, dest: "x0")
         self.emit(f"mov x1, {rhs_reg}")
-        self.free_reg(rhs_reg)
+        self.pool.free_reg(rhs_reg)
         self.emit("bl _kod_array_concat")
         return .VReg(name: "x0")
     }
@@ -3296,25 +3175,25 @@ type Codegen = struct {
             // works for either; we don't need a separate `bl` here.
             let subj_for_len: Val = self.compile_expr(s_id)
             let sr0: str = self.load(subj_for_len)
-            let lr: str = self.alloc_reg()
+            let lr: str = self.pool.alloc_reg()
             self.emit(f"ldr {lr}, [{sr0}, #8]")
             self.emit(f"str {lr}, [sp, #16]")
-            self.free_reg(lr)
-            self.free_reg(sr0)
+            self.pool.free_reg(lr)
+            self.pool.free_reg(sr0)
         } else {
             let hi_v = self.compile_expr(hi_id)
             let hi_r = self.load(hi_v)
             self.emit(f"str {hi_r}, [sp, #16]")
-            self.free_reg(hi_r)
+            self.pool.free_reg(hi_r)
         }
         let lo_v = self.compile_expr(lo_id)
         let lo_r = self.load(lo_v)
         self.emit(f"str {lo_r}, [sp, #8]")
-        self.free_reg(lo_r)
+        self.pool.free_reg(lo_r)
         let subj_val = self.compile_expr(s_id)
         let s_r = self.load(subj_val)
         self.emit(f"str {s_r}, [sp]")
-        self.free_reg(s_r)
+        self.pool.free_reg(s_r)
         self.emit("ldr x0, [sp]")
         self.emit("ldr x1, [sp, #8]")
         self.emit("ldr x2, [sp, #16]")
@@ -3385,25 +3264,25 @@ type Codegen = struct {
             }
             // Reload buf from stack — any bl in compile_expr above would
             // have clobbered a pool-register copy.
-            let buf_r = self.alloc_reg()
+            let buf_r = self.pool.alloc_reg()
             self.emit(f"ldr {buf_r}, [sp, #8]")
             self.emit(f"str {elem_reg}, [{buf_r}, #{i * item_sz}]")
-            self.free_reg(buf_r)
-            self.free_reg(elem_reg)
+            self.pool.free_reg(buf_r)
+            self.pool.free_reg(elem_reg)
             i = i + 1
         }
-        let hdr_r = self.alloc_reg()
-        let buf_r = self.alloc_reg()
+        let hdr_r = self.pool.alloc_reg()
+        let buf_r = self.pool.alloc_reg()
         self.emit(f"ldr {hdr_r}, [sp]")
         self.emit(f"ldr {buf_r}, [sp, #8]")
         self.emit("add sp, sp, #16")
         self.emit(f"str {buf_r}, [{hdr_r}]")
-        let len_r = self.alloc_reg()
+        let len_r = self.pool.alloc_reg()
         self.emit_load_imm(len_r, value: n)
         self.emit(f"str {len_r}, [{hdr_r}, #8]")
         self.emit(f"str {len_r}, [{hdr_r}, #16]")
-        self.free_reg(len_r)
-        self.free_reg(buf_r)
+        self.pool.free_reg(len_r)
+        self.pool.free_reg(buf_r)
         return .VReg(name: hdr_r)
     }
 
@@ -3622,8 +3501,8 @@ type Codegen = struct {
         // Load cell ptr -> x0; data_ptr -> sp[0]; vtable -> x1; method ptr -> sp[n*8].
         let recv_val = self.compile_expr(receiver_id)
         self.mov_to(recv_val, dest: "x0")
-        let cell_r = self.alloc_reg()
-        let tmp_r = self.alloc_reg()
+        let cell_r = self.pool.alloc_reg()
+        let tmp_r = self.pool.alloc_reg()
         // Use two distinct pool regs: hard-coding x9 here would clobber
         // cell_r when alloc_reg happens to hand back x9.
         self.emit(f"mov {cell_r}, x0")
@@ -3632,8 +3511,8 @@ type Codegen = struct {
         self.emit(f"ldr {tmp_r}, [{cell_r}, #8]")
         self.emit(f"ldr {tmp_r}, [{tmp_r}, #{method_idx * 8}]")
         self.emit(f"str {tmp_r}, [sp, #{n * 8}]")
-        self.free_reg(tmp_r)
-        self.free_reg(cell_r)
+        self.pool.free_reg(tmp_r)
+        self.pool.free_reg(cell_r)
         mut i = 0
         for i < len(args) {
             mut arg_reg = ""
@@ -3646,7 +3525,7 @@ type Codegen = struct {
                 arg_reg = self.load(arg_val)
             }
             self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
-            self.free_reg(arg_reg)
+            self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k = 0
@@ -3778,7 +3657,7 @@ type Codegen = struct {
                 arg_reg = self.load(arg_val)
             }
             self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
-            self.free_reg(arg_reg)
+            self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k = 0
@@ -3802,13 +3681,13 @@ type Codegen = struct {
         self.emit("bl _arena_alloc")
         let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.emit(f"str {data_r}, [x0]")
-        self.free_reg(data_r)
-        let vt_r = self.alloc_reg()
+        self.pool.free_reg(data_r)
+        let vt_r = self.pool.alloc_reg()
         self.emit(f"adrp {vt_r}, {vt_lbl}@PAGE")
         self.emit(f"add {vt_r}, {vt_r}, {vt_lbl}@PAGEOFF")
         self.emit(f"str {vt_r}, [x0, #8]")
-        self.free_reg(vt_r)
-        let cell_r = self.alloc_reg()
+        self.pool.free_reg(vt_r)
+        let cell_r = self.pool.alloc_reg()
         self.emit(f"mov {cell_r}, x0")
         return cell_r
     }
@@ -3838,13 +3717,13 @@ type Codegen = struct {
         self.emit("bl _arena_alloc")
         let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.emit(f"str {data_r}, [x0]")
-        self.free_reg(data_r)
-        let vt_r = self.alloc_reg()
+        self.pool.free_reg(data_r)
+        let vt_r = self.pool.alloc_reg()
         self.emit(f"adrp {vt_r}, {vt_lbl}@PAGE")
         self.emit(f"add {vt_r}, {vt_r}, {vt_lbl}@PAGEOFF")
         self.emit(f"str {vt_r}, [x0, #8]")
-        self.free_reg(vt_r)
-        let cell_r = self.alloc_reg()
+        self.pool.free_reg(vt_r)
+        let cell_r = self.pool.alloc_reg()
         self.emit(f"mov {cell_r}, x0")
         return cell_r
     }
@@ -3883,7 +3762,7 @@ type Codegen = struct {
                 arg_reg = self.load(arg_val)
             }
             self.emit(f"str {arg_reg}, [sp, #{i * 8}]")
-            self.free_reg(arg_reg)
+            self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k = 0
@@ -3905,10 +3784,10 @@ type Codegen = struct {
         let sptr_r = self.load(subj_val)
         let subj_slot = self.alloc_var(name: self.fresh("__msubj"), kind: .KInt64)
         self.emit_str(subj_slot, reg: sptr_r)
-        self.free_reg(sptr_r)
+        self.pool.free_reg(sptr_r)
         let disc_val = .VStack(offset: subj_slot)
         let disc_r = self.load_enum_or_val(disc_val, expr_id: subject_id)
-        let result_r = self.alloc_reg()
+        let result_r = self.pool.alloc_reg()
         mut i = 0
         for i < len(arms) {
             let arm = self.p.match_expr_arms[arms[i]]
@@ -3989,13 +3868,13 @@ type Codegen = struct {
                     self.emit(f"beq {skip_lbl}")
                     if len(binding) > 0 {
                         let boff = self.find_var_offset(binding)
-                        let ptr_r = self.alloc_reg()
+                        let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
-                        let val_r = self.alloc_reg()
+                        let val_r = self.pool.alloc_reg()
                         self.emit(f"ldr {val_r}, [{ptr_r}]")
                         self.emit_str(boff, reg: val_r)
-                        self.free_reg(val_r)
-                        self.free_reg(ptr_r)
+                        self.pool.free_reg(val_r)
+                        self.pool.free_reg(ptr_r)
                     }
                     let body_val = self.compile_expr(arm.body)
                     self.mov_to(body_val, dest: result_r)
@@ -4036,7 +3915,7 @@ type Codegen = struct {
             i = i + 1
         }
         self.emit_label(done_lbl)
-        self.free_reg(disc_r)
+        self.pool.free_reg(disc_r)
         return .VReg(name: result_r)
     }
 
@@ -4380,11 +4259,11 @@ type Codegen = struct {
                 let val_spilled = self.preserve_begin(val_reg)
                 self.emit("mov x0, #8")
                 self.emit("bl _arena_alloc")
-                let ptr_reg = self.alloc_reg()
+                let ptr_reg = self.pool.alloc_reg()
                 self.emit(f"mov {ptr_reg}, x0")
                 let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                 self.emit(f"str {tmp}, [{ptr_reg}]")
-                self.free_reg(tmp)
+                self.pool.free_reg(tmp)
                 return ptr_reg
             }
             .KInterface(iface_idx) -> {
@@ -4430,7 +4309,7 @@ type Codegen = struct {
                     let val = self.compile_expr(value_id)
                     mut reg = self.load(val)
                     self.emit_str(dest_off, :reg)
-                    self.free_reg(reg)
+                    self.pool.free_reg(reg)
                 } else {
                     self.emit_struct_alloc(struct_idx: idx, :value_id, :dest_off)
                 }
@@ -4439,25 +4318,25 @@ type Codegen = struct {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KArrayStruct(elem_idx) -> {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KArrayEnum(elem_idx) -> {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KArrayStr -> {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KArrayInterface(elem_idx) -> {
                 // Array literal needs each element boxed into an iface
@@ -4466,13 +4345,13 @@ type Codegen = struct {
                 let val = self.compile_typed_array_value(value_id, expected_elem: .KInterface(idx: elem_idx))
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KArrayOptional(inner_kind) -> {
                 let val = self.compile_typed_array_value(value_id, expected_elem: .KOptional(inner: inner_kind))
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KInterface(iface_idx) -> {
                 // Box a struct into a {data, vtable} iface cell when the
@@ -4485,7 +4364,7 @@ type Codegen = struct {
                 let actual = self.infer_kind(value_id)
                 reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
             .KOptional(inner) -> {
                 // Wrap into an Optional cell unless the value is already an
@@ -4504,27 +4383,27 @@ type Codegen = struct {
                     let wrapped_val = self.compile_expr(value_id)
                     let val_reg = self.load(wrapped_val)
                     self.emit_str(dest_off, reg: val_reg)
-                    self.free_reg(val_reg)
+                    self.pool.free_reg(val_reg)
                 } else {
                     let wrapped_val = self.compile_expr(value_id)
                     let val_reg = self.load(wrapped_val)
                     let val_spilled = self.preserve_begin(val_reg)
                     self.emit("mov x0, #8")
                     self.emit("bl _arena_alloc")
-                    let ptr_reg = self.alloc_reg()
+                    let ptr_reg = self.pool.alloc_reg()
                     self.emit(f"mov {ptr_reg}, x0")
                     self.emit_str(dest_off, reg: ptr_reg)
                     let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                     self.emit(f"str {tmp}, [{ptr_reg}]")
-                    self.free_reg(tmp)
-                    self.free_reg(ptr_reg)
+                    self.pool.free_reg(tmp)
+                    self.pool.free_reg(ptr_reg)
                 }
             }
             else {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 self.emit_str(dest_off, :reg)
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             }
         }
     }
@@ -4535,7 +4414,7 @@ type Codegen = struct {
         let data_width = self.structs[struct_idx].data_width
         self.emit_load_imm("x0", value: data_width)
         self.emit("bl _arena_alloc")
-        let ptr_r = self.alloc_reg()
+        let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
         for arg in field_args {
             if self.has_field(arg.label, :struct_idx) == false {
@@ -4555,7 +4434,7 @@ type Codegen = struct {
             let field_reg = self.compile_value_for_kind(arg.value, expected: field_kind)
             self.restore_across(ptr_r, spilled: ptr_spilled)
             self.emit(f"str {field_reg}, [{ptr_r}, #{foff}]")
-            self.free_reg(field_reg)
+            self.pool.free_reg(field_reg)
         }
         mut provided: [str] = []
         for arg in field_args {
@@ -4608,7 +4487,7 @@ type Codegen = struct {
                     let dreg = self.compile_value_for_kind(field.default_expr, expected: field.kind)
                     self.restore_across(ptr_r, spilled: dptr_spilled)
                     self.emit(f"str {dreg}, [{ptr_r}, #{field.offset}]")
-                    self.free_reg(dreg)
+                    self.pool.free_reg(dreg)
                 }
             }
             fi = fi + 1
@@ -4617,7 +4496,7 @@ type Codegen = struct {
         self.subst_names = saved_names
         self.subst_args = saved_args
         self.emit(f"mov x0, {ptr_r}")
-        self.free_reg(ptr_r)
+        self.pool.free_reg(ptr_r)
         return .VReg(name: "x0")
     }
 
@@ -4628,12 +4507,12 @@ type Codegen = struct {
         mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
         self.emit_load_imm("x0", value: data_width)
         self.emit("bl _arena_alloc")
-        let ptr_r = self.alloc_reg()
+        let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
-        let disc_r = self.alloc_reg()
+        let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: disc)
         self.emit(f"str {disc_r}, [{ptr_r}]")
-        self.free_reg(disc_r)
+        self.pool.free_reg(disc_r)
         if len(field_args) > 0 {
             let vinfo = self.enums[enum_idx].variants[variant_idx]
             mut i = 0
@@ -4649,12 +4528,12 @@ type Codegen = struct {
                 let field_reg = self.compile_value_for_kind(field_args[i].value, expected: field_kind)
                 self.restore_across(ptr_r, spilled: eptr_spilled)
                 self.emit(f"str {field_reg}, [{ptr_r}, #{8 + foff}]")
-                self.free_reg(field_reg)
+                self.pool.free_reg(field_reg)
                 i = i + 1
             }
         }
         self.emit(f"mov x0, {ptr_r}")
-        self.free_reg(ptr_r)
+        self.pool.free_reg(ptr_r)
         return .VReg(name: "x0")
     }
 
@@ -4701,7 +4580,7 @@ type Codegen = struct {
             let val = self.compile_expr(value_id)
             mut reg = self.load(val)
             self.emit_str(dest_off, :reg)
-            self.free_reg(reg)
+            self.pool.free_reg(reg)
         }
     }
 
@@ -4709,10 +4588,10 @@ type Codegen = struct {
         let data_width = self.structs[struct_idx].data_width
         self.emit_load_imm("x0", value: data_width)
         self.emit("bl _arena_alloc")
-        let ptr_r = self.alloc_reg()
+        let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
         self.emit_str(dest_off, reg: ptr_r)
-        self.free_reg(ptr_r)
+        self.pool.free_reg(ptr_r)
         match self.p.exprs[value_id] {
             .Call(callee_id, args) -> {
                 mut i = 0
@@ -4721,11 +4600,11 @@ type Codegen = struct {
                     mut foff = self.find_field_offset(arg.label, :struct_idx)
                     mut field_kind = self.find_field_kind(arg.label, :struct_idx)
                     let field_reg = self.compile_value_for_kind(arg.value, expected: field_kind)
-                    let ptr_reg = self.alloc_reg()
+                    let ptr_reg = self.pool.alloc_reg()
                     self.emit_ldr(dest_off, reg: ptr_reg)
                     self.emit(f"str {field_reg}, [{ptr_reg}, #{foff}]")
-                    self.free_reg(field_reg)
-                    self.free_reg(ptr_reg)
+                    self.pool.free_reg(field_reg)
+                    self.pool.free_reg(ptr_reg)
                     i = i + 1
                 }
             }
@@ -4753,8 +4632,8 @@ type Codegen = struct {
         let ptr_reg = self.load(ptr_val)
         let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
         self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
-        self.free_reg(tmp_reg)
-        self.free_reg(ptr_reg)
+        self.pool.free_reg(tmp_reg)
+        self.pool.free_reg(ptr_reg)
     }
 
     // Look up `op_index_set` on a struct, returning its mangled label.
@@ -4780,16 +4659,16 @@ type Codegen = struct {
                 // Compile rhs first (clean register state), stash, then key,
                 // then load the array pointer and call.
                 let rhs_v = self.compile_expr(rhs_id)
-                let rhs_r = self.alloc_reg()
+                let rhs_r = self.pool.alloc_reg()
                 self.mov_to(rhs_v, dest: rhs_r)
                 let rhs_spilled = self.preserve_begin(rhs_r)
                 let key_val = self.compile_expr(rhs)
-                let key_reg = self.alloc_reg()
+                let key_reg = self.pool.alloc_reg()
                 self.mov_to(key_val, dest: key_reg)
                 let lhs_val = self.compile_expr(lhs)
                 self.mov_to(lhs_val, dest: "x0")
                 self.emit(f"mov x1, {key_reg}")
-                self.free_reg(key_reg)
+                self.pool.free_reg(key_reg)
                 // rhs is the third arg (x2). If it was spilled, reload from
                 // the slot; if it rode through a callee-saved register, just
                 // move it across.
@@ -4798,7 +4677,7 @@ type Codegen = struct {
                     self.emit("add sp, sp, #16")
                 } else {
                     self.emit(f"mov x2, {rhs_r}")
-                    self.free_reg(rhs_r)
+                    self.pool.free_reg(rhs_r)
                 }
                 self.emit(f"bl {method_lbl}")
             }
@@ -4826,13 +4705,13 @@ type Codegen = struct {
                 // Preserve rhs across the lhs computation too.
                 let rhs_spilled = self.preserve_begin(rhs_r)
                 let arr_val = self.compile_expr(lhs)
-                let arr_ptr_r = self.alloc_reg()
+                let arr_ptr_r = self.pool.alloc_reg()
                 self.mov_to(arr_val, dest: arr_ptr_r)
-                let buf_r = self.alloc_reg()
+                let buf_r = self.pool.alloc_reg()
                 self.emit(f"ldr {buf_r}, [{arr_ptr_r}]")
-                let len_r = self.alloc_reg()
+                let len_r = self.pool.alloc_reg()
                 self.emit(f"ldr {len_r}, [{arr_ptr_r}, #8]")
-                self.free_reg(arr_ptr_r)
+                self.pool.free_reg(arr_ptr_r)
                 let reloaded_rhs_r = self.preserve_end(rhs_r, spilled: rhs_spilled)
                 let reloaded_idx_r = self.preserve_end(idx_r, spilled: idx_spilled)
                 // Normalise negative index: if idx < 0, idx += len.
@@ -4855,12 +4734,12 @@ type Codegen = struct {
                 self.emit(f"mov x1, {len_r}")
                 self.emit("bl _kod_index_oob")
                 self.emit_label(ok_lbl)
-                self.free_reg(len_r)
+                self.pool.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
                 self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
-                self.free_reg(buf_r)
-                self.free_reg(reloaded_idx_r)
-                self.free_reg(reloaded_rhs_r)
+                self.pool.free_reg(buf_r)
+                self.pool.free_reg(reloaded_idx_r)
+                self.pool.free_reg(reloaded_rhs_r)
             }
         }
     }
@@ -4989,7 +4868,7 @@ type Codegen = struct {
             self.emit("bl _arena_alloc")
             let tmp = self.preserve_end(reg, spilled: reg_spilled)
             self.emit(f"str {tmp}, [x0]")
-            self.free_reg(tmp)
+            self.pool.free_reg(tmp)
             if conditional {
                 self.emit(f"b {done_lbl}")
                 self.emit_label(skip_lbl)
@@ -5004,7 +4883,7 @@ type Codegen = struct {
             if self.return_kind is .KInterface(idx) {
                 mut reg = self.compile_value_for_kind(value_id, expected: .KInterface(:idx))
                 self.emit(f"mov x0, {reg}")
-                self.free_reg(reg)
+                self.pool.free_reg(reg)
             } else {
                 let val = self.compile_expr(value_id)
                 self.mov_to(val, dest: "x0")
@@ -5018,18 +4897,18 @@ type Codegen = struct {
     // functions and for the Ok arm of try/must.
     func compile_wrap_ok(self, anon value_id: int64) -> none {
         let val = self.compile_expr(value_id)
-        mut reg = self.alloc_reg()
+        mut reg = self.pool.alloc_reg()
         self.mov_to(val, dest: reg)
         let reg_spilled = self.preserve_begin(reg)
         self.emit("mov x0, #16")
         self.emit("bl _arena_alloc")
         let payload = self.preserve_end(reg, spilled: reg_spilled)
-        let disc_r = self.alloc_reg()
+        let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
         self.emit(f"str {disc_r}, [x0]")
-        self.free_reg(disc_r)
+        self.pool.free_reg(disc_r)
         self.emit(f"str {payload}, [x0, #8]")   // payload
-        self.free_reg(payload)
+        self.pool.free_reg(payload)
     }
 
     // `throw expr` — box `expr` as an Error (fat pointer with vtable) and
@@ -5065,7 +4944,7 @@ type Codegen = struct {
         mut reg = self.load(val)
         let ok_lbl = self.fresh("Lassert_ok")
         self.emit(f"cbnz {reg}, {ok_lbl}")
-        self.free_reg(reg)
+        self.pool.free_reg(reg)
         let pos = self.format_position(span.start)
         let msg = f"{pos}: assertion failed: {source_text}"
         let msg_lbl = self.intern_str(msg)
@@ -5083,7 +4962,7 @@ type Codegen = struct {
         let iface_idx = self.find_iface_idx("Error")
         let actual = self.infer_kind(value_id)
         let val = self.compile_expr(value_id)
-        mut reg = self.alloc_reg()
+        mut reg = self.pool.alloc_reg()
         self.mov_to(val, dest: reg)
         // Box into the Error interface if the source is a concrete struct.
         if iface_idx >= 0 {
@@ -5097,7 +4976,7 @@ type Codegen = struct {
         self.emit(f"mov x9, #{self.result_err_disc()}")
         self.emit("str x9, [x0]")
         self.emit(f"str {payload}, [x0, #8]")   // error iface ptr
-        self.free_reg(payload)
+        self.pool.free_reg(payload)
         self.emit(f"b {self.ret_lbl}")
     }
 
@@ -5109,12 +4988,12 @@ type Codegen = struct {
     func compile_try_or_must(self, anon inner_id: int64, is_must: bool) -> Val {
         let val = self.compile_expr(inner_id)
         self.mov_to(val, dest: "x0")
-        mut disc = self.alloc_reg()
+        mut disc = self.pool.alloc_reg()
         self.emit(f"ldr {disc}, [x0]")
         let ok_lbl = self.fresh("Lresult_ok")
         let done_lbl = self.fresh("Lresult_done")
         self.emit(f"cmp {disc}, #{self.result_ok_disc()}")
-        self.free_reg(disc)
+        self.pool.free_reg(disc)
         self.emit(f"beq {ok_lbl}")
         // Err path.
         if is_must {
@@ -5134,7 +5013,7 @@ type Codegen = struct {
             self.emit(f"b {self.ret_lbl}")
         }
         self.emit_label(ok_lbl)
-        let result_r = self.alloc_reg()
+        let result_r = self.pool.alloc_reg()
         self.emit(f"ldr {result_r}, [x0, #8]")
         self.emit_label(done_lbl)
         return .VReg(name: result_r)
@@ -5226,13 +5105,13 @@ type Codegen = struct {
         let val_spilled = self.preserve_begin(reg)
         self.emit("mov x0, #8")
         self.emit("bl _arena_alloc")
-        let ptr = self.alloc_reg()
+        let ptr = self.pool.alloc_reg()
         self.emit(f"mov {ptr}, x0")
         let tmp = self.preserve_end(reg, spilled: val_spilled)
         self.emit(f"str {tmp}, [{ptr}]")
-        self.free_reg(tmp)
+        self.pool.free_reg(tmp)
         self.emit(f"mov {reg}, {ptr}")
-        self.free_reg(ptr)
+        self.pool.free_reg(ptr)
         self.emit_label(done_lbl)
         return .VReg(name: reg)
     }
@@ -5260,7 +5139,7 @@ type Codegen = struct {
             return .VImm(value: 0)
         }
         self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method, call_span: self.p.expr_spans[value_id])
-        let result = self.alloc_reg()
+        let result = self.pool.alloc_reg()
         let val = self.compile_expr(value_id)
         mut reg = self.load(val)
         let some_lbl = self.fresh("Lopt_call_some")
@@ -5283,7 +5162,7 @@ type Codegen = struct {
         }
         self.emit(f"sub sp, sp, #{padded}")
         self.emit(f"str {reg}, [sp]")
-        self.free_reg(reg)
+        self.pool.free_reg(reg)
         mut i: int64 = 0
         for i < len(args) {
             mut arg_reg: str = ""
@@ -5295,7 +5174,7 @@ type Codegen = struct {
                 arg_reg = self.load(arg_val)
             }
             self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
-            self.free_reg(arg_reg)
+            self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k: int64 = 0
@@ -5306,19 +5185,19 @@ type Codegen = struct {
         self.emit(f"add sp, sp, #{padded}")
         self.emit(f"bl {method_lbl}")
         // Wrap the return value (now in x0) into a fresh Some cell.
-        let ret_reg = self.alloc_reg()
+        let ret_reg = self.pool.alloc_reg()
         self.emit(f"mov {ret_reg}, x0")
         let val_spilled = self.preserve_begin(ret_reg)
         self.emit("mov x0, #8")
         self.emit("bl _arena_alloc")
-        let ptr = self.alloc_reg()
+        let ptr = self.pool.alloc_reg()
         self.emit(f"mov {ptr}, x0")
         let tmp = self.preserve_end(ret_reg, spilled: val_spilled)
         self.emit(f"str {tmp}, [{ptr}]")
-        self.free_reg(tmp)
+        self.pool.free_reg(tmp)
         self.emit(f"mov {result}, {ptr}")
-        self.free_reg(ptr)
-        self.free_reg(ret_reg)
+        self.pool.free_reg(ptr)
+        self.pool.free_reg(ret_reg)
         self.emit_label(done_lbl)
         return .VReg(name: result)
     }
@@ -5330,7 +5209,7 @@ type Codegen = struct {
         let cond_val = self.compile_expr(cond_id)
         let cond_reg = self.load(cond_val)
         self.emit(f"cmp {cond_reg}, #0")
-        self.free_reg(cond_reg)
+        self.pool.free_reg(cond_reg)
         self.emit(f"beq {false_lbl}")
         mut i = 0
         for i < len(then_body) {
@@ -5358,7 +5237,7 @@ type Codegen = struct {
         let cond_val = self.compile_expr(cond_id)
         let cond_reg = self.load(cond_val)
         self.emit(f"cmp {cond_reg}, #0")
-        self.free_reg(cond_reg)
+        self.pool.free_reg(cond_reg)
         self.emit(f"beq {end_lbl}")
         mut i = 0
         for i < len(body) {
@@ -5411,32 +5290,32 @@ type Codegen = struct {
         let arr_val = self.compile_expr(iter_id)
         let hdr_r = self.load(arr_val)
         self.emit_str(hdr_off, reg: hdr_r)
-        self.free_reg(hdr_r)
+        self.pool.free_reg(hdr_r)
 
-        let idx_r = self.alloc_reg()
+        let idx_r = self.pool.alloc_reg()
         self.emit(f"mov {idx_r}, #0")
         self.emit_str(idx_off, reg: idx_r)
-        self.free_reg(idx_r)
+        self.pool.free_reg(idx_r)
 
         self.emit_label(start_lbl)
-        let hdr_reg = self.alloc_reg()
-        let len_reg = self.alloc_reg()
-        let idx_reg = self.alloc_reg()
+        let hdr_reg = self.pool.alloc_reg()
+        let len_reg = self.pool.alloc_reg()
+        let idx_reg = self.pool.alloc_reg()
         self.emit_ldr(hdr_off, reg: hdr_reg)
         self.emit(f"ldr {len_reg}, [{hdr_reg}, #8]")
         self.emit_ldr(idx_off, reg: idx_reg)
         self.emit(f"cmp {idx_reg}, {len_reg}")
         self.emit(f"bge {end_lbl}")
-        self.free_reg(len_reg)
+        self.pool.free_reg(len_reg)
 
-        mut elem_reg = self.alloc_reg()
+        mut elem_reg = self.pool.alloc_reg()
         self.emit(f"ldr {elem_reg}, [{hdr_reg}]")
         self.emit(f"lsl {idx_reg}, {idx_reg}, #3")
         self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
         self.emit_str(elem_off, reg: elem_reg)
-        self.free_reg(elem_reg)
-        self.free_reg(idx_reg)
-        self.free_reg(hdr_reg)
+        self.pool.free_reg(elem_reg)
+        self.pool.free_reg(idx_reg)
+        self.pool.free_reg(hdr_reg)
 
         mut i = 0
         for i < len(body) {
@@ -5445,11 +5324,11 @@ type Codegen = struct {
         }
 
         self.emit_label(incr_lbl)
-        let bump_reg = self.alloc_reg()
+        let bump_reg = self.pool.alloc_reg()
         self.emit_ldr(idx_off, reg: bump_reg)
         self.emit(f"add {bump_reg}, {bump_reg}, #1")
         self.emit_str(idx_off, reg: bump_reg)
-        self.free_reg(bump_reg)
+        self.pool.free_reg(bump_reg)
         self.emit(f"b {start_lbl}")
         self.emit_label(end_lbl)
 
@@ -5481,32 +5360,32 @@ type Codegen = struct {
         let sptr_r = self.load(subj_val)
         let subj_slot = self.alloc_var(name: self.fresh("__lsubj"), kind: .KInt64)
         self.emit_str(subj_slot, reg: sptr_r)
-        self.free_reg(sptr_r)
+        self.pool.free_reg(sptr_r)
         match self.p.patterns[pattern_id] {
             .EnumPat(enum_name, variant_name, bindings) -> {
                 let enum_idx = self.find_enum_idx(enum_name)
                 mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
                 mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
-                let disc_r = self.alloc_reg()
-                let ptr_r = self.alloc_reg()
+                let disc_r = self.pool.alloc_reg()
+                let ptr_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: ptr_r)
                 self.emit(f"ldr {disc_r}, [{ptr_r}]")
                 self.emit(f"cmp {disc_r}, #{disc}")
                 self.emit(f"bne {else_lbl}")
-                self.free_reg(disc_r)
-                self.free_reg(ptr_r)
+                self.pool.free_reg(disc_r)
+                self.pool.free_reg(ptr_r)
                 let vinfo = self.enums[enum_idx].variants[variant_idx]
                 mut key_idx = 0
                 for key_idx < len(bindings) {
                     mut foff = vinfo.field_offsets[key_idx]
                     let binding_off = self.find_var_offset(bindings[key_idx])
-                    let ptr_r2 = self.alloc_reg()
+                    let ptr_r2 = self.pool.alloc_reg()
                     self.emit_ldr(subj_slot, reg: ptr_r2)
-                    let fv_r = self.alloc_reg()
+                    let fv_r = self.pool.alloc_reg()
                     self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
                     self.emit_str(binding_off, reg: fv_r)
-                    self.free_reg(fv_r)
-                    self.free_reg(ptr_r2)
+                    self.pool.free_reg(fv_r)
+                    self.pool.free_reg(ptr_r2)
                     key_idx = key_idx + 1
                 }
             }
@@ -5514,52 +5393,52 @@ type Codegen = struct {
                 let enum_idx = self.find_enum_with_variant(variant_name)
                 mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
                 mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
-                let disc_r = self.alloc_reg()
-                let ptr_r = self.alloc_reg()
+                let disc_r = self.pool.alloc_reg()
+                let ptr_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: ptr_r)
                 self.emit(f"ldr {disc_r}, [{ptr_r}]")
                 self.emit(f"cmp {disc_r}, #{disc}")
                 self.emit(f"bne {else_lbl}")
-                self.free_reg(disc_r)
-                self.free_reg(ptr_r)
+                self.pool.free_reg(disc_r)
+                self.pool.free_reg(ptr_r)
                 let vinfo2 = self.enums[enum_idx].variants[variant_idx]
                 mut key_idx = 0
                 for key_idx < len(bindings) {
                     mut foff = vinfo2.field_offsets[key_idx]
                     let binding_off = self.find_var_offset(bindings[key_idx])
-                    let ptr_r2 = self.alloc_reg()
+                    let ptr_r2 = self.pool.alloc_reg()
                     self.emit_ldr(subj_slot, reg: ptr_r2)
-                    let fv_r = self.alloc_reg()
+                    let fv_r = self.pool.alloc_reg()
                     self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
                     self.emit_str(binding_off, reg: fv_r)
-                    self.free_reg(fv_r)
-                    self.free_reg(ptr_r2)
+                    self.pool.free_reg(fv_r)
+                    self.pool.free_reg(ptr_r2)
                     key_idx = key_idx + 1
                 }
             }
             .SomePat(binding) -> {
-                let disc_r = self.alloc_reg()
+                let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
                 self.emit(f"cmp {disc_r}, #0")
                 self.emit(f"beq {else_lbl}")
-                self.free_reg(disc_r)
+                self.pool.free_reg(disc_r)
                 if len(binding) > 0 {
                     let boff = self.find_var_offset(binding)
-                    let ptr_r = self.alloc_reg()
+                    let ptr_r = self.pool.alloc_reg()
                     self.emit_ldr(subj_slot, reg: ptr_r)
-                    let val_r = self.alloc_reg()
+                    let val_r = self.pool.alloc_reg()
                     self.emit(f"ldr {val_r}, [{ptr_r}]")
                     self.emit_str(boff, reg: val_r)
-                    self.free_reg(val_r)
-                    self.free_reg(ptr_r)
+                    self.pool.free_reg(val_r)
+                    self.pool.free_reg(ptr_r)
                 }
             }
             .NonePat -> {
-                let disc_r = self.alloc_reg()
+                let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
                 self.emit(f"cmp {disc_r}, #0")
                 self.emit(f"bne {else_lbl}")
-                self.free_reg(disc_r)
+                self.pool.free_reg(disc_r)
             }
             else {
                 // Other patterns are not supported here yet.
@@ -5590,7 +5469,7 @@ type Codegen = struct {
         let sptr_r = self.load(subj_val)
         let subj_slot = self.alloc_var(name: self.fresh("__msubj"), kind: .KInt64)
         self.emit_str(subj_slot, reg: sptr_r)
-        self.free_reg(sptr_r)
+        self.pool.free_reg(sptr_r)
         let disc_val = .VStack(offset: subj_slot)
         let disc_r = self.load_enum_or_val(disc_val, expr_id: subject_id)
         mut i = 0
@@ -5653,13 +5532,13 @@ type Codegen = struct {
                     for key_idx < len(bindings) {
                         mut foff = vinfo.field_offsets[key_idx]
                         let binding_off = self.find_var_offset(bindings[key_idx])
-                        let ptr_r = self.alloc_reg()
+                        let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
-                        let fv_r = self.alloc_reg()
+                        let fv_r = self.pool.alloc_reg()
                         self.emit(f"ldr {fv_r}, [{ptr_r}, #{8 + foff}]")
                         self.emit_str(binding_off, reg: fv_r)
-                        self.free_reg(fv_r)
-                        self.free_reg(ptr_r)
+                        self.pool.free_reg(fv_r)
+                        self.pool.free_reg(ptr_r)
                         key_idx = key_idx + 1
                     }
                     for stmt_id in arm.body {
@@ -5679,13 +5558,13 @@ type Codegen = struct {
                     for key_idx < len(bindings) {
                         mut foff = vinfo2.field_offsets[key_idx]
                         let binding_off = self.find_var_offset(bindings[key_idx])
-                        let ptr_r = self.alloc_reg()
+                        let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
-                        let fv_r = self.alloc_reg()
+                        let fv_r = self.pool.alloc_reg()
                         self.emit(f"ldr {fv_r}, [{ptr_r}, #{8 + foff}]")
                         self.emit_str(binding_off, reg: fv_r)
-                        self.free_reg(fv_r)
-                        self.free_reg(ptr_r)
+                        self.pool.free_reg(fv_r)
+                        self.pool.free_reg(ptr_r)
                         key_idx = key_idx + 1
                     }
                     for stmt_id in arm.body {
@@ -5708,13 +5587,13 @@ type Codegen = struct {
                     self.emit(f"beq {skip_lbl}")
                     if len(binding) > 0 {
                         let boff = self.find_var_offset(binding)
-                        let ptr_r = self.alloc_reg()
+                        let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
-                        let val_r = self.alloc_reg()
+                        let val_r = self.pool.alloc_reg()
                         self.emit(f"ldr {val_r}, [{ptr_r}]")
                         self.emit_str(boff, reg: val_r)
-                        self.free_reg(val_r)
-                        self.free_reg(ptr_r)
+                        self.pool.free_reg(val_r)
+                        self.pool.free_reg(ptr_r)
                     }
                     for stmt_id in arm.body {
                         self.compile_stmt(stmt_id)
@@ -5757,7 +5636,7 @@ type Codegen = struct {
             i = i + 1
         }
         self.emit_label(done_lbl)
-        self.free_reg(disc_r)
+        self.pool.free_reg(disc_r)
     }
 
 
@@ -5772,9 +5651,7 @@ type Codegen = struct {
         self.check_param_order(func_decl, func_decl.name)
         self.vars = []
         self.frame_slots = 0
-        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
-        self.cs_in_use = 0
-        self.cs_high_water = 0
+        self.pool.reset()
         self.loop_stack = []
 
         for param in func_decl.params {
@@ -5828,7 +5705,7 @@ type Codegen = struct {
         // live *outside* the existing frame, so every fp-relative local
         // and sp-relative spill in the body keeps its exact offset.
         let saved_buf = self.out_buf
-        let vreg_start: int64 = len(self.vreg_phys)
+        let vreg_start: int64 = len(self.pool.vreg_phys)
         self.out_buf = []
 
         self.emit(f"sub sp, sp, #{aligned + 16}")
@@ -5863,19 +5740,19 @@ type Codegen = struct {
         // callee-saved set into a dense `x19..` prefix and returns the
         // new high-water mark so the prologue saves exactly the
         // registers the body actually uses.
-        regalloc.run(:body_buf, vreg_phys: self.vreg_phys, :vreg_start)
-        self.cs_high_water = regalloc.pack(vreg_phys: self.vreg_phys, :vreg_start)
+        regalloc.run(:body_buf, pool: self.pool, :vreg_start)
+        self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)
 
         // Round the callee-saved count up to an even number of registers
         // (stp/ldp move pairs); the pad slot uses x28, which is never
         // pool-allocated, so saving/restoring it is a harmless no-op.
-        mut cs = self.cs_high_water
+        mut cs = self.pool.cs_high_water
         if cs % 2 != 0 {
             cs = cs + 1
         }
         mut pi = 0
         for pi < cs {
-            self.emit(f"stp {self.cs_reg(pi)}, {self.cs_reg(pi + 1)}, [sp, #-16]!")
+            self.emit(f"stp {regalloc.cs_reg(pi)}, {regalloc.cs_reg(pi + 1)}, [sp, #-16]!")
             pi = pi + 2
         }
         for line in body_buf {
@@ -5883,7 +5760,7 @@ type Codegen = struct {
         }
         mut qi = cs
         for qi > 0 {
-            self.emit(f"ldp {self.cs_reg(qi - 2)}, {self.cs_reg(qi - 1)}, [sp], #16")
+            self.emit(f"ldp {regalloc.cs_reg(qi - 2)}, {regalloc.cs_reg(qi - 1)}, [sp], #16")
             qi = qi - 2
         }
         self.emit("ret")
