@@ -341,7 +341,15 @@ class Interpreter:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
             case ast.ArrayLiteral(elements):
                 evaled = [self.evaluate_expression(module, e) for e in elements]
-                item_type = type(evaled[0]) if evaled else types.NoneType
+                # FunctionDeclaration AST nodes are first-class values
+                # in the interpreter (function-pointer support); flatten
+                # them to a single FunctionType bucket so the resulting
+                # array's item_type has the `.name` attribute
+                # `ArrayType.make` expects.
+                if evaled and isinstance(evaled[0], ast.FunctionDeclaration):
+                    item_type = types.FunctionType
+                else:
+                    item_type = type(evaled[0]) if evaled else types.NoneType
                 arr_type = types.ArrayType.make(item_type)
                 return arr_type(evaled)
             case ast.FunctionCall(callee, args):

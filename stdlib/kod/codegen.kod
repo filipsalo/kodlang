@@ -34,6 +34,10 @@ type TypeKind = enum {
     // function. `param_kinds` and `return_kind` carry the signature
     // for call-site type checks.
     KFunc(param_kinds: [TypeKind], return_kind: TypeKind)
+    // Array of function pointers — captures the element signature
+    // so `arr[i](x)` can dispatch indirectly with correct arg
+    // expectations.
+    KArrayFunc(param_kinds: [TypeKind], return_kind: TypeKind)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -1657,6 +1661,9 @@ type Codegen = struct {
                 }
                 return f"{result}) -> {self.kind_display(return_kind)}"
             }
+            .KArrayFunc(param_kinds, return_kind) -> {
+                return f"[{self.kind_display(.KFunc(:param_kinds, :return_kind))}]"
+            }
         }
     }
 
@@ -1775,6 +1782,9 @@ type Codegen = struct {
                 }
                 return f"{name}$ret${self.canonical_kind_name(return_kind)}"
             }
+            .KArrayFunc(param_kinds, return_kind) -> {
+                return f"arr${self.canonical_kind_name(.KFunc(:param_kinds, :return_kind))}"
+            }
         }
     }
 
@@ -1888,6 +1898,7 @@ type Codegen = struct {
                     .KStr -> return .KArrayStr
                     .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
                     .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
+                    .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
                     else return .KArray
                 }
             }
@@ -2934,6 +2945,7 @@ type Codegen = struct {
             .KArrayStr -> array_like = true
             .KArrayInterface(elem_idx) -> array_like = true
             .KArrayOptional(inner_kind) -> array_like = true
+            .KArrayFunc(_pk, _rk) -> array_like = true
             else none
         }
         if array_like {
@@ -3168,6 +3180,7 @@ type Codegen = struct {
                     .KArrayStr -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayInterface(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayOptional(inner_kind) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
+                    .KArrayFunc(_pk, _rk) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     else none
                 }
             }
@@ -3602,7 +3615,52 @@ type Codegen = struct {
             self.emit(f"bl {lbl}")
             return .VReg(name: "x0")
         }
+        // `obj.fn(args)` where `fn` is a struct FIELD of function-
+        // pointer type (not a method). Load the field, then indirect
+        // call. Checked before falling through to method dispatch so
+        // the user can call a func-typed field with the same syntax
+        // they'd use for a method.
+        let lhs_kind: TypeKind = self.infer_kind(callee_lhs)
+        if lhs_kind is .KStruct(sidx, _ta) {
+            if self.has_field(method_name, struct_idx: sidx) {
+                if self.find_field_kind(method_name, struct_idx: sidx) is .KFunc(_p, _r) {
+                    return none
+                }
+            }
+        }
         return self.compile_method_call(args, receiver_id: callee_lhs, :method_name, span: self.p.expr_spans[callee_lhs])
+    }
+
+    // Indirect call on any expression of `KFunc` type. The callee
+    // expression may itself be a Call (`getfn()(x)`), a field load
+    // (`obj.handler(x)` where handler is a field, not a method), an
+    // index (`arr[i](x)`), or any other shape that evaluates to a
+    // function pointer. Compile the callee first, spill it across
+    // arg eval (so any `bl`s during argument compilation don't
+    // clobber it), then `blr`.
+    func compile_indirect_call(self, callee_id: int64, args: [ast.CallArg]) -> Val {
+        let callee_kind: TypeKind = self.infer_kind(callee_id)
+        if callee_kind is .KFunc(param_kinds, _return_kind) {
+            let callee_val: Val = self.compile_expr(callee_id)
+            // Always move the function pointer into a fresh pool reg
+            // (NOT the load's "x0" return slot when callee is a Call):
+            // prepare_args_with_kinds will overwrite x0 with the first
+            // argument, so a restore-across from sp would clobber it.
+            // A pool reg either lands in a callee-saved slot
+            // (`spill_across` no-ops, value survives the call directly)
+            // or in caller-saved x8-x15 (spill works without colliding
+            // with the arg registers x0-x7).
+            let callee_reg: str = self.pool.alloc_reg()
+            self.mov_to(callee_val, dest: callee_reg)
+            let spilled: bool = self.spill_across(callee_reg)
+            self.prepare_args_with_kinds(args, expected_kinds: param_kinds)
+            self.restore_across(callee_reg, :spilled)
+            self.emit(f"blr {callee_reg}")
+            self.pool.free_reg(callee_reg)
+            return .VReg(name: "x0")
+        }
+        self.report_error("error: call with non-callable expression", span: self.p.expr_spans[callee_id])
+        return .VImm(value: 0)
     }
 
     func compile_call(self, anon args: [ast.CallArg], callee_id: int64) -> Val {
@@ -3665,6 +3723,21 @@ type Codegen = struct {
             }
             .Binary(lhs, op, rhs) -> {
                 match op {
+                    .Index -> {
+                        // `Type[A](args)` parses to Call(Binary(Index,
+                        // Ident(Type), Ident(A)), args). When the lhs
+                        // is a known struct name, drop the type arg
+                        // and dispatch as a regular constructor —
+                        // generics are monomorphised inside the call
+                        // path, the type args at the call site are
+                        // pure annotation.
+                        if self.p.exprs[lhs] is .Ident(name) {
+                            let struct_idx = self.find_struct_idx(name)
+                            if struct_idx >= 0 {
+                                return self.compile_struct_construct(args, :struct_idx, span: self.p.expr_spans[callee_id])
+                            }
+                        }
+                    }
                     .Dot -> {
                         if self.try_three_part_construct(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
@@ -3672,18 +3745,31 @@ type Codegen = struct {
                         if self.try_two_part_call(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
                         }
-                        // Fallback: receiver is a non-Ident expression
-                        // (literal, field access, call result, ...). Dispatch
-                        // via the general method-call path using the receiver
-                        // expression directly.
-                        if self.p.exprs[rhs] is .Ident(method_name) {
-                            return self.compile_method_call(args, receiver_id: lhs, :method_name, span: self.p.expr_spans[lhs])
+                        if self.p.exprs[rhs] is .Ident(name) {
+                            // `obj.fn(...)` where `fn` is a struct
+                            // FIELD of function-pointer type — load
+                            // the field, then indirect call. Checked
+                            // before method dispatch so a field shadows
+                            // a same-named method (unlikely but the
+                            // dispatch needs to be deterministic).
+                            let lhs_kind: TypeKind = self.infer_kind(lhs)
+                            if lhs_kind is .KStruct(sidx, _ta) {
+                                if self.has_field(name, struct_idx: sidx) {
+                                    if self.find_field_kind(name, struct_idx: sidx) is .KFunc(_p, _r) {
+                                        return self.compile_indirect_call(:callee_id, :args)
+                                    }
+                                }
+                            }
+                            return self.compile_method_call(args, receiver_id: lhs, method_name: name, span: self.p.expr_spans[lhs])
                         }
                     }
                     else none
                 }
-                self.report_error("error: unresolved call on dotted callee", span: self.p.expr_spans[callee_id])
-                return .VReg(name: "x0")
+                // Non-Dot binary expressions (Index, ...) and any
+                // unresolved Dot form fall through to the general
+                // function-pointer call path: `arr[i](x)`, `(obj.f)(x)`
+                // for a function-typed field, etc.
+                return self.compile_indirect_call(:callee_id, :args)
             }
             .ImplicitVariant(variant_name) -> {
                 // .Variant(args) constructor — payload form of implicit variant.
@@ -3708,8 +3794,10 @@ type Codegen = struct {
                 return .VReg(name: "x0")
             }
             else {
-                self.report_error("error: call with non-callable expression", span: self.p.expr_spans[callee_id])
-                return .VReg(name: "x0")
+                // Any other callee shape (Call, ArrayLit, Match, ...).
+                // If the resulting value is a function pointer, do an
+                // indirect call; otherwise report.
+                return self.compile_indirect_call(:callee_id, :args)
             }
         }
     }
@@ -3728,6 +3816,7 @@ type Codegen = struct {
             .KArrayStr -> header_len = true
             .KArrayInterface(_elem) -> header_len = true
             .KArrayOptional(_inner) -> header_len = true
+            .KArrayFunc(_pk, _rk) -> header_len = true
             .KStr -> header_len = true
             else none
         }
@@ -4319,6 +4408,7 @@ type Codegen = struct {
                     .KStr -> return .KArrayStr
                     .KInterface(idx) -> return .KArrayInterface(elem_idx: idx)
                     .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
+                    .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
                     else return .KArray
                 }
             }
@@ -4336,6 +4426,7 @@ type Codegen = struct {
                     .KArrayEnum(_idx) -> return k
                     .KArrayInterface(_idx) -> return k
                     .KArrayOptional(_inner) -> return k
+                    .KArrayFunc(_pk, _rk) -> return k
                     else return .KStr
                 }
             }
@@ -4416,6 +4507,7 @@ type Codegen = struct {
                             .KArrayStr -> return .KStr
                             .KArrayInterface(elem_idx) -> return .KInterface(idx: elem_idx)
                             .KArrayOptional(inner_kind) -> return .KOptional(inner: inner_kind)
+                            .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
                                 if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
@@ -5569,6 +5661,7 @@ type Codegen = struct {
             .KArrayStr -> elem_kind = .KStr
             .KArrayInterface(elem_idx) -> elem_kind = .KInterface(idx: elem_idx)
             .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
+            .KArrayFunc(param_kinds, return_kind) -> elem_kind = .KFunc(:param_kinds, :return_kind)
             else none
         }
         self.update_var_kind(:name, kind: elem_kind)
