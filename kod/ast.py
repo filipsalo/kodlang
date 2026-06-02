@@ -964,11 +964,21 @@ class Expression(ASTNode):
                 span = parser.peek().span
                 parser.consume(tokens.OpenBracket)
                 elements = []
+                # Skip EOLs around elements so the array can span
+                # multiple lines (one element per line is the more
+                # readable layout when the elements themselves are
+                # long, e.g. `[func(x: int64) -> int64 { ... }, ...]`).
+                while parser.try_consume(tokens.EOL):
+                    pass
                 while not parser.try_consume(tokens.CloseBracket):
                     elements.append(Expression.parse(parser))
+                    while parser.try_consume(tokens.EOL):
+                        pass
                     if not parser.try_consume(tokens.Comma):
                         parser.consume(tokens.CloseBracket)
                         break
+                    while parser.try_consume(tokens.EOL):
+                        pass
                 value = ArrayLiteral(elements, span)
             case tokens.Dot():
                 with parser.span() as span:
