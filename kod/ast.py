@@ -190,6 +190,26 @@ class StringLiteral(ASTNode, Literal):
         return cls(value, span=token.span)
 
 
+@dataclasses.dataclass
+class BytesLiteral(ASTNode, Literal):
+    """A `b"..."` byte-string literal — same on-disk shape as a str but
+    typed as `bytes`."""
+
+    value: types.Bytes
+    span: Span
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        token = parser.consume(tokens.BytesLiteral)
+        raw = token.value
+        if len(raw) >= 7 and raw.startswith('b"""') and raw.endswith('"""'):
+            body = _dedent_triple_body(raw[4:-3])
+            bytes_ = process_escapes(body).encode("utf8")
+        else:
+            bytes_ = raw[2:-1].encode("utf8")
+        return cls(types.Bytes(bytes_), span=token.span)
+
+
 def _parse_fstring(parser: Parser) -> ASTNode:
     """Parse an f-string token into a BinaryOperator tree of str concatenations."""
     from kod.lexer import Lexer
@@ -950,6 +970,8 @@ class Expression(ASTNode):
                 parser.consume(tokens.CloseParen)
             case tokens.StringLiteral():
                 value = StringLiteral.parse(parser)
+            case tokens.BytesLiteral():
+                value = BytesLiteral.parse(parser)
             case tokens.FStringLiteral():
                 value = _parse_fstring(parser)
             case tokens.IntegerLiteral():

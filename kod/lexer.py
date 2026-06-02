@@ -16,6 +16,7 @@ from kod.tokens import (
     Assert,
     BooleanLiteral,
     Break,
+    BytesLiteral,
     Caret,
     CloseBracket,
     CloseCurly,
@@ -247,6 +248,40 @@ class Lexer:
         string.value = process_escapes(string.value)
         return string
 
+    def lex_bytes_literal(self) -> BytesLiteral:
+        # `b"..."` shares lex_string's shape — the only difference is
+        # the leading `b`, which is already buffered. The parser strips
+        # the `b` and the surrounding quotes.
+        self.consume('"')
+        if self.peek() == '"' and self._peek_at(1) == '"':
+            self.consume('"')
+            self.consume('"')
+            while True:
+                if self.peek() == "":
+                    raise self.error("Unterminated triple-quoted bytes literal")
+                if (
+                    self.peek() == '"'
+                    and self._peek_at(1) == '"'
+                    and self._peek_at(2) == '"'
+                ):
+                    self.consume('"')
+                    self.consume('"')
+                    self.consume('"')
+                    break
+                self.pos += 1
+            return self.build(BytesLiteral)
+        while self.peek() != '"':
+            if self.peek() == "\\":
+                self.pos += 1
+                if self.peek() != "":
+                    self.pos += 1
+            else:
+                self.pos += 1
+        self.consume('"')
+        token: BytesLiteral = self.build(BytesLiteral)
+        token.value = process_escapes(token.value)
+        return token
+
     def lex_fstring(self) -> FStringLiteral:
         # Lex an f-string literal — both single-line and triple-quoted forms.
         self.consume('"')
@@ -349,6 +384,11 @@ class Lexer:
             char = self.peek()
         if self.buffered() == "f" and self.peek() == '"':
             return self.lex_fstring()
+        # `b"..."` — byte-string literal. Same lexer shape as a
+        # plain string; emitted as BytesLiteral so the parser
+        # produces a `bytes`-typed expression.
+        if self.buffered() == "b" and self.peek() == '"':
+            return self.lex_bytes_literal()
         if keyword_token_type := KEYWORDS.get(self.buffered()):
             return self.build(keyword_token_type)
         return self.build(Identifier)

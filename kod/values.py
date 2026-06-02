@@ -35,6 +35,8 @@ class Type:
                 return Int64
             case "str":
                 return String
+            case "bytes":
+                return Bytes
             case "bool":
                 return Bool
             case "none":
@@ -160,6 +162,29 @@ class String(Type):
         """Concatenate two strings. Non-string operands must be cast
         explicitly: `"x = " + str(n)`."""
         return String(self.value + other.value)
+
+    def op_index(self, index: "Int64") -> "Int64":
+        return Int64(self.value[index.value])
+
+
+class Bytes(Type):
+    """An immutable byte buffer. Same in-memory layout as `String` but a
+    distinct type — `str` is heading toward unicode, `bytes` stays raw."""
+
+    name = "bytes"
+    width = 8
+
+    def __eq__(self, other):
+        return isinstance(other, Bytes) and self.value == other.value
+
+    def __hash__(self):
+        return hash(("bytes", self.value))
+
+    def to_str(self) -> "String":
+        return String(self.value)
+
+    def op_plus(self, other: "Bytes") -> "Bytes":
+        return Bytes(self.value + other.value)
 
     def op_index(self, index: "Int64") -> "Int64":
         return Int64(self.value[index.value])

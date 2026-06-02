@@ -248,6 +248,13 @@ class FStringLiteral(Token):
 
 
 @dataclasses.dataclass
+class BytesLiteral(Token):
+    """A byte-string literal like b"raw\\x00data". Same lexer shape
+    as a regular string, but the parser produces a bytes-typed
+    expression so the type system can keep text and binary apart."""
+
+
+@dataclasses.dataclass
 class IntegerLiteral(Token):
     """A literal number."""
 

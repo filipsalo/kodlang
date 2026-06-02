@@ -15,6 +15,12 @@ type TypeKind = enum {
     KInt64
     KBool
     KStr
+    // Raw byte sequence — same runtime layout as `KStr` (length +
+    // buffer) but typed distinctly so the type system can keep
+    // "text" and "binary" apart ahead of the unicode upgrade to
+    // `str`. Indexing returns an int64 byte, slicing is byte-
+    // positional, concatenation is byte append.
+    KBytes
     KArray
     // The inner type of an optional. KVoid means "unknown" (e.g. a bare
     // `none` literal — its inner is fixed up by the surrounding context).
@@ -27,6 +33,7 @@ type TypeKind = enum {
     KArrayStruct(elem_idx: int64)
     KArrayEnum(elem_idx: int64)
     KArrayStr
+    KArrayBytes
     KArrayInterface(elem_idx: int64)
     KArrayOptional(inner: TypeKind)
     KInterface(idx: int64)
@@ -1653,8 +1660,10 @@ type Codegen = struct {
             .KInt64 -> return "int64"
             .KBool -> return "bool"
             .KStr -> return "str"
+            .KBytes -> return "bytes"
             .KArray -> return "[?]"
             .KArrayStr -> return "[str]"
+            .KArrayBytes -> return "[bytes]"
             .KArrayStruct(elem_idx) -> return f"[{self.structs[elem_idx].name}]"
             .KArrayEnum(elem_idx) -> return f"[{self.enums[elem_idx].name}]"
             .KArrayInterface(elem_idx) -> return f"[{self.interfaces[elem_idx].name}]"
@@ -1788,8 +1797,10 @@ type Codegen = struct {
             .KInt64 -> return "int64"
             .KBool -> return "bool"
             .KStr -> return "str"
+            .KBytes -> return "bytes"
             .KArray -> return "arr"
             .KArrayStr -> return "arrstr"
+            .KArrayBytes -> return "arrbytes"
             .KArrayStruct(elem_idx) -> return f"arrstruct${self.structs[elem_idx].name}"
             .KArrayEnum(elem_idx) -> return f"arrenum${self.enums[elem_idx].name}"
             .KArrayInterface(elem_idx) -> return f"arriface${self.interfaces[elem_idx].name}"
@@ -1904,6 +1915,9 @@ type Codegen = struct {
                 if name == "str" {
                     return .KStr
                 }
+                if name == "bytes" {
+                    return .KBytes
+                }
                 if name == "none" {
                     return .KVoid
                 }
@@ -1927,6 +1941,7 @@ type Codegen = struct {
                     .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
                     .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
                     .KStr -> return .KArrayStr
+                    .KBytes -> return .KArrayBytes
                     .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
                     .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
                     .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
@@ -2767,6 +2782,14 @@ type Codegen = struct {
                 return .VImm(value: 0)
             }
             .NoneLit -> return .VImm(value: 0)
+            .BytesLit(value) -> {
+                // Identical runtime to a StrLit — same intern table,
+                // same KodStr cell layout. The only difference is
+                // the static kind (`KBytes` vs `KStr`), pinned in
+                // `infer_kind` so type-checking stays sharp.
+                let lbl = self.intern_str(value)
+                return .VStrLbl(page: lbl)
+            }
             .StrLit(value) -> {
                 let lbl = self.intern_str(value)
                 return .VStrLbl(page: lbl)
@@ -3000,6 +3023,7 @@ type Codegen = struct {
             .KArrayStruct(elem_idx) -> array_like = true
             .KArrayEnum(elem_idx) -> array_like = true
             .KArrayStr -> array_like = true
+            .KArrayBytes -> array_like = true
             .KArrayInterface(elem_idx) -> array_like = true
             .KArrayOptional(inner_kind) -> array_like = true
             .KArrayFunc(_pk, _rk) -> array_like = true
@@ -3225,16 +3249,25 @@ type Codegen = struct {
                     else none
                 }
             }
+            .KBytes -> {
+                match op {
+                    .Eq -> return self.compile_str_eq(:lhs_id, :rhs_id, negate: false)
+                    .Ne -> return self.compile_str_eq(:lhs_id, :rhs_id, negate: true)
+                    else none
+                }
+            }
             else none
         }
         match op {
             .Add -> {
                 match lhs_kind {
                     .KStr -> return self.compile_str_concat(:lhs_id, :rhs_id)
+                    .KBytes -> return self.compile_str_concat(:lhs_id, :rhs_id)
                     .KArray -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayStruct(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayEnum(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayStr -> return self.compile_arr_concat(:lhs_id, :rhs_id)
+                    .KArrayBytes -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayInterface(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayOptional(inner_kind) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     .KArrayFunc(_pk, _rk) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
@@ -3540,6 +3573,7 @@ type Codegen = struct {
         // a KodStr while the array routine returns a KodArray.
         match self.infer_kind(s_id) {
             .KStr -> self.emit("bl _kod_str_slice")
+            .KBytes -> self.emit("bl _kod_str_slice")
             else self.emit("bl _kod_array_slice")
         }
         return .VReg(name: "x0")
@@ -3884,10 +3918,12 @@ type Codegen = struct {
             .KArrayStruct(_elem) -> header_len = true
             .KArrayEnum(_elem) -> header_len = true
             .KArrayStr -> header_len = true
+            .KArrayBytes -> header_len = true
             .KArrayInterface(_elem) -> header_len = true
             .KArrayOptional(_inner) -> header_len = true
             .KArrayFunc(_pk, _rk) -> header_len = true
             .KStr -> header_len = true
+            .KBytes -> header_len = true
             else none
         }
         if header_len {
@@ -4502,6 +4538,7 @@ type Codegen = struct {
             .IntLit(value) -> return .KInt64
             .BoolLit(value) -> return .KBool
             .StrLit(value) -> return .KStr
+            .BytesLit(value) -> return .KBytes
             .NoneLit -> return .KOptional(inner: .KVoid)
             .Ident(name) -> {
                 if self.var_declared(name) {
@@ -4528,6 +4565,7 @@ type Codegen = struct {
                     .KStruct(idx, _struct_type_args) -> return .KArrayStruct(elem_idx: idx)
                     .KEnum(idx) -> return .KArrayEnum(elem_idx: idx)
                     .KStr -> return .KArrayStr
+                    .KBytes -> return .KArrayBytes
                     .KInterface(idx) -> return .KArrayInterface(elem_idx: idx)
                     .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
                     .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
@@ -4542,8 +4580,10 @@ type Codegen = struct {
                 let k = self.infer_kind(s)
                 match k {
                     .KStr -> return .KStr
+                    .KBytes -> return .KBytes
                     .KArray -> return .KArray
                     .KArrayStr -> return .KArrayStr
+                    .KArrayBytes -> return .KArrayBytes
                     .KArrayStruct(_idx) -> return k
                     .KArrayEnum(_idx) -> return k
                     .KArrayInterface(_idx) -> return k
@@ -4627,6 +4667,7 @@ type Codegen = struct {
                             .KArrayStruct(elem_idx) -> return .KStruct(idx: elem_idx, type_args: [])
                             .KArrayEnum(elem_idx) -> return .KEnum(idx: elem_idx)
                             .KArrayStr -> return .KStr
+                            .KArrayBytes -> return .KBytes
                             .KArrayInterface(elem_idx) -> return .KInterface(idx: elem_idx)
                             .KArrayOptional(inner_kind) -> return .KOptional(inner: inner_kind)
                             .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
@@ -5795,6 +5836,7 @@ type Codegen = struct {
             .KArrayStruct(elem_idx) -> elem_kind = .KStruct(idx: elem_idx, type_args: [])
             .KArrayEnum(elem_idx) -> elem_kind = .KEnum(idx: elem_idx)
             .KArrayStr -> elem_kind = .KStr
+            .KArrayBytes -> elem_kind = .KBytes
             .KArrayInterface(elem_idx) -> elem_kind = .KInterface(idx: elem_idx)
             .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
             .KArrayFunc(param_kinds, return_kind) -> elem_kind = .KFunc(:param_kinds, :return_kind)

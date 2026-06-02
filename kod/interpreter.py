@@ -951,6 +951,13 @@ class Interpreter:
             # the str struct's header directly; we mirror it here so
             # the interpreter doesn't fall back to a vanished function.
             return types.Int64(len(args[0].value))
+        if (
+            isinstance(func, ast.FunctionDeclaration)
+            and func.name == "len"
+            and len(args) == 1
+            and isinstance(args[0], types.Bytes)
+        ):
+            return types.Int64(len(args[0].value))
 
         if isinstance(func, BoundMethod):
             receiver = func.receiver
