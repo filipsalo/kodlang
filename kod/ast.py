@@ -345,6 +345,10 @@ class FunctionParam(ASTNode):
     span: Span
     label: Optional[str] = None
     mutable: bool = False
+    # Default expression for this parameter, or None when no default
+    # was declared. Evaluated fresh at each call site that omits the
+    # arg, in the defining function's module scope.
+    default: Optional["ASTNode"] = None
 
     @classmethod
     def parse(cls, parser: Parser) -> Self:
@@ -364,13 +368,16 @@ class FunctionParam(ASTNode):
             type_ = None
             if parser.try_consume(tokens.Colon):
                 type_ = parser.parse_type()
+            default = None
+            if parser.try_consume(tokens.Equal):
+                default = Expression.parse(parser)
             if second is not None:
                 label = None if anonymous else first.value
                 variable = Variable(second.value, type_, span=second.span)
             else:
                 label = None if anonymous else first.value
                 variable = Variable(first.value, type_, span=first.span)
-        return cls(variable, anonymous, span, label, mutable=mutable)
+        return cls(variable, anonymous, span, label, mutable=mutable, default=default)
 
 
 @dataclasses.dataclass

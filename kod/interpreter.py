@@ -970,12 +970,18 @@ class Interpreter:
             func = method
             all_params = list(func.params)
             explicit_params = all_params[1:]  # skip self
-            frame = {
-                param.variable.id: (
-                    self.lookup(module, arg) if isinstance(arg, ast.Variable) else arg
-                )
-                for param, arg in zip(explicit_params, args)
-            }
+            n_args = len(args)
+            frame = {}
+            for i, param in enumerate(explicit_params):
+                if i < n_args:
+                    a = args[i]
+                    frame[param.variable.id] = (
+                        self.lookup(module, a) if isinstance(a, ast.Variable) else a
+                    )
+                elif param.default is not None:
+                    frame[param.variable.id] = self.evaluate_expression(
+                        func.module, param.default
+                    )
             frame["self"] = receiver
             self.stack.append(frame)
             param_immutable = {p.variable.id for p in explicit_params if not p.mutable}
@@ -1003,13 +1009,24 @@ class Interpreter:
                 self.immutable_stack.pop()
             return None
 
-        # Map args to params
-        args = {
-            param.variable.id: (
-                self.lookup(module, arg) if isinstance(arg, ast.Variable) else arg
-            )
-            for param, arg in zip(func.params, args)
-        }
+        # Map args to params. Trailing params with a declared
+        # default value fill in when the call supplied fewer args
+        # — evaluated in the function's defining-module scope so
+        # name lookups inside the default expression see the right
+        # scope.
+        n_args = len(args)
+        frame = {}
+        for i, param in enumerate(func.params):
+            if i < n_args:
+                a = args[i]
+                frame[param.variable.id] = (
+                    self.lookup(module, a) if isinstance(a, ast.Variable) else a
+                )
+            elif param.default is not None:
+                frame[param.variable.id] = self.evaluate_expression(
+                    func.module, param.default
+                )
+        args = frame
         self.stack.append(args)
         self.immutable_stack.append(
             {p.variable.id for p in func.params if not p.mutable}

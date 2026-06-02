@@ -54,6 +54,13 @@ type SigInfo = struct {
     param_labels: [str]
     param_names: [str]
     return_kind: TypeKind
+    // Parallel to the other arrays. `param_default_exprs[i] == 0`
+    // means parameter i has no default; otherwise it's an *Expr id
+    // into `src_p.exprs`. Cross-module call sites swap `self.p` to
+    // `src_p` to evaluate the default, then swap back — same dance
+    // as `compile_struct_construct` uses for field defaults.
+    param_default_exprs: [int64]
+    src_p: parsing.Parser
 }
 
 // Name → entry-index map for the parallel `func_names` / `func_labels`
@@ -493,14 +500,34 @@ type Codegen = struct {
     //
     // `skip` is the number of leading param_labels entries to ignore —
     // 1 for method calls (skip self), 0 for free functions.
-    func check_call_args(self, anon args: [ast.CallArg], param_labels: [str], skip: int64, call_name: str, call_span: ast.Span) -> none {
+    func check_call_args(self, anon args: [ast.CallArg], param_labels: [str], param_defaults: [int64], skip: int64, call_name: str, call_span: ast.Span) -> none {
         let expected_count: int64 = len(param_labels) - skip
-        if len(args) != expected_count {
-            self.report_error(f"error: `{call_name}` takes {expected_count} arguments, got {len(args)}", span: call_span)
+        let n_args: int64 = len(args)
+        // Too many: always an error. Too few: only an error if a
+        // missing trailing param doesn't have a default. Args fill
+        // params left-to-right; partial calls require the trailing
+        // omitted ones to all carry defaults.
+        if n_args > expected_count {
+            self.report_error(f"error: `{call_name}` takes {expected_count} arguments, got {n_args}", span: call_span)
             return none
         }
+        if n_args < expected_count {
+            mut j: int64 = n_args
+            for j < expected_count {
+                if len(param_defaults) <= j + skip or param_defaults[j + skip] == 0 {
+                    let missing: str = param_labels[j + skip]
+                    if len(missing) == 0 {
+                        self.report_error(f"error: `{call_name}` missing argument at position {j}", span: call_span)
+                    } else {
+                        self.report_error(f"error: `{call_name}` missing argument `{missing}`", span: call_span)
+                    }
+                    return none
+                }
+                j = j + 1
+            }
+        }
         mut i: int64 = 0
-        for i < len(args) {
+        for i < n_args {
             let arg = args[i]
             let expected = param_labels[i + skip]
             if len(expected) == 0 {
@@ -1515,7 +1542,8 @@ type Codegen = struct {
         }
         let empty_kinds: [TypeKind] = []
         let empty_strs: [str] = []
-        return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid)
+        let empty_defaults: [int64] = []
+        return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid, param_default_exprs: empty_defaults, src_p: self.p)
     }
 
     func find_import_fn_sig(self, anon local_mod: str, anon name: str) -> SigInfo {
@@ -1529,7 +1557,8 @@ type Codegen = struct {
         }
         let empty_kinds: [TypeKind] = []
         let empty_strs: [str] = []
-        return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid)
+        let empty_defaults: [int64] = []
+        return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid, param_default_exprs: empty_defaults, src_p: self.p)
     }
 
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
@@ -1822,6 +1851,7 @@ type Codegen = struct {
             mut pk: [TypeKind] = []
             mut pl: [str] = []
             mut pn: [str] = []
+            mut pd: [int64] = []
             for param in fd.params {
                 pk += [self.resolve_type(param.typ)]
                 if param.anonymous {
@@ -1830,9 +1860,10 @@ type Codegen = struct {
                     pl += [param.label]
                 }
                 pn += [param.name]
+                pd += [param.default_expr]
             }
             let rk = self.resolve_type(fd.return_typ)
-            let sig: SigInfo = SigInfo(param_kinds: pk, param_labels: pl, param_names: pn, return_kind: rk)
+            let sig: SigInfo = SigInfo(param_kinds: pk, param_labels: pl, param_names: pn, return_kind: rk, param_default_exprs: pd, src_p: template.src_p)
             cloned_methods += [MethodInfo(name: m.name, decl_id: m.decl_id, :sig)]
         }
         self.p = saved_p
@@ -1991,6 +2022,7 @@ type Codegen = struct {
         mut param_kinds: [TypeKind] = []
         mut param_labels: [str] = []
         mut param_names: [str] = []
+        mut param_default_exprs: [int64] = []
         for param in func_decl.params {
             param_kinds += [self.resolve_type(param.typ)]
             if param.anonymous {
@@ -1999,10 +2031,11 @@ type Codegen = struct {
                 param_labels += [param.label]
             }
             param_names += [param.name]
+            param_default_exprs += [param.default_expr]
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
         self.p = saved_p
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind)
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p)
     }
 
     // Same as resolve_sig but for an Extern decl, whose params/return_typ
@@ -2013,6 +2046,7 @@ type Codegen = struct {
         mut param_kinds: [TypeKind] = []
         mut param_labels: [str] = []
         mut param_names: [str] = []
+        mut param_default_exprs: [int64] = []
         for param in params {
             param_kinds += [self.resolve_type(param.typ)]
             if param.anonymous {
@@ -2021,10 +2055,11 @@ type Codegen = struct {
                 param_labels += [param.label]
             }
             param_names += [param.name]
+            param_default_exprs += [param.default_expr]
         }
         let return_kind = self.resolve_type(return_typ)
         self.p = saved_p
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind)
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p)
     }
 
     func func_label(self, anon name: str) -> str {
@@ -2175,7 +2210,8 @@ type Codegen = struct {
             .Interface(name, name_span, methods) -> {
                 let empty_kinds: [TypeKind] = []
                 let empty_strs: [str] = []
-                let empty_sig: SigInfo = SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid)
+                let empty_defaults: [int64] = []
+                let empty_sig: SigInfo = SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid, param_default_exprs: empty_defaults, src_p: p)
                 mut method_infos: [MethodInfo] = []
                 for method_id in methods {
                     let func_decl = p.func_decls[method_id]
@@ -3630,8 +3666,8 @@ type Codegen = struct {
                 return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
             }
             let sig = self.find_import_fn_sig(mod_or_obj, method_name)
-            self.check_call_args(args, param_labels: sig.param_labels, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
-            self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds)
+            self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
+            self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
             let lbl = self.import_func_label(method_name, local_mod: mod_or_obj)
             self.emit(f"bl {lbl}")
             return .VReg(name: "x0")
@@ -3686,7 +3722,12 @@ type Codegen = struct {
             let callee_reg: str = self.pool.alloc_reg()
             self.mov_to(callee_val, dest: callee_reg)
             let spilled: bool = self.spill_across(callee_reg)
-            self.prepare_args_with_kinds(args, expected_kinds: param_kinds)
+            // Function-pointer types don't carry defaults — the
+            // sig isn't accessible at the indirect-call site, only
+            // the type. Pass empty default_exprs so prepare_args
+            // walks just the supplied args.
+            let no_defaults: [int64] = []
+            self.prepare_args_with_kinds(args, expected_kinds: param_kinds, default_exprs: no_defaults, src_p: self.p)
             self.restore_across(callee_reg, :spilled)
             self.emit(f"blr {callee_reg}")
             self.pool.free_reg(callee_reg)
@@ -3740,8 +3781,9 @@ type Codegen = struct {
                 }
                 let func_lookup = self.func_idx
                 if func_lookup.get(name) is Some(idx) {
-                    self.check_call_args(args, param_labels: self.func_sigs[idx].param_labels, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
-                    self.prepare_args_with_kinds(args, expected_kinds: self.func_sigs[idx].param_kinds)
+                    let sig = self.func_sigs[idx]
+                    self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
+                    self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
                     self.emit(f"bl {self.func_labels[idx]}")
                     return .VReg(name: "x0")
                 }
@@ -3974,12 +4016,16 @@ type Codegen = struct {
         mut method_lbl = ""
         mut sig_params: [TypeKind] = []
         mut sig_labels: [str] = []
+        mut sig_defaults: [int64] = []
+        mut sig_src_p: parsing.Parser = self.p
         match recv_kind {
             .KStruct(idx, _struct_type_args) -> {
                 if self.structs[idx].method_idx.get(method_name) is Some(mi) {
                     method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
                     sig_params = self.structs[idx].methods[mi].sig.param_kinds
                     sig_labels = self.structs[idx].methods[mi].sig.param_labels
+                    sig_defaults = self.structs[idx].methods[mi].sig.param_default_exprs
+                    sig_src_p = self.structs[idx].methods[mi].sig.src_p
                 }
             }
             else none
@@ -3993,6 +4039,8 @@ type Codegen = struct {
                 method_lbl = pm.label
                 sig_params = pm.sig.param_kinds
                 sig_labels = pm.sig.param_labels
+                sig_defaults = pm.sig.param_default_exprs
+                sig_src_p = pm.sig.src_p
             }
         }
         if len(method_lbl) == 0 {
@@ -4030,13 +4078,29 @@ type Codegen = struct {
             self.report_error(msg, :span)
             return .VImm(value: 0)
         }
-        self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method_name, call_span: span)
+        self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name, call_span: span)
 
         // Stash self and each compiled arg on the stack so that arg
         // expressions (which may issue bl calls) don't clobber preceding
-        // values held in x0..x7.
+        // values held in x0..x7. When the call supplies fewer args than
+        // the method's param list, the trailing slots are filled from
+        // each param's default expression — compiled in the method's
+        // owning-module parser context so identifier scopes match.
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-        let n = len(args) + 1
+        // Total slots = `self` + the larger of supplied-args and
+        // sig-implied-params. sig_params[0] is `self`, so user-visible
+        // params are sig_params[1..]; missing trailing user args are
+        // filled from sig_defaults at the matching index.
+        let n_args = len(args)
+        mut n_params = 0
+        if len(sig_params) > 1 {
+            n_params = len(sig_params) - 1
+        }
+        mut total_user = n_args
+        if n_params > total_user {
+            total_user = n_params
+        }
+        let n = total_user + 1
         mut padded = n * 8
         if padded % 16 != 0 {
             padded = padded + 8
@@ -4046,15 +4110,23 @@ type Codegen = struct {
         self.mov_to(recv_val, dest: "x0")
         self.emit("str x0, [sp]")
         mut i = 0
-        for i < len(args) {
+        for i < total_user {
             mut arg_reg = ""
             // Method param 0 is self; caller arg i maps to param i+1.
             let param_idx = i + 1
-            if param_idx < len(sig_params) {
-                arg_reg = self.compile_value_for_kind(args[i].value, expected: sig_params[param_idx])
+            if i < n_args {
+                if param_idx < len(sig_params) {
+                    arg_reg = self.compile_value_for_kind(args[i].value, expected: sig_params[param_idx])
+                } else {
+                    let arg_val = self.compile_expr(args[i].value)
+                    arg_reg = self.load(arg_val)
+                }
             } else {
-                let arg_val = self.compile_expr(args[i].value)
-                arg_reg = self.load(arg_val)
+                let default_id: int64 = sig_defaults[param_idx]
+                let saved_p = self.p
+                self.p = sig_src_p
+                arg_reg = self.compile_value_for_kind(default_id, expected: sig_params[param_idx])
+                self.p = saved_p
             }
             self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
             self.pool.free_reg(arg_reg)
@@ -4130,43 +4202,65 @@ type Codegen = struct {
 
     func prepare_args(self, anon args: [ast.CallArg]) -> none {
         let empty: [TypeKind] = []
-        self.prepare_args_with_kinds(args, expected_kinds: empty)
+        let no_defaults: [int64] = []
+        self.prepare_args_with_kinds(args, expected_kinds: empty, default_exprs: no_defaults, src_p: self.p)
     }
 
-    func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind]) -> none {
+    func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-        let n = len(args)
-        if n == 0 {
+        // When the call has fewer args than the function declares,
+        // missing slots fill from `default_exprs` (compiled in the
+        // function's defining-module parser via `src_p`). Otherwise
+        // `total` collapses to `n_args` and the loop matches the
+        // pre-defaults behaviour exactly.
+        let n_args = len(args)
+        mut total = n_args
+        if len(expected_kinds) > total {
+            total = len(expected_kinds)
+        }
+        if total == 0 {
             return none
         }
         // Reserve 16-byte aligned stack space and stash each compiled arg
         // there. Compiling an arg may issue bl calls (e.g. into match
         // expressions, struct/enum construction, array concat) which would
         // clobber any earlier args we'd already placed into x0..x7.
-        mut padded = n * 8
+        mut padded = total * 8
         if padded % 16 != 0 {
             padded = padded + 8
         }
         self.emit(f"sub sp, sp, #{padded}")
         mut i = 0
-        for i < n {
+        for i < total {
             mut arg_reg = ""
-            if i < len(expected_kinds) {
-                // Route through compile_value_for_kind so call args
-                // get the same wrapping/boxing as struct-field stores:
-                // a bare int passed to an `int64?` param wraps into
-                // a Some-cell, a struct passed to an iface param boxes.
-                arg_reg = self.compile_value_for_kind(args[i].value, expected: expected_kinds[i])
+            if i < n_args {
+                if i < len(expected_kinds) {
+                    // Route through compile_value_for_kind so call args
+                    // get the same wrapping/boxing as struct-field stores:
+                    // a bare int passed to an `int64?` param wraps into
+                    // a Some-cell, a struct passed to an iface param boxes.
+                    arg_reg = self.compile_value_for_kind(args[i].value, expected: expected_kinds[i])
+                } else {
+                    let arg_val = self.compile_expr(args[i].value)
+                    arg_reg = self.load(arg_val)
+                }
             } else {
-                let arg_val = self.compile_expr(args[i].value)
-                arg_reg = self.load(arg_val)
+                // Missing trailing arg — compile the param's default
+                // expression in the function's source-module parser
+                // context (so identifier lookups, type resolution, etc.
+                // see the right scope), then swap back.
+                let default_id: int64 = default_exprs[i]
+                let saved_p = self.p
+                self.p = src_p
+                arg_reg = self.compile_value_for_kind(default_id, expected: expected_kinds[i])
+                self.p = saved_p
             }
             self.emit(f"str {arg_reg}, [sp, #{i * 8}]")
             self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k = 0
-        for k < n {
+        for k < total {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
@@ -5561,16 +5655,18 @@ type Codegen = struct {
         mut method_lbl: str = ""
         mut sig_params: [TypeKind] = []
         mut sig_labels: [str] = []
+        mut sig_defaults: [int64] = []
         if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
             method_lbl = f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}${method}"
             sig_params = self.structs[struct_idx].methods[mi].sig.param_kinds
             sig_labels = self.structs[struct_idx].methods[mi].sig.param_labels
+            sig_defaults = self.structs[struct_idx].methods[mi].sig.param_default_exprs
         }
         if len(method_lbl) == 0 {
             self.report_error(f"error: struct `{self.structs[struct_idx].name}` has no method `{method}`", span: self.p.expr_spans[value_id])
             return .VImm(value: 0)
         }
-        self.check_call_args(args, param_labels: sig_labels, skip: 1, call_name: method, call_span: self.p.expr_spans[value_id])
+        self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method, call_span: self.p.expr_spans[value_id])
         let result = self.pool.alloc_reg()
         let val = self.compile_expr(value_id)
         mut reg = self.load(val)
