@@ -535,6 +535,33 @@ class FunctionDeclaration(ASTNode):
         return node
 
     @classmethod
+    def parse_anon(cls, parser: Parser) -> "FunctionDeclaration":
+        """Parse an anonymous `func(params) -> R { body }` expression.
+        Same as `parse` minus the name (synthesised with a per-file
+        counter so the resulting label stays unique within the
+        module). Used by the interpreter as a first-class
+        function-pointer value; no support for captures."""
+        with parser.span() as span:
+            parser.consume(tokens.Func)
+            counter = getattr(parser, "_anon_func_counter", 0)
+            parser._anon_func_counter = counter + 1
+            name = f"__lambda_{counter}"
+            params = FunctionParamList.parse(parser)
+            parser.consume(tokens.Arrow)
+            return_type = parser.parse_type_expr()
+            parser.consume(tokens.OpenCurly)
+            body = []
+            variables = {param.variable.id: param.variable for param in params}
+            while not parser.try_consume(tokens.CloseCurly):
+                if statement := parser.parse_statement():
+                    body.append(statement)
+                if isinstance(statement, VariableDeclaration):
+                    variables[statement.variable.id] = statement.variable
+        label_parts = ["", *parser.file.canonical_path.with_suffix("").parts, name]
+        label_name = "$".join(label_parts)
+        return cls(name, label_name, params, body, return_type, variables, span)
+
+    @classmethod
     def parse_signature(cls, parser: Parser) -> "FunctionDeclaration":
         """Parse a function signature with no body (for interface methods)."""
         with parser.span() as span:
@@ -950,6 +977,12 @@ class Expression(ASTNode):
                     value = ImplicitEnumVariant(variant_name, span)
             case tokens.Match():
                 value = MatchExpression.parse(parser)
+            case tokens.Func():
+                # Anonymous function expression. Parses to a
+                # FunctionDeclaration (synthesised name); the
+                # interpreter passes it through as a first-class
+                # function-pointer value.
+                value = FunctionDeclaration.parse_anon(parser)
             case tokens.Identifier():
                 value = Name.parse(parser)
                 if isinstance(parser.peek(), tokens.OpenBracket) and isinstance(

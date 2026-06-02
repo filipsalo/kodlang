@@ -2404,6 +2404,11 @@ type Codegen = struct {
                     self.collect_expr_vars(arg.value)
                 }
             }
+            .FuncLit(_decl_id) -> {
+                // Lambda bodies get their own var scope when
+                // compiled separately; nothing to collect into the
+                // enclosing function's frame.
+            }
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
                 mut subj_inner: TypeKind = .KInt64
@@ -2793,6 +2798,22 @@ type Codegen = struct {
             .UnwrapOpt(value, default) -> return self.compile_unwrap_opt(value_id: value, default_id: default)
             .OptionalDot(value, field) -> return self.compile_optional_dot(value_id: value, :field)
             .OptionalMethodCall(value, method, args) -> return self.compile_optional_method_call(value_id: value, :method, :args)
+            .FuncLit(decl_id) -> {
+                // The lambda was registered with a synthesised name
+                // and label during compile_module; emit its address
+                // as a function-pointer value, same shape as a bare
+                // named-function reference.
+                let name: str = self.p.func_decls[decl_id].name
+                let func_lookup = self.func_idx
+                if func_lookup.get(name) is Some(idx) {
+                    let lbl: str = self.func_labels[idx]
+                    let reg: str = self.pool.alloc_reg()
+                    self.emit(f"adrp {reg}, {lbl}@PAGE")
+                    self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
+                    return .VReg(name: reg)
+                }
+                return .VImm(value: 0)
+            }
         }
     }
 
@@ -4562,6 +4583,18 @@ type Codegen = struct {
                 }
                 return .KInt64
             }
+            .FuncLit(decl_id) -> {
+                // Same shape as a named function reference — return
+                // a KFunc built from the synthesised entry's
+                // pre-resolved signature.
+                let name: str = self.p.func_decls[decl_id].name
+                let func_lookup = self.func_idx
+                if func_lookup.get(name) is Some(idx) {
+                    let sig: SigInfo = self.func_sigs[idx]
+                    return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
+                }
+                return .KVoid
+            }
             else return .KInt64
         }
     }
@@ -6227,6 +6260,34 @@ type Codegen = struct {
             }
         }
 
+        // Lambdas — anonymous func expressions — were allocated into
+        // `self.p.func_decls` with empty names. Synthesise a name
+        // (`__lambda_N`) for each so they look like an ordinary
+        // top-level function for registration + later compilation.
+        // Has to run AFTER the named-function loop above so the
+        // numeric idx into `func_names` doesn't collide with a real
+        // function, and BEFORE the compile_func loop below so any
+        // FuncLit reference in a function body resolves to the
+        // registered label.
+        mut lambda_decl_ids: [int64] = []
+        mut li: int64 = 1
+        for li < len(self.p.func_decls) {
+            if len(self.p.func_decls[li].name) == 0 {
+                let synthesized: str = f"__lambda_{len(lambda_decl_ids)}"
+                self.p.func_decls[li].name = synthesized
+                let idx_m = self.func_idx
+                idx_m.set(synthesized, len(self.func_names))
+                self.func_names += [synthesized]
+                self.func_labels += [f"${self.path_prefix}${synthesized}"]
+                self.func_sigs += [self.resolve_sig(self.p.func_decls[li], p: self.p)]
+                self.func_def_paths += [self.p.path]
+                self.func_def_spans += [self.p.func_decls[li].name_span]
+                self.func_docs += [""]
+                lambda_decl_ids += [li]
+            }
+            li = li + 1
+        }
+
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
@@ -6237,6 +6298,9 @@ type Codegen = struct {
                 }
                 else none
             }
+        }
+        for ld_id in lambda_decl_ids {
+            self.compile_func(fd_id: ld_id, struct_name: "", override_lbl: "")
         }
 
         // Compile any `test "..." { ... }` blocks. Each becomes a normal
