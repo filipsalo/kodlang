@@ -886,11 +886,15 @@ class Interpreter:
                 # has its own buffer and would interleave wrong.
                 libc.puts(args[0].value)
                 return types.Int64(0)
-            if func.name == "kod_str_from_bytes":
-                # Mirror runtime kod_str_from_bytes: pack each int64
-                # entry's low 8 bits into a fresh byte string.
+            if func.name == "kod_bytes_from_array":
+                # Mirror runtime kod_bytes_from_array: pack each int64
+                # entry's low 8 bits into a fresh byte buffer.
                 buf = bytes(int(v.value) & 0xFF for v in args[0].value)
-                return types.String(buf)
+                return types.Bytes(buf)
+            if func.name == "kod_str_to_bytes":
+                return types.Bytes(args[0].value)
+            if func.name == "kod_bytes_to_str":
+                return types.String(args[0].value)
             if func.name == "kod_eprint":
                 # Mirror runtime kod_eprint: write to stderr, no exit.
                 msg = args[0].value.decode("utf8")

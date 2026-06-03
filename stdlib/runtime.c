@@ -486,20 +486,26 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
 // clamps to a zero-length slice. Explicit range checking is the caller's
 // job (the codegen could emit a `len` check; today we don't).
 // Pack a Kod `[int64]` (one byte per element, low 8 bits) into a fresh
-// Kod string of the same length. Useful for builders that accumulate
-// bytes as int64s and emit binary output in one shot — avoids the
-// quadratic-time pattern of repeatedly concatenating one-character
-// strings.
-KodStr *kod_str_from_bytes(void *bytes_raw) {
-    KodArray *bytes = (KodArray *)bytes_raw;
-    int64_t len = bytes->len;
+// Kod bytes buffer of the same length. Useful for builders that
+// accumulate bytes as int64s and emit binary output in one shot —
+// avoids the quadratic-time pattern of repeatedly concatenating
+// one-character buffers.
+KodStr *kod_bytes_from_array(void *arr_raw) {
+    KodArray *arr = (KodArray *)arr_raw;
+    int64_t len = arr->len;
     KodStr *s = kod_str_alloc(len);
-    int64_t *src = (int64_t *)bytes->ptr;
+    int64_t *src = (int64_t *)arr->ptr;
     for (int64_t i = 0; i < len; i++) {
         s->buf[i] = (char)(src[i] & 0xff);
     }
     return s;
 }
+
+// `str` and `bytes` share the same runtime representation (a `KodStr *`);
+// these casts are zero-copy. The type system uses them to mark the
+// boundary between text and raw-byte handling.
+KodStr *kod_str_to_bytes(void *s) { return (KodStr *)s; }
+KodStr *kod_bytes_to_str(void *b) { return (KodStr *)b; }
 
 void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
     KodArray *src = (KodArray *)src_raw;
