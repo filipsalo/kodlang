@@ -4,7 +4,7 @@ icon: lucide/package
 
 # Modules
 
-Each `.kod` file is a module. Modules are imported by path, relative to the project root.
+Each `.kod` file is a module. Imports name either a file relative to the importing module or a stdlib module.
 
 ## Importing
 
@@ -12,19 +12,31 @@ Two forms:
 
 ```kod
 import "./utils"        // relative — utils.kod next to the importing file
-import "./math/vec"     // relative — math/vec.kod in a sibling directory
+import "./math/vec"     // relative — math/vec.kod below the importing file's directory
 import "kod/ast"        // stdlib — stdlib/kod/ast.kod
 import "io"             // stdlib — stdlib/io.kod
 ```
 
-Paths beginning with `./` resolve relative to the importing file. Anything else resolves under `stdlib/`.
+Paths beginning with `./` resolve against the directory of the importing file, not the project root or the current directory. Anything else resolves under `stdlib/`.
 
-The imported module's public names are accessible via the import alias (the last path component by default):
+The imported module's public names are accessible via the import alias, which is the last path component:
 
 ```kod
 import "./math/vec"
 
-let v: vec.Vec2 = vec.Vec2(x: 1, y: 2)
+func origin() -> vec.Vec2 {
+    return vec.Vec2(x: 0, y: 0)
+}
+```
+
+To also use some names unqualified, list them after the path. The qualified form keeps working:
+
+```kod
+import "./math/vec" { Vec2, dot }
+
+func norm2(anon v: Vec2) -> int64 {
+    return dot(v, v)        // same as vec.dot(v, v)
+}
 ```
 
 ## Standard library
@@ -33,10 +45,18 @@ The stdlib lives under `stdlib/` in the repository.
 
 | Module | Contents |
 |--------|----------|
-| `builtins` | Always imported. `print`, `print_int`, `len`, `fail`, `Map[K, V]`, the `Error` / `Stringable` / `ExitCode` interfaces. |
+| `builtins` | Always imported. `print`, `print_int`, `len`, `fail`, `Map[K, V]`, `Option[T]`, the `Error` / `Stringable` / `ExitCode` interfaces. |
 | `primitives/int64`, `primitives/str`, `primitives/bool` | Methods on the primitive types (`to_str`, `hash`). Auto-loaded; not imported directly. |
-| `io` | `read_file`. |
+| `io` | `read_file`, `write_file`, and stdin/stdout/stderr helpers. |
+| `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. |
+| `time` | `monotonic_ns()` and `unix_ns()`. |
+| `set` | `Set[T]`, a hash set built on `Map`. |
+| `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |
+| `json` | Minimal JSON parse/emit, int64 numbers only. See [JSON](json.md). |
+| `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
+| `hash/crc32` | CRC-32 (gzip polynomial), streaming or one-shot. |
+| `compress/deflate`, `compress/gzip` | Deflate encoder (fixed Huffman, optional LZ77) and a gzip writer. |
 | `kod/ast` | AST node types (for the self-hosted compiler). |
 | `kod/lexing` | Tokenizer (self-hosted). |
 | `kod/parsing` | Parser (self-hosted). |
@@ -48,4 +68,12 @@ Circular imports are not supported. The dependency graph must be a DAG.
 
 ## Visibility
 
-All top-level declarations (functions, types, variables) are visible to importing modules. There is no explicit `pub`/`private` distinction yet.
+Top-level functions and types are visible to importing modules. There is no explicit `pub`/`private` distinction yet.
+
+Top-level `let` and `mut` bindings are not supported by the compiler. They are skipped when parsing, so any later reference to the name fails with `unknown name`, both inside the module and from an importer. For a module-wide constant, use a function with no arguments:
+
+```kod
+func max_block() -> int64 {
+    return 65535
+}
+```

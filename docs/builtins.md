@@ -12,8 +12,8 @@ These names live in `stdlib/builtins.kod` and are available in every Kod program
 |----------|-----------|-------------|
 | `print` | `(str) -> none` | Print a string followed by a newline. |
 | `print_int` | `(int64) -> none` | Print an integer followed by a newline. Equivalent to `print(n.to_str())`. |
-| `puts` | `(str) -> int64` | C `puts`. |
-| `putchar` | `(int64) -> int64` | Write a single byte to stdout. |
+| `kod_puts` | `(str) -> int64` | Write a string and a newline to stdout. What `print` calls; embedded NULs are written as-is. |
+| `putchar` | `(int64) -> int64` | C `putchar`: write a single byte to stdout. |
 
 ## Length
 
