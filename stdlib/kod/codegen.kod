@@ -5657,11 +5657,11 @@ type Codegen = struct {
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
         let enum3 = self.three_part_ctor_enum(callee_lhs, variant_name: method_name)
         if enum3 >= 0 {
-            return .KEnum(idx: enum3)
+            return self.ctor_kind(enum3)
         }
         let enum2 = self.two_part_ctor_enum(callee_lhs, variant_name: method_name)
         if enum2 >= 0 {
-            return .KEnum(idx: enum2)
+            return self.ctor_kind(enum2)
         }
         if self.p.exprs[callee_lhs] is .Ident(maybe_mod) {
             if self.is_import_alias(maybe_mod) {
@@ -5718,7 +5718,7 @@ type Codegen = struct {
         let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
         let enum_idx = self.find_enum_idx(enum_name)
         if enum_idx < 0 { return none }
-        return .KEnum(idx: enum_idx)
+        return self.ctor_kind(enum_idx)
     }
 
     // For `EnumName.X`, return KEnum(idx). (X is checked at the call site.)
@@ -5726,6 +5726,14 @@ type Codegen = struct {
         let .Ident(type_name) = self.p.exprs[dot_lhs] else { return none }
         let enum_idx = self.find_enum_idx(type_name)
         if enum_idx < 0 { return none }
+        return self.ctor_kind(enum_idx)
+    }
+
+    // A generic enum's variant doesn't say which instance it builds.
+    func ctor_kind(self, anon enum_idx: int64) -> TypeKind {
+        if len(self.enums[enum_idx].type_param_names) > 0 {
+            return .KUnknown
+        }
         return .KEnum(idx: enum_idx)
     }
 
@@ -5787,7 +5795,7 @@ type Codegen = struct {
             .ImplicitVariant(name) -> {
                 let enum_idx = self.find_enum_with_variant(name)
                 if enum_idx >= 0 {
-                    return .KEnum(idx: enum_idx)
+                    return self.ctor_kind(enum_idx)
                 }
                 return .KUnknown
             }
@@ -5818,7 +5826,7 @@ type Codegen = struct {
                         }
                         let enum_idx = self.find_enum_idx(name)
                         if enum_idx >= 0 {
-                            return .KEnum(idx: enum_idx)
+                            return self.ctor_kind(enum_idx)
                         }
                         // Free function call: use the cached return kind.
                         let idx_m = self.func_idx
@@ -5852,7 +5860,7 @@ type Codegen = struct {
                         // .Variant(args) — constructor for an enum.
                         let ei2 = self.find_enum_with_variant(variant_name)
                         if ei2 >= 0 {
-                            return .KEnum(idx: ei2)
+                            return self.ctor_kind(ei2)
                         }
                     }
                     else none
@@ -6284,6 +6292,15 @@ type Codegen = struct {
     // the actual store and is responsible for freeing the register.
     func compile_value_for_kind(self, anon value_id: int64, expected: TypeKind) -> str {
         match expected {
+            .KEnum(idx) -> {
+                let variant_idx = self.ctor_variant_idx(value_id, enum_idx: idx)
+                if variant_idx >= 0 {
+                    let val = self.compile_enum_construct(self.ctor_args(value_id), enum_idx: idx, :variant_idx, span: self.p.expr_spans[value_id])
+                    return self.load(val)
+                }
+                let val = self.compile_expr(value_id)
+                return self.load(val)
+            }
             .KOptional(inner) -> {
                 mut needs_wrap = true
                 mut unknown = false
@@ -6291,7 +6308,7 @@ type Codegen = struct {
                     .NoneLit -> needs_wrap = false
                     else none
                 }
-                if needs_wrap {
+                if self.is_ctor_for(value_id, kind: inner) == false and needs_wrap {
                     match self.infer_kind(value_id) {
                         .KOptional(inner2) -> needs_wrap = false
                         .KUnknown -> {
@@ -6308,8 +6325,7 @@ type Codegen = struct {
                     }
                     return self.load(val)
                 }
-                let val = self.compile_expr(value_id)
-                let val_reg = self.load(val)
+                let val_reg = self.compile_value_for_kind(value_id, expected: inner)
                 let val_spilled = self.preserve_begin(val_reg)
                 self.emit("mov x0, #8")
                 self.emit("bl _arena_alloc")
@@ -6415,7 +6431,7 @@ type Codegen = struct {
                     .NoneLit -> needs_wrap = false
                     else none
                 }
-                if needs_wrap {
+                if self.is_ctor_for(value_id, kind: inner) == false and needs_wrap {
                     match self.infer_kind(value_id) {
                         .KOptional(inner2) -> needs_wrap = false
                         .KUnknown -> {
@@ -6434,8 +6450,7 @@ type Codegen = struct {
                     self.emit_str(dest_off, reg: val_reg)
                     self.pool.free_reg(val_reg)
                 } else {
-                    let wrapped_val = self.compile_expr(value_id)
-                    let val_reg = self.load(wrapped_val)
+                    let val_reg = self.compile_value_for_kind(value_id, expected: inner)
                     let val_spilled = self.preserve_begin(val_reg)
                     self.emit("mov x0, #8")
                     self.emit("bl _arena_alloc")
@@ -6592,44 +6607,83 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
-    // For an expression that looks like a dotted variant reference, return
-    // the variant name. Handles `.Variant`, `Enum.Variant`, and the Dot side
-    // of `Enum.Variant(args)`.
-    func dotted_variant_name(self, expr_id: int64) -> str? {
-        if self.p.exprs[expr_id] is .ImplicitVariant(variant_name) {
-            return variant_name
+    // The variant of `enum_idx` that `value_id` constructs: `.V`, `E.V` or
+    // `mod.E.V`, optionally with a payload, where E is that enum or its
+    // template. -1 for any other value.
+    func ctor_variant_idx(self, anon value_id: int64, enum_idx: int64) -> int64 {
+        mut callee = value_id
+        if self.p.exprs[value_id] is .Call(call_callee, _args) {
+            callee = call_callee
         }
-        let .Binary(lhs, op, rhs) = self.p.exprs[expr_id] else { return none }
-        let .Dot = op else { return none }
-        let .Ident(variant_name) = self.p.exprs[rhs] else { return none }
-        return variant_name
+        match self.p.exprs[callee] {
+            .ImplicitVariant(name) -> return self.find_variant_idx(name, :enum_idx)
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    if self.p.exprs[rhs] is .Ident(name) {
+                        let named = self.ctor_qualifier_enum(lhs)
+                        if named >= 0 {
+                            if self.enums_compatible(enum_idx, a_idx: named) {
+                                return self.find_variant_idx(name, :enum_idx)
+                            }
+                        }
+                    }
+                }
+            }
+            else none
+        }
+        return -1
+    }
+
+    // The enum that `E` or `mod.E` names, or -1.
+    func ctor_qualifier_enum(self, anon expr_id: int64) -> int64 {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> {
+                if self.var_declared(name) {
+                    return -1
+                }
+                return self.find_enum_idx(name)
+            }
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    if self.p.exprs[lhs] is .Ident(mod_name) {
+                        if self.is_import_alias(mod_name) {
+                            if self.p.exprs[rhs] is .Ident(name) {
+                                return self.find_enum_idx(name)
+                            }
+                        }
+                    }
+                }
+            }
+            else none
+        }
+        return -1
+    }
+
+    func ctor_args(self, anon value_id: int64) -> [ast.CallArg] {
+        if self.p.exprs[value_id] is .Call(_callee, args) {
+            return args
+        }
+        let none_args: [ast.CallArg] = []
+        return none_args
+    }
+
+    // Whether `value_id` constructs a variant of the enum `kind` (or of the
+    // enum inside an optional `kind`), so it's built as that enum.
+    func is_ctor_for(self, anon value_id: int64, kind: TypeKind) -> bool {
+        match kind {
+            .KEnum(idx) -> return self.ctor_variant_idx(value_id, enum_idx: idx) >= 0
+            .KOptional(inner) -> return self.is_ctor_for(value_id, kind: inner)
+            else return false
+        }
     }
 
     func emit_enum_alloc(self, enum_idx: int64, value_id: int64, dest_off: int64) -> none {
         // Detect direct enum construction patterns and route through
         // compile_enum_construct; otherwise compile the expression and store
         // its (pointer) result.
-        mut variant_idx = -1
-        mut field_args: [ast.CallArg] = []
-        // Bare-variant cases: .Variant or Enum.Variant
-        if self.dotted_variant_name(expr_id: value_id) is Some(name) {
-            variant_idx = self.find_variant_idx(name, :enum_idx)
-        }
-        // Variant-with-args case: <dotted>(args)
-        match self.p.exprs[value_id] {
-            .Call(callee_id, call_args) -> {
-                match self.dotted_variant_name(expr_id: callee_id) {
-                    Some(name) -> {
-                        variant_idx = self.find_variant_idx(name, :enum_idx)
-                        field_args = call_args
-                    }
-                    none -> {}
-                }
-            }
-            else none
-        }
+        let variant_idx = self.ctor_variant_idx(value_id, :enum_idx)
         if variant_idx >= 0 {
-            let val = self.compile_enum_construct(field_args, :enum_idx, :variant_idx, span: self.p.expr_spans[value_id])
+            let val = self.compile_enum_construct(self.ctor_args(value_id), :enum_idx, :variant_idx, span: self.p.expr_spans[value_id])
             self.emit_str(dest_off, reg: "x0")
         } else {
             let val = self.compile_expr(value_id)
@@ -6884,6 +6938,12 @@ type Codegen = struct {
     func compile_return(self, anon value_id: int64) -> none {
         if value_id == 0 {
             self.emit("mov x0, #0")
+            self.emit(f"b {self.ret_lbl}")
+            return
+        }
+        if self.is_ctor_for(value_id, kind: self.return_kind) {
+            let reg = self.compile_value_for_kind(value_id, expected: self.return_kind)
+            self.mov_to(.VReg(name: reg), dest: "x0")
             self.emit(f"b {self.ret_lbl}")
             return
         }

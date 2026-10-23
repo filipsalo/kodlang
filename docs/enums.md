@@ -64,9 +64,10 @@ Unit variants can also use the implicit `.Variant` form in expressions:
 let d: Direction = .North
 ```
 
-A payload variant can use it too when it goes straight into an annotated
-`let`, as in `let m: Message = .Text(content: "hi")`. Elsewhere, construct
-payload variants with the explicit `Enum.Variant(...)` form.
+A payload variant can use it too wherever the enum type is known: an
+annotated `let` (`let m: Message = .Text(content: "hi")`), an argument, or a
+return value. Elsewhere, construct payload variants with the explicit
+`Enum.Variant(...)` form.
 
 ## Generic enums
 
@@ -82,9 +83,12 @@ type Either[L, R] = enum {
 let e: Either[int64, str] = .Left(value: 1)
 ```
 
-Construct a variant with the implicit form into an annotated `let`, as
-above. Type arguments on the enum name, `Either[int64, str].Left(value: 1)`,
-are an error, since type arguments must be followed by `(`.
+A variant of a generic enum needs its type arguments from where it goes:
+an annotated `let`, as above, an argument or a return value. Without one,
+`let e = Either.Left(value: 1)` (or `.Left(value: 1)`, `Result.Ok(5)`) is an
+error, ``cannot infer the type of `e`; add a type annotation``. Type
+arguments on the enum name, `Either[int64, str].Left(value: 1)`, are an
+error, since type arguments must be followed by `(`.
 
 ## Pattern matching
 
