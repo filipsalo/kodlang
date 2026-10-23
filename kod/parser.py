@@ -66,6 +66,7 @@ class Parser:
         # (TypeDeclaration, target TypeExpr) for aliases whose target is
         # declared later in the module.
         self.pending_aliases: list = []
+        self.pending_alias_names: set[str] = set()
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -356,6 +357,9 @@ class Parser:
             progress = False
             still_pending = []
             for decl, type_expr in self.pending_aliases:
+                if self.names_pending_alias(type_expr):
+                    still_pending.append((decl, type_expr))
+                    continue
                 try:
                     resolved = self.resolve_type_expr(type_expr)
                 except ValueError:
@@ -363,8 +367,28 @@ class Parser:
                     continue
                 decl.type = resolved
                 self.type_registry[decl.name.id] = resolved
+                self.pending_alias_names.discard(decl.name.id)
                 progress = True
             self.pending_aliases = still_pending
+
+    def names_pending_alias(self, expr: ast.TypeExpr) -> bool:
+        """True when `expr` names an alias still waiting for its target,
+        whose registry entry is only a placeholder."""
+        if isinstance(expr, ast.NamedTypeExpr):
+            return expr.name in self.pending_alias_names
+        if isinstance(expr, ast.ArrayTypeExpr):
+            return self.names_pending_alias(expr.element)
+        if isinstance(expr, ast.OptionalTypeExpr):
+            return self.names_pending_alias(expr.inner)
+        if isinstance(expr, ast.GenericTypeExpr):
+            return self.names_pending_alias(expr.base) or any(
+                self.names_pending_alias(arg) for arg in expr.args
+            )
+        if isinstance(expr, ast.FuncTypeExpr):
+            return any(
+                self.names_pending_alias(param) for param in expr.params
+            ) or self.names_pending_alias(expr.return_typ)
+        return False
 
     def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:

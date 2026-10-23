@@ -249,6 +249,7 @@ type Ids = [int64]
 type MaybeNode = Node?
 type Callback = func(int64) -> int64
 type StrMap = Map[str, str]
+type Outcome = int64 or Error
 
 type Node = struct {
     label: str

@@ -1206,6 +1206,8 @@ class Module(ASTNode):
                     names[local_name] = statement
                 case TypeDeclaration(name, type_):
                     names[name.id] = type_
+                case InterfaceDeclaration(name):
+                    names[name] = types.InterfaceType
         return names
 
     def get_imports(self) -> list[Import]:
@@ -1561,6 +1563,8 @@ class TypeDeclaration(ASTNode):
                 for p in type_param_names:
                     del parser.type_registry[p]
                 type_ = types.GenericTemplate(name.id, type_param_names, type_)
+            elif parser.names_pending_alias(type_expr):
+                type_ = None
             else:
                 try:
                     type_ = parser.resolve_type_expr(type_expr)
@@ -1571,6 +1575,7 @@ class TypeDeclaration(ASTNode):
         decl = cls(name, type_ or types.InterfaceType, span)
         if type_ is None:
             parser.pending_aliases.append((decl, type_expr))
+            parser.pending_alias_names.add(name.id)
         else:
             parser.type_registry[name.id] = type_
             parser.resolve_pending_aliases()
