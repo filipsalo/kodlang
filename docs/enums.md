@@ -37,6 +37,10 @@ let m: Message = Message.Text(content: "hello")
 let q: Message = Message.Quit
 ```
 
+The annotation is optional: a constructor has the enum's type, so
+`let m = Message.Text(content: "hello")` (or `mod.Enum.Variant(...)` for
+an imported enum) can be matched without an `else` arm.
+
 ## Implicit variant syntax
 
 Inside a `match` arm, the enum name can be omitted when the type is unambiguous:

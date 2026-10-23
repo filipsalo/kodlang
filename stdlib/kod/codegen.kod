@@ -3748,40 +3748,53 @@ type Codegen = struct {
     // Binary(Binary(Ident(mod), Dot, Ident(enum)), Dot, Ident(variant))
     // and Enum/Variant resolve.
     func try_three_part_construct(self, anon args: [ast.CallArg], callee_lhs: int64, callee_rhs: int64) -> Val? {
-        let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[callee_lhs] else { return none }
-        let .Dot = inner_op else { return none }
-        let .Ident(mod_name) = self.p.exprs[inner_lhs] else { return none }
-        let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
         let .Ident(variant_name) = self.p.exprs[callee_rhs] else { return none }
-        let enum_idx = self.find_enum_idx(enum_name)
+        let enum_idx = self.three_part_ctor_enum(callee_lhs, :variant_name)
         if enum_idx < 0 { return none }
-        mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-        if variant_idx < 0 { return none }
-        return self.compile_enum_construct(args, :enum_idx, :variant_idx)
+        return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(variant_name, :enum_idx))
+    }
+
+    // The enum that a `mod.Enum.Variant(...)` callee constructs, or -1.
+    func three_part_ctor_enum(self, anon callee_lhs: int64, variant_name: str) -> int64 {
+        let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[callee_lhs] else { return -1 }
+        let .Dot = inner_op else { return -1 }
+        let .Ident(_mod_name) = self.p.exprs[inner_lhs] else { return -1 }
+        let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return -1 }
+        let enum_idx = self.find_enum_idx(enum_name)
+        if enum_idx < 0 or self.find_variant_idx(variant_name, :enum_idx) < 0 {
+            return -1
+        }
+        return enum_idx
+    }
+
+    // The enum that an `Enum.Variant(...)` callee constructs, or -1.
+    func two_part_ctor_enum(self, anon callee_lhs: int64, variant_name: str) -> int64 {
+        let .Ident(enum_name) = self.p.exprs[callee_lhs] else { return -1 }
+        let enum_idx = self.find_enum_idx(enum_name)
+        if enum_idx < 0 or self.find_variant_idx(variant_name, :enum_idx) < 0 {
+            return -1
+        }
+        return enum_idx
+    }
+
+    func is_import_alias(self, anon name: str) -> bool {
+        for alias in self.import_local {
+            if alias == name {
+                return true
+            }
+        }
+        return false
     }
 
     // Try `EnumName.Variant(args)` or `module.thing(args)` two-part forms.
     func try_two_part_call(self, anon args: [ast.CallArg], callee_lhs: int64, callee_rhs: int64) -> Val? {
         let .Ident(mod_or_obj) = self.p.exprs[callee_lhs] else { return none }
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
-        let enum_idx = self.find_enum_idx(mod_or_obj)
+        let enum_idx = self.two_part_ctor_enum(callee_lhs, variant_name: method_name)
         if enum_idx >= 0 {
-            mut variant_idx = self.find_variant_idx(method_name, :enum_idx)
-            if variant_idx >= 0 {
-                return self.compile_enum_construct(args, :enum_idx, :variant_idx)
-            }
+            return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(method_name, :enum_idx))
         }
-        mut is_import = false
-        mut i = 0
-        for i < len(self.import_local) {
-            if self.import_local[i] == mod_or_obj {
-                is_import = true
-                i = len(self.import_local)
-            } else {
-                i = i + 1
-            }
-        }
-        if is_import {
+        if self.is_import_alias(mod_or_obj) {
             let s_idx = self.find_struct_idx(method_name)
             if s_idx >= 0 {
                 return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
@@ -4538,8 +4551,27 @@ type Codegen = struct {
     // For `obj.method()` where obj is a known struct, return the method's
     // recorded return kind. Returns none if anything about the shape doesn't
     // match (callee not Ident.Ident, obj not a struct, method not found).
+    // Constructor and module-call forms are tried first, in compile_call's
+    // order.
     func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64) -> TypeKind? {
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
+        let enum3 = self.three_part_ctor_enum(callee_lhs, variant_name: method_name)
+        if enum3 >= 0 {
+            return .KEnum(idx: enum3)
+        }
+        let enum2 = self.two_part_ctor_enum(callee_lhs, variant_name: method_name)
+        if enum2 >= 0 {
+            return .KEnum(idx: enum2)
+        }
+        if self.p.exprs[callee_lhs] is .Ident(maybe_mod) {
+            if self.is_import_alias(maybe_mod) {
+                let struct_idx = self.find_struct_idx(method_name)
+                if struct_idx >= 0 {
+                    return .KStruct(idx: struct_idx, type_args: [])
+                }
+                return self.find_import_fn_sig(maybe_mod, method_name).return_kind
+            }
+        }
         // Recurse via infer_kind so receivers like `0.to_str()` (IntLit
         // receiver) or `p.field.to_str()` (Binary.Dot receiver) get the
         // right kind, not just bare `var.method()`.
@@ -4565,22 +4597,6 @@ type Codegen = struct {
         let prim_idx = self.find_prim_method(method_name, kind: obj_kind)
         if prim_idx >= 0 {
             return self.prim_methods[prim_idx].sig.return_kind
-        }
-        // Module-qualified call `mod.func(...)`: the lhs is an import alias,
-        // not a value-typed receiver. Run last so a struct/iface/primitive
-        // method on the same name (none in tree today, but plausible)
-        // takes precedence.
-        match self.p.exprs[callee_lhs] {
-            .Ident(maybe_mod) -> {
-                mut i = 0
-                for i < len(self.import_local) {
-                    if self.import_local[i] == maybe_mod {
-                        return self.find_import_fn_sig(maybe_mod, method_name).return_kind
-                    }
-                    i = i + 1
-                }
-            }
-            else none
         }
         return none
     }

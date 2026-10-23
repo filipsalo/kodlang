@@ -29,6 +29,9 @@ func origin() -> vec.Vec2 {
 }
 ```
 
+Qualified constructors have the imported type, so `let v = vec.Vec2(x: 1, y: 2)`
+needs no annotation before `v.x`.
+
 To also use some names unqualified, list them after the path. The qualified form keeps working:
 
 ```kod
