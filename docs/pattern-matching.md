@@ -110,6 +110,21 @@ match shape {
 
 Bindings are by position — the names in the pattern don't have to match the field names.
 
+Each binding takes the type of the field it binds, so different arms can
+reuse a name for payloads of different types:
+
+```kod
+type Value = enum {
+    I(value: int64)
+    S(value: str)
+}
+
+match v {
+    .I(value) -> print(f"int {value}")
+    .S(value) -> print(f"str {value}")
+}
+```
+
 ### Optional
 
 ```kod

@@ -2526,6 +2526,148 @@ type Codegen = struct {
     }
 
 
+    // Names a pattern binds, in payload order.
+    func pattern_binding_names(self, anon pattern: ast.Pattern) -> [str] {
+        mut names: [str] = []
+        match pattern {
+            .SomePat(binding) -> names += [binding]
+            .OkPat(binding) -> names += [binding]
+            .ErrPat(binding) -> names += [binding]
+            .TypePat(_type_name, binding) -> names += [binding]
+            .EnumPat(_enum_name, _variant_name, bindings) -> return bindings
+            .ImplicitEnumPat(_variant_name, bindings) -> return bindings
+            else none
+        }
+        if len(names) == 1 and len(names[0]) == 0 {
+            return []
+        }
+        return names
+    }
+
+    // Kinds of the bindings named by pattern_binding_names, given the
+    // subject's kind. Unknown payloads fall back to .KInt64.
+    func pattern_binding_kinds(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
+        let count = len(self.pattern_binding_names(pattern))
+        mut kinds: [TypeKind] = []
+        if count == 0 {
+            return kinds
+        }
+        mut kind: TypeKind = .KInt64
+        match pattern {
+            .SomePat(_binding) -> {
+                if subject_kind is .KOptional(inner) {
+                    kind = inner
+                }
+            }
+            .OkPat(_binding) -> {
+                if self.is_result_kind(subject_kind) {
+                    kind = self.result_inner_kind(subject_kind)
+                }
+            }
+            .ErrPat(_binding) -> kind = .KInterface(idx: self.find_iface_idx("Error"))
+            .TypePat(type_name, _binding) -> kind = .KStruct(idx: self.find_struct_idx(type_name), type_args: [])
+            .EnumPat(enum_name, variant_name, _bindings) -> {
+                return self.variant_binding_kinds(self.find_enum_idx(enum_name), :variant_name, :count)
+            }
+            .ImplicitEnumPat(variant_name, _bindings) -> {
+                let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: self.enum_idx_of_kind(subject_kind))
+                return self.variant_binding_kinds(enum_idx, :variant_name, :count)
+            }
+            else none
+        }
+        kinds += [kind]
+        return kinds
+    }
+
+    func variant_binding_kinds(self, anon enum_idx: int64, variant_name: str, count: int64) -> [TypeKind] {
+        mut field_kinds: [TypeKind] = []
+        if enum_idx >= 0 {
+            let variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+            if variant_idx >= 0 {
+                field_kinds = self.enums[enum_idx].variants[variant_idx].field_kinds
+            }
+        }
+        mut kinds: [TypeKind] = []
+        mut j = 0
+        for j < count {
+            mut kind: TypeKind = .KInt64
+            if j < len(field_kinds) {
+                kind = field_kinds[j]
+            }
+            kinds += [kind]
+            j = j + 1
+        }
+        return kinds
+    }
+
+    // Collect-pass slots for a pattern's bindings. The kinds are a first
+    // guess: compile time retypes them from the subject's final kind.
+    func alloc_pattern_bindings(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> none {
+        let names = self.pattern_binding_names(pattern)
+        let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
+        mut i = 0
+        for i < len(names) {
+            if self.var_declared(names[i]) == false {
+                self.alloc_var(name: names[i], kind: kinds[i])
+            }
+            i = i + 1
+        }
+    }
+
+    // Retype a pattern's bindings for the arm being compiled and return
+    // their previous kinds for restore_pattern_bindings.
+    func retype_pattern_bindings(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
+        let names = self.pattern_binding_names(pattern)
+        let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
+        mut saved: [TypeKind] = []
+        mut i = 0
+        for i < len(names) {
+            saved += [self.find_var_kind(names[i])]
+            self.update_var_kind(name: names[i], kind: kinds[i])
+            i = i + 1
+        }
+        return saved
+    }
+
+    func restore_pattern_bindings(self, anon pattern: ast.Pattern, kinds: [TypeKind]) -> none {
+        let names = self.pattern_binding_names(pattern)
+        mut i = len(names) - 1
+        for i >= 0 {
+            self.update_var_kind(name: names[i], kind: kinds[i])
+            i = i - 1
+        }
+    }
+
+    // Compile a match-statement arm body with the pattern's bindings typed
+    // from the subject's compile-time kind. The collect pass may have seen
+    // a placeholder subject (a loop variable) or an earlier arm's binding
+    // of the same name.
+    func compile_arm_stmts(self, anon body: [int64], pattern_id: int64, subject_kind: TypeKind) -> none {
+        let pattern = self.p.patterns[pattern_id]
+        let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+        for stmt_id in body {
+            self.compile_stmt(stmt_id)
+        }
+        self.restore_pattern_bindings(pattern, kinds: saved)
+    }
+
+    func compile_arm_expr(self, anon body: int64, pattern_id: int64, subject_kind: TypeKind) -> Val {
+        let pattern = self.p.patterns[pattern_id]
+        let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+        let val = self.compile_expr(body)
+        self.restore_pattern_bindings(pattern, kinds: saved)
+        return val
+    }
+
+    // Subject kind for typing let-else bindings. Implicit variants still
+    // resolve by global lookup, as compile_let_else's test does.
+    func let_else_subject_kind(self, anon pattern: ast.Pattern, value_id: int64) -> TypeKind {
+        if pattern is .SomePat(_binding) {
+            return self.infer_kind(value_id)
+        }
+        return .KVoid
+    }
+
     // Walk an expression and allocate stack slots for any bindings that
     // appear in nested match expressions. Without this, 'Some(x) -> x'
     // inside a match expression returns 'x' as an unknown var.
@@ -2584,85 +2726,11 @@ type Codegen = struct {
             }
             .MatchExpr(subject, arms) -> {
                 self.collect_expr_vars(subject)
-                mut subj_inner: TypeKind = .KInt64
-                if self.infer_kind(subject) is .KOptional(inner) {
-                    subj_inner = inner
-                }
-                mut result_inner: TypeKind = .KInt64
-                if self.is_result_kind(self.infer_kind(subject)) {
-                    result_inner = self.result_inner_kind(self.infer_kind(subject))
-                }
-                mut subj_enum_idx: int64 = -1
-                if self.infer_kind(subject) is .KEnum(eidx) {
-                    subj_enum_idx = eidx
-                }
-                mut i = 0
-                for i < len(arms) {
-                    let arm = self.p.match_expr_arms[arms[i]]
-                    match self.p.patterns[arm.pattern] {
-                        .SomePat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: subj_inner)
-                            }
-                        }
-                        .OkPat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: result_inner)
-                            }
-                        }
-                        .ErrPat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
-                            }
-                        }
-                        .TypePat(type_name, binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: .KStruct(idx: self.find_struct_idx(type_name), type_args: []))
-                            }
-                        }
-                        .EnumPat(enum_name, variant_name, bindings) -> {
-                            let enum_idx = self.find_enum_idx(enum_name)
-                            mut variant_idx = -1
-                            if enum_idx >= 0 {
-                                variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                            }
-                            mut j = 0
-                            for j < len(bindings) {
-                                if self.var_declared(bindings[j]) == false {
-                                    mut binding_kind = .KInt64
-                                    if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                        binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                    }
-                                    self.alloc_var(name: bindings[j], kind: binding_kind)
-                                }
-                                j = j + 1
-                            }
-                        }
-                        .ImplicitEnumPat(variant_name, bindings) -> {
-                            mut enum_idx = subj_enum_idx
-                            if enum_idx < 0 {
-                                enum_idx = self.find_enum_with_variant(variant_name)
-                            }
-                            mut variant_idx = -1
-                            if enum_idx >= 0 {
-                                variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                            }
-                            mut j = 0
-                            for j < len(bindings) {
-                                if self.var_declared(bindings[j]) == false {
-                                    mut binding_kind = .KInt64
-                                    if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                        binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                    }
-                                    self.alloc_var(name: bindings[j], kind: binding_kind)
-                                }
-                                j = j + 1
-                            }
-                        }
-                        else none
-                    }
+                let subj_kind = self.infer_kind(subject)
+                for arm_id in arms {
+                    let arm = self.p.match_expr_arms[arm_id]
+                    self.alloc_pattern_bindings(self.p.patterns[arm.pattern], subject_kind: subj_kind)
                     self.collect_expr_vars(arm.body)
-                    i = i + 1
                 }
             }
             else none
@@ -2743,145 +2811,21 @@ type Codegen = struct {
                 }
             }
             .MatchStmt(subject, arms) -> {
-                mut subj_inner: TypeKind = .KInt64
-                if self.infer_kind(subject) is .KOptional(inner) {
-                    subj_inner = inner
-                }
-                mut result_inner: TypeKind = .KInt64
-                if self.is_result_kind(self.infer_kind(subject)) {
-                    result_inner = self.result_inner_kind(self.infer_kind(subject))
-                }
-                // Subject's enum idx, if any — used to pick the right
-                // monomorphised instance for ImplicitEnumPat instead of
-                // falling back to the template (whose variant kinds are
-                // KInt64 stubs for unresolved type-param fields).
-                mut subj_enum_idx: int64 = -1
-                if self.infer_kind(subject) is .KEnum(eidx) {
-                    subj_enum_idx = eidx
-                }
-                mut i = 0
-                for i < len(arms) {
-                    let arm = self.p.match_arms[arms[i]]
-                    match self.p.patterns[arm.pattern] {
-                        .SomePat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: subj_inner)
-                            }
-                        }
-                        .OkPat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: result_inner)
-                            }
-                        }
-                        .ErrPat(binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: .KInterface(idx: self.find_iface_idx("Error")))
-                            }
-                        }
-                        .TypePat(type_name, binding) -> {
-                            if len(binding) > 0 and self.var_declared(binding) == false {
-                                self.alloc_var(name: binding, kind: .KStruct(idx: self.find_struct_idx(type_name), type_args: []))
-                            }
-                        }
-                        .EnumPat(enum_name, variant_name, bindings) -> {
-                            let enum_idx = self.find_enum_idx(enum_name)
-                            mut variant_idx = -1
-                            if enum_idx >= 0 {
-                                variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                            }
-                            mut j = 0
-                            for j < len(bindings) {
-                                if self.var_declared(bindings[j]) == false {
-                                    mut binding_kind = .KInt64
-                                    if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                        binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                    }
-                                    self.alloc_var(name: bindings[j], kind: binding_kind)
-                                }
-                                j = j + 1
-                            }
-                        }
-                        .ImplicitEnumPat(variant_name, bindings) -> {
-                            mut enum_idx = subj_enum_idx
-                            if enum_idx < 0 {
-                                enum_idx = self.find_enum_with_variant(variant_name)
-                            }
-                            mut variant_idx = -1
-                            if enum_idx >= 0 {
-                                variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                            }
-                            mut j = 0
-                            for j < len(bindings) {
-                                if self.var_declared(bindings[j]) == false {
-                                    mut binding_kind = .KInt64
-                                    if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                        binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                    }
-                                    self.alloc_var(name: bindings[j], kind: binding_kind)
-                                }
-                                j = j + 1
-                            }
-                        }
-                        else none
-                    }
+                let subj_kind = self.infer_kind(subject)
+                for arm_id in arms {
+                    let arm = self.p.match_arms[arm_id]
+                    self.alloc_pattern_bindings(self.p.patterns[arm.pattern], subject_kind: subj_kind)
                     for stmt_id in arm.body {
                         self.collect_stmt_vars(:stmt_id)
                     }
-                    i = i + 1
                 }
             }
             .LetElse(pattern, value, else_body) -> {
                 // Allocate bindings introduced by the pattern (same shape as
                 // a match arm) so the rest of the surrounding block can use
                 // them.
-                match self.let_else_pattern(pattern, value_id: value) {
-                    .EnumPat(enum_name, variant_name, bindings) -> {
-                        let enum_idx = self.find_enum_idx(enum_name)
-                        mut variant_idx = -1
-                        if enum_idx >= 0 {
-                            variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                        }
-                        mut j = 0
-                        for j < len(bindings) {
-                            if self.var_declared(bindings[j]) == false {
-                                mut binding_kind = .KInt64
-                                if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                    binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                }
-                                self.alloc_var(name: bindings[j], kind: binding_kind)
-                            }
-                            j = j + 1
-                        }
-                    }
-                    .ImplicitEnumPat(variant_name, bindings) -> {
-                        let enum_idx = self.find_enum_with_variant(variant_name)
-                        mut variant_idx = -1
-                        if enum_idx >= 0 {
-                            variant_idx = self.find_variant_idx(variant_name, :enum_idx)
-                        }
-                        mut j = 0
-                        for j < len(bindings) {
-                            if self.var_declared(bindings[j]) == false {
-                                mut binding_kind = .KInt64
-                                if variant_idx >= 0 and j < len(self.enums[enum_idx].variants[variant_idx].field_kinds) {
-                                    binding_kind = self.enums[enum_idx].variants[variant_idx].field_kinds[j]
-                                }
-                                self.alloc_var(name: bindings[j], kind: binding_kind)
-                            }
-                            j = j + 1
-                        }
-                    }
-                    .SomePat(binding) -> {
-                        if len(binding) > 0 and self.var_declared(binding) == false {
-                            mut inner_kind: TypeKind = .KInt64
-                            if self.infer_kind(value) is .KOptional(inner) {
-                                inner_kind = inner
-                            }
-                            self.alloc_var(name: binding, kind: inner_kind)
-                        }
-                    }
-                    else none
-                }
+                let pat = self.let_else_pattern(pattern, value_id: value)
+                self.alloc_pattern_bindings(pat, subject_kind: self.let_else_subject_kind(pat, value_id: value))
                 self.collect_expr_vars(value)
                 mut e = 0
                 for e < len(else_body) {
@@ -4463,7 +4407,8 @@ type Codegen = struct {
         self.check_match_exhaustive(subject_id, pattern_ids: expr_patterns)
         // Static enum kind for `.Foo` pattern disambiguation. See
         // compile_match_stmt for the analogous reasoning.
-        let subj_enum_idx: int64 = self.enum_idx_of_kind(self.infer_kind(subject_id))
+        let subj_kind = self.infer_kind(subject_id)
+        let subj_enum_idx: int64 = self.enum_idx_of_kind(subj_kind)
         let done_lbl = self.fresh("Lmexpr_done")
         let subj_val = self.compile_expr(subject_id)
         let sptr_r = self.load(subj_val)
@@ -4521,7 +4466,7 @@ type Codegen = struct {
                 .EnumPat(enum_name, variant_name, bindings) -> {
                     let enum_idx = self.find_enum_idx(enum_name)
                     self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -4529,7 +4474,7 @@ type Codegen = struct {
                 .ImplicitEnumPat(variant_name, bindings) -> {
                     let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: subj_enum_idx)
                     self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -4555,7 +4500,7 @@ type Codegen = struct {
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -4564,7 +4509,7 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -4573,14 +4518,14 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
                     self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
-                    let body_val = self.compile_expr(arm.body)
+                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -6102,7 +6047,9 @@ type Codegen = struct {
         let subj_slot = self.alloc_var(name: self.fresh("__lsubj"), kind: .KInt64)
         self.emit_str(subj_slot, reg: sptr_r)
         self.pool.free_reg(sptr_r)
-        match self.let_else_pattern(pattern_id, :value_id) {
+        let pattern = self.let_else_pattern(pattern_id, :value_id)
+        self.retype_pattern_bindings(pattern, subject_kind: self.let_else_subject_kind(pattern, :value_id))
+        match pattern {
             .EnumPat(enum_name, variant_name, bindings) -> {
                 let enum_idx = self.find_enum_idx(enum_name)
                 mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
@@ -6206,7 +6153,8 @@ type Codegen = struct {
         // Static enum kind of the subject, used to disambiguate
         // implicit `.Foo` patterns when multiple enums declare a
         // variant named `Foo`. -1 if the subject isn't an enum.
-        let subj_enum_idx: int64 = self.enum_idx_of_kind(self.infer_kind(subject_id))
+        let subj_kind = self.infer_kind(subject_id)
+        let subj_enum_idx: int64 = self.enum_idx_of_kind(subj_kind)
         let done_lbl = self.fresh("Lmatch_done")
         // Evaluate subject once; stash its pointer on the stack so pattern
         // bindings can read fields off the subject after disc_r is consumed.
@@ -6269,18 +6217,14 @@ type Codegen = struct {
                 .EnumPat(enum_name, variant_name, bindings) -> {
                     let enum_idx = self.find_enum_idx(enum_name)
                     self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(variant_name, bindings) -> {
                     let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: subj_enum_idx)
                     self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -6306,9 +6250,7 @@ type Codegen = struct {
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -6319,9 +6261,7 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -6329,17 +6269,13 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
                     self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
