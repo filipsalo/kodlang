@@ -48,15 +48,20 @@ start yields an empty slice. Unlike indexing, slice bounds never wrap.
 Use `+=` to append elements or extend with another array:
 
 ```kod
-let a: [int64] = [1, 2]
+mut a: [int64] = [1, 2]
 a += [3, 4]          // a is now [1, 2, 3, 4]
 ```
 
-Or `+` to produce a new array:
+Or `+` to produce a new array; neither operand is modified:
 
 ```kod
-let c: [int64] = a + b
+let b: [int64] = [5]
+let c: [int64] = a + b   // [1, 2, 3, 4, 5]; a and b are unchanged
 ```
+
+`+=` grows the array's buffer geometrically, so appending in a loop is
+amortized O(1) per element. `+` always copies both operands, so
+`xs = xs + [x]` costs O(len(xs)); prefer `xs += [x]` in loops.
 
 ## Iterating
 
@@ -88,4 +93,7 @@ Arrays are represented as a header struct on the heap:
 
 The `ptr` field points to an arena-allocated block of elements, each 8 bytes wide. `len` is the number of live elements; `cap` is the allocated capacity.
 
-Appending (`+=`) allocates a new backing buffer via `_kod_arr_concat` in the runtime.
+Appending (`+=`) goes through `_kod_array_concat` in the runtime, which
+writes into the existing buffer and reallocates it with doubled capacity
+only when `cap` runs out. `+` goes through `_kod_array_concat_new`, which
+allocates a fresh header and buffer.

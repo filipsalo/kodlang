@@ -567,6 +567,20 @@ void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     return lhs;
 }
 
+// Binary `+` on arrays: a fresh array; `+=` appends via kod_array_concat.
+void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
+    KodArray *lhs = (KodArray *)lhs_raw;
+    KodArray *rhs = (KodArray *)rhs_raw;
+    int64_t total = lhs->len + rhs->len;
+    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
+    out->ptr = arena_alloc(total > 0 ? total * 8 : 8);
+    out->len = total;
+    out->cap = total;
+    if (lhs->len > 0) memcpy(out->ptr, lhs->ptr, lhs->len * 8);
+    if (rhs->len > 0) memcpy((char *)out->ptr + lhs->len * 8, rhs->ptr, rhs->len * 8);
+    return out;
+}
+
 // Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
 // timeout, -1 on error. Used by the LSP loop to detect typing pauses:
 // after a didChange, wait a short window for the next message; if it

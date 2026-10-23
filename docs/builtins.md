@@ -116,7 +116,7 @@ Available for re-declaration in any module if needed:
 | `_strlen` | C `strlen`. |
 | `_arena_alloc` | Bump allocator for everything heap-shaped. |
 | `_kod_str_concat`, `_kod_str_slice` | String operations the runtime exposes to codegen. |
-| `_kod_array_concat` | Array concatenation. |
+| `_kod_array_concat`, `_kod_array_concat_new` | Array append in place (`+=`) and concatenation into a new array (`+`). |
 | `_kod_test_fail`, `_kod_test_summary` | Test runner internals. |
 | `read_file`, `write_file` | File I/O. |
 
