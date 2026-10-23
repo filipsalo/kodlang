@@ -298,7 +298,10 @@ show(true)      // same for bool
 ```
 
 A call on an interface value must name one of the interface's methods,
-with arguments that match its signature; an unknown method is an error.
+with arguments that match its signature; an unknown method is an error. A
+trailing argument the call leaves out takes the default the interface
+declares for it (`func greet(self, times: int64 = 2) -> str`), so give
+each implementation the same default.
 
 A struct or primitive becomes an interface value wherever one is expected:
 an annotated `let`, an argument, a field, an array element, a value stored
