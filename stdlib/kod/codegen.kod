@@ -230,6 +230,12 @@ type ModuleScope = struct {
     lambdas: FuncIdx = FuncIdx()
     // Own function names, for typo hints.
     names: [str] = []
+    // Import aliases and the module paths they name, from build.kod's note_import.
+    alias_names: [str] = []
+    alias_paths: [str] = []
+    // `import "..." { name }` items, each with the alias of the module it names.
+    item_names: [str] = []
+    item_aliases: [str] = []
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
@@ -2066,6 +2072,32 @@ type Codegen = struct {
         return -1
     }
 
+    // `importer` binds `local_name` to the module at `target`.
+    func note_import(self, importer: str, local_name: str, target: str) -> none {
+        if self.scope_idx.get(importer) is Some(si) {
+            self.scopes[si].alias_names += [local_name]
+            self.scopes[si].alias_paths += [target]
+        }
+    }
+
+    // The scope an import alias of scope `si` names, or -1.
+    func scope_alias_target(self, anon si: int64, anon alias: str) -> int64 {
+        mut i = 0
+        for i < len(self.scopes[si].alias_names) {
+            if self.scopes[si].alias_names[i] == alias {
+                if self.scope_idx.get(self.scopes[si].alias_paths[i]) is Some(ti) {
+                    if self.scopes[ti].built == false {
+                        self.build_scope(ti)
+                    }
+                    return ti
+                }
+                return -1
+            }
+            i += 1
+        }
+        return -1
+    }
+
     func add_scope(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
         if self.scope_idx.contains(p.path) {
             return
@@ -2090,6 +2122,12 @@ type Codegen = struct {
                 .Extern(name, _name_span, _params, _return_typ) -> {
                     own.set(name, di)
                     self.scopes[si].names += [name]
+                }
+                .Import(_module_name, local_name, items) -> {
+                    for want in items {
+                        self.scopes[si].item_names += [want]
+                        self.scopes[si].item_aliases += [local_name]
+                    }
                 }
                 else none
             }
@@ -2158,6 +2196,25 @@ type Codegen = struct {
         return -1
     }
 
+    // Scope `si`'s `{ name }` import item as a scope_fns index, or -1; the last import wins.
+    func scope_item_fn(self, anon si: int64, anon name: str) -> int64 {
+        mut k = -1
+        mut i = 0
+        for i < len(self.scopes[si].item_names) {
+            if self.scopes[si].item_names[i] == name {
+                let ti = self.scope_alias_target(si, self.scopes[si].item_aliases[i])
+                if ti >= 0 {
+                    let tk = self.scope_own_fn(ti, name)
+                    if tk >= 0 {
+                        k = tk
+                    }
+                }
+            }
+            i += 1
+        }
+        return k
+    }
+
     // What a bare function name means where the current expression was
     // written: a func_* index (>= 0), a scope_fns entry (-2 - k), or -1.
     func lookup_func(self, anon name: str) -> int64 {
@@ -2171,6 +2228,10 @@ type Codegen = struct {
         let k = self.scope_own_fn(si, name)
         if k >= 0 {
             return -2 - k
+        }
+        let ik = self.scope_item_fn(si, name)
+        if ik >= 0 {
+            return -2 - ik
         }
         if self.scopes[si].path != self.builtins_path {
             if self.scope_idx.get(self.builtins_path) is Some(bi) {
@@ -2221,6 +2282,52 @@ type Codegen = struct {
                 for n in self.scopes[bi].names {
                     names += [n]
                 }
+            }
+        }
+        return names
+    }
+
+    // `alias.name` where the current expression was written: an import_fns
+    // index (>= 0), a scope_fns entry (-2 - k), or -1.
+    func lookup_import_fn(self, anon local_mod: str, anon name: str) -> int64 {
+        let si = self.cur_scope()
+        if si < 0 {
+            return self.find_import_fn_idx(local_mod, name)
+        }
+        let ti = self.scope_alias_target(si, local_mod)
+        if ti < 0 {
+            return -1
+        }
+        let k = self.scope_own_fn(ti, name)
+        if k >= 0 {
+            return -2 - k
+        }
+        return -1
+    }
+
+    func import_fn_at(self, anon slot: int64) -> ImportFn {
+        if slot >= 0 {
+            return self.import_fns[slot]
+        }
+        return self.scope_fns[-2 - slot]
+    }
+
+    // The functions `alias.` can name where the current expression was written, for typo hints.
+    func import_fn_names(self, anon local_mod: str) -> [str] {
+        mut names: [str] = []
+        let si = self.cur_scope()
+        if si < 0 {
+            for f in self.import_fns {
+                if f.module == local_mod {
+                    names += [f.name]
+                }
+            }
+            return names
+        }
+        let ti = self.scope_alias_target(si, local_mod)
+        if ti >= 0 {
+            for n in self.scopes[ti].names {
+                names += [n]
             }
         }
         return names
@@ -5295,6 +5402,15 @@ type Codegen = struct {
     }
 
     func is_import_alias(self, anon name: str) -> bool {
+        let si = self.cur_scope()
+        if si >= 0 {
+            for alias in self.scopes[si].alias_names {
+                if alias == name {
+                    return true
+                }
+            }
+            return false
+        }
         for alias in self.import_local {
             if alias == name {
                 return true
@@ -5716,21 +5832,16 @@ type Codegen = struct {
             if s_idx >= 0 {
                 return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
             }
-            let fn_idx = self.find_import_fn_idx(mod_or_obj, method_name)
-            if fn_idx < 0 {
-                mut names: [str] = []
-                for f in self.import_fns {
-                    if f.module == mod_or_obj {
-                        names += [f.name]
-                    }
-                }
-                self.report_error(self.with_suggestion(f"error: module `{mod_or_obj}` has no function `{method_name}`", typo: method_name, candidates: names), span: self.p.expr_spans[callee_rhs])
+            let fn_idx = self.lookup_import_fn(mod_or_obj, method_name)
+            if fn_idx == -1 {
+                self.report_error(self.with_suggestion(f"error: module `{mod_or_obj}` has no function `{method_name}`", typo: method_name, candidates: self.import_fn_names(mod_or_obj)), span: self.p.expr_spans[callee_rhs])
                 return .VImm(value: 0)
             }
-            let sig = self.import_fns[fn_idx].sig
+            let ifn = self.import_fn_at(fn_idx)
+            let sig = ifn.sig
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
-            self.emit(f"bl {self.import_fns[fn_idx].label}")
+            self.emit(f"bl {ifn.label}")
             return .VReg(name: "x0")
         }
         // `obj.fn(args)` where `fn` is a struct FIELD of function-
@@ -6615,11 +6726,11 @@ type Codegen = struct {
                 if struct_idx >= 0 {
                     return .KStruct(idx: struct_idx, type_args: [])
                 }
-                let fn_idx = self.find_import_fn_idx(maybe_mod, method_name)
-                if fn_idx < 0 {
+                let fn_idx = self.lookup_import_fn(maybe_mod, method_name)
+                if fn_idx == -1 {
                     return .KUnknown
                 }
-                return self.import_fns[fn_idx].sig.return_kind
+                return self.import_fn_at(fn_idx).sig.return_kind
             }
         }
         // Recurse via infer_kind so receivers like `0.to_str()` (IntLit
