@@ -82,6 +82,8 @@ let other: bool = false
 ```
 
 Logical operators: `and`, `or`, `not` (prefix). Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`.
+Comparisons, `and`/`or` and `is` always produce a `bool`, so `let ok = a < b`
+is a `bool` binding and `f"{a < b}"` prints `true` or `false`.
 
 Chained comparisons are supported Python-style: `a < b < c` evaluates `b` once and is equivalent to `(a < b) and (b < c)`. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
 
