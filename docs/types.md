@@ -334,7 +334,8 @@ print(n.char_count())    // 3
 
 An alias of `T or Error` works wherever `T or Error` does, including as the
 return type of a function or of `main`, so `throw`, `try` and `must` behave
-the same through it.
+the same through it. That holds for an imported alias too, written
+`dep.Outcome` or listed in `import "./dep" { Outcome }`.
 
 A struct, enum or interface that the importing module declares wins over
 a same-named alias from an imported module. An alias whose target names an

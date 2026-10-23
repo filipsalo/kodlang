@@ -291,7 +291,7 @@ class Builder:
         )
         mangled = self._mangled_module_prefix(file)
         # A Result main exits with the Ok (discriminant 1) payload, else panics.
-        returns_result = ast.returns_result(main_decl, module)
+        returns_result = ast.returns_result(main_decl, module, self.program)
         if returns_result:
             unwrap = """
                     ldr x9, [x0, #0]

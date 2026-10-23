@@ -149,7 +149,7 @@ class Interpreter:
         """ast.returns_result, cached on the declaration: call_function is hot."""
         fallible = func.__dict__.get("_returns_result")
         if fallible is None:
-            fallible = ast.returns_result(func, func.module)
+            fallible = ast.returns_result(func, func.module, self.program)
             func.__dict__["_returns_result"] = fallible
         return fallible
 

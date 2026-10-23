@@ -102,15 +102,22 @@ def is_result_type_expr(expr) -> bool:
     return False
 
 
-def returns_result(func, module) -> bool:
-    """True if `func` is declared to return `T or Error`, spelled out or
-    through one of `module`'s aliases."""
+def returns_result(func, module, program) -> bool:
+    """True if `func` returns `T or Error`, spelled out or through an alias."""
     expr = func.return_type
     if is_result_type_expr(expr):
         return True
-    if not isinstance(expr, NamedTypeExpr):
+    if isinstance(expr, QualifiedTypeExpr):
+        owner = module.names.get(expr.module)
+    elif isinstance(expr, NamedTypeExpr) and expr.name not in module.names:
+        owner = next((i for i in module.get_imports() if expr.name in i.items), None)
+    elif isinstance(expr, NamedTypeExpr):
+        owner = module
+    else:
         return False
-    resolved = module.names.get(expr.name)
+    if isinstance(owner, Import):
+        owner = program.get_module(module.resolve_import(owner.module_name))
+    resolved = owner.names.get(expr.name) if isinstance(owner, Module) else None
     return (
         isinstance(resolved, type)
         and issubclass(resolved, types.EnumType)
