@@ -107,8 +107,9 @@ implicit conversions are the ones an annotated `let` makes (see
 
 An array value is never converted element by element. With
 `func take(anon xs: [Shape])`, `take([Sq(s: 1)])` is fine, but passing a
-`[Sq]` variable is an error. The same rules apply to extern functions and
-to calls through a function value.
+`[Sq]` variable is an error. The same rules apply to extern functions, to
+calls through a function value, and to the arguments of a method, an
+interface method and `x?.method(...)`.
 
 ## `main`
 
