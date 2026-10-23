@@ -675,8 +675,18 @@ class Interpreter:
                 else:
                     type_ = self.evaluate_expression(module, value)
                 module.names[lhs.id] = type_
-                if hasattr(type_, "methods"):
-                    for method in type_.methods.values():
+                # Imports run first, so the defining module stamps before any alias.
+                if isinstance(type_, types.GenericTemplate):
+                    owner = type_.template
+                else:
+                    owner = getattr(type_, "template_origin", type_)
+                if "decl_module" not in getattr(owner, "__dict__", {}):
+                    try:
+                        owner.decl_module = module
+                    except (AttributeError, TypeError):
+                        pass
+                for method in getattr(owner, "methods", {}).values():
+                    if getattr(method, "module", None) is None:
                         method.module = module
             case ast.Assignment(lhs, rhs):
                 rhs_val = self.evaluate_expression(module, rhs)
@@ -944,6 +954,16 @@ class Interpreter:
             return self.call_function(module, methods["to_str"], (value,))
         return types.String(str(value).encode("utf8"))
 
+    def _evaluate_default(self, module, expr):
+        """A default value, evaluated without the caller's locals in view."""
+        self.stack.append({})
+        self.immutable_stack.append(set())
+        try:
+            return self.evaluate_expression(module, expr)
+        finally:
+            self.stack.pop()
+            self.immutable_stack.pop()
+
     def call_function(self, module, func, args=()):
         """Call a function"""
         if callable(func):
@@ -953,9 +973,11 @@ class Interpreter:
                 # Fill any field the construction omitted with its default
                 # expression. struct_fields carries the ast.Variable for
                 # each field, with `.default` set when declared `= expr`.
+                owner = getattr(func, "template_origin", func)
+                owner_module = getattr(owner, "decl_module", None) or module
                 for v in getattr(func, "struct_fields", []):
                     if v.id not in kwargs and v.default is not None:
-                        kwargs[v.id] = self.evaluate_expression(module, v.default)
+                        kwargs[v.id] = self._evaluate_default(owner_module, v.default)
                 return func(**kwargs)
             return func(*args)
         if isinstance(func, ast.ExternalFunctionDeclaration):
@@ -1087,7 +1109,7 @@ class Interpreter:
                         self.lookup(module, a) if isinstance(a, ast.Variable) else a
                     )
                 elif param.default is not None:
-                    frame[param.variable.id] = self.evaluate_expression(
+                    frame[param.variable.id] = self._evaluate_default(
                         func.module, param.default
                     )
             frame["self"] = receiver
@@ -1131,7 +1153,7 @@ class Interpreter:
                     self.lookup(module, a) if isinstance(a, ast.Variable) else a
                 )
             elif param.default is not None:
-                frame[param.variable.id] = self.evaluate_expression(
+                frame[param.variable.id] = self._evaluate_default(
                     func.module, param.default
                 )
         args = frame
