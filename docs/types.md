@@ -12,11 +12,12 @@ an alias target or a type argument. The error carries a did-you-mean hint
 when a known type name is close.
 
 An unannotated `let` takes the type of its value. If the compiler can't
-work out that type, the binding is an error (`cannot infer the type of
-`x`; add a type annotation`). A value whose type is unknown because of an
-earlier error, such as a call to an unknown function or method, a
-misspelled field, an unknown variant or an unknown type, doesn't produce
-further errors where it's used.
+work out that type, the binding is an error
+(``cannot infer the type of `x`; add a type annotation``), and so is any
+other use of such a value, like a `match` subject or an argument. A value
+whose type is unknown because of an earlier error, such as a call to an
+unknown function or method, a misspelled field, an unknown variant or an
+unknown type, doesn't produce further errors where it's used.
 
 ## Bindings and mutability
 
