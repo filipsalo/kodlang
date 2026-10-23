@@ -330,7 +330,9 @@ or ``method `area` is `func(int64) -> int64`, not `func() -> int64` ``.
 `type Name = T` gives an existing type a second name. An alias is
 transparent: a value of the alias type is a value of `T`, with all of its
 methods, fields and operators. The target can be any type, including one
-declared further down the module:
+declared further down the module or one from the module's own imports
+(`type Num2 = dep.Num`, usable as `mid.Num2` from a module that imports
+only `mid`):
 
 ```kod
 type Name = str
