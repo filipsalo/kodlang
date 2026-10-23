@@ -43,6 +43,36 @@ func norm2(anon v: Vec2) -> int64 {
 }
 ```
 
+## Where names resolve
+
+Parameter defaults, struct field defaults and the method bodies of a generic type resolve function names in the module that wrote them, even though they run as part of the caller's code. A default in `util.kod` that calls `helper()` calls util's own `helper`, or the builtin of that name, never one that belongs to the caller:
+
+```kod
+// util.kod
+func helper() -> int64 {
+    return 1
+}
+
+func f(x: int64 = helper()) -> int64 {
+    return x
+}
+
+// main.kod
+import "./util"
+
+func helper() -> int64 {
+    return 2
+}
+
+func main() -> int64 {
+    let helper = 3          // not visible to util's default either
+    print(f"{util.f()}")    // 1
+    return 0
+}
+```
+
+The same holds for a function literal or a function value used as a default (`cb: func() -> int64 = helper`). A name the defining module doesn't have is an error at the default, even when the caller happens to declare it.
+
 ## Standard library
 
 The stdlib lives under `stdlib/` in the repository.

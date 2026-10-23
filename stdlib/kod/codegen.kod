@@ -213,6 +213,25 @@ type ImportFn = struct {
     def_span: ast.Span
 }
 
+// An imported module's function namespace. Its defaults and generic method
+// bodies compile while `self.p` is one of its parsers, so their bare names
+// resolve here rather than in the module being compiled.
+type ModuleScope = struct {
+    path: str
+    prefix: str
+    module: ast.Module
+    p: parsing.Parser
+    built: bool = false
+    // Name → index into Codegen.scope_fns, filled as names are looked up.
+    funcs: FuncIdx = FuncIdx()
+    // Own functions and externs: name → index into module.decls.
+    own: FuncIdx = FuncIdx()
+    // Function literal decl id (as text) → its `__lambda_k` number.
+    lambdas: FuncIdx = FuncIdx()
+    // Own function names, for typo hints.
+    names: [str] = []
+}
+
 // ── Per-variable stack slot ───────────────────────────────────────────────────
 
 type VarSlot = struct {
@@ -435,6 +454,13 @@ type Codegen = struct {
     body_instance: int64 = -1
     // A default checked where it is declared isn't compiled there, so only its kind is reported.
     checking_default: bool = false
+
+    // Imported modules' namespaces, by source path. See ModuleScope.
+    scopes: [ModuleScope] = []
+    scope_idx: FuncIdx = FuncIdx()
+    scope_fns: [ImportFn] = []
+    // Builtins (registered by register_module_funcs) back every scope's own names.
+    builtins_path: str = ""
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
@@ -2003,9 +2029,9 @@ type Codegen = struct {
     }
 
     func find_func_sig(self, anon name: str) -> SigInfo {
-        let m = self.func_idx
-        if m.get(name) is Some(idx) {
-            return self.func_sigs[idx]
+        let slot = self.lookup_func(name)
+        if slot != -1 {
+            return self.fn_sig(slot)
         }
         let empty_kinds: [TypeKind] = []
         let empty_strs: [str] = []
@@ -2023,6 +2049,195 @@ type Codegen = struct {
             i = i + 1
         }
         return -1
+    }
+
+    // The scope of the module the current expression was written in, or -1
+    // for the module being compiled, whose names live in func_idx.
+    func cur_scope(self) -> int64 {
+        if self.p.path == self.entry_path {
+            return -1
+        }
+        if self.scope_idx.get(self.p.path) is Some(si) {
+            if self.scopes[si].built == false {
+                self.build_scope(si)
+            }
+            return si
+        }
+        return -1
+    }
+
+    func add_scope(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
+        if self.scope_idx.contains(p.path) {
+            return
+        }
+        let m = self.scope_idx
+        m.set(p.path, len(self.scopes))
+        self.scopes += [ModuleScope(path: p.path, :prefix, :module, :p)]
+    }
+
+    // Signatures resolve per name on first use, so unused generics aren't instantiated.
+    func build_scope(self, anon si: int64) -> none {
+        self.scopes[si].built = true
+        let s = self.scopes[si]
+        let own = s.own
+        mut di = 0
+        for decl in s.module.decls {
+            match decl {
+                .Func(decl_id) -> {
+                    own.set(s.p.func_decls[decl_id].name, di)
+                    self.scopes[si].names += [s.p.func_decls[decl_id].name]
+                }
+                .Extern(name, _name_span, _params, _return_typ) -> {
+                    own.set(name, di)
+                    self.scopes[si].names += [name]
+                }
+                else none
+            }
+            di += 1
+        }
+        // Numbered the way compile_module names them in their own module.
+        let lambdas = s.lambdas
+        mut k = 0
+        mut li = 1
+        for li < len(s.p.func_decls) {
+            if len(s.p.func_decls[li].name) == 0 {
+                lambdas.set(f"{li}", k)
+                k += 1
+            }
+            li += 1
+        }
+    }
+
+    // Resolve scope `si`'s function `key` into scope_fns: module.decls[decl_idx]
+    // when decl_idx >= 0, else the function literal `lambda_id`.
+    func add_scope_fn(self, anon si: int64, anon key: str, decl_idx: int64, lambda_id: int64) -> int64 {
+        let s = self.scopes[si]
+        // Resolved outside any generic body that happens to look it up first.
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        let no_names: [str] = []
+        let no_args: [TypeKind] = []
+        self.subst_names = no_names
+        self.subst_args = no_args
+        mut fd_id = lambda_id
+        mut k = -1
+        if decl_idx >= 0 {
+            match s.module.decls[decl_idx] {
+                .Func(decl_id) -> fd_id = decl_id
+                .Extern(_name, name_span, params, return_typ) -> {
+                    k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: f"_{key}", sig: self.resolve_extern_sig(params, :return_typ, p: s.p), def_path: s.path, def_span: name_span))
+                }
+                else none
+            }
+        }
+        if fd_id > 0 {
+            let fd = s.p.func_decls[fd_id]
+            k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: f"${s.prefix}${key}", sig: self.resolve_sig(fd, p: s.p), def_path: s.path, def_span: fd.name_span))
+        }
+        self.subst_names = saved_names
+        self.subst_args = saved_args
+        return k
+    }
+
+    func push_scope_fn(self, anon si: int64, f: ImportFn) -> int64 {
+        let funcs = self.scopes[si].funcs
+        funcs.set(f.name, len(self.scope_fns))
+        self.scope_fns += [f]
+        return len(self.scope_fns) - 1
+    }
+
+    // Scope `si`'s own function `name` as a scope_fns index, or -1.
+    func scope_own_fn(self, anon si: int64, anon name: str) -> int64 {
+        let s = self.scopes[si]
+        if s.funcs.get(name) is Some(k) {
+            return k
+        }
+        if s.own.get(name) is Some(di) {
+            return self.add_scope_fn(si, name, decl_idx: di, lambda_id: 0)
+        }
+        return -1
+    }
+
+    // What a bare function name means where the current expression was
+    // written: a func_* index (>= 0), a scope_fns entry (-2 - k), or -1.
+    func lookup_func(self, anon name: str) -> int64 {
+        let si = self.cur_scope()
+        if si < 0 {
+            if self.func_idx.get(name) is Some(idx) {
+                return idx
+            }
+            return -1
+        }
+        let k = self.scope_own_fn(si, name)
+        if k >= 0 {
+            return -2 - k
+        }
+        if self.scopes[si].path != self.builtins_path {
+            if self.scope_idx.get(self.builtins_path) is Some(bi) {
+                if self.scopes[bi].built == false {
+                    self.build_scope(bi)
+                }
+                let bk = self.scope_own_fn(bi, name)
+                if bk >= 0 {
+                    return -2 - bk
+                }
+            }
+        }
+        return -1
+    }
+
+    // A function literal's entry: by its synthesised name here, by decl id elsewhere.
+    func lookup_lambda(self, anon decl_id: int64) -> int64 {
+        let si = self.cur_scope()
+        if si < 0 {
+            return self.lookup_func(self.p.func_decls[decl_id].name)
+        }
+        let s = self.scopes[si]
+        if s.lambdas.get(f"{decl_id}") is Some(n) {
+            let name = f"__lambda_{n}"
+            if s.funcs.get(name) is Some(k) {
+                return -2 - k
+            }
+            return -2 - self.add_scope_fn(si, name, decl_idx: -1, lambda_id: decl_id)
+        }
+        return -1
+    }
+
+    // The function names a typo hint may suggest where the current expression was written.
+    func visible_func_names(self) -> [str] {
+        let si = self.cur_scope()
+        if si < 0 {
+            return self.func_names
+        }
+        mut names: [str] = []
+        for n in self.scopes[si].names {
+            names += [n]
+        }
+        if self.scope_idx.get(self.builtins_path) is Some(bi) {
+            if bi != si {
+                if self.scopes[bi].built == false {
+                    self.build_scope(bi)
+                }
+                for n in self.scopes[bi].names {
+                    names += [n]
+                }
+            }
+        }
+        return names
+    }
+
+    func fn_label(self, anon slot: int64) -> str {
+        if slot >= 0 {
+            return self.func_labels[slot]
+        }
+        return self.scope_fns[-2 - slot].label
+    }
+
+    func fn_sig(self, anon slot: int64) -> SigInfo {
+        if slot >= 0 {
+            return self.func_sigs[slot]
+        }
+        return self.scope_fns[-2 - slot].sig
     }
 
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
@@ -3126,6 +3341,7 @@ type Codegen = struct {
     // are registered before structs so struct method signatures can reference
     // interface types.
     func register_module_types(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
+        self.add_scope(module, :prefix, :p)
         // Phase 1: register interface NAMES (with empty sigs) so they're
         // findable when struct method signatures reference them.
         for decl in module.decls {
@@ -3505,9 +3721,9 @@ type Codegen = struct {
         if self.var_declared(name) {
             return false
         }
-        let func_lookup = self.func_idx
-        if func_lookup.get(name) is Some(idx) {
-            return self.func_sigs[idx].never_returns
+        let slot = self.lookup_func(name)
+        if slot != -1 {
+            return self.fn_sig(slot).never_returns
         }
         return false
     }
@@ -3735,9 +3951,9 @@ type Codegen = struct {
                     // Ident path; landing here with a function name
                     // means the user wrote `let f = foo` or passed
                     // `foo` as a callback.
-                    let func_lookup = self.func_idx
-                    if func_lookup.get(name) is Some(idx) {
-                        let lbl: str = self.func_labels[idx]
+                    let slot = self.lookup_func(name)
+                    if slot != -1 {
+                        let lbl: str = self.fn_label(slot)
                         let reg: str = self.pool.alloc_reg()
                         self.emit(f"adrp {reg}, {lbl}@PAGE")
                         self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
@@ -3752,7 +3968,7 @@ type Codegen = struct {
                     for v in self.vars {
                         cands += [v.name]
                     }
-                    for n in self.func_names {
+                    for n in self.visible_func_names() {
                         cands += [n]
                     }
                     let msg: str = self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands)
@@ -3795,10 +4011,9 @@ type Codegen = struct {
                 // and label during compile_module; emit its address
                 // as a function-pointer value, same shape as a bare
                 // named-function reference.
-                let name: str = self.p.func_decls[decl_id].name
-                let func_lookup = self.func_idx
-                if func_lookup.get(name) is Some(idx) {
-                    let lbl: str = self.func_labels[idx]
+                let slot = self.lookup_lambda(decl_id)
+                if slot != -1 {
+                    let lbl: str = self.fn_label(slot)
                     let reg: str = self.pool.alloc_reg()
                     self.emit(f"adrp {reg}, {lbl}@PAGE")
                     self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
@@ -5648,15 +5863,15 @@ type Codegen = struct {
                         return .VImm(value: 0)
                     }
                 }
-                let func_lookup = self.func_idx
-                if func_lookup.get(name) is Some(idx) {
-                    let sig = self.func_sigs[idx]
+                let slot = self.lookup_func(name)
+                if slot != -1 {
+                    let sig = self.fn_sig(slot)
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
-                    self.emit(f"bl {self.func_labels[idx]}")
+                    self.emit(f"bl {self.fn_label(slot)}")
                     return .VReg(name: "x0")
                 }
-                let msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.func_names)
+                let msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.visible_func_names())
                 self.report_error(msg, span: self.p.expr_spans[callee_id])
                 return .VImm(value: 0)
             }
@@ -6494,9 +6709,9 @@ type Codegen = struct {
                 // Function-as-value reference: synthesise a KFunc
                 // from the function's pre-resolved signature so
                 // `let f = foo` infers `f: func(...) -> R`.
-                let func_lookup = self.func_idx
-                if func_lookup.get(name) is Some(idx) {
-                    let sig: SigInfo = self.func_sigs[idx]
+                let slot = self.lookup_func(name)
+                if slot != -1 {
+                    let sig: SigInfo = self.fn_sig(slot)
                     return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
                 }
                 return .KUnknown
@@ -6560,9 +6775,9 @@ type Codegen = struct {
                             return self.ctor_kind(enum_idx)
                         }
                         // Free function call: use the cached return kind.
-                        let idx_m = self.func_idx
-                        if idx_m.get(name) is Some(idx) {
-                            return self.func_sigs[idx].return_kind
+                        let slot = self.lookup_func(name)
+                        if slot != -1 {
+                            return self.fn_sig(slot).return_kind
                         }
                     }
                     .Binary(call_lhs, call_op, call_rhs) -> {
@@ -6709,10 +6924,9 @@ type Codegen = struct {
                 // Same shape as a named function reference — return
                 // a KFunc built from the synthesised entry's
                 // pre-resolved signature.
-                let name: str = self.p.func_decls[decl_id].name
-                let func_lookup = self.func_idx
-                if func_lookup.get(name) is Some(idx) {
-                    let sig: SigInfo = self.func_sigs[idx]
+                let slot = self.lookup_lambda(decl_id)
+                if slot != -1 {
+                    let sig: SigInfo = self.fn_sig(slot)
                     return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
                 }
                 return .KUnknown
@@ -9345,6 +9559,7 @@ type Codegen = struct {
     // Register all functions and externs from a dependency module without compiling it.
     // Call this for each imported module (e.g. builtins) before compile_module.
     func register_module_funcs(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
+        self.builtins_path = p.path
         let idx_m = self.func_idx
         for decl in module.decls {
             match decl {
