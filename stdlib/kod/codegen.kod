@@ -73,6 +73,7 @@ type SigInfo = struct {
     // as `compile_struct_construct` uses for field defaults.
     param_default_exprs: [int64]
     src_p: parsing.Parser
+    never_returns: bool = false
 }
 
 // Name → entry-index map for the parallel `func_names` / `func_labels`
@@ -2684,8 +2685,78 @@ type Codegen = struct {
             param_default_exprs += [param.default_expr]
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
+        mut never_returns = false
+        if self.is_void_kind(return_kind) and self.block_diverges(func_decl.body, leaves: false) {
+            never_returns = self.block_has_return(func_decl.body) == false
+        }
         self.p = saved_p
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p)
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :never_returns)
+    }
+
+    // Whether `stmts` never completes normally; with `leaves`, leaving the scope counts too.
+    func block_diverges(self, anon stmts: [int64], leaves: bool) -> bool {
+        if len(stmts) == 0 {
+            return false
+        }
+        match self.p.stmts[stmts[len(stmts) - 1]] {
+            .Return(_value) -> return leaves
+            .Break -> return leaves
+            .Continue -> return leaves
+            .Throw(_value) -> return leaves
+            .ExprStmt(expr) -> {
+                if leaves {
+                    return self.is_diverging_call(expr)
+                }
+                return self.is_panic_call(expr)
+            }
+            .If(_cond, then_body, else_body) -> return self.block_diverges(then_body, :leaves) and self.block_diverges(else_body, :leaves)
+            .MatchStmt(_subject, arms) -> {
+                for arm_id in arms {
+                    if self.block_diverges(self.p.match_arms[arm_id].body, :leaves) == false {
+                        return false
+                    }
+                }
+                return len(arms) > 0
+            }
+            else return false
+        }
+    }
+
+    func block_has_return(self, anon stmts: [int64]) -> bool {
+        for stmt_id in stmts {
+            match self.p.stmts[stmt_id] {
+                .Return(_value) -> return true
+                .If(_cond, then_body, else_body) -> {
+                    if self.block_has_return(then_body) or self.block_has_return(else_body) {
+                        return true
+                    }
+                }
+                .For(_cond, body) -> {
+                    if self.block_has_return(body) {
+                        return true
+                    }
+                }
+                .ForEach(_name, _iter, body) -> {
+                    if self.block_has_return(body) {
+                        return true
+                    }
+                }
+                .MatchStmt(_subject, arms) -> {
+                    for arm_id in arms {
+                        if self.block_has_return(self.p.match_arms[arm_id].body) {
+                            return true
+                        }
+                    }
+                }
+                .LetElse(_pattern, _value, else_body) -> {
+                    if self.block_has_return(else_body) {
+                        return true
+                    }
+                }
+                else none
+            }
+        }
+        return false
     }
 
     // Same as resolve_sig but for an Extern decl, whose params/return_typ
@@ -3375,7 +3446,7 @@ type Codegen = struct {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
         let body_kind = self.infer_kind(body)
-        if self.is_void_kind(body_kind) and self.is_panic_call(body) == false {
+        if self.is_void_kind(body_kind) and self.is_void_kind(expected) == false and self.is_diverging_call(body) == false {
             self.report_error("error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement", span: self.p.expr_spans[body])
         }
         mut wrap = false
@@ -3402,6 +3473,23 @@ type Codegen = struct {
             }
         }
         self.restore_pattern_bindings(pattern, kinds: saved)
+    }
+
+    // `kod_panic(...)`, or a call to a function that never returns.
+    func is_diverging_call(self, anon expr_id: int64) -> bool {
+        if self.is_panic_call(expr_id) {
+            return true
+        }
+        let .Call(callee, _args) = self.p.exprs[expr_id] else { return false }
+        let .Ident(name) = self.p.exprs[callee] else { return false }
+        if self.var_declared(name) {
+            return false
+        }
+        let func_lookup = self.func_idx
+        if func_lookup.get(name) is Some(idx) {
+            return self.func_sigs[idx].never_returns
+        }
+        return false
     }
 
     func is_panic_call(self, anon expr_id: int64) -> bool {
