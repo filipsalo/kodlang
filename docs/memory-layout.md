@@ -113,3 +113,12 @@ exposed to Kod programs directly.
 
 Since struct variables are 8-byte pointers, they fit in a single register
 and can be passed to and returned from functions normally.
+
+### Stack frame
+
+A function pushes `fp` and `lr`, points `fp` at them and keeps each local
+in an 8-byte slot below `fp`, including the compiler's own temporaries.
+Values that must survive a call in the middle of an expression are pushed
+below those slots. The epilogue restores `sp` from `fp`, so a `try` that
+returns from inside an expression, such as an array literal element or a
+call argument, leaves the stack as the function found it.
