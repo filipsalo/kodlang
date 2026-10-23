@@ -44,6 +44,14 @@ an `op_index` method (`Map` does). Element assignment needs an array or a
 struct with `op_index_set`, slicing needs an array, `str` or `bytes`, and
 `for … in` needs an array. Anything else is a compile error.
 
+An assigned element must have the array's element type, with the same
+conversions as a `let`: `names[0] = 5` on a `[str]` is an error, while
+`xs[0] = 42` on an `[int64?]` and `pets[0] = Cat()` on a `[Pet]` wrap and
+box the value. On a struct, the key of `m[k]` and the key and value of
+`m[k] = v` must have the types of `op_index`'s and `op_index_set`'s
+parameters (see [Indexing a struct](builtins.md#indexing-a-struct)), so
+`m[5]` on a `Map[str, int64]` is an error.
+
 ## Length
 
 ```kod

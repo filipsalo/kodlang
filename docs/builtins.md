@@ -21,7 +21,7 @@ These names live in `stdlib/builtins.kod` and are available in every Kod program
 |----------|-----------|-------------|
 | `len` | `(str) -> int64` | String length in bytes. |
 | `len` | `([T]) -> int64` | Number of elements in an array. |
-| `len` | `(SomeStruct) -> int64` | Dispatches to the struct's `len(self) -> int64` method if one exists (e.g. `Map.len`). |
+| `len` | `(SomeStruct) -> int64` | Dispatches to the struct's `func len(self) -> int64` method if one exists (e.g. `Map.len`); a `len` method of any other shape is an error. |
 
 ## String conversion
 
@@ -69,6 +69,21 @@ equality depends on the key type: `str` and `bytes` keys match by
 content, `int64` and `bool` keys by value, enum keys by variant (like
 `==`, ignoring any payload), and struct keys by identity, so only the
 same struct value finds its entry again.
+
+## Indexing a struct
+
+`m[k]` calls the struct's `op_index` and `m[k] = v` its `op_index_set`,
+which is how `Map` supports both (`m[k]` is a `V?`, like `m.get(k)`).
+`op_index` must take one key besides `self`, and `op_index_set` a key and
+a value:
+
+```kod
+func op_index(self, anon key: K) -> V? { ... }
+func op_index_set(self, anon key: K, anon value: V) -> none { ... }
+```
+
+The key and value must have those parameters' types, like a method's
+arguments.
 
 ## Error handling
 

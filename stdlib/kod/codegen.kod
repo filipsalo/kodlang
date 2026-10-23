@@ -3960,14 +3960,21 @@ type Codegen = struct {
         // Struct with op_index — dispatch as a method call.
         match lhs_kind {
             .KStruct(idx, _struct_type_args) -> {
-                if self.structs[idx].method_idx.get("op_index") is Some(_mi) {
-                    let key_val = self.compile_expr(rhs)
-                    let key_reg = self.pool.alloc_reg()
-                    self.mov_to(key_val, dest: key_reg)
+                if self.structs[idx].method_idx.get("op_index") is Some(mi) {
+                    let sig = self.structs[idx].methods[mi].sig
+                    if self.takes_self_and(sig, count: 1) == false {
+                        self.compile_discard(lhs)
+                        self.compile_discard(rhs)
+                        self.report_error(f"error: `{self.struct_display_name(idx)}.op_index` must take one key", span: self.p.expr_spans[lhs])
+                        return .VImm(value: 0)
+                    }
+                    let key_reg = self.compile_key(rhs, kind: sig.param_kinds[1])
+                    let key_spilled = self.preserve_begin(key_reg)
                     let ov = self.compile_expr(lhs)
                     self.mov_to(ov, dest: "x0")
-                    self.emit(f"mov x1, {key_reg}")
-                    self.pool.free_reg(key_reg)
+                    let key_r = self.preserve_end(key_reg, spilled: key_spilled)
+                    self.emit(f"mov x1, {key_r}")
+                    self.pool.free_reg(key_r)
                     mut method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}$op_index"
                     self.emit(f"bl {method_lbl}")
                     return .VReg(name: "x0")
@@ -5725,10 +5732,17 @@ type Codegen = struct {
         // `len(array)` and `len(str)` do.
         if kind is .KStruct(struct_idx, _struct_type_args) {
             mut s = self.structs[struct_idx]
-            if s.method_idx.get("len") is Some(_mi) {
-                self.mov_to(arg_val, dest: "x0")
-                self.emit(f"bl ${s.module_prefix}${s.name}$len")
-                return .VReg(name: "x0")
+            if s.method_idx.get("len") is Some(mi) {
+                let sig = s.methods[mi].sig
+                if self.takes_self_and(sig, count: 0) and self.same_kind(sig.return_kind, .KInt64) {
+                    self.mov_to(arg_val, dest: "x0")
+                    self.emit(f"bl ${s.module_prefix}${s.name}$len")
+                    return .VReg(name: "x0")
+                }
+                let name = self.struct_display_name(struct_idx)
+                self.free_val(arg_val)
+                self.report_error(f"error: len() not defined for struct `{name}`; `{name}.len` isn't `func len(self) -> int64`", span: self.p.expr_spans[arg_id])
+                return .VImm(value: 0)
             }
             self.report_error(f"error: len() not defined for struct `{self.struct_display_name(struct_idx)}` (no `len` method)", span: self.p.expr_spans[arg_id])
             return .VImm(value: 0)
@@ -7538,16 +7552,35 @@ type Codegen = struct {
         self.pool.free_reg(ptr_reg)
     }
 
-    func setter_value_kind(self, anon kind: TypeKind) -> TypeKind {
-        if kind is .KStruct(struct_idx, _type_args) {
-            if self.structs[struct_idx].method_idx.get("op_index_set") is Some(mi) {
-                let params = self.structs[struct_idx].methods[mi].sig.param_kinds
-                if len(params) == 3 {
-                    return params[2]
-                }
-            }
+    // The caller has checked that the struct declares `name`.
+    func struct_method_sig(self, anon struct_idx: int64, name: str) -> SigInfo {
+        mut mi = 0
+        if self.structs[struct_idx].method_idx.get(name) is Some(found) {
+            mi = found
         }
-        return .KVoid
+        return self.structs[struct_idx].methods[mi].sig
+    }
+
+    func takes_self_and(self, anon sig: SigInfo, count: int64) -> bool {
+        if len(sig.param_kinds) != count + 1 {
+            return false
+        }
+        return sig.param_names[0] == "self"
+    }
+
+    // A key that needs no conversion keeps the plain lowering.
+    func compile_key(self, anon key_id: int64, kind: TypeKind) -> str {
+        if self.converts_for(key_id, :kind) {
+            let converted = self.compile_into(key_id, expected: kind)
+            let converted_reg = self.pool.alloc_reg()
+            self.mov_to(.VReg(name: converted), dest: converted_reg)
+            return converted_reg
+        }
+        let key_val = self.compile_expr(key_id)
+        let key_reg = self.pool.alloc_reg()
+        self.mov_to(key_val, dest: key_reg)
+        self.check_value_kind(key_id, expected: kind)
+        return key_reg
     }
 
     // Look up `op_index_set` on a struct, returning its mangled label.
@@ -7573,8 +7606,10 @@ type Codegen = struct {
         }
         let lhs_kind = self.infer_kind(lhs)
         mut setter: str? = none
+        mut setter_struct = -1
         if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
             setter = self.struct_index_setter_label(:struct_idx)
+            setter_struct = struct_idx
         }
         if setter is none {
             if self.is_array_kind(lhs_kind) == false {
@@ -7594,9 +7629,17 @@ type Codegen = struct {
         }
         match setter {
             Some(method_lbl) -> {
+                let sig = self.struct_method_sig(setter_struct, name: "op_index_set")
+                if self.takes_self_and(sig, count: 2) == false {
+                    self.compile_discard(lhs)
+                    self.compile_discard(rhs)
+                    self.compile_discard(rhs_id)
+                    self.report_error(f"error: `{self.struct_display_name(setter_struct)}.op_index_set` must take a key and a value", span: self.p.expr_spans[lhs])
+                    return
+                }
                 // Compile rhs first (clean register state), stash, then key,
                 // then load the array pointer and call.
-                let value_kind = self.setter_value_kind(lhs_kind)
+                let value_kind = sig.param_kinds[2]
                 let rhs_r = self.pool.alloc_reg()
                 if self.converts_for(rhs_id, kind: value_kind) {
                     let converted = self.compile_value_for_kind(rhs_id, expected: value_kind)
@@ -7605,14 +7648,17 @@ type Codegen = struct {
                     let rhs_v = self.compile_expr(rhs_id)
                     self.mov_to(rhs_v, dest: rhs_r)
                 }
+                if self.is_match_expr(rhs_id) == false {
+                    self.check_value_kind(rhs_id, expected: value_kind)
+                }
                 let rhs_spilled = self.preserve_begin(rhs_r)
-                let key_val = self.compile_expr(rhs)
-                let key_reg = self.pool.alloc_reg()
-                self.mov_to(key_val, dest: key_reg)
+                let key_reg = self.compile_key(rhs, kind: sig.param_kinds[1])
+                let key_spilled = self.preserve_begin(key_reg)
                 let lhs_val = self.compile_expr(lhs)
                 self.mov_to(lhs_val, dest: "x0")
-                self.emit(f"mov x1, {key_reg}")
-                self.pool.free_reg(key_reg)
+                let key_r = self.preserve_end(key_reg, spilled: key_spilled)
+                self.emit(f"mov x1, {key_r}")
+                self.pool.free_reg(key_r)
                 // rhs is the third arg (x2). If it was spilled, reload from
                 // the slot; if it rode through a callee-saved register, just
                 // move it across.
@@ -7637,17 +7683,9 @@ type Codegen = struct {
                 // Wrap/box the rhs to match the array's element kind, so
                 // `xs[i] = 42` on a `[int64?]` stores a Some-cell and
                 // `pets[i] = Cat()` on a `[Greet]` stores an iface cell —
-                // mirroring the struct-field and call-arg store paths.
-                // Non-wrapping element kinds fall through to a plain load.
-                mut elem_kind: TypeKind = .KInt64
-                match self.infer_kind(lhs) {
-                    .KArrayEnum(elem_idx) -> elem_kind = .KEnum(idx: elem_idx)
-                    .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
-                    .KArrayInterface(elem_idx) -> elem_kind = .KInterface(idx: elem_idx)
-                    .KArrayArray(inner) -> elem_kind = inner
-                    else none
-                }
-                let rhs_r = self.compile_value_for_kind(rhs_id, expected: elem_kind)
+                // mirroring the struct-field and call-arg store paths, and
+                // check it against that kind.
+                let rhs_r = self.compile_into(rhs_id, expected: self.array_elem_kind(lhs_kind))
                 // Preserve rhs across the lhs computation too.
                 let rhs_spilled = self.preserve_begin(rhs_r)
                 let arr_val = self.compile_expr(lhs)
