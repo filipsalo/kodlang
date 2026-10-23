@@ -48,6 +48,18 @@ print(f"flag={true}")             // flag=true
 print(f"items: {items.len()}")    // any type with to_str works
 ```
 
+What can be interpolated:
+
+- `str`, and `bytes` as-is
+- `int64` and `bool`
+- a struct that declares `func to_str(self) -> str`
+- a value of an interface that declares `to_str`, such as `Stringable` or
+  `Error`; the call goes to the concrete type's `to_str`
+
+Anything else is a compile error for now: an optional (`T?`), an enum, an
+array, a function value, and a struct or interface without `to_str`.
+Unwrap an optional first, e.g. `f"{n? or 0}"`.
+
 ## Concatenation
 
 Use `+` to concatenate strings, or `+=` to append in place:
@@ -162,5 +174,7 @@ let u: str = "hi".to_str()         // identity
 ```
 
 Structs can opt in by declaring `func to_str(self) -> str`. F-string interpolation calls `to_str` automatically.
+`str(x)` converts the same values an f-string interpolates, and rejects the
+same ones.
 
 See [Built-ins](builtins.md) for the full list of string-related functions.
