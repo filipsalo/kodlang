@@ -4250,9 +4250,14 @@ type Codegen = struct {
         if build_rhs == false {
             build_lhs = self.is_eq_ctor_operand(lhs_id, :op, other_kind: rhs_kind0)
         }
-        let concat_lhs = self.concat_builds_lhs(:lhs_id, :op, :lhs_kind, :rhs_id, rhs_kind: rhs_kind0)
-        if build_lhs or concat_lhs {
+        if build_lhs {
             lhs_kind = rhs_kind0
+        }
+        if op is .Add {
+            let chain_kind = self.concat_kind(lhs_id, :rhs_id)
+            if self.is_array_kind(chain_kind) {
+                lhs_kind = chain_kind
+            }
         }
         mut lhs_unknown = false
         if lhs_kind is .KUnknown {
@@ -4330,7 +4335,7 @@ type Codegen = struct {
                     else none
                 }
                 if self.is_array_kind(lhs_kind) {
-                    return self.compile_arr_concat(:lhs_id, :rhs_id, :lhs_kind, build_lhs: concat_lhs)
+                    return self.compile_concat(:lhs_id, :rhs_id, kind: lhs_kind, typed_anchor: 0)
                 }
             }
             else none
@@ -4462,12 +4467,49 @@ type Codegen = struct {
         return false
     }
 
-    // In `[.V] + xs` the literal is built as `xs`'s element kind instead.
-    func concat_builds_lhs(self, lhs_id: int64, op: ast.Op, lhs_kind: TypeKind, rhs_id: int64, rhs_kind: TypeKind) -> bool {
-        if self.builds_for_operand(rhs_id, :op, other_kind: lhs_kind) {
-            return false
+    // Literals and matches take a chain's kind, so its other operands decide it.
+    func concat_kind(self, anon lhs_id: int64, rhs_id: int64) -> TypeKind {
+        mut anchor = self.first_concat_anchor(lhs_id)
+        if anchor == 0 {
+            anchor = self.first_concat_anchor(rhs_id)
         }
-        return self.builds_for_operand(lhs_id, :op, other_kind: rhs_kind)
+        if anchor != 0 {
+            return self.infer_kind(anchor)
+        }
+        let k = self.first_inferred_kind(lhs_id)
+        if k is .KUnknown {
+            return self.first_inferred_kind(rhs_id)
+        }
+        return k
+    }
+
+    func first_concat_anchor(self, anon value_id: int64) -> int64 {
+        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) {
+            if op is .Add {
+                let found = self.first_concat_anchor(lhs)
+                if found != 0 {
+                    return found
+                }
+                return self.first_concat_anchor(rhs)
+            }
+        }
+        if self.is_literal_or_match(value_id) {
+            return 0
+        }
+        return value_id
+    }
+
+    func first_inferred_kind(self, anon value_id: int64) -> TypeKind {
+        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) {
+            if op is .Add {
+                let k = self.first_inferred_kind(lhs)
+                if k is .KUnknown {
+                    return self.first_inferred_kind(rhs)
+                }
+                return k
+            }
+        }
+        return self.infer_kind(value_id)
     }
 
     func load_enum_or_val(self, anon val: Val, expr_id: int64) -> str {
@@ -4715,24 +4757,16 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
-    func compile_arr_concat(self, lhs_id: int64, rhs_id: int64, lhs_kind: TypeKind, build_lhs: bool) -> Val {
+    // `typed_anchor` is the first operand of a chain typed by where it goes, or 0.
+    func compile_concat(self, lhs_id: int64, rhs_id: int64, kind: TypeKind, typed_anchor: int64) -> Val {
         // Same register discipline as compile_str_concat: rhs may come back
         // in x0 (a call, a slice, a nested concat), so park it before lhs.
-        mut rhs_val = .VImm(value: 0)
-        if build_lhs == false and self.converts_for(rhs_id, kind: lhs_kind) {
-            rhs_val = .VReg(name: self.compile_value_for_kind(rhs_id, expected: lhs_kind))
-        } else {
-            rhs_val = self.compile_expr(rhs_id)
-        }
+        let rhs_val = self.compile_concat_operand(rhs_id, :kind, :typed_anchor)
         let rhs_reg = self.pool.alloc_reg()
         self.mov_to(rhs_val, dest: rhs_reg)
         let rhs_spilled = self.spill_across(rhs_reg)
-        if build_lhs {
-            self.mov_to(.VReg(name: self.compile_value_for_kind(lhs_id, expected: lhs_kind)), dest: "x0")
-        } else {
-            let lhs_val = self.compile_expr(lhs_id)
-            self.mov_to(lhs_val, dest: "x0")
-        }
+        let lhs_val = self.compile_concat_operand(lhs_id, :kind, :typed_anchor)
+        self.mov_to(lhs_val, dest: "x0")
         self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
         self.pool.free_reg(rhs_reg)
@@ -4742,6 +4776,34 @@ type Codegen = struct {
             self.emit("bl _kod_array_concat_new")
         }
         return .VReg(name: "x0")
+    }
+
+    func compile_concat_operand(self, anon value_id: int64, kind: TypeKind, typed_anchor: int64) -> Val {
+        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) {
+            if op is .Add {
+                return self.compile_concat(lhs_id: lhs, rhs_id: rhs, :kind, :typed_anchor)
+            }
+        }
+        if self.is_literal_or_match(value_id) {
+            if self.converts_for(value_id, :kind) {
+                return .VReg(name: self.compile_value_for_kind(value_id, expected: kind))
+            }
+            return self.compile_expr(value_id)
+        }
+        let val = self.compile_expr(value_id)
+        let actual = self.infer_kind(value_id)
+        if actual is .KUnknown {
+            self.report_cannot_infer(value_id, what: "this expression")
+            return val
+        }
+        if self.kinds_compatible(kind, :actual) == false {
+            mut msg = f"error: cannot concatenate `{self.kind_display(kind)}` and `{self.kind_display(actual)}`"
+            if value_id == typed_anchor {
+                msg = f"error: expected `{self.kind_display(kind)}`, got `{self.kind_display(actual)}`"
+            }
+            self.report_error(msg, span: self.p.expr_spans[value_id])
+        }
+        return val
     }
 
     func compile_slice(self, s_id: int64, lo_id: int64, hi_id: int64) -> Val {
@@ -4839,8 +4901,14 @@ type Codegen = struct {
     }
 
     func builds_array_for(self, anon value_id: int64, kind: TypeKind) -> bool {
-        if self.p.exprs[value_id] is .ArrayLit(_elements) {
-            return self.array_needs_conversion(kind)
+        match self.p.exprs[value_id] {
+            .ArrayLit(_elements) -> return self.array_needs_conversion(kind)
+            .Binary(_lhs, op, _rhs) -> {
+                if op is .Add {
+                    return self.array_needs_conversion(kind)
+                }
+            }
+            else none
         }
         return false
     }
@@ -4851,8 +4919,14 @@ type Codegen = struct {
     // it's anything else (variable, call, etc.) we trust the producer
     // already laid it out correctly and just compile in the usual way.
     func compile_typed_array_value(self, anon value_id: int64, expected_elem: TypeKind) -> Val {
-        if self.p.exprs[value_id] is .ArrayLit(elements) {
-            return self.compile_array_lit_typed(elements, :expected_elem)
+        match self.p.exprs[value_id] {
+            .ArrayLit(elements) -> return self.compile_array_lit_typed(elements, :expected_elem)
+            .Binary(lhs, op, rhs) -> {
+                if op is .Add {
+                    return self.compile_concat(lhs_id: lhs, rhs_id: rhs, kind: self.array_kind_of(expected_elem), typed_anchor: self.first_concat_anchor(value_id))
+                }
+            }
+            else none
         }
         return self.compile_expr(value_id)
     }
@@ -6495,16 +6569,7 @@ type Codegen = struct {
                             none -> return .KUnknown
                         }
                     }
-                    .Add -> {
-                        let lhs_kind = self.infer_kind(lhs)
-                        if self.is_literal_or_match(lhs) {
-                            let rhs_kind = self.infer_kind(rhs)
-                            if self.concat_builds_lhs(lhs_id: lhs, :op, :lhs_kind, rhs_id: rhs, :rhs_kind) {
-                                return rhs_kind
-                            }
-                        }
-                        return lhs_kind
-                    }
+                    .Add -> return self.concat_kind(lhs, rhs_id: rhs)
                     .Eq -> return .KBool
                     .Ne -> return .KBool
                     .Lt -> return .KBool
@@ -6897,6 +6962,15 @@ type Codegen = struct {
                     self.check_value_kind(e, expected: elem)
                 }
                 return
+            }
+        }
+        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) {
+            if op is .Add {
+                if self.is_array_kind(expected) {
+                    self.check_value_kind(lhs, :expected)
+                    self.check_value_kind(rhs, :expected)
+                    return
+                }
             }
         }
         if self.p.exprs[value_id] is .MatchExpr(subject, arms) {

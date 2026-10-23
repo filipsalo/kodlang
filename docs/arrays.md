@@ -30,14 +30,14 @@ and `for row in grid { for x in row { ... } }` work, and an element of a
 
 A literal takes its element type from where it goes, at any depth: a
 `let`, an assignment, an argument, a field, an enum payload, a return value
-(including a match arm's), the other operand of an array `+`, or an element
-or `Map` value it's stored as. In `let g: [[Shape]] = [[Sq(s: 3)]]`,
-`shapes += [Sq(s: 4)]`, `[Sq(s: 1)] + shapes` or `return [none, 3]` from a
-`-> [int64?]` function, each struct is boxed as the interface and each value
-wrapped as the optional. In a `[Direction]`,
-`[.North, .South]` builds `Direction` variants even when another enum
-declares variants of those names, and in a `[Maybe[int64]]`,
-`[.Just(value: 1), .Nothing]` builds `Maybe[int64]` ones.
+(including a match arm's), the rest of an array `+` chain (see
+[Concatenation](#concatenation)), or an element or `Map` value it's stored
+as. In `let g: [[Shape]] = [[Sq(s: 3)]]`, `shapes += [Sq(s: 4)]`,
+`[Sq(s: 1)] + shapes` or `return [none, 3]` from a `-> [int64?]` function,
+each struct is boxed as the interface and each value wrapped as the
+optional. In a `[Direction]`, `[.North, .South]` builds `Direction`
+variants even when another enum declares variants of those names, and in a
+`[Maybe[int64]]`, `[.Just(value: 1), .Nothing]` builds `Maybe[int64]` ones.
 
 Arrays, `str` and `bytes` can be indexed, and so can a struct that declares
 an `op_index` method (`Map` does). Element assignment needs an array or a
@@ -78,6 +78,13 @@ Or `+` to produce a new array; neither operand is modified:
 let b: [int64] = [5]
 let c: [int64] = a + b   // [1, 2, 3, 4, 5]; a and b are unchanged
 ```
+
+Every literal and `match` in a chain of `+` is built as the type the whole
+chain goes to, or, without one, as its first operand that isn't a literal or
+`match`. So `[Sq(s: 1)] + [Sq(s: 2)] + shapes` boxes both squares as `Shape`,
+and `let ms: [Maybe[str]] = [.Just(value: "a")] + [.Nothing]` builds
+`Maybe[str]` variants. The other operands must all have that one type:
+`squares + shapes` (a `[Sq]` and a `[Shape]`) and `nums + names` are errors.
 
 `+=` grows the array's buffer geometrically, so appending in a loop is
 amortized O(1) per element. `+` always copies both operands, so
