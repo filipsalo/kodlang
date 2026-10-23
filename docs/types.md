@@ -394,7 +394,9 @@ Outside a fallible function's `return`, a plain value isn't a result:
 
 `Error` is the only type that can follow `or`: `-> int64 or IoError` is a
 parse error. Throw a struct that implements `Error` instead, and recover it
-with a downcast (see below).
+with a downcast (see below). `throw` takes an `Error` value, so throwing an
+enum, an array or an optional is an error, such as
+``expected `Error`, got `Color` ``.
 
 ```kod
 type IoError = struct {

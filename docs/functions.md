@@ -114,6 +114,19 @@ An array value is never converted element by element. With
 calls through a function value, and to the arguments of a method, an
 interface method and `x?.method(...)`.
 
+## Return values
+
+A returned value must have the function's return type, with the same
+conversions as an argument: `func f() -> str { return 5 }` is an error
+(`` expected `str`, got `int64` ``), and so is returning a `[Sq]` variable
+from a `-> [Shape]` function. A `-> none` function returns no value; it
+can end with a bare `return`, `return none`, or `return` of a call that
+itself returns `none`.
+
+In a `-> T or Error` function, a returned `T` becomes a successful result.
+A returned `T or Error` value must have the same `T`, so returning an
+`int64 or Error` from a `-> str or Error` function is an error.
+
 ## `main`
 
 Every executable must define `main`. It can take no arguments or receive the command-line argument list:
