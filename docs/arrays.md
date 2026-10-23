@@ -24,6 +24,10 @@ let third: int64 = nums[2]
 
 Negative indices wrap around: `arr[-1]` is equivalent to `arr[len(arr) - 1]`.
 
+Arrays nest: an element of a `[[int64]]` is an `[int64]`, so `grid[i][j]`
+and `for row in grid { for x in row { ... } }` work, and an element of a
+`[bool]` is a `bool`.
+
 ## Length
 
 ```kod

@@ -48,6 +48,9 @@ type TypeKind = enum {
     // The kind of an expression whose type couldn't be worked out. The
     // miss is reported once; consumers of a KUnknown stay quiet.
     KUnknown
+    KArrayBool
+    // `[[T]]`: `inner` is the kind of the element arrays.
+    KArrayArray(inner: TypeKind)
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -513,11 +516,28 @@ type Codegen = struct {
         self.free_val(val)
     }
 
+    func is_array_kind(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KArray -> return true
+            .KArrayStruct(_elem_idx) -> return true
+            .KArrayEnum(_elem_idx) -> return true
+            .KArrayStr -> return true
+            .KArrayBytes -> return true
+            .KArrayInterface(_elem_idx) -> return true
+            .KArrayOptional(_inner) -> return true
+            .KArrayFunc(_pk, _rk) -> return true
+            .KArrayBool -> return true
+            .KArrayArray(_inner) -> return true
+            else return false
+        }
+    }
+
     func kind_has_unknown(self, anon kind: TypeKind) -> bool {
         match kind {
             .KUnknown -> return true
             .KOptional(inner) -> return self.kind_has_unknown(inner)
             .KArrayOptional(inner) -> return self.kind_has_unknown(inner)
+            .KArrayArray(inner) -> return self.kind_has_unknown(inner)
             .KStruct(_idx, type_args) -> {
                 for ta in type_args {
                     if self.kind_has_unknown(ta) {
@@ -1965,6 +1985,8 @@ type Codegen = struct {
                 return f"[{self.kind_display(.KFunc(:param_kinds, :return_kind))}]"
             }
             .KUnknown -> return "<unknown>"
+            .KArrayBool -> return "[bool]"
+            .KArrayArray(inner) -> return f"[{self.kind_display(inner)}]"
         }
     }
 
@@ -2089,6 +2111,8 @@ type Codegen = struct {
                 return f"arr${self.canonical_kind_name(.KFunc(:param_kinds, :return_kind))}"
             }
             .KUnknown -> return "unknown"
+            .KArrayBool -> return "arrbool"
+            .KArrayArray(inner) -> return f"arrarr${self.canonical_kind_name(inner)}"
         }
     }
 
@@ -2187,7 +2211,11 @@ type Codegen = struct {
 
     // The kind of an array whose elements have kind `elem`.
     func array_kind_of(self, anon elem: TypeKind) -> TypeKind {
+        if self.is_array_kind(elem) {
+            return .KArrayArray(inner: elem)
+        }
         match elem {
+            .KBool -> return .KArrayBool
             .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
             .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
             .KStr -> return .KArrayStr
@@ -3464,19 +3492,7 @@ type Codegen = struct {
         let ptr_r = self.load(ptr_v)
         let idx_r = self.load(idx_v)
         mut result = self.pool.alloc_reg()
-        mut array_like = false
-        match lhs_kind {
-            .KArray -> array_like = true
-            .KArrayStruct(elem_idx) -> array_like = true
-            .KArrayEnum(elem_idx) -> array_like = true
-            .KArrayStr -> array_like = true
-            .KArrayBytes -> array_like = true
-            .KArrayInterface(elem_idx) -> array_like = true
-            .KArrayOptional(inner_kind) -> array_like = true
-            .KArrayFunc(_pk, _rk) -> array_like = true
-            else none
-        }
-        if array_like {
+        if self.is_array_kind(lhs_kind) {
             // Normalise negative index: if idx < 0, idx += len.
             let pos_lbl = self.fresh("Lidx_pos")
             let len_r = self.pool.alloc_reg()
@@ -3733,15 +3749,10 @@ type Codegen = struct {
                 match lhs_kind {
                     .KStr -> return self.compile_str_concat(:lhs_id, :rhs_id)
                     .KBytes -> return self.compile_str_concat(:lhs_id, :rhs_id)
-                    .KArray -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayStruct(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayEnum(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayStr -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayBytes -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayInterface(elem_idx) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayOptional(inner_kind) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
-                    .KArrayFunc(_pk, _rk) -> return self.compile_arr_concat(:lhs_id, :rhs_id)
                     else none
+                }
+                if self.is_array_kind(lhs_kind) {
+                    return self.compile_arr_concat(:lhs_id, :rhs_id)
                 }
             }
             else none
@@ -4885,16 +4896,8 @@ type Codegen = struct {
         // Every array (whatever its element kind) and `str` is a
         // length-prefixed header: the count lives at offset 8 of the
         // pointer. One load covers them all.
-        mut header_len = false
+        mut header_len = self.is_array_kind(kind)
         match kind {
-            .KArray -> header_len = true
-            .KArrayStruct(_elem) -> header_len = true
-            .KArrayEnum(_elem) -> header_len = true
-            .KArrayStr -> header_len = true
-            .KArrayBytes -> header_len = true
-            .KArrayInterface(_elem) -> header_len = true
-            .KArrayOptional(_inner) -> header_len = true
-            .KArrayFunc(_pk, _rk) -> header_len = true
             .KStr -> header_len = true
             .KBytes -> header_len = true
             else none
@@ -5563,33 +5566,18 @@ type Codegen = struct {
                 if len(elements) == 0 {
                     return .KArray
                 }
-                match self.infer_kind(elements[0]) {
-                    .KStruct(idx, _struct_type_args) -> return .KArrayStruct(elem_idx: idx)
-                    .KEnum(idx) -> return .KArrayEnum(elem_idx: idx)
-                    .KStr -> return .KArrayStr
-                    .KBytes -> return .KArrayBytes
-                    .KInterface(idx) -> return .KArrayInterface(elem_idx: idx)
-                    .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
-                    .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
-                    .KUnknown -> return .KUnknown
-                    else return .KArray
-                }
+                return self.array_kind_of(self.infer_kind(elements[0]))
             }
             // Slice preserves the subject's kind — `str[lo..hi]` is `str`,
             // `[T][lo..hi]` is `[T]`.
             .Slice(s, lo, hi) -> {
                 let k = self.infer_kind(s)
+                if self.is_array_kind(k) {
+                    return k
+                }
                 match k {
                     .KStr -> return .KStr
                     .KBytes -> return .KBytes
-                    .KArray -> return .KArray
-                    .KArrayStr -> return .KArrayStr
-                    .KArrayBytes -> return .KArrayBytes
-                    .KArrayStruct(_idx) -> return k
-                    .KArrayEnum(_idx) -> return k
-                    .KArrayInterface(_idx) -> return k
-                    .KArrayOptional(_inner) -> return k
-                    .KArrayFunc(_pk, _rk) -> return k
                     else return .KUnknown
                 }
             }
@@ -5712,6 +5700,8 @@ type Codegen = struct {
                             .KArrayInterface(elem_idx) -> return .KInterface(idx: elem_idx)
                             .KArrayOptional(inner_kind) -> return .KOptional(inner: inner_kind)
                             .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
+                            .KArrayBool -> return .KBool
+                            .KArrayArray(inner) -> return inner
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
                                 if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
@@ -6950,6 +6940,8 @@ type Codegen = struct {
             .KArrayInterface(elem_idx) -> elem_kind = .KInterface(idx: elem_idx)
             .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
             .KArrayFunc(param_kinds, return_kind) -> elem_kind = .KFunc(:param_kinds, :return_kind)
+            .KArrayBool -> elem_kind = .KBool
+            .KArrayArray(inner) -> elem_kind = inner
             else none
         }
         self.update_var_kind(:name, kind: elem_kind)
