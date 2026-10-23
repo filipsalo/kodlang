@@ -254,7 +254,10 @@ if v is .Some(x) {
 Destructure with an early-exit on the non-matching case. The `else`
 block must exit the enclosing scope (return / throw / panic, or
 break / continue in a loop) so the bindings are guaranteed-in-scope
-below:
+below. A block that can reach its end is an error. It may end in an
+`if`/`else` or a `match` whose every branch exits, and a panic is
+`kod_panic(...)` or a call to a function that doesn't return, as for
+match arms above:
 
 ```kod
 let .Some(v) = m.get(key) else { return -1 }
