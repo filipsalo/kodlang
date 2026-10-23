@@ -856,15 +856,19 @@ class Interpreter:
 
     def _map_dict_key(self, value):
         """Turn a Kod value into a hashable Python key for the Map fast
-        path. Bytes/int/bool participate in value equality; everything
-        else falls back to identity (matches the compiled side's pointer
-        equality for non-interned structured keys)."""
+        path, equal exactly when `==` holds: str/bytes by content,
+        int/bool by value, enums by variant; everything else falls back
+        to identity (the compiled side's pointer equality)."""
         if isinstance(value, types.String):
             return ("str", value.value)
+        if isinstance(value, types.Bytes):
+            return ("bytes", value.value)
         if isinstance(value, types.Int64):
             return ("int", value.value)
         if isinstance(value, types.Bool):
             return ("bool", value.value)
+        if isinstance(value, types.EnumValue):
+            return ("enum", id(value.enum_type), value.variant_name)
         return ("id", id(value))
 
     def _map_py_dict(self, map_instance) -> dict:
@@ -912,15 +916,17 @@ class Interpreter:
 
     def _hash_value(self, value) -> "types.Int64":
         """Hash a Kod value to an int64. Used to implement the `hash(x)`
-        intrinsic. Content-based for primitives; pointer-id for anything
-        else (matches the compiled-side identity hash for non-interned
-        struct keys)."""
+        intrinsic. Content-based for primitives, by variant for enums;
+        pointer-id for anything else (matches the compiled-side identity
+        hash for struct keys)."""
         if isinstance(value, types.Int64):
             return types.Int64(value.value)
         if isinstance(value, types.Bool):
             return types.Int64(1 if value.value else 0)
-        if isinstance(value, types.String):
+        if isinstance(value, (types.String, types.Bytes)):
             return types.Int64(hash(value.value))
+        if isinstance(value, types.EnumValue):
+            return types.Int64(hash((id(value.enum_type), value.variant_name)))
         return types.Int64(id(value))
 
     def _coerce_to_str(self, module, value):

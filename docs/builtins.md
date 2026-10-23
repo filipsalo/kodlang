@@ -64,6 +64,12 @@ match m.get("a") {
 print(len(m).to_str())   // 2
 ```
 
+A lookup finds the entry whose key is `==` to the one it's given, so key
+equality depends on the key type: `str` and `bytes` keys match by
+content, `int64` and `bool` keys by value, enum keys by variant (like
+`==`, ignoring any payload), and struct keys by identity, so only the
+same struct value finds its entry again.
+
 ## Error handling
 
 | Name | Description |
