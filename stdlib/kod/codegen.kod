@@ -504,9 +504,111 @@ type Codegen = struct {
         return false
     }
 
-    func report_if_unknown(self, anon expr_id: int64) -> none {
-        if self.infer_kind(expr_id) is .KUnknown {
+    // Conditions and `and`/`or` operands must be bool; there's no truthiness.
+    func check_bool(self, anon expr_id: int64, need: str, optional_hint: str) -> none {
+        let k = self.infer_kind(expr_id)
+        if k is .KBool {
+            return
+        }
+        if k is .KUnknown {
             self.report_cannot_infer(expr_id, what: "this expression")
+            return
+        }
+        // An error inside the expression usually explains its kind.
+        if self.report_attempts > self.stmt_error_mark {
+            return
+        }
+        mut msg = f"error: {need}, got `{self.kind_display(k)}`"
+        if k is .KOptional(_inner) {
+            msg = msg + optional_hint
+        }
+        self.report_once(msg, span: self.p.expr_spans[expr_id])
+    }
+
+    func op_symbol(self, anon op: ast.Op) -> str {
+        match op {
+            .Add -> return "+"
+            .Sub -> return "-"
+            .Mul -> return "*"
+            .Div -> return "/"
+            .Mod -> return "%"
+            .Eq -> return "=="
+            .Ne -> return "!="
+            .Lt -> return "<"
+            .Le -> return "<="
+            .Gt -> return ">"
+            .Ge -> return ">="
+            .And -> return "and"
+            .Or -> return "or"
+            .BitAnd -> return "&"
+            .BitOr -> return "|"
+            .BitXor -> return "^"
+            .Shl -> return "<<"
+            .Shr -> return ">>"
+            else return "?"
+        }
+    }
+
+    // Arithmetic, bitwise and ordering operators reject bool operands, and
+    // `==`/`!=` don't compare a bool with anything but a bool.
+    func check_bool_operands(self, lhs_id: int64, op: ast.Op, rhs_id: int64, lhs_kind: TypeKind) -> none {
+        let rhs_kind = self.infer_kind(rhs_id)
+        mut lhs_bool = false
+        if lhs_kind is .KBool {
+            lhs_bool = true
+        }
+        mut rhs_bool = false
+        if rhs_kind is .KBool {
+            rhs_bool = true
+        }
+        if lhs_bool == false and rhs_bool == false {
+            return
+        }
+        mut equality = false
+        if op is .Eq {
+            equality = true
+        }
+        if op is .Ne {
+            equality = true
+        }
+        if equality {
+            if lhs_bool and rhs_bool {
+                return
+            }
+            // Comparing with `none` has its own error.
+            if lhs_kind is .KOptional(_inner) {
+                return
+            }
+            if rhs_kind is .KOptional(_inner) {
+                return
+            }
+            self.report_once(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`", span: self.p.expr_spans[lhs_id])
+            return
+        }
+        mut bad = lhs_id
+        if lhs_bool == false {
+            bad = rhs_id
+        }
+        let sym = self.op_symbol(op)
+        mut msg = f"error: `{sym}` doesn't take `bool` operands"
+        if self.p.exprs[bad] is .Binary(_l, inner_op, _r) {
+            if self.is_comparison_op(inner_op) {
+                let cmp = self.op_symbol(inner_op)
+                msg = f"{msg}; `{cmp}` binds tighter than `{sym}`, so write `(a {sym} b) {cmp} c`"
+            }
+        }
+        self.report_once(msg, span: self.p.expr_spans[bad])
+    }
+
+    func is_comparison_op(self, anon op: ast.Op) -> bool {
+        match op {
+            .Eq -> return true
+            .Ne -> return true
+            .Lt -> return true
+            .Le -> return true
+            .Gt -> return true
+            .Ge -> return true
+            else return false
         }
     }
 
@@ -3619,13 +3721,13 @@ type Codegen = struct {
         let done = self.fresh("Land")
         mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
-        self.report_if_unknown(lhs)
+        self.check_bool(lhs, need: "`and` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
         self.emit(f"beq {done}")
         let rhs_val = self.compile_expr(rhs)
-        self.report_if_unknown(rhs)
+        self.check_bool(rhs, need: "`and` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(rhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
@@ -3637,13 +3739,17 @@ type Codegen = struct {
         let done = self.fresh("Lor")
         mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
-        self.report_if_unknown(lhs)
+        mut default_hint = "; did you mean `x? or default`?"
+        if self.p.exprs[lhs] is .Ident(name) {
+            default_hint = f"; did you mean `{name}? or default`?"
+        }
+        self.check_bool(lhs, need: "`or` needs `bool` operands", optional_hint: default_hint)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
         self.emit(f"bne {done}")
         let rhs_val = self.compile_expr(rhs)
-        self.report_if_unknown(rhs)
+        self.check_bool(rhs, need: "`or` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(rhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
@@ -3750,6 +3856,7 @@ type Codegen = struct {
             }
             return .VImm(value: 0)
         }
+        self.check_bool_operands(:lhs_id, :op, :rhs_id, :lhs_kind)
         // Comparing against `none` only makes sense for optional types;
         // for other kinds it would silently compile to `x == 0`.
         mut is_eq_or_ne: bool = false
@@ -6695,6 +6802,7 @@ type Codegen = struct {
     // the surrounding context.
     func compile_assert(self, anon expr_id: int64, source_text: str, span: ast.Span) -> none {
         let val = self.compile_expr(expr_id)
+        self.check_bool(expr_id, need: "`assert` needs a `bool`", optional_hint: "; test it with `is not none`")
         mut reg = self.load(val)
         let ok_lbl = self.fresh("Lassert_ok")
         self.emit(f"cbnz {reg}, {ok_lbl}")
@@ -6966,6 +7074,7 @@ type Codegen = struct {
         let false_lbl = f"{lbl}_false"
         let end_lbl = f"{lbl}_end"
         let cond_val = self.compile_expr(cond_id)
+        self.check_bool(cond_id, need: "an `if` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         let cond_reg = self.load(cond_val)
         self.emit(f"cmp {cond_reg}, #0")
         self.pool.free_reg(cond_reg)
@@ -6994,6 +7103,7 @@ type Codegen = struct {
         self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl)]
         self.emit_label(start_lbl)
         let cond_val = self.compile_expr(cond_id)
+        self.check_bool(cond_id, need: "a `for` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         let cond_reg = self.load(cond_val)
         self.emit(f"cmp {cond_reg}, #0")
         self.pool.free_reg(cond_reg)

@@ -16,6 +16,10 @@ if x > 0 {
 
 The `else` branch is optional. Braces are always required.
 
+The condition must be a `bool`. There's no truthiness, so `if n` on an
+`int64` is an error (write `if n != 0`), and so is `if x` on an optional
+(write `if x is not none`, or `if x is Some(v)` to bind the value).
+
 ## `for` (while-style)
 
 `for` with a condition loops until the condition is false:
@@ -29,6 +33,7 @@ for i < 10 {
 ```
 
 This is Kod's general looping construct. There is no `while` keyword.
+As with `if`, the condition must be a `bool`.
 
 ## `for` / `in` (foreach)
 

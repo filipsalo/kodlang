@@ -101,6 +101,15 @@ Logical operators: `and`, `or`, `not` (prefix). Comparison: `==`, `!=`, `<`, `<=
 Comparisons, `and`/`or` and `is` always produce a `bool`, so `let ok = a < b`
 is a `bool` binding and `f"{a < b}"` prints `true` or `false`.
 
+`bool` and `int64` don't mix, and nothing else stands in for a `bool`. Both
+operands of `and` and `or` must be `bool`, and so must the condition of an
+`if`, a `for` loop and an `assert`: test a number with `n != 0` and an
+optional with `x is not none`. Arithmetic, bitwise and ordering operators
+don't take `bool` operands, and `==`/`!=` compare a `bool` only with
+another `bool`, so `b == 1`, `true + 1` and `if flags & 1` are errors.
+Comparisons bind tighter than `&`, `|` and `^`, so a bit test is written
+`(flags & 1) != 0`.
+
 Chained comparisons are supported Python-style: `a < b < c` evaluates `b` once and is equivalent to `(a < b) and (b < c)`. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
 
 ## `none`
