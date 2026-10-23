@@ -1891,67 +1891,71 @@ type Codegen = struct {
     }
 
 
+    // The kind a bare type name denotes. Inside a specialised method,
+    // type-parameter names (e.g. K, V) map to concrete TypeKinds via the
+    // active substitution context. Unknown names fall back to int64.
+    func resolve_type_name(self, anon name: str) -> TypeKind {
+        mut si = 0
+        for si < len(self.subst_names) {
+            if self.subst_names[si] == name {
+                return self.subst_args[si]
+            }
+            si = si + 1
+        }
+        if name == "int64" {
+            return .KInt64
+        }
+        if name == "bool" {
+            return .KBool
+        }
+        if name == "str" {
+            return .KStr
+        }
+        if name == "bytes" {
+            return .KBytes
+        }
+        if name == "none" {
+            return .KVoid
+        }
+        if self.alias_idx.get(name) is Some(alias_i) {
+            return self.alias_kinds[alias_i]
+        }
+        let enum_idx = self.find_enum_idx(name)
+        if enum_idx >= 0 {
+            return .KEnum(idx: enum_idx)
+        }
+        let struct_idx = self.find_struct_idx(name)
+        if struct_idx >= 0 {
+            return .KStruct(idx: struct_idx, type_args: [])
+        }
+        let iface_idx = self.find_iface_idx(name)
+        if iface_idx >= 0 {
+            return .KInterface(idx: iface_idx)
+        }
+        return .KInt64
+    }
+
+    // The kind of an array whose elements have kind `elem`.
+    func array_kind_of(self, anon elem: TypeKind) -> TypeKind {
+        match elem {
+            .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
+            .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
+            .KStr -> return .KArrayStr
+            .KBytes -> return .KArrayBytes
+            .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
+            .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
+            .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
+            else return .KArray
+        }
+    }
+
     func resolve_type(self, anon type_id: int64) -> TypeKind {
         if type_id == 0 {
             return .KVoid
         }
         match self.p.type_exprs[type_id] {
-            .Named(name) -> {
-                // If we are inside a specialised method, type-parameter
-                // names (e.g. K, V) map to concrete TypeKinds via the
-                // active substitution context.
-                mut si = 0
-                for si < len(self.subst_names) {
-                    if self.subst_names[si] == name {
-                        return self.subst_args[si]
-                    }
-                    si = si + 1
-                }
-                if name == "int64" {
-                    return .KInt64
-                }
-                if name == "bool" {
-                    return .KBool
-                }
-                if name == "str" {
-                    return .KStr
-                }
-                if name == "bytes" {
-                    return .KBytes
-                }
-                if name == "none" {
-                    return .KVoid
-                }
-                if self.alias_idx.get(name) is Some(alias_i) {
-                    return self.alias_kinds[alias_i]
-                }
-                let enum_idx = self.find_enum_idx(name)
-                if enum_idx >= 0 {
-                    return .KEnum(idx: enum_idx)
-                }
-                let struct_idx = self.find_struct_idx(name)
-                if struct_idx >= 0 {
-                    return .KStruct(idx: struct_idx, type_args: [])
-                }
-                let iface_idx = self.find_iface_idx(name)
-                if iface_idx >= 0 {
-                    return .KInterface(idx: iface_idx)
-                }
-                return .KInt64
-            }
-            .Array(inner) -> {
-                let ek = self.resolve_type(inner)
-                match ek {
-                    .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
-                    .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
-                    .KStr -> return .KArrayStr
-                    .KBytes -> return .KArrayBytes
-                    .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
-                    .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
-                    .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
-                    else return .KArray
-                }
-            }
+            .Named(name) -> return self.resolve_type_name(name)
+            .Array(inner) -> return self.array_kind_of(self.resolve_type(inner))
             .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
             .Func(params, return_typ) -> {
                 mut pkinds: [TypeKind] = []
@@ -3786,6 +3790,132 @@ type Codegen = struct {
         return false
     }
 
+    // `Type[A, B]` parses to the left-nested chain Index(Index(Type, A), B).
+    func index_chain_root(self, anon chain_id: int64) -> int64 {
+        let .Binary(lhs, op, _rhs) = self.p.exprs[chain_id] else { return chain_id }
+        let .Index = op else { return chain_id }
+        return self.index_chain_root(lhs)
+    }
+
+    func index_chain_args(self, anon chain_id: int64) -> [int64] {
+        let no_args: [int64] = []
+        let .Binary(lhs, op, rhs) = self.p.exprs[chain_id] else { return no_args }
+        let .Index = op else { return no_args }
+        mut args: [int64] = self.index_chain_args(lhs)
+        args += [rhs]
+        return args
+    }
+
+    // The struct a `Type[A, ...](...)` callee constructs: the instance of the
+    // generic struct for those type arguments. -1 when the chain's root isn't
+    // a struct name. On a bad type argument list the template is returned,
+    // after reporting the error when `report` is set (infer_kind must not).
+    func generic_ctor_instance(self, anon callee_id: int64, report: bool) -> int64 {
+        let .Ident(name) = self.p.exprs[self.index_chain_root(callee_id)] else { return -1 }
+        let template_idx = self.find_struct_idx(name)
+        if template_idx < 0 {
+            return -1
+        }
+        let kinds = self.generic_type_args(callee_id, :name, param_count: len(self.structs[template_idx].type_param_names), :report)
+        if len(kinds) == 0 {
+            return template_idx
+        }
+        return self.instantiate_struct(kinds, :template_idx)
+    }
+
+    // The kinds of a chain's type arguments, checked against the generic's
+    // parameter count. Empty on an error (reported when `report` is set).
+    func generic_type_args(self, anon chain_id: int64, name: str, param_count: int64, report: bool) -> [TypeKind] {
+        let failed: [TypeKind] = []
+        let arg_ids = self.index_chain_args(chain_id)
+        if param_count == 0 {
+            if report {
+                self.report_error(f"error: `{name}` is not generic", span: self.p.expr_spans[chain_id])
+            }
+            return failed
+        }
+        if len(arg_ids) != param_count {
+            if report {
+                mut noun = "type arguments"
+                if param_count == 1 {
+                    noun = "type argument"
+                }
+                self.report_error(f"error: `{name}` expects {param_count} {noun}, got {len(arg_ids)}", span: self.p.expr_spans[chain_id])
+            }
+            return failed
+        }
+        mut kinds: [TypeKind] = []
+        for arg_id in arg_ids {
+            match self.type_kind_of_expr(arg_id, :report) {
+                Some(k) -> kinds += [k]
+                none -> return failed
+            }
+        }
+        return kinds
+    }
+
+    // The type a type-argument expression spells: a type name (optionally
+    // module-qualified), `[T]`, `T?` or a nested `G[A, ...]`. none for
+    // anything else, after reporting it when `report` is set.
+    func type_kind_of_expr(self, anon expr_id: int64, report: bool) -> TypeKind? {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> return self.resolve_type_name(name)
+            .ArrayLit(elements) -> {
+                if len(elements) == 1 {
+                    if self.type_kind_of_expr(elements[0], :report) is Some(elem) {
+                        return self.array_kind_of(elem)
+                    }
+                    return none
+                }
+            }
+            .UnwrapOpt(value, default) -> {
+                if default == 0 {
+                    if self.type_kind_of_expr(value, :report) is Some(inner) {
+                        return .KOptional(:inner)
+                    }
+                    return none
+                }
+            }
+            .Binary(lhs, op, rhs) -> {
+                match op {
+                    .Dot -> {
+                        if self.p.exprs[lhs] is .Ident(_mod) {
+                            if self.p.exprs[rhs] is .Ident(name) {
+                                return self.resolve_type_name(name)
+                            }
+                        }
+                    }
+                    .Index -> {
+                        if self.p.exprs[self.index_chain_root(expr_id)] is .Ident(name) {
+                            let struct_idx = self.find_struct_idx(name)
+                            if struct_idx >= 0 {
+                                let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.structs[struct_idx].type_param_names), :report)
+                                if len(kinds) == 0 {
+                                    return none
+                                }
+                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx), type_args: [])
+                            }
+                            let enum_idx = self.find_enum_idx(name)
+                            if enum_idx >= 0 {
+                                let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.enums[enum_idx].type_param_names), :report)
+                                if len(kinds) == 0 {
+                                    return none
+                                }
+                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx))
+                            }
+                        }
+                    }
+                    else none
+                }
+            }
+            else none
+        }
+        if report {
+            self.report_error("error: unsupported type argument", span: self.p.expr_spans[expr_id])
+        }
+        return none
+    }
+
     // Try `EnumName.Variant(args)` or `module.thing(args)` two-part forms.
     func try_two_part_call(self, anon args: [ast.CallArg], callee_lhs: int64, callee_rhs: int64) -> Val? {
         let .Ident(mod_or_obj) = self.p.exprs[callee_lhs] else { return none }
@@ -3928,18 +4058,12 @@ type Codegen = struct {
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Index -> {
-                        // `Type[A](args)` parses to Call(Binary(Index,
-                        // Ident(Type), Ident(A)), args). When the lhs
-                        // is a known struct name, drop the type arg
-                        // and dispatch as a regular constructor —
-                        // generics are monomorphised inside the call
-                        // path, the type args at the call site are
-                        // pure annotation.
-                        if self.p.exprs[lhs] is .Ident(name) {
-                            let struct_idx = self.find_struct_idx(name)
-                            if struct_idx >= 0 {
-                                return self.compile_struct_construct(args, :struct_idx, span: self.p.expr_spans[callee_id])
-                            }
+                        // `Type[A, B](args)` is a call on an Index chain
+                        // rooted at a struct name: construct the instance
+                        // for those type arguments.
+                        let ctor_idx = self.generic_ctor_instance(callee_id, report: true)
+                        if ctor_idx >= 0 {
+                            return self.compile_struct_construct(args, struct_idx: ctor_idx, span: self.p.expr_spans[callee_id])
                         }
                     }
                     .Dot -> {
@@ -4743,10 +4867,9 @@ type Codegen = struct {
                                 }
                             }
                             .Index -> {
-                                if self.p.exprs[call_lhs] is .Ident(type_name) {
-                                    if self.find_struct_idx(type_name) >= 0 {
-                                        return .KInt64
-                                    }
+                                let ctor_idx = self.generic_ctor_instance(callee, report: false)
+                                if ctor_idx >= 0 {
+                                    return .KStruct(idx: ctor_idx, type_args: [])
                                 }
                             }
                             else none
