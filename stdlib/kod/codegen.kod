@@ -417,6 +417,9 @@ type Codegen = struct {
     alias_idx: FuncIdx = FuncIdx()
     alias_kinds: [TypeKind] = []
 
+    // Keys of the errors report_once has already emitted.
+    reported: FuncIdx = FuncIdx()
+
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
     // surfaces every error rather than stopping at the first.
@@ -426,6 +429,18 @@ type Codegen = struct {
     // to compute line, column, and the surrounding line text — cheap
     // enough for the handful of errors we'd ever report in a single
     // compile.
+    // report_error, once per position and message: default-arg and
+    // field-default exprs compile per call site, generic bodies per instance.
+    func report_once(self, anon msg: str, span: ast.Span) -> none {
+        let key = f"{self.p.path}:{span.start}:{msg}"
+        let seen = self.reported
+        if seen.contains(key) {
+            return
+        }
+        seen.set(key, 1)
+        self.report_error(msg, :span)
+    }
+
     func report_error(self, anon msg: str, span: ast.Span) -> none {
         let source: str = self.p.source
         mut offset: int64 = span.start
@@ -1666,6 +1681,28 @@ type Codegen = struct {
             }
         }
         return false
+    }
+
+    // has_field, reporting an unknown field at `span`.
+    func check_field(self, anon field_name: str, struct_idx: int64, span: ast.Span) -> bool {
+        if self.has_field(field_name, :struct_idx) {
+            return true
+        }
+        mut field_names: [str] = []
+        for f in self.structs[struct_idx].fields {
+            field_names += [f.name]
+        }
+        let msg: str = self.with_suggestion(f"error: struct `{self.structs[struct_idx].name}` has no field `{field_name}`", typo: field_name, candidates: field_names)
+        self.report_once(msg, :span)
+        return false
+    }
+
+    func report_field_on_non_struct(self, anon field_name: str, kind: TypeKind, span: ast.Span) -> none {
+        mut msg: str = f"error: cannot access field `{field_name}` on a value of type `{self.kind_display(kind)}`"
+        if kind is .KOptional(_inner) {
+            msg = f"{msg}. did you mean `?.{field_name}`?"
+        }
+        self.report_once(msg, :span)
     }
 
 
@@ -3094,6 +3131,7 @@ type Codegen = struct {
         if self.try_two_part_unit_variant(dot_lhs: lhs, dot_rhs: rhs) is Some(val) {
             return val
         }
+        let errors_before = len(self.errors)
         let ptr_v = self.compile_expr(lhs)
         let ptr_r = self.load(ptr_v)
         match self.p.exprs[rhs] {
@@ -3101,8 +3139,15 @@ type Codegen = struct {
                 // Resolve the struct via infer_kind so chained accesses
                 // (e.g. obj.field, arr[i].field) work, not just Ident lhs.
                 mut field_off = 0
-                if self.infer_kind(lhs) is .KStruct(struct_idx, _struct_type_args) {
-                    field_off = self.find_field_offset(field_name, :struct_idx)
+                let lhs_kind: TypeKind = self.infer_kind(lhs)
+                if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
+                    if self.check_field(field_name, :struct_idx, span: self.p.expr_spans[rhs]) {
+                        field_off = self.find_field_offset(field_name, :struct_idx)
+                    }
+                } else {
+                    if len(self.errors) == errors_before {
+                        self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs])
+                    }
                 }
                 mut result = self.pool.alloc_reg()
                 self.emit(f"ldr {result}, [{ptr_r}, #{field_off}]")
@@ -5308,14 +5353,7 @@ type Codegen = struct {
         let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
         for arg in field_args {
-            if self.has_field(arg.label, :struct_idx) == false {
-                mut field_names: [str] = []
-                for f in self.structs[struct_idx].fields {
-                    field_names += [f.name]
-                }
-                let msg: str = self.with_suggestion(f"error: struct `{self.structs[struct_idx].name}` has no field `{arg.label}`", typo: arg.label, candidates: field_names)
-                self.report_error(msg, span: arg.label_span)
-            }
+            self.check_field(arg.label, :struct_idx, span: arg.label_span)
             mut foff = self.find_field_offset(arg.label, :struct_idx)
             mut field_kind = self.find_field_kind(arg.label, :struct_idx)
             // Stash ptr_r across the call so it survives any bl in the
@@ -5481,9 +5519,14 @@ type Codegen = struct {
         let .Ident(field_name) = self.p.exprs[rhs] else { return }
         mut foff = 0
         mut field_kind: TypeKind = .KInt64
-        if self.infer_kind(lhs) is .KStruct(struct_idx, _struct_type_args) {
-            foff = self.find_field_offset(field_name, :struct_idx)
-            field_kind = self.find_field_kind(field_name, :struct_idx)
+        mut lhs_is_struct = false
+        let lhs_kind: TypeKind = self.infer_kind(lhs)
+        if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
+            lhs_is_struct = true
+            if self.check_field(field_name, :struct_idx, span: self.p.expr_spans[rhs]) {
+                foff = self.find_field_offset(field_name, :struct_idx)
+                field_kind = self.find_field_kind(field_name, :struct_idx)
+            }
         }
         // Compute rhs first (kind-aware, so an int assigned to an
         // optional field gets wrapped), stash on stack, then compute
@@ -5491,7 +5534,11 @@ type Codegen = struct {
         // can itself hit `bl` (e.g. a method call) and clobber rhs_reg.
         let rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
         let rhs_spilled = self.preserve_begin(rhs_reg)
+        let errors_before = len(self.errors)
         let ptr_val = self.compile_expr(lhs)
+        if len(self.errors) == errors_before and lhs_is_struct == false {
+            self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs])
+        }
         let ptr_reg = self.load(ptr_val)
         let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
         self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
@@ -5974,7 +6021,10 @@ type Codegen = struct {
             self.report_error(f"error: `?.{field}` requires a `T?` value where T is a struct", span: self.p.expr_spans[value_id])
             return .VImm(value: 0)
         }
-        let foff: int64 = self.find_field_offset(field, :struct_idx)
+        mut foff: int64 = 0
+        if self.check_field(field, :struct_idx, span: self.p.expr_spans[value_id]) {
+            foff = self.find_field_offset(field, :struct_idx)
+        }
         let val = self.compile_expr(value_id)
         mut reg = self.load(val)
         let some_lbl = self.fresh("Lopt_dot_some")

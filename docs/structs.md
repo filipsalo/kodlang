@@ -94,6 +94,11 @@ print_int(p.y)
 p.x = p.x + 1
 ```
 
+Reading or assigning a field the struct doesn't declare is an error, with
+a did-you-mean hint when the name is close to a real field. So is `.field`
+on a value that isn't a struct, such as an interface or an optional; for a
+`T?`, use `p?.x`.
+
 ## Methods
 
 Define methods inside the struct body. The first parameter must be `self`:
