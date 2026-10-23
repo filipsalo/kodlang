@@ -6,8 +6,8 @@ User-facing commands:
     kod run <file>       build, then execute
     kod check <file>     compile through codegen; report errors but emit no
                          artifacts (exits non-zero if anything failed)
-    kod test [path]      run the test framework (not yet implemented)
-    kod fmt <file>       format source (not yet implemented)
+    kod test [path]      run `test` blocks in a file, or in every
+                         `*_test.kod` under a directory
 
 Internal/debug commands (subject to change):
     kod _interpret <file>          run via the Python interpreter
@@ -31,10 +31,6 @@ from kod.paths import find_stdlib_path
 
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kod")
-    # Accepted-but-ignored: the standalone typechecker was retired once the
-    # self-hosted codegen began reporting the same errors with spans, so the
-    # flag exists only to keep existing build scripts working.
-    parser.add_argument("--no-type-check", dest="type_check", action="store_false")
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.required = True
@@ -52,11 +48,8 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("file", type=str)
 
-    p = subparsers.add_parser("test", help="run the test framework (TODO)")
+    p = subparsers.add_parser("test", help="run `test` blocks")
     p.add_argument("path", nargs="?", default=".")
-
-    p = subparsers.add_parser("fmt", help="format source (TODO)")
-    p.add_argument("file", type=str)
 
     # Internal/debug commands. Underscore prefix signals "not part of the
     # public surface; shape and existence may change."
@@ -132,18 +125,58 @@ def _open_program(file: str):
 _NATIVE_DELEGATED = {"build", "run", "test", "check"}
 
 
+def _refresh_toolchain(root: Path) -> None:
+    """Rebuild sh_kodc, the stage0 objects and the native driver if any of
+    their sources changed. The up-to-date check (`make -q`) costs ~10 ms.
+    A lock serializes concurrent `kod` invocations so two rebuilds never
+    write the same objects at once."""
+    import fcntl
+    import os
+
+    targets = ["stage1", "kod"]
+    # Don't inherit an outer `make test`'s flags (-B would rebuild on
+    # every call, -j prints jobserver warnings, -i hides failures).
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")
+    }
+    (root / "build").mkdir(exist_ok=True)
+    with open(root / "build" / ".toolchain.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            up_to_date = subprocess.run(
+                ["make", "-s", "-q", *targets], cwd=root, env=env, check=False
+            )
+        except FileNotFoundError:
+            return
+        if up_to_date.returncode == 0:
+            return
+        result = subprocess.run(
+            ["make", "-s", *targets],
+            cwd=root,
+            env=env,
+            stdout=sys.stderr,
+            check=False,
+        )
+    if result.returncode != 0:
+        print("kod: failed to rebuild the toolchain", file=sys.stderr)
+        sys.exit(result.returncode)
+
+
 def _maybe_delegate_to_native() -> int | None:
-    """If `build/apps/kod/kod` exists and the user is invoking one of
-    the subcommands the native binary implements, exec it directly with
-    the same argv. The native path is ~5× faster on cold builds — most
-    of the Python `kod` startup is import+import-cache overhead the
-    native binary doesn't pay. The Python path stays valid as the
-    fallback when the native binary is missing (fresh clone before
-    `make kod`) or when the user has explicitly asked for a Python-only
-    subcommand (anything not in `_NATIVE_DELEGATED`)."""
+    """For the subcommands the native driver implements, exec
+    `build/apps/kod/kod` with the same argv. When run from the repo root,
+    first bring the toolchain up to date. The Python path stays as the
+    fallback when the native binary is missing (e.g. invoked outside the
+    repo root) and for Python-only subcommands (anything not in
+    `_NATIVE_DELEGATED`)."""
     if len(sys.argv) < 2 or sys.argv[1] not in _NATIVE_DELEGATED:
         return None
-    native = Path.cwd() / "build" / "apps" / "kod" / "kod"
+    root = Path.cwd()
+    if (root / "Makefile").exists() and (root / "kodc.kod").exists():
+        _refresh_toolchain(root)
+    native = root / "build" / "apps" / "kod" / "kod"
     if not native.exists():
         return None
     import os
@@ -173,10 +206,6 @@ def main():
         executable = bob.build_test_executable(entry_module)
         result = subprocess.run([executable], check=False)
         return result.returncode
-
-    if args.command == "fmt":
-        print("kod fmt: not yet implemented", file=sys.stderr)
-        return 1
 
     if args.command == "_emit-runtime-main":
         # Delegate to sh_kodc when it's available and fresh — that's the

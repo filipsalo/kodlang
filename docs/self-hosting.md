@@ -17,31 +17,40 @@ The self-hosted compiler `sh_kodc` exists and is the production path. `make stag
 | `stdlib/kod/lexing.kod` | Tokenizer |
 | `stdlib/kod/parsing.kod` | Parser (AST built into a pool of `int64` ids) |
 | `stdlib/kod/ast.kod` | AST node types |
+| `stdlib/kod/regalloc.kod` | Register allocation over the emitted instructions |
 | `stdlib/kod/codegen.kod` | ARM64 assembly emitter |
-| `kodc.kod` | Driver: parses entry + imports, registers types, runs codegen |
-| `stdlib/process.kod`, `stdlib/io.kod`, `stdlib/testing.kod` | Stdlib |
+| `stdlib/kod/build.kod` | Import resolution and whole-program registration |
+| `kodc.kod` | `sh_kodc` entry point: compile a module, emit the `_main` shim |
+| `tools/kod.kod` | The native `kod` driver: build / run / test / check |
 
-`sh_kodc` reads a `.kod` file and emits ARM64 assembly to stdout, plus a few internal subcommands (`_emit-runtime-main`) that grow over time as build steps move out of Python.
+`sh_kodc` reads a `.kod` file and emits ARM64 assembly to stdout, plus a few internal subcommands (`_compile`, `_emit-runtime-main`, `_emit-test-runtime-main`).
 
 ## Build chain
 
 ```
-build/stage0/   shared stdlib objects (arena.o, runtime.o, _builtins.o,
-                _int64.o, _str.o, _bool.o)
-build/stage1/   sh_kodc + its .s/.o, plus runtime_main.{s,o}
+bootstrap/sh_kodc   checked-in sh_kodc snapshot
+build/stage0/       C runtime objects, the always-linked stdlib modules, and the
+                    compiler library shared by sh_kodc and the kod driver
+build/stage1/       sh_kodc + its .s/.o, plus runtime_main.{s,o}
+build/apps/kod/     the native kod driver
 build/apps/<stem>/  per-app outputs + the final executable
 ```
 
-Bootstrap, driven by the `Makefile`:
+Driven by the `Makefile`:
 
-1. **stage0** — the Python interpreter compiles every stdlib module under `stdlib/` to assembly, then assembles them. Slow but only happens once per source change.
-2. **stage1** — for each of `lexing`, `parsing`, `codegen`, `kodc`, the Python interpreter drives `kodc.kod` to emit `.s`, which `as` assembles. `_emit-runtime-main` writes the `_main` shim. `ld` links it all into `build/stage1/sh_kodc`.
-3. After bootstrap, `kod build foo.kod` uses `sh_kodc` to compile each module; the Python interpreter is only used as a fallback if `sh_kodc` is missing or stale.
+1. **stage0**: the checked-in snapshot `bootstrap/sh_kodc` compiles the always-linked stdlib modules and the compiler library to assembly; `as` assembles them and `clang` builds `arena.c` / `runtime.c`.
+2. **stage1**: the snapshot compiles `kodc.kod` and writes the `_main` shim; `ld` links everything into `build/stage1/sh_kodc`. So `sh_kodc` is the *current* compiler sources, compiled by the *snapshot*.
+3. **apps**: `kod build foo.kod` compiles each of the program's modules with `build/stage1/sh_kodc` and links them against `build/stage0/`.
+
+Two consequences: a codegen change reaches user programs right away, but the stage0 stdlib modules keep the snapshot's codegen until `make bootstrap-snapshot` refreshes it. And the compiler sources themselves may only use features the snapshot can compile.
+
+If the snapshot is missing, the Makefile falls back to running `kodc.kod` under the Python interpreter (`make bootstrap-snapshot` forces this path; it takes minutes).
 
 ## What's still Python
 
-- The build orchestrator (`kod/builder.py`) drives `as` / `ld` / `clang` and walks the module graph. Subprocess support in Kod (`process.run` in `stdlib/process.kod`) is the foundation for moving this in; the first step landed (`_emit-runtime-main` is Kod-native).
-- The Python lexer/parser still exists, used by `kod _interpret` and as the entry point that walks imports. `kod build` parses with Python then hands each module to `sh_kodc`; the parse happens twice in practice.
+- `kod/interpreter.py` and the Python lexer/parser: the bootstrap path (`kod _interpret kodc.kod ...`) for when the snapshot can't be used.
+- `kod/builder.py`: the older build orchestrator. From the repo root, `uv run kod build/run/test/check` no longer reach it; the internal subcommands (`_interpret`, `_emit-asm`, `_dump-ast`) still use it to load programs.
+- `kod/__main__.py`: the `uv run kod` entry point. For `build` / `run` / `test` / `check` it refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`.
 
 See `TODO.md` for the running list of Python-deletion work.
 
@@ -58,10 +67,18 @@ See `TODO.md` for the running list of Python-deletion work.
 ## Verifying self-hosting
 
 ```shell
-$ make bootstrap
-$ build/stage1/sh_kodc tests/map.kod > /tmp/sh.s
-$ uv run kod _interpret kodc.kod tests/map.kod > /tmp/py.s
-$ diff /tmp/sh.s /tmp/py.s
+make selfhost-check
 ```
 
-`sh_kodc` and the interpreter-driven `kodc.kod` produce identical assembly. `tests/examples_test.py::test_selfhost_matches_interpreter` runs this check in CI.
+Fixed-point check. `build/stage1/sh_kodc` compiles the compiler into `build/selfhost/stage2/`, that compiler compiles it again into `build/selfhost/stage3/`, and the two sets of assembly must be byte-identical. A miscompile in the compiler that changes its own behavior shows up as a difference. Takes a few seconds; pytest runs it.
+
+`tests/examples_test.py::test_selfhost_matches_interpreter` additionally checks that `sh_kodc` and `kodc.kod` running under the Python interpreter produce identical assembly for a small program, so the bootstrap path stays usable.
+
+### Checking that a compiler refactor changes nothing
+
+```shell
+make asm-diff            # compare against HEAD
+make asm-diff BASE=main  # or any other revision
+```
+
+Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself.

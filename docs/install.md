@@ -26,8 +26,10 @@ The Makefile bootstraps everything from scratch:
 ```shell
 make bootstrap   # clean rebuild of stage0 + stage1 (sh_kodc)
 make stage1      # incremental rebuild
-make test        # run pytest
+make test        # rebuild, then run the full test suite
 ```
+
+`uv run kod build|run|test|check` runs `make stage1 kod` first when invoked from the repo root, so edits to the compiler, the C runtime, or the always-linked stdlib modules are picked up automatically.
 
 ## Running
 

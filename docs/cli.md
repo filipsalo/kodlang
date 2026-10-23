@@ -19,12 +19,13 @@ uv run kod build hello.kod
 
 Build pipeline:
 
-1. Parse all transitively-imported modules.
-2. Emit ARM64 assembly for each module (via `sh_kodc` when available, Python interpreter as fallback during bootstrap).
-3. Assemble each `.s` with `as`.
-4. Compile `stdlib/{arena,runtime}.c` with `clang`.
-5. Generate the `_main` runtime shim that calls the user's `main`.
-6. Link everything with `ld`.
+1. Refresh the toolchain with `make stage1 kod` (a no-op unless the compiler, the C runtime, or an always-linked stdlib module changed). This only happens when `kod` runs from the repo root; invoking `build/apps/kod/kod` directly skips it. If the rebuild fails, `kod` reports it and stops.
+2. Parse the entry and walk its transitive imports. A missing entry file (`path:1:1: error: no such file`) or a missing import (`importer:line:col: error: no such module ...`) is an error.
+3. Compile each module that isn't prebuilt in `build/stage0/` to a `.o` with `sh_kodc _compile`.
+4. Generate and assemble the `_main` runtime shim that calls the user's `main`.
+5. Link everything with `ld` against the prebuilt `build/stage0/` objects.
+
+The native driver (`build/apps/kod/kod`, built from `tools/kod.kod`) runs steps 2–5.
 
 ### `kod run <file>`
 
@@ -56,10 +57,6 @@ Run the full compile pipeline through codegen, report errors, but write no artif
 ```shell
 uv run kod check src/foo.kod
 ```
-
-### `kod fmt <file>`
-
-Not yet implemented.
 
 ## Build outputs
 

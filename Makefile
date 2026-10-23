@@ -10,7 +10,14 @@
 #                         resulting sh_kodc to bootstrap/sh_kodc. Run after
 #                         changes that the checked-in snapshot can no longer
 #                         handle (parser format, runtime ABI, …) and commit.
-#   make test             run pytest
+#   make test             build sh_kodc + the kod driver, then run pytest
+#                         (example programs, every *_test.kod, self-hosting checks)
+#   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
+#                         stage2 compiles it again (stage3); asm must match
+#   make asm-diff [BASE=rev]
+#                         compile every .kod file with sh_kodc built at BASE
+#                         (default HEAD) and with the working tree's; report
+#                         differences. A pure compiler refactor shows none.
 #   make clean-apps       drop build/apps/ (per-app outputs)
 #   make clean            drop build/ entirely (keeps bootstrap/sh_kodc)
 #
@@ -36,17 +43,29 @@ KODC_EMIT_MAIN := $(if $(wildcard $(BOOTSTRAP_SH_KODC)),./$(BOOTSTRAP_SH_KODC) _
 STAGE0 := build/stage0
 STAGE1 := build/stage1
 
+# Always-linked stdlib modules, in link order. Each lowers to
+# $(STAGE0)/_<basename>.o.
+STAGE0_KOD := \
+    stdlib/builtins.kod \
+    stdlib/primitives/int64.kod \
+    stdlib/primitives/str.kod \
+    stdlib/primitives/bool.kod \
+    stdlib/io.kod \
+    stdlib/process.kod \
+    stdlib/time.kod \
+    stdlib/kod/inspect.kod
+
 STAGE0_OBJS := \
     $(STAGE0)/arena.o \
     $(STAGE0)/runtime.o \
-    $(STAGE0)/_builtins.o \
-    $(STAGE0)/_int64.o \
-    $(STAGE0)/_str.o \
-    $(STAGE0)/_bool.o \
-    $(STAGE0)/_io.o \
-    $(STAGE0)/_process.o \
-    $(STAGE0)/_time.o \
-    $(STAGE0)/_inspect.o
+    $(patsubst %,$(STAGE0)/_%.o,$(basename $(notdir $(STAGE0_KOD))))
+
+# Every module compile reads the stage0 sources (builtins generics are
+# monomorphised into each object; io/process/time layouts are imported),
+# so any edit to one recompiles everything — a few seconds. Also depend
+# on the compiler binary itself when KODC is one (not the Python form).
+KODC_DEP := $(wildcard $(patsubst ./%,%,$(firstword $(KODC))))
+KOD_DEPS := $(KODC_DEP) $(STAGE0_KOD)
 
 # Compiler-library .o files shared by `make stage1` (sh_kodc itself)
 # and `make kod` (the native kod driver). Compiled into build/stage0/
@@ -77,7 +96,12 @@ LDFLAGS := -lc -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib -d
 MACOS_VERSION := $(shell sw_vers -productVersion)
 AS := as -target arm64-apple-darwin
 
-.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test clean clean-apps clean-stage1
+.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test selfhost-check asm-diff clean clean-apps clean-stage1
+
+# sh_kodc writes complete-looking assembly even when it reports errors;
+# without this a failed compile leaves a fresh .s that the next make
+# would happily assemble.
+.DELETE_ON_ERROR:
 
 all: stage1
 
@@ -93,9 +117,13 @@ $(KOD_APP)/kod: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)
 	ld -macos_version_min $(MACOS_VERSION) $(LDFLAGS) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o
 
-$(KOD_APP)/_kod.o: tools/kod.kod $(COMPILER_KOD)
+# Two steps (not `_compile`) so the Python-interpreter fallback works.
+$(KOD_APP)/_kod.s: tools/kod.kod $(COMPILER_KOD)
 	mkdir -p $(KOD_APP)
-	$(KODC) _compile $< $@
+	$(KODC) $< > $@
+
+$(KOD_APP)/_kod.o: $(KOD_APP)/_kod.s
+	$(AS) -o $@ $<
 
 $(KOD_APP)/runtime_main.s: tools/kod.kod
 	mkdir -p $(KOD_APP)
@@ -208,6 +236,11 @@ $(STAGE1)/runtime_main.s: kodc.kod
 $(STAGE1)/%.o: $(STAGE1)/%.s
 	$(AS) -o $@ $<
 
+# Extra prerequisites for every .kod lowering above (see KOD_DEPS).
+$(patsubst %.o,%.s,$(filter $(STAGE0)/_%.o,$(STAGE0_OBJS) $(COMPILER_LIB_OBJS))) \
+$(STAGE1)/kodc.s $(KOD_APP)/_kod.s: $(KOD_DEPS)
+$(STAGE1)/runtime_main.s $(KOD_APP)/runtime_main.s: $(KODC_DEP)
+
 bootstrap:
 	rm -rf build
 	$(MAKE) stage1
@@ -228,8 +261,26 @@ bootstrap-snapshot:
 	cp build/stage1/sh_kodc $(BOOTSTRAP_SH_KODC)
 	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Verify, then commit it."
 
-test: stage1
+test: stage1 kod
 	uv run pytest tests/
+
+# Rebuild the whole compiler (stage0 + stage1) twice more, first with the
+# current sh_kodc and then with the result, into scratch dirs. The two
+# rebuilds must emit byte-identical assembly.
+SELFHOST := build/selfhost
+selfhost-check: stage1
+	rm -rf $(SELFHOST)
+	$(MAKE) -s stage1 STAGE0=$(SELFHOST)/stage2/stage0 STAGE1=$(SELFHOST)/stage2/stage1 \
+	    KODC=./$(STAGE1)/sh_kodc KODC_EMIT_MAIN="./$(STAGE1)/sh_kodc _emit-runtime-main"
+	$(MAKE) -s stage1 STAGE0=$(SELFHOST)/stage3/stage0 STAGE1=$(SELFHOST)/stage3/stage1 \
+	    KODC=./$(SELFHOST)/stage2/stage1/sh_kodc KODC_EMIT_MAIN="./$(SELFHOST)/stage2/stage1/sh_kodc _emit-runtime-main"
+	@diff -r -x '*.o' -x sh_kodc $(SELFHOST)/stage2 $(SELFHOST)/stage3 \
+	    || { echo "selfhost-check: stage2 and stage3 assembly differ (see diff above)"; exit 1; }
+	@echo "selfhost-check: stage2 == stage3"
+
+BASE ?= HEAD
+asm-diff:
+	$(PY) tools/asm_diff.py $(BASE)
 
 clean-apps:
 	rm -rf build/apps

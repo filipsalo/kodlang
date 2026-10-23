@@ -121,7 +121,6 @@ class Builder:
                 sys.executable,
                 "-m",
                 "kod",
-                "--no-type-check",
                 "_interpret",
                 str(kodc_path),
                 str(rel_path),
@@ -147,6 +146,8 @@ class Builder:
         sources = [
             root_path / "kodc.kod",
             stdlib_path / "kod" / "codegen.kod",
+            stdlib_path / "kod" / "regalloc.kod",
+            stdlib_path / "kod" / "build.kod",
             stdlib_path / "kod" / "parsing.kod",
             stdlib_path / "kod" / "lexing.kod",
             stdlib_path / "kod" / "ast.kod",
