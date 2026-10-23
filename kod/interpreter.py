@@ -3,6 +3,7 @@
 
 import ctypes
 import dataclasses
+import os
 import sys
 from functools import partial
 from typing import Any
@@ -871,6 +872,9 @@ class Interpreter:
                     return types.String(open(path, "rb").read())
                 except OSError:
                     return types.String(b"")
+            if func.name == "kod_is_file":
+                path = args[0].value.decode("utf8")
+                return types.Int64(1 if os.path.isfile(path) else 0)
             if func.name == "kod_panic":
                 # Mirror the runtime helper: print "panic: <msg>" to
                 # stderr and exit(1). The Python interpreter has no

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -298,6 +299,11 @@ int64_t write_file(KodStr *path, KodStr *content) {
     size_t written = fwrite(content->buf, 1, (size_t)content->len, fp);
     fclose(fp);
     return written == (size_t)content->len ? 0 : -1;
+}
+
+int64_t kod_is_file(KodStr *path) {
+    struct stat st;
+    return stat(path->buf, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 KodStr *read_file(KodStr *path) {

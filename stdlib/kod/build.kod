@@ -67,11 +67,46 @@ func path_to_prefix(anon path: str) -> str {
     return result
 }
 
+// A missing file still yields a parser (over empty source) carrying a
+// "no such file" ParseError, so callers that fold parser errors report it.
 func parse_file(anon path: str) -> parsing.Parser {
-    let source: str = io.read_file(path)
+    let found: bool = io.is_file(path)
+    mut source: str = ""
+    if found {
+        source = io.read_file(path)
+    }
     let lxr: lexing.Lexer = lexing.Lexer(:source, pos: 0, start: 0)
     let tokens: [lexing.Token] = lxr.lex()
-    return parsing.make_parser(tokens, :path, :source)
+    let p: parsing.Parser = parsing.make_parser(tokens, :path, :source)
+    if found == false {
+        p.errors += [parsing.ParseError(:path, line: 1, col: 1, end_col: 2, message: "error: no such file", source_line: "", caret: "")]
+    }
+    return p
+}
+
+// Byte offset of the first `"<module_name>"` in `source`, or 0. Import
+// decls carry no span, so a missing-import error locates the import by
+// its text.
+func import_offset(source: str, module_name: str) -> int64 {
+    let needle: str = "\"" + module_name + "\""
+    let n: int64 = len(needle)
+    mut i: int64 = 0
+    for i + n <= len(source) {
+        if source[i] == '"' and source[i..i+n] == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Print a parser's errors to stderr; true if there were any. For the
+// sh_kodc subcommands that parse without running codegen.
+func report_parse_errors(anon p: parsing.Parser) -> bool {
+    for pe in p.errors {
+        kod_eprint(pe.to_str())
+    }
+    return len(p.errors) > 0
 }
 
 // Resolve an import's module_name to (file_path, codegen_prefix).
@@ -235,6 +270,10 @@ func compile_program(entry_parser: parsing.Parser, entry_module: ast.Module, ent
             ast.Decl.Import(module_name, local_name, _items) -> {
                 if len(module_name) > 0 {
                     let resolved: Resolved = resolve_import(target_path: entry_path, :module_name)
+                    if io.is_file(resolved.file) == false {
+                        let at: int64 = import_offset(source: entry_parser.source, :module_name)
+                        cg.report_error(f"error: no such module `{module_name}` (looked for {resolved.file})", span: ast.Span(start: at))
+                    }
                     let import_parser: parsing.Parser = parse_file(resolved.file)
                     let im: ast.Module = import_parser.parse_module()
                     cg.register_import_module_alias(local_name, prefix: resolved.prefix)
