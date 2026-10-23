@@ -212,8 +212,10 @@ let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
 
 The type arguments of a constructor call pick the instantiation, so
 `let p = Pair[str, int64](first: "hello", second: 42)` needs no annotation.
-A type argument is any type spelling: a name (`str`, `ast.Expr`), `[T]`,
-`T?` or another instantiation (`Map[str, Pair[int64, str]]()`). Passing the
+A type argument is a name (`str`, `ast.Expr`), an array (`[str]`), an
+optional of either (`int64?`, `[str]?`) or another instantiation
+(`Map[str, Pair[int64, str]]()`). Function types (`func(int64) -> str`) and
+optional instantiations (`Pair[str, int64]?`) aren't accepted. Passing the
 wrong number of type arguments, or type arguments to a struct that isn't
 generic, is an error, and so is a `Type[A, B]` that isn't followed by `(`.
 

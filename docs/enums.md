@@ -59,7 +59,27 @@ Unit variants can also use the implicit `.Variant` form in expressions:
 let d: Direction = .North
 ```
 
-Payload variants always require the explicit form at construction time.
+A payload variant can use it too when it goes straight into an annotated
+`let`, as in `let m: Message = .Text(content: "hi")`. Elsewhere, construct
+payload variants with the explicit `Enum.Variant(...)` form.
+
+## Generic enums
+
+Type parameters go in square brackets after the name, as for structs, and
+each instantiation is monomorphised:
+
+```kod
+type Either[L, R] = enum {
+    Left(value: L)
+    Right(value: R)
+}
+
+let e: Either[int64, str] = .Left(value: 1)
+```
+
+Construct a variant with the implicit form into an annotated `let`, as
+above. Type arguments on the enum name, `Either[int64, str].Left(value: 1)`,
+are an error, since type arguments must be followed by `(`.
 
 ## Pattern matching
 
@@ -86,14 +106,15 @@ match m {
 [ offset 8  ] payload      : max(variant payload sizes) bytes
 ```
 
-Variants are assigned discriminants in declaration order starting from 0.
+Variants are assigned discriminants in declaration order starting from 1.
+Discriminant 0 is reserved as the `none` sentinel.
 
 ### Example: `Message`
 
 ```
-Message.Quit  → discriminant 0, no payload
-Message.Text  → discriminant 1, content at payload offset 0  (8 bytes)
-Message.Move  → discriminant 2, x at offset 0, y at offset 8 (16 bytes)
+Message.Quit  → discriminant 1, no payload
+Message.Text  → discriminant 2, content at payload offset 0  (8 bytes)
+Message.Move  → discriminant 3, x at offset 0, y at offset 8 (16 bytes)
 ```
 
 Total size: 8 (discriminant) + 16 (max payload) = **24 bytes**.
