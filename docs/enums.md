@@ -58,6 +58,10 @@ match d {
 }
 ```
 
+The variant must belong to the subject's enum: `.Up` in a `match` on a
+`Direction` that has no `Up` is an error, even when another enum declares
+`Up`.
+
 Unit variants can also use the implicit `.Variant` form in expressions:
 
 ```kod
