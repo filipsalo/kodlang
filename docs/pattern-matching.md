@@ -229,8 +229,8 @@ enum is named without type arguments, and the bindings take the value's
 payload types: on a `Maybe[int64]`, `Maybe.Just(n)` binds an `int64`.
 
 Any other variant pattern needs an enum value. On a `Color?`, `.Red` is an
-error rather than a test that never matches: match `.Some(c)` first, or
-unwrap it with `x?`. Likewise `.Some` and `.None` need an optional, and
+error rather than a test that never matches: unwrap it first with `x?`, or
+match `.Some(c)`. Likewise `.Some` and `.None` need an optional, and
 `.Ok` and `.Err` a `T or Error`.
 
 A bare `is` also tests an enum value's variant without binding its

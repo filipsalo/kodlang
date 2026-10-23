@@ -642,11 +642,7 @@ type Codegen = struct {
                 return
             }
         }
-        mut shown = "x"
-        if self.p.exprs[bad] is .Ident(name) {
-            shown = name
-        }
-        let hint = f"; unwrap it first with `{shown}?` or `{shown}? or default`"
+        let hint = self.unwrap_hint(bad)
         if equality {
             self.report_error(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`{hint}", span: self.p.expr_spans[bad])
             return
@@ -704,17 +700,30 @@ type Codegen = struct {
     }
 
     // The tail of a "cannot index / slice / assign an element of" error.
-    func index_error_note(self, anon kind: TypeKind, method: str) -> str {
+    func index_error_note(self, anon kind: TypeKind, method: str, value_id: int64) -> str {
         match kind {
             .KStruct(_idx, _type_args) -> {
                 if len(method) > 0 {
                     return f"; it has no `{method}` method"
                 }
             }
-            .KOptional(_inner) -> return "; unwrap it with `?` first"
+            .KOptional(_inner) -> return self.unwrap_hint(value_id)
             else none
         }
         return ""
+    }
+
+    // How a hint spells `expr_id` when it suggests unwrapping it.
+    func unwrap_name(self, anon expr_id: int64) -> str {
+        if self.p.exprs[expr_id] is .Ident(name) {
+            return name
+        }
+        return "x"
+    }
+
+    func unwrap_hint(self, anon expr_id: int64) -> str {
+        let name = self.unwrap_name(expr_id)
+        return f"; unwrap it first with `{name}?` or `{name}? or default`"
     }
 
     func either_unknown(self, anon a: TypeKind, anon b: TypeKind) -> bool {
@@ -1008,11 +1017,7 @@ type Codegen = struct {
         let inner = self.optional_inner(kind)
         if inner is .KEnum(_inner_idx) {
             if kind is .KOptional(_k) {
-                mut unwrap = "`?`"
-                if self.p.exprs[subject_id] is .Ident(name) {
-                    unwrap = f"`{name}?`"
-                }
-                self.report_error(f"error: {target} matches a `{self.kind_display(inner)}`, not a `{shown}`; match `.Some(v)` first, or unwrap it with {unwrap}", :span)
+                self.report_error(f"error: {target} matches a `{self.kind_display(inner)}`, not a `{shown}`{self.unwrap_hint(subject_id)}, or match `.Some(v)`", :span)
                 return false
             }
         }
@@ -1035,11 +1040,7 @@ type Codegen = struct {
         }
         mut hint = ""
         if self.same_kind(self.optional_inner(kind), want) {
-            mut unwrap = "`?`"
-            if self.p.exprs[subject_id] is .Ident(name) {
-                unwrap = f"`{name}?`"
-            }
-            hint = f"; unwrap it first with {unwrap}"
+            hint = self.unwrap_hint(subject_id)
         }
         self.report_error(f"error: cannot match a `{self.kind_display(kind)}` value against a `{self.kind_display(want)}` literal{hint}", span: self.p.expr_spans[subject_id])
         return false
@@ -1977,14 +1978,14 @@ type Codegen = struct {
         return best
     }
 
-    // Build an `error: <msg>. did you mean `<X>`?` message when a
+    // Build an `error: <msg>; did you mean `<X>`?` message when a
     // near-match exists in `candidates`, or just `error: <msg>` when
     // it doesn't. Centralises the suggestion-or-not branch so each
     // call site stays a one-liner.
     func with_suggestion(self, anon msg: str, typo: str, candidates: [str]) -> str {
         mut s: str = self.find_closest(typo, :candidates, max_distance: 2)
         if len(s) > 0 {
-            return f"{msg}. did you mean `{s}`?"
+            return f"{msg}; did you mean `{s}`?"
         }
         return msg
     }
@@ -3818,7 +3819,7 @@ type Codegen = struct {
                         self.report_cannot_infer(lhs, what: "this expression")
                     } else {
                         if self.report_attempts == attempts_before {
-                            self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs], optional_hint: f". did you mean `?.{field_name}`?")
+                            self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs], optional_hint: f"; did you mean `?.{field_name}`?")
                         }
                     }
                 }
@@ -3872,7 +3873,7 @@ type Codegen = struct {
                 self.compile_discard(lhs)
                 self.compile_discard(rhs)
                 if self.kind_has_unknown(lhs_kind) == false {
-                    self.report_error(f"error: cannot index a value of type `{self.kind_display(lhs_kind)}`{self.index_error_note(lhs_kind, method: "op_index")}", span: self.p.expr_spans[lhs])
+                    self.report_error(f"error: cannot index a value of type `{self.kind_display(lhs_kind)}`{self.index_error_note(lhs_kind, method: "op_index", value_id: lhs)}", span: self.p.expr_spans[lhs])
                 }
                 return .VImm(value: 0)
             }
@@ -3966,10 +3967,7 @@ type Codegen = struct {
         let done = self.fresh("Lor")
         mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
-        mut default_hint = "; did you mean `x? or default`?"
-        if self.p.exprs[lhs] is .Ident(name) {
-            default_hint = f"; did you mean `{name}? or default`?"
-        }
+        let default_hint = f"; did you mean `{self.unwrap_name(lhs)}? or default`?"
         self.check_bool(lhs, need: "`or` needs `bool` operands", optional_hint: default_hint)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
@@ -4569,7 +4567,7 @@ type Codegen = struct {
         match k {
             .KOptional(_inner) -> {
                 if self.is_none_kind(k) == false {
-                    note = "; unwrap it first with `x?` or `x? or default`"
+                    note = self.unwrap_hint(expr_id)
                 }
             }
             .KStruct(_idx, _type_args) -> note = f"; `{shown}` has no `to_str` method"
@@ -4644,7 +4642,7 @@ type Codegen = struct {
                     self.compile_discard(hi_id)
                 }
                 if self.kind_has_unknown(s_kind) == false {
-                    self.report_error(f"error: cannot slice a value of type `{self.kind_display(s_kind)}`{self.index_error_note(s_kind, method: "")}", span: self.p.expr_spans[s_id])
+                    self.report_error(f"error: cannot slice a value of type `{self.kind_display(s_kind)}`{self.index_error_note(s_kind, method: "", value_id: s_id)}", span: self.p.expr_spans[s_id])
                 }
                 return .VImm(value: 0)
             }
@@ -7324,7 +7322,7 @@ type Codegen = struct {
         if setter is none {
             if self.is_array_kind(lhs_kind) == false {
                 let shown = self.kind_display(lhs_kind)
-                mut note = self.index_error_note(lhs_kind, method: "op_index_set")
+                mut note = self.index_error_note(lhs_kind, method: "op_index_set", value_id: lhs)
                 if self.is_str_or_bytes(lhs_kind) {
                     note = f"; `{shown}` values are immutable"
                 }
@@ -7643,7 +7641,7 @@ type Codegen = struct {
             return
         }
         if self.is_some_optional(value_kind) {
-            self.report_error(f"error: returning `{self.kind_display(value_kind)}` from a function that returns `{self.kind_display(self.return_kind)}`; unwrap it with `value?` or `value? or default`", span: self.p.expr_spans[value_id])
+            self.report_error(f"error: returning `{self.kind_display(value_kind)}` from a function that returns `{self.kind_display(self.return_kind)}`{self.unwrap_hint(value_id)}", span: self.p.expr_spans[value_id])
         }
     }
 
