@@ -184,6 +184,11 @@ unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
 `(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
 
+Operators don't look inside an optional. With `n: int64?`, `n == 3`,
+`n < 4` and `n + 1` are errors, and so is comparing a `bool?` such as
+`m.get(key)` with `true`; unwrap first, as in `n? == 3` or
+`(n? or 0) + 1`. Only `== none` and `!= none` compare the optional itself.
+
 ### Optional chaining
 
 On a struct `T?`, `x?.field` and `x?.method(...)` evaluate to an optional
