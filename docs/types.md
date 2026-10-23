@@ -330,6 +330,10 @@ A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)
 `try` and `must` take a `T or Error` value, and `try` only works inside a
 function that returns `T or Error` itself; anything else is an error.
 
+Outside a fallible function's `return`, a plain value isn't a result:
+`let r: int64 or Error = 3` is an error, and
+`let r: int64 or Error = .Ok(value: 3)` is a successful result.
+
 `Error` is the only type that can follow `or`: `-> int64 or IoError` is a
 parse error. Throw a struct that implements `Error` instead, and recover it
 with a downcast (see below).

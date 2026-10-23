@@ -945,7 +945,7 @@ type Codegen = struct {
         mut needs_result: bool = false
         for arm_id in arms {
             let arm = self.p.match_arms[arm_id]
-            let pat = self.p.patterns[arm.pattern]
+            let pat = self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: self.infer_kind(subject_id))
             if pat is .NonePat {
                 needs_optional = true
             }
@@ -1069,7 +1069,7 @@ type Codegen = struct {
             mut has_some: bool = false
             mut has_none: bool = false
             for pid in pattern_ids {
-                let pat = self.p.patterns[pid]
+                let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: subj_kind)
                 if pat is .SomePat(_b) {
                     has_some = true
                 }
@@ -2231,6 +2231,11 @@ type Codegen = struct {
         if info.template_idx < 0 {
             return info.name
         }
+        if self.is_result_enum_idx(idx) and len(info.template_args) == 2 {
+            if self.kind_display(info.template_args[1]) == "Error" {
+                return f"{self.kind_display(info.template_args[0])} or Error"
+            }
+        }
         return self.instance_display(self.enums[info.template_idx].name, args: info.template_args)
     }
 
@@ -3178,7 +3183,8 @@ type Codegen = struct {
 
     // Kinds of the bindings named by pattern_binding_names, given the
     // subject's kind. Unknown payloads fall back to .KInt64.
-    func pattern_binding_kinds(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
+    func pattern_binding_kinds(self, anon subject_pat: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
+        let pattern = self.subject_pattern(subject_pat, :subject_kind)
         let count = len(self.pattern_binding_names(pattern))
         mut kinds: [TypeKind] = []
         if count == 0 {
@@ -3929,11 +3935,8 @@ type Codegen = struct {
     func is_pattern_name(self, anon expr_id: int64) -> str {
         match self.p.exprs[expr_id] {
             .Ident(name) -> return name
-            .Call(callee, _args) -> {
-                if self.p.exprs[callee] is .Ident(name) {
-                    return name
-                }
-            }
+            .ImplicitVariant(name) -> return name
+            .Call(callee, _args) -> return self.is_pattern_name(callee)
             else none
         }
         return ""
@@ -4000,9 +4003,14 @@ type Codegen = struct {
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
         self.emit(f"cmp {reg}, #0")
-        match self.p.exprs[rhs] {
-            .NoneLit -> self.emit(f"cset {reg}, {cond_match}")
-            else self.emit(f"cset {reg}, {cond_no_match}")
+        mut tests_none = self.is_pattern_name(rhs) == "None"
+        if self.p.exprs[rhs] is .NoneLit {
+            tests_none = true
+        }
+        if tests_none {
+            self.emit(f"cset {reg}, {cond_match}")
+        } else {
+            self.emit(f"cset {reg}, {cond_no_match}")
         }
         return .VReg(name: reg)
     }
@@ -5741,7 +5749,7 @@ type Codegen = struct {
         for i < len(arms) {
             let arm = self.p.match_expr_arms[arms[i]]
             let skip_lbl = self.fresh("Lmexpr_skip")
-            match self.p.patterns[arm.pattern] {
+            match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
@@ -6494,7 +6502,11 @@ type Codegen = struct {
         if self.is_none_kind(actual) {
             shown = "none"
         }
-        self.report_once(f"error: expected `{self.kind_display(expected)}`, got `{shown}`", span: self.p.expr_spans[value_id])
+        mut hint = ""
+        if self.is_result_kind(expected) and self.kinds_compatible(self.result_inner_kind(expected), :actual) {
+            hint = "; write `.Ok(value: ...)` for a successful result"
+        }
+        self.report_once(f"error: expected `{self.kind_display(expected)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
     }
 
     // Compile `value_id` into a register, applying any kind-specific
@@ -7283,15 +7295,8 @@ type Codegen = struct {
     // the caller the optional's cell instead of the value.
     func check_optional_return(self, anon value_id: int64) -> none {
         mut target = self.return_kind
-        mut shown = self.kind_display(self.return_kind)
         if self.is_result_kind(self.return_kind) {
             target = self.result_inner_kind(self.return_kind)
-            let args = self.enums[self.enum_idx_of_kind(self.return_kind)].template_args
-            if len(args) == 2 {
-                if self.kind_display(args[1]) == "Error" {
-                    shown = f"{self.kind_display(target)} or Error"
-                }
-            }
         }
         match target {
             .KOptional(_ret_inner) -> return
@@ -7303,7 +7308,7 @@ type Codegen = struct {
             return
         }
         if self.is_some_optional(value_kind) {
-            self.report_error(f"error: returning `{self.kind_display(value_kind)}` from a function that returns `{shown}`; unwrap it with `value?` or `value? or default`", span: self.p.expr_spans[value_id])
+            self.report_error(f"error: returning `{self.kind_display(value_kind)}` from a function that returns `{self.kind_display(self.return_kind)}`; unwrap it with `value?` or `value? or default`", span: self.p.expr_spans[value_id])
         }
     }
 
@@ -7871,8 +7876,12 @@ type Codegen = struct {
 
     // `T?` is a nullable cell, not an Option enum cell: `.Some`/`.None` on it mean SomePat/NonePat.
     func let_else_pattern(self, anon pattern_id: int64, value_id: int64) -> ast.Pattern {
-        let pat = self.p.patterns[pattern_id]
-        let .KOptional(_inner) = self.infer_kind(value_id) else { return pat }
+        return self.subject_pattern(self.p.patterns[pattern_id], subject_kind: self.infer_kind(value_id))
+    }
+
+    // On a `T?` subject, `.Some(v)` and `.None` are its Some and none patterns.
+    func subject_pattern(self, anon pat: ast.Pattern, subject_kind: TypeKind) -> ast.Pattern {
+        let .KOptional(_inner) = subject_kind else { return pat }
         let .ImplicitEnumPat(variant_name, bindings) = pat else { return pat }
         if variant_name == "None" and len(bindings) == 0 {
             return ast.Pattern.NonePat
@@ -8046,7 +8055,7 @@ type Codegen = struct {
         for i < len(arms) {
             let arm = self.p.match_arms[arms[i]]
             let skip_lbl = self.fresh("Lmatch_skip")
-            match self.p.patterns[arm.pattern] {
+            match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     for stmt_id in arm.body {
                         self.compile_stmt(stmt_id)

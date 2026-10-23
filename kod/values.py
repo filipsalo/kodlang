@@ -337,6 +337,10 @@ class EnumVariantConstructor:
         self.field_names = field_names
 
     def __call__(self, *args):
+        name = getattr(self.enum_type, "name", "")
+        if (name == "Result" or name.startswith("Result[")) and len(args) == 1:
+            # A Result variant is the same value a fallible call produces.
+            return ResultValue(self.variant_name == "Ok", args[0])
         fields = dict(zip(self.field_names, args))
         return EnumValue(self.enum_type, self.variant_name, fields)
 

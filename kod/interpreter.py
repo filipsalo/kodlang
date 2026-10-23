@@ -52,7 +52,7 @@ class BoundMethod:
     receiver: Any
 
 
-def _let_else_pattern(pattern, value):
+def _value_pattern(pattern, value):
     """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the
     optional patterns; a `T or Error` is a ResultValue, so `.Ok`/`.Err` mean
     the result patterns."""
@@ -74,6 +74,16 @@ def _let_else_pattern(pattern, value):
         binding = pattern.bindings[0] if pattern.bindings else ""
         return ast.OptionalSomePattern(binding, pattern.span)
     return pattern
+
+
+def _value_arm(arm, value):
+    """`arm` with its pattern read for `value`, as in _value_pattern."""
+    if not isinstance(arm.pattern, ast.ImplicitEnumVariantPattern):
+        return arm
+    pattern = _value_pattern(arm.pattern, value)
+    if pattern is arm.pattern:
+        return arm
+    return dataclasses.replace(arm, pattern=pattern)
 
 
 class Interpreter:
@@ -117,10 +127,13 @@ class Interpreter:
 
     def _is_rhs_name(self, rhs):
         """The callee/identifier name of an `is` right-hand side: "Ok" for
-        `is Ok(v)` or `is Ok`, "Err" for `is Err(e)`, etc. "" otherwise."""
+        `is Ok(v)`, `is Ok` or `is .Ok`, "Err" for `is Err(e)`, etc. ""
+        otherwise."""
         callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
         if isinstance(callee, (ast.Variable, ast.Name)):
             return callee.id
+        if isinstance(callee, ast.ImplicitEnumVariant):
+            return callee.variant_name
         return ""
 
     def _returns_result(self, func):
@@ -130,6 +143,12 @@ class Interpreter:
             fallible = ast.returns_result(func, func.module)
             func.__dict__["_returns_result"] = fallible
         return fallible
+
+    def _is_result_enum(self, enum_type):
+        """True for the stdlib Result enum, template or instance: its values
+        are ResultValues, the same as a fallible call's."""
+        name = getattr(enum_type, "name", "")
+        return name == "Result" or name.startswith("Result[")
 
     def _is_result_value(self, v):
         """True if `v` is already a fallible-result carrier — the legacy
@@ -233,7 +252,7 @@ class Interpreter:
                 # isn't the optional `Some`/`none` marker. Interface values are
                 # the raw struct instance, so this is a class-name check.
                 name = self._is_rhs_name(rhs)
-                if name not in ("", "Some", "Ok", "Err") and not isinstance(
+                if name not in ("", "Some", "None", "Ok", "Err") and not isinstance(
                     rhs, ast.NoneLiteral
                 ):
                     if isinstance(lhs_val, types.NoneType):
@@ -241,7 +260,7 @@ class Interpreter:
                     matches = type(lhs_val).__name__ == name
                     return types.Bool(matches != negate)
                 is_none = isinstance(lhs_val, types.NoneType)
-                if isinstance(rhs, ast.NoneLiteral):
+                if isinstance(rhs, ast.NoneLiteral) or name == "None":
                     return types.Bool(is_none != negate)
                 else:
                     return types.Bool((not is_none) != negate)
@@ -452,6 +471,10 @@ class Interpreter:
                                 evaled = [
                                     self.evaluate_expression(module, a) for a in args
                                 ]
+                                if self._is_result_enum(enum_type) and len(evaled) == 1:
+                                    return types.ResultValue(
+                                        variant_name == "Ok", evaled[0]
+                                    )
                                 fields = {f.id: v for f, v in zip(vinfo.fields, evaled)}
                                 return types.EnumValue(enum_type, variant_name, fields)
                     raise ValueError(f"No enum found with variant .{variant_name}")
@@ -517,6 +540,7 @@ class Interpreter:
             case ast.MatchExpression(subject, arms):
                 value = self.evaluate_expression(module, subject)
                 for arm in arms:
+                    arm = _value_arm(arm, value)
                     if isinstance(arm.pattern, ast.IntegerPattern):
                         if value.value == arm.pattern.value:
                             return self.evaluate_expression(module, arm.body)
@@ -700,6 +724,7 @@ class Interpreter:
             case ast.MatchStatement(expression, arms):
                 value = self.evaluate_expression(module, expression)
                 for arm in arms:
+                    arm = _value_arm(arm, value)
                     if isinstance(arm.pattern, ast.IntegerPattern):
                         if value.value == arm.pattern.value:
                             for stmt in arm.body:
@@ -766,7 +791,7 @@ class Interpreter:
                             break
             case ast.LetElseStatement(pattern, value_expr, else_body):
                 value = self.evaluate_expression(module, value_expr)
-                pattern = _let_else_pattern(pattern, value)
+                pattern = _value_pattern(pattern, value)
                 matched = False
                 if isinstance(
                     pattern, (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern)

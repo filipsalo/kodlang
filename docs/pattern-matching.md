@@ -210,6 +210,10 @@ An optional `else { ... }` runs when the pattern doesn't match.
 Pattern bindings stay scoped to the matching arm — they aren't
 in scope in the `else` block.
 
+On a `T?` value, `.Some(v)` and `.None` are the same patterns as `Some(v)`
+and `none`, here, in a `match` and with a bare `is`. On a `T or Error`
+value, `.Ok(v)` and `.Err(e)` are the same as `Ok(v)` and `Err(e)`.
+
 ```kod
 if v is .Some(x) {
     print_int(x)
