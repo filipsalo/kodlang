@@ -68,6 +68,10 @@ match b {
 }
 ```
 
+A literal pattern needs a value of its own type, so matching a `str`
+against `3` is an error, and so is matching an optional: with
+`n: int64?`, unwrap it first, as in `match n? { 3 -> ... }`.
+
 ### Enum variant (explicit)
 
 ```kod
