@@ -129,6 +129,11 @@ let sub: str = s[2..5]   // bytes at positions 2, 3, 4
 
 Either endpoint may be omitted: `s[..k]` is `s[0..k]` and `s[k..]` is `s[k..len(s)]`. `s[..]` returns a copy.
 
+Both endpoints clamp to `[0, len(s)]`: a negative bound becomes 0 and a bound
+past the end becomes `len(s)`, so `"hello"[3..40]` is `"lo"`. An end before
+the start yields `""`. Unlike indexing, slice bounds never wrap. `bytes`
+slices follow the same rules.
+
 ## Comparison
 
 ```kod

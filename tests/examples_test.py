@@ -171,6 +171,28 @@ def test_kod_test_reports_failures(sh_kodc):
     assert "FAIL canary: this test fails" in result.stdout
 
 
+def test_read_file_pipe(sh_kodc):
+    """io.read_file on a pipe must read to EOF; ftell can't size it."""
+    path = "tests/read_file_stdin.kod"
+    data = b"".join(b"line %06d of piped input\n" % i for i in range(12000))
+    build = subprocess.run(
+        [sys.executable, "-m", "kod", "build", path],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr.decode()
+    for cmd in (
+        [str(ROOT / "build/apps/read_file_stdin/read_file_stdin")],
+        [sys.executable, "-m", "kod", "_interpret", path],
+    ):
+        result = subprocess.run(
+            cmd, cwd=ROOT, input=data, capture_output=True, timeout=30, check=False
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        assert result.stdout == b"%d\n" % len(data) + data + b"\n"
+
+
 @pytest.mark.parametrize(
     "target",
     [

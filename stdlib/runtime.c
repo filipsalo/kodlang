@@ -306,21 +306,42 @@ int64_t kod_is_file(KodStr *path) {
     return stat(path->buf, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// Read until EOF: fseek/ftell can't size pipes and FIFOs.
 KodStr *read_file(KodStr *path) {
     FILE *fp = fopen(path->buf, "rb");
     if (!fp) return kod_empty_str();
-    fseek(fp, 0, SEEK_END);
-    int64_t size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    KodStr *s = kod_str_alloc(size);
-    fread(s->buf, 1, size, fp);
+    size_t cap = 64 * 1024;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    while (buf) {
+        len += fread(buf + len, 1, cap - len, fp);
+        if (len < cap) break;
+        cap *= 2;
+        char *grown = (char *)realloc(buf, cap);
+        if (!grown) free(buf);
+        buf = grown;
+    }
+    int failed = !buf || ferror(fp);
     fclose(fp);
+    if (failed) {
+        free(buf);
+        return kod_empty_str();
+    }
+    KodStr *s = kod_str_alloc((int64_t)len);
+    memcpy(s->buf, buf, len);
+    free(buf);
     return s;
 }
 
+static int64_t clamp_slice(int64_t len, int64_t *start, int64_t end) {
+    if (*start < 0) *start = 0;
+    if (*start > len) *start = len;
+    if (end > len) end = len;
+    return end > *start ? end - *start : 0;
+}
+
 KodStr *kod_str_slice(KodStr *s, int64_t start, int64_t end) {
-    int64_t len = end - start;
-    if (len < 0) len = 0;
+    int64_t len = clamp_slice(s->len, &start, end);
     KodStr *out = kod_str_alloc(len);
     memcpy(out->buf, s->buf + start, len);
     return out;
@@ -515,8 +536,7 @@ KodStr *kod_bytes_to_str(void *b) { return (KodStr *)b; }
 
 void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
     KodArray *src = (KodArray *)src_raw;
-    int64_t len = end - start;
-    if (len < 0) len = 0;
+    int64_t len = clamp_slice(src->len, &start, end);
     KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
     out->ptr = arena_alloc(len > 0 ? len * 8 : 8);
     out->len = len;

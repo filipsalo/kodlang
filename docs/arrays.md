@@ -39,7 +39,9 @@ let suffix: [int64] = nums[3..]  // from index 3 onward
 let copy: [int64] = nums[..]     // shallow copy
 ```
 
-Both endpoints clamp to `[0, len]`; out-of-range bounds yield an empty slice.
+Both endpoints clamp to `[0, len]`: a negative bound becomes 0 and a bound past
+the end becomes `len`, so `[1, 2, 3][1..10]` is `[2, 3]`. An end before the
+start yields an empty slice. Unlike indexing, slice bounds never wrap.
 
 ## Concatenation
 

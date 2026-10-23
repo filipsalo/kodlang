@@ -88,7 +88,8 @@ The `io` module wraps the filesystem primitives. Both calls require
 ```kod
 import "io"
 
-// Read whole file. Returns "" if the file can't be opened.
+// Read the whole file. Pipes and FIFOs (e.g. "/dev/stdin") are read
+// until EOF. Returns "" if the file can't be opened or read.
 let contents: str = io.read_file("data.txt")
 
 // Write a file, replacing it if it exists. Returns 0 on success,
