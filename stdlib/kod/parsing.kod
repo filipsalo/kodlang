@@ -556,6 +556,76 @@ type Parser = struct {
 	}
 
 
+	// The pattern the right-hand side of an `if x is ...` spells, or -1.
+	func pattern_of_expr(self, anon expr_id: int64) -> int64 {
+		let none_bindings: [str] = []
+		match self.exprs[expr_id] {
+			.IntLit(value) -> return self.alloc_pattern(ast.Pattern.IntPat(:value))
+			.StrLit(value) -> return self.alloc_pattern(ast.Pattern.StrPat(:value))
+			.BoolLit(value) -> return self.alloc_pattern(ast.Pattern.BoolPat(:value))
+			.NoneLit -> return self.alloc_pattern(ast.Pattern.NonePat)
+			.ImplicitVariant(name) -> return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, bindings: none_bindings))
+			.Ident(name) -> return self.named_pattern(name, binding: "")
+			.Binary(_lhs, _op, _rhs) -> return self.variant_pattern(expr_id, bindings: none_bindings)
+			.Call(callee, args) -> {
+				mut bindings: [str] = []
+				for arg in args {
+					if len(arg.label) > 0 {
+						return -1
+					}
+					let .Ident(binding) = self.exprs[arg.value] else { return -1 }
+					bindings += [binding]
+				}
+				match self.exprs[callee] {
+					.Ident(name) -> {
+						if len(bindings) > 1 {
+							return -1
+						}
+						mut binding = ""
+						if len(bindings) == 1 {
+							binding = bindings[0]
+						}
+						return self.named_pattern(name, :binding)
+					}
+					.ImplicitVariant(name) -> return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, :bindings))
+					else return self.variant_pattern(callee, :bindings)
+				}
+			}
+			else return -1
+		}
+	}
+
+	// `Some`, `Ok` or `Err` with an optional binding, or a struct type name.
+	func named_pattern(self, anon name: str, binding: str) -> int64 {
+		if name == "Some" {
+			return self.alloc_pattern(ast.Pattern.SomePat(:binding))
+		}
+		if name == "Ok" {
+			return self.alloc_pattern(ast.Pattern.OkPat(:binding))
+		}
+		if name == "Err" {
+			return self.alloc_pattern(ast.Pattern.ErrPat(:binding))
+		}
+		return self.alloc_pattern(ast.Pattern.TypePat(type_name: name, :binding))
+	}
+
+	// `Enum.Variant` or `mod.Enum.Variant` as a pattern, or -1.
+	func variant_pattern(self, anon expr_id: int64, bindings: [str]) -> int64 {
+		let .Binary(lhs, op, rhs) = self.exprs[expr_id] else { return -1 }
+		let .Dot = op else { return -1 }
+		let .Ident(variant_name) = self.exprs[rhs] else { return -1 }
+		match self.exprs[lhs] {
+			.Ident(enum_name) -> return self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings))
+			.Binary(mod_lhs, mod_op, enum_rhs) -> {
+				let .Dot = mod_op else { return -1 }
+				let .Ident(_mod) = self.exprs[mod_lhs] else { return -1 }
+				let .Ident(enum_name) = self.exprs[enum_rhs] else { return -1 }
+				return self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings))
+			}
+			else return -1
+		}
+	}
+
 	func parse_pattern(self) -> int64 {
 		// Integer
 		if self.at(.IntegerLit) {
@@ -1056,7 +1126,7 @@ type Parser = struct {
 		// expressions like `(crc >> 8) ^ table[(crc ^ byte) & 0xff]`
 		// parse without parens.
 		match self.peek_kind() {
-			.KwIs -> return 1
+			.KwIs -> return 7
 			.KwOr -> return 2
 			.KwAnd -> return 3
 			.Pipe -> return 4
@@ -1118,6 +1188,23 @@ type Parser = struct {
 		return self.parse_expr_prec(1)
 	}
 
+	// `is` shares the comparisons' precedence but doesn't chain.
+	func chains(self, anon op: ast.Op) -> bool {
+		match op {
+			.Eq -> return true
+			.Ne -> return true
+			.Lt -> return true
+			.Le -> return true
+			.Gt -> return true
+			.Ge -> return true
+			else return false
+		}
+	}
+
+	func at_chain_op(self) -> bool {
+		return self.bin_op_prec() == 7 and self.peek_kind() != .KwIs
+	}
+
 	func parse_expr_prec(self, anon min_prec: int64) -> int64 {
 		mut lhs: int64 = self.parse_primary()
 		lhs = self.parse_postfix(lhs)
@@ -1132,10 +1219,10 @@ type Parser = struct {
 			// single Chain instead of `((a < b) < c)`. Comparisons live
 			// at precedence 7; if the next token is also a comparison
 			// op, keep collecting operands and operators into one node.
-			if prec == 7 and self.bin_op_prec() == 7 {
+			if self.chains(op) and self.at_chain_op() {
 				mut chain_exprs: [int64] = [lhs, rhs]
 				mut chain_ops: [ast.Op] = [op]
-				for self.bin_op_prec() == 7 {
+				for self.at_chain_op() {
 					let next_op: ast.Op = self.consume_bin_op()
 					let next_rhs: int64 = self.parse_expr_prec(8)
 					chain_exprs += [next_rhs]
@@ -1242,15 +1329,25 @@ type Parser = struct {
 		// if / else. `if expr is Pat { body }` is sugar for a one-arm
 		// match-statement (with bindings from Pat scoped to body).
 		if self.try_consume(.KwIf) {
-			// Parse the condition above the `is` precedence so we can peek
-			// for the pattern-check form.
-			let cond: int64 = self.parse_expr_prec(2)
-			if self.try_consume(.KwIs) {
+			let cond: int64 = self.parse_expr()
+			mut pat: int64 = -1
+			mut negated = false
+			mut subject: int64 = cond
+			if self.exprs[cond] is .Binary(is_lhs, is_op, is_rhs) {
+				match is_op {
+					.Is -> pat = self.pattern_of_expr(is_rhs)
+					.IsNot -> {
+						pat = self.pattern_of_expr(is_rhs)
+						negated = true
+					}
+					else none
+				}
+				subject = is_lhs
+			}
+			if pat >= 0 {
 				// `if x is not Pat { body } else { else_body }` swaps
 				// roles: the body runs when the pattern does NOT match;
 				// any bindings in Pat are scoped to else_body.
-				let negated: bool = self.try_consume(.KwNot)
-				let pat: int64 = self.parse_pattern()
 				mut body: [int64] = self.parse_block()
 				let wild: int64 = self.alloc_pattern(ast.Pattern.Wildcard)
 				// An optional `else { ... }` after the `is`-form populates
@@ -1271,7 +1368,7 @@ type Parser = struct {
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))]
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: wild, body: else_body))]
 				}
-				return self.alloc_stmt(ast.Stmt.MatchStmt(subject: cond, :arms))
+				return self.alloc_stmt(ast.Stmt.MatchStmt(:subject, :arms))
 			}
 			let then_body: [int64] = self.parse_block()
 			mut else_body: [int64] = []

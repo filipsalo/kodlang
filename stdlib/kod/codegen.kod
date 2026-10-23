@@ -3959,6 +3959,12 @@ type Codegen = struct {
             self.report_cannot_infer(lhs, what: "this expression")
             return .VImm(value: 0)
         }
+        let binding = self.is_rhs_binding(rhs)
+        if len(binding) > 0 {
+            self.compile_discard(lhs)
+            self.report_once(f"error: `is` can't bind `{binding}` here; a pattern binds names only as the whole condition of an `if`", span: self.p.expr_spans[rhs])
+            return .VImm(value: 0)
+        }
         // Interface downcast: `e is StructType` — compare the value's vtable
         // (cell offset 8) against the (StructType, iface) vtable's address.
         if lhs_kind is .KInterface(iface_idx) {
@@ -3982,15 +3988,40 @@ type Codegen = struct {
         }
         // `T or Error` result: test the discriminant against Ok's disc.
         if self.is_result_kind(lhs_kind) {
+            let name = self.is_pattern_name(rhs)
+            if name != "Ok" and name != "Err" {
+                self.compile_discard(lhs)
+                self.report_once("error: `is` on a `T or Error` value takes `Ok` or `Err`", span: self.p.expr_spans[rhs])
+                return .VImm(value: 0)
+            }
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
             self.emit(f"ldr {reg}, [{reg}]")
             self.emit(f"cmp {reg}, #{self.result_ok_disc()}")
-            if self.is_pattern_name(rhs) == "Ok" {
+            if name == "Ok" {
                 self.emit(f"cset {reg}, {cond_match}")
             } else {
                 self.emit(f"cset {reg}, {cond_no_match}")
             }
+            return .VReg(name: reg)
+        }
+        if lhs_kind is .KEnum(enum_idx) {
+            let variant_idx = self.ctor_variant_idx(rhs, :enum_idx)
+            if variant_idx < 0 {
+                self.compile_discard(lhs)
+                let name = self.is_pattern_name(rhs)
+                if len(name) > 0 {
+                    self.check_variant(name, :enum_idx, span: self.p.expr_spans[rhs])
+                } else {
+                    self.report_once(f"error: `is` on a `{self.enum_display_name(enum_idx)}` value takes one of its variants", span: self.p.expr_spans[rhs])
+                }
+                return .VImm(value: 0)
+            }
+            let ptr_v = self.compile_expr(lhs)
+            mut reg = self.load(ptr_v)
+            self.emit(f"ldr {reg}, [{reg}]")
+            self.emit(f"cmp {reg}, #{self.enums[enum_idx].variants[variant_idx].discriminant}")
+            self.emit(f"cset {reg}, {cond_match}")
             return .VReg(name: reg)
         }
         mut is_optional: bool = false
@@ -3998,21 +4029,39 @@ type Codegen = struct {
             is_optional = true
         }
         if is_optional == false {
-            self.report_error("error: `is` requires an optional or `T or Error` value", span: self.p.expr_spans[lhs])
+            self.report_error("error: `is` requires an optional, `T or Error`, enum or interface value", span: self.p.expr_spans[lhs])
         }
-        let ptr_v = self.compile_expr(lhs)
-        mut reg = self.load(ptr_v)
-        self.emit(f"cmp {reg}, #0")
         mut tests_none = self.is_pattern_name(rhs) == "None"
         if self.p.exprs[rhs] is .NoneLit {
             tests_none = true
         }
+        if is_optional and tests_none == false and self.is_pattern_name(rhs) != "Some" {
+            self.report_once("error: `is` on an optional takes `none` or `Some`", span: self.p.expr_spans[rhs])
+        }
+        let ptr_v = self.compile_expr(lhs)
+        mut reg = self.load(ptr_v)
+        self.emit(f"cmp {reg}, #0")
         if tests_none {
             self.emit(f"cset {reg}, {cond_match}")
         } else {
             self.emit(f"cset {reg}, {cond_no_match}")
         }
         return .VReg(name: reg)
+    }
+
+    // The first name an `is` pattern would bind, like `v` in `Some(v)`;
+    // `_` and `_name` bind nothing.
+    func is_rhs_binding(self, anon rhs: int64) -> str {
+        if self.p.exprs[rhs] is .Call(_callee, args) {
+            for arg in args {
+                if self.p.exprs[arg.value] is .Ident(name) {
+                    if name[0] != '_' {
+                        return name
+                    }
+                }
+            }
+        }
+        return ""
     }
 
     func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {

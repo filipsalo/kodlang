@@ -214,6 +214,10 @@ On a `T?` value, `.Some(v)` and `.None` are the same patterns as `Some(v)`
 and `none`, here, in a `match` and with a bare `is`. On a `T or Error`
 value, `.Ok(v)` and `.Err(e)` are the same as `Ok(v)` and `Err(e)`.
 
+A bare `is` also tests an enum value's variant without binding its
+payload: `if c is .Red and ready { ... }`, `s is .Circle(_)`. Bindings need
+the `is` to be the whole `if` condition.
+
 ```kod
 if v is .Some(x) {
     print_int(x)

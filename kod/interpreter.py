@@ -144,6 +144,20 @@ class Interpreter:
             func.__dict__["_returns_result"] = fallible
         return fallible
 
+    def _is_rhs_variant(self, rhs):
+        """The variant an `is` right-hand side names: "Red" for `.Red`,
+        `Color.Red` or `.Circle(_)`. "" otherwise."""
+        callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
+        if isinstance(callee, ast.ImplicitEnumVariant):
+            return callee.variant_name
+        if (
+            isinstance(callee, ast.BinaryOperator)
+            and isinstance(callee.op, tokens.Dot)
+            and isinstance(callee.rhs, (ast.Variable, ast.Name))
+        ):
+            return callee.rhs.id
+        return ""
+
     def _is_result_enum(self, enum_type):
         """True for the stdlib Result enum, template or instance: its values
         are ResultValues, the same as a fallible call's."""
@@ -248,6 +262,12 @@ class Interpreter:
                 if isinstance(lhs_val, types.ResultValue):
                     matches = (self._is_rhs_name(rhs) == "Ok") == bool(lhs_val.ok)
                     return types.Bool(matches != negate)
+                variant = self._is_rhs_variant(rhs)
+                if (
+                    isinstance(lhs_val, types.EnumValue)
+                    and variant in lhs_val.enum_type.variants
+                ):
+                    return types.Bool((lhs_val.variant_name == variant) != negate)
                 # Interface downcast: `value is StructType` — a type name that
                 # isn't the optional `Some`/`none` marker. Interface values are
                 # the raw struct instance, so this is a class-name check.
