@@ -63,6 +63,9 @@ class Parser:
         self.program = program
         self.resolve_import = resolve_import  # Callable[[str] -> ast.Module] | None
         self.import_aliases: dict[str, str] = {}  # local_name -> module_name
+        # (TypeDeclaration, target TypeExpr) for aliases whose target is
+        # declared later in the module.
+        self.pending_aliases: list = []
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -341,7 +344,27 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
+        for _decl, type_expr in self.pending_aliases:
+            # Still unresolved: report the unknown target.
+            self.resolve_type_expr(type_expr)
         return ast.Module(self.file, statements, span)
+
+    def resolve_pending_aliases(self) -> None:
+        """Resolve pending aliases whose targets are now declared."""
+        progress = True
+        while progress:
+            progress = False
+            still_pending = []
+            for decl, type_expr in self.pending_aliases:
+                try:
+                    resolved = self.resolve_type_expr(type_expr)
+                except ValueError:
+                    still_pending.append((decl, type_expr))
+                    continue
+                decl.type = resolved
+                self.type_registry[decl.name.id] = resolved
+                progress = True
+            self.pending_aliases = still_pending
 
     def __iter__(self) -> Generator["ast.Statement", None, None]:
         while True:

@@ -219,6 +219,28 @@ show(42)        // works — int64 implements Stringable via primitives/int64.ko
 show(true)      // same for bool
 ```
 
+## Type aliases
+
+`type Name = T` gives an existing type a second name. An alias is
+transparent: a value of the alias type is a value of `T`, with all of its
+methods, fields and operators. The target can be any type, including one
+declared further down the module:
+
+```kod
+type Name = str
+type Ids = [int64]
+type MaybeNode = Node?
+type Callback = func(int64) -> int64
+type StrMap = Map[str, str]
+
+type Node = struct {
+    label: str
+}
+
+let n: Name = "kod"
+print(n.char_count())    // 3
+```
+
 ## Fallible types: `T or Error`
 
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.

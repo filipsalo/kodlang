@@ -411,6 +411,12 @@ type Codegen = struct {
     append_lhs_id: int64 = 0
     append_lhs_path: str = ""
 
+    // Aliases to non-nominal types (`type Name = str`, `type Ids = [int64]`):
+    // name → index into alias_kinds. Struct, enum and interface aliases
+    // live in struct_idx / enum_idx / iface_idx instead.
+    alias_idx: FuncIdx = FuncIdx()
+    alias_kinds: [TypeKind] = []
+
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
     // surfaces every error rather than stopping at the first.
@@ -1916,6 +1922,9 @@ type Codegen = struct {
                 if name == "none" {
                     return .KVoid
                 }
+                if self.alias_idx.get(name) is Some(alias_i) {
+                    return self.alias_kinds[alias_i]
+                }
                 let enum_idx = self.find_enum_idx(name)
                 if enum_idx >= 0 {
                     return .KEnum(idx: enum_idx)
@@ -2270,50 +2279,120 @@ type Codegen = struct {
         }
     }
 
+    // Register the module's `type Name = Target` aliases whose targets
+    // already resolve, repeating so an alias can name a later alias. Runs
+    // before and again after the module's own enums and structs are
+    // registered, so a target may be declared later in the module. `p`
+    // owns the target type_expr ids.
+    func register_type_aliases(self, anon module: ast.Module, p: parsing.Parser) -> none {
+        let saved_p = self.p
+        self.p = p
+        mut names: [str] = []
+        mut targets: [int64] = []
+        for decl in module.decls {
+            if decl is .TypeAlias(name, target) {
+                names += [name]
+                targets += [target]
+            }
+        }
+        mut done: [bool] = []
+        for _n in names {
+            done += [false]
+        }
+        mut progress: bool = true
+        for progress {
+            progress = false
+            mut i: int64 = 0
+            for i < len(names) {
+                if done[i] == false and self.type_resolvable(targets[i]) {
+                    self.register_type_alias(names[i], target: targets[i])
+                    done[i] = true
+                    progress = true
+                }
+                i = i + 1
+            }
+        }
+        self.p = saved_p
+    }
+
+    func register_type_alias(self, anon name: str, target: int64) -> none {
+        let kind: TypeKind = self.resolve_type(target)
+        match kind {
+            .KStruct(idx, _struct_type_args) -> self.struct_idx.set(name, idx)
+            .KEnum(idx) -> self.enum_idx.set(name, idx)
+            .KInterface(idx) -> self.iface_idx.set(name, idx)
+            else {
+                if self.alias_idx.get(name) is Some(i) {
+                    self.alias_kinds[i] = kind
+                } else {
+                    self.alias_idx.set(name, len(self.alias_kinds))
+                    self.alias_kinds += [kind]
+                }
+            }
+        }
+    }
+
+    // True when every type name in the expression is already known, so
+    // resolving it captures no fallback kind.
+    func type_resolvable(self, anon type_id: int64) -> bool {
+        if type_id == 0 {
+            return true
+        }
+        match self.p.type_exprs[type_id] {
+            .Named(name) -> return self.type_name_known(name)
+            .Array(inner) -> return self.type_resolvable(inner)
+            .Optional(inner) -> return self.type_resolvable(inner)
+            .Func(params, return_typ) -> {
+                for param in params {
+                    if self.type_resolvable(param) == false {
+                        return false
+                    }
+                }
+                return self.type_resolvable(return_typ)
+            }
+            .Generic(name, args) -> {
+                if self.find_struct_idx(name) < 0 and self.find_enum_idx(name) < 0 {
+                    return false
+                }
+                for arg in args {
+                    if self.type_resolvable(arg) == false {
+                        return false
+                    }
+                }
+                return true
+            }
+        }
+    }
+
+    func type_name_known(self, anon name: str) -> bool {
+        for sn in self.subst_names {
+            if sn == name {
+                return true
+            }
+        }
+        if name == "int64" or name == "bool" or name == "str" or name == "bytes" or name == "none" {
+            return true
+        }
+        if self.alias_idx.contains(name) {
+            return true
+        }
+        return self.find_enum_idx(name) >= 0 or self.find_struct_idx(name) >= 0 or self.find_iface_idx(name) >= 0
+    }
+
     // Register all struct and enum declarations from another module under the
     // given prefix (e.g. "builtins"). Doesn't emit any code for them — just
     // makes their names and methods visible for label resolution. Interfaces
     // are registered before structs so struct method signatures can reference
     // interface types.
-    // Register a `type Name = OtherType` alias. The target type must
-    // already be known (typically an import or an earlier enum). `p`
-    // is the parser that owns the type_expr arena entry for `target`;
-    // we swap self.p so resolve_type indexes into the right arena.
-    func register_type_alias(self, anon decl: ast.Decl, p: parsing.Parser) -> none {
-        match decl {
-            .TypeAlias(name, target) -> {
-                let saved_p = self.p
-                self.p = p
-                mut kind = self.resolve_type(target)
-                self.p = saved_p
-                match kind {
-                    .KStruct(idx, _struct_type_args) -> {
-                        self.struct_idx.set(name, idx)
-                    }
-                    .KEnum(idx) -> {
-                        self.enum_idx.set(name, idx)
-                    }
-                    else none
-                }
-            }
-            else none
-        }
-    }
-
     func register_module_types(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
         // Phase 1: register interface NAMES (with empty sigs) so they're
         // findable when struct method signatures reference them.
         for decl in module.decls {
             self.register_interface(decl, :prefix, :p)
         }
-        // Phase 2: register type aliases targeting *already-registered*
-        // types (e.g. `type StrMap = Map[str, str]` where Map came from
-        // an imported module). Aliases targeting local enums or structs
-        // would also work as long as they appear after the target in the
-        // source, but in practice this pass handles import aliases.
-        for decl in module.decls {
-            self.register_type_alias(decl, :p)
-        }
+        // Phase 2: register type aliases whose targets are already known
+        // (e.g. `type StrMap = Map[str, str]` with Map from an import).
+        self.register_type_aliases(module, :p)
         // Phase 3: register enums and structs in source order. Order
         // matters here: ast.kod's `Decl` enum has a variant with a
         // `[StructField]` payload, and StructField is a struct defined
@@ -2324,6 +2403,8 @@ type Codegen = struct {
             self.register_enum(decl, :prefix, :p)
             self.register_struct(decl, :prefix, :p)
         }
+        // Phase 3b: aliases naming this module's own enums and structs.
+        self.register_type_aliases(module, :p)
         // Phase 4: now that structs are also registered, resolve the
         // interface method signatures (which may reference struct types).
         for decl in module.decls {
@@ -6416,12 +6497,9 @@ type Codegen = struct {
             self.register_interface(decl, prefix: self.path_prefix, p: self.p)
         }
         // Type aliases come before enum/struct registration so struct
-        // fields and enum variant payload types can use them. Aliases
-        // targeting *local* structs/enums aren't supported here, but we
-        // don't have any such cases in-tree.
-        for decl in module.decls {
-            self.register_type_alias(decl, p: self.p)
-        }
+        // fields and enum variant payload types can use them, and again
+        // after it for aliases naming this module's own types.
+        self.register_type_aliases(module, p: self.p)
         // Interleave enums and structs in source order: a later enum's
         // variant payload may reference an earlier struct (see ast.kod's
         // `Decl.Struct(... fields: [StructField] ...)`), and an earlier
@@ -6433,6 +6511,7 @@ type Codegen = struct {
             self.register_enum(decl, prefix: self.path_prefix, p: self.p)
             self.register_struct(decl, prefix: self.path_prefix, p: self.p)
         }
+        self.register_type_aliases(module, p: self.p)
         for decl in module.decls {
             self.resolve_interface_methods(decl, p: self.p)
         }

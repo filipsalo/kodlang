@@ -778,6 +778,7 @@ class InterfaceDeclaration(ASTNode):
                     continue
                 methods.append(FunctionDeclaration.parse_signature(parser))
         parser.type_registry[name] = types.InterfaceType
+        parser.resolve_pending_aliases()
         return cls(name, methods, span)
 
 
@@ -1554,13 +1555,26 @@ class TypeDeclaration(ASTNode):
             # `KOptional(inner: TypeKind)` inside `type TypeKind = enum {...}`)
             # can resolve the name while their own body is being parsed.
             parser.type_registry[name.id] = types.InterfaceType
-            type_ = parser.parse_type(name.id)
+            type_expr = parser.parse_type_expr(name.id)
             if type_param_names:
+                type_ = parser.resolve_type_expr(type_expr)
                 for p in type_param_names:
                     del parser.type_registry[p]
                 type_ = types.GenericTemplate(name.id, type_param_names, type_)
-        parser.type_registry[name.id] = type_
-        return cls(name, type_, span)
+            else:
+                try:
+                    type_ = parser.resolve_type_expr(type_expr)
+                except ValueError:
+                    # An alias naming a later declaration keeps the
+                    # placeholder until that declaration is parsed.
+                    type_ = None
+        decl = cls(name, type_ or types.InterfaceType, span)
+        if type_ is None:
+            parser.pending_aliases.append((decl, type_expr))
+        else:
+            parser.type_registry[name.id] = type_
+            parser.resolve_pending_aliases()
+        return decl
 
 
 @dataclasses.dataclass
