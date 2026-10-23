@@ -146,7 +146,13 @@ type Pair[A, B] = struct {
 }
 
 let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
+let q = p.swap()    // Pair[int64, str]
 ```
+
+A generic struct or enum may name itself, with any type arguments, in its
+fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
+`Pair[B, A]` above. The Python interpreter (`kod _interpret`) does not
+parse these yet.
 
 The built-in `Map[K, V]` is the canonical example.
 
