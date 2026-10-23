@@ -4144,7 +4144,8 @@ type Codegen = struct {
         if build_rhs == false {
             build_lhs = self.is_eq_ctor_operand(lhs_id, :op, other_kind: rhs_kind0)
         }
-        if build_lhs {
+        let concat_lhs = self.concat_builds_lhs(:lhs_id, :op, :lhs_kind, :rhs_id, rhs_kind: rhs_kind0)
+        if build_lhs or concat_lhs {
             lhs_kind = rhs_kind0
         }
         mut lhs_unknown = false
@@ -4234,7 +4235,7 @@ type Codegen = struct {
                     else none
                 }
                 if self.is_array_kind(lhs_kind) {
-                    return self.compile_arr_concat(:lhs_id, :rhs_id)
+                    return self.compile_arr_concat(:lhs_id, :rhs_id, :lhs_kind, build_lhs: concat_lhs)
                 }
             }
             else none
@@ -4364,6 +4365,14 @@ type Codegen = struct {
             }
         }
         return false
+    }
+
+    // In `[.V] + xs` the literal is built as `xs`'s element kind instead.
+    func concat_builds_lhs(self, lhs_id: int64, op: ast.Op, lhs_kind: TypeKind, rhs_id: int64, rhs_kind: TypeKind) -> bool {
+        if self.builds_for_operand(rhs_id, :op, other_kind: lhs_kind) {
+            return false
+        }
+        return self.builds_for_operand(lhs_id, :op, other_kind: rhs_kind)
     }
 
     func load_enum_or_val(self, anon val: Val, expr_id: int64) -> str {
@@ -4602,12 +4611,11 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
-    func compile_arr_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
+    func compile_arr_concat(self, lhs_id: int64, rhs_id: int64, lhs_kind: TypeKind, build_lhs: bool) -> Val {
         // Same register discipline as compile_str_concat: rhs may come back
         // in x0 (a call, a slice, a nested concat), so park it before lhs.
         mut rhs_val = .VImm(value: 0)
-        let lhs_kind = self.infer_kind(lhs_id)
-        if self.converts_for(rhs_id, kind: lhs_kind) {
+        if build_lhs == false and self.converts_for(rhs_id, kind: lhs_kind) {
             rhs_val = .VReg(name: self.compile_value_for_kind(rhs_id, expected: lhs_kind))
         } else {
             rhs_val = self.compile_expr(rhs_id)
@@ -4615,8 +4623,12 @@ type Codegen = struct {
         let rhs_reg = self.pool.alloc_reg()
         self.mov_to(rhs_val, dest: rhs_reg)
         let rhs_spilled = self.spill_across(rhs_reg)
-        let lhs_val = self.compile_expr(lhs_id)
-        self.mov_to(lhs_val, dest: "x0")
+        if build_lhs {
+            self.mov_to(.VReg(name: self.compile_value_for_kind(lhs_id, expected: lhs_kind)), dest: "x0")
+        } else {
+            let lhs_val = self.compile_expr(lhs_id)
+            self.mov_to(lhs_val, dest: "x0")
+        }
         self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
         self.pool.free_reg(rhs_reg)
@@ -4710,6 +4722,14 @@ type Codegen = struct {
             .KArrayInterface(_idx) -> return true
             .KArrayOptional(_inner) -> return true
             .KArrayArray(inner) -> return self.array_needs_conversion(inner)
+            else return false
+        }
+    }
+
+    func is_literal_or_match(self, anon value_id: int64) -> bool {
+        match self.p.exprs[value_id] {
+            .ArrayLit(_elements) -> return true
+            .MatchExpr(_subject, _arms) -> return true
             else return false
         }
     }
@@ -6371,7 +6391,16 @@ type Codegen = struct {
                             none -> return .KUnknown
                         }
                     }
-                    .Add -> return self.infer_kind(lhs)
+                    .Add -> {
+                        let lhs_kind = self.infer_kind(lhs)
+                        if self.is_literal_or_match(lhs) {
+                            let rhs_kind = self.infer_kind(rhs)
+                            if self.concat_builds_lhs(lhs_id: lhs, :op, :lhs_kind, rhs_id: rhs, :rhs_kind) {
+                                return rhs_kind
+                            }
+                        }
+                        return lhs_kind
+                    }
                     .Eq -> return .KBool
                     .Ne -> return .KBool
                     .Lt -> return .KBool

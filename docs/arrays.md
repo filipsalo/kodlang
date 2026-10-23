@@ -30,10 +30,11 @@ and `for row in grid { for x in row { ... } }` work, and an element of a
 
 A literal takes its element type from where it goes, at any depth: a
 `let`, an assignment, an argument, a field, an enum payload, a return value
-(including a match arm's), or an element or `Map` value it's stored as. In
-`let g: [[Shape]] = [[Sq(s: 3)]]`, `shapes += [Sq(s: 4)]` or
-`return [none, 3]` from a `-> [int64?]` function, each struct is boxed as the
-interface and each value wrapped as the optional. In a `[Direction]`,
+(including a match arm's), the other operand of an array `+`, or an element
+or `Map` value it's stored as. In `let g: [[Shape]] = [[Sq(s: 3)]]`,
+`shapes += [Sq(s: 4)]`, `[Sq(s: 1)] + shapes` or `return [none, 3]` from a
+`-> [int64?]` function, each struct is boxed as the interface and each value
+wrapped as the optional. In a `[Direction]`,
 `[.North, .South]` builds `Direction` variants even when another enum
 declares variants of those names, and in a `[Maybe[int64]]`,
 `[.Just(value: 1), .Nothing]` builds `Maybe[int64]` ones.
