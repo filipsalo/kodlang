@@ -43,6 +43,10 @@ for name in names {
 
 The loop variable is declared implicitly — no `let` needed.
 
+Only arrays can be iterated. `for c in s` over a `str` and `for k in m`
+over a `Map` are errors for now: iterate over `s.code_points()` or
+`m.keys` instead. Iterating over any other kind of value is an error too.
+
 ## `break` and `continue`
 
 Works inside both loop forms:

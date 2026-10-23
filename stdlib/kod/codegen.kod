@@ -532,6 +532,28 @@ type Codegen = struct {
         }
     }
 
+    func is_str_or_bytes(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KStr -> return true
+            .KBytes -> return true
+            else return false
+        }
+    }
+
+    // The tail of a "cannot index / slice / assign an element of" error.
+    func index_error_note(self, anon kind: TypeKind, method: str) -> str {
+        match kind {
+            .KStruct(_idx, _type_args) -> {
+                if len(method) > 0 {
+                    return f"; it has no `{method}` method"
+                }
+            }
+            .KOptional(_inner) -> return "; unwrap it with `?` first"
+            else none
+        }
+        return ""
+    }
+
     func kind_has_unknown(self, anon kind: TypeKind) -> bool {
         match kind {
             .KUnknown -> return true
@@ -1946,17 +1968,17 @@ type Codegen = struct {
             .KArray -> return "[?]"
             .KArrayStr -> return "[str]"
             .KArrayBytes -> return "[bytes]"
-            .KArrayStruct(elem_idx) -> return f"[{self.structs[elem_idx].name}]"
-            .KArrayEnum(elem_idx) -> return f"[{self.enums[elem_idx].name}]"
+            .KArrayStruct(elem_idx) -> return f"[{self.struct_display_name(elem_idx)}]"
+            .KArrayEnum(elem_idx) -> return f"[{self.enum_display_name(elem_idx)}]"
             .KArrayInterface(elem_idx) -> return f"[{self.interfaces[elem_idx].name}]"
             .KArrayOptional(inner_kind) -> return f"[{self.kind_display(inner_kind)}?]"
-            .KEnum(idx) -> return self.enums[idx].name
+            .KEnum(idx) -> return self.enum_display_name(idx)
             .KInterface(idx) -> return self.interfaces[idx].name
             .KOptional(inner) -> return f"{self.kind_display(inner)}?"
             .KStruct(idx, type_args) -> {
                 let base: str = self.structs[idx].name
                 if len(type_args) == 0 {
-                    return base
+                    return self.struct_display_name(idx)
                 }
                 mut result: str = f"{base}["
                 mut i: int64 = 0
@@ -1988,6 +2010,36 @@ type Codegen = struct {
             .KArrayBool -> return "[bool]"
             .KArrayArray(inner) -> return f"[{self.kind_display(inner)}]"
         }
+    }
+
+    // A generic instance reads as `Map[str, int64]`, not its mangled name.
+    func struct_display_name(self, anon idx: int64) -> str {
+        let info = self.structs[idx]
+        if info.template_idx < 0 {
+            return info.name
+        }
+        return self.instance_display(self.structs[info.template_idx].name, args: info.template_args)
+    }
+
+    func enum_display_name(self, anon idx: int64) -> str {
+        let info = self.enums[idx]
+        if info.template_idx < 0 {
+            return info.name
+        }
+        return self.instance_display(self.enums[info.template_idx].name, args: info.template_args)
+    }
+
+    func instance_display(self, anon base: str, args: [TypeKind]) -> str {
+        mut result: str = f"{base}["
+        mut first = true
+        for a in args {
+            if first == false {
+                result = result + ", "
+            }
+            result = result + self.kind_display(a)
+            first = false
+        }
+        return f"{result}]"
     }
 
     // `type Name = struct { field: kind, ... }` — for hover on a
@@ -3487,12 +3539,21 @@ type Codegen = struct {
             }
             else none
         }
+        let array_like = self.is_array_kind(lhs_kind)
+        if array_like == false {
+            if self.is_str_or_bytes(lhs_kind) == false {
+                self.compile_discard(lhs)
+                self.compile_discard(rhs)
+                self.report_once(f"error: cannot index a value of type `{self.kind_display(lhs_kind)}`{self.index_error_note(lhs_kind, method: "op_index")}", span: self.p.expr_spans[lhs])
+                return .VImm(value: 0)
+            }
+        }
         let ptr_v = self.compile_expr(lhs)
         let idx_v = self.compile_expr(rhs)
         let ptr_r = self.load(ptr_v)
         let idx_r = self.load(idx_v)
         mut result = self.pool.alloc_reg()
-        if self.is_array_kind(lhs_kind) {
+        if array_like {
             // Normalise negative index: if idx < 0, idx += len.
             let pos_lbl = self.fresh("Lidx_pos")
             let len_r = self.pool.alloc_reg()
@@ -4066,6 +4127,22 @@ type Codegen = struct {
     }
 
     func compile_slice(self, s_id: int64, lo_id: int64, hi_id: int64) -> Val {
+        let s_kind = self.infer_kind(s_id)
+        if self.is_array_kind(s_kind) == false {
+            mut sliceable = self.is_str_or_bytes(s_kind)
+            if s_kind is .KUnknown {
+                sliceable = true
+            }
+            if sliceable == false {
+                self.compile_discard(s_id)
+                self.compile_discard(lo_id)
+                if hi_id != 0 {
+                    self.compile_discard(hi_id)
+                }
+                self.report_once(f"error: cannot slice a value of type `{self.kind_display(s_kind)}`{self.index_error_note(s_kind, method: "")}", span: self.p.expr_spans[s_id])
+                return .VImm(value: 0)
+            }
+        }
         // Stash each value on the stack so that compile_expr calls (which can
         // issue bl into len/strlen/etc.) don't clobber prior args still held
         // in caller-saved pool registers or in x0.
@@ -6261,9 +6338,24 @@ type Codegen = struct {
             self.compile_discard(rhs_id)
             return
         }
+        let lhs_kind = self.infer_kind(lhs)
         mut setter: str? = none
-        if self.infer_kind(lhs) is .KStruct(struct_idx, _struct_type_args) {
+        if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
             setter = self.struct_index_setter_label(:struct_idx)
+        }
+        if setter is none {
+            if self.is_array_kind(lhs_kind) == false {
+                let shown = self.kind_display(lhs_kind)
+                mut note = self.index_error_note(lhs_kind, method: "op_index_set")
+                if self.is_str_or_bytes(lhs_kind) {
+                    note = f"; `{shown}` values are immutable"
+                }
+                self.compile_discard(lhs)
+                self.compile_discard(rhs)
+                self.compile_discard(rhs_id)
+                self.report_once(f"error: cannot assign to an element of a value of type `{shown}`{note}", span: self.p.expr_spans[lhs])
+                return
+            }
         }
         match setter {
             Some(method_lbl) -> {
@@ -6944,6 +7036,13 @@ type Codegen = struct {
             .KArrayArray(inner) -> elem_kind = inner
             else none
         }
+        mut iterable = self.is_array_kind(iter_kind)
+        if iter_kind is .KUnknown {
+            iterable = true
+        }
+        if iterable == false {
+            elem_kind = .KUnknown
+        }
         self.update_var_kind(:name, kind: elem_kind)
 
         let lbl = self.fresh("Lfe")
@@ -6963,6 +7062,9 @@ type Codegen = struct {
         let arr_val = self.compile_expr(iter_id)
         if iter_kind is .KUnknown {
             self.report_cannot_infer(iter_id, what: "this expression")
+        }
+        if iterable == false {
+            self.report_once(self.foreach_error(iter_kind, iter_id: iter_id), span: self.p.expr_spans[iter_id])
         }
         let hdr_r = self.load(arr_val)
         self.emit_str(hdr_off, reg: hdr_r)
@@ -7016,6 +7118,29 @@ type Codegen = struct {
             j = j + 1
         }
         self.loop_stack = new_stack
+    }
+
+    func foreach_error(self, anon kind: TypeKind, iter_id: int64) -> str {
+        let msg = f"error: cannot iterate over a value of type `{self.kind_display(kind)}`"
+        mut hint = ""
+        if kind is .KStr {
+            hint = ".code_points()"
+        }
+        if kind is .KStruct(idx, _type_args) {
+            let template_idx = self.structs[idx].template_idx
+            if template_idx >= 0 {
+                if self.structs[template_idx].name == "Map" {
+                    hint = ".keys"
+                }
+            }
+        }
+        if len(hint) == 0 {
+            return msg
+        }
+        if self.p.exprs[iter_id] is .Ident(name) {
+            return f"{msg}; iterate over `{name}{hint}` instead"
+        }
+        return f"{msg}; iterate over its `{hint}` instead"
     }
 
     func compile_break(self) -> none {

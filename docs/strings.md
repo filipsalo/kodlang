@@ -121,6 +121,10 @@ Negative indices count from the end:
 let last: int64 = s[-1]
 ```
 
+Strings are immutable, so assigning to an element (`s[0] = 'H'`) is an
+error. A `str` can't be iterated with `for … in` either; iterate over
+`s.code_points()` instead.
+
 ## Slicing
 
 ```kod
