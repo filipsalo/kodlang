@@ -33,7 +33,10 @@ A literal takes its element type from where it goes, at any depth: a
 (including a match arm's), or an element or `Map` value it's stored as. In
 `let g: [[Shape]] = [[Sq(s: 3)]]`, `shapes += [Sq(s: 4)]` or
 `return [none, 3]` from a `-> [int64?]` function, each struct is boxed as the
-interface and each value wrapped as the optional.
+interface and each value wrapped as the optional. In a `[Direction]`,
+`[.North, .South]` builds `Direction` variants even when another enum
+declares variants of those names, and in a `[Maybe[int64]]`,
+`[.Just(value: 1), .Nothing]` builds `Maybe[int64]` ones.
 
 Arrays, `str` and `bytes` can be indexed, and so can a struct that declares
 an `op_index` method (`Map` does). Element assignment needs an array or a
