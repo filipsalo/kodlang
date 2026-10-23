@@ -234,6 +234,8 @@ type Parser = struct {
 	// a default-valued field mid-list would shift every following
 	// arg by one. New default fields go here, never in the middle.
 	line_starts: [int64] = []
+	// Parallel to `type_exprs`: the span of each type's first token.
+	type_spans: [ast.Span] = []
 
 	func peek(self) -> lexing.Token {
 		if self.pos >= len(self.tokens) {
@@ -301,6 +303,10 @@ type Parser = struct {
 	// callers can render parse errors the same way (and the LSP can
 	// publish them as Diagnostics without reformatting).
 	func record_unexpected(self, expected: str, got: lexing.Token) -> none {
+		self.record_error(f"error: expected {expected}, got {lexing.kind_name(got.kind)}", :got)
+	}
+
+	func record_error(self, anon message: str, got: lexing.Token) -> none {
 		let offset: int64 = got.start
 		mut line: int64 = 1
 		mut col: int64 = 1
@@ -348,7 +354,6 @@ type Parser = struct {
 			width = 1
 		}
 		let end_col: int64 = col + width
-		let message: str = f"error: expected {expected}, got {lexing.kind_name(got.kind)}"
 		self.errors += [ParseError(path: self.path, :line, :col, :end_col, :message, source_line: line_text, :caret)]
 	}
 
@@ -380,9 +385,10 @@ type Parser = struct {
 		return id
 	}
 
-	func alloc_type(self, anon tok: ast.TypeExpr) -> int64 {
+	func alloc_type(self, anon tok: ast.TypeExpr, span: ast.Span) -> int64 {
 		mut id: int64 = len(self.type_exprs)
 		self.type_exprs += [tok]
+		self.type_spans += [span]
 		return id
 	}
 
@@ -412,11 +418,12 @@ type Parser = struct {
 
 
 	func parse_type_expr_core(self) -> int64 {
+		let span: ast.Span = self.here()
 		// Array type: [T]
 		if self.try_consume(.OpenBracket) {
 			mut inner: int64 = self.parse_type_expr()
 			self.expect(.CloseBracket)
-			return self.alloc_type(ast.TypeExpr.Array(:inner))
+			return self.alloc_type(ast.TypeExpr.Array(:inner), :span)
 		}
 		// Function type: `func(T1, T2, ...) -> R`. Reuses the `func`
 		// keyword (no `fn` token added) — the `(` immediately after
@@ -434,7 +441,7 @@ type Parser = struct {
 			self.expect(.CloseParen)
 			self.expect(.Arrow)
 			let return_typ: int64 = self.parse_type_expr()
-			return self.alloc_type(ast.TypeExpr.Func(:params, :return_typ))
+			return self.alloc_type(ast.TypeExpr.Func(:params, :return_typ), :span)
 		}
 		// `none` doubles as both the keyword for the absent optional and
 		// the void-return type. The lexer always lex's it as KwNone, so
@@ -454,8 +461,8 @@ type Parser = struct {
 		}
 		// Optional: T?
 		if self.try_consume(.Question) {
-			mut inner: int64 = self.alloc_type(ast.TypeExpr.Named(:name))
-			return self.alloc_type(ast.TypeExpr.Optional(:inner))
+			mut inner: int64 = self.alloc_type(ast.TypeExpr.Named(:name), :span)
+			return self.alloc_type(ast.TypeExpr.Optional(:inner), :span)
 		}
 		// Generic: T[U] or T[U, V, ...]. Codegen monomorphises per
 		// concrete instantiation; preserve every type-argument.
@@ -465,18 +472,20 @@ type Parser = struct {
 				args += [self.parse_type_expr()]
 			}
 			self.expect(.CloseBracket)
-			return self.alloc_type(ast.TypeExpr.Generic(:name, :args))
+			return self.alloc_type(ast.TypeExpr.Generic(:name, :args), :span)
 		}
-		return self.alloc_type(ast.TypeExpr.Named(:name))
+		return self.alloc_type(ast.TypeExpr.Named(:name), :span)
 	}
 
 	func parse_type_expr(self) -> int64 {
+		let span: ast.Span = self.here()
 		mut id: int64 = self.parse_type_expr_core()
 		// Fallible result: `T or Error` desugars to Result[T, Error] — the
 		// unified tagged-sum representation. Only `or Error` is supported;
 		// the umbrella Error interface is the thrown type. Repeated
 		// `(T or Error) or Error` collapses back to the same shape.
 		for self.try_consume(.KwOr) {
+			let err_tok: lexing.Token = self.peek()
 			let err_name: str = self.expect_identifier()
 			if err_name == "Error" {
 				mut already_result: bool = false
@@ -486,9 +495,13 @@ type Parser = struct {
 					}
 				}
 				if already_result == false {
-					let error_id: int64 = self.alloc_type(ast.TypeExpr.Named(name: "Error"))
+					let error_id: int64 = self.alloc_type(ast.TypeExpr.Named(name: "Error"), span: ast.Span(start: err_tok.start))
 					let result_args: [int64] = [id, error_id]
-					id = self.alloc_type(ast.TypeExpr.Generic(name: "Result", args: result_args))
+					id = self.alloc_type(ast.TypeExpr.Generic(name: "Result", args: result_args), :span)
+				}
+			} else {
+				if err_tok.kind is .Identifier {
+					self.record_error(f"error: only `T or Error` is supported, got `or {err_name}`", got: err_tok)
 				}
 			}
 		}
@@ -1644,6 +1657,8 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
 	let expr_spans: [ast.Span] = [ast.Span(start: 0)]
 	mut stmts: [ast.Stmt] = [ast.Stmt.Break]
 	let type_exprs: [ast.TypeExpr] = [ast.TypeExpr.Named(name: "")]
+	let type_spans: [ast.Span] = [ast.Span(start: 0)]
+	let line_starts: [int64] = []
 	let patterns: [ast.Pattern] = [ast.Pattern.Wildcard]
 	let dummy_arm_body: [int64] = []
 	let match_arms: [ast.MatchArm] = [ast.MatchArm(pattern: 0, body: dummy_arm_body)]
@@ -1652,5 +1667,5 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
 	let dummy_body: [int64] = []
 	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", name_span: ast.Span(start: 0), params: dummy_params, return_typ: 0, body: dummy_body, doc: "")]
 	let errors: [ParseError] = []
-	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls, :errors)
+	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls, :errors, :line_starts, :type_spans)
 }

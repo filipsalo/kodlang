@@ -279,6 +279,10 @@ a same-named alias from an imported module.
 
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
 
+`Error` is the only type that can follow `or`: `-> int64 or IoError` is a
+parse error. Throw a struct that implements `Error` instead, and recover it
+with a downcast (see below).
+
 ```kod
 type IoError = struct {
     message: str
