@@ -53,9 +53,7 @@ class BoundMethod:
 
 
 def _value_pattern(pattern, value):
-    """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the
-    optional patterns; a `T or Error` is a ResultValue, so `.Ok`/`.Err` mean
-    the result patterns."""
+    """`pattern` with `.Some`/`.None` and `.Ok`/`.Err` read for `value`'s kind."""
     if isinstance(pattern, ast.EnumVariantPattern):
         if pattern.enum_name not in ("Option", "Result"):
             return pattern
@@ -127,9 +125,7 @@ class Interpreter:
         sys.exit(exit_code.value if exit_code else 0)
 
     def _is_rhs_name(self, rhs):
-        """The callee/identifier name of an `is` right-hand side: "Ok" for
-        `is Ok(v)`, `is Ok` or `is .Ok`, "Err" for `is Err(e)`, etc. ""
-        otherwise."""
+        """The name an `is` right-hand side calls or names: "Ok" for `is .Ok(v)`."""
         callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
         if isinstance(callee, (ast.Variable, ast.Name)):
             return callee.id
@@ -154,8 +150,7 @@ class Interpreter:
         return fallible
 
     def _is_rhs_variant(self, rhs):
-        """The variant an `is` right-hand side names: "Red" for `.Red`,
-        `Color.Red` or `.Circle(_)`. "" otherwise."""
+        """The variant an `is` right-hand side names: "Red" for `Color.Red`."""
         callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
         if isinstance(callee, ast.ImplicitEnumVariant):
             return callee.variant_name
@@ -168,8 +163,7 @@ class Interpreter:
         return ""
 
     def _is_result_enum(self, enum_type):
-        """True for the stdlib Result enum, template or instance: its values
-        are ResultValues, the same as a fallible call's."""
+        """True for the stdlib Result enum, whose values are ResultValues."""
         name = getattr(enum_type, "name", "")
         return name == "Result" or name.startswith("Result[")
 

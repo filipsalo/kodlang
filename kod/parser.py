@@ -371,8 +371,7 @@ class Parser:
             self.pending_aliases = still_pending
 
     def names_pending_alias(self, expr: ast.TypeExpr) -> bool:
-        """True when `expr` names an alias still waiting for its target,
-        whose registry entry is only a placeholder."""
+        """True when `expr` names an alias whose target isn't declared yet."""
         if isinstance(expr, ast.NamedTypeExpr):
             return expr.name in self.pending_alias_names
         if isinstance(expr, ast.ArrayTypeExpr):
