@@ -58,6 +58,10 @@ let q: Point = p        // q and p point to the same object
 q.x = 10               // also modifies p.x
 ```
 
+The same holds for any expression that yields a struct, such as a call, a
+`match` expression, `x? or fallback` or `try f()`: the binding stores the
+pointer the expression produced.
+
 ## Enum values
 
 Enums are **arena-allocated**, like structs. A stack slot holds an 8-byte
