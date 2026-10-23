@@ -116,6 +116,15 @@ let label: str = match d {
 }
 ```
 
+Payload bindings are in scope in the arm's expression:
+
+```kod
+let dist: int64 = match m {
+    .Move(x, y) -> x + y
+    else 0
+}
+```
+
 ## Current limitations
 
 - No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value).

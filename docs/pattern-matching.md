@@ -145,6 +145,16 @@ let label: str = match direction {
 }
 ```
 
+Payload, `Some(x)`, and `Ok(v)` / `Err(e)` bindings are in scope in the
+arm's expression, just as in the statement form:
+
+```kod
+let area: int64 = match shape {
+    Shape.Circle(r)  -> 3 * r * r
+    Shape.Rect(w, h) -> w * h
+}
+```
+
 For multi-statement arm bodies, use a match statement and assign or
 return from inside.
 
