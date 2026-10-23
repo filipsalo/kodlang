@@ -70,6 +70,26 @@ greet(who: "Alice")
 Useful for prepositions that make call sites read naturally without forcing
 short variable names inside the function.
 
+## Default values
+
+Trailing parameters may declare a default with `= expr`, and a call can
+leave them out:
+
+```kod
+func retry(anon n: int64, delay_ms: int64 = 100) -> int64 {
+    return n * delay_ms
+}
+
+retry(3)                  // 300
+retry(3, delay_ms: 500)   // 1500
+```
+
+The default is evaluated fresh at each call that omits it. It is
+evaluated in the module that declares the function and can't see the
+caller's local variables, so a name in it means the same thing at every
+call site. Methods and [interface methods](types.md#interfaces) take
+defaults the same way.
+
 ## `main`
 
 Every executable must define `main`. It can take no arguments or receive the command-line argument list:
