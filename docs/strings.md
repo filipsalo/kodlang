@@ -12,7 +12,21 @@ Strings in Kod are UTF-8 byte sequences. The type is `str`.
 let s: str = "hello, world"
 ```
 
-Standard escape sequences are supported: `\n`, `\t`, `\\`.
+Supported escape sequences:
+
+| Escape | Meaning |
+|--------|---------|
+| `\n` | newline |
+| `\t` | tab |
+| `\r` | carriage return |
+| `\0` | NUL byte |
+| `\\` | backslash |
+| `\"` | double quote |
+| `\'` | single quote |
+
+There are no `\x..` or `\u{...}` escapes yet. For any other escape the
+backslash and the character after it are both dropped, so `"\x41"` is
+`"41"`. Non-ASCII UTF-8 can be written directly in the source.
 
 ## F-strings
 
@@ -41,7 +55,7 @@ Use `+` to concatenate strings, or `+=` to append in place:
 ```kod
 let greeting: str = "hello" + ", " + name + "!"
 
-let buf: str = "lines:\n"
+mut buf: str = "lines:\n"
 buf += "  one\n"
 buf += "  two\n"
 ```
@@ -83,7 +97,7 @@ let asm: str = f"""
     """
 ```
 
-Escape sequences (`\n`, `\t`, `\\`) work the same as regular strings.
+Escape sequences work the same as in regular strings.
 Each content line must be indented at least as far as the closing
 `"""`; a content line with less indent is a lex error.
 

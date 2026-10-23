@@ -1,67 +1,40 @@
 # Roadmap
 
-## Milestone: Self-hosting
+## Where things stand
 
-The primary near-term goal is to implement just enough language features to be able to write
-the Kod compiler in Kod itself. The Python implementation will serve as a bootstrap compiler —
-used to compile the Kod-written compiler, which can then compile itself going forward.
+Kod is self-hosted. `sh_kodc` (lexer, parser, codegen in `stdlib/kod/`, driver in
+`kodc.kod`) compiles every Kod program, including itself, and the native `kod` tool
+(`tools/kod.kod`) drives build / run / test / check. The Python package in `kod/` is the
+bootstrap and fallback path: its interpreter runs `kodc.kod` when no `sh_kodc` exists, and
+its CLI hands off to the native tool once `make kod` has built it.
 
-Feature work should be evaluated against whether it moves the needle toward self-hosting.
-A compiler needs: string manipulation, data structures, heap allocation, file I/O, and a
-sufficient type system.
+The language has structs, enums with payloads, `match` (statement and expression, with
+exhaustiveness checks), generics (monomorphised), interfaces, `T?`, `T or Error` with
+`try` / `must`, function values and non-capturing lambdas, `str` / `bytes` / dynamic arrays,
+and `test` blocks. The stdlib covers file and process I/O, `Map` / `Set`, sorting, time,
+CRC-32, deflate / gzip, a minimal JSON, and LSP-style JSON-RPC framing.
 
-### Remaining blockers
+## Next milestone: networking → HTTP → JSON
 
-- **Arena allocation** — structs and enums are currently stack-allocated with fixed size.
-  Building recursive data structures (like an AST) requires heap allocation. Design: arenas
-  with explicit passing, growing automatically when full. See discussion in code history.
-- **Optional types (`T?`)** — enums are now implemented, so `Optional[T]` as a built-in
-  enum with `Some(T)` / `None` variants is unblocked. Needed for nullable struct fields
-  (e.g. the `else` branch of an `IfStatement` node).
-- **String manipulation** — lexing source code requires character access, slicing, and
-  length. Currently `str` supports concatenation (`+`) but not indexing or slicing.
-- **File I/O** — reading source files requires some form of file access, likely via `extern`
-  bindings to libc (`fopen`, `fread`, etc.) wrapped in a stdlib module.
-- **Enum function arguments** — passing enums to functions requires an extended calling
-  convention (enums are multi-word values). See `docs/enums.md` for details.
-- **Dynamic arrays** — fixed-size arrays exist but a resizable list/array type is needed
-  for token lists, AST node children, etc.
+Grow the stdlib far enough to talk to HTTP services and handle real JSON. In order:
 
+1. **Networking** — TCP sockets (`getaddrinfo`, connect, read, write, close) as runtime
+   externs with a small Kod wrapper. Errors come back as `T or Error`, not panics.
+2. **TLS** — a client-side TLS stream with the same read/write shape as a plain socket,
+   most likely by binding the system TLS library rather than implementing it in Kod.
+3. **HTTP/1.1 client** — request building, status line and header parsing,
+   `Content-Length` and chunked bodies, over either stream type.
+4. **Robust JSON** — parse errors returned as values instead of panics, `\uXXXX` escapes,
+   non-integer numbers, and pretty-printing.
 
-## Pattern matching
+Language work along the way, as these modules need it: `\x` / `\u` string escapes,
+module-level constants (top-level `let` is currently dropped by the parser), and the
+open codegen bugs that this kind of code is most likely to hit.
 
-Basic match statements are implemented (see `docs/enums.md`). Remaining:
+## Later
 
-- Match as expression (currently statement only)
-- Exhaustiveness checking
-- Nested patterns
-- `if let` shorthand for single-variant matching
-
-
-## Type system
-
-- **Optional types** — `T?` as sugar for `Optional[T]` enum (unblocked now that enums exist)
-- **Type inference** — `infer_type` currently handles literals and explicitly annotated
-  variables; needs extending to cover function return types, binary operator results, etc.
-- **Generics** — needed for a proper `Optional[T]`, `List[T]`, etc. Currently types like
-  `ArrayType` and `EnumType` are created dynamically in Python but there is no user-facing
-  generic syntax.
-- Clean up type representation in the AST — `Statement`, `Expression` and similar aliases
-  should be usable as real type hints throughout
-
-
-## Architecture
-
-- Module-level names should be collected earlier in the pipeline, before the typechecker
-  and interpreter each do it independently
-- Modules should probably only contain declarations at the top level — not arbitrary statements
-- The typechecker and compiler share significant logic for resolving names and traversing the
-  AST; consider extracting shared helpers or a visitor base class
-- Consider making AST classes data-only and returning parse methods to the parser
-
-
-## Build process
-
-- Dead code elimination: track which module-level names are accessed; skip compiling
-  unreachable functions and modules
-- Built-in sampling profiler: sample the call stack at regular intervals
+- Pattern matching: nested patterns and guard clauses.
+- Closures that capture enclosing locals.
+- `pub` / private visibility for module members.
+- Dead-code elimination: skip compiling functions nothing reaches.
+- Retire the remaining Python (see `TODO.md`).
