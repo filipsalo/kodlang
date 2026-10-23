@@ -88,7 +88,27 @@ The default is evaluated fresh at each call that omits it. It is
 evaluated in the module that declares the function and can't see the
 caller's local variables, so a name in it means the same thing at every
 call site. Methods and [interface methods](types.md#interfaces) take
-defaults the same way.
+defaults the same way. A default must have its parameter's type, like an
+argument, and is checked at each call that leaves it out.
+
+## Argument types
+
+Each argument must have its parameter's type: `print(5)` is an error
+(`` expected `str`, got `int64` ``), and so is passing a `Gen[int64]` where
+a `Gen[str]` is declared, or an `int64?` where an `int64` is. The only
+implicit conversions are the ones an annotated `let` makes (see
+[Bindings and mutability](types.md#bindings-and-mutability)):
+
+- a `T` becomes a `T?`;
+- a struct, `int64`, `str` or `bool` becomes an interface value;
+- `.Variant` and `Enum.Variant(...)` are built for the parameter's enum;
+- an array literal or `+` chain is built for an array of enums,
+  interfaces, optionals or arrays.
+
+An array value is never converted element by element. With
+`func take(anon xs: [Shape])`, `take([Sq(s: 1)])` is fine, but passing a
+`[Sq]` variable is an error. The same rules apply to extern functions and
+to calls through a function value.
 
 ## `main`
 
