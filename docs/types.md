@@ -4,7 +4,8 @@ icon: lucide/layers
 
 # Types
 
-Kod is statically typed. Every variable and parameter requires a type annotation.
+Kod is statically typed. Every parameter needs a type annotation; a `let`
+without one takes the type of its value.
 
 Naming a type that doesn't exist is an error wherever a type is written:
 an annotation, a parameter or return type, a struct field, an enum payload,
@@ -47,6 +48,11 @@ function type exactly, since a function is never adapted: a function taking
 a struct isn't a `func(SomeInterface) -> ...`, and one returning `int64`
 isn't a `func() -> int64?`. Without an annotation, `let x = none` and
 `let xs = []` are errors, since their type can't be inferred.
+
+Arguments, struct constructor fields, element stores (`xs[i] = v`,
+`m[k] = v`, `m.set(k, v)`) and `return` values aren't checked against their
+declared types yet, apart from the optional cases described below, so a
+value of the wrong type there compiles and misbehaves at run time.
 
 Parameters are immutable too — `mut` makes one reassignable inside the
 body (`mut self` for a method receiver). This is **callee-local**: params
@@ -109,7 +115,8 @@ let flag: bool = true
 let other: bool = false
 ```
 
-Logical operators: `and`, `or`, `not` (prefix). Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`.
+Logical operators: `and`, `or`. There's no prefix `not`; negate a `bool`
+with `b == false`. Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`.
 Comparisons, `and`/`or` and `is` always produce a `bool`, so `let ok = a < b`
 is a `bool` binding and `f"{a < b}"` prints `true` or `false`.
 
@@ -211,7 +218,7 @@ when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
 from a function declared `-> str` or `-> str or Error` is an error, so
 unwrap it first with `t?.name?` or `t?.name? or ""`, or declare the
 function `-> str?`. `t?.name = v` isn't an assignment; unwrap first, as in
-`if t is Some(v) { v.name = "x" }`.
+`if t is Some(u) { u.name = v }`.
 
 ## Arrays
 
@@ -338,7 +345,7 @@ type Node = struct {
 }
 
 let n: Name = "kod"
-print(n.char_count())    // 3
+print_int(n.char_count())    // 3
 ```
 
 An alias of `T or Error` works wherever `T or Error` does, including as the

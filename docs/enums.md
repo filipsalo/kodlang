@@ -74,9 +74,10 @@ variant belongs to that enum: an annotated `let`
 (`let m: Message = .Text(content: "hi")`), an assignment, an argument, a
 struct field, an array element, a return value, an arm of a `match` whose
 value goes to one of these, or the other side of `==` or `!=`
-(`m == .Quit`). Elsewhere, as in an
-unannotated `let`, it belongs to the enum that declares a variant of that
-name; when more than one enum does, write `Enum.Variant(...)`.
+(`m == .Quit`). Elsewhere, as in an unannotated `let`, it belongs to the
+first enum that declares a variant of that name, counting imported modules'
+enums before the module's own. Nothing reports it when several enums
+declare the name, so write `Enum.Variant(...)` there.
 
 ## Generic enums
 
