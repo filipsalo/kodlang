@@ -250,6 +250,9 @@ let n: Name = "kod"
 print(n.char_count())    // 3
 ```
 
+A struct, enum or interface that the importing module declares wins over
+a same-named alias from an imported module.
+
 ## Fallible types: `T or Error`
 
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
