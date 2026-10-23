@@ -78,10 +78,33 @@ variant belongs to that enum: an annotated `let`
 struct field, an array element, a return value (the `T` of a `T or Error`
 function too), an arm of a `match` whose value goes to one of these, or the
 other side of `==` or `!=`
-(`m == .Quit`). Elsewhere, as in an unannotated `let`, it belongs to the
-first enum that declares a variant of that name, counting imported modules'
-enums before the module's own. Nothing reports it when several enums
-declare the name, so write `Enum.Variant(...)` there.
+(`m == .Quit`). Elsewhere, as in an unannotated `let`, a `match` subject,
+an unannotated array literal or a method call on the variant, it belongs to
+the one enum that declares a variant of that name among those the module
+sees: its own, those of the modules it imports and the builtin ones. When
+several of them declare it, that is an error:
+
+```kod
+type Figure = enum {
+    Square(side: int64)
+    Circle(r: int64)
+}
+
+type Shape = enum {
+    Circle(r: int64)
+    Rect(w: int64, h: int64)
+}
+
+let s = .Circle(r: 2)
+// error: `.Circle` is ambiguous: `Figure` and `Shape` both declare it;
+// write `Shape.Circle` or give the value a type
+```
+
+`let s: Shape = .Circle(r: 2)` and `Shape.Circle(r: 2)` both work. Enums of
+modules a module doesn't import don't count, so a generic method or a default
+written in an imported module means the same variant whichever program uses
+it. Only when none of the enums the module sees declares the variant does an
+enum of another loaded module count.
 
 ## Generic enums
 

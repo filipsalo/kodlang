@@ -467,6 +467,7 @@ type Codegen = struct {
     scope_fns: [ImportFn] = []
     // Builtins (registered by register_module_funcs) back every scope's own names.
     builtins_path: str = ""
+    entry_import_paths: [str] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
@@ -2347,19 +2348,80 @@ type Codegen = struct {
         return self.scope_fns[-2 - slot].sig
     }
 
+    // The enum a context-free `.Name` builds: -1 when none declares it, -2 when several do.
     func find_enum_with_variant(self, anon variant_name: str) -> int64 {
+        let found = self.enums_with_variant(variant_name)
+        if len(found) == 0 {
+            return -1
+        }
+        if len(found) > 1 {
+            return -2
+        }
+        return found[0]
+    }
+
+    // Instances share their template's variants; a module registered twice repeats its enums.
+    func enums_with_variant(self, anon variant_name: str) -> [int64] {
+        mut found: [int64] = []
+        mut visible: [int64] = []
         mut i = 0
         for i < len(self.enums) {
-            mut j = 0
-            for j < len(self.enums[i].variants) {
-                if self.enums[i].variants[j].name == variant_name {
-                    return i
+            if self.enums[i].template_idx < 0 and self.find_variant_idx(variant_name, enum_idx: i) >= 0 {
+                mut seen = false
+                for f in found {
+                    if self.enums[f].name == self.enums[i].name and self.enums[f].def_path == self.enums[i].def_path {
+                        seen = true
+                    }
                 }
-                j = j + 1
+                if seen == false {
+                    found += [i]
+                    if self.enum_visible(i) {
+                        visible += [i]
+                    }
+                }
             }
-            i = i + 1
+            i += 1
         }
-        return -1
+        if len(visible) > 0 {
+            return visible
+        }
+        return found
+    }
+
+    // Declared by the module being compiled, a module it imports or the builtins.
+    func enum_visible(self, anon idx: int64) -> bool {
+        let path = self.enums[idx].def_path
+        if path == self.p.path or path == self.builtins_path {
+            return true
+        }
+        if self.p.path == self.entry_path {
+            return regalloc.str_in(self.entry_import_paths, p: path)
+        }
+        let si = self.cur_scope()
+        if si < 0 {
+            return true
+        }
+        return regalloc.str_in(self.scopes[si].alias_paths, p: path)
+    }
+
+    // Once per statement: both sides of `.A(..) == .A(..)` would report it.
+    func report_ambiguous_variant(self, anon variant_name: str, span: ast.Span) -> none {
+        if self.report_attempts > self.stmt_error_mark {
+            return
+        }
+        let found = self.enums_with_variant(variant_name)
+        let last = self.enums[found[len(found) - 1]].name
+        mut names = f"`{self.enums[found[0]].name}`"
+        mut i = 1
+        for i < len(found) - 1 {
+            names = f"{names}, `{self.enums[found[i]].name}`"
+            i += 1
+        }
+        mut all = "all"
+        if len(found) == 2 {
+            all = "both"
+        }
+        self.report_error(f"error: `.{variant_name}` is ambiguous: {names} and `{last}` {all} declare it; write `{last}.{variant_name}` or give the value a type", :span)
     }
 
     // Extract the enum index from a TypeKind, or -1 if not an enum.
@@ -4087,6 +4149,10 @@ type Codegen = struct {
             }
             .ImplicitVariant(name) -> {
                 let enum_idx = self.find_enum_with_variant(name)
+                if enum_idx == -2 {
+                    self.report_ambiguous_variant(name, span: self.p.expr_spans[expr_id])
+                    return .VImm(value: 0)
+                }
                 if enum_idx < 0 {
                     mut variant_names: [str] = []
                     for e in self.enums {
@@ -6034,6 +6100,13 @@ type Codegen = struct {
             .ImplicitVariant(variant_name) -> {
                 // .Variant(args) constructor — payload form of implicit variant.
                 let enum_idx = self.find_enum_with_variant(variant_name)
+                if enum_idx == -2 {
+                    self.report_ambiguous_variant(variant_name, span: self.p.expr_spans[callee_id])
+                    for arg in args {
+                        self.compile_discard(arg.value)
+                    }
+                    return .VImm(value: 0)
+                }
                 if enum_idx >= 0 {
                     mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
                     if variant_idx >= 0 {
@@ -9761,6 +9834,10 @@ type Codegen = struct {
     // every imported module's types are registered.
     func register_import_module_alias(self, anon local_mod: str) -> none {
         self.import_local += [local_mod]
+    }
+
+    func note_entry_import(self, anon target: str) -> none {
+        self.entry_import_paths += [target]
     }
 
     // Resolve and store sigs for each function / extern exported by
