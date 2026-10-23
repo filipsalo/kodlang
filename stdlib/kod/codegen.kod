@@ -433,10 +433,12 @@ type Codegen = struct {
     stmt_error_mark: int64 = 0
     // The generic instance whose method bodies are being compiled, or -1.
     body_instance: int64 = -1
+    // A default checked where it is declared isn't compiled there, so only its kind is reported.
+    checking_default: bool = false
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
-        if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) {
+        if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) or self.checking_default {
             return
         }
         mut hint = "add a type annotation"
@@ -6126,6 +6128,20 @@ type Codegen = struct {
         return reg
     }
 
+    // At the declaration, so a default that no call or construction omits is still checked.
+    func check_default(self, anon default_id: int64, expected: TypeKind) -> none {
+        let saved_vars = self.vars
+        let saved_slots = self.frame_slots
+        self.vars = []
+        self.stmt_error_mark = self.report_attempts
+        self.checking_default = true
+        self.collect_expr_vars(default_id)
+        self.check_value_kind(default_id, :expected)
+        self.checking_default = false
+        self.vars = saved_vars
+        self.frame_slots = saved_slots
+    }
+
     func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         // When the call has fewer args than the function declares,
@@ -6946,7 +6962,9 @@ type Codegen = struct {
         if self.is_implicit_variant_value(value_id) {
             let enum_idx = self.expected_enum_idx(expected)
             if enum_idx >= 0 {
-                self.check_variant(self.implicit_variant_name(value_id), :enum_idx, span: self.p.expr_spans[value_id])
+                if self.checking_default == false {
+                    self.check_variant(self.implicit_variant_name(value_id), :enum_idx, span: self.p.expr_spans[value_id])
+                }
                 return
             }
         }
@@ -8853,6 +8871,9 @@ type Codegen = struct {
                     kind = .KStruct(idx: struct_idx, type_args: [])
                 }
             }
+            if param.default_expr != 0 {
+                self.check_default(param.default_expr, expected: kind)
+            }
             self.alloc_var(name: param.name, :kind)
             // Parameters are immutable by default; `mut x` (or `mut self`)
             // opts the binding into reassignment. The slot otherwise defaults
@@ -9049,6 +9070,20 @@ type Codegen = struct {
                 lambda_decl_ids += [li]
             }
             li = li + 1
+        }
+
+        // A generic template's field kinds are unknown; its instances check defaults at construction.
+        mut si = local_structs
+        for si < len(self.structs) {
+            let s = self.structs[si]
+            if len(s.type_param_names) == 0 and s.template_idx < 0 {
+                for field in s.fields {
+                    if field.default_expr != 0 {
+                        self.check_default(field.default_expr, expected: field.kind)
+                    }
+                }
+            }
+            si += 1
         }
 
         for decl in module.decls {

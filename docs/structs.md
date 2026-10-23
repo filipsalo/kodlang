@@ -80,7 +80,10 @@ let d: Counter = Counter(label: "x", count: 5)
 The default is evaluated fresh at each construction (so a `[]` default
 yields a new empty array per instance, not a shared one). Defaults are
 ordinary expressions evaluated in the struct's defining module, and they
-can't see the local variables of the function doing the construction.
+can't see the local variables of the function doing the construction. A
+default must have its field's type. It is checked where it is declared, so
+`count: int64 = "x"` is an error even if no construction omits `count`; a
+generic struct's default is checked at each construction that omits it.
 
 This is what lets the built-in `Map[K, V]` be created with no arguments —
 all three of its fields default to `[]`:

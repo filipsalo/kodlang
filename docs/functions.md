@@ -89,7 +89,10 @@ evaluated in the module that declares the function and can't see the
 caller's local variables, so a name in it means the same thing at every
 call site. Methods and [interface methods](types.md#interfaces) take
 defaults the same way. A default must have its parameter's type, like an
-argument, and is checked at each call that leaves it out.
+argument. A function's or method's default is checked where it is
+declared, so `func f(x: int64 = "a")` is an error even if no call leaves
+`x` out; an interface method's default is checked at each call that leaves
+it out.
 
 ## Argument types
 
