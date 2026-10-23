@@ -1021,13 +1021,12 @@ type Codegen = struct {
                 if pat is .ErrPat(_b) {
                     has_err = true
                 }
-                if pat is .ImplicitEnumPat(name, _b2) {
-                    if name == "Ok" {
-                        has_ok = true
-                    }
-                    if name == "Err" {
-                        has_err = true
-                    }
+                let name = self.pattern_variant_name(pat)
+                if name == "Ok" {
+                    has_ok = true
+                }
+                if name == "Err" {
+                    has_err = true
                 }
             }
             if has_ok == false {
@@ -2055,9 +2054,12 @@ type Codegen = struct {
                 self.report_error(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
                 return -1
             }
-            if subj_enum_idx >= 0 and self.enums_compatible(subj_enum_idx, a_idx: enum_idx) == false {
-                self.report_error(f"error: `{enum_name}.{variant_name}` is not a variant of `{self.enum_display_name(subj_enum_idx)}`", :span)
-                return -1
+            if subj_enum_idx >= 0 {
+                if self.enums_compatible(subj_enum_idx, a_idx: enum_idx) == false {
+                    self.report_error(f"error: `{enum_name}.{variant_name}` is not a variant of `{self.enum_display_name(subj_enum_idx)}`", :span)
+                    return -1
+                }
+                return subj_enum_idx
             }
             return enum_idx
         }
@@ -3221,7 +3223,7 @@ type Codegen = struct {
                 }
             }
             .EnumPat(enum_name, variant_name, _bindings) -> {
-                return self.variant_binding_kinds(self.find_enum_idx(enum_name), :variant_name, :count)
+                return self.variant_binding_kinds(self.named_pattern_enum_idx(enum_name, :subject_kind), :variant_name, :count)
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
                 mut enum_idx = self.enum_idx_of_kind(subject_kind)
@@ -3234,6 +3236,19 @@ type Codegen = struct {
         }
         kinds += [kind]
         return kinds
+    }
+
+    // A generic enum's pattern names the template; the subject's instance has the payload kinds.
+    func named_pattern_enum_idx(self, anon enum_name: str, subject_kind: TypeKind) -> int64 {
+        let named = self.find_enum_idx(enum_name)
+        let subj = self.enum_idx_of_kind(subject_kind)
+        if named < 0 or subj < 0 {
+            return named
+        }
+        if self.enums_compatible(subj, a_idx: named) {
+            return subj
+        }
+        return -1
     }
 
     func pattern_variant_name(self, anon pattern: ast.Pattern) -> str {
@@ -3954,6 +3969,26 @@ type Codegen = struct {
         return ""
     }
 
+    // `Option.Some` and `Result.Ok` name the variants `T?` and `T or Error` test.
+    func std_pattern_name(self, anon expr_id: int64, std_enum: str) -> str {
+        mut callee = expr_id
+        if self.p.exprs[expr_id] is .Call(call_callee, _args) {
+            callee = call_callee
+        }
+        if self.p.exprs[callee] is .Binary(lhs, op, rhs) {
+            if op is .Dot {
+                if self.p.exprs[lhs] is .Ident(enum_name) {
+                    if enum_name == std_enum and self.var_declared(enum_name) == false {
+                        if self.p.exprs[rhs] is .Ident(name) {
+                            return name
+                        }
+                    }
+                }
+            }
+        }
+        return self.is_pattern_name(expr_id)
+    }
+
     func compile_is(self, lhs: int64, rhs: int64, negate: bool) -> Val {
         // Each branch below picks one of two ARM64 condition codes per
         // emit site: `cond_match` (the original "match" condition) and
@@ -4000,7 +4035,7 @@ type Codegen = struct {
         }
         // `T or Error` result: test the discriminant against Ok's disc.
         if self.is_result_kind(lhs_kind) {
-            let name = self.is_pattern_name(rhs)
+            let name = self.std_pattern_name(rhs, std_enum: "Result")
             if name != "Ok" and name != "Err" {
                 self.compile_discard(lhs)
                 self.report_error("error: `is` on a `T or Error` value takes `Ok` or `Err`", span: self.p.expr_spans[rhs])
@@ -4043,11 +4078,12 @@ type Codegen = struct {
         if is_optional == false {
             self.report_error("error: `is` requires an optional, `T or Error`, enum or interface value", span: self.p.expr_spans[lhs])
         }
-        mut tests_none = self.is_pattern_name(rhs) == "None"
+        let opt_name = self.std_pattern_name(rhs, std_enum: "Option")
+        mut tests_none = opt_name == "None"
         if self.p.exprs[rhs] is .NoneLit {
             tests_none = true
         }
-        if is_optional and tests_none == false and self.is_pattern_name(rhs) != "Some" {
+        if is_optional and tests_none == false and opt_name != "Some" {
             self.report_error("error: `is` on an optional takes `none` or `Some`", span: self.p.expr_spans[rhs])
         }
         let ptr_v = self.compile_expr(lhs)
@@ -7999,10 +8035,25 @@ type Codegen = struct {
         return self.subject_pattern(self.p.patterns[pattern_id], subject_kind: self.infer_kind(value_id))
     }
 
-    // On a `T?` subject, `.Some(v)` and `.None` are its Some and none patterns.
+    // On a `T?` subject, `.Some(v)` and `.None`, or `Option.` ones, are its Some and none patterns.
     func subject_pattern(self, anon pat: ast.Pattern, subject_kind: TypeKind) -> ast.Pattern {
         let .KOptional(_inner) = subject_kind else { return pat }
-        let .ImplicitEnumPat(variant_name, bindings) = pat else { return pat }
+        mut variant_name = ""
+        mut bindings: [str] = []
+        match pat {
+            .ImplicitEnumPat(v, b) -> {
+                variant_name = v
+                bindings = b
+            }
+            .EnumPat(e, v, b) -> {
+                if e != "Option" {
+                    return pat
+                }
+                variant_name = v
+                bindings = b
+            }
+            else return pat
+        }
         if variant_name == "None" and len(bindings) == 0 {
             return ast.Pattern.NonePat
         }

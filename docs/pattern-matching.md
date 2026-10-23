@@ -214,7 +214,10 @@ the enum, `if s is Shape.Rect(w, h)`, or an imported one,
 
 On a `T?` value, `.Some(v)` and `.None` are the same patterns as `Some(v)`
 and `none`, here, in a `match` and with a bare `is`. On a `T or Error`
-value, `.Ok(v)` and `.Err(e)` are the same as `Ok(v)` and `Err(e)`.
+value, `.Ok(v)` and `.Err(e)` are the same as `Ok(v)` and `Err(e)`. Naming
+the enum works too, as in `Option.Some(v)` and `Result.Ok(v)`. A generic
+enum is named without type arguments, and the bindings take the value's
+payload types: on a `Maybe[int64]`, `Maybe.Just(n)` binds an `int64`.
 
 A bare `is` also tests an enum value's variant without binding its
 payload: `if c is .Red and ready { ... }`, `s is .Circle(_)`. Bindings need

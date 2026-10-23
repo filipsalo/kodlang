@@ -56,7 +56,10 @@ def _value_pattern(pattern, value):
     """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the
     optional patterns; a `T or Error` is a ResultValue, so `.Ok`/`.Err` mean
     the result patterns."""
-    if not isinstance(pattern, ast.ImplicitEnumVariantPattern):
+    if isinstance(pattern, ast.EnumVariantPattern):
+        if pattern.enum_name not in ("Option", "Result"):
+            return pattern
+    elif not isinstance(pattern, ast.ImplicitEnumVariantPattern):
         return pattern
     if isinstance(value, types.EnumValue) and (
         pattern.variant_name in value.enum_type.variants
@@ -78,8 +81,6 @@ def _value_pattern(pattern, value):
 
 def _value_arm(arm, value):
     """`arm` with its pattern read for `value`, as in _value_pattern."""
-    if not isinstance(arm.pattern, ast.ImplicitEnumVariantPattern):
-        return arm
     pattern = _value_pattern(arm.pattern, value)
     if pattern is arm.pattern:
         return arm
@@ -134,6 +135,14 @@ class Interpreter:
             return callee.id
         if isinstance(callee, ast.ImplicitEnumVariant):
             return callee.variant_name
+        if (
+            isinstance(callee, ast.BinaryOperator)
+            and isinstance(callee.op, tokens.Dot)
+            and isinstance(callee.lhs, (ast.Variable, ast.Name))
+            and callee.lhs.id in ("Option", "Result")
+            and isinstance(callee.rhs, (ast.Variable, ast.Name))
+        ):
+            return callee.rhs.id
         return ""
 
     def _returns_result(self, func):

@@ -95,7 +95,9 @@ an annotated `let`, as above, an argument or a return value. Without one,
 `let e = Either.Left(value: 1)` (or `.Left(value: 1)`, `Result.Ok(5)`) is an
 error, ``cannot infer the type of `e`; add a type annotation``. Type
 arguments on the enum name, `Either[int64, str].Left(value: 1)`, are an
-error, since type arguments must be followed by `(`.
+error, since type arguments must be followed by `(`. A pattern names the
+enum without them, and its bindings take the matched value's payload
+types: on an `Either[int64, str]`, `Either.Left(n)` binds an `int64`.
 
 ## Pattern matching
 
