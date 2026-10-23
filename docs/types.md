@@ -42,12 +42,17 @@ The value of an annotated `let`, of an assignment to a name and of an
 assignment to a field must have the declared type: `let x: int64 = "s"` is
 an error (`` expected `int64`, got `str` ``), and so is storing an `int64` in
 a `bool` or an `[int64]` in a `[str]`. A `T` is accepted where a `T?` is
-declared and `none` wherever an optional is, a struct or primitive where an
-interface is, and `[]` as any array type. A function value must match a
-function type exactly, since a function is never adapted: a function taking
-a struct isn't a `func(SomeInterface) -> ...`, and one returning `int64`
-isn't a `func() -> int64?`. Without an annotation, `let x = none` and
-`let xs = []` are errors, since their type can't be inferred.
+declared and is checked as a `T`: with `type Words = [str]`,
+`let w: Words? = []` is fine and `let w: Words? = [1]` reports the element
+(`` expected `str`, got `int64` ``). `none` is accepted wherever an optional
+or `none` is declared, a struct or primitive other than `bytes` where an
+interface is, and `[]` as any array type. A `T?` isn't accepted where a `T`
+is declared; unwrap it first with `x?` or `x? or default`. A function value
+must match a function type exactly, since a function is never adapted: a
+function taking a struct isn't a `func(SomeInterface) -> ...`, and one
+returning `int64` isn't a `func() -> int64?`. Without an annotation,
+`let x = none` and `let xs = []` are errors, since their type can't be
+inferred.
 
 Arguments, struct constructor fields, element stores (`xs[i] = v`,
 `m[k] = v`, `m.set(k, v)`) and `return` values aren't checked against their
@@ -316,7 +321,8 @@ trailing argument the call leaves out takes the default the interface
 declares for it (`func greet(self, times: int64 = 2) -> str`), so give
 each implementation the same default.
 
-A struct or primitive becomes an interface value wherever one is expected:
+A struct, `int64`, `str` or `bool` becomes an interface value wherever one
+is expected (a `bytes` value can't be one):
 an annotated `let`, an argument, a field, an array element, a value stored
 with `m[k] = v`, and a return value, including the value of a `-> Shape?`
 or `-> Shape or Error` function.
