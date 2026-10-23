@@ -60,7 +60,8 @@ match d {
 
 The variant must belong to the subject's enum: `.Up` in a `match` on a
 `Direction` that has no `Up` is an error, even when another enum declares
-`Up`.
+`Up`, and so is naming that other enum, `Arrow.Up`. The same goes for an
+`if d is ...` pattern.
 
 Unit variants can also use the implicit `.Variant` form in expressions:
 
