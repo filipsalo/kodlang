@@ -72,7 +72,9 @@ let d: Direction = .North
 A payload variant can use it too. Wherever the enum type is known, the
 variant belongs to that enum: an annotated `let`
 (`let m: Message = .Text(content: "hi")`), an assignment, an argument, a
-struct field, an array element or a return value. Elsewhere, as in an
+struct field, an array element, a return value, an arm of a `match` whose
+value goes to one of these, or the other side of `==` or `!=`
+(`m == .Quit`). Elsewhere, as in an
 unannotated `let`, it belongs to the enum that declares a variant of that
 name; when more than one enum does, write `Enum.Variant(...)`.
 
@@ -91,7 +93,9 @@ let e: Either[int64, str] = .Left(value: 1)
 ```
 
 A variant of a generic enum needs its type arguments from where it goes:
-an annotated `let`, as above, an argument or a return value. Without one,
+an annotated `let`, as above, or any other place listed above where the
+enum type is known, such as an argument, an array element or the other side
+of `==`. Without one,
 `let e = Either.Left(value: 1)` (or `.Left(value: 1)`, `Result.Ok(5)`) is an
 error, ``cannot infer the type of `e`; add a type annotation``. Type
 arguments on the enum name, `Either[int64, str].Left(value: 1)`, are an

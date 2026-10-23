@@ -4115,14 +4115,23 @@ type Codegen = struct {
     }
 
     func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
-        let lhs_kind = self.infer_kind(lhs_id)
+        mut lhs_kind = self.infer_kind(lhs_id)
+        let rhs_kind0 = self.infer_kind(rhs_id)
+        let build_rhs = self.is_eq_ctor_operand(rhs_id, :op, other_kind: lhs_kind)
+        mut build_lhs = false
+        if build_rhs == false {
+            build_lhs = self.is_eq_ctor_operand(lhs_id, :op, other_kind: rhs_kind0)
+        }
+        if build_lhs {
+            lhs_kind = rhs_kind0
+        }
         mut lhs_unknown = false
         if lhs_kind is .KUnknown {
             lhs_unknown = true
         }
         mut rhs_unknown = false
-        if self.infer_kind(rhs_id) is .KUnknown {
-            rhs_unknown = self.builds_for_operand(rhs_id, op: op, other_kind: lhs_kind) == false
+        if rhs_kind0 is .KUnknown {
+            rhs_unknown = build_rhs == false and self.builds_for_operand(rhs_id, op: op, other_kind: lhs_kind) == false
         }
         if lhs_unknown or rhs_unknown {
             self.compile_discard(lhs_id)
@@ -4211,16 +4220,28 @@ type Codegen = struct {
 
         // Compile both sides, stashing the lhs on the stack across the rhs
         // compilation so its value survives any bl calls in rhs.
-        let lhs_val = self.compile_expr(lhs_id)
-        let lv_r = self.load_enum_or_val(lhs_val, expr_id: lhs_id)
+        mut lv_r = ""
+        if build_lhs {
+            lv_r = self.compile_value_for_kind(lhs_id, expected: lhs_kind)
+            self.emit(f"ldr {lv_r}, [{lv_r}]")
+        } else {
+            let lhs_val = self.compile_expr(lhs_id)
+            lv_r = self.load_enum_or_val(lhs_val, expr_id: lhs_id)
+        }
         let lhs_reg = self.pool.alloc_reg()
         if lv_r != lhs_reg {
             self.emit(f"mov {lhs_reg}, {lv_r}")
         }
         self.pool.free_reg(lv_r)
         let lhs_spilled = self.spill_across(lhs_reg)
-        let rhs_val = self.compile_expr(rhs_id)
-        let rhs_reg = self.load_enum_or_val(rhs_val, expr_id: rhs_id)
+        mut rhs_reg = ""
+        if build_rhs {
+            rhs_reg = self.compile_value_for_kind(rhs_id, expected: lhs_kind)
+            self.emit(f"ldr {rhs_reg}, [{rhs_reg}]")
+        } else {
+            let rhs_val = self.compile_expr(rhs_id)
+            rhs_reg = self.load_enum_or_val(rhs_val, expr_id: rhs_id)
+        }
         self.restore_across(lhs_reg, spilled: lhs_spilled)
         mut result = self.pool.alloc_reg()
         match op {
@@ -4294,6 +4315,23 @@ type Codegen = struct {
         self.pool.free_reg(lhs_reg)
         self.pool.free_reg(rhs_reg)
         return .VReg(name: result)
+    }
+
+    // In `e == .V` the variant belongs to `e`'s enum.
+    func is_eq_ctor_operand(self, anon value_id: int64, op: ast.Op, other_kind: TypeKind) -> bool {
+        mut equality = false
+        if op is .Eq {
+            equality = true
+        }
+        if op is .Ne {
+            equality = true
+        }
+        if equality {
+            if other_kind is .KEnum(_idx) {
+                return self.is_ctor_for(value_id, kind: other_kind)
+            }
+        }
+        return false
     }
 
     // An appended literal or match is built as the array's element kind.
@@ -6624,6 +6662,19 @@ type Codegen = struct {
                 }
                 return
             }
+        }
+        if self.p.exprs[value_id] is .MatchExpr(subject, arms) {
+            let subject_kind = self.infer_kind(subject)
+            for arm_id in arms {
+                let arm = self.p.match_expr_arms[arm_id]
+                let pattern = self.p.patterns[arm.pattern]
+                let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+                if self.is_void_kind(self.infer_kind(arm.body)) == false {
+                    self.check_value_kind(arm.body, :expected)
+                }
+                self.restore_pattern_bindings(pattern, kinds: saved)
+            }
+            return
         }
         let actual = self.infer_kind(value_id)
         if actual is .KUnknown {
