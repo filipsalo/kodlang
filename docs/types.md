@@ -20,6 +20,10 @@ total += max          // ok — total is mutable
 max = 50              // error: cannot reassign immutable binding `max`
 ```
 
+Assigning to a name that was never declared is an error too (declare it
+with `mut` first), and so is assigning to anything other than a name, a
+field (`p.x = 1`) or an element (`xs[0] = 1`).
+
 Parameters are immutable too — `mut` makes one reassignable inside the
 body (`mut self` for a method receiver). This is **callee-local**: params
 are passed by value, so reassigning one never affects the caller, and the
@@ -241,6 +245,9 @@ func show(anon x: Stringable) -> none {
 show(42)        // works — int64 implements Stringable via primitives/int64.kod
 show(true)      // same for bool
 ```
+
+A call on an interface value must name one of the interface's methods,
+with arguments that match its signature; an unknown method is an error.
 
 ## Type aliases
 

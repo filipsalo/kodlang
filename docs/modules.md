@@ -30,7 +30,8 @@ func origin() -> vec.Vec2 {
 ```
 
 Qualified constructors have the imported type, so `let v = vec.Vec2(x: 1, y: 2)`
-needs no annotation before `v.x`.
+needs no annotation before `v.x`. Calling a function the module doesn't
+declare, such as `vec.lenght(v)`, is an error with a did-you-mean hint.
 
 To also use some names unqualified, list them after the path. The qualified form keeps working:
 

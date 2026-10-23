@@ -1591,14 +1591,22 @@ type Codegen = struct {
         return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid, param_default_exprs: empty_defaults, src_p: self.p)
     }
 
-    func find_import_fn_sig(self, anon local_mod: str, anon name: str) -> SigInfo {
+    func find_import_fn_idx(self, anon local_mod: str, anon name: str) -> int64 {
         mut i = 0
         for i < len(self.import_fns) {
             let f = self.import_fns[i]
             if f.module == local_mod and f.name == name {
-                return f.sig
+                return i
             }
             i = i + 1
+        }
+        return -1
+    }
+
+    func find_import_fn_sig(self, anon local_mod: str, anon name: str) -> SigInfo {
+        let idx = self.find_import_fn_idx(local_mod, name)
+        if idx >= 0 {
+            return self.import_fns[idx].sig
         }
         let empty_kinds: [TypeKind] = []
         let empty_strs: [str] = []
@@ -2243,28 +2251,6 @@ type Codegen = struct {
             return self.func_labels[idx]
         }
         return f"$builtins${name}"
-    }
-
-    func import_func_label(self, anon func_name: str, local_mod: str) -> str {
-        // Prefer the exact label recorded by register_import_module
-        // (extern names map to _name, regular functions map to $prefix$name).
-        mut j = 0
-        for j < len(self.import_fns) {
-            let f = self.import_fns[j]
-            if f.module == local_mod and f.name == func_name {
-                return f.label
-            }
-            j = j + 1
-        }
-        // Fallback: synthesize a label from the registered prefix.
-        mut i = 0
-        for i < len(self.import_local) {
-            if self.import_local[i] == local_mod {
-                return f"${self.import_prefix[i]}${func_name}"
-            }
-            i = i + 1
-        }
-        return f"_{func_name}"
     }
 
 
@@ -4197,11 +4183,21 @@ type Codegen = struct {
             if s_idx >= 0 {
                 return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
             }
-            let sig = self.find_import_fn_sig(mod_or_obj, method_name)
+            let fn_idx = self.find_import_fn_idx(mod_or_obj, method_name)
+            if fn_idx < 0 {
+                mut names: [str] = []
+                for f in self.import_fns {
+                    if f.module == mod_or_obj {
+                        names += [f.name]
+                    }
+                }
+                self.report_error(self.with_suggestion(f"error: module `{mod_or_obj}` has no function `{method_name}`", typo: method_name, candidates: names), span: self.p.expr_spans[callee_rhs])
+                return .VImm(value: 0)
+            }
+            let sig = self.import_fns[fn_idx].sig
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
-            let lbl = self.import_func_label(method_name, local_mod: mod_or_obj)
-            self.emit(f"bl {lbl}")
+            self.emit(f"bl {self.import_fns[fn_idx].label}")
             return .VReg(name: "x0")
         }
         // `obj.fn(args)` where `fn` is a struct FIELD of function-
@@ -4241,6 +4237,14 @@ type Codegen = struct {
                 if len(arg.label) > 0 {
                     self.report_error(f"error: indirect call through a function-pointer value can't take labelled arguments (drop `{arg.label}:`); the function-type syntax `func(T) -> R` doesn't carry parameter names", span: arg.label_span)
                 }
+            }
+            if len(args) != len(param_kinds) {
+                mut callee_desc = "this function value"
+                if self.p.exprs[callee_id] is .Ident(callee_name) {
+                    callee_desc = f"`{callee_name}`"
+                }
+                self.report_error(f"error: {callee_desc} takes {len(param_kinds)} arguments, got {len(args)}", span: self.p.expr_spans[callee_id])
+                return .VImm(value: 0)
             }
             let callee_val: Val = self.compile_expr(callee_id)
             // Always move the function pointer into a fresh pool reg
@@ -4446,7 +4450,8 @@ type Codegen = struct {
     // Dispatch on an interface value: the variable holds a pointer to an
     // arena cell {data_ptr at 0, vtable_ptr at 8}. The method index in the
     // vtable matches its order in the interface declaration.
-    func compile_iface_method_call(self, anon args: [ast.CallArg], receiver_id: int64, iface_idx: int64, method_name: str) -> Val {
+    func compile_iface_method_call(self, anon args: [ast.CallArg], receiver_id: int64, iface_idx: int64, method_name: str, span: ast.Span) -> Val {
+        let iface_name = self.interfaces[iface_idx].name
         mut i = 0
         mut method_idx = -1
         for i < len(self.interfaces[iface_idx].methods) {
@@ -4457,10 +4462,19 @@ type Codegen = struct {
                 i = i + 1
             }
         }
-        mut sig_params: [TypeKind] = []
-        if method_idx >= 0 {
-            sig_params = self.interfaces[iface_idx].methods[method_idx].sig.param_kinds
+        if method_idx < 0 {
+            mut names: [str] = []
+            for m in self.interfaces[iface_idx].methods {
+                names += [m.name]
+            }
+            self.report_error(self.with_suggestion(f"error: interface `{iface_name}` has no method `{method_name}`", typo: method_name, candidates: names), :span)
+            return .VImm(value: 0)
         }
+        let sig = self.interfaces[iface_idx].methods[method_idx].sig
+        // A vtable call can't fill defaults, so every argument is required.
+        let no_defaults: [int64] = []
+        self.check_call_args(args, param_labels: sig.param_labels, param_defaults: no_defaults, skip: 1, call_name: f"{iface_name}.{method_name}", call_span: span)
+        let sig_params: [TypeKind] = sig.param_kinds
         // Stash self (data_ptr) and each compiled arg, plus the method ptr,
         // so arg compilation doesn't clobber x0..x7. Layout in the spill
         // area: [data_ptr, arg0, arg1, ..., method_ptr].
@@ -4541,7 +4555,7 @@ type Codegen = struct {
 
         // Interface dispatch: load vtable from the cell, then indirect call.
         if recv_kind is .KInterface(iface_idx) {
-            return self.compile_iface_method_call(args, :receiver_id, :iface_idx, :method_name)
+            return self.compile_iface_method_call(args, :receiver_id, :iface_idx, :method_name, :span)
         }
 
         mut method_lbl = ""
@@ -5810,6 +5824,19 @@ type Codegen = struct {
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         match self.p.exprs[lhs_id] {
             .Ident(name) -> {
+                if self.var_declared(name) == false {
+                    mut cands: [str] = []
+                    for v in self.vars {
+                        cands += [v.name]
+                    }
+                    let base: str = f"error: unknown name `{name}`"
+                    mut msg: str = self.with_suggestion(base, typo: name, candidates: cands)
+                    if msg == base {
+                        msg = f"{base}; declare it with `mut {name} = ...`"
+                    }
+                    self.report_error(msg, span: self.p.expr_spans[lhs_id])
+                    return none
+                }
                 if self.enforce_immutability() and self.find_var_mutable(name) == false {
                     self.report_error("cannot reassign immutable binding `" + name + "`; declare it with `mut`", span: self.p.expr_spans[lhs_id])
                     return none
@@ -5822,10 +5849,10 @@ type Codegen = struct {
                 match op {
                     .Dot -> self.compile_field_assign(lhs: lhs2, rhs: rhs2, :rhs_id)
                     .Index -> self.compile_index_assign(lhs: lhs2, rhs: rhs2, :rhs_id)
-                    else none
+                    else self.report_error("error: cannot assign to this expression", span: self.p.expr_spans[lhs_id])
                 }
             }
-            else none
+            else self.report_error("error: cannot assign to this expression", span: self.p.expr_spans[lhs_id])
         }
     }
 

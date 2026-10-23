@@ -140,7 +140,9 @@ function type, falling through to the direct `bl` otherwise.
 
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a
-struct field (`h.fn(x)`) or another call (`get_fn()(x)`).
+struct field (`h.fn(x)`) or another call (`get_fn()(x)`). It must pass
+exactly as many arguments as the function type has parameters, since a
+function type carries no defaults.
 
 ## Extern functions
 
