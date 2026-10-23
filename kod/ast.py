@@ -235,7 +235,7 @@ class BytesLiteral(ASTNode, Literal):
 
 def _parse_fstring(parser: Parser) -> ASTNode:
     """Parse an f-string token into a BinaryOperator tree of str concatenations."""
-    from kod.lexer import Lexer
+    from kod.lexer import Lexer, interp_end
 
     token = parser.consume(tokens.FStringLiteral)
     raw = token.value
@@ -275,8 +275,8 @@ def _parse_fstring(parser: Parser) -> ASTNode:
             break
         if j > i:
             parts.append(make_str(inner[i:j]))
-        k = inner.find("}", j + 1)
-        if k == -1:
+        k = interp_end(inner, j + 1)
+        if k == len(inner):
             raise parser.error("Unterminated { in f-string", span)
         parts.append(wrap_in_str(parse_expr(inner[j + 1 : k])))
         i = k + 1

@@ -143,6 +143,55 @@ def process_escapes(s: str) -> str:
     return "".join(out)
 
 
+def interp_end(s: str, start: int) -> int:
+    """Index of the `}` closing an f-string interpolation that starts at
+    `start` (or len(s)), skipping nested braces, strings and f-strings."""
+    depth = 0
+    i = start
+    while i < len(s):
+        ch = s[i]
+        if ch == '"':
+            i = string_end(s, i + 1, fstr=i > 0 and s[i - 1] == "f")
+        elif ch == "'":
+            i = char_end(s, i + 1)
+        else:
+            if ch == "}":
+                if depth == 0:
+                    return i
+                depth -= 1
+            if ch == "{":
+                depth += 1
+            i += 1
+    return len(s)
+
+
+def string_end(s: str, start: int, fstr: bool) -> int:
+    """Index just past the `"` closing a string literal whose body starts
+    at `start`, or len(s)."""
+    i = start
+    while i < len(s):
+        ch = s[i]
+        if ch == '"':
+            return i + 1
+        if ch == "\\":
+            i += 2
+        elif fstr and ch == "{":
+            i = interp_end(s, i + 1) + 1
+        else:
+            i += 1
+    return len(s)
+
+
+def char_end(s: str, start: int) -> int:
+    i = start
+    if i < len(s) and s[i] == "\\":
+        i += 1
+    i += 1
+    if i < len(s) and s[i] == "'":
+        i += 1
+    return i
+
+
 class Lexer:
     """A lexer for the kod language."""
 
@@ -288,46 +337,43 @@ class Lexer:
         if self.peek() == '"' and self._peek_at(1) == '"':
             self.consume('"')
             self.consume('"')
-            depth = 0
             while True:
                 ch = self.peek()
                 if ch == "":
                     raise self.error("Unterminated triple-quoted f-string")
-                if (
-                    ch == '"'
-                    and depth == 0
-                    and self._peek_at(1) == '"'
-                    and self._peek_at(2) == '"'
-                ):
+                if ch == '"' and self._peek_at(1) == '"' and self._peek_at(2) == '"':
                     self.consume('"')
                     self.consume('"')
                     self.consume('"')
                     break
                 if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                self.pos += 1
+                    self.skip_interpolation()
+                else:
+                    self.pos += 1
             return self.build(FStringLiteral)
-        depth = 0
         while True:
             ch = self.peek()
             if ch == "":
                 raise self.error("Unterminated f-string")
-            if ch == '"' and depth == 0:
+            if ch == '"':
                 self.pos += 1
                 break
             if ch == "\\":
                 self.pos += 1
                 if self.peek() != "":
                     self.pos += 1
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            self.pos += 1
+            elif ch == "{":
+                self.skip_interpolation()
+            else:
+                self.pos += 1
         return self.build(FStringLiteral)
+
+    def skip_interpolation(self) -> None:
+        """From an interpolation's `{` past its `}`, skipping braces and
+        string literals inside it whole."""
+        self.pos = interp_end(self.source, self.pos + 1)
+        if self.peek() == "}":
+            self.pos += 1
 
     def lex_number(self) -> IntegerLiteral:
         """Lex a number. Base-prefix forms (`0x…`, `0o…`, `0b…`) read

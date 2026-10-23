@@ -40,7 +40,8 @@ let n: int64 = 42
 print(f"the answer is {n}")       // the answer is 42
 ```
 
-Anything inside `{ }` is a Kod expression. Non-`str` values are auto-converted via their `to_str` method:
+Anything inside `{ }` is a Kod expression, string literals and nested
+f-strings included (`f"[{f"<{n}>"}]"`, `f"{"}" + s}"`). Non-`str` values are auto-converted via their `to_str` method:
 
 ```kod
 print(f"{a} + {b} = {a + b}")
