@@ -178,6 +178,10 @@ type IfaceInfo = struct {
     module_prefix: str
     def_path: str
     def_span: ast.Span
+    // Owning parser and FuncDecl ids of `methods`, so resolve_method_sigs
+    // can re-resolve the sigs once every type is registered.
+    src_p: parsing.Parser
+    method_decl_ids: [int64]
 }
 
 // One method on a primitive type (int64.to_str, str.hash, etc.).
@@ -1866,30 +1870,8 @@ type Codegen = struct {
             let new_kind = self.resolve_type(field.type_expr)
             cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr, default_expr: field.default_expr)]
         }
-        // Re-resolve each method's sig with the new substitution context;
-        // names + decl_ids stay the same as the template, so we build
-        // fresh MethodInfo entries that copy those across.
-        mut cloned_methods: [MethodInfo] = []
-        for m in template.methods {
-            let fd = template.src_p.func_decls[m.decl_id]
-            mut pk: [TypeKind] = []
-            mut pl: [str] = []
-            mut pn: [str] = []
-            mut pd: [int64] = []
-            for param in fd.params {
-                pk += [self.resolve_type(param.typ)]
-                if param.anonymous {
-                    pl += [""]
-                } else {
-                    pl += [param.label]
-                }
-                pn += [param.name]
-                pd += [param.default_expr]
-            }
-            let rk = self.resolve_type(fd.return_typ)
-            let sig: SigInfo = SigInfo(param_kinds: pk, param_labels: pl, param_names: pn, return_kind: rk, param_default_exprs: pd, src_p: template.src_p)
-            cloned_methods += [MethodInfo(name: m.name, decl_id: m.decl_id, :sig)]
-        }
+        // Re-resolve each method's sig with the new substitution context.
+        let cloned_methods: [MethodInfo] = self.resolve_method_infos(template.methods, p: template.src_p)
         self.p = saved_p
         self.subst_names = saved_names
         self.subst_args = saved_args
@@ -2038,6 +2020,17 @@ type Codegen = struct {
         return new_idx
     }
 
+
+    // Rebuild each method's sig from its FuncDecl in `p` under the active
+    // substitution context; names and decl_ids carry over.
+    func resolve_method_infos(self, anon methods: [MethodInfo], p: parsing.Parser) -> [MethodInfo] {
+        mut out: [MethodInfo] = []
+        for m in methods {
+            let fd: ast.FuncDecl = p.func_decls[m.decl_id]
+            out += [MethodInfo(name: m.name, decl_id: m.decl_id, sig: self.resolve_sig(fd, :p))]
+        }
+        return out
+    }
 
     // Resolve a FuncDecl's params and return type into a SigInfo, using p
     // as the owning parser (the type_expr arena ids in the FuncDecl point
@@ -2249,7 +2242,7 @@ type Codegen = struct {
                     // second pass once all types are registered.
                     method_infos += [MethodInfo(name: func_decl.name, decl_id: -1, sig: empty_sig)]
                 }
-                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span)]
+                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span, src_p: p, method_decl_ids: methods)]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
             }
             else none
@@ -2415,6 +2408,39 @@ type Codegen = struct {
             self.subst_names = saved_names
             self.subst_args = saved_args
             i = i + 1
+        }
+    }
+
+    // Re-resolve the method sigs of structs and interfaces registered at
+    // or after the given indices. Sigs are first resolved during
+    // registration, before the struct itself, later declarations and
+    // later-loaded imports are known.
+    func resolve_method_sigs(self, struct_start: int64, iface_start: int64) -> none {
+        mut i: int64 = struct_start
+        for i < len(self.structs) {
+            let s: StructInfo = self.structs[i]
+            let saved_names = self.subst_names
+            let saved_args = self.subst_args
+            if s.template_idx >= 0 {
+                let template = self.structs[s.template_idx]
+                self.subst_names = template.type_param_names
+                self.subst_args = s.template_args
+            }
+            self.structs[i].methods = self.resolve_method_infos(s.methods, p: s.src_p)
+            self.subst_names = saved_names
+            self.subst_args = saved_args
+            i = i + 1
+        }
+        mut j: int64 = iface_start
+        for j < len(self.interfaces) {
+            let iface: IfaceInfo = self.interfaces[j]
+            mut new_methods: [MethodInfo] = []
+            for decl_id in iface.method_decl_ids {
+                let fd: ast.FuncDecl = iface.src_p.func_decls[decl_id]
+                new_methods += [MethodInfo(name: fd.name, decl_id: -1, sig: self.resolve_sig(fd, p: iface.src_p))]
+            }
+            self.interfaces[j].methods = new_methods
+            j = j + 1
         }
     }
 
@@ -6382,6 +6408,7 @@ type Codegen = struct {
 
     func compile_module(self, anon module: ast.Module) -> none {
         self.println("\t.text")
+        let local_ifaces: int64 = len(self.interfaces)
 
         // Three-phase registration to handle struct ⇄ interface refs:
         // 1) interface names, 2) enums + structs, 3) interface method sigs.
@@ -6413,6 +6440,7 @@ type Codegen = struct {
         // resolve once all of them are registered.
         self.resolve_field_kinds(start: local_structs)
         self.resolve_variant_field_kinds(start: local_enums)
+        self.resolve_method_sigs(struct_start: local_structs, iface_start: local_ifaces)
 
         for decl in module.decls {
             let idx_m = self.func_idx

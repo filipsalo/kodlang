@@ -126,6 +126,10 @@ print_int(p.x)               // 4
 Methods can also be invoked on non-`Ident` receivers — `0.to_str()`,
 `p.field.method()`, `f().bar()`, etc.
 
+A method's parameter and return types can name the struct itself or a type
+declared later in the module, so `func scaled(self, by: int64) -> Point`
+inside `Point` chains as `p.scaled(by: 2).distance_sq()`.
+
 ## Generic structs
 
 Type parameters in square brackets after the name; each unique
