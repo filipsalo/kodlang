@@ -190,8 +190,10 @@ let idx2: int64      = n? or -1     // -1 if none
 ```
 
 The default is evaluated lazily (only when the value is `none`), and
-its type must match the unwrapped `T`. `x?` on a value that isn't
-optional is an error. A following `or` outside the
+its type must match the unwrapped `T`, unless it's a `kod_panic(...)` call.
+It's built as a `T`: with `T` an interface, a struct default becomes an
+interface value, and with `T` an enum, `.Up` names `T`'s variant. `x?` on
+a value that isn't optional is an error. A following `or` outside the
 unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
 `(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
