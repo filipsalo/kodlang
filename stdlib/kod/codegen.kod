@@ -4795,9 +4795,12 @@ type Codegen = struct {
         }
         if self.is_literal_or_match(value_id) {
             if self.converts_for(value_id, :kind) {
-                return .VReg(name: self.compile_value_for_kind(value_id, expected: kind))
+                return .VReg(name: self.compile_into(value_id, expected: kind))
             }
-            return self.compile_expr(value_id)
+            // Built as the chain's element type, so its elements are checked against that.
+            let val = self.compile_typed_array_value(value_id, expected_elem: self.array_elem_kind(kind))
+            self.check_value_kind(value_id, expected: kind)
+            return val
         }
         let val = self.compile_expr(value_id)
         let actual = self.infer_kind(value_id)
@@ -4891,6 +4894,28 @@ type Codegen = struct {
         return self.compile_array_lit_typed(elements, expected_elem: .KVoid)
     }
 
+    // An element of this kind is wrapped, boxed or built for it.
+    func elem_needs_conversion(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KEnum(_idx) -> return true
+            .KInterface(_idx) -> return true
+            .KOptional(_inner) -> return true
+            else return self.array_needs_conversion(kind)
+        }
+    }
+
+    // KVoid when the first element can't give the literal a type: `none`, `[]` or unknown.
+    func first_elem_kind(self, anon elements: [int64]) -> TypeKind {
+        if len(elements) < 2 or self.is_untyped_literal(elements[0]) {
+            return .KVoid
+        }
+        let kind = self.infer_kind(elements[0])
+        if self.kind_has_unknown(kind) or self.is_none_kind(kind) {
+            return .KVoid
+        }
+        return kind
+    }
+
     func array_needs_conversion(self, anon kind: TypeKind) -> bool {
         match kind {
             .KArrayEnum(_idx) -> return true
@@ -4963,22 +4988,28 @@ type Codegen = struct {
         self.emit_load_imm("x0", value: buf_sz)
         self.emit("bl _arena_alloc")
         self.emit("str x0, [sp, #8]")
-        mut typed = self.array_needs_conversion(expected_elem)
-        match expected_elem {
-            .KEnum(_idx) -> typed = true
-            .KInterface(_idx) -> typed = true
-            .KOptional(_inner) -> typed = true
-            else none
+        let typed = self.elem_needs_conversion(expected_elem)
+        // With no type to go to, the literal takes its first element's.
+        mut rest_kind: TypeKind = .KVoid
+        if self.is_void_kind(expected_elem) {
+            rest_kind = self.first_elem_kind(elements)
         }
+        let check_rest = self.is_void_kind(rest_kind) == false
+        let rest_typed = self.elem_needs_conversion(rest_kind)
         mut i = 0
         for i < n {
             mut elem_reg = ""
             if typed {
                 elem_reg = self.compile_value_for_kind(elements[i], expected: expected_elem)
+            } else if i > 0 and rest_typed {
+                elem_reg = self.compile_into(elements[i], expected: rest_kind)
             } else {
                 let elem_val = self.compile_expr(elements[i])
                 self.report_if_unknown(elements[i])
                 elem_reg = self.load(elem_val)
+                if i > 0 and check_rest {
+                    self.check_value_kind(elements[i], expected: rest_kind)
+                }
             }
             // Reload buf from stack — any bl in compile_expr above would
             // have clobbered a pool-register copy.
@@ -6744,9 +6775,20 @@ type Codegen = struct {
         if typ == 0 {
             if kind is .KUnknown {
                 self.report_cannot_infer(value, what: f"`{name}`")
+            } else {
+                self.check_unannotated_literal(value, :kind)
             }
         } else {
             self.check_value_kind(value, expected: kind)
+        }
+    }
+
+    // Built for its first element's type, which converts the other elements without checking them.
+    func check_unannotated_literal(self, anon value_id: int64, kind: TypeKind) -> none {
+        if self.p.exprs[value_id] is .ArrayLit(elements) {
+            if self.elem_needs_conversion(self.first_elem_kind(elements)) {
+                self.check_value_kind(value_id, expected: kind)
+            }
         }
     }
 

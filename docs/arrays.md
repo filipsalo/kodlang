@@ -14,6 +14,12 @@ let words: [str] = ["hello", "world"]
 let empty: [int64] = []
 ```
 
+A literal with no type to go to takes its first element's type, and every
+other element must have that type: `let xs = [1, "a"]` is an error
+(`` expected `int64`, got `str` ``), and so is `[Sq(s: 1), Circle(r: 1)]`
+even when both implement `Shape`. Annotate the array to mix structs behind
+an interface: `let shapes: [Shape] = [Sq(s: 1), Circle(r: 1)]`.
+
 ## Indexing
 
 ```kod
@@ -92,7 +98,8 @@ chain goes to, or, without one, as its first operand that isn't a literal or
 `match`. So `[Sq(s: 1)] + [Sq(s: 2)] + shapes` boxes both squares as `Shape`,
 and `let ms: [Maybe[str]] = [.Just(value: "a")] + [.Nothing]` builds
 `Maybe[str]` variants. The other operands must all have that one type:
-`squares + shapes` (a `[Sq]` and a `[Shape]`) and `nums + names` are errors.
+`squares + shapes` (a `[Sq]` and a `[Shape]`) and `nums + names` are errors,
+and so is `names + [1]`, whose literal's element isn't a `str`.
 
 `+=` grows the array's buffer geometrically, so appending in a loop is
 amortized O(1) per element. `+` always copies both operands, so
