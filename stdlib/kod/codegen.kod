@@ -45,6 +45,9 @@ type TypeKind = enum {
     // so `arr[i](x)` can dispatch indirectly with correct arg
     // expectations.
     KArrayFunc(param_kinds: [TypeKind], return_kind: TypeKind)
+    // The kind of an expression whose type couldn't be worked out. The
+    // miss is reported once; consumers of a KUnknown stay quiet.
+    KUnknown
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -429,6 +432,12 @@ type Codegen = struct {
     unresolved_aliases: [str] = []
     unresolved_alias_targets: [int64] = []
 
+    // Errors reported so far, counting the ones report_once drops as
+    // repeats, and the count when the current statement started. A
+    // statement that already has an error doesn't add "cannot infer".
+    report_attempts: int64 = 0
+    stmt_error_mark: int64 = 0
+
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
     // surfaces every error rather than stopping at the first.
@@ -444,10 +453,97 @@ type Codegen = struct {
         let key = f"{self.p.path}:{span.start}:{msg}"
         let seen = self.reported
         if seen.contains(key) {
+            self.report_attempts = self.report_attempts + 1
             return
         }
         seen.set(key, 1)
         self.report_error(msg, :span)
+    }
+
+    // Report an expression whose kind is KUnknown, unless the miss is a
+    // cascade: this statement already reported an error, or the value
+    // comes from a variable whose declaration already did.
+    func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
+        if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) {
+            return
+        }
+        self.report_once(f"error: cannot infer the type of {what}; add a type annotation", span: self.p.expr_spans[expr_id])
+    }
+
+    // Whether the receiver chain of `expr_id` starts at a variable of
+    // kind KUnknown.
+    func unknown_var_root(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> {
+                if self.var_declared(name) {
+                    if self.find_var_kind(name) is .KUnknown {
+                        return true
+                    }
+                }
+            }
+            .Binary(lhs, op, _rhs) -> {
+                if op is .Dot {
+                    return self.unknown_var_root(lhs)
+                }
+                if op is .Index {
+                    return self.unknown_var_root(lhs)
+                }
+            }
+            .Call(callee, _args) -> return self.unknown_var_root(callee)
+            .Slice(subject, _lo, _hi) -> return self.unknown_var_root(subject)
+            .UnwrapOpt(value, _default) -> return self.unknown_var_root(value)
+            .OptionalDot(value, _field) -> return self.unknown_var_root(value)
+            .OptionalMethodCall(value, _method, _args) -> return self.unknown_var_root(value)
+            .Try(inner) -> return self.unknown_var_root(inner)
+            .Must(inner) -> return self.unknown_var_root(inner)
+            else none
+        }
+        return false
+    }
+
+    func report_if_unknown(self, anon expr_id: int64) -> none {
+        if self.infer_kind(expr_id) is .KUnknown {
+            self.report_cannot_infer(expr_id, what: "this expression")
+        }
+    }
+
+    // Compile an expression only for the errors it reports.
+    func compile_discard(self, anon expr_id: int64) -> none {
+        let val = self.compile_expr(expr_id)
+        self.free_val(val)
+    }
+
+    func kind_has_unknown(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KUnknown -> return true
+            .KOptional(inner) -> return self.kind_has_unknown(inner)
+            .KArrayOptional(inner) -> return self.kind_has_unknown(inner)
+            .KStruct(_idx, type_args) -> {
+                for ta in type_args {
+                    if self.kind_has_unknown(ta) {
+                        return true
+                    }
+                }
+            }
+            .KFunc(param_kinds, return_kind) -> {
+                for pk in param_kinds {
+                    if self.kind_has_unknown(pk) {
+                        return true
+                    }
+                }
+                return self.kind_has_unknown(return_kind)
+            }
+            .KArrayFunc(param_kinds, return_kind) -> {
+                for pk in param_kinds {
+                    if self.kind_has_unknown(pk) {
+                        return true
+                    }
+                }
+                return self.kind_has_unknown(return_kind)
+            }
+            else none
+        }
+        return false
     }
 
     func report_error(self, anon msg: str, span: ast.Span) -> none {
@@ -524,6 +620,7 @@ type Codegen = struct {
             k = k + 1
         }
         self.errors += [Error(path: self.p.path, :line, :col, :end_col, message: msg, source_line: line_text, :caret)]
+        self.report_attempts = self.report_attempts + 1
     }
 
     func had_errors(self) -> bool {
@@ -1878,6 +1975,7 @@ type Codegen = struct {
             .KArrayFunc(param_kinds, return_kind) -> {
                 return f"[{self.kind_display(.KFunc(:param_kinds, :return_kind))}]"
             }
+            .KUnknown -> return "<unknown>"
         }
     }
 
@@ -2001,6 +2099,7 @@ type Codegen = struct {
             .KArrayFunc(param_kinds, return_kind) -> {
                 return f"arr${self.canonical_kind_name(.KFunc(:param_kinds, :return_kind))}"
             }
+            .KUnknown -> return "unknown"
         }
     }
 
@@ -2009,6 +2108,11 @@ type Codegen = struct {
     // doesn't already exist. The new entry shares the template's method
     // func_decls but has substituted field kinds and method sigs.
     func instantiate_struct(self, anon type_args: [TypeKind], template_idx: int64) -> int64 {
+        for ta in type_args {
+            if self.kind_has_unknown(ta) {
+                return template_idx
+            }
+        }
         let template = self.structs[template_idx]
         mut canonical = template.name
         for ta in type_args {
@@ -2102,6 +2206,7 @@ type Codegen = struct {
             .KInterface(iface_idx) -> return .KArrayInterface(elem_idx: iface_idx)
             .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
             .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
+            .KUnknown -> return .KUnknown
             else return .KArray
         }
     }
@@ -2170,6 +2275,11 @@ type Codegen = struct {
     // template's substitution context so K/V in `Some(T)` become the concrete
     // kinds. Canonical name is `Template$arg1$arg2` to match struct mangling.
     func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64) -> int64 {
+        for ta in type_args {
+            if self.kind_has_unknown(ta) {
+                return template_idx
+            }
+        }
         let template = self.enums[template_idx]
         mut canonical = template.name
         for ta in type_args {
@@ -3270,8 +3380,12 @@ type Codegen = struct {
                         field_off = self.find_field_offset(field_name, :struct_idx)
                     }
                 } else {
-                    if len(self.errors) == errors_before {
-                        self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs])
+                    if lhs_kind is .KUnknown {
+                        self.report_cannot_infer(lhs, what: "this expression")
+                    } else {
+                        if len(self.errors) == errors_before {
+                            self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs])
+                        }
                     }
                 }
                 mut result = self.pool.alloc_reg()
@@ -3294,6 +3408,12 @@ type Codegen = struct {
 
     func compile_index(self, lhs: int64, rhs: int64) -> Val {
         let lhs_kind = self.infer_kind(lhs)
+        if lhs_kind is .KUnknown {
+            self.compile_discard(lhs)
+            self.report_cannot_infer(lhs, what: "this expression")
+            self.compile_discard(rhs)
+            return .VImm(value: 0)
+        }
         // Struct with op_index — dispatch as a method call.
         match lhs_kind {
             .KStruct(idx, _struct_type_args) -> {
@@ -3395,11 +3515,13 @@ type Codegen = struct {
         let done = self.fresh("Land")
         mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
+        self.report_if_unknown(lhs)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
         self.emit(f"beq {done}")
         let rhs_val = self.compile_expr(rhs)
+        self.report_if_unknown(rhs)
         self.mov_to(rhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
@@ -3411,11 +3533,13 @@ type Codegen = struct {
         let done = self.fresh("Lor")
         mut result = self.pool.alloc_reg()
         let lhs_val = self.compile_expr(lhs)
+        self.report_if_unknown(lhs)
         self.mov_to(lhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
         self.emit(f"bne {done}")
         let rhs_val = self.compile_expr(rhs)
+        self.report_if_unknown(rhs)
         self.mov_to(rhs_val, dest: result)
         self.emit(f"cmp {result}, #0")
         self.emit(f"cset {result}, ne")
@@ -3503,6 +3627,25 @@ type Codegen = struct {
 
     func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
         let lhs_kind = self.infer_kind(lhs_id)
+        mut lhs_unknown = false
+        if lhs_kind is .KUnknown {
+            lhs_unknown = true
+        }
+        mut rhs_unknown = false
+        if self.infer_kind(rhs_id) is .KUnknown {
+            rhs_unknown = true
+        }
+        if lhs_unknown or rhs_unknown {
+            self.compile_discard(lhs_id)
+            if lhs_unknown {
+                self.report_cannot_infer(lhs_id, what: "this expression")
+            }
+            self.compile_discard(rhs_id)
+            if rhs_unknown {
+                self.report_cannot_infer(rhs_id, what: "this expression")
+            }
+            return .VImm(value: 0)
+        }
         // Comparing against `none` only makes sense for optional types;
         // for other kinds it would silently compile to `x == 0`.
         mut is_eq_or_ne: bool = false
@@ -3834,6 +3977,11 @@ type Codegen = struct {
                 }
                 return self.compile_expr(expr_id)
             }
+            .KUnknown -> {
+                let val = self.compile_expr(expr_id)
+                self.report_cannot_infer(expr_id, what: "this expression")
+                return val
+            }
             else return self.compile_expr(expr_id)
         }
     }
@@ -3927,6 +4075,7 @@ type Codegen = struct {
         match self.infer_kind(s_id) {
             .KStr -> self.emit("bl _kod_str_slice")
             .KBytes -> self.emit("bl _kod_str_slice")
+            .KUnknown -> self.report_cannot_infer(s_id, what: "this expression")
             else self.emit("bl _kod_array_slice")
         }
         return .VReg(name: "x0")
@@ -4850,6 +4999,14 @@ type Codegen = struct {
 
     func compile_method_call(self, anon args: [ast.CallArg], receiver_id: int64, method_name: str, span: ast.Span) -> Val {
         let recv_kind = self.infer_kind(receiver_id)
+        if recv_kind is .KUnknown {
+            self.compile_discard(receiver_id)
+            self.report_cannot_infer(receiver_id, what: "this expression")
+            for arg in args {
+                self.compile_discard(arg.value)
+            }
+            return .VImm(value: 0)
+        }
 
         // Interface dispatch: load vtable from the cell, then indirect call.
         if recv_kind is .KInterface(iface_idx) {
@@ -5111,6 +5268,11 @@ type Codegen = struct {
     }
 
     func compile_match_expr(self, anon arms: [int64], subject_id: int64) -> Val {
+        if self.infer_kind(subject_id) is .KUnknown {
+            self.compile_discard(subject_id)
+            self.report_cannot_infer(subject_id, what: "this expression")
+            return .VImm(value: 0)
+        }
         mut expr_patterns: [int64] = []
         for arm_id in arms {
             expr_patterns += [self.p.match_expr_arms[arm_id].pattern]
@@ -5587,6 +5749,7 @@ type Codegen = struct {
 
     func compile_stmt(self, anon stmt_id: int64) -> none {
         self.mark_stmt_line(stmt_id)
+        self.stmt_error_mark = self.report_attempts
         match self.p.stmts[stmt_id] {
             .Let(name, typ, value, mutable) -> self.compile_let(:name, :typ, :value, :mutable)
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
@@ -5631,6 +5794,9 @@ type Codegen = struct {
             }
         }
         self.compile_store(dest_off: off, :kind, value_id: value)
+        if typ == 0 and kind is .KUnknown {
+            self.report_cannot_infer(value, what: f"`{name}`")
+        }
     }
 
     // Compile `value_id` into a register, applying any kind-specific
@@ -5652,17 +5818,26 @@ type Codegen = struct {
         match expected {
             .KOptional(inner) -> {
                 mut needs_wrap = true
+                mut unknown = false
                 match self.p.exprs[value_id] {
                     .NoneLit -> needs_wrap = false
                     else none
                 }
                 if needs_wrap {
-                    if self.infer_kind(value_id) is .KOptional(inner2) {
-                        needs_wrap = false
+                    match self.infer_kind(value_id) {
+                        .KOptional(inner2) -> needs_wrap = false
+                        .KUnknown -> {
+                            needs_wrap = false
+                            unknown = true
+                        }
+                        else none
                     }
                 }
                 if needs_wrap == false {
                     let val = self.compile_expr(value_id)
+                    if unknown {
+                        self.report_cannot_infer(value_id, what: "this expression")
+                    }
                     return self.load(val)
                 }
                 let val = self.compile_expr(value_id)
@@ -5681,6 +5856,10 @@ type Codegen = struct {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 let actual = self.infer_kind(value_id)
+                if actual is .KUnknown {
+                    self.report_cannot_infer(value_id, what: "this expression")
+                    return reg
+                }
                 return self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
             }
             else {
@@ -5751,7 +5930,11 @@ type Codegen = struct {
                 let val = self.compile_expr(value_id)
                 mut reg = self.load(val)
                 let actual = self.infer_kind(value_id)
-                reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+                if actual is .KUnknown {
+                    self.report_cannot_infer(value_id, what: "this expression")
+                } else {
+                    reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+                }
                 self.emit_str(dest_off, :reg)
                 self.pool.free_reg(reg)
             }
@@ -5759,17 +5942,26 @@ type Codegen = struct {
                 // Wrap into an Optional cell unless the value is already an
                 // Optional (NoneLit, Call return, or an inferred-Optional expr).
                 mut needs_wrap = true
+                mut unknown = false
                 match self.p.exprs[value_id] {
                     .NoneLit -> needs_wrap = false
                     else none
                 }
                 if needs_wrap {
-                    if self.infer_kind(value_id) is .KOptional(inner2) {
-                        needs_wrap = false
+                    match self.infer_kind(value_id) {
+                        .KOptional(inner2) -> needs_wrap = false
+                        .KUnknown -> {
+                            needs_wrap = false
+                            unknown = true
+                        }
+                        else none
                     }
                 }
                 if needs_wrap == false {
                     let wrapped_val = self.compile_expr(value_id)
+                    if unknown {
+                        self.report_cannot_infer(value_id, what: "this expression")
+                    }
                     let val_reg = self.load(wrapped_val)
                     self.emit_str(dest_off, reg: val_reg)
                     self.pool.free_reg(val_reg)
@@ -6026,6 +6218,13 @@ type Codegen = struct {
     // `op_index_set` (Map, Set, …). The op_index_set dispatch needs the
     // lhs's inferred struct kind; the plain-array path doesn't care.
     func compile_index_assign(self, lhs: int64, rhs: int64, rhs_id: int64) -> none {
+        if self.infer_kind(lhs) is .KUnknown {
+            self.compile_discard(lhs)
+            self.report_cannot_infer(lhs, what: "this expression")
+            self.compile_discard(rhs)
+            self.compile_discard(rhs_id)
+            return
+        }
         mut setter: str? = none
         if self.infer_kind(lhs) is .KStruct(struct_idx, _struct_type_args) {
             setter = self.struct_index_setter_label(:struct_idx)
@@ -6205,14 +6404,21 @@ type Codegen = struct {
         // wrap it as .Ok(value) — a 16-byte arena cell {0, value}.
         if self.is_result_kind(self.return_kind) {
             mut already = false
-            if self.is_result_kind(self.infer_kind(value_id)) {
+            let value_kind = self.infer_kind(value_id)
+            if self.is_result_kind(value_kind) {
                 already = true
             }
-            if already {
+            if value_kind is .KUnknown {
                 let val = self.compile_expr(value_id)
                 self.mov_to(val, dest: "x0")
+                self.report_cannot_infer(value_id, what: "this expression")
             } else {
-                self.compile_wrap_ok(value_id)
+                if already {
+                    let val = self.compile_expr(value_id)
+                    self.mov_to(val, dest: "x0")
+                } else {
+                    self.compile_wrap_ok(value_id)
+                }
             }
             self.emit(f"b {self.ret_lbl}")
             return
@@ -6232,6 +6438,13 @@ type Codegen = struct {
                 if assume_optional == false {
                     match self.infer_kind(value_id) {
                         .KOptional(inner2) -> {}
+                        .KUnknown -> {
+                            let val = self.compile_expr(value_id)
+                            self.mov_to(val, dest: "x0")
+                            self.report_cannot_infer(value_id, what: "this expression")
+                            self.emit(f"b {self.ret_lbl}")
+                            return
+                        }
                         else needs_wrap = true
                     }
                 }
@@ -6681,7 +6894,9 @@ type Codegen = struct {
         // body needs to see the kind of *this* iterator, not whichever
         // foreach ran last during collection.
         mut elem_kind: TypeKind = .KInt64
-        match self.infer_kind(iter_id) {
+        let iter_kind = self.infer_kind(iter_id)
+        match iter_kind {
+            .KUnknown -> elem_kind = .KUnknown
             .KArrayStruct(elem_idx) -> elem_kind = .KStruct(idx: elem_idx, type_args: [])
             .KArrayEnum(elem_idx) -> elem_kind = .KEnum(idx: elem_idx)
             .KArrayStr -> elem_kind = .KStr
@@ -6708,6 +6923,9 @@ type Codegen = struct {
         let hdr_off = self.find_var_offset(hdr_name)
 
         let arr_val = self.compile_expr(iter_id)
+        if iter_kind is .KUnknown {
+            self.report_cannot_infer(iter_id, what: "this expression")
+        }
         let hdr_r = self.load(arr_val)
         self.emit_str(hdr_off, reg: hdr_r)
         self.pool.free_reg(hdr_r)
@@ -6909,6 +7127,11 @@ type Codegen = struct {
     }
 
     func compile_match_stmt(self, anon arms: [int64], subject_id: int64) -> none {
+        if self.infer_kind(subject_id) is .KUnknown {
+            self.compile_discard(subject_id)
+            self.report_cannot_infer(subject_id, what: "this expression")
+            return
+        }
         self.check_match_subject(subject_id, :arms)
         mut stmt_patterns: [int64] = []
         for arm_id in arms {
