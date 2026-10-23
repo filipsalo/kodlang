@@ -256,7 +256,9 @@ print(f"{text}!")    // text is a str
 
 A `match` on an enum (or on `T?` or `bool`) must cover every variant.
 The compiler reports an error if any variant is missing and no
-wildcard arm is present.
+wildcard arm is present. An arm naming a variant the enum doesn't declare
+is reported instead, since it's usually a misspelling of the missing one,
+and its bindings don't cause further errors in the arm.
 
 ```kod
 type Color = enum { Red, Green, Blue }
