@@ -196,6 +196,11 @@ error. With an annotation each arm is converted to the annotated type,
 which is how arms of different structs become one interface value:
 `let s: Shape = match k { 1 -> Sq(s: 2) else -> Circle(r: 1) }`.
 
+Every arm needs a value: an arm that calls a function returning `none` is
+an error, except `kod_panic(...)`, which doesn't return. Without an
+annotation, a match whose arms are all `none` is an error too, as
+`let x = none` is, since its type can't be inferred.
+
 For multi-statement arm bodies, use a match statement and assign or
 return from inside.
 
