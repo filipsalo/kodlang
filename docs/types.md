@@ -310,6 +310,10 @@ let n: Name = "kod"
 print(n.char_count())    // 3
 ```
 
+An alias of `T or Error` works wherever `T or Error` does, including as the
+return type of a function or of `main`, so `throw`, `try` and `must` behave
+the same through it.
+
 A struct, enum or interface that the importing module declares wins over
 a same-named alias from an imported module. An alias whose target names an
 unknown type is an error, and so is one that refers back to itself through

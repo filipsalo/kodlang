@@ -102,6 +102,22 @@ def is_result_type_expr(expr) -> bool:
     return False
 
 
+def returns_result(func, module) -> bool:
+    """True if `func` is declared to return `T or Error`, spelled out or
+    through one of `module`'s aliases."""
+    expr = func.return_type
+    if is_result_type_expr(expr):
+        return True
+    if not isinstance(expr, NamedTypeExpr):
+        return False
+    resolved = module.names.get(expr.name)
+    return (
+        isinstance(resolved, type)
+        and issubclass(resolved, types.EnumType)
+        and resolved.name.startswith("Result[")
+    )
+
+
 def dump(node, indent=""):
     """Dump the AST node."""
     print(f"{indent}{node.__class__.__name__}(")

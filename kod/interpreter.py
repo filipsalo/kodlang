@@ -123,6 +123,14 @@ class Interpreter:
             return callee.id
         return ""
 
+    def _returns_result(self, func):
+        """ast.returns_result, cached on the declaration: call_function is hot."""
+        fallible = func.__dict__.get("_returns_result")
+        if fallible is None:
+            fallible = ast.returns_result(func, func.module)
+            func.__dict__["_returns_result"] = fallible
+        return fallible
+
     def _is_result_value(self, v):
         """True if `v` is already a fallible-result carrier — the legacy
         ResultValue dataclass OR an EnumValue of stdlib Result[T, E]
@@ -1034,7 +1042,7 @@ class Interpreter:
             if all_params and not all_params[0].mutable:
                 param_immutable.add("self")
             self.immutable_stack.append(param_immutable)
-            fallible = ast.is_result_type_expr(func.return_type)
+            fallible = self._returns_result(func)
             try:
                 for statement in func.body:
                     self.execute_statement(func.module, statement)
@@ -1077,7 +1085,7 @@ class Interpreter:
         self.immutable_stack.append(
             {p.variable.id for p in func.params if not p.mutable}
         )
-        fallible = ast.is_result_type_expr(func.return_type)
+        fallible = self._returns_result(func)
         try:
             for statement in func.body:
                 self.execute_statement(func.module, statement)
