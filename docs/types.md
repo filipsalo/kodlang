@@ -349,7 +349,9 @@ reported once, at the alias.
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
 
 `try` and `must` take a `T or Error` value, and `try` only works inside a
-function that returns `T or Error` itself; anything else is an error.
+function that returns `T or Error` itself; anything else is an error. An
+explicit `Result[T, E]` with an `E` other than `Error` doesn't count, since
+its error isn't an `Error` to report or pass on; match it instead.
 
 Outside a fallible function's `return`, a plain value isn't a result:
 `let r: int64 or Error = 3` is an error, and
