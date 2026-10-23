@@ -53,11 +53,13 @@ What can be interpolated:
 - `str`, and `bytes` as-is
 - `int64` and `bool`
 - a struct that declares `func to_str(self) -> str`
-- a value of an interface that declares `to_str`, such as `Stringable` or
-  `Error`; the call goes to the concrete type's `to_str`
+- a value of an interface that declares the same `to_str`, such as
+  `Stringable` or `Error`; the call goes to the concrete type's `to_str`
 
 Anything else is a compile error for now: an optional (`T?`), an enum, an
-array, a function value, and a struct or interface without `to_str`.
+array, a function value, and a struct or interface without a
+`func to_str(self) -> str`, including one whose `to_str` takes arguments
+or returns something else.
 Unwrap an optional first, e.g. `f"{n? or 0}"`.
 
 ## Concatenation

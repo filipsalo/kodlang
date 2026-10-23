@@ -4516,6 +4516,7 @@ type Codegen = struct {
     //                    we don't have a string representation for it yet)
     func compile_as_str(self, anon expr_id: int64) -> Val {
         mut k = self.infer_kind(expr_id)
+        mut bad_to_str = false
         match k {
             .KStr -> return self.compile_expr(expr_id)
             .KInt64 -> {
@@ -4532,19 +4533,25 @@ type Codegen = struct {
             }
             .KBytes -> return self.compile_expr(expr_id)
             .KStruct(struct_idx, _struct_type_args) -> {
-                if self.structs[struct_idx].method_idx.get("to_str") is Some(_mi) {
-                    let val = self.compile_expr(expr_id)
-                    self.mov_to(val, dest: "x0")
-                    let struct_info = self.structs[struct_idx]
-                    self.emit(f"bl ${struct_info.module_prefix}${struct_info.name}$to_str")
-                    return .VReg(name: "x0")
+                if self.structs[struct_idx].method_idx.get("to_str") is Some(mi) {
+                    bad_to_str = self.is_to_str_sig(self.structs[struct_idx].methods[mi].sig) == false
+                    if bad_to_str == false {
+                        let val = self.compile_expr(expr_id)
+                        self.mov_to(val, dest: "x0")
+                        let struct_info = self.structs[struct_idx]
+                        self.emit(f"bl ${struct_info.module_prefix}${struct_info.name}$to_str")
+                        return .VReg(name: "x0")
+                    }
                 }
             }
             .KInterface(iface_idx) -> {
                 for m in self.interfaces[iface_idx].methods {
                     if m.name == "to_str" {
-                        let no_args: [ast.CallArg] = []
-                        return self.compile_iface_method_call(no_args, receiver_id: expr_id, :iface_idx, method_name: "to_str", span: self.p.expr_spans[expr_id])
+                        bad_to_str = self.is_to_str_sig(m.sig) == false
+                        if bad_to_str == false {
+                            let no_args: [ast.CallArg] = []
+                            return self.compile_iface_method_call(no_args, receiver_id: expr_id, :iface_idx, method_name: "to_str", span: self.p.expr_spans[expr_id])
+                        }
                     }
                 }
             }
@@ -4570,6 +4577,9 @@ type Codegen = struct {
             .KStruct(_idx, _type_args) -> note = f"; `{shown}` has no `to_str` method"
             .KInterface(_idx) -> note = f"; `{shown}` doesn't declare `to_str`"
             else none
+        }
+        if bad_to_str {
+            note = f"; `{shown}.to_str` isn't `func to_str(self) -> str`"
         }
         self.report_error(f"error: cannot convert a value of type `{shown}` to `str`{note}", span: self.p.expr_spans[expr_id])
         return .VImm(value: 0)
@@ -5813,8 +5823,16 @@ type Codegen = struct {
     // If expected kind is KInterface and actual is KStruct, perform an
     // implicit upcast: box the struct pointer in a {data, vtable} cell
     // and return the new register. Otherwise returns the input register.
-    func maybe_box_for_iface(self, anon arg_reg: str, actual: TypeKind, expected: TypeKind) -> str {
+    func maybe_box_for_iface(self, anon arg_reg: str, actual: TypeKind, expected: TypeKind, span: ast.Span) -> str {
         let .KInterface(iface_idx) = expected else { return arg_reg }
+        let gap = self.iface_gap(actual, :iface_idx)
+        if len(gap) > 0 {
+            mut what = f"`{self.kind_display(actual)}`"
+            if actual is .KStruct(struct_idx, _type_args) {
+                what = f"struct `{self.struct_display_name(struct_idx)}`"
+            }
+            self.report_error(f"error: {what} doesn't implement interface `{self.interfaces[iface_idx].name}`: {gap}", :span)
+        }
         match actual {
             .KStruct(struct_idx, _struct_type_args) -> return self.emit_iface_box(arg_reg, :struct_idx, :iface_idx)
             .KInt64 -> return self.emit_prim_iface_box(arg_reg, kind: .KInt64, :iface_idx)
@@ -5822,6 +5840,65 @@ type Codegen = struct {
             .KBool -> return self.emit_prim_iface_box(arg_reg, kind: .KBool, :iface_idx)
             else return arg_reg
         }
+    }
+
+    // Why a struct or primitive can't be a value of the interface; "" when it can.
+    func iface_gap(self, anon actual: TypeKind, iface_idx: int64) -> str {
+        mut boxable = false
+        match actual {
+            .KStruct(_idx, _type_args) -> boxable = true
+            .KInt64 -> boxable = true
+            .KStr -> boxable = true
+            .KBool -> boxable = true
+            .KBytes -> boxable = true
+            else none
+        }
+        if boxable == false or self.kind_has_unknown(actual) {
+            return ""
+        }
+        for m in self.interfaces[iface_idx].methods {
+            mut found = false
+            mut sig = m.sig
+            if actual is .KStruct(struct_idx, _args) {
+                if self.structs[struct_idx].method_idx.get(m.name) is Some(mi) {
+                    found = true
+                    sig = self.structs[struct_idx].methods[mi].sig
+                }
+            } else {
+                let pm = self.find_prim_method(m.name, kind: actual)
+                if pm >= 0 {
+                    found = true
+                    sig = self.prim_methods[pm].sig
+                }
+            }
+            if found == false {
+                return f"missing method `{m.name}`"
+            }
+            let want = self.method_kind(m.sig)
+            let got = self.method_kind(sig)
+            if self.same_kind(want, got) == false {
+                return f"method `{m.name}` is `{self.kind_display(got)}`, not `{self.kind_display(want)}`"
+            }
+        }
+        return ""
+    }
+
+    // A method's type without its `self` receiver.
+    func method_kind(self, anon sig: SigInfo) -> TypeKind {
+        mut params: [TypeKind] = []
+        mut i = 0
+        for pk in sig.param_kinds {
+            if i > 0 or sig.param_names[0] != "self" {
+                params += [pk]
+            }
+            i += 1
+        }
+        return .KFunc(param_kinds: params, return_kind: sig.return_kind)
+    }
+
+    func is_to_str_sig(self, anon sig: SigInfo) -> bool {
+        let no_params: [TypeKind] = []
+        return self.same_kind(self.method_kind(sig), .KFunc(param_kinds: no_params, return_kind: .KStr))
     }
 
     // Box a primitive value (int64 / str / bool) into a {data, vtable}
@@ -6796,7 +6873,7 @@ type Codegen = struct {
                     self.report_cannot_infer(value_id, what: "this expression")
                     return reg
                 }
-                return self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+                return self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx), span: self.p.expr_spans[value_id])
             }
             .KArrayEnum(elem_idx) -> return self.load(self.compile_typed_array_value(value_id, expected_elem: .KEnum(idx: elem_idx)))
             .KArrayInterface(elem_idx) -> return self.load(self.compile_typed_array_value(value_id, expected_elem: .KInterface(idx: elem_idx)))
@@ -6890,7 +6967,7 @@ type Codegen = struct {
                 if actual is .KUnknown {
                     self.report_cannot_infer(value_id, what: "this expression")
                 } else {
-                    reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+                    reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx), span: self.p.expr_spans[value_id])
                 }
                 self.emit_str(dest_off, :reg)
                 self.pool.free_reg(reg)
@@ -7653,7 +7730,7 @@ type Codegen = struct {
         self.mov_to(val, dest: reg)
         // Box into the Error interface if the source is a concrete struct.
         if iface_idx >= 0 {
-            reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx))
+            reg = self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx), span: self.p.expr_spans[value_id])
         }
         // Build the Result.Err cell.
         let reg_spilled = self.preserve_begin(reg)

@@ -311,6 +311,13 @@ an annotated `let`, an argument, a field, an array element, a value stored
 with `m[k] = v`, and a return value, including the value of a `-> Shape?`
 or `-> Shape or Error` function.
 
+The type must declare every method of the interface, with the same
+parameter and return types (labels and defaults may differ). Otherwise
+using it as the interface is an error at that spot, such as
+``struct `P` doesn't implement interface `Shape`: missing method `area` ``
+or ``method `area` is `func(int64) -> int64`, not `func() -> int64` ``.
+`throw` counts too, since it makes its value an `Error`.
+
 ## Type aliases
 
 `type Name = T` gives an existing type a second name. An alias is
