@@ -372,6 +372,9 @@ function that returns `T or Error` itself; anything else is an error. An
 explicit `Result[T, E]` with an `E` other than `Error` doesn't count, since
 its error isn't an `Error` to report or pass on; match it instead.
 
+A `none or Error` function that ends without a `return`, or with a bare
+`return`, returns `Ok(none)`, as `return none` does.
+
 Outside a fallible function's `return`, a plain value isn't a result:
 `let r: int64 or Error = 3` is an error, and
 `let r: int64 or Error = .Ok(value: 3)` is a successful result.
