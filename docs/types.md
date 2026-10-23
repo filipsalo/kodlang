@@ -208,7 +208,8 @@ of the field or return type, and to `none` without touching the field
 when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
 from a function declared `-> str` or `-> str or Error` is an error, so
 unwrap it first with `t?.name?` or `t?.name? or ""`, or declare the
-function `-> str?`.
+function `-> str?`. `t?.name = v` isn't an assignment; unwrap first, as in
+`if t is Some(v) { v.name = "x" }`.
 
 ## Arrays
 
