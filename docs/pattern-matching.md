@@ -109,6 +109,9 @@ match shape {
 ```
 
 Bindings are by position — the names in the pattern don't have to match the field names.
+A pattern may bind fewer names than the variant has fields, but not more.
+Naming an enum or variant that doesn't exist is an error, as is an
+implicit `.Variant` that no enum declares.
 
 Each binding takes the type of the field it binds, so different arms can
 reuse a name for payloads of different types:

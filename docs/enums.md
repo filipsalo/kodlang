@@ -41,6 +41,11 @@ The annotation is optional: a constructor has the enum's type, so
 `let m = Message.Text(content: "hello")` (or `mod.Enum.Variant(...)` for
 an imported enum) can be matched without an `else` arm.
 
+Payload values go in declaration order, labelled or not:
+`Message.Move(x: 1, y: 2)` and `Message.Move(1, 2)` are the same value. A
+missing or extra payload value, a label that isn't the field in that
+position, and a variant the enum doesn't declare (`Message.Txt`) are errors.
+
 ## Implicit variant syntax
 
 Inside a `match` arm, the enum name can be omitted when the type is unambiguous:

@@ -1663,6 +1663,105 @@ type Codegen = struct {
         return -1
     }
 
+    // find_variant_idx, reporting an unknown variant at `span`.
+    func check_variant(self, anon variant_name: str, enum_idx: int64, span: ast.Span) -> int64 {
+        let variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+        if variant_idx < 0 {
+            mut names: [str] = []
+            for v in self.enums[enum_idx].variants {
+                names += [v.name]
+            }
+            let msg: str = self.with_suggestion(f"error: enum `{self.enums[enum_idx].name}` has no variant `{variant_name}`", typo: variant_name, candidates: names)
+            self.report_once(msg, :span)
+        }
+        return variant_idx
+    }
+
+    func payload_noun(self, anon count: int64) -> str {
+        if count == 1 {
+            return "1 payload field"
+        }
+        return f"{count} payload fields"
+    }
+
+    // The enum an `Enum.V` or `.V` pattern tests (enum_name is "" for the
+    // implicit form), or -1 after reporting it at `span`.
+    func pattern_enum_idx(self, enum_name: str, variant_name: str, subj_enum_idx: int64, span: ast.Span) -> int64 {
+        if len(enum_name) > 0 {
+            let enum_idx = self.find_enum_idx(enum_name)
+            if enum_idx < 0 {
+                mut names: [str] = []
+                for e in self.enums {
+                    if e.template_idx < 0 {
+                        names += [e.name]
+                    }
+                }
+                self.report_once(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
+            }
+            return enum_idx
+        }
+        let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: subj_enum_idx)
+        if enum_idx >= 0 {
+            return enum_idx
+        }
+        if subj_enum_idx >= 0 {
+            return subj_enum_idx
+        }
+        mut variant_names: [str] = []
+        for e in self.enums {
+            for v in e.variants {
+                variant_names += [v.name]
+            }
+        }
+        self.report_once(self.with_suggestion(f"error: no enum has a variant `.{variant_name}`", typo: variant_name, candidates: variant_names), :span)
+        return -1
+    }
+
+    // The variant a pattern tests, or -1 after reporting an unknown variant
+    // or more bindings than it has payload fields.
+    func pattern_variant_idx(self, anon enum_idx: int64, variant_name: str, binding_count: int64, span: ast.Span) -> int64 {
+        let variant_idx = self.check_variant(variant_name, :enum_idx, :span)
+        if variant_idx < 0 {
+            return -1
+        }
+        let field_count = len(self.enums[enum_idx].variants[variant_idx].field_offsets)
+        if binding_count > field_count {
+            self.report_once(f"error: `{self.enums[enum_idx].name}.{variant_name}` has {self.payload_noun(field_count)}, pattern binds {binding_count}", :span)
+            return -1
+        }
+        return variant_idx
+    }
+
+    // Payload arity and labels of a variant construction. Labels are
+    // optional, but a label must name the field in its position.
+    func check_payload_args(self, anon args: [ast.CallArg], enum_idx: int64, variant_idx: int64, span: ast.Span) -> none {
+        let vinfo = self.enums[enum_idx].variants[variant_idx]
+        let shown: str = f"{self.enums[enum_idx].name}.{vinfo.name}"
+        let field_count = len(vinfo.field_names)
+        if len(args) != field_count {
+            self.report_once(f"error: `{shown}` has {self.payload_noun(field_count)}, got {len(args)}", :span)
+        }
+        mut i = 0
+        for arg in args {
+            if len(arg.label) > 0 and i < field_count {
+                if arg.label != vinfo.field_names[i] {
+                    mut known = false
+                    for name in vinfo.field_names {
+                        if name == arg.label {
+                            known = true
+                        }
+                    }
+                    if known {
+                        self.report_once(f"error: `{shown}` takes its payload in declaration order: expected `{vinfo.field_names[i]}`, got `{arg.label}`", span: arg.label_span)
+                    } else {
+                        self.report_once(self.with_suggestion(f"error: `{shown}` has no payload field `{arg.label}`", typo: arg.label, candidates: vinfo.field_names), span: arg.label_span)
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
     func find_field_offset(self, anon field_name: str, struct_idx: int64) -> int64 {
         mut j = 0
         for j < len(self.structs[struct_idx].fields) {
@@ -2649,7 +2748,12 @@ type Codegen = struct {
                 }
             }
             .ErrPat(_binding) -> kind = .KInterface(idx: self.find_iface_idx("Error"))
-            .TypePat(type_name, _binding) -> kind = .KStruct(idx: self.find_struct_idx(type_name), type_args: [])
+            .TypePat(type_name, _binding) -> {
+                let struct_idx = self.find_struct_idx(type_name)
+                if struct_idx >= 0 {
+                    kind = .KStruct(idx: struct_idx, type_args: [])
+                }
+            }
             .EnumPat(enum_name, variant_name, _bindings) -> {
                 return self.variant_binding_kinds(self.find_enum_idx(enum_name), :variant_name, :count)
             }
@@ -3011,7 +3115,7 @@ type Codegen = struct {
                 }
                 mut variant_idx = self.find_variant_idx(name, :enum_idx)
                 let empty: [ast.CallArg] = []
-                return self.compile_enum_construct(empty, :enum_idx, :variant_idx)
+                return self.compile_enum_construct(empty, :enum_idx, :variant_idx, span: self.p.expr_spans[expr_id])
             }
             .Binary(lhs, op, rhs) -> return self.compile_binary(:lhs, :op, :rhs)
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
@@ -3065,9 +3169,17 @@ type Codegen = struct {
         let ei3 = self.find_enum_idx(enum_name)
         if ei3 < 0 { return none }
         let vi3 = self.find_variant_idx(variant_name, enum_idx: ei3)
-        if vi3 < 0 { return none }
+        if vi3 < 0 {
+            if self.p.exprs[inner_lhs] is .Ident(mod_name) {
+                if self.is_import_alias(mod_name) {
+                    self.check_variant(variant_name, enum_idx: ei3, span: self.p.expr_spans[dot_rhs])
+                    return .VImm(value: 0)
+                }
+            }
+            return none
+        }
         let empty: [ast.CallArg] = []
-        return self.compile_enum_construct(empty, enum_idx: ei3, variant_idx: vi3)
+        return self.compile_enum_construct(empty, enum_idx: ei3, variant_idx: vi3, span: self.p.expr_spans[dot_rhs])
     }
 
     // Python-style chained comparison: `a < b < c` evaluates as
@@ -3119,9 +3231,12 @@ type Codegen = struct {
         let enum_idx = self.find_enum_idx(type_name)
         if enum_idx < 0 { return none }
         let .Ident(variant_name) = self.p.exprs[dot_rhs] else { return none }
-        mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+        let variant_idx = self.check_variant(variant_name, :enum_idx, span: self.p.expr_spans[dot_rhs])
+        if variant_idx < 0 {
+            return .VImm(value: 0)
+        }
         let empty: [ast.CallArg] = []
-        return self.compile_enum_construct(empty, :enum_idx, :variant_idx)
+        return self.compile_enum_construct(empty, :enum_idx, :variant_idx, span: self.p.expr_spans[dot_rhs])
     }
 
     func compile_dot(self, lhs: int64, rhs: int64) -> Val {
@@ -3567,8 +3682,31 @@ type Codegen = struct {
     }
 
     // Variant arm test + payload binding, shared by match stmts and exprs.
-    func emit_variant_test(self, enum_idx: int64, variant_name: str, bindings: [str], disc_r: str, subj_slot: int64, skip_lbl: str) -> none {
-        let variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+    func emit_variant_test(self, anon pattern: ast.Pattern, subj_enum_idx: int64, disc_r: str, subj_slot: int64, skip_lbl: str, span: ast.Span) -> none {
+        mut enum_name = ""
+        mut variant_name = ""
+        mut bindings: [str] = []
+        match pattern {
+            .EnumPat(e, v, b) -> {
+                enum_name = e
+                variant_name = v
+                bindings = b
+            }
+            .ImplicitEnumPat(v, b) -> {
+                variant_name = v
+                bindings = b
+            }
+            else none
+        }
+        let enum_idx = self.pattern_enum_idx(:enum_name, :variant_name, :subj_enum_idx, :span)
+        mut variant_idx = -1
+        if enum_idx >= 0 {
+            variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), :span)
+        }
+        if variant_idx < 0 {
+            self.emit(f"b {skip_lbl}")
+            return
+        }
         let vinfo = self.enums[enum_idx].variants[variant_idx]
         self.emit(f"cmp {disc_r}, #{vinfo.discriminant}")
         self.emit(f"bne {skip_lbl}")
@@ -3868,8 +4006,19 @@ type Codegen = struct {
     func try_three_part_construct(self, anon args: [ast.CallArg], callee_lhs: int64, callee_rhs: int64) -> Val? {
         let .Ident(variant_name) = self.p.exprs[callee_rhs] else { return none }
         let enum_idx = self.three_part_ctor_enum(callee_lhs, :variant_name)
-        if enum_idx < 0 { return none }
-        return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(variant_name, :enum_idx))
+        if enum_idx < 0 {
+            let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[callee_lhs] else { return none }
+            let .Dot = inner_op else { return none }
+            let .Ident(mod_name) = self.p.exprs[inner_lhs] else { return none }
+            let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
+            let named_enum = self.find_enum_idx(enum_name)
+            if named_enum < 0 or self.is_import_alias(mod_name) == false {
+                return none
+            }
+            self.check_variant(variant_name, enum_idx: named_enum, span: self.p.expr_spans[callee_rhs])
+            return .VImm(value: 0)
+        }
+        return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(variant_name, :enum_idx), span: self.p.expr_spans[callee_rhs])
     }
 
     // The enum that a `mod.Enum.Variant(...)` callee constructs, or -1.
@@ -4036,7 +4185,12 @@ type Codegen = struct {
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
         let enum_idx = self.two_part_ctor_enum(callee_lhs, variant_name: method_name)
         if enum_idx >= 0 {
-            return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(method_name, :enum_idx))
+            return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(method_name, :enum_idx), span: self.p.expr_spans[callee_rhs])
+        }
+        let named_enum = self.find_enum_idx(mod_or_obj)
+        if named_enum >= 0 {
+            self.check_variant(method_name, enum_idx: named_enum, span: self.p.expr_spans[callee_rhs])
+            return .VImm(value: 0)
         }
         if self.is_import_alias(mod_or_obj) {
             let s_idx = self.find_struct_idx(method_name)
@@ -4222,7 +4376,7 @@ type Codegen = struct {
                 if enum_idx >= 0 {
                     mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
                     if variant_idx >= 0 {
-                        return self.compile_enum_construct(args, :enum_idx, :variant_idx)
+                        return self.compile_enum_construct(args, :enum_idx, :variant_idx, span: self.p.expr_spans[callee_id])
                     }
                 }
                 // Candidates for the typo hint: every variant of every
@@ -4708,17 +4862,15 @@ type Codegen = struct {
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
-                .EnumPat(enum_name, variant_name, bindings) -> {
-                    let enum_idx = self.find_enum_idx(enum_name)
-                    self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
+                .EnumPat(_enum_name, _variant_name, _bindings) -> {
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
                     let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
-                .ImplicitEnumPat(variant_name, bindings) -> {
-                    let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: subj_enum_idx)
-                    self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
+                .ImplicitEnumPat(_variant_name, _bindings) -> {
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
                     let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.mov_to(body_val, dest: result_r)
                     self.emit(f"b {done_lbl}")
@@ -5431,7 +5583,8 @@ type Codegen = struct {
 
     // Allocate an enum value on the arena and return its pointer in x0.
     // field_args supplies payload values (empty for unit variants).
-    func compile_enum_construct(self, anon field_args: [ast.CallArg], enum_idx: int64, variant_idx: int64) -> Val {
+    func compile_enum_construct(self, anon field_args: [ast.CallArg], enum_idx: int64, variant_idx: int64, span: ast.Span) -> Val {
+        self.check_payload_args(field_args, :enum_idx, :variant_idx, :span)
         let data_width = self.enums[enum_idx].data_width
         mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
         self.emit_load_imm("x0", value: data_width)
@@ -5445,7 +5598,7 @@ type Codegen = struct {
         if len(field_args) > 0 {
             let vinfo = self.enums[enum_idx].variants[variant_idx]
             mut i = 0
-            for i < len(field_args) {
+            for i < len(field_args) and i < len(vinfo.field_offsets) {
                 mut foff = vinfo.field_offsets[i]
                 mut field_kind: TypeKind = .KInt64
                 if i < len(vinfo.field_kinds) {
@@ -5503,7 +5656,7 @@ type Codegen = struct {
             else none
         }
         if variant_idx >= 0 {
-            let val = self.compile_enum_construct(field_args, :enum_idx, :variant_idx)
+            let val = self.compile_enum_construct(field_args, :enum_idx, :variant_idx, span: self.p.expr_spans[value_id])
             self.emit_str(dest_off, reg: "x0")
         } else {
             let val = self.compile_expr(value_id)
@@ -6325,8 +6478,14 @@ type Codegen = struct {
         self.retype_pattern_bindings(pattern, subject_kind: value_kind)
         match pattern {
             .EnumPat(enum_name, variant_name, bindings) -> {
-                let enum_idx = self.find_enum_idx(enum_name)
-                mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+                let enum_idx = self.pattern_enum_idx(:enum_name, :variant_name, subj_enum_idx: -1, span: self.p.expr_spans[value_id])
+                if enum_idx < 0 {
+                    return
+                }
+                mut variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), span: self.p.expr_spans[value_id])
+                if variant_idx < 0 {
+                    return
+                }
                 mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
                 let disc_r = self.pool.alloc_reg()
                 let ptr_r = self.pool.alloc_reg()
@@ -6352,8 +6511,14 @@ type Codegen = struct {
                 }
             }
             .ImplicitEnumPat(variant_name, bindings) -> {
-                let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: self.enum_idx_of_kind(value_kind))
-                mut variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+                let enum_idx = self.pattern_enum_idx(enum_name: "", :variant_name, subj_enum_idx: self.enum_idx_of_kind(value_kind), span: self.p.expr_spans[value_id])
+                if enum_idx < 0 {
+                    return
+                }
+                mut variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), span: self.p.expr_spans[value_id])
+                if variant_idx < 0 {
+                    return
+                }
                 mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
                 let disc_r = self.pool.alloc_reg()
                 let ptr_r = self.pool.alloc_reg()
@@ -6403,8 +6568,8 @@ type Codegen = struct {
                 self.pool.free_reg(disc_r)
             }
             else {
-                // Other patterns are not supported here yet.
-                self.emit(f"b {else_lbl}")
+                self.report_error("error: pattern not supported in let-else", span: self.p.expr_spans[value_id])
+                return
             }
         }
         self.emit(f"b {done_lbl}")
@@ -6488,16 +6653,14 @@ type Codegen = struct {
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
-                .EnumPat(enum_name, variant_name, bindings) -> {
-                    let enum_idx = self.find_enum_idx(enum_name)
-                    self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
+                .EnumPat(_enum_name, _variant_name, _bindings) -> {
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
                     self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
-                .ImplicitEnumPat(variant_name, bindings) -> {
-                    let enum_idx = self.find_enum_with_variant_in(variant_name, preferred_idx: subj_enum_idx)
-                    self.emit_variant_test(:enum_idx, :variant_name, :bindings, :disc_r, :subj_slot, :skip_lbl)
+                .ImplicitEnumPat(_variant_name, _bindings) -> {
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
                     self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
