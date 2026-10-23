@@ -174,13 +174,18 @@ if v is .Some(x) {
 ## `let .Pattern(bindings) = expr else { ... }`
 
 Destructure with an early-exit on the non-matching case. The `else`
-block must exit the enclosing scope (return / throw / panic) so the
-bindings are guaranteed-in-scope below:
+block must exit the enclosing scope (return / throw / panic, or
+break / continue in a loop) so the bindings are guaranteed-in-scope
+below:
 
 ```kod
 let .Some(v) = m.get(key) else { return -1 }
 // v is in scope here
 ```
+
+The pattern always starts with a `.`. On a `T?` value (like
+`m.get(key)` above), `.Some(v)` binds the unwrapped payload and
+`.None` matches `none`, the same spelling as for an `Option[T]`.
 
 ## Exhaustiveness
 

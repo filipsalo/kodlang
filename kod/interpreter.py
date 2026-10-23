@@ -52,6 +52,22 @@ class BoundMethod:
     receiver: Any
 
 
+def _optional_let_pattern(pattern, value):
+    """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the optional patterns."""
+    if not isinstance(pattern, ast.ImplicitEnumVariantPattern):
+        return pattern
+    if isinstance(value, types.EnumValue) and (
+        pattern.variant_name in value.enum_type.variants
+    ):
+        return pattern
+    if pattern.variant_name == "None" and not pattern.bindings:
+        return ast.OptionalNonePattern(pattern.span)
+    if pattern.variant_name == "Some" and len(pattern.bindings) <= 1:
+        binding = pattern.bindings[0] if pattern.bindings else ""
+        return ast.OptionalSomePattern(binding, pattern.span)
+    return pattern
+
+
 class Interpreter:
     """Simple interpreter for the Kod language"""
 
@@ -734,6 +750,7 @@ class Interpreter:
                             break
             case ast.LetElseStatement(pattern, value_expr, else_body):
                 value = self.evaluate_expression(module, value_expr)
+                pattern = _optional_let_pattern(pattern, value)
                 matched = False
                 if isinstance(
                     pattern, (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern)
