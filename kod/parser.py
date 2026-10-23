@@ -63,8 +63,7 @@ class Parser:
         self.program = program
         self.resolve_import = resolve_import  # Callable[[str] -> ast.Module] | None
         self.import_aliases: dict[str, str] = {}  # local_name -> module_name
-        # (TypeDeclaration, target TypeExpr) for aliases whose target is
-        # declared later in the module.
+        # (declaration, target) of aliases whose target is declared later.
         self.pending_aliases: list = []
         self.pending_alias_names: set[str] = set()
 

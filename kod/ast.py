@@ -1585,8 +1585,7 @@ class TypeDeclaration(ASTNode):
                 try:
                     type_ = parser.resolve_type_expr(type_expr)
                 except ValueError:
-                    # An alias naming a later declaration keeps the
-                    # placeholder until that declaration is parsed.
+                    # Keeps the placeholder until the later declaration is parsed.
                     type_ = None
         decl = cls(name, type_ or types.InterfaceType, span)
         if type_ is None:
