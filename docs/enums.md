@@ -68,10 +68,12 @@ Unit variants can also use the implicit `.Variant` form in expressions:
 let d: Direction = .North
 ```
 
-A payload variant can use it too wherever the enum type is known: an
-annotated `let` (`let m: Message = .Text(content: "hi")`), an argument, or a
-return value. Elsewhere, construct payload variants with the explicit
-`Enum.Variant(...)` form.
+A payload variant can use it too. Wherever the enum type is known, the
+variant belongs to that enum: an annotated `let`
+(`let m: Message = .Text(content: "hi")`), an assignment, an argument, a
+struct field, an array element or a return value. Elsewhere, as in an
+unannotated `let`, it belongs to the enum that declares a variant of that
+name; when more than one enum does, write `Enum.Variant(...)`.
 
 ## Generic enums
 
