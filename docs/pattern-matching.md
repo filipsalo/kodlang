@@ -208,7 +208,9 @@ if module.decls[i] is .Func(decl_id) {
 
 An optional `else { ... }` runs when the pattern doesn't match.
 Pattern bindings stay scoped to the matching arm — they aren't
-in scope in the `else` block.
+in scope in the `else` block. As in a `match` arm, the pattern can name
+the enum, `if s is Shape.Rect(w, h)`, or an imported one,
+`if s is geo.Shape.Rect(w, h)`.
 
 On a `T?` value, `.Some(v)` and `.None` are the same patterns as `Some(v)`
 and `none`, here, in a `match` and with a bare `is`. On a `T or Error`
