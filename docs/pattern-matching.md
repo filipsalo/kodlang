@@ -170,6 +170,17 @@ let area: int64 = match shape {
 }
 ```
 
+Without an annotation, the match takes the type of its first arm that
+isn't `none`, and each arm's bindings have that arm's payload types:
+
+```kod
+let name = match w {
+    .S(value) -> value          // value: str
+    .I(value) -> f"#{value}"    // value: int64
+}
+print(name + "!")               // name: str
+```
+
 For multi-statement arm bodies, use a match statement and assign or
 return from inside.
 
