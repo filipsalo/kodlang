@@ -152,6 +152,14 @@ unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
 `(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
 
+### Optional chaining
+
+On a struct `T?`, `x?.field` and `x?.method(...)` evaluate to an optional
+of the field or return type, and to `none` without touching the field
+when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
+from a function declared `-> str` is an error, so unwrap it first with
+`t?.name?` or `t?.name? or ""`, or declare the function `-> str?`.
+
 ## Arrays
 
 `[T]` is a resizable array of element type `T`:
