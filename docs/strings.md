@@ -164,7 +164,9 @@ if s != "bye" {
 }
 ```
 
-String equality compares contents, not identity.
+String equality compares contents, not identity. `<`, `<=`, `>` and `>=`
+order two strings byte by byte, a prefix before the longer string:
+`"apple" < "apples" < "zebra"`. The same holds for two `bytes` values.
 
 ## Conversion
 
