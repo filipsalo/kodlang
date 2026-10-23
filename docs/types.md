@@ -39,10 +39,14 @@ field (`p.x = 1`) or an element (`xs[0] = 1`).
 
 The value of an annotated `let`, of an assignment to a name and of an
 assignment to a field must have the declared type: `let x: int64 = "s"` is
-an error (`expected `int64`, got `str``), and so is storing an `int64` in a
-`bool`. A `T` is accepted where a `T?` is declared and `none` wherever an
-optional is, a struct or primitive where an interface is, and `[]` as any
-array type.
+an error (``expected `int64`, got `str` ``), and so is storing an `int64` in
+a `bool` or an `[int64]` in a `[str]`. A `T` is accepted where a `T?` is
+declared and `none` wherever an optional is, a struct or primitive where an
+interface is, and `[]` as any array type. A function value must match a
+function type exactly, since a function is never adapted: a function taking
+a struct isn't a `func(SomeInterface) -> ...`, and one returning `int64`
+isn't a `func() -> int64?`. Without an annotation, `let x = none` and
+`let xs = []` are errors, since their type can't be inferred.
 
 Parameters are immutable too — `mut` makes one reassignable inside the
 body (`mut self` for a method receiver). This is **callee-local**: params
