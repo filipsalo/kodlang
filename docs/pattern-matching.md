@@ -184,6 +184,14 @@ let name = match w {
 print(name + "!")               // name: str
 ```
 
+A `none` arm, or an arm of type `T?` next to arms of type `T`, makes the
+match a `T?`, and the plain arms are wrapped:
+`let found = match k { 1 -> "one" else -> none }` is a `str?`. Every other
+arm must have the match's type, so `1 -> "a"` next to `else -> 2` is an
+error. With an annotation each arm is converted to the annotated type,
+which is how arms of different structs become one interface value:
+`let s: Shape = match k { 1 -> Sq(s: 2) else -> Circle(r: 1) }`.
+
 For multi-statement arm bodies, use a match statement and assign or
 return from inside.
 

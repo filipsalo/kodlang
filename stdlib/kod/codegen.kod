@@ -3288,37 +3288,81 @@ type Codegen = struct {
     }
 
     // Kind of a match expression: the first arm body kind that is neither
-    // void nor a bare `none`, each arm inferred with its own bindings.
+    // void nor a bare `none`, each arm inferred with its own bindings, and
+    // made optional when another arm is `none` or optional.
     func match_expr_kind(self, anon arms: [int64], subject_kind: TypeKind) -> TypeKind {
+        mut kind: TypeKind = .KInt64
+        mut found = false
+        mut widen = false
         for arm_id in arms {
             let arm = self.p.match_expr_arms[arm_id]
             let pattern = self.p.patterns[arm.pattern]
             let saved = self.retype_pattern_bindings(pattern, :subject_kind)
             let k = self.infer_kind(arm.body)
             self.restore_pattern_bindings(pattern, kinds: saved)
-            mut concrete = true
-            match k {
-                .KVoid -> concrete = false
-                .KOptional(inner) -> {
-                    if inner is .KVoid {
-                        concrete = false
-                    }
-                }
-                else none
+            if self.is_none_kind(k) or self.is_some_optional(k) {
+                widen = true
             }
-            if concrete {
-                return k
+            if found == false and self.is_void_kind(k) == false and self.is_none_kind(k) == false {
+                kind = k
+                found = true
             }
         }
-        return .KInt64
+        if found == false {
+            if widen {
+                return .KOptional(inner: .KVoid)
+            }
+            return .KInt64
+        }
+        if widen and self.is_some_optional(kind) == false and self.kind_has_unknown(kind) == false {
+            return .KOptional(inner: kind)
+        }
+        return kind
     }
 
-    func compile_arm_expr(self, anon body: int64, pattern_id: int64, subject_kind: TypeKind) -> Val {
+    // Compile one match-expression arm into `result_r` as a value of
+    // `expected`, with the pattern's bindings typed for the arm. With
+    // `ok_wrap`, a value that isn't already a result becomes its Ok.
+    func compile_arm_value(self, anon body: int64, pattern_id: int64, subject_kind: TypeKind, expected: TypeKind, ok_wrap: bool, result_r: str) -> none {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
-        let val = self.compile_expr(body)
+        let body_kind = self.infer_kind(body)
+        mut wrap = false
+        if ok_wrap and self.is_ctor_for(body, kind: expected) == false and self.is_result_kind(body_kind) == false {
+            wrap = true
+        }
+        if wrap {
+            self.compile_wrap_ok(body)
+            self.mov_to(.VReg(name: "x0"), dest: result_r)
+            if self.is_void_kind(body_kind) == false {
+                self.check_value_kind(body, expected: self.result_inner_kind(expected))
+            }
+        } else {
+            if self.converts_for(body, kind: expected) {
+                let reg = self.compile_value_for_kind(body, :expected)
+                self.mov_to(.VReg(name: reg), dest: result_r)
+            } else {
+                let val = self.compile_expr(body)
+                self.mov_to(val, dest: result_r)
+                self.report_if_unknown(body)
+            }
+            if self.is_void_kind(body_kind) == false {
+                self.check_value_kind(body, :expected)
+            }
+        }
         self.restore_pattern_bindings(pattern, kinds: saved)
-        return val
+    }
+
+    // Whether compile_value_for_kind does more than compile `value_id`.
+    func converts_for(self, anon value_id: int64, kind: TypeKind) -> bool {
+        if self.p.exprs[value_id] is .MatchExpr(_subject, _arms) {
+            return true
+        }
+        match kind {
+            .KOptional(_inner) -> return true
+            .KInterface(_idx) -> return true
+            else return self.is_ctor_for(value_id, :kind)
+        }
     }
 
     // Walk an expression and allocate stack slots for any bindings that
@@ -5663,6 +5707,12 @@ type Codegen = struct {
     }
 
     func compile_match_expr(self, anon arms: [int64], subject_id: int64) -> Val {
+        let kind = self.match_expr_kind(arms, subject_kind: self.infer_kind(subject_id))
+        return self.compile_match_expr_for(arms, :subject_id, expected: kind, ok_wrap: false)
+    }
+
+    // A match expression whose arms each become a value of `expected`.
+    func compile_match_expr_for(self, anon arms: [int64], subject_id: int64, expected: TypeKind, ok_wrap: bool) -> Val {
         if self.infer_kind(subject_id) is .KUnknown {
             self.compile_discard(subject_id)
             self.report_cannot_infer(subject_id, what: "this expression")
@@ -5692,15 +5742,13 @@ type Codegen = struct {
             let skip_lbl = self.fresh("Lmexpr_skip")
             match self.p.patterns[arm.pattern] {
                 .Wildcard -> {
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                 }
                 .IntPat(value) -> {
                     self.emit(f"cmp {disc_r}, #{value}")
                     self.emit(f"bne {skip_lbl}")
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -5711,8 +5759,7 @@ type Codegen = struct {
                     }
                     self.emit(f"cmp {disc_r}, #{lit}")
                     self.emit(f"bne {skip_lbl}")
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -5726,30 +5773,26 @@ type Codegen = struct {
                     self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .NonePat -> {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"bne {skip_lbl}")
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -5766,8 +5809,7 @@ type Codegen = struct {
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -5775,8 +5817,7 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -5784,21 +5825,18 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
                     self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
-                    let body_val = self.compile_arm_expr(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 else {
-                    let body_val = self.compile_expr(arm.body)
-                    self.mov_to(body_val, dest: result_r)
+                    self.compile_arm_value(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                 }
             }
@@ -6474,6 +6512,10 @@ type Codegen = struct {
     // Returns the register holding the prepared value — the caller does
     // the actual store and is responsible for freeing the register.
     func compile_value_for_kind(self, anon value_id: int64, expected: TypeKind) -> str {
+        if self.p.exprs[value_id] is .MatchExpr(subject, arms) {
+            let val = self.compile_match_expr_for(arms, subject_id: subject, :expected, ok_wrap: false)
+            return self.load(val)
+        }
         match expected {
             .KEnum(idx) -> {
                 let variant_idx = self.ctor_variant_idx(value_id, enum_idx: idx)
@@ -6538,6 +6580,12 @@ type Codegen = struct {
     }
 
     func compile_store(self, dest_off: int64, kind: TypeKind, value_id: int64) -> none {
+        if self.p.exprs[value_id] is .MatchExpr(_subject, _arms) {
+            let reg = self.compile_value_for_kind(value_id, expected: kind)
+            self.emit_str(dest_off, :reg)
+            self.pool.free_reg(reg)
+            return
+        }
         match kind {
             .KEnum(idx) -> {
                 self.emit_enum_alloc(enum_idx: idx, :value_id, :dest_off)
@@ -7139,6 +7187,16 @@ type Codegen = struct {
             self.emit(f"b {self.ret_lbl}")
             return
         }
+        if self.p.exprs[value_id] is .MatchExpr(subject, arms) {
+            let is_result = self.is_result_kind(self.return_kind)
+            if is_result == false {
+                self.check_optional_return(value_id)
+            }
+            let val = self.compile_match_expr_for(arms, subject_id: subject, expected: self.return_kind, ok_wrap: is_result)
+            self.mov_to(val, dest: "x0")
+            self.emit(f"b {self.ret_lbl}")
+            return
+        }
         // If returning into a Result and the value isn't already a Result,
         // wrap it as .Ok(value) — a 16-byte arena cell {0, value}.
         if self.is_result_kind(self.return_kind) {
@@ -7194,38 +7252,14 @@ type Codegen = struct {
             else none
         }
         if needs_wrap {
-            // A match expression whose arms include `else -> none` produces
-            // a 0 value that we must NOT re-wrap (would yield Some(NULL)).
-            // For any other expression, infer_kind already established this
-            // is a concrete non-optional value (bool/int/etc.) — a literal 0
-            // or `false` MUST still wrap, or `return 0` from an `int64?`
-            // function silently becomes `none` (the same bug used to bite
-            // `as_int(.Number(0))` and `Map[K, int64].get` on its first entry).
-            mut conditional: bool = false
-            match self.p.exprs[value_id] {
-                .MatchExpr(_subject, _arms) -> conditional = true
-                else none
-            }
             let val = self.compile_expr(value_id)
             mut reg = self.load(val)
-            let skip_lbl = self.fresh("Lwrap_skip")
-            let done_lbl = self.fresh("Lwrap_done")
-            if conditional {
-                self.emit(f"cmp {reg}, #0")
-                self.emit(f"beq {skip_lbl}")
-            }
             let reg_spilled = self.preserve_begin(reg)
             self.emit("mov x0, #8")
             self.emit("bl _arena_alloc")
             let tmp = self.preserve_end(reg, spilled: reg_spilled)
             self.emit(f"str {tmp}, [x0]")
             self.pool.free_reg(tmp)
-            if conditional {
-                self.emit(f"b {done_lbl}")
-                self.emit_label(skip_lbl)
-                self.emit("mov x0, #0")
-                self.emit_label(done_lbl)
-            }
         } else {
             // Returning a concrete struct from an interface-returning
             // function needs the {data, vtable} box; mov_to would
