@@ -28,6 +28,11 @@ Arrays nest: an element of a `[[int64]]` is an `[int64]`, so `grid[i][j]`
 and `for row in grid { for x in row { ... } }` work, and an element of a
 `[bool]` is a `bool`.
 
+A literal takes its element type from where it goes, at any depth: in
+`let g: [[Shape]] = [[Sq(s: 3)]]`, `shapes += [Sq(s: 4)]` or an argument
+of type `[int64?]`, each struct is boxed as the interface and each value
+wrapped as the optional.
+
 Arrays, `str` and `bytes` can be indexed, and so can a struct that declares
 an `op_index` method (`Map` does). Element assignment needs an array or a
 struct with `op_index_set`, slicing needs an array, `str` or `bytes`, and
