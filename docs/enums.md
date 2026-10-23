@@ -27,6 +27,8 @@ type Message = enum {
 
 Comments are allowed inside the body. Variants without parentheses are *unit variants*; variants with parentheses carry named fields.
 
+A payload field can name the enum itself, e.g. `Branch(kids: [Tree])` inside `type Tree = enum { ... }`.
+
 ## Construction
 
 ```kod

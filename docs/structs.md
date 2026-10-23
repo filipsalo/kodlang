@@ -28,6 +28,16 @@ type Rect = struct {
 }
 ```
 
+A field's type can name the struct itself:
+
+```kod
+type Node = struct {
+    kids: [Node]
+    parent: Node?
+    name: str
+}
+```
+
 ## Construction
 
 Pass fields by name using labeled arguments:
