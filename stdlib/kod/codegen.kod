@@ -6035,7 +6035,236 @@ type Codegen = struct {
             if kind is .KUnknown {
                 self.report_cannot_infer(value, what: f"`{name}`")
             }
+        } else {
+            self.check_value_kind(value, expected: kind)
         }
+    }
+
+    // Whether a value of kind `actual` can be stored where `expected` is
+    // declared, with the wrapping and boxing compile_store does.
+    func kinds_compatible(self, anon expected: TypeKind, actual: TypeKind) -> bool {
+        if expected is .KUnknown {
+            return true
+        }
+        if actual is .KUnknown {
+            return true
+        }
+        match expected {
+            .KOptional(inner) -> {
+                if self.is_none_kind(actual) {
+                    return true
+                }
+                if actual is .KOptional(actual_inner) {
+                    return self.kinds_compatible(inner, actual: actual_inner)
+                }
+                return self.kinds_compatible(inner, :actual)
+            }
+            .KInterface(idx) -> {
+                match actual {
+                    .KStruct(_a_idx, _a_args) -> return true
+                    .KInt64 -> return true
+                    .KBool -> return true
+                    .KStr -> return true
+                    .KBytes -> return true
+                    .KInterface(a_idx) -> return a_idx == idx
+                    else return false
+                }
+            }
+            .KStruct(idx, _type_args) -> {
+                if actual is .KStruct(a_idx, _a_args) {
+                    return a_idx == idx
+                }
+                return false
+            }
+            .KEnum(idx) -> {
+                if actual is .KEnum(a_idx) {
+                    return self.enums_compatible(idx, :a_idx)
+                }
+                return false
+            }
+            .KFunc(param_kinds, return_kind) -> {
+                if actual is .KFunc(a_params, a_return) {
+                    return self.sigs_compatible(param_kinds, :return_kind, :a_params, :a_return)
+                }
+                return false
+            }
+            else none
+        }
+        if self.is_array_kind(expected) {
+            return self.array_kinds_compatible(expected, :actual)
+        }
+        return self.same_primitive(expected, :actual)
+    }
+
+    // The kind of a bare `none`. Payload bindings go through a TypeKind
+    // parameter: the snapshot compiler types them as int64.
+    func is_none_kind(self, anon kind: TypeKind) -> bool {
+        if kind is .KOptional(inner) {
+            return self.is_void_kind(inner)
+        }
+        return false
+    }
+
+    func is_void_kind(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KVoid -> return true
+            else return false
+        }
+    }
+
+    // An implicit variant infers the enum template, not the instance.
+    func enums_compatible(self, anon idx: int64, a_idx: int64) -> bool {
+        if idx == a_idx {
+            return true
+        }
+        if self.enums[idx].template_idx == a_idx {
+            return true
+        }
+        return self.enums[a_idx].template_idx == idx
+    }
+
+    func sigs_compatible(self, anon param_kinds: [TypeKind], return_kind: TypeKind, a_params: [TypeKind], a_return: TypeKind) -> bool {
+        if len(param_kinds) != len(a_params) {
+            return false
+        }
+        mut i = 0
+        for pk in param_kinds {
+            if self.kinds_compatible(pk, actual: a_params[i]) == false {
+                return false
+            }
+            i += 1
+        }
+        return self.kinds_compatible(return_kind, actual: a_return)
+    }
+
+    // The untyped array kind (`[]`, `[int64]`) goes either way.
+    func array_kinds_compatible(self, anon expected: TypeKind, actual: TypeKind) -> bool {
+        if self.is_array_kind(actual) == false {
+            return false
+        }
+        if expected is .KArray {
+            return true
+        }
+        if actual is .KArray {
+            return true
+        }
+        match expected {
+            .KArrayStruct(idx) -> {
+                if actual is .KArrayStruct(a_idx) {
+                    return a_idx == idx
+                }
+                return false
+            }
+            .KArrayEnum(idx) -> {
+                if actual is .KArrayEnum(a_idx) {
+                    return self.enums_compatible(idx, :a_idx)
+                }
+                return false
+            }
+            .KArrayInterface(idx) -> {
+                if actual is .KArrayInterface(a_idx) {
+                    return a_idx == idx
+                }
+                return false
+            }
+            .KArrayOptional(inner) -> {
+                if actual is .KArrayOptional(a_inner) {
+                    return self.kinds_compatible(inner, actual: a_inner)
+                }
+                return false
+            }
+            .KArrayFunc(param_kinds, return_kind) -> {
+                if actual is .KArrayFunc(a_params, a_return) {
+                    return self.sigs_compatible(param_kinds, :return_kind, :a_params, :a_return)
+                }
+                return false
+            }
+            .KArrayArray(inner) -> {
+                if actual is .KArrayArray(a_inner) {
+                    return self.kinds_compatible(inner, actual: a_inner)
+                }
+                return false
+            }
+            else none
+        }
+        return self.same_primitive(expected, :actual)
+    }
+
+    // Kinds without payloads compare by variant.
+    func same_primitive(self, anon expected: TypeKind, actual: TypeKind) -> bool {
+        return self.canonical_kind_name(expected) == self.canonical_kind_name(actual)
+    }
+
+    // The element kind of an array kind, for checking an array literal
+    // element by element.
+    func array_elem_kind(self, anon kind: TypeKind) -> TypeKind {
+        match kind {
+            .KArray -> return .KInt64
+            .KArrayStruct(idx) -> return .KStruct(:idx, type_args: [])
+            .KArrayEnum(idx) -> return .KEnum(:idx)
+            .KArrayStr -> return .KStr
+            .KArrayBytes -> return .KBytes
+            .KArrayInterface(idx) -> return .KInterface(:idx)
+            .KArrayOptional(inner) -> return .KOptional(:inner)
+            .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
+            .KArrayBool -> return .KBool
+            .KArrayArray(inner) -> return inner
+            else return .KUnknown
+        }
+    }
+
+    // Whether `value_id` is `.Variant` or `.Variant(...)`, which resolve
+    // against the declared enum rather than by inference.
+    func is_implicit_variant_value(self, anon value_id: int64) -> bool {
+        match self.p.exprs[value_id] {
+            .ImplicitVariant(_name) -> return true
+            .Call(callee, _args) -> {
+                if self.p.exprs[callee] is .ImplicitVariant(_name) {
+                    return true
+                }
+            }
+            else none
+        }
+        return false
+    }
+
+    func expects_enum(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KEnum(_idx) -> return true
+            .KOptional(inner) -> return self.expects_enum(inner)
+            else return false
+        }
+    }
+
+    // Report a value whose kind can't be stored where `expected` is
+    // declared. Quiet when the statement already reported an error.
+    func check_value_kind(self, anon value_id: int64, expected: TypeKind) -> none {
+        if self.report_attempts > self.stmt_error_mark {
+            return
+        }
+        if self.is_implicit_variant_value(value_id) {
+            if self.expects_enum(expected) {
+                return
+            }
+        }
+        if self.p.exprs[value_id] is .ArrayLit(elements) {
+            if self.is_array_kind(expected) {
+                let elem = self.array_elem_kind(expected)
+                for e in elements {
+                    self.check_value_kind(e, expected: elem)
+                }
+                return
+            }
+        }
+        let actual = self.infer_kind(value_id)
+        if self.kinds_compatible(expected, :actual) {
+            return
+        }
+        mut shown = self.kind_display(actual)
+        if self.is_none_kind(actual) {
+            shown = "none"
+        }
+        self.report_once(f"error: expected `{self.kind_display(expected)}`, got `{shown}`", span: self.p.expr_spans[value_id])
     }
 
     // Compile `value_id` into a register, applying any kind-specific
@@ -6436,6 +6665,9 @@ type Codegen = struct {
         if len(self.errors) == errors_before and lhs_is_struct == false {
             self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs])
         }
+        if lhs_is_struct {
+            self.check_value_kind(rhs_id, expected: field_kind)
+        }
         let ptr_reg = self.load(ptr_val)
         let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
         self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
@@ -6596,6 +6828,7 @@ type Codegen = struct {
                 let off = self.find_var_offset(name)
                 mut kind = self.find_var_kind(name)
                 self.compile_store(dest_off: off, :kind, value_id: rhs_id)
+                self.check_value_kind(rhs_id, expected: kind)
             }
             .Binary(lhs2, op, rhs2) -> {
                 match op {

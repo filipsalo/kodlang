@@ -36,6 +36,13 @@ Assigning to a name that was never declared is an error too (declare it
 with `mut` first), and so is assigning to anything other than a name, a
 field (`p.x = 1`) or an element (`xs[0] = 1`).
 
+The value of an annotated `let`, of an assignment to a name and of an
+assignment to a field must have the declared type: `let x: int64 = "s"` is
+an error (`expected `int64`, got `str``), and so is storing an `int64` in a
+`bool`. A `T` is accepted where a `T?` is declared and `none` wherever an
+optional is, a struct or primitive where an interface is, and `[]` as any
+array type.
+
 Parameters are immutable too — `mut` makes one reassignable inside the
 body (`mut self` for a method receiver). This is **callee-local**: params
 are passed by value, so reassigning one never affects the caller, and the
