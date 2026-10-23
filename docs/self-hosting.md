@@ -72,6 +72,8 @@ make selfhost-check
 
 Fixed-point check. `build/stage1/sh_kodc` compiles the compiler into `build/selfhost/stage2/`, that compiler compiles it again into `build/selfhost/stage3/`, and the two sets of assembly must be byte-identical. A miscompile in the compiler that changes its own behavior shows up as a difference. Takes a few seconds; pytest runs it.
 
+It then compiles every `.kod` file in the repo (the `make asm-diff` corpus) with both `build/stage1/sh_kodc` and the stage2 compiler, and fails if any file's assembly, diagnostics or exit status differ, writing both outputs under `build/selfhost/corpus-diff/`. Stage1 is the current sources compiled by the snapshot and stage2 the same sources compiled by themselves, so a difference means the snapshot miscompiles some of the new compiler code, typically a construct it handles differently than the current compiler does. Compiler sources must then avoid that construct until the snapshot is refreshed.
+
 `tests/examples_test.py::test_selfhost_matches_interpreter` additionally checks that `sh_kodc` and `kodc.kod` running under the Python interpreter produce identical assembly for a small program, so the bootstrap path stays usable.
 
 ### Checking that a compiler refactor changes nothing

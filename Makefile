@@ -13,7 +13,9 @@
 #   make test             build sh_kodc + the kod driver, then run pytest
 #                         (example programs, every *_test.kod, self-hosting checks)
 #   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
-#                         stage2 compiles it again (stage3); asm must match
+#                         stage2 compiles it again (stage3); asm must match,
+#                         and stage1 and stage2 must compile every .kod file
+#                         in the repo identically
 #   make asm-diff [BASE=rev]
 #                         compile every .kod file with sh_kodc built at BASE
 #                         (default HEAD) and with the working tree's; report
@@ -267,6 +269,7 @@ test: stage1 kod
 # Rebuild the whole compiler (stage0 + stage1) twice more, first with the
 # current sh_kodc and then with the result, into scratch dirs. The two
 # rebuilds must emit byte-identical assembly.
+# Stage1 and stage2 must also agree on the corpus: the snapshot can miscompile new code.
 SELFHOST := build/selfhost
 selfhost-check: stage1
 	rm -rf $(SELFHOST)
@@ -277,6 +280,7 @@ selfhost-check: stage1
 	@diff -r -x '*.o' -x sh_kodc $(SELFHOST)/stage2 $(SELFHOST)/stage3 \
 	    || { echo "selfhost-check: stage2 and stage3 assembly differ (see diff above)"; exit 1; }
 	@echo "selfhost-check: stage2 == stage3"
+	@$(PY) tools/asm_diff.py --compilers $(STAGE1)/sh_kodc $(SELFHOST)/stage2/stage1/sh_kodc
 
 BASE ?= HEAD
 asm-diff:

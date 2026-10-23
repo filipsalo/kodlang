@@ -1,6 +1,7 @@
 """Compare sh_kodc output between a base revision and the working tree.
 
 Usage: uv run python tools/asm_diff.py [BASE]   (default: HEAD; or `make asm-diff`)
+       uv run python tools/asm_diff.py --compilers OLD NEW   (two built compilers)
 
 Builds sh_kodc at BASE (cached as build/asm-diff/<sha>/sh_kodc), then
 compiles every .kod file in the working tree with both that compiler and
@@ -79,18 +80,13 @@ def compile_with(compiler: Path, path: str) -> str:
     return f"{r.stdout}--- stderr ---\n{r.stderr}--- exit {r.returncode} ---\n"
 
 
-def main() -> int:
-    base_rev = sys.argv[1] if len(sys.argv) > 1 else "HEAD"
-    base = build_base_compiler(base_rev)
-    subprocess.run(["make", "-s", "stage1"], cwd=ROOT, check=True, stdout=sys.stderr)
-    new = ROOT / "build" / "stage1" / "sh_kodc"
+def compare(base: Path, new: Path, out: Path, label: str, versus: str) -> int:
     files = corpus()
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(
             pool.map(lambda f: (f, compile_with(base, f), compile_with(new, f)), files)
         )
 
-    out = OUT / "out"
     shutil.rmtree(out, ignore_errors=True)
     differing = []
     for f, base_out, new_out in results:
@@ -103,13 +99,27 @@ def main() -> int:
         (out / f"{stem}.new").write_text(new_out)
         print(f"differs: {f}")
 
-    print(f"asm-diff: {len(files)} files, {len(differing)} differ from {base_rev}")
+    print(f"{label}: {len(files)} files, {len(differing)} differ {versus}")
     if differing:
         stem = differing[0].replace("/", "__")
         rel = out.relative_to(ROOT)
         print(f"  e.g. diff {rel}/{stem}.base {rel}/{stem}.new")
         return 1
     return 0
+
+
+def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--compilers":
+        old, new = sys.argv[2:]
+        out = ROOT / "build" / "selfhost" / "corpus-diff"
+        return compare(
+            ROOT / old, ROOT / new, out, "compilers", f"between {old} and {new}"
+        )
+    base_rev = sys.argv[1] if len(sys.argv) > 1 else "HEAD"
+    base = build_base_compiler(base_rev)
+    subprocess.run(["make", "-s", "stage1"], cwd=ROOT, check=True, stdout=sys.stderr)
+    new = ROOT / "build" / "stage1" / "sh_kodc"
+    return compare(base, new, OUT / "out", "asm-diff", f"from {base_rev}")
 
 
 if __name__ == "__main__":
