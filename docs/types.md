@@ -180,7 +180,8 @@ let idx2: int64      = n? or -1     // -1 if none
 ```
 
 The default is evaluated lazily (only when the value is `none`), and
-its type must match the unwrapped `T`. A following `or` outside the
+its type must match the unwrapped `T`. `x?` on a value that isn't
+optional is an error. A following `or` outside the
 unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
 `(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
@@ -320,6 +321,9 @@ reported once, at the alias.
 ## Fallible types: `T or Error`
 
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
+
+`try` and `must` take a `T or Error` value, and `try` only works inside a
+function that returns `T or Error` itself; anything else is an error.
 
 `Error` is the only type that can follow `or`: `-> int64 or IoError` is a
 parse error. Throw a struct that implements `Error` instead, and recover it
