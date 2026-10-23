@@ -306,7 +306,10 @@ print(n.char_count())    // 3
 A struct, enum or interface that the importing module declares wins over
 a same-named alias from an imported module. An alias whose target names an
 unknown type is an error, and so is one that refers back to itself through
-other aliases (`type A = B` with `type B = A`).
+other aliases (`type A = B` with `type B = A`). So is a target that gets a
+generic's type arguments wrong, such as `type B = Map[str]`, `type P = Pair`
+or `type D = [Box[int64]]` for a `Box` that isn't generic. Each of these is
+reported once, at the alias.
 
 ## Fallible types: `T or Error`
 
