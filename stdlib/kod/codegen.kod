@@ -423,7 +423,7 @@ type Codegen = struct {
     alias_idx: FuncIdx = FuncIdx()
     alias_kinds: [TypeKind] = []
 
-    // Keys of the errors report_once has already emitted.
+    // Keys of the errors report_error has already emitted.
     reported: FuncIdx = FuncIdx()
 
     // Path of the module compile_module compiles. Type expressions are
@@ -435,33 +435,11 @@ type Codegen = struct {
     unresolved_aliases: [str] = []
     unresolved_alias_targets: [int64] = []
 
-    // Errors reported so far, counting the ones report_once drops as
-    // repeats, and the count when the current statement started. A
-    // statement that already has an error doesn't add "cannot infer".
+    // Reports so far, repeats included, and the count when the statement began.
     report_attempts: int64 = 0
     stmt_error_mark: int64 = 0
-
-    // Accumulate a user-facing error. Unlike `kod_panic`, this does not
-    // abort — the rest of the module is still walked so a single run
-    // surfaces every error rather than stopping at the first.
-    //
-    // Formats as `path:L:C: msg`, followed by the offending source line
-    // and a caret pointing at the column. Walks the source once per call
-    // to compute line, column, and the surrounding line text — cheap
-    // enough for the handful of errors we'd ever report in a single
-    // compile.
-    // report_error, once per position and message: default-arg and
-    // field-default exprs compile per call site, generic bodies per instance.
-    func report_once(self, anon msg: str, span: ast.Span) -> none {
-        let key = f"{self.p.path}:{span.start}:{msg}"
-        let seen = self.reported
-        if seen.contains(key) {
-            self.report_attempts = self.report_attempts + 1
-            return
-        }
-        seen.set(key, 1)
-        self.report_error(msg, :span)
-    }
+    // The generic instance whose method bodies are being compiled, or -1.
+    body_instance: int64 = -1
 
     // Report an expression whose kind is KUnknown, unless the miss is a
     // cascade: this statement already reported an error, or the value
@@ -470,7 +448,7 @@ type Codegen = struct {
         if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) {
             return
         }
-        self.report_once(f"error: cannot infer the type of {what}; add a type annotation", span: self.p.expr_spans[expr_id])
+        self.report_error(f"error: cannot infer the type of {what}; add a type annotation", span: self.p.expr_spans[expr_id])
     }
 
     // A KUnknown variable's cause was reported where it got that kind.
@@ -563,7 +541,7 @@ type Codegen = struct {
         if k is .KOptional(_inner) {
             msg = msg + optional_hint
         }
-        self.report_once(msg, span: self.p.expr_spans[expr_id])
+        self.report_error(msg, span: self.p.expr_spans[expr_id])
     }
 
     func op_symbol(self, anon op: ast.Op) -> str {
@@ -626,7 +604,7 @@ type Codegen = struct {
             if rhs_kind is .KOptional(_inner) {
                 return
             }
-            self.report_once(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`", span: self.p.expr_spans[lhs_id])
+            self.report_error(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`", span: self.p.expr_spans[lhs_id])
             return
         }
         mut bad = lhs_id
@@ -641,7 +619,7 @@ type Codegen = struct {
                 msg = f"{msg}; `{cmp}` binds tighter than `{sym}`, so write `(a {sym} b) {cmp} c`"
             }
         }
-        self.report_once(msg, span: self.p.expr_spans[bad])
+        self.report_error(msg, span: self.p.expr_spans[bad])
     }
 
     // The operator would act on the optional's cell, not its value.
@@ -678,10 +656,10 @@ type Codegen = struct {
         }
         let hint = f"; unwrap it first with `{shown}?` or `{shown}? or default`"
         if equality {
-            self.report_once(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`{hint}", span: self.p.expr_spans[bad])
+            self.report_error(f"error: cannot compare `{self.kind_display(lhs_kind)}` with `{self.kind_display(rhs_kind)}`{hint}", span: self.p.expr_spans[bad])
             return
         }
-        self.report_once(f"error: `{self.op_symbol(op)}` doesn't take an optional operand{hint}", span: self.p.expr_spans[bad])
+        self.report_error(f"error: `{self.op_symbol(op)}` doesn't take an optional operand{hint}", span: self.p.expr_spans[bad])
     }
 
     func is_some_optional(self, anon kind: TypeKind) -> bool {
@@ -785,7 +763,20 @@ type Codegen = struct {
         return false
     }
 
+    // Accumulate a user-facing error. Unlike `kod_panic`, this does not
+    // abort — the rest of the module is still walked so a single run
+    // surfaces every error rather than stopping at the first.
+    //
+    // Formats as `path:L:C: msg`, followed by the offending source line
+    // and a caret pointing at the column. Walks the source once per call
+    // to compute line, column, and the surrounding line text — cheap
+    // enough for the handful of errors we'd ever report in a single
+    // compile.
     func report_error(self, anon msg: str, span: ast.Span) -> none {
+        if self.is_repeat_report(msg, :span) {
+            self.report_attempts = self.report_attempts + 1
+            return
+        }
         let source: str = self.p.source
         mut offset: int64 = span.start
         mut line: int64 = 1
@@ -860,6 +851,24 @@ type Codegen = struct {
         }
         self.errors += [Error(path: self.p.path, :line, :col, :end_col, message: msg, source_line: line_text, :caret)]
         self.report_attempts = self.report_attempts + 1
+    }
+
+    // Default args compile per call site and generic bodies per instance.
+    func is_repeat_report(self, anon msg: str, span: ast.Span) -> bool {
+        let seen = self.reported
+        let key = f"{self.p.path}:{span.start}:{msg}"
+        if seen.contains(key) {
+            return true
+        }
+        seen.set(key, 1)
+        if self.body_instance >= 0 {
+            let pos_key = f"{self.p.path}:{span.start}"
+            if seen.get(pos_key) is Some(owner) {
+                return owner != self.body_instance
+            }
+            seen.set(pos_key, self.body_instance)
+        }
+        return false
     }
 
     func had_errors(self) -> bool {
@@ -1057,7 +1066,7 @@ type Codegen = struct {
                     }
                 }
                 if covered == false {
-                    self.report_error(f"error: match on `{enum_info.name}` doesn't cover variant `{variant.name}`", span: self.p.expr_spans[subject_id])
+                    self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover variant `{variant.name}`", span: self.p.expr_spans[subject_id])
                 }
             }
         }
@@ -2014,7 +2023,7 @@ type Codegen = struct {
                 names += [v.name]
             }
             let msg: str = self.with_suggestion(f"error: enum `{self.enum_display_name(enum_idx)}` has no variant `{variant_name}`", typo: variant_name, candidates: names)
-            self.report_once(msg, :span)
+            self.report_error(msg, :span)
         }
         return variant_idx
     }
@@ -2038,7 +2047,7 @@ type Codegen = struct {
                         names += [e.name]
                     }
                 }
-                self.report_once(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
+                self.report_error(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
             }
             return enum_idx
         }
@@ -2056,7 +2065,7 @@ type Codegen = struct {
                 variant_names += [v.name]
             }
         }
-        self.report_once(self.with_suggestion(f"error: no enum has a variant `.{variant_name}`", typo: variant_name, candidates: variant_names), :span)
+        self.report_error(self.with_suggestion(f"error: no enum has a variant `.{variant_name}`", typo: variant_name, candidates: variant_names), :span)
         return -1
     }
 
@@ -2069,7 +2078,7 @@ type Codegen = struct {
         }
         let field_count = len(self.enums[enum_idx].variants[variant_idx].field_offsets)
         if binding_count > field_count {
-            self.report_once(f"error: `{self.enums[enum_idx].name}.{variant_name}` has {self.payload_noun(field_count)}, pattern binds {binding_count}", :span)
+            self.report_error(f"error: `{self.enum_base_name(enum_idx)}.{variant_name}` has {self.payload_noun(field_count)}, pattern binds {binding_count}", :span)
             return -1
         }
         return variant_idx
@@ -2079,10 +2088,10 @@ type Codegen = struct {
     // optional, but a label must name the field in its position.
     func check_payload_args(self, anon args: [ast.CallArg], enum_idx: int64, variant_idx: int64, span: ast.Span) -> none {
         let vinfo = self.enums[enum_idx].variants[variant_idx]
-        let shown: str = f"{self.enums[enum_idx].name}.{vinfo.name}"
+        let shown: str = f"{self.enum_base_name(enum_idx)}.{vinfo.name}"
         let field_count = len(vinfo.field_names)
         if len(args) != field_count {
-            self.report_once(f"error: `{shown}` has {self.payload_noun(field_count)}, got {len(args)}", :span)
+            self.report_error(f"error: `{shown}` has {self.payload_noun(field_count)}, got {len(args)}", :span)
         }
         mut i = 0
         for arg in args {
@@ -2095,9 +2104,9 @@ type Codegen = struct {
                         }
                     }
                     if known {
-                        self.report_once(f"error: `{shown}` takes its payload in declaration order: expected `{vinfo.field_names[i]}`, got `{arg.label}`", span: arg.label_span)
+                        self.report_error(f"error: `{shown}` takes its payload in declaration order: expected `{vinfo.field_names[i]}`, got `{arg.label}`", span: arg.label_span)
                     } else {
-                        self.report_once(self.with_suggestion(f"error: `{shown}` has no payload field `{arg.label}`", typo: arg.label, candidates: vinfo.field_names), span: arg.label_span)
+                        self.report_error(self.with_suggestion(f"error: `{shown}` has no payload field `{arg.label}`", typo: arg.label, candidates: vinfo.field_names), span: arg.label_span)
                     }
                 }
             }
@@ -2134,8 +2143,8 @@ type Codegen = struct {
         for f in self.structs[struct_idx].fields {
             field_names += [f.name]
         }
-        let msg: str = self.with_suggestion(f"error: struct `{self.structs[struct_idx].name}` has no field `{field_name}`", typo: field_name, candidates: field_names)
-        self.report_once(msg, :span)
+        let msg: str = self.with_suggestion(f"error: struct `{self.struct_display_name(struct_idx)}` has no field `{field_name}`", typo: field_name, candidates: field_names)
+        self.report_error(msg, :span)
         return false
     }
 
@@ -2147,7 +2156,7 @@ type Codegen = struct {
         if kind is .KOptional(_inner) {
             msg = f"{msg}. did you mean `?.{field_name}`?"
         }
-        self.report_once(msg, :span)
+        self.report_error(msg, :span)
     }
 
 
@@ -2236,6 +2245,15 @@ type Codegen = struct {
             }
         }
         return self.instance_display(self.enums[info.template_idx].name, args: info.template_args)
+    }
+
+    // `Maybe` for `Maybe[int64]`: how a variant is spelled in source.
+    func enum_base_name(self, anon idx: int64) -> str {
+        let info = self.enums[idx]
+        if info.template_idx < 0 {
+            return info.name
+        }
+        return self.enums[info.template_idx].name
     }
 
     func instance_display(self, anon base: str, args: [TypeKind]) -> str {
@@ -3634,7 +3652,7 @@ type Codegen = struct {
                     self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
                     return .VReg(name: reg)
                 }
-                self.report_once("internal error: function literal was never registered", span: self.p.expr_spans[expr_id])
+                self.report_error("internal error: function literal was never registered", span: self.p.expr_spans[expr_id])
                 return .VImm(value: 0)
             }
         }
@@ -3811,7 +3829,7 @@ type Codegen = struct {
                 self.compile_discard(lhs)
                 self.compile_discard(rhs)
                 if self.kind_has_unknown(lhs_kind) == false {
-                    self.report_once(f"error: cannot index a value of type `{self.kind_display(lhs_kind)}`{self.index_error_note(lhs_kind, method: "op_index")}", span: self.p.expr_spans[lhs])
+                    self.report_error(f"error: cannot index a value of type `{self.kind_display(lhs_kind)}`{self.index_error_note(lhs_kind, method: "op_index")}", span: self.p.expr_spans[lhs])
                 }
                 return .VImm(value: 0)
             }
@@ -3955,7 +3973,7 @@ type Codegen = struct {
         let binding = self.is_rhs_binding(rhs)
         if len(binding) > 0 {
             self.compile_discard(lhs)
-            self.report_once(f"error: `is` can't bind `{binding}` here; a pattern binds names only as the whole condition of an `if`", span: self.p.expr_spans[rhs])
+            self.report_error(f"error: `is` can't bind `{binding}` here; a pattern binds names only as the whole condition of an `if`", span: self.p.expr_spans[rhs])
             return .VImm(value: 0)
         }
         // Interface downcast: `e is StructType` — compare the value's vtable
@@ -3984,7 +4002,7 @@ type Codegen = struct {
             let name = self.is_pattern_name(rhs)
             if name != "Ok" and name != "Err" {
                 self.compile_discard(lhs)
-                self.report_once("error: `is` on a `T or Error` value takes `Ok` or `Err`", span: self.p.expr_spans[rhs])
+                self.report_error("error: `is` on a `T or Error` value takes `Ok` or `Err`", span: self.p.expr_spans[rhs])
                 return .VImm(value: 0)
             }
             let ptr_v = self.compile_expr(lhs)
@@ -4006,7 +4024,7 @@ type Codegen = struct {
                 if len(name) > 0 {
                     self.check_variant(name, :enum_idx, span: self.p.expr_spans[rhs])
                 } else {
-                    self.report_once(f"error: `is` on a `{self.enum_display_name(enum_idx)}` value takes one of its variants", span: self.p.expr_spans[rhs])
+                    self.report_error(f"error: `is` on a `{self.enum_display_name(enum_idx)}` value takes one of its variants", span: self.p.expr_spans[rhs])
                 }
                 return .VImm(value: 0)
             }
@@ -4029,7 +4047,7 @@ type Codegen = struct {
             tests_none = true
         }
         if is_optional and tests_none == false and self.is_pattern_name(rhs) != "Some" {
-            self.report_once("error: `is` on an optional takes `none` or `Some`", span: self.p.expr_spans[rhs])
+            self.report_error("error: `is` on an optional takes `none` or `Some`", span: self.p.expr_spans[rhs])
         }
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
@@ -4439,7 +4457,7 @@ type Codegen = struct {
             .KInterface(_idx) -> note = f"; `{shown}` doesn't declare `to_str`"
             else none
         }
-        self.report_once(f"error: cannot convert a value of type `{shown}` to `str`{note}", span: self.p.expr_spans[expr_id])
+        self.report_error(f"error: cannot convert a value of type `{shown}` to `str`{note}", span: self.p.expr_spans[expr_id])
         return .VImm(value: 0)
     }
 
@@ -4504,7 +4522,7 @@ type Codegen = struct {
                     self.compile_discard(hi_id)
                 }
                 if self.kind_has_unknown(s_kind) == false {
-                    self.report_once(f"error: cannot slice a value of type `{self.kind_display(s_kind)}`{self.index_error_note(s_kind, method: "")}", span: self.p.expr_spans[s_id])
+                    self.report_error(f"error: cannot slice a value of type `{self.kind_display(s_kind)}`{self.index_error_note(s_kind, method: "")}", span: self.p.expr_spans[s_id])
                 }
                 return .VImm(value: 0)
             }
@@ -4837,7 +4855,7 @@ type Codegen = struct {
         }
         if len(msg) > 0 {
             if report {
-                self.report_once(msg, :span)
+                self.report_error(msg, :span)
             }
             return none
         }
@@ -4938,7 +4956,7 @@ type Codegen = struct {
                     }
                 }
                 if len(msg) > 0 {
-                    self.report_once(msg, :span)
+                    self.report_error(msg, :span)
                 }
             }
             .Array(inner) -> self.check_type_expr(inner)
@@ -4969,7 +4987,7 @@ type Codegen = struct {
                     }
                 }
                 if len(msg) > 0 {
-                    self.report_once(msg, :span)
+                    self.report_error(msg, :span)
                 }
                 for arg in args {
                     self.check_type_expr(arg)
@@ -5055,7 +5073,7 @@ type Codegen = struct {
         mut i = 0
         for i < len(names) {
             if self.alias_reaches(names[i], type_id: targets[i], depth: 0) {
-                self.report_once(f"error: type alias `{names[i]}` refers to itself", span: self.p.type_spans[targets[i]])
+                self.report_error(f"error: type alias `{names[i]}` refers to itself", span: self.p.type_spans[targets[i]])
             } else {
                 self.check_type_expr(targets[i])
             }
@@ -5395,7 +5413,7 @@ type Codegen = struct {
                 self.emit(f"bl ${s.module_prefix}${s.name}$len")
                 return .VReg(name: "x0")
             }
-            self.report_error(f"error: len() not defined for struct `{s.name}` (no `len` method)", span: self.p.expr_spans[arg_id])
+            self.report_error(f"error: len() not defined for struct `{self.struct_display_name(struct_idx)}` (no `len` method)", span: self.p.expr_spans[arg_id])
             return .VImm(value: 0)
         }
         self.report_error("error: len() not defined for this type", span: self.p.expr_spans[arg_id])
@@ -6574,7 +6592,7 @@ type Codegen = struct {
         if self.is_result_kind(expected) and self.kinds_compatible(self.result_inner_kind(expected), :actual) {
             hint = "; write `.Ok(value: ...)` for a successful result"
         }
-        self.report_once(f"error: expected `{self.kind_display(expected)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
+        self.report_error(f"error: expected `{self.kind_display(expected)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
     }
 
     // Compile `value_id` into a register, applying any kind-specific
@@ -6851,7 +6869,7 @@ type Codegen = struct {
                     }
                 }
                 if cf_provided == false {
-                    self.report_error(f"error: struct `{self.structs[struct_idx].name}` requires field `{cf.name}` (it has no default)", :span)
+                    self.report_error(f"error: struct `{self.struct_display_name(struct_idx)}` requires field `{cf.name}` (it has no default)", :span)
                 }
             }
             ci = ci + 1
@@ -7106,7 +7124,7 @@ type Codegen = struct {
                 self.compile_discard(rhs)
                 self.compile_discard(rhs_id)
                 if self.kind_has_unknown(lhs_kind) == false {
-                    self.report_once(f"error: cannot assign to an element of a value of type `{shown}`{note}", span: self.p.expr_spans[lhs])
+                    self.report_error(f"error: cannot assign to an element of a value of type `{shown}`{note}", span: self.p.expr_spans[lhs])
                 }
                 return
             }
@@ -7529,13 +7547,13 @@ type Codegen = struct {
                 self.report_cannot_infer(inner_id, what: "this expression")
             } else {
                 if self.kind_has_unknown(inner_kind) == false {
-                    self.report_once(f"error: `{self.try_word(is_must)}` needs a `T or Error` value, got `{self.kind_display(inner_kind)}`", span: self.p.expr_spans[inner_id])
+                    self.report_error(f"error: `{self.try_word(is_must)}` needs a `T or Error` value, got `{self.kind_display(inner_kind)}`", span: self.p.expr_spans[inner_id])
                 }
             }
             return .VImm(value: 0)
         }
         if is_must == false and self.is_result_kind(self.return_kind) == false {
-            self.report_once("error: `try` only works in a function that returns `T or Error`; use `must` or match the result", span: self.p.expr_spans[inner_id])
+            self.report_error("error: `try` only works in a function that returns `T or Error`; use `must` or match the result", span: self.p.expr_spans[inner_id])
         }
         let val = self.compile_expr(inner_id)
         self.mov_to(val, dest: "x0")
@@ -7605,7 +7623,7 @@ type Codegen = struct {
                 self.report_cannot_infer(value_id, what: "this expression")
             } else {
                 if self.kind_has_unknown(value_kind) == false {
-                    self.report_once(f"error: `?` needs an optional value, got `{self.kind_display(value_kind)}`", span: self.p.expr_spans[value_id])
+                    self.report_error(f"error: `?` needs an optional value, got `{self.kind_display(value_kind)}`", span: self.p.expr_spans[value_id])
                 }
             }
             return .VImm(value: 0)
@@ -7730,7 +7748,7 @@ type Codegen = struct {
             sig_defaults = self.structs[struct_idx].methods[mi].sig.param_default_exprs
         }
         if len(method_lbl) == 0 {
-            self.report_error(f"error: struct `{self.structs[struct_idx].name}` has no method `{method}`", span: self.p.expr_spans[value_id])
+            self.report_error(f"error: struct `{self.struct_display_name(struct_idx)}` has no method `{method}`", span: self.p.expr_spans[value_id])
             return .VImm(value: 0)
         }
         self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method, call_span: self.p.expr_spans[value_id])
@@ -7902,7 +7920,7 @@ type Codegen = struct {
             self.report_cannot_infer(iter_id, what: "this expression")
         }
         if iterable == false and self.kind_has_unknown(iter_kind) == false {
-            self.report_once(self.foreach_error(iter_kind, iter_id: iter_id), span: self.p.expr_spans[iter_id])
+            self.report_error(self.foreach_error(iter_kind, iter_id: iter_id), span: self.p.expr_spans[iter_id])
         }
         let hdr_r = self.load(arr_val)
         self.emit_str(hdr_off, reg: hdr_r)
@@ -8596,9 +8614,11 @@ type Codegen = struct {
                 self.p = s.src_p
                 self.subst_names = template.type_param_names
                 self.subst_args = s.template_args
+                self.body_instance = cursor
                 for m in s.methods {
                     self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "")
                 }
+                self.body_instance = -1
                 self.p = saved_p
                 self.subst_names = saved_names
                 self.subst_args = saved_args
