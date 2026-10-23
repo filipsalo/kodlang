@@ -211,6 +211,14 @@ let .Some(v) = m.get(key) else { return -1 }
 The pattern always starts with a `.`. On a `T?` value (like
 `m.get(key)` above), `.Some(v)` binds the unwrapped payload and
 `.None` matches `none`, the same spelling as for an `Option[T]`.
+On a `T or Error` value, `.Ok(v)` binds the value and `.Err(e)` the
+error. On an enum value, the variant is looked up in that value's
+enum, even when another enum declares a variant of the same name:
+
+```kod
+let .Ok(text) = read_text(path) else { return 1 }
+print(f"{text}!")    // text is a str
+```
 
 ## Exhaustiveness
 

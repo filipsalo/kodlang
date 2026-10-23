@@ -52,14 +52,22 @@ class BoundMethod:
     receiver: Any
 
 
-def _optional_let_pattern(pattern, value):
-    """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the optional patterns."""
+def _let_else_pattern(pattern, value):
+    """A `T?` holds the bare payload or none, so `.Some`/`.None` mean the
+    optional patterns; a `T or Error` is a ResultValue, so `.Ok`/`.Err` mean
+    the result patterns."""
     if not isinstance(pattern, ast.ImplicitEnumVariantPattern):
         return pattern
     if isinstance(value, types.EnumValue) and (
         pattern.variant_name in value.enum_type.variants
     ):
         return pattern
+    if isinstance(value, types.ResultValue) and len(pattern.bindings) <= 1:
+        binding = pattern.bindings[0] if pattern.bindings else ""
+        if pattern.variant_name == "Ok":
+            return ast.ResultOkPattern(binding, pattern.span)
+        if pattern.variant_name == "Err":
+            return ast.ResultErrPattern(binding, pattern.span)
     if pattern.variant_name == "None" and not pattern.bindings:
         return ast.OptionalNonePattern(pattern.span)
     if pattern.variant_name == "Some" and len(pattern.bindings) <= 1:
@@ -750,7 +758,7 @@ class Interpreter:
                             break
             case ast.LetElseStatement(pattern, value_expr, else_body):
                 value = self.evaluate_expression(module, value_expr)
-                pattern = _optional_let_pattern(pattern, value)
+                pattern = _let_else_pattern(pattern, value)
                 matched = False
                 if isinstance(
                     pattern, (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern)
@@ -770,6 +778,11 @@ class Interpreter:
                     if not isinstance(value, types.NoneType):
                         if pattern.binding:
                             self.stack[-1][pattern.binding] = value
+                        matched = True
+                elif isinstance(pattern, (ast.ResultOkPattern, ast.ResultErrPattern)):
+                    if value.ok == isinstance(pattern, ast.ResultOkPattern):
+                        if pattern.binding:
+                            self.stack[-1][pattern.binding] = value.payload
                         matched = True
                 if not matched:
                     for stmt in else_body:
