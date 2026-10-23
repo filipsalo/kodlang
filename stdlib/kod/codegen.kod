@@ -403,7 +403,9 @@ type Codegen = struct {
     out_buf: [regalloc.Insn] = []
 
     // Lhs of the `+=` being compiled: an array `+` on it appends in place.
+    // Expr ids are per parser, and codegen swaps `self.p` for defaults.
     append_lhs_id: int64 = 0
+    append_lhs_path: str = ""
 
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
@@ -3548,13 +3550,18 @@ type Codegen = struct {
     }
 
     func compile_arr_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
+        // Same register discipline as compile_str_concat: rhs may come back
+        // in x0 (a call, a slice, a nested concat), so park it before lhs.
         let rhs_val = self.compile_expr(rhs_id)
-        let rhs_reg = self.load(rhs_val)
+        let rhs_reg = self.pool.alloc_reg()
+        self.mov_to(rhs_val, dest: rhs_reg)
+        let rhs_spilled = self.spill_across(rhs_reg)
         let lhs_val = self.compile_expr(lhs_id)
         self.mov_to(lhs_val, dest: "x0")
+        self.restore_across(rhs_reg, spilled: rhs_spilled)
         self.emit(f"mov x1, {rhs_reg}")
         self.pool.free_reg(rhs_reg)
-        if lhs_id == self.append_lhs_id {
+        if lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path {
             self.emit("bl _kod_array_concat")
         } else {
             self.emit("bl _kod_array_concat_new")
@@ -5386,9 +5393,12 @@ type Codegen = struct {
         let span = self.p.expr_spans[lhs_id]
         let sum_id = self.p.alloc_expr(ast.Expr.Binary(lhs: lhs_id, op: .Add, rhs: rhs_id), :span)
         let saved_append = self.append_lhs_id
+        let saved_append_path = self.append_lhs_path
         self.append_lhs_id = lhs_id
+        self.append_lhs_path = self.p.path
         self.compile_assign(:lhs_id, rhs_id: sum_id)
         self.append_lhs_id = saved_append
+        self.append_lhs_path = saved_append_path
     }
 
     // `lhs -= rhs` desugars to `lhs = lhs - rhs`. Same shape as
