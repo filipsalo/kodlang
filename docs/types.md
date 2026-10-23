@@ -214,6 +214,9 @@ Operators don't look inside an optional. With `n: int64?`, `n == 3`,
 
 On a struct `T?`, `x?.field` and `x?.method(...)` evaluate to an optional
 of the field or return type, and to `none` without touching the field
+when `x` is `none`. `x?.method(...)` takes arguments like an ordinary
+method call: arguments it leaves out take the method's
+[defaults](functions.md#default-values), and none of them is evaluated
 when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
 from a function declared `-> str` or `-> str or Error` is an error, so
 unwrap it first with `t?.name?` or `t?.name? or ""`, or declare the

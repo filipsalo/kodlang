@@ -404,7 +404,7 @@ class Interpreter:
                     return types.none_value
                 methods = getattr(type(v), "methods", {})
                 bound = BoundMethod(methods[method], v)
-                arg_values = [self.evaluate_expression(module, p.value) for p in args]
+                arg_values = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, bound, arg_values)
             case ast.Name() | ast.Variable() as name:
                 return name if as_lvalue else self.lookup(module, name)
