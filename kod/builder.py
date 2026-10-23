@@ -290,16 +290,13 @@ class Builder:
             if isinstance(s, ast.FunctionDeclaration) and s.name == "main"
         )
         mangled = self._mangled_module_prefix(file)
-        # If main returns `T or Error`, the call result is a Result cell ptr:
-        # {discriminant, payload}. On Ok, we unwrap the payload as the exit
-        # code; on Err, we call _kod_panic (prints the message and exits 1).
-        # `return_type` is the data-only ast.TypeExpr, so this is a pure
-        # syntactic check — no resolution needed.
+        # A Result main exits with the Ok (discriminant 1) payload, else panics.
         returns_result = ast.returns_result(main_decl, module)
         if returns_result:
             unwrap = """
                     ldr x9, [x0, #0]
-                    cbz x9, Lmain_ok
+                    cmp x9, #1
+                    b.eq Lmain_ok
                     ldr x0, [x0, #8]
                     ldr x1, [x0, #8]
                     ldr x9, [x1, #0]

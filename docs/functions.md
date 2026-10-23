@@ -87,6 +87,10 @@ func main(argv: [str]) -> int64 {
 }
 ```
 
+`main` can also return `int64 or Error`, directly or through an alias. A
+returned value is the exit status, and an error that reaches the end of
+`main` prints `panic: <message>` and exits with status 1.
+
 ## Methods
 
 Functions inside a `struct` type declaration are methods. The first parameter must be `self`:
