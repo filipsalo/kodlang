@@ -1458,7 +1458,7 @@ type Codegen = struct {
             }
             i = i - 1
         }
-        return .KVoid
+        return .KUnknown
     }
 
     // Overwrite the most-recently-allocated slot for `name` with a new
@@ -2141,7 +2141,7 @@ type Codegen = struct {
 
     // The kind a bare type name denotes. Inside a specialised method,
     // type-parameter names (e.g. K, V) map to concrete TypeKinds via the
-    // active substitution context. Unknown names fall back to int64.
+    // active substitution context. Unknown names are KUnknown.
     func resolve_type_name(self, anon name: str) -> TypeKind {
         mut si = 0
         for si < len(self.subst_names) {
@@ -2182,7 +2182,7 @@ type Codegen = struct {
         if iface_idx >= 0 {
             return .KInterface(idx: iface_idx)
         }
-        return .KInt64
+        return .KUnknown
     }
 
     // The kind of an array whose elements have kind `elem`.
@@ -2207,7 +2207,13 @@ type Codegen = struct {
         match self.p.type_exprs[type_id] {
             .Named(name) -> return self.resolve_type_name(name)
             .Array(inner) -> return self.array_kind_of(self.resolve_type(inner))
-            .Optional(inner) -> return .KOptional(inner: self.resolve_type(inner))
+            .Optional(inner) -> {
+                let inner_kind = self.resolve_type(inner)
+                if inner_kind is .KUnknown {
+                    return .KUnknown
+                }
+                return .KOptional(inner: inner_kind)
+            }
             .Func(params, return_typ) -> {
                 mut pkinds: [TypeKind] = []
                 for p in params {
@@ -2228,11 +2234,15 @@ type Codegen = struct {
                         return .KStruct(idx: struct_idx, type_args: [])
                     }
                     if param_count != len(args) {
-                        return .KInt64
+                        return .KUnknown
                     }
                     mut resolved: [TypeKind] = []
                     for arg in args {
-                        resolved += [self.resolve_type(arg)]
+                        let arg_kind = self.resolve_type(arg)
+                        if self.kind_has_unknown(arg_kind) {
+                            return .KUnknown
+                        }
+                        resolved += [arg_kind]
                     }
                     let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx)
                     return .KStruct(idx: inst_idx, type_args: [])
@@ -2244,16 +2254,20 @@ type Codegen = struct {
                         return .KEnum(idx: enum_idx)
                     }
                     if param_count != len(args) {
-                        return .KInt64
+                        return .KUnknown
                     }
                     mut resolved: [TypeKind] = []
                     for arg in args {
-                        resolved += [self.resolve_type(arg)]
+                        let arg_kind = self.resolve_type(arg)
+                        if self.kind_has_unknown(arg_kind) {
+                            return .KUnknown
+                        }
+                        resolved += [arg_kind]
                     }
                     let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx)
                     return .KEnum(idx: inst_idx)
                 }
-                return .KInt64
+                return .KUnknown
             }
         }
     }
@@ -2412,6 +2426,9 @@ type Codegen = struct {
             .Enum(name, name_span, type_params, variants) -> {
                 let saved_p = self.p
                 self.p = p
+                let saved_names = self.subst_names
+                let saved_args = self.subst_args
+                self.bind_type_params_unknown(type_params)
                 mut variant_infos: [VariantInfo] = []
                 // Discriminants start at 1, not 0. Disc 0 is reserved
                 // globally as the "None" sentinel for nullable contexts
@@ -2440,6 +2457,8 @@ type Codegen = struct {
                     disc = disc + 1
                 }
                 self.p = saved_p
+                self.subst_names = saved_names
+                self.subst_args = saved_args
                 let data_width = 8 + max_payload
                 let no_template_args: [TypeKind] = []
                 self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
@@ -2448,6 +2467,19 @@ type Codegen = struct {
             }
             else none
         }
+    }
+
+    // A template's own type parameters have no kind until it's instantiated.
+    func bind_type_params_unknown(self, anon type_params: [str]) -> none {
+        if len(type_params) == 0 {
+            return
+        }
+        mut args: [TypeKind] = []
+        for _tp in type_params {
+            args += [.KUnknown]
+        }
+        self.subst_names = type_params
+        self.subst_args = args
     }
 
     func register_struct(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
@@ -2459,6 +2491,9 @@ type Codegen = struct {
                 // expressions from p (the source module's parser), not self.p.
                 let saved_p = self.p
                 self.p = p
+                let saved_names = self.subst_names
+                let saved_args = self.subst_args
+                self.bind_type_params_unknown(type_params)
                 for field in fields {
                     mut field_kind = self.resolve_type(field.typ)
                     field_infos += [FieldInfo(name: field.name, :offset, kind: field_kind, type_expr: field.typ, default_expr: field.default_expr)]
@@ -2478,6 +2513,8 @@ type Codegen = struct {
                     method_idx.set(func_decl.name, mi)
                     mi = mi + 1
                 }
+                self.subst_names = saved_names
+                self.subst_args = saved_args
                 let no_template_args: [TypeKind] = []
                 self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span)]
                 self.struct_idx.set(name, len(self.structs) - 1)
@@ -3060,7 +3097,7 @@ type Codegen = struct {
                     // collect calls (e.g. a foreach over `name.field`) can
                     // resolve correctly. compile_let does this too, but
                     // that only runs after collection.
-                    if kind is .KVoid {
+                    if typ == 0 {
                         kind = self.infer_kind(value)
                     }
                     self.alloc_var(:name, :kind)
@@ -5517,7 +5554,7 @@ type Codegen = struct {
                     let sig: SigInfo = self.func_sigs[idx]
                     return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
                 }
-                return .KVoid
+                return .KUnknown
             }
             .ArrayLit(elements) -> {
                 // Peek at the first element so `for x in [s]` knows the
@@ -5534,13 +5571,12 @@ type Codegen = struct {
                     .KInterface(idx) -> return .KArrayInterface(elem_idx: idx)
                     .KOptional(inner_kind) -> return .KArrayOptional(inner: inner_kind)
                     .KFunc(param_kinds, return_kind) -> return .KArrayFunc(:param_kinds, :return_kind)
+                    .KUnknown -> return .KUnknown
                     else return .KArray
                 }
             }
             // Slice preserves the subject's kind — `str[lo..hi]` is `str`,
-            // `[T][lo..hi]` is `[T]` — except when we don't have a known
-            // kind, in which case fall back to `str` (the historically
-            // assumed shape from when only strings were sliceable).
+            // `[T][lo..hi]` is `[T]`.
             .Slice(s, lo, hi) -> {
                 let k = self.infer_kind(s)
                 match k {
@@ -5554,7 +5590,7 @@ type Codegen = struct {
                     .KArrayInterface(_idx) -> return k
                     .KArrayOptional(_inner) -> return k
                     .KArrayFunc(_pk, _rk) -> return k
-                    else return .KStr
+                    else return .KUnknown
                 }
             }
             .ImplicitVariant(name) -> {
@@ -5562,7 +5598,7 @@ type Codegen = struct {
                 if enum_idx >= 0 {
                     return .KEnum(idx: enum_idx)
                 }
-                return .KInt64
+                return .KUnknown
             }
             .Call(callee, args) -> {
                 match self.p.exprs[callee] {
@@ -5649,11 +5685,11 @@ type Codegen = struct {
                             return k
                         }
                         // Field access on any struct-valued expression.
-                        let .KStruct(struct_idx, _struct_type_args) = self.infer_kind(lhs) else { return .KInt64 }
-                        let .Ident(field_name) = self.p.exprs[rhs] else { return .KInt64 }
+                        let .KStruct(struct_idx, _struct_type_args) = self.infer_kind(lhs) else { return .KUnknown }
+                        let .Ident(field_name) = self.p.exprs[rhs] else { return .KUnknown }
                         match self.struct_field_kind(:struct_idx, :field_name) {
                             Some(k) -> return k
-                            none -> return .KInt64
+                            none -> return .KUnknown
                         }
                     }
                     .Add -> return self.infer_kind(lhs)
@@ -5681,9 +5717,13 @@ type Codegen = struct {
                                 if self.structs[sidx].method_idx.get("op_index") is Some(mi) {
                                     return self.structs[sidx].methods[mi].sig.return_kind
                                 }
-                                return .KInt64
+                                return .KUnknown
                             }
-                            else return .KInt64
+                            // A str or bytes element is a byte.
+                            .KStr -> return .KInt64
+                            .KBytes -> return .KInt64
+                            .KArray -> return .KInt64
+                            else return .KUnknown
                         }
                     }
                     else return .KInt64
@@ -5715,9 +5755,13 @@ type Codegen = struct {
                 // to its inner struct, find the field's kind, and re-wrap.
                 let struct_idx = self.find_struct_idx_of_optional(value)
                 if struct_idx >= 0 {
-                    return .KOptional(inner: self.find_field_kind(field, struct_idx: struct_idx))
+                    let field_kind = self.find_field_kind(field, struct_idx: struct_idx)
+                    if field_kind is .KUnknown {
+                        return .KUnknown
+                    }
+                    return .KOptional(inner: field_kind)
                 }
-                return .KInt64
+                return .KUnknown
             }
             .OptionalMethodCall(value, method, _args) -> {
                 // `x?.method(args)` returns U?: look up the method on the
@@ -5728,7 +5772,7 @@ type Codegen = struct {
                         return .KOptional(inner: self.structs[struct_idx].methods[mi].sig.return_kind)
                     }
                 }
-                return .KInt64
+                return .KUnknown
             }
             .FuncLit(decl_id) -> {
                 // Same shape as a named function reference — return
@@ -5742,7 +5786,7 @@ type Codegen = struct {
                 }
                 return .KUnknown
             }
-            else return .KInt64
+            else return .KUnknown
         }
     }
 
@@ -5776,7 +5820,7 @@ type Codegen = struct {
         self.check_type_expr(typ)
         let off = self.find_var_offset(name)
         mut kind = self.resolve_type(typ)
-        if kind is .KVoid {
+        if typ == 0 {
             kind = self.infer_kind(value)
         }
         // Update the slot's kind and mutability for this (re)declaration.
@@ -5794,8 +5838,10 @@ type Codegen = struct {
             }
         }
         self.compile_store(dest_off: off, :kind, value_id: value)
-        if typ == 0 and kind is .KUnknown {
-            self.report_cannot_infer(value, what: f"`{name}`")
+        if typ == 0 {
+            if kind is .KUnknown {
+                self.report_cannot_infer(value, what: f"`{name}`")
+            }
         }
     }
 
@@ -6362,7 +6408,7 @@ type Codegen = struct {
             }
             field_idx = field_idx + 1
         }
-        return .KInt64
+        return .KUnknown
     }
 
     // Desugar `lhs += rhs` to `lhs = lhs + rhs` and dispatch through the
