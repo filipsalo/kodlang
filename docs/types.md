@@ -6,6 +6,11 @@ icon: lucide/layers
 
 Kod is statically typed. Every variable and parameter requires a type annotation.
 
+Naming a type that doesn't exist is an error wherever a type is written:
+an annotation, a parameter or return type, a struct field, an enum payload,
+an alias target or a type argument. The error carries a did-you-mean hint
+when a known type name is close.
+
 ## Bindings and mutability
 
 A `let` binding is immutable: once set, reassigning the name is a compile
@@ -226,6 +231,9 @@ optional of either (`int64?`, `[str]?`) or another instantiation
 optional instantiations (`Pair[str, int64]?`) aren't accepted. Passing the
 wrong number of type arguments, or type arguments to a struct that isn't
 generic, is an error, and so is a `Type[A, B]` that isn't followed by `(`.
+The same goes for a generic written as a type: `let m: Map = ...` is an
+error that says to write `Map[K, V]`, and `Map[str]` is one for the missing
+type argument.
 
 `Map[K, V]` (in `builtins`) is the canonical example.
 
@@ -273,7 +281,9 @@ print(n.char_count())    // 3
 ```
 
 A struct, enum or interface that the importing module declares wins over
-a same-named alias from an imported module.
+a same-named alias from an imported module. An alias whose target names an
+unknown type is an error, and so is one that refers back to itself through
+other aliases (`type A = B` with `type B = A`).
 
 ## Fallible types: `T or Error`
 

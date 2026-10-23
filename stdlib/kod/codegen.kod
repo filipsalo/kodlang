@@ -420,6 +420,15 @@ type Codegen = struct {
     // Keys of the errors report_once has already emitted.
     reported: FuncIdx = FuncIdx()
 
+    // Path of the module compile_module compiles. Type expressions are
+    // only checked there, so an importer doesn't repeat an imported
+    // module's errors.
+    entry_path: str = ""
+    // This module's aliases whose target doesn't resolve, and their
+    // targets. Already reported, so their uses aren't reported again.
+    unresolved_aliases: [str] = []
+    unresolved_alias_targets: [int64] = []
+
     // Accumulate a user-facing error. Unlike `kod_panic`, this does not
     // abort — the rest of the module is still walked so a single run
     // surfaces every error rather than stopping at the first.
@@ -2117,8 +2126,16 @@ type Codegen = struct {
                 // into a fresh concrete entry (Map[str, str] → struct
                 // `Map$str$str`) so all downstream lookups read substituted
                 // types directly from the new entry.
+                // A wrong type-argument count is reported by check_type_expr.
                 let struct_idx = self.find_struct_idx(name)
                 if struct_idx >= 0 {
+                    let param_count = len(self.structs[struct_idx].type_param_names)
+                    if param_count == 0 {
+                        return .KStruct(idx: struct_idx, type_args: [])
+                    }
+                    if param_count != len(args) {
+                        return .KInt64
+                    }
                     mut resolved: [TypeKind] = []
                     for arg in args {
                         resolved += [self.resolve_type(arg)]
@@ -2128,6 +2145,13 @@ type Codegen = struct {
                 }
                 let enum_idx = self.find_enum_idx(name)
                 if enum_idx >= 0 {
+                    let param_count = len(self.enums[enum_idx].type_param_names)
+                    if param_count == 0 {
+                        return .KEnum(idx: enum_idx)
+                    }
+                    if param_count != len(args) {
+                        return .KInt64
+                    }
                     mut resolved: [TypeKind] = []
                     for arg in args {
                         resolved += [self.resolve_type(arg)]
@@ -4077,19 +4101,10 @@ type Codegen = struct {
     func generic_type_args(self, anon chain_id: int64, name: str, param_count: int64, report: bool) -> [TypeKind] {
         let failed: [TypeKind] = []
         let arg_ids = self.index_chain_args(chain_id)
-        if param_count == 0 {
+        let arity_msg = self.type_arity_error(name, :param_count, got: len(arg_ids))
+        if len(arity_msg) > 0 {
             if report {
-                self.report_error(f"error: `{name}` is not generic", span: self.p.expr_spans[chain_id])
-            }
-            return failed
-        }
-        if len(arg_ids) != param_count {
-            if report {
-                mut noun = "type arguments"
-                if param_count == 1 {
-                    noun = "type argument"
-                }
-                self.report_error(f"error: `{name}` expects {param_count} {noun}, got {len(arg_ids)}", span: self.p.expr_spans[chain_id])
+                self.report_error(arity_msg, span: self.p.expr_spans[chain_id])
             }
             return failed
         }
@@ -4108,7 +4123,7 @@ type Codegen = struct {
     // anything else, after reporting it when `report` is set.
     func type_kind_of_expr(self, anon expr_id: int64, report: bool) -> TypeKind? {
         match self.p.exprs[expr_id] {
-            .Ident(name) -> return self.resolve_type_name(name)
+            .Ident(name) -> return self.type_arg_name_kind(name, span: self.p.expr_spans[expr_id], :report)
             .ArrayLit(elements) -> {
                 if len(elements) == 1 {
                     if self.type_kind_of_expr(elements[0], :report) is Some(elem) {
@@ -4130,7 +4145,7 @@ type Codegen = struct {
                     .Dot -> {
                         if self.p.exprs[lhs] is .Ident(_mod) {
                             if self.p.exprs[rhs] is .Ident(name) {
-                                return self.resolve_type_name(name)
+                                return self.type_arg_name_kind(name, span: self.p.expr_spans[rhs], :report)
                             }
                         }
                     }
@@ -4163,6 +4178,289 @@ type Codegen = struct {
             self.report_error("error: unsupported type argument", span: self.p.expr_spans[expr_id])
         }
         return none
+    }
+
+    // The kind of a type-argument name, or none for a name that isn't a
+    // type or is a generic used without its type arguments.
+    func type_arg_name_kind(self, anon name: str, span: ast.Span, report: bool) -> TypeKind? {
+        mut msg = ""
+        if self.type_name_known(name) {
+            msg = self.bare_generic_error(name)
+        } else {
+            msg = self.unknown_type_error(name)
+        }
+        if len(msg) > 0 {
+            if report {
+                self.report_once(msg, :span)
+            }
+            return none
+        }
+        return self.resolve_type_name(name)
+    }
+
+    // "" when `name` takes `got` type arguments, otherwise the error.
+    func type_arity_error(self, anon name: str, param_count: int64, got: int64) -> str {
+        if param_count == 0 {
+            return f"error: `{name}` is not generic"
+        }
+        if got != param_count {
+            mut noun = "type arguments"
+            if param_count == 1 {
+                noun = "type argument"
+            }
+            return f"error: `{name}` expects {param_count} {noun}, got {got}"
+        }
+        return ""
+    }
+
+    func unknown_type_error(self, anon name: str) -> str {
+        mut names: [str] = ["int64", "bool", "str", "bytes", "none"]
+        for n in self.subst_names {
+            names += [n]
+        }
+        for n in self.struct_idx.keys {
+            names += [n]
+        }
+        for n in self.enum_idx.keys {
+            names += [n]
+        }
+        for n in self.iface_idx.keys {
+            names += [n]
+        }
+        for n in self.alias_idx.keys {
+            if self.type_name_known(n) {
+                names += [n]
+            }
+        }
+        return self.with_suggestion(f"error: unknown type `{name}`", typo: name, candidates: names)
+    }
+
+    // "" unless `name` is a generic struct or enum, which needs its type
+    // arguments wherever it's used as a type.
+    func bare_generic_error(self, anon name: str) -> str {
+        for sn in self.subst_names {
+            if sn == name {
+                return ""
+            }
+        }
+        if self.alias_idx.get(name) is Some(alias_i) {
+            if alias_i >= 0 {
+                return ""
+            }
+        }
+        mut params: [str] = []
+        mut what = "struct"
+        let enum_idx = self.find_enum_idx(name)
+        if enum_idx >= 0 {
+            params = self.enums[enum_idx].type_param_names
+            what = "enum"
+        } else {
+            let struct_idx = self.find_struct_idx(name)
+            if struct_idx >= 0 {
+                params = self.structs[struct_idx].type_param_names
+            }
+        }
+        if len(params) == 0 {
+            return ""
+        }
+        mut spelled = ""
+        for param in params {
+            if len(spelled) > 0 {
+                spelled = spelled + ", "
+            }
+            spelled = spelled + param
+        }
+        return f"error: generic {what} `{name}` needs type arguments: write `{name}[{spelled}]`"
+    }
+
+    // Report the unknown type names, generics used without type arguments
+    // and wrong type-argument counts in a type expression. Only the module
+    // being compiled is checked.
+    func check_type_expr(self, anon type_id: int64) -> none {
+        if type_id == 0 or self.p.path != self.entry_path {
+            return
+        }
+        let span = self.p.type_spans[type_id]
+        match self.p.type_exprs[type_id] {
+            .Named(name) -> {
+                mut msg = ""
+                if self.type_name_known(name) {
+                    msg = self.bare_generic_error(name)
+                } else {
+                    if self.is_unresolved_alias(name) == false {
+                        msg = self.unknown_type_error(name)
+                    }
+                }
+                if len(msg) > 0 {
+                    self.report_once(msg, :span)
+                }
+            }
+            .Array(inner) -> self.check_type_expr(inner)
+            .Optional(inner) -> self.check_type_expr(inner)
+            .Func(params, return_typ) -> {
+                for param in params {
+                    self.check_type_expr(param)
+                }
+                self.check_type_expr(return_typ)
+            }
+            .Generic(name, args) -> {
+                mut msg = ""
+                let struct_idx = self.find_struct_idx(name)
+                let enum_idx = self.find_enum_idx(name)
+                if struct_idx >= 0 {
+                    msg = self.type_arity_error(name, param_count: len(self.structs[struct_idx].type_param_names), got: len(args))
+                } else {
+                    if enum_idx >= 0 {
+                        msg = self.type_arity_error(name, param_count: len(self.enums[enum_idx].type_param_names), got: len(args))
+                    } else {
+                        if self.type_name_known(name) {
+                            msg = self.type_arity_error(name, param_count: 0, got: len(args))
+                        } else {
+                            msg = self.unknown_type_error(name)
+                        }
+                    }
+                }
+                if len(msg) > 0 {
+                    self.report_once(msg, :span)
+                }
+                for arg in args {
+                    self.check_type_expr(arg)
+                }
+            }
+        }
+    }
+
+    func is_unresolved_alias(self, anon name: str) -> bool {
+        for n in self.unresolved_aliases {
+            if n == name {
+                return true
+            }
+        }
+        return false
+    }
+
+    func check_sig_types(self, anon params: [ast.Param], return_typ: int64) -> none {
+        for param in params {
+            self.check_type_expr(param.typ)
+        }
+        self.check_type_expr(return_typ)
+    }
+
+    // Check the type expressions of the module's declarations. Runs once
+    // registration is done, so forward references resolve. Type params
+    // are in scope inside their own generic struct or enum.
+    func check_module_types(self, anon module: ast.Module) -> none {
+        self.check_type_aliases(module)
+        let saved_names = self.subst_names
+        for decl in module.decls {
+            match decl {
+                .Struct(_name, _name_span, type_params, fields, methods) -> {
+                    self.subst_names = type_params
+                    for field in fields {
+                        self.check_type_expr(field.typ)
+                    }
+                    // Non-generic methods are checked when compile_func runs.
+                    if len(type_params) > 0 {
+                        for method_id in methods {
+                            let fd = self.p.func_decls[method_id]
+                            self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                        }
+                    }
+                    self.subst_names = saved_names
+                }
+                .Enum(_name, _name_span, type_params, variants) -> {
+                    self.subst_names = type_params
+                    for variant in variants {
+                        for field in variant.fields {
+                            self.check_type_expr(field.typ)
+                        }
+                    }
+                    self.subst_names = saved_names
+                }
+                .Interface(_name, _name_span, methods) -> {
+                    for method_id in methods {
+                        let fd = self.p.func_decls[method_id]
+                        self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                    }
+                }
+                .Extern(_name, _name_span, params, return_typ) -> self.check_sig_types(params, :return_typ)
+                else none
+            }
+        }
+    }
+
+    // Report this module's aliases that never registered: a target naming
+    // an unknown type, or a cycle of aliases.
+    func check_type_aliases(self, anon module: ast.Module) -> none {
+        mut names: [str] = []
+        mut targets: [int64] = []
+        for decl in module.decls {
+            if decl is .TypeAlias(name, target) {
+                if self.type_name_known(name) == false {
+                    names += [name]
+                    targets += [target]
+                }
+            }
+        }
+        self.unresolved_aliases = names
+        self.unresolved_alias_targets = targets
+        mut i = 0
+        for i < len(names) {
+            if self.alias_reaches(names[i], type_id: targets[i], depth: 0) {
+                self.report_once(f"error: type alias `{names[i]}` refers to itself", span: self.p.type_spans[targets[i]])
+            } else {
+                self.check_type_expr(targets[i])
+            }
+            i = i + 1
+        }
+    }
+
+    // Whether `type_id`, following unresolved aliases, names `alias`.
+    func alias_reaches(self, anon alias: str, type_id: int64, depth: int64) -> bool {
+        if depth > len(self.unresolved_aliases) {
+            return false
+        }
+        for name in self.type_expr_names(type_id) {
+            if name == alias {
+                return true
+            }
+            mut i = 0
+            for i < len(self.unresolved_aliases) {
+                if self.unresolved_aliases[i] == name {
+                    if self.alias_reaches(alias, type_id: self.unresolved_alias_targets[i], depth: depth + 1) {
+                        return true
+                    }
+                }
+                i = i + 1
+            }
+        }
+        return false
+    }
+
+    // Every type name a type expression mentions.
+    func type_expr_names(self, anon type_id: int64) -> [str] {
+        mut names: [str] = []
+        if type_id == 0 {
+            return names
+        }
+        match self.p.type_exprs[type_id] {
+            .Named(name) -> names += [name]
+            .Array(inner) -> names = self.type_expr_names(inner)
+            .Optional(inner) -> names = self.type_expr_names(inner)
+            .Func(params, return_typ) -> {
+                for param in params {
+                    names += self.type_expr_names(param)
+                }
+                names += self.type_expr_names(return_typ)
+            }
+            .Generic(name, args) -> {
+                names += [name]
+                for arg in args {
+                    names += self.type_expr_names(arg)
+                }
+            }
+        }
+        return names
     }
 
     // Try `EnumName.Variant(args)` or `module.thing(args)` two-part forms.
@@ -5312,6 +5610,7 @@ type Codegen = struct {
     }
 
     func compile_let(self, name: str, typ: int64, value: int64, mutable: bool) -> none {
+        self.check_type_expr(typ)
         let off = self.find_var_offset(name)
         mut kind = self.resolve_type(typ)
         if kind is .KVoid {
@@ -6768,6 +7067,7 @@ type Codegen = struct {
         self.func_lines_values = []
         self.last_marked_line = 0
 
+        self.check_sig_types(func_decl.params, return_typ: func_decl.return_typ)
         for param in func_decl.params {
             mut kind = self.resolve_type(param.typ)
             // The method receiver `self` has no type annotation; give it
@@ -6889,6 +7189,7 @@ type Codegen = struct {
 
     func compile_module(self, anon module: ast.Module) -> none {
         self.println("\t.text")
+        self.entry_path = self.p.path
         let local_ifaces: int64 = len(self.interfaces)
 
         // Three-phase registration to handle struct ⇄ interface refs:
@@ -6920,6 +7221,7 @@ type Codegen = struct {
         self.resolve_field_kinds(start: local_structs)
         self.resolve_variant_field_kinds(start: local_enums)
         self.resolve_method_sigs(struct_start: local_structs, iface_start: local_ifaces)
+        self.check_module_types(module)
 
         for decl in module.decls {
             let idx_m = self.func_idx
