@@ -54,9 +54,9 @@ returning `int64` isn't a `func() -> int64?`. Without an annotation,
 `let x = none` and `let xs = []` are errors, since their type can't be
 inferred.
 
-Function and method arguments are checked the same way (see
-[Argument types](functions.md#argument-types)), so `m.set(5, 1)` on a
-`Map[str, int64]` is an error. Struct constructor fields, element stores
+Function and method arguments, struct constructor fields and enum payloads
+are checked the same way (see [Argument types](functions.md#argument-types)),
+so `m.set(5, 1)` on a `Map[str, int64]` is an error. Element stores
 (`xs[i] = v`, `m[k] = v`) and `return` values aren't checked against their
 declared types yet, apart from the optional cases described below, so a
 value of the wrong type there compiles and misbehaves at run time.

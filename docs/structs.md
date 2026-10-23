@@ -54,6 +54,13 @@ implicit zero/null value:
 let p: Point = Point(x: 10)   // error: struct `Point` requires field `y`
 ```
 
+Each field value must have the field's type, with the same implicit
+conversions as a [function argument](functions.md#argument-types):
+`Point(x: "a", y: 1)` is an error (`` expected `int64`, got `str` ``), while
+`3` is fine for an `int64?` field and a struct for an interface field. A
+field can be given only once: `Point(x: 1, x: 2, y: 3)` is an error
+(`` field `x` is given twice ``).
+
 ## Field defaults
 
 A field may declare a default with `= expr`. When a construction omits

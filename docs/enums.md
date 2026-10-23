@@ -45,6 +45,9 @@ Payload values go in declaration order, labelled or not:
 `Message.Move(x: 1, y: 2)` and `Message.Move(1, 2)` are the same value. A
 missing or extra payload value, a label that isn't the field in that
 position, and a variant the enum doesn't declare (`Message.Txt`) are errors.
+Each payload value must have its field's type, with the same implicit
+conversions as a [function argument](functions.md#argument-types):
+`Message.Text(content: 5)` is an error (`` expected `str`, got `int64` ``).
 
 ## Implicit variant syntax
 
