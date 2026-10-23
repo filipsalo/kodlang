@@ -96,3 +96,11 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 - The codegen emits each test as a regular function (`<prefix>$__test_N`) and, per module, a `<prefix>$__run_tests` dispatcher.
 - `kod test` builds a runtime `_main` that calls every test-bearing module's `__run_tests` in turn, then `_kod_test_summary` once at the end. Counters live in C runtime statics.
 - `fail`/`assert` set a per-test "failed" flag the dispatcher reads after each test returns; that flag drives the `ok` / `FAIL` line and the aggregate count.
+
+## Testing the compiler itself
+
+`make test` rebuilds the toolchain and runs pytest, which covers three kinds of check:
+
+- **Example programs**: every `tests/**/*.kod`. Trailing `// expected output:`, `// expected errors:`, `// expected stderr:`, `// expected status:` and `// expected mode:` comments say what should happen. By default each one runs both compiled and under the Python interpreter (`mode: run` / `mode: interpret` pick one, `mode: skip` opts out).
+- **Test blocks**: every `*_test.kod` in the repo that contains `test` blocks runs through `kod test <file>`, one pytest case per file.
+- **Self-hosting**: the fixed-point check and the interpreter parity check described in [Self-hosting](self-hosting.md#verifying-self-hosting).

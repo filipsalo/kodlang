@@ -1,5 +1,6 @@
 """Example-based tests for the compiler."""
 
+import os
 import re
 import subprocess
 import sys
@@ -9,6 +10,8 @@ from typing import Generator
 
 import _pytest
 import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def run_interpreted(path: str) -> subprocess.CompletedProcess:
@@ -112,38 +115,124 @@ def test_example(func: types.FunctionType, path: str, expects: dict[str, str], s
     assert result.returncode == int(expects.get("status", 0))
 
 
-def test_selfhost_matches_interpreter(sh_kodc):
+TEST_BLOCK = re.compile(r"^[ \t]*test\b", re.MULTILINE)
+TEST_SUMMARY = re.compile(r"^(\d+)/(\d+) passed", re.MULTILINE)
+
+
+def run_kod_test(path: Path | str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "kod", "test", str(path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def find_test_block_files() -> Generator[Path, None, None]:
+    """Every `*_test.kod` in the repo that contains `test` blocks, relative
+    to the repo root. Skips build output and dot-directories (worktrees)."""
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        rel_dir = Path(dirpath).relative_to(ROOT)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if not d.startswith(".") and not (rel_dir == Path(".") and d == "build")
+        )
+        for name in sorted(filenames):
+            if not name.endswith("_test.kod"):
+                continue
+            path = Path(dirpath) / name
+            if TEST_BLOCK.search(path.read_text()):
+                yield path.relative_to(ROOT)
+
+
+@pytest.mark.parametrize("path", find_test_block_files(), ids=str)
+def test_kod_test_blocks(path: Path, sh_kodc):
+    """Run a file's `test` blocks (and those of the modules it imports), and
+    check that at least the file's own blocks actually ran."""
+    result = run_kod_test(path)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, output
+    summary = TEST_SUMMARY.search(result.stdout)
+    assert summary, output
+    passed, total = int(summary[1]), int(summary[2])
+    assert passed == total, output
+    assert total >= len(TEST_BLOCK.findall((ROOT / path).read_text())), output
+
+
+def test_kod_test_reports_failures(sh_kodc):
+    """A failing `test` block fails the run (guards against the runner
+    silently passing everything)."""
+    result = run_kod_test("tests/test_block_canary.kod")
+    assert result.returncode == 1, f"{result.stdout}\n{result.stderr}"
+    assert "1/2 passed" in result.stdout
+    assert "FAIL canary: this test fails" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tests/xmod_return_kind.kod",
+        "tests/interface_dispatch.kod",
+        "tests/selfhost_parity.kod",
+    ],
+)
+def test_selfhost_matches_interpreter(target: str, sh_kodc):
     """Byte-identity check between the native sh_kodc binary and kodc.kod
-    driven through the Python interpreter, on a small but non-trivial test.
-    The sh_kodc build (the fixture) already exercises the interpreter on all
-    compiler-source modules — this just confirms the two front-ends agree on
-    a program with imports, structs, enums, match, and methods so any
-    divergence in the language semantics surfaces."""
-    target = "tests/map.kod"
+    driven through the Python interpreter. Keeps the bootstrap path (which
+    runs the compiler under the interpreter) honest. The targets cover
+    imports, structs, enums, interfaces, match, methods, and (via
+    selfhost_parity.kod) the statement lowering the compiler sources use."""
     sh_out = subprocess.run(
         [str(sh_kodc), target],
+        cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=10,
         check=False,
     )
     py_out = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kod",
-            "--no-type-check",
-            "_interpret",
-            "kodc.kod",
-            target,
-        ],
+        [sys.executable, "-m", "kod", "_interpret", "kodc.kod", target],
+        cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
         check=False,
     )
     assert sh_out.returncode == 0, f"sh_kodc failed: {sh_out.stderr}"
     assert py_out.returncode == 0, f"interpreter failed: {py_out.stderr}"
+    # Guard against comparing two empty modules.
+    assert ".globl" in sh_out.stdout, f"sh_kodc emitted no symbols for {target}"
     assert (
         sh_out.stdout == py_out.stdout
     ), f"sh_kodc and interpreter diverge on {target}"
+
+
+def test_selfhost_fixed_point(sh_kodc):
+    """The current compiler, compiled by itself twice, emits identical
+    assembly both times (see `make selfhost-check`)."""
+    result = subprocess.run(
+        ["make", "-s", "selfhost-check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.parametrize("via", ["sh_kodc", "kod build"])
+def test_missing_entry_file_is_an_error(via: str, sh_kodc):
+    missing = "tests/does_not_exist.kod"
+    if via == "sh_kodc":
+        cmd = [str(sh_kodc), missing]
+    else:
+        cmd = [sys.executable, "-m", "kod", "build", missing]
+    result = subprocess.run(
+        cmd, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 1
+    assert f"{missing}:1:1: error: no such file" in result.stderr
