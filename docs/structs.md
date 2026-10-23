@@ -149,6 +149,9 @@ let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
 let q = p.swap()    // Pair[int64, str]
 ```
 
+Construction always spells the type arguments; a bare `Pair(...)` is an
+error.
+
 A generic struct or enum may name itself, with any type arguments, in its
 fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
 `Pair[B, A]` above. The Python interpreter (`kod _interpret`) does not

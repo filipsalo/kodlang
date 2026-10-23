@@ -212,6 +212,10 @@ let p: Pair[str, int64] = Pair[str, int64](first: "hello", second: 42)
 
 The type arguments of a constructor call pick the instantiation, so
 `let p = Pair[str, int64](first: "hello", second: 42)` needs no annotation.
+A generic struct always needs them: a bare `Pair(first: "hello", second: 42)`
+is an error that says to write `Pair[A, B](...)`. Only instantiations are
+compiled, so a method of a generic struct that nothing instantiates isn't
+checked.
 A type argument is a name (`str`, `ast.Expr`), an array (`[str]`), an
 optional of either (`int64?`, `[str]?`) or another instantiation
 (`Map[str, Pair[int64, str]]()`). Function types (`func(int64) -> str`) and
