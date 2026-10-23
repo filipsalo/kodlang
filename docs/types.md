@@ -401,7 +401,8 @@ func main() -> int64 {
 
 To inspect a result instead of propagating or panicking, pattern-match it
 with `Ok` / `Err` (the two-armed analog of `Some` / `none`). `Ok`'s binding
-has the result's value type; `Err`'s is the `Error` interface:
+has the result's value type; `Err`'s is the `Error` interface (on an
+explicit `Result[T, E]`, it's an `E`):
 
 ```kod
 match read_size("missing.txt") {
