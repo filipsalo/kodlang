@@ -72,8 +72,9 @@ let d: Direction = .North
 A payload variant can use it too. Wherever the enum type is known, the
 variant belongs to that enum: an annotated `let`
 (`let m: Message = .Text(content: "hi")`), an assignment, an argument, a
-struct field, an array element, a return value, an arm of a `match` whose
-value goes to one of these, or the other side of `==` or `!=`
+struct field, an array element, a return value (the `T` of a `T or Error`
+function too), an arm of a `match` whose value goes to one of these, or the
+other side of `==` or `!=`
 (`m == .Quit`). Elsewhere, as in an unannotated `let`, it belongs to the
 first enum that declares a variant of that name, counting imported modules'
 enums before the module's own. Nothing reports it when several enums
