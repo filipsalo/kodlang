@@ -138,6 +138,10 @@ function's address when it isn't shadowed by a local variable; a
 call site `f(args)` does an indirect `blr` when `f` is a local of
 function type, falling through to the direct `bl` otherwise.
 
+An indirect call has the function type's return type wherever the
+function value comes from: a local, an array element (`fs[i](x)`), a
+struct field (`h.fn(x)`) or another call (`get_fn()(x)`).
+
 ## Extern functions
 
 Declare external C functions with `extern`:
