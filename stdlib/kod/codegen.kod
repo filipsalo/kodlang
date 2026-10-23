@@ -937,29 +937,19 @@ type Codegen = struct {
     // meaningful patterns on a non-optional value. Same intent as
     // the Python typechecker's "Cannot use 'is' on non-optional" rule,
     // since `if x is none {...}` lowers to a MatchStmt.
-    func check_match_subject(self, anon subject_id: int64, arms: [int64]) -> none {
+    func check_match_subject(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
         mut needs_optional: bool = false
         mut needs_result: bool = false
-        for arm_id in arms {
-            let arm = self.p.match_arms[arm_id]
-            let pat = self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: self.infer_kind(subject_id))
-            if pat is .NonePat {
-                needs_optional = true
-            }
-            if pat is .SomePat(_binding) {
-                needs_optional = true
-            }
-            if pat is .OkPat(_b) {
-                needs_result = true
-            }
-            if pat is .ErrPat(_b) {
-                needs_result = true
-            }
-        }
         mut needs_interface: bool = false
-        for arm_id in arms {
-            if self.p.patterns[self.p.match_arms[arm_id].pattern] is .TypePat(_t, _b) {
-                needs_interface = true
+        for pid in pattern_ids {
+            let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: self.infer_kind(subject_id))
+            match pat {
+                .NonePat -> needs_optional = true
+                .SomePat(_binding) -> needs_optional = true
+                .OkPat(_b) -> needs_result = true
+                .ErrPat(_b) -> needs_result = true
+                .TypePat(_t, _b) -> needs_interface = true
+                else self.check_pattern_subject(pat, :subject_id)
             }
         }
         let subj_kind = self.infer_kind(subject_id)
@@ -986,6 +976,53 @@ type Codegen = struct {
                 self.report_error("error: `is` / `match` with Ok/Err requires a `T or Error` value", span: self.p.expr_spans[subject_id])
             }
         }
+    }
+
+    // False after reporting a variant pattern on a value that isn't an enum.
+    func check_pattern_subject(self, anon pat: ast.Pattern, subject_id: int64) -> bool {
+        let kind = self.infer_kind(subject_id)
+        if self.kind_has_unknown(kind) {
+            return true
+        }
+        if kind is .KEnum(_idx) {
+            return true
+        }
+        mut target = ""
+        mut variant = ""
+        match pat {
+            .EnumPat(enum_name, variant_name, _bindings) -> {
+                target = f"`{enum_name}.{variant_name}`"
+                variant = variant_name
+            }
+            .ImplicitEnumPat(variant_name, _bindings) -> {
+                target = f"`.{variant_name}`"
+                variant = variant_name
+            }
+            else return true
+        }
+        let span = self.p.expr_spans[subject_id]
+        let shown = self.kind_display(kind)
+        let inner = self.optional_inner(kind)
+        if inner is .KEnum(_inner_idx) {
+            if kind is .KOptional(_k) {
+                mut unwrap = "`?`"
+                if self.p.exprs[subject_id] is .Ident(name) {
+                    unwrap = f"`{name}?`"
+                }
+                self.report_error(f"error: {target} matches a `{self.kind_display(inner)}`, not a `{shown}`; match `.Some(v)` first, or unwrap it with {unwrap}", :span)
+                return false
+            }
+        }
+        if variant == "Some" or variant == "None" {
+            self.report_error(f"error: {target} needs an optional value, got `{shown}`", :span)
+            return false
+        }
+        if variant == "Ok" or variant == "Err" {
+            self.report_error(f"error: {target} needs a `T or Error` value, got `{shown}`", :span)
+            return false
+        }
+        self.report_error(f"error: {target} needs an enum value, got `{shown}`", :span)
+        return false
     }
 
     // Exhaustiveness check for matches whose subject is an enum,
@@ -1970,30 +2007,7 @@ type Codegen = struct {
         return -1
     }
 
-    // Like `find_enum_with_variant`, but disambiguates by static
-    // context: if `preferred_idx >= 0` and that enum has a variant
-    // named `variant_name`, return it directly. Otherwise fall back
-    // to the global first-match search. Used by match-statement /
-    // match-expression compilation, where the subject's enum kind
-    // is known and `.Foo` must dispatch on THAT enum's `Foo` — not
-    // some other enum's `Foo` that happens to be registered earlier.
-    func find_enum_with_variant_in(self, anon variant_name: str, preferred_idx: int64) -> int64 {
-        if preferred_idx >= 0 and preferred_idx < len(self.enums) {
-            mut j = 0
-            for j < len(self.enums[preferred_idx].variants) {
-                if self.enums[preferred_idx].variants[j].name == variant_name {
-                    return preferred_idx
-                }
-                j = j + 1
-            }
-        }
-        return self.find_enum_with_variant(variant_name)
-    }
-
     // Extract the enum index from a TypeKind, or -1 if not an enum.
-    // Used to feed `find_enum_with_variant_in` with the match subject's
-    // statically-known enum so implicit `.Variant` patterns resolve
-    // against THAT enum even when another enum has a same-named variant.
     func enum_idx_of_kind(self, anon kind: TypeKind) -> int64 {
         if kind is .KEnum(idx) {
             return idx
@@ -2040,8 +2054,11 @@ type Codegen = struct {
         return f"{count} payload fields"
     }
 
-    // -1 after reporting; enum_name is "" for the implicit `.V` form.
+    // -1 after reporting, or for a subject that isn't an enum (check_pattern_subject reports it).
     func pattern_enum_idx(self, enum_name: str, variant_name: str, subj_enum_idx: int64, span: ast.Span) -> int64 {
+        if subj_enum_idx < 0 {
+            return -1
+        }
         if len(enum_name) > 0 {
             let enum_idx = self.find_enum_idx(enum_name)
             if enum_idx < 0 {
@@ -2054,31 +2071,12 @@ type Codegen = struct {
                 self.report_error(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
                 return -1
             }
-            if subj_enum_idx >= 0 {
-                if self.enums_compatible(subj_enum_idx, a_idx: enum_idx) == false {
-                    self.report_error(f"error: `{enum_name}.{variant_name}` is not a variant of `{self.enum_display_name(subj_enum_idx)}`", :span)
-                    return -1
-                }
-                return subj_enum_idx
-            }
-            return enum_idx
-        }
-        // The subject's enum decides; pattern_variant_idx reports a miss.
-        if subj_enum_idx >= 0 {
-            return subj_enum_idx
-        }
-        let enum_idx = self.find_enum_with_variant(variant_name)
-        if enum_idx >= 0 {
-            return enum_idx
-        }
-        mut variant_names: [str] = []
-        for e in self.enums {
-            for v in e.variants {
-                variant_names += [v.name]
+            if self.enums_compatible(subj_enum_idx, a_idx: enum_idx) == false {
+                self.report_error(f"error: `{enum_name}.{variant_name}` is not a variant of `{self.enum_display_name(subj_enum_idx)}`", :span)
+                return -1
             }
         }
-        self.report_error(self.with_suggestion(f"error: no enum has a variant `.{variant_name}`", typo: variant_name, candidates: variant_names), :span)
-        return -1
+        return subj_enum_idx
     }
 
     // -1 after reporting an unknown variant or too many bindings.
@@ -3226,11 +3224,7 @@ type Codegen = struct {
                 return self.variant_binding_kinds(self.named_pattern_enum_idx(enum_name, :subject_kind), :variant_name, :count)
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
-                mut enum_idx = self.enum_idx_of_kind(subject_kind)
-                if enum_idx < 0 {
-                    enum_idx = self.find_enum_with_variant(variant_name)
-                }
-                return self.variant_binding_kinds(enum_idx, :variant_name, :count)
+                return self.variant_binding_kinds(self.enum_idx_of_kind(subject_kind), :variant_name, :count)
             }
             else none
         }
@@ -3243,7 +3237,7 @@ type Codegen = struct {
         let named = self.find_enum_idx(enum_name)
         let subj = self.enum_idx_of_kind(subject_kind)
         if named < 0 or subj < 0 {
-            return named
+            return -1
         }
         if self.enums_compatible(subj, a_idx: named) {
             return subj
@@ -5902,7 +5896,11 @@ type Codegen = struct {
         for arm_id in arms {
             expr_patterns += [self.p.match_expr_arms[arm_id].pattern]
         }
-        self.check_match_exhaustive(subject_id, pattern_ids: expr_patterns)
+        let attempts_before = self.report_attempts
+        self.check_match_subject(subject_id, pattern_ids: expr_patterns)
+        if self.report_attempts == attempts_before {
+            self.check_match_exhaustive(subject_id, pattern_ids: expr_patterns)
+        }
         // Static enum kind for `.Foo` pattern disambiguation. See
         // compile_match_stmt for the analogous reasoning.
         let subj_kind = self.infer_kind(subject_id)
@@ -8159,6 +8157,13 @@ type Codegen = struct {
             }
             return
         }
+        if self.check_pattern_subject(self.let_else_pattern(pattern_id, :value_id), subject_id: value_id) == false {
+            self.compile_discard(value_id)
+            for name in self.pattern_binding_names(self.let_else_pattern(pattern_id, :value_id)) {
+                self.update_var_kind(:name, kind: .KUnknown)
+            }
+            return
+        }
         let else_lbl = self.fresh("Llet_else")
         let done_lbl = self.fresh("Llet_done")
         let subj_val = self.compile_expr(value_id)
@@ -8281,12 +8286,15 @@ type Codegen = struct {
             self.report_cannot_infer(subject_id, what: "this expression")
             return
         }
-        self.check_match_subject(subject_id, :arms)
         mut stmt_patterns: [int64] = []
         for arm_id in arms {
             stmt_patterns += [self.p.match_arms[arm_id].pattern]
         }
-        self.check_match_exhaustive(subject_id, pattern_ids: stmt_patterns)
+        let attempts_before = self.report_attempts
+        self.check_match_subject(subject_id, pattern_ids: stmt_patterns)
+        if self.report_attempts == attempts_before {
+            self.check_match_exhaustive(subject_id, pattern_ids: stmt_patterns)
+        }
         // Static enum kind of the subject, used to disambiguate
         // implicit `.Foo` patterns when multiple enums declare a
         // variant named `Foo`. -1 if the subject isn't an enum.
