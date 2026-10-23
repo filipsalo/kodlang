@@ -298,6 +298,11 @@ show(true)      // same for bool
 A call on an interface value must name one of the interface's methods,
 with arguments that match its signature; an unknown method is an error.
 
+A struct or primitive becomes an interface value wherever one is expected:
+an annotated `let`, an argument, a field, an array element, a value stored
+with `m[k] = v`, and a return value, including the value of a `-> Shape?`
+or `-> Shape or Error` function.
+
 ## Type aliases
 
 `type Name = T` gives an existing type a second name. An alias is
