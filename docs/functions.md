@@ -121,7 +121,10 @@ conversions as an argument: `func f() -> str { return 5 }` is an error
 (`` expected `str`, got `int64` ``), and so is returning a `[Sq]` variable
 from a `-> [Shape]` function. A `-> none` function returns no value; it
 can end with a bare `return`, `return none`, or `return` of a call that
-itself returns `none`.
+itself returns `none`. Any function can return a call that doesn't return,
+such as `return self.fail("bad")` or `return log.die("bad")`, where the
+method or function returns `none`, has no `return` and ends in
+`kod_panic(...)` on every path.
 
 In a `-> T or Error` function, a returned `T` becomes a successful result.
 A returned `T or Error` value must have the same `T`, so returning an

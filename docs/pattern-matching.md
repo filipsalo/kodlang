@@ -198,8 +198,9 @@ which is how arms of different structs become one interface value:
 
 When the match's value is used, every arm needs a value: an arm that calls
 a function returning `none` is an error, unless the call doesn't return.
-`kod_panic(...)` doesn't, and neither does a function returning `none` that
-has no `return` and ends in `kod_panic(...)` on every path. In a `-> none`
+`kod_panic(...)` doesn't, and neither does a function or method returning
+`none` that has no `return` and ends in `kod_panic(...)` on every path, an
+imported module's function (`log.die(...)`) included. In a `-> none`
 or `-> none or Error` function, `return match k { 1 -> a() else -> b() }`
 doesn't use the value, so its arms may return `none`. Without an annotation, a match whose arms are
 all `none` is an error too, as `let x = none` is, since its type can't be
