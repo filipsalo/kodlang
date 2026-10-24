@@ -703,6 +703,8 @@ class Interpreter:
                         module, enum_type, callee.variant_name, list(args)
                     )
                 func = self._call_target(module, callee)
+                if isinstance(func, type) and issubclass(func, types.StructType):
+                    return self._construct(module, func, args, callee.span)
                 self._check_labels(func, args)
                 args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
@@ -1097,6 +1099,9 @@ class Interpreter:
                 setattr(statement, "module", module)
             case ast.FunctionCall():
                 callee = self._call_target(module, statement.callee)
+                if isinstance(callee, type) and issubclass(callee, types.StructType):
+                    self._construct(module, callee, statement.args, statement.span)
+                    return
                 args = self._evaluate_args(module, statement.args, callee)
                 self.call_function(module, callee, args)
             case ast.VariableDeclaration(variable, value, _span, mutable):
@@ -1424,6 +1429,46 @@ class Interpreter:
         if "to_str" in methods:
             return self.call_function(module, methods["to_str"], (value,))
         return types.String(str(value).encode("utf8"))
+
+    def _construct(self, module, struct_type, args, span):
+        """`struct_type(args)`: each value goes to the field its label names."""
+        fields = struct_type.__dict__.get("_kod_fields")
+        if fields is None:
+            fields = {
+                v.id: (v, self._variant_slot(v.type))
+                for v in getattr(struct_type, "struct_fields", [])
+            }
+            setattr(struct_type, "_kod_fields", fields)
+        shown = struct_type.__name__
+        names = []
+        for arg in args:
+            label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
+            name = label.id if label is not None else ""
+            where = label.span if label is not None else arg.span
+            if name not in fields:
+                raise KodError(f"struct `{shown}` has no field `{name}`", where)
+            if name in names:
+                raise KodError(f"field `{name}` is given twice", where)
+            names.append(name)
+        for name, (field, _slot) in fields.items():
+            if field.default is None and name not in names:
+                raise KodError(
+                    f"struct `{shown}` requires field `{name}` (it has no default)",
+                    span,
+                )
+        kwargs = {
+            name: self._evaluate_for(module, arg, fields[name][1])
+            for name, arg in zip(names, args)
+        }
+        if len(kwargs) < len(fields):
+            owner = getattr(struct_type, "template_origin", struct_type)
+            owner_module = getattr(owner, "decl_module", None) or module
+            for name, (field, _slot) in fields.items():
+                if name not in kwargs:
+                    kwargs[name] = self._evaluate_default(
+                        owner_module, field.default, field.type
+                    )
+        return struct_type(**kwargs)
 
     def _evaluate_default(self, module, expr, slot=None):
         """A default value, evaluated without the caller's locals in view."""

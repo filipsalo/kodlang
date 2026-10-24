@@ -40,11 +40,15 @@ type Node = struct {
 
 ## Construction
 
-Pass fields by name using labeled arguments:
+Pass fields by name using labeled arguments, in any order:
 
 ```kod
 let p: Point = Point(x: 10, y: 20)
+let q: Point = Point(y: 20, x: 10)   // the same point
 ```
+
+The values are computed in the order they're written. Every value needs
+its label: `Point(10, 20)` is an error, since it names no field.
 
 Every field must be supplied unless it has a [default](#field-defaults).
 Omitting a field with no default is a compile error — there's no
