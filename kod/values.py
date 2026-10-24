@@ -532,5 +532,6 @@ class GenericTemplate:
             ]
             result = StructType.make(inst_name, new_fields, self.template.methods)
             result.template_origin = self.template
+            result.type_subst = subst
         self._cache[type_args] = result
         return result

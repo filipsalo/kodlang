@@ -5,7 +5,6 @@ import ctypes
 import dataclasses
 import os
 import sys
-from functools import partial
 from typing import Any
 
 from kod import ast, tokens
@@ -77,6 +76,53 @@ def _value_pattern(pattern, value):
     return pattern
 
 
+def _slot_target(expr):
+    """`expr` unwrapped if its `.Variant`s take their enum from its slot."""
+    while True:
+        t = type(expr)
+        if t is ast.Expression:
+            expr = expr.value
+        elif t is ast.FunctionCallParam:
+            expr = expr.expression
+        else:
+            break
+    if (
+        t is ast.ImplicitEnumVariant
+        or t is ast.ArrayLiteral
+        or t is ast.MatchExpression
+    ):
+        return expr
+    if t is ast.FunctionCall and type(expr.callee) is ast.ImplicitEnumVariant:
+        return expr
+    return None
+
+
+def _is_variant(expr):
+    t = type(expr)
+    if t is ast.FunctionCall:
+        return type(expr.callee) is ast.ImplicitEnumVariant
+    return t is ast.ImplicitEnumVariant
+
+
+def _implicit_variant(expr):
+    """The name and argument expressions of `.V` or `.V(...)`, else ("", [])."""
+    if isinstance(expr, ast.ImplicitEnumVariant):
+        return expr.variant_name, []
+    if isinstance(expr, ast.FunctionCall) and isinstance(
+        expr.callee, ast.ImplicitEnumVariant
+    ):
+        return expr.callee.variant_name, list(expr.args)
+    return "", []
+
+
+def _substituted(t, subst):
+    """`t` with a generic instance's type arguments for its parameters."""
+    try:
+        return types._substitute_type(t, subst)
+    except KeyError:
+        return t
+
+
 def _value_arm(arm, value):
     """`arm` with its pattern read for `value`, as in _value_pattern."""
     pattern = _value_pattern(arm.pattern, value)
@@ -95,6 +141,8 @@ class Interpreter:
         # binding names in each frame. Mirrors the codegen's per-VarSlot
         # mutable flag so `_interpret` rejects the same reassignments.
         self.immutable_stack = [set()]
+        # The running functions, innermost last; a `return` goes to the last.
+        self.funcs = []
 
     def run(self, file, argv=()):
         """Run the program"""
@@ -230,14 +278,12 @@ class Interpreter:
                 return getattr(lhs, rhs.id)
             case tokens.OpenBracket():
                 lhs_val = self.evaluate_expression(module, lhs)
-                rhs_val = self.evaluate_expression(module, rhs)
                 struct_methods = getattr(type(lhs_val), "methods", {})
                 if "op_index" in struct_methods:
-                    return self.call_function(
-                        module,
-                        BoundMethod(struct_methods["op_index"], lhs_val),
-                        [rhs_val],
-                    )
+                    bound = BoundMethod(struct_methods["op_index"], lhs_val)
+                    key = self._evaluate_args(module, [rhs], bound)
+                    return self.call_function(module, bound, key)
+                rhs_val = self.evaluate_expression(module, rhs)
                 try:
                     return lhs_val.op_index(rhs_val)
                 except (IndexError, KeyError) as e:
@@ -250,6 +296,9 @@ class Interpreter:
             case tokens.Minus():
                 op_func_name = "op_minus"
             case tokens.NotEqual():
+                if _is_variant(lhs) or _is_variant(rhs):
+                    lhs_val, rhs_val = self._variant_operands(module, lhs, rhs)
+                    return lhs_val.op_ne(rhs_val)
                 op_func_name = "op_ne"
             case tokens.LessThan():
                 op_func_name = "op_lt"
@@ -288,6 +337,9 @@ class Interpreter:
                 else:
                     return types.Bool((not is_none) != negate)
             case tokens.EqualEqual():
+                if _is_variant(lhs) or _is_variant(rhs):
+                    lhs_val, rhs_val = self._variant_operands(module, lhs, rhs)
+                    return lhs_val.op_eq(rhs_val)
                 op_func_name = "op_eq"
             case tokens.And():
                 lhs_val = self.evaluate_expression(module, lhs)
@@ -357,7 +409,9 @@ class Interpreter:
                 }
                 prev = self.evaluate_expression(module, operands[0])
                 for i, op in enumerate(ops):
-                    nxt = self.evaluate_expression(module, operands[i + 1])
+                    nxt = self._evaluate_for(
+                        module, operands[i + 1], self._value_slot(prev)
+                    )
                     method = getattr(prev, cmp_methods[type(op)])
                     if not method(nxt).to_bool().value:
                         return types.Bool(False)
@@ -415,18 +469,9 @@ class Interpreter:
             case ast.FunctionCallParam() as param:
                 return self.evaluate_expression(module, param.expression, as_lvalue)
             case ast.ArrayLiteral(elements):
-                evaled = [self.evaluate_expression(module, e) for e in elements]
-                # FunctionDeclaration AST nodes are first-class values
-                # in the interpreter (function-pointer support); flatten
-                # them to a single FunctionType bucket so the resulting
-                # array's item_type has the `.name` attribute
-                # `ArrayType.make` expects.
-                if evaled and isinstance(evaled[0], ast.FunctionDeclaration):
-                    item_type = types.FunctionType
-                else:
-                    item_type = type(evaled[0]) if evaled else types.NoneType
-                arr_type = types.ArrayType.make(item_type)
-                return arr_type(evaled)
+                return self._array_value(
+                    [self.evaluate_expression(module, e) for e in elements]
+                )
             case ast.FunctionCall(callee, args):
                 # .Variant(payload) — implicit enum variant constructor with
                 # payload fields. Resolve the enum here so we can pass args
@@ -487,19 +532,12 @@ class Interpreter:
                             ):
                                 enum_type = val.template
                             if enum_type is not None:
-                                vinfo = enum_type.variants[variant_name]
-                                evaled = [
-                                    self.evaluate_expression(module, a) for a in args
-                                ]
-                                if self._is_result_enum(enum_type) and len(evaled) == 1:
-                                    return types.ResultValue(
-                                        variant_name == "Ok", evaled[0]
-                                    )
-                                fields = {f.id: v for f, v in zip(vinfo.fields, evaled)}
-                                return types.EnumValue(enum_type, variant_name, fields)
+                                return self._variant_value(
+                                    module, enum_type, variant_name, list(args)
+                                )
                     raise ValueError(f"No enum found with variant .{variant_name}")
                 func = self.evaluate_expression(module, callee)
-                args = [self.evaluate_expression(module, arg) for arg in args]
+                args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
             case ast.GenericInstantiation(name, type_args):
                 template = self.lookup(module, name)
@@ -559,55 +597,9 @@ class Interpreter:
                 return arr_type(s.value[i_val:j_val])
             case ast.MatchExpression(subject, arms):
                 value = self.evaluate_expression(module, subject)
-                for arm in arms:
-                    arm = _value_arm(arm, value)
-                    if isinstance(arm.pattern, ast.IntegerPattern):
-                        if value.value == arm.pattern.value:
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.StringPattern):
-                        if value.to_py_str() == arm.pattern.value:
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.WildcardPattern):
-                        return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.OptionalNonePattern):
-                        if isinstance(value, types.NoneType):
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.OptionalSomePattern):
-                        if not isinstance(value, types.NoneType):
-                            if arm.pattern.binding:
-                                self.stack[-1][arm.pattern.binding] = value
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.ResultOkPattern):
-                        if isinstance(value, types.ResultValue) and value.ok:
-                            if arm.pattern.binding:
-                                self.stack[-1][arm.pattern.binding] = value.payload
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.ResultErrPattern):
-                        if isinstance(value, types.ResultValue) and not value.ok:
-                            if arm.pattern.binding:
-                                self.stack[-1][arm.pattern.binding] = value.payload
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(arm.pattern, ast.TypePattern):
-                        if type(value).__name__ == arm.pattern.type_name:
-                            if arm.pattern.binding:
-                                self.stack[-1][arm.pattern.binding] = value
-                            return self.evaluate_expression(module, arm.body)
-                    elif isinstance(
-                        arm.pattern,
-                        (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern),
-                    ):
-                        if (
-                            isinstance(value, types.EnumValue)
-                            and value.variant_name == arm.pattern.variant_name
-                        ):
-                            bindings = getattr(arm.pattern, "bindings", [])
-                            field_values = list(value.fields.values())
-                            for binding_name, field_value in zip(
-                                bindings, field_values
-                            ):
-                                self.stack[-1][binding_name] = field_value
-                            return self.evaluate_expression(module, arm.body)
-                raise ValueError("Non-exhaustive match expression")
+                return self.evaluate_expression(
+                    module, self._match_arm_body(value, arms)
+                )
             case ast.FunctionDeclaration():
                 # Function-as-value: `let f = foo` binds the function
                 # declaration as the value. Subsequent indirect calls
@@ -624,11 +616,252 @@ class Interpreter:
                     f"Don't know how to evaluate expression {expression!r}"
                 )
 
+    def _variant_slot(self, slot):
+        """`slot` if it's an enum, or an optional or array of one, else None."""
+        inner = slot
+        while isinstance(inner, type) and issubclass(inner, types.OptionalType):
+            inner = inner.inner_type
+        if not isinstance(inner, type):
+            return None
+        if issubclass(inner, types.EnumType):
+            return inner
+        if issubclass(inner, types.ArrayType) and hasattr(inner, "item_type"):
+            if self._variant_slot(inner.item_type) is not None:
+                return inner
+        return None
+
+    def _arg_slots(self, func):
+        """The `_variant_slot`s of `func`'s arguments, or () if none; cached."""
+        if isinstance(func, BoundMethod):
+            cls = type(func.receiver)
+            cache = cls.__dict__.get("_kod_method_slots")
+            if cache is None:
+                cache = {}
+                setattr(cls, "_kod_method_slots", cache)
+            slots = cache.get(func.func.name)
+            if slots is None:
+                subst = getattr(cls, "type_subst", None) or {}
+                slots = self._slots_of(
+                    [
+                        _substituted(p.variable.type, subst)
+                        for p in list(func.func.params)[1:]
+                    ]
+                )
+                cache[func.func.name] = slots
+            return slots
+        if isinstance(func, (ast.FunctionDeclaration, ast.ExternalFunctionDeclaration)):
+            slots = func.__dict__.get("_kod_arg_slots")
+            if slots is None:
+                slots = self._slots_of([p.variable.type for p in func.params])
+                func.__dict__["_kod_arg_slots"] = slots
+            return slots
+        if isinstance(func, type) and issubclass(func, types.StructType):
+            slots = func.__dict__.get("_kod_arg_slots")
+            if slots is None:
+                slots = self._slots_of(
+                    [v.type for v in getattr(func, "struct_fields", [])]
+                )
+                setattr(func, "_kod_arg_slots", slots)
+            return slots
+        if isinstance(func, types.EnumVariantConstructor):
+            fields = func.enum_type.variants[func.variant_name].fields
+            return self._slots_of([f.type for f in fields])
+        return ()
+
+    def _slots_of(self, slot_types):
+        slots = [self._variant_slot(t) for t in slot_types]
+        return slots if any(slot is not None for slot in slots) else ()
+
+    def _evaluate_args(self, module, args, func):
+        if all(_slot_target(arg) is None for arg in args):
+            return [self.evaluate_expression(module, arg) for arg in args]
+        slots = self._arg_slots(func)
+        return [
+            self._evaluate_for(module, arg, slots[i] if i < len(slots) else None)
+            for i, arg in enumerate(args)
+        ]
+
+    def _evaluate_for(self, module, expr, slot):
+        """Evaluate `expr` for `slot`, whose enum its `.Variant`s belong to."""
+        target = _slot_target(expr) if slot is not None else None
+        slot = self._variant_slot(slot) if target is not None else None
+        if slot is None:
+            return self.evaluate_expression(module, expr)
+        expr = target
+        if issubclass(slot, types.EnumType):
+            name, args = _implicit_variant(expr)
+            if name in slot.variants:
+                return self._variant_value(module, slot, name, args)
+        elif isinstance(expr, ast.ArrayLiteral):
+            return self._array_value(
+                [self._evaluate_for(module, e, slot.item_type) for e in expr.elements]
+            )
+        if isinstance(expr, ast.MatchExpression):
+            value = self.evaluate_expression(module, expr.expression)
+            return self._evaluate_for(
+                module, self._match_arm_body(value, expr.arms), slot
+            )
+        return self.evaluate_expression(module, expr)
+
+    def _variant_value(self, module, enum_type, variant_name, args):
+        """`enum_type.variant_name` built from the argument expressions `args`."""
+        vinfo = enum_type.variants[variant_name]
+        evaled = [
+            self._evaluate_for(module, arg, field.type)
+            for arg, field in zip(args, vinfo.fields)
+        ]
+        if self._is_result_enum(enum_type) and len(evaled) == 1:
+            return types.ResultValue(variant_name == "Ok", evaled[0])
+        fields = {f.id: v for f, v in zip(vinfo.fields, evaled)}
+        return types.EnumValue(enum_type, variant_name, fields)
+
+    def _array_value(self, evaled):
+        # Function values are AST nodes, which ArrayType.make can't name.
+        if evaled and isinstance(evaled[0], ast.FunctionDeclaration):
+            item_type = types.FunctionType
+        else:
+            item_type = type(evaled[0]) if evaled else types.NoneType
+        return types.ArrayType.make(item_type)(evaled)
+
+    def _variant_operands(self, module, lhs, rhs):
+        """Operands of `==` with a `.Variant`, which takes the other side's enum."""
+        if _is_variant(rhs):
+            lhs_val = self.evaluate_expression(module, lhs)
+            return lhs_val, self._evaluate_for(module, rhs, self._value_slot(lhs_val))
+        rhs_val = self.evaluate_expression(module, rhs)
+        return self._evaluate_for(module, lhs, self._value_slot(rhs_val)), rhs_val
+
+    def _value_slot(self, value):
+        """The enum of an enum value, else None."""
+        return value.enum_type if isinstance(value, types.EnumValue) else None
+
+    def _assign_slot(self, module, lhs):
+        """What an assignment to `lhs` stores, if known without side effects."""
+        if isinstance(lhs, (ast.Name, ast.Variable)):
+            try:
+                return self._value_slot(self.lookup(module, lhs))
+            except ValueError:
+                return None
+        if not isinstance(lhs, ast.BinaryOperator) or not isinstance(
+            lhs.lhs, (ast.Name, ast.Variable)
+        ):
+            return None
+        try:
+            obj = self.lookup(module, lhs.lhs)
+        except ValueError:
+            return None
+        if isinstance(lhs.op, tokens.Dot):
+            for field in getattr(type(obj), "struct_fields", []):
+                if field.id == lhs.rhs.id:
+                    return field.type
+            return None
+        if isinstance(lhs.op, tokens.OpenBracket):
+            setter = getattr(type(obj), "methods", {}).get("op_index_set")
+            if setter is not None:
+                slots = self._arg_slots(BoundMethod(setter, obj))
+                return slots[1] if len(slots) > 1 else None
+            return getattr(type(obj), "item_type", None)
+        return None
+
+    def _return_slot(self):
+        """What a `return` in the running function goes to; cached."""
+        if not self.funcs:
+            return None
+        func = self.funcs[-1]
+        slot = func.__dict__.get("_kod_return_slot", False)
+        if slot is False:
+            slot = self._type_of(getattr(func, "module", None), func.return_type)
+            func.__dict__["_kod_return_slot"] = slot
+        return slot
+
+    def _type_of(self, module, expr):
+        """The enum, or array of one, that a return type names in `module`."""
+        if module is None:
+            return None
+        if ast.is_result_type_expr(expr):
+            return self._type_of(module, expr.args[0])
+        if isinstance(expr, ast.OptionalTypeExpr):
+            return self._type_of(module, expr.inner)
+        if isinstance(expr, ast.ArrayTypeExpr):
+            inner = self._type_of(module, expr.element)
+            return types.ArrayType.make(inner) if inner is not None else None
+        if isinstance(expr, ast.ResolvedTypeExpr):
+            return self._variant_slot(expr.resolved)
+        owner = None
+        if isinstance(expr, ast.QualifiedTypeExpr):
+            owner = module.names.get(expr.module)
+        elif isinstance(expr, ast.NamedTypeExpr):
+            owner = module
+            if expr.name not in module.names:
+                owner = next(
+                    (i for i in module.get_imports() if expr.name in i.items), None
+                )
+        else:
+            return None
+        if isinstance(owner, ast.Import):
+            owner = self._resolve_import(module, owner)
+        if not isinstance(owner, ast.Module):
+            return None
+        return self._variant_slot(owner.names.get(expr.name))
+
+    def _match_arm_body(self, value, arms):
+        """The body of the arm that `value` matches, its bindings set."""
+        for arm in arms:
+            arm = _value_arm(arm, value)
+            if isinstance(arm.pattern, ast.IntegerPattern):
+                if value.value == arm.pattern.value:
+                    return arm.body
+            elif isinstance(arm.pattern, ast.StringPattern):
+                if value.to_py_str() == arm.pattern.value:
+                    return arm.body
+            elif isinstance(arm.pattern, ast.WildcardPattern):
+                return arm.body
+            elif isinstance(arm.pattern, ast.OptionalNonePattern):
+                if isinstance(value, types.NoneType):
+                    return arm.body
+            elif isinstance(arm.pattern, ast.OptionalSomePattern):
+                if not isinstance(value, types.NoneType):
+                    if arm.pattern.binding:
+                        self.stack[-1][arm.pattern.binding] = value
+                    return arm.body
+            elif isinstance(arm.pattern, ast.ResultOkPattern):
+                if isinstance(value, types.ResultValue) and value.ok:
+                    if arm.pattern.binding:
+                        self.stack[-1][arm.pattern.binding] = value.payload
+                    return arm.body
+            elif isinstance(arm.pattern, ast.ResultErrPattern):
+                if isinstance(value, types.ResultValue) and not value.ok:
+                    if arm.pattern.binding:
+                        self.stack[-1][arm.pattern.binding] = value.payload
+                    return arm.body
+            elif isinstance(arm.pattern, ast.TypePattern):
+                if type(value).__name__ == arm.pattern.type_name:
+                    if arm.pattern.binding:
+                        self.stack[-1][arm.pattern.binding] = value
+                    return arm.body
+            elif isinstance(
+                arm.pattern,
+                (ast.EnumVariantPattern, ast.ImplicitEnumVariantPattern),
+            ):
+                if (
+                    isinstance(value, types.EnumValue)
+                    and value.variant_name == arm.pattern.variant_name
+                ):
+                    bindings = getattr(arm.pattern, "bindings", [])
+                    field_values = list(value.fields.values())
+                    for binding_name, field_value in zip(bindings, field_values):
+                        self.stack[-1][binding_name] = field_value
+                    return arm.body
+        raise ValueError("Non-exhaustive match expression")
+
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
             case ast.Return(expression):
-                value = self.evaluate_expression(module, expression)
+                slot = None
+                if _slot_target(expression) is not None:
+                    slot = self._return_slot()
+                value = self._evaluate_for(module, expression, slot)
                 raise ReturnValue(value)
             case ast.ThrowStatement(expression):
                 value = self.evaluate_expression(module, expression)
@@ -648,13 +881,11 @@ class Interpreter:
                 setattr(statement, "module", module)
             case ast.FunctionCall():
                 callee = self.evaluate_expression(module, statement.callee)
-                args = list(
-                    map(partial(self.evaluate_expression, module), statement.args)
-                )
+                args = self._evaluate_args(module, statement.args, callee)
                 self.call_function(module, callee, args)
             case ast.VariableDeclaration(variable, value, _span, mutable):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
-                value = self.evaluate_expression(module, value)
+                value = self._evaluate_for(module, value, variable.type)
                 if len(self.stack) > 1:
                     self.stack[-1][lhs.id] = self.evaluate_expression(module, value)
                     # Track (re)declared mutability for this frame; most
@@ -686,7 +917,10 @@ class Interpreter:
                     if getattr(method, "module", None) is None:
                         method.module = module
             case ast.Assignment(lhs, rhs):
-                rhs_val = self.evaluate_expression(module, rhs)
+                slot = None
+                if _slot_target(rhs) is not None:
+                    slot = self._assign_slot(module, lhs)
+                rhs_val = self._evaluate_for(module, rhs, slot)
                 if isinstance(lhs, ast.BinaryOperator) and isinstance(
                     lhs.op, tokens.Dot
                 ):
@@ -696,15 +930,13 @@ class Interpreter:
                     lhs.op, tokens.OpenBracket
                 ):
                     obj = self.evaluate_expression(module, lhs.lhs)
-                    key_val = self.evaluate_expression(module, lhs.rhs)
                     struct_methods = getattr(type(obj), "methods", {})
                     if "op_index_set" in struct_methods:
-                        self.call_function(
-                            module,
-                            BoundMethod(struct_methods["op_index_set"], obj),
-                            [key_val, rhs_val],
-                        )
+                        bound = BoundMethod(struct_methods["op_index_set"], obj)
+                        key_val = self._evaluate_args(module, [lhs.rhs], bound)[0]
+                        self.call_function(module, bound, [key_val, rhs_val])
                     else:
+                        key_val = self.evaluate_expression(module, lhs.rhs)
                         obj.value[key_val.value] = rhs_val
                 else:
                     lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
@@ -957,12 +1189,12 @@ class Interpreter:
             return self.call_function(module, methods["to_str"], (value,))
         return types.String(str(value).encode("utf8"))
 
-    def _evaluate_default(self, module, expr):
+    def _evaluate_default(self, module, expr, slot=None):
         """A default value, evaluated without the caller's locals in view."""
         self.stack.append({})
         self.immutable_stack.append(set())
         try:
-            return self.evaluate_expression(module, expr)
+            return self._evaluate_for(module, expr, slot)
         finally:
             self.stack.pop()
             self.immutable_stack.pop()
@@ -980,7 +1212,9 @@ class Interpreter:
                 owner_module = getattr(owner, "decl_module", None) or module
                 for v in getattr(func, "struct_fields", []):
                     if v.id not in kwargs and v.default is not None:
-                        kwargs[v.id] = self._evaluate_default(owner_module, v.default)
+                        kwargs[v.id] = self._evaluate_default(
+                            owner_module, v.default, v.type
+                        )
                 return func(**kwargs)
             return func(*args)
         if isinstance(func, ast.ExternalFunctionDeclaration):
@@ -1121,10 +1355,11 @@ class Interpreter:
                     )
                 elif param.default is not None:
                     frame[param.variable.id] = self._evaluate_default(
-                        func.module, param.default
+                        func.module, param.default, param.variable.type
                     )
             frame["self"] = receiver
             self.stack.append(frame)
+            self.funcs.append(func)
             param_immutable = {p.variable.id for p in explicit_params if not p.mutable}
             if all_params and not all_params[0].mutable:
                 param_immutable.add("self")
@@ -1148,6 +1383,7 @@ class Interpreter:
             finally:
                 self.stack.pop()
                 self.immutable_stack.pop()
+                self.funcs.pop()
             return None
 
         # Map args to params. Trailing params with a declared
@@ -1165,10 +1401,11 @@ class Interpreter:
                 )
             elif param.default is not None:
                 frame[param.variable.id] = self._evaluate_default(
-                    func.module, param.default
+                    func.module, param.default, param.variable.type
                 )
         args = frame
         self.stack.append(args)
+        self.funcs.append(func)
         self.immutable_stack.append(
             {p.variable.id for p in func.params if not p.mutable}
         )
@@ -1191,3 +1428,4 @@ class Interpreter:
         finally:
             self.stack.pop()
             self.immutable_stack.pop()
+            self.funcs.pop()
