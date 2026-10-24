@@ -115,8 +115,11 @@ result's own variant, unless `T` declares a variant of that name whose
 payload fits what is written and the result's doesn't. With
 `type Status = enum { Ok  Failed(code: int64) }`, `return .Ok` in a
 `-> Status or Error` function returns `Status.Ok`, while
-`return .Ok(.Failed(code: 1))` returns the result's `Ok`. An arm of a
-returned `match` works the same way.
+`return .Ok(.Failed(code: 1))` returns the result's `Ok`. When both
+variants take the one argument written, its type decides: with
+`Ok(n: int64)` in `Status`, `return .Ok(5)` returns `Status.Ok(n: 5)`, as
+5 can't be a `Status`. An arm of a returned `match` works the same way,
+and so does a return type that names the `T or Error` through an alias.
 
 ## Generic enums
 

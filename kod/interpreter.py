@@ -112,6 +112,27 @@ def _fits_result(name, args):
     return label is None or label.id == ("value" if name == "Ok" else "error")
 
 
+def _own_variant(inner, name, arg, payload):
+    """T's one-field `name` holding `payload`, if the result's variant can't take it."""
+    if not (isinstance(inner, type) and issubclass(inner, types.EnumType)):
+        return None
+    info = inner.variants.get(name)
+    if info is None or len(info.fields) != 1:
+        return None
+    label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
+    if label is not None and label.id != info.fields[0].id:
+        return None
+    if name == "Ok":
+        fits = isinstance(payload, types.EnumValue) and payload.enum_type is inner
+    else:
+        fits = isinstance(
+            payload, (types.Int64, types.Bool, types.String, types.StructType)
+        )
+    if fits:
+        return None
+    return types.EnumValue(inner, name, {info.fields[0].id: payload})
+
+
 def _is_variant(expr):
     t = type(expr)
     if t is ast.FunctionCall:
@@ -785,6 +806,9 @@ class Interpreter:
             if _fits_result(name, args):
                 inner = slot.inner if name == "Ok" else None
                 payload = self._evaluate_for(module, args[0], inner)
+                own = _own_variant(slot.inner, name, args[0], payload)
+                if own is not None:
+                    return own
                 return types.ResultValue(name == "Ok", payload)
             slot = slot.inner
         slot = self._variant_slot(slot) if target is not None else None
@@ -930,7 +954,7 @@ class Interpreter:
         slot = func.__dict__.get("_kod_return_slot", False)
         if slot is False:
             slot = self._type_of(getattr(func, "module", None), func.return_type)
-            if ast.is_result_type_expr(func.return_type):
+            if self._returns_result(func):
                 slot = _OkSlot(slot)
             func.__dict__["_kod_return_slot"] = slot
         return slot
@@ -963,7 +987,11 @@ class Interpreter:
             owner = self._resolve_import(module, owner)
         if not isinstance(owner, ast.Module):
             return None
-        return self._variant_slot(owner.names.get(expr.name))
+        named = owner.names.get(expr.name)
+        if isinstance(named, type) and issubclass(named, types.EnumType):
+            if self._is_result_enum(named):
+                return self._variant_slot(named.variants["Ok"].fields[0].type)
+        return self._variant_slot(named)
 
     def _match_arm_body(self, value, arms):
         """The body of the arm that `value` matches, its bindings set."""
