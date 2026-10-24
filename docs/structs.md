@@ -175,6 +175,12 @@ parse these yet.
 
 The built-in `Map[K, V]` is the canonical example.
 
+## Equality
+
+Structs have no `==` or `!=`: comparing two struct values is an error, even
+two of the same type. Compare the fields you care about instead, as in
+`a.x == b.x and a.y == b.y`.
+
 ## Memory layout (compiler)
 
 Struct fields are laid out sequentially, each taking 8 bytes, allocated on an arena:

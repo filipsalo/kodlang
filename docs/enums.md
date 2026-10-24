@@ -180,6 +180,14 @@ Direction.North == Direction.South  // false
 
 In the compiler this is a single integer comparison on the discriminant.
 
+Since payloads aren't compared, an enum with payload variants only compares
+with a variant that has none: with `m: Message`, `m == .Quit` and
+`m != Message.Quit` are fine, but `m == .Text(content: "hi")` is an error
+that suggests `m is .Text(content)` instead, and so is comparing two
+`Message` values (`a == b`); test them with `is` or `match`. Comparing
+values of two different enums is an error, and so is a `.Variant` that the
+other side's enum doesn't declare.
+
 ## `match` as an expression
 
 A match can produce a value when every arm body is an expression:

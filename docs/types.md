@@ -151,6 +151,7 @@ and of the same type:
 | `-` `*` `/` `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `str` or two `bytes` | `bool` |
+| `==` `!=` | two `int64`, `bool`, `str` or `bytes`, two values of one enum, or an optional and `none` | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
@@ -160,6 +161,13 @@ are errors too. `+=` and `-=` follow the rules of `+` and `-`. An index,
 as in `xs[i]`, `s[i]` and `xs[i] = v`, and the bounds of a slice must be
 `int64`, so `xs["a"]` and `xs[true]` are errors, and so is an `int64?`
 index; unwrap it first.
+
+`==` and `!=` compare `str` and `bytes` by content and enums by variant (see
+[Equality](enums.md#equality)). Nothing else has an `==`: comparing two
+structs, arrays, interface values or function values is an error, so
+compare a struct's fields, or an array's `len(...)` and elements, instead.
+Comparing values of two different types, like an `int64` with a `str` or
+values of two different enums, is an error too.
 
 ## `none`
 

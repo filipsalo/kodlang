@@ -686,6 +686,7 @@ type Codegen = struct {
             return
         }
         if op is .Eq or op is .Ne {
+            self.check_equality_operands(:lhs_id, :op, :rhs_id, :lhs_kind, :rhs_kind)
             return
         }
         let sym = self.op_symbol(op)
@@ -733,6 +734,97 @@ type Codegen = struct {
         }
         if bad != 0 {
             self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`", span: self.p.expr_spans[bad])
+        }
+    }
+
+    // `==` is a word compare, so only kinds whose word is the value (or a str/bytes) have one.
+    func check_equality_operands(self, lhs_id: int64, op: ast.Op, rhs_id: int64, lhs_kind: TypeKind, rhs_kind: TypeKind) -> none {
+        // `none` and optional operands are reported elsewhere.
+        if lhs_kind is .KOptional(_l) or rhs_kind is .KOptional(_r) {
+            return
+        }
+        let sym = self.op_symbol(op)
+        let lhs_shown = self.kind_display(lhs_kind)
+        let rhs_shown = self.kind_display(rhs_kind)
+        let lhs_note = self.no_equality_note(lhs_kind)
+        if len(lhs_note) > 0 {
+            self.report_error(f"error: `{sym}` doesn't compare {lhs_note}", span: self.p.expr_spans[lhs_id])
+            return
+        }
+        if lhs_kind is .KEnum(idx) {
+            if rhs_kind is .KEnum(rhs_idx) {
+                if self.enums_compatible(idx, a_idx: rhs_idx) {
+                    self.check_enum_equality(:lhs_id, :rhs_id, enum_idx: idx)
+                    return
+                }
+            }
+        } else {
+            let lhs_name = self.equality_scalar(lhs_kind)
+            if len(lhs_name) > 0 and lhs_name == self.equality_scalar(rhs_kind) {
+                return
+            }
+        }
+        mut bad = rhs_id
+        if lhs_kind is .KVoid {
+            bad = lhs_id
+        }
+        self.report_error(f"error: cannot compare `{lhs_shown}` with `{rhs_shown}`", span: self.p.expr_spans[bad])
+    }
+
+    func equality_scalar(self, anon kind: TypeKind) -> str {
+        if kind is .KBool {
+            return "bool"
+        }
+        return self.operand_scalar(kind)
+    }
+
+    func no_equality_note(self, anon kind: TypeKind) -> str {
+        if self.is_array_kind(kind) {
+            return "arrays; compare `len(...)` and the elements"
+        }
+        match kind {
+            .KStruct(_idx, _type_args) -> return "structs; compare their fields"
+            .KInterface(_idx) -> return "interface values"
+            .KFunc(_params, _ret) -> return "function values"
+            else return ""
+        }
+    }
+
+    // Only the variant is compared, so a payload could only be ignored.
+    func check_enum_equality(self, lhs_id: int64, rhs_id: int64, enum_idx: int64) -> none {
+        let info = self.enums[enum_idx]
+        mut has_payload = false
+        for v in info.variants {
+            if len(v.field_names) > 0 {
+                has_payload = true
+            }
+        }
+        if has_payload == false {
+            return
+        }
+        mut unit_side = false
+        for side in [lhs_id, rhs_id] {
+            let vi = self.ctor_variant_idx(side, :enum_idx)
+            if vi >= 0 {
+                let variant = info.variants[vi]
+                if len(variant.field_names) > 0 {
+                    mut fields = ""
+                    for name in variant.field_names {
+                        if len(fields) > 0 {
+                            fields = fields + ", "
+                        }
+                        fields = fields + name
+                    }
+                    let pattern = f".{variant.name}({fields})"
+                    self.report_error(f"error: cannot compare with `.{variant.name}(...)`, which has a payload; test it with `is {pattern}`", span: self.p.expr_spans[side])
+                    return
+                }
+                unit_side = true
+            }
+        }
+        if unit_side == false {
+            let shown = self.enum_display_name(enum_idx)
+            self.report_error(f"error: cannot compare two `{shown}` values; some of its variants have payloads, so test the variant with `is` or `match`", span: self.p.expr_spans[lhs_id])
         }
     }
 
@@ -4773,6 +4865,22 @@ type Codegen = struct {
         if build_lhs {
             lhs_kind = rhs_kind0
         }
+        if build_rhs == false and build_lhs == false {
+            mut variant_side = -1
+            if self.reports_missing_eq_variant(rhs_id, :op, other_kind: lhs_kind) {
+                variant_side = rhs_id
+            } else if self.reports_missing_eq_variant(lhs_id, :op, other_kind: rhs_kind0) {
+                variant_side = lhs_id
+            }
+            if variant_side >= 0 {
+                if variant_side == rhs_id {
+                    self.compile_discard(lhs_id)
+                } else {
+                    self.compile_discard(rhs_id)
+                }
+                return .VImm(value: 0)
+            }
+        }
         if op is .Add {
             let chain_kind = self.concat_kind(lhs_id, :rhs_id)
             if self.is_array_kind(chain_kind) {
@@ -4804,7 +4912,11 @@ type Codegen = struct {
             self.check_optional_operands(:lhs_id, :op, :rhs_id, :lhs_kind)
         }
         if self.report_attempts == attempts_before {
-            self.check_operand_kinds(:lhs_id, :op, :rhs_id, :lhs_kind, rhs_kind: rhs_kind0)
+            mut rhs_kind = rhs_kind0
+            if build_rhs {
+                rhs_kind = lhs_kind
+            }
+            self.check_operand_kinds(:lhs_id, :op, :rhs_id, :lhs_kind, :rhs_kind)
         }
         // Comparing against `none` only makes sense for optional types;
         // for other kinds it would silently compile to `x == 0`.
@@ -4961,6 +5073,24 @@ type Codegen = struct {
         self.pool.free_reg(lhs_reg)
         self.pool.free_reg(rhs_reg)
         return .VReg(name: result)
+    }
+
+    // So `e == .V` with a `.V` that `e`'s enum lacks names that enum, not the one declaring `.V`.
+    func reports_missing_eq_variant(self, anon value_id: int64, op: ast.Op, other_kind: TypeKind) -> bool {
+        if op is .Eq or op is .Ne {
+            let .KEnum(idx) = other_kind else { return false }
+            mut callee = value_id
+            if self.p.exprs[value_id] is .Call(call_callee, _args) {
+                callee = call_callee
+            }
+            let .ImplicitVariant(name) = self.p.exprs[callee] else { return false }
+            if self.find_variant_idx(name, enum_idx: idx) >= 0 {
+                return false
+            }
+            self.check_variant(name, enum_idx: idx, span: self.p.expr_spans[value_id])
+            return true
+        }
+        return false
     }
 
     // In `e == .V` the variant belongs to `e`'s enum.
