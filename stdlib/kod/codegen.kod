@@ -528,12 +528,23 @@ type Codegen = struct {
         self.report_error(f"error: cannot infer the type of {what}{hint}", span: self.p.expr_spans[expr_id])
     }
 
+    // The parser has reported this literal.
+    func is_bad_lit(self, anon expr_id: int64) -> bool {
+        for id in self.p.bad_lits {
+            if id == expr_id {
+                return true
+            }
+        }
+        return false
+    }
+
     // A KUnknown variable's cause was reported where it got that kind.
     func unknown_var_root(self, anon expr_id: int64) -> bool {
         if expr_id == 0 {
             return false
         }
         match self.p.exprs[expr_id] {
+            .IntLit(_value) -> return self.is_bad_lit(expr_id)
             .Ident(name) -> {
                 if self.var_declared(name) {
                     if self.find_var_kind(name) is .KUnknown {
@@ -787,10 +798,6 @@ type Codegen = struct {
         if bad != 0 {
             mut hint = ""
             if bad == rhs_id and self.is_unary_minus(lhs_id) {
-                if self.chain_base_overflows(rhs_id) {
-                    self.report_attempts = self.report_attempts + 1
-                    return
-                }
                 hint = self.negate_base_hint(rhs_id, minus: self.p.expr_spans[lhs_id].start)
             }
             self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`{hint}", span: self.p.expr_spans[bad])
@@ -802,29 +809,6 @@ type Codegen = struct {
         let .IntLit(value) = self.p.exprs[lhs_id] else { return false }
         let pos = self.p.expr_spans[lhs_id].start
         return value == 0 and pos < len(self.p.source) and self.p.source[pos] == '-'
-    }
-
-    // `-99999999999999999999.to_str()`: the parser has reported the literal.
-    func chain_base_overflows(self, anon operand: int64) -> bool {
-        mut e = operand
-        for true {
-            match self.p.exprs[e] {
-                .Call(callee, _args) -> e = callee
-                .Binary(lhs, op, _rhs) -> {
-                    match op {
-                        .Dot -> e = lhs
-                        .Index -> e = lhs
-                        else return false
-                    }
-                }
-                .IntLit(_value) -> {
-                    let t = self.token_at(self.p.expr_spans[e].start)
-                    return t >= 0 and parsing.literal_excess(self.p.tokens[t].value) > 0
-                }
-                else return false
-            }
-        }
-        return false
     }
 
     // `-n.to_str()` negates the str; point at `(-n).to_str()`.
@@ -8360,7 +8344,12 @@ type Codegen = struct {
 
     func infer_kind(self, anon expr_id: int64) -> TypeKind {
         match self.p.exprs[expr_id] {
-            .IntLit(value) -> return .KInt64
+            .IntLit(value) -> {
+                if len(self.p.bad_lits) > 0 and self.is_bad_lit(expr_id) {
+                    return .KUnknown
+                }
+                return .KInt64
+            }
             .BoolLit(value) -> return .KBool
             .StrLit(value) -> return .KStr
             .BytesLit(value) -> return .KBytes
@@ -8659,12 +8648,16 @@ type Codegen = struct {
                 i = i + 1
             }
         }
+        let mark = self.report_attempts
         self.compile_store(dest_off: off, :kind, value_id: value)
         if typ == 0 {
             if kind is .KUnknown {
                 self.report_cannot_infer(value, what: f"`{name}`")
             } else {
                 self.check_unannotated_literal(value, :kind)
+            }
+            if self.report_attempts > mark {
+                self.update_var_kind(:name, kind: .KUnknown)
             }
         } else {
             self.check_value_kind(value, expected: kind)
