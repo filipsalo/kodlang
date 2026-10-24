@@ -160,4 +160,6 @@ taken to return when its receiver's type depends on a local other than
 `self` or a parameter, and a parameter that a `let` or let-else in the
 body binds again counts as a local; end the path with a `kod_panic(...)`
 or a `return` after the call (see
-[Return values](functions.md#return-values)).
+[Return values](functions.md#return-values)). A method called through an
+interface value is taken to return too, so call it as a statement and
+end the path with `kod_panic(...)`.

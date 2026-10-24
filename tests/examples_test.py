@@ -294,6 +294,40 @@ def test_let_else_checks_keep_memory_linear(sh_kodc, tmp_path):
     assert rss < 300 * 2**20, f"{rss // 2**20} MB"
 
 
+def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
+    """Each function is decided once for the hints of 1000 errors along a chain."""
+    lines = ["type Hard = struct {", "    tag: str"]
+    lines += ["    func fail(self, anon msg: str) -> none {", "        kod_panic(msg)"]
+    lines += ["    }", "}"]
+    n = 1000
+    for i in range(n):
+        lines += [f"func d{i}(anon msg: str) -> none {{", f"    d{i + 1}(msg)", "}"]
+    lines += [f"func d{n}(anon msg: str) -> none {{", '    let h = Hard(tag: "x")']
+    lines += ["    h.fail(msg)", "}"]
+    for i in range(n):
+        lines += [f"func f{i}(anon k: int64) -> int64 {{", f'    return d{i}("x")', "}"]
+    lines += ["func main() -> int64 {", "    return 0", "}"]
+    src = tmp_path / "hint_chain.kod"
+    src.write_text("\n".join(lines) + "\n")
+    probe = (
+        "import resource, subprocess, sys\n"
+        "r = subprocess.run(sys.argv[1:], capture_output=True, text=True)\n"
+        "print(r.stderr.count('ends in `h.fail(msg)`'),"
+        " resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(sh_kodc), str(src)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    hints, maxrss = result.stdout.split()
+    assert hints == str(n), result.stderr
+    rss = int(maxrss) if sys.platform == "darwin" else int(maxrss) * 1024
+    assert rss < 300 * 2**20, f"{rss // 2**20} MB"
+
+
 def test_interpreter_reads_a_plus_chain_once(monkeypatch):
     """Whether an operand of `+` takes its enum from a slot is worked out
     once per operand, so a long chain is evaluated in linear time."""

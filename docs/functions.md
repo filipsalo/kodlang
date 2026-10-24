@@ -184,8 +184,8 @@ only when what it calls doesn't depend on such a type: the builtin
 function of an imported module (`log.die(msg)`), or a method whose
 receiver's type depends on no local but `self` and parameters that no
 `let` or let-else in the body binds again (`self.fail(msg)`,
-`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r`,
-`reporter().fail(msg)`, and `make(t).fail(msg)` or
+`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r` of a
+struct type, `reporter().fail(msg)`, and `make(t).fail(msg)` or
 `self.reps[i].fail(msg)` even for locals `t` and `i`, since the type of
 the receiver doesn't depend on them). A method whose receiver's type
 depends on any other local is taken to return, whether a `let`
@@ -201,7 +201,13 @@ A call in a value's place, as a returned value, a match arm's value or an
 receiver has there, so `return r.fail(msg)` never returns after
 `let r = Reporter()`. What it calls is still decided by the rules above:
 `return die(msg)` is an error when `die` ends in `r.fail(msg)` on such a
-local, and the error says to put a `kod_panic(...)` after that call.
+local, and the error names that call and its line
+(`` as `die` ends in `r.fail(msg)` (line 19) ``) and says to put a
+`kod_panic(...)` after it. The `can reach its end` error names it too
+when the body ends in such a call, or in a call through a local of its
+own. A method called through an interface value is taken to return
+wherever it is called, since the method that runs is chosen at run
+time: call it as a statement and end the path with `kod_panic(...)`.
 
 ## `main`
 

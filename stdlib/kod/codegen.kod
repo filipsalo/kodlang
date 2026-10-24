@@ -527,6 +527,24 @@ type Codegen = struct {
     block_depth: int64 = 0
     // Set once a body's locals are collected, so a read goes by where its name is bound.
     reads_scoped: bool = false
+    // never_returns' verdicts with locals trusted, decided once per compilation for hints.
+    trusted_memo: FuncIdx = FuncIdx()
+    // Per function decided with locals trusted, the last call that ended a path in it.
+    trust_ends: FuncIdx = FuncIdx()
+    trust_end_exprs: [int64] = []
+    trust_end_ps: [parsing.Parser] = []
+    trust_end_fns: [str] = []
+    trust_end_whys: [str] = []
+    trust_end_vias: [str] = []
+    // Per function, the record its chain of ending calls leads to.
+    trust_sites: FuncIdx = FuncIdx()
+    // Why the call being decided was trusted not to return, if it was.
+    trust_why: str = ""
+    // The function never_returns last answered for.
+    last_nr_key: str = ""
+    walking_fn: str = ""
+    // The value in a place that takes a call that never returns.
+    diverge_ok_id: int64 = 0
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -3961,7 +3979,15 @@ type Codegen = struct {
             .Throw(_value) -> return Flow(completes: false, breaks: false)
             .Break -> return Flow(completes: false, breaks: true)
             .Continue -> return Flow(completes: false, breaks: false)
-            .ExprStmt(expr) -> return Flow(completes: self.is_diverging_call(expr) == false, breaks: false)
+            .ExprStmt(expr) -> {
+                self.trust_why = ""
+                self.last_nr_key = ""
+                let diverges = self.is_diverging_call(expr)
+                if diverges and self.trust_locals and self.deciding_depth > 0 {
+                    self.note_trust_end(expr)
+                }
+                return Flow(completes: diverges == false, breaks: false)
+            }
             .If(_cond, then_body, else_body) -> return either_flow(self.block_flow(then_body), self.block_flow(else_body))
             // A match statement is exhaustive, so it completes only through an arm.
             .MatchStmt(_subject, arms) -> {
@@ -4009,7 +4035,30 @@ type Codegen = struct {
         if kind is .KOptional(_inner) {
             fix = "(`return none` for no value)"
         }
-        self.report_error(f"error: {name} can reach its end without returning a value; it returns `{self.kind_display(kind)}`, so add a `return` {fix} at the end", span: func_decl.name_span)
+        self.report_error(f"error: {name} can reach its end without returning a value; it returns `{self.kind_display(kind)}`, so add a `return` {fix} at the end{self.end_hint(func_decl.body)}", span: func_decl.name_span)
+    }
+
+    // Why a body that ends in a call that may not return is taken to finish.
+    func end_hint(self, anon body: [int64]) -> str {
+        if len(body) == 0 {
+            return ""
+        }
+        let .ExprStmt(expr) = self.p.stmts[body[-1]] else { return "" }
+        if (self.p.exprs[expr] is .Call(_callee, _args)) == false {
+            return ""
+        }
+        let at = f"`{call_text(self.p, expr)}` (line {self.line_of_offset(self.p.expr_spans[expr].start)})"
+        if self.is_iface_method_call(expr) {
+            return f"; {at} is a method called through an interface value, which is taken to return"
+        }
+        if self.is_diverging_call(expr) {
+            return f"; {at} is a call through a local, which counts as returning until blocks get scopes"
+        }
+        let site = self.trusted_site(expr)
+        if len(site) == 0 {
+            return ""
+        }
+        return f"; {at} is taken to return, as {site}"
     }
 
     func block_has_return(self, anon stmts: [int64]) -> bool {
@@ -4785,7 +4834,7 @@ type Codegen = struct {
             target = self.result_inner_kind(expected)
         }
         if self.is_void_kind(body_kind) and self.is_void_kind(target) == false and self.is_diverging_call(body) == false {
-            self.report_error(f"error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement{self.scopes_hint(body)}", span: self.p.expr_spans[body])
+            self.report_error(f"error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement{self.diverge_hint(body)}", span: self.p.expr_spans[body])
         }
         mut wrap = false
         if ok_wrap and self.is_ctor_for(body, kind: expected) == false and self.is_result_kind(body_kind) == false {
@@ -4839,7 +4888,15 @@ type Codegen = struct {
     }
 
     func trusts(self, anon kind: TypeKind) -> bool {
-        return self.trust_locals and self.deciding_depth > 0 and kind is .KUnknown
+        if self.trust_locals == false or self.deciding_depth == 0 {
+            return false
+        }
+        match kind {
+            .KUnknown -> self.trust_why = "a call through a local, which counts as returning until blocks get scopes"
+            .KInterface(_idx) -> self.trust_why = "a method called through an interface value, which is taken to return"
+            else return false
+        }
+        return true
     }
 
     // `alias.f` or a struct method, resolved as try_two_part_call does.
@@ -4881,6 +4938,7 @@ type Codegen = struct {
             return false
         }
         let key = f"{sig.src_p.path}:{sig.decl_id}:{owner}"
+        self.last_nr_key = key
         let memo = self.returns_memo
         if memo.get(key) is Some(v) {
             if v == 0 or v == 1 {
@@ -4900,7 +4958,10 @@ type Codegen = struct {
         self.deciding_depth = depth + 1
         self.deciding_key = key
         self.deciding_rests = false
+        let outer_why = self.trust_why
         let never = self.body_never_returns(sig, :owner)
+        self.trust_why = outer_why
+        self.last_nr_key = key
         let rests = self.deciding_rests
         self.deciding_depth = depth
         self.deciding_key = outer_key
@@ -5004,6 +5065,11 @@ type Codegen = struct {
         self.seen_log = no_seen
         self.p = sig.src_p
         let fd = self.p.func_decls[sig.decl_id]
+        let saved_fn = self.walking_fn
+        self.walking_fn = fd.name
+        if owner >= 0 {
+            self.walking_fn = f"{self.struct_display_name(owner)}.{fd.name}"
+        }
         self.fixed_names = self.fixed_params(fd)
         let no_vars: [VarSlot] = []
         self.vars = no_vars
@@ -5044,6 +5110,7 @@ type Codegen = struct {
         self.walk_slots = saved_walk_slots
         self.walk_kinds = saved_walk_kinds
         self.seen_log = saved_seen
+        self.walking_fn = saved_fn
         return never
     }
 
@@ -5090,20 +5157,101 @@ type Codegen = struct {
         return completes
     }
 
-    // For a call that returns only because a call through a local in what it calls is taken to.
-    func scopes_hint(self, anon expr_id: int64) -> str {
-        if self.p.exprs[expr_id] is .Call(_callee, _args) {
-            let saved = self.returns_memo
-            self.returns_memo = FuncIdx()
-            self.trust_locals = true
-            let never = self.is_diverging_call(expr_id)
-            self.trust_locals = false
-            self.returns_memo = saved
-            if never {
-                return "; the call is taken to return, as what it calls ends in a call through a local, which counts as returning until blocks get scopes; if that one never returns, add a `kod_panic(...)` after it"
-            }
+    // So a hint can name the call in a chain that was taken not to return.
+    func note_trust_end(self, anon expr_id: int64) -> none {
+        let ends = self.trust_ends
+        if len(self.trust_why) == 0 and (ends.get(self.last_nr_key) is Some(_i)) == false {
+            return
         }
-        return ""
+        ends.set(self.deciding_key, len(self.trust_end_exprs))
+        self.trust_end_exprs += [expr_id]
+        self.trust_end_ps += [self.p]
+        self.trust_end_fns += [self.walking_fn]
+        self.trust_end_whys += [self.trust_why]
+        self.trust_end_vias += [self.last_nr_key]
+    }
+
+    // In a place that takes a call that never returns: why this one is taken to return.
+    func diverge_hint(self, anon expr_id: int64) -> str {
+        if self.is_iface_method_call(expr_id) {
+            return "; a method called through an interface value is taken to return, so call it as a statement and end the path with `kod_panic(...)`"
+        }
+        let site = self.trusted_site(expr_id)
+        if len(site) == 0 {
+            return ""
+        }
+        return f"; the call is taken to return, as {site}; if that one never returns, add a `kod_panic(...)` after it"
+    }
+
+    func is_iface_method_call(self, anon expr_id: int64) -> bool {
+        let .Call(callee, _args) = self.p.exprs[expr_id] else { return false }
+        let .Binary(lhs, op, _rhs) = self.p.exprs[callee] else { return false }
+        if op is .Dot {
+            return self.infer_kind(lhs) is .KInterface(_idx)
+        }
+        return false
+    }
+
+    // Names the call taken on trust when only trusting locals makes this one never return.
+    func trusted_site(self, anon expr_id: int64) -> str {
+        if self.deciding_depth > 0 or self.is_diverging_call(expr_id) {
+            return ""
+        }
+        if (self.p.exprs[expr_id] is .Call(_callee, _args)) == false {
+            return ""
+        }
+        let saved = self.returns_memo
+        self.returns_memo = self.trusted_memo
+        self.trust_locals = true
+        self.last_nr_key = ""
+        let never = self.is_diverging_call(expr_id)
+        let key = self.last_nr_key
+        self.trust_locals = false
+        self.returns_memo = saved
+        if never == false {
+            return ""
+        }
+        let i = self.trust_site(key)
+        if i < 0 {
+            return ""
+        }
+        let p = self.trust_end_ps[i]
+        let e = self.trust_end_exprs[i]
+        return f"`{self.trust_end_fns[i]}` ends in `{call_text(p, e)}` (line {self.line_in(p, offset: p.expr_spans[e].start)}), {self.trust_end_whys[i]}"
+    }
+
+    // Follows the calls functions end in to the one taken on trust, remembering the answer.
+    func trust_site(self, anon start: str) -> int64 {
+        let sites = self.trust_sites
+        let ends = self.trust_ends
+        mut path: [str] = []
+        mut key = start
+        mut found = -1
+        for len(path) <= len(self.trust_end_exprs) {
+            if sites.get(key) is Some(known) {
+                found = known
+                break
+            }
+            let .Some(i) = ends.get(key) else { break }
+            path += [key]
+            if len(self.trust_end_whys[i]) > 0 {
+                found = i
+                break
+            }
+            key = self.trust_end_vias[i]
+        }
+        for k in path {
+            sites.set(k, found)
+        }
+        return found
+    }
+
+    func line_in(self, anon p: parsing.Parser, offset: int64) -> int64 {
+        let saved = self.p
+        self.p = p
+        let line = self.line_of_offset(offset)
+        self.p = saved
+        return line
     }
 
     func converts_for(self, anon value_id: int64, kind: TypeKind) -> bool {
@@ -9176,8 +9324,8 @@ type Codegen = struct {
             if expected is .KOptional(_inner) {
                 hint = self.rewrap_hint(value_id)
             }
-        } else if self.is_void_kind(actual) {
-            hint = self.scopes_hint(value_id)
+        } else if self.is_void_kind(actual) and value_id == self.diverge_ok_id {
+            hint = self.diverge_hint(value_id)
         }
         self.report_error(f"error: expected `{self.kind_display(slot)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
     }
@@ -10331,8 +10479,15 @@ type Codegen = struct {
     // A call that never returns has no value to check.
     func check_return_value(self, anon value_id: int64, expected: TypeKind) -> none {
         if self.is_diverging_call(value_id) == false {
-            self.check_value_kind(value_id, :expected)
+            self.check_diverge_ok(value_id, :expected)
         }
+    }
+
+    func check_diverge_ok(self, anon value_id: int64, expected: TypeKind) -> none {
+        let saved = self.diverge_ok_id
+        self.diverge_ok_id = value_id
+        self.check_value_kind(value_id, :expected)
+        self.diverge_ok_id = saved
     }
 
     // A `none or Error` function returns an Ok(none) cell, not the none sentinel.
@@ -10604,7 +10759,7 @@ type Codegen = struct {
                 self.mov_to(dval, dest: reg)
             }
             if panics == false {
-                self.check_value_kind(default_id, expected: inner)
+                self.check_diverge_ok(default_id, expected: inner)
             }
             self.emit(f"b {done_lbl}")
         }
@@ -11877,6 +12032,37 @@ func ident_char(anon c: int64) -> bool {
 // What `kod test <dir>` gathers into one program.
 func is_test_file(anon path: str) -> bool {
     return len(path) >= 9 and path[len(path) - 9..len(path)] == "_test.kod"
+}
+
+// A call's source, from its start through the closing bracket that ends its postfix chain.
+func call_text(anon p: parsing.Parser, anon expr_id: int64) -> str {
+    let source = p.source
+    let start = p.expr_spans[expr_id].start
+    mut depth = 0
+    mut quote = 0
+    mut i = start
+    for i < len(source) and source[i] != '\n' {
+        let c = source[i]
+        if quote != 0 {
+            if c == '\\' {
+                i += 1
+            } else if c == quote {
+                quote = 0
+            }
+        } else if c == '"' or c == '\'' {
+            quote = c
+        } else if c == '(' or c == '[' {
+            depth += 1
+        } else if c == ')' or c == ']' {
+            depth -= 1
+            let next = i + 1
+            if depth == 0 and (next >= len(source) or (source[next] != '.' and source[next] != '(' and source[next] != '[')) {
+                return source[start..next]
+            }
+        }
+        i += 1
+    }
+    return source[start..i]
 }
 
 func either_flow(anon a: Flow, anon b: Flow) -> Flow {
