@@ -1497,6 +1497,23 @@ type Codegen = struct {
     // parameters before any labeled ones. Reports one error per
     // out-of-order anon param. The implicit `self` receiver of a method
     // doesn't count as a labeled parameter for ordering purposes.
+    // Every argument travels in one of x0-x7, `self` included.
+    func check_param_count(self, anon params: [ast.Param], what: str, span: ast.Span) -> none {
+        let count = len(params)
+        if count <= 8 {
+            return
+        }
+        if params[0].name == "self" {
+            self.report_error(f"error: {what} takes {count - 1} parameters besides `self`, but a method can take at most 7", :span)
+            return
+        }
+        self.report_error(f"error: {what} takes {count} parameters, but a function can take at most 8", :span)
+    }
+
+    func is_lambda_name(self, anon name: str) -> bool {
+        return len(name) > 9 and name[0..9] == "__lambda_"
+    }
+
     func check_param_order(self, anon func_decl: ast.FuncDecl, anon name: str) -> none {
         mut seen_labeled: bool = false
         for param in func_decl.params {
@@ -6346,6 +6363,9 @@ type Codegen = struct {
             .Array(inner) -> self.check_type_expr(inner)
             .Optional(inner) -> self.check_type_expr(inner)
             .Func(params, return_typ) -> {
+                if len(params) > 8 {
+                    self.report_error(f"error: this function type takes {len(params)} parameters, but a function can take at most 8", :span)
+                }
                 for param in params {
                     self.check_type_expr(param)
                 }
@@ -6402,7 +6422,7 @@ type Codegen = struct {
         let saved_names = self.subst_names
         for decl in module.decls {
             match decl {
-                .Struct(_name, _name_span, type_params, fields, methods) -> {
+                .Struct(struct_name, _name_span, type_params, fields, methods) -> {
                     self.subst_names = type_params
                     for field in fields {
                         self.check_type_expr(field.typ)
@@ -6412,6 +6432,7 @@ type Codegen = struct {
                         for method_id in methods {
                             let fd = self.p.func_decls[method_id]
                             self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                            self.check_param_count(fd.params, what: f"`{struct_name}.{fd.name}`", span: fd.name_span)
                         }
                     }
                     self.subst_names = saved_names
@@ -6425,13 +6446,17 @@ type Codegen = struct {
                     }
                     self.subst_names = saved_names
                 }
-                .Interface(_name, _name_span, methods) -> {
+                .Interface(iface_name, _name_span, methods) -> {
                     for method_id in methods {
                         let fd = self.p.func_decls[method_id]
                         self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                        self.check_param_count(fd.params, what: f"`{iface_name}.{fd.name}`", span: fd.name_span)
                     }
                 }
-                .Extern(_name, _name_span, params, return_typ) -> self.check_sig_types(params, :return_typ)
+                .Extern(name, name_span, params, return_typ) -> {
+                    self.check_sig_types(params, :return_typ)
+                    self.check_param_count(params, what: f"`{name}`", span: name_span)
+                }
                 else none
             }
         }
@@ -6563,6 +6588,13 @@ type Codegen = struct {
     // function pointer. Compile the callee first, spill it across
     // arg eval (so any `bl`s during argument compilation don't
     // clobber it), then `blr`.
+    func callee_desc(self, anon callee_id: int64) -> str {
+        if self.p.exprs[callee_id] is .Ident(callee_name) {
+            return f"`{callee_name}`"
+        }
+        return "this function value"
+    }
+
     func compile_indirect_call(self, callee_id: int64, args: [ast.CallArg]) -> Val {
         let callee_kind: TypeKind = self.infer_kind(callee_id)
         if callee_kind is .KFunc(param_kinds, _return_kind) {
@@ -6579,11 +6611,14 @@ type Codegen = struct {
                 }
             }
             if len(args) != len(param_kinds) {
-                mut callee_desc = "this function value"
-                if self.p.exprs[callee_id] is .Ident(callee_name) {
-                    callee_desc = f"`{callee_name}`"
+                self.report_error(f"error: {self.callee_desc(callee_id)} takes {self.arg_noun(len(param_kinds))}, got {len(args)}", span: self.p.expr_spans[callee_id])
+                return .VImm(value: 0)
+            }
+            if len(args) > 8 {
+                for arg in args {
+                    self.compile_discard(arg.value)
                 }
-                self.report_error(f"error: {callee_desc} takes {self.arg_noun(len(param_kinds))}, got {len(args)}", span: self.p.expr_spans[callee_id])
+                self.report_error(f"error: {self.callee_desc(callee_id)} takes {len(args)} parameters, but a function can take at most 8", span: self.p.expr_spans[callee_id])
                 return .VImm(value: 0)
             }
             let callee_val: Val = self.compile_expr(callee_id)
@@ -6894,7 +6929,7 @@ type Codegen = struct {
             i = i + 1
         }
         mut k = 0
-        for k < n {
+        for k < n and k < len(arg_regs) {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
@@ -7060,7 +7095,7 @@ type Codegen = struct {
             i = i + 1
         }
         mut k = 0
-        for k < n {
+        for k < n and k < len(arg_regs) {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
@@ -7262,7 +7297,7 @@ type Codegen = struct {
             i = i + 1
         }
         mut k = 0
-        for k < total {
+        for k < total and k < len(arg_regs) {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
@@ -9460,7 +9495,7 @@ type Codegen = struct {
             i = i + 1
         }
         mut k: int64 = 0
-        for k < n {
+        for k < n and k < len(arg_regs) {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
@@ -10009,6 +10044,16 @@ type Codegen = struct {
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.check_param_order(func_decl, func_decl.name)
+        // A generic template's methods are checked once, in check_module_types.
+        if self.body_instance < 0 {
+            mut what = f"`{func_decl.name}`"
+            if len(struct_name) > 0 {
+                what = f"`{struct_name}.{func_decl.name}`"
+            } else if self.is_lambda_name(func_decl.name) {
+                what = "this function literal"
+            }
+            self.check_param_count(func_decl.params, :what, span: func_decl.name_span)
+        }
         self.vars = []
         self.frame_slots = 0
         self.pool.reset()
@@ -10080,8 +10125,9 @@ type Codegen = struct {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         mut k = 0
         for param in func_decl.params {
-            let off = self.find_var_offset(param.name)
-            self.emit_str(off, reg: arg_regs[k])
+            if k < len(arg_regs) {
+                self.emit_str(self.find_var_offset(param.name), reg: arg_regs[k])
+            }
             k = k + 1
         }
 
