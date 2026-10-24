@@ -47,7 +47,10 @@ declared and is checked as a `T`: with `type Words = [str]`,
 (`` expected `str`, got `int64` ``). `none` is accepted wherever an optional
 or `none` is declared, a struct or primitive other than `bytes` where an
 interface is, and `[]` as any array type. A `T?` isn't accepted where a `T`
-is declared; unwrap it first with `x?` or `x? or default`. A function value
+is declared; unwrap it first with `x?` or `x? or default`. An optional is
+passed on as it is, so a `T?` where a `U?` is declared needs `T` to be `U`:
+like an `[Sq]` isn't a `[Shape]`, an `Sq?` or `int64?` isn't a `Shape?` even
+when `Sq` and `int64` implement `Shape`. A function value
 must match a function type exactly, since a function is never adapted: a
 function taking a struct isn't a `func(SomeInterface) -> ...`, and one
 returning `int64` isn't a `func() -> int64?`. Without an annotation,
