@@ -999,7 +999,7 @@ type Codegen = struct {
     }
 
     // `outer` is the outermost instance, or -1 for an enum.
-    func report_bad_keys(self, anon outer: int64, shown: str, site: ast.Span) -> none {
+    func report_bad_keys(self, anon outer: int64, shown: str, args: [TypeKind], arg_spans: [ast.Span], whole: ast.Span) -> none {
         for inst_idx in self.pending_bad_keys {
             let key = self.structs[inst_idx].template_args[0]
             let template_idx = self.structs[inst_idx].template_idx
@@ -1007,11 +1007,51 @@ type Codegen = struct {
             mut where = ""
             if inst_idx != outer {
                 where = f" in `{shown}`"
+            } else if self.body_instance >= 0 {
+                where = f" in `{self.struct_display_name(self.body_instance)}`"
             }
-            self.report_error(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: site)
+            mut site = whole
+            mut i = 0
+            for arg in args {
+                if self.kind_holds(arg, :key) {
+                    site = arg_spans[i]
+                    break
+                }
+                i += 1
+            }
+            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: site)
         }
         let none_pending: [int64] = []
         self.pending_bad_keys = none_pending
+    }
+
+    func kind_holds(self, anon kind: TypeKind, key: TypeKind) -> bool {
+        if self.canonical_kind_name(kind) == self.canonical_kind_name(key) {
+            return true
+        }
+        match kind {
+            .KOptional(inner) -> return self.kind_holds(inner, :key)
+            .KArrayOptional(inner) -> return self.kind_holds(inner, :key)
+            .KArrayArray(inner) -> return self.kind_holds(inner, :key)
+            .KArrayStruct(elem_idx) -> return self.kind_holds(.KStruct(idx: elem_idx, type_args: []), :key)
+            .KArrayEnum(elem_idx) -> return self.kind_holds(.KEnum(idx: elem_idx), :key)
+            .KStruct(idx, _type_args) -> {
+                for ta in self.structs[idx].template_args {
+                    if self.kind_holds(ta, :key) {
+                        return true
+                    }
+                }
+            }
+            .KEnum(idx) -> {
+                for ta in self.enums[idx].template_args {
+                    if self.kind_holds(ta, :key) {
+                        return true
+                    }
+                }
+            }
+            else none
+        }
+        return false
     }
 
     func has_bad_key(self, anon instance: StructInfo) -> bool {
@@ -1196,11 +1236,15 @@ type Codegen = struct {
     // enough for the handful of errors we'd ever report in a single
     // compile.
     func report_error(self, anon text: str, span: ast.Span) -> none {
-        mut msg = text
         // A generic body is template code, so name the instance that has the error.
         if self.body_instance >= 0 {
-            msg = f"{text} (in `{self.struct_display_name(self.body_instance)}`)"
+            self.report_message(f"{text} (in `{self.struct_display_name(self.body_instance)}`)", :span)
+            return
         }
+        self.report_message(text, :span)
+    }
+
+    func report_message(self, anon msg: str, span: ast.Span) -> none {
         if self.is_repeat_report(msg, :span) {
             self.report_attempts = self.report_attempts + 1
             return
@@ -3285,7 +3329,7 @@ type Codegen = struct {
     // with `type_args`, creating a new monomorphised struct entry if it
     // doesn't already exist. The new entry shares the template's method
     // func_decls but has substituted field kinds and method sigs.
-    func instantiate_struct(self, anon type_args: [TypeKind], template_idx: int64, site: ast.Span) -> int64 {
+    func instantiate_struct(self, anon type_args: [TypeKind], template_idx: int64, arg_spans: [ast.Span], whole: ast.Span) -> int64 {
         for ta in type_args {
             if self.kind_has_unknown(ta) {
                 return template_idx
@@ -3326,7 +3370,7 @@ type Codegen = struct {
         self.subst_names = saved_names
         self.subst_args = saved_args
         if self.inst_depth == 0 {
-            self.report_bad_keys(new_idx, shown: self.struct_display_name(new_idx), :site)
+            self.report_bad_keys(new_idx, shown: self.struct_display_name(new_idx), args: type_args, :arg_spans, :whole)
         }
         return new_idx
     }
@@ -3395,6 +3439,14 @@ type Codegen = struct {
         }
     }
 
+    func type_arg_spans(self, anon arg_ids: [int64]) -> [ast.Span] {
+        mut spans: [ast.Span] = []
+        for arg_id in arg_ids {
+            spans += [self.p.type_spans[arg_id]]
+        }
+        return spans
+    }
+
     func resolve_type(self, anon type_id: int64) -> TypeKind {
         if type_id == 0 {
             return .KVoid
@@ -3439,7 +3491,7 @@ type Codegen = struct {
                         }
                         resolved += [arg_kind]
                     }
-                    let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx, site: self.p.type_spans[args[0]])
+                    let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx, arg_spans: self.type_arg_spans(args), whole: self.p.type_spans[type_id])
                     return .KStruct(idx: inst_idx, type_args: [])
                 }
                 let enum_idx = self.find_enum_idx(name)
@@ -3459,7 +3511,7 @@ type Codegen = struct {
                         }
                         resolved += [arg_kind]
                     }
-                    let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx, site: self.p.type_spans[args[0]])
+                    let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx, arg_spans: self.type_arg_spans(args), whole: self.p.type_spans[type_id])
                     return .KEnum(idx: inst_idx)
                 }
                 return .KUnknown
@@ -3472,7 +3524,7 @@ type Codegen = struct {
     // instantiate_struct: variant field type_exprs are re-resolved under the
     // template's substitution context so K/V in `Some(T)` become the concrete
     // kinds. Canonical name is `Template$arg1$arg2` to match struct mangling.
-    func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64, site: ast.Span) -> int64 {
+    func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64, arg_spans: [ast.Span], whole: ast.Span) -> int64 {
         for ta in type_args {
             if self.kind_has_unknown(ta) {
                 return template_idx
@@ -3514,7 +3566,7 @@ type Codegen = struct {
         self.subst_names = saved_names
         self.subst_args = saved_args
         if self.inst_depth == 0 {
-            self.report_bad_keys(-1, shown: self.enum_display_name(new_idx), :site)
+            self.report_bad_keys(-1, shown: self.enum_display_name(new_idx), args: type_args, :arg_spans, :whole)
         }
         return new_idx
     }
@@ -6296,6 +6348,14 @@ type Codegen = struct {
         return args
     }
 
+    func expr_arg_spans(self, anon chain_id: int64) -> [ast.Span] {
+        mut spans: [ast.Span] = []
+        for arg_id in self.index_chain_args(chain_id) {
+            spans += [self.p.expr_spans[arg_id]]
+        }
+        return spans
+    }
+
     // Returns the template for bad type arguments, reporting them only when `report`.
     func generic_ctor_instance(self, anon callee_id: int64, report: bool) -> int64 {
         let .Ident(name) = self.p.exprs[self.index_chain_root(callee_id)] else { return -1 }
@@ -6307,7 +6367,7 @@ type Codegen = struct {
         if len(kinds) == 0 {
             return template_idx
         }
-        return self.instantiate_struct(kinds, :template_idx, site: self.p.expr_spans[self.index_chain_args(callee_id)[0]])
+        return self.instantiate_struct(kinds, :template_idx, arg_spans: self.expr_arg_spans(callee_id), whole: self.p.expr_spans[callee_id])
     }
 
     // Empty on an error, reported only when `report` is set.
@@ -6368,7 +6428,7 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx, site: self.p.expr_spans[self.index_chain_args(expr_id)[0]]), type_args: [])
+                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id]), type_args: [])
                             }
                             let enum_idx = self.find_enum_idx(name)
                             if enum_idx >= 0 {
@@ -6376,7 +6436,7 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx, site: self.p.expr_spans[self.index_chain_args(expr_id)[0]]))
+                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id]))
                             }
                         }
                     }

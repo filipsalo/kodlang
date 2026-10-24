@@ -91,10 +91,13 @@ The key type must be hashable, as for `hash(x)`: `int64`, `str`, `bytes`,
 `Map[[int64], int64]`, `Map[int64?, str]` or a struct, is an error at the
 type argument that names it, in whichever module it's written
 (`` `[int64]` can't be a `Map` key ``), reported once per key type. A key
-that comes from another generic type's parameter is reported where that
-type gets its argument: with `type Index[T] = struct { m: Map[T, int64] }`,
-a parameter of type `Index[Pt]` is an error at `Pt`
-(`` `Pt` can't be a `Map` key in `Index[Pt]` ``). The same holds for the
+that comes from another generic type's parameter is reported at the
+argument of that type that is or holds the key: with
+`type Index[V, K] = struct { m: Map[K, V] }`, a parameter of type
+`Index[int64, Pt]` is an error at `Pt`
+(`` `Pt` can't be a `Map` key in `Index[int64, Pt]` ``). A `Map[T, V]` in
+a generic type's method names the instance whose `T` is the bad key
+(`` `Pt` can't be a `Map` key in `Box[Pt]` ``). The same holds for the
 element type of a `Set[T]` from the `set` module.
 
 ## Indexing a struct
