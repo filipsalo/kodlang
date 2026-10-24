@@ -130,6 +130,24 @@ In a `-> T or Error` function, a returned `T` becomes a successful result.
 A returned `T or Error` value must have the same `T`, so returning an
 `int64 or Error` from a `-> str or Error` function is an error.
 
+A function with a return type other than `none` must end every path with a
+`return`, a `throw`, or a call that doesn't return, like `kod_panic(...)`.
+One that can reach the end of its body is an error at its name
+(`` `pick` can reach its end without returning a value ``), and that
+includes a `-> T?` function: write `return none` at the end. Only a
+`-> none or Error` function may run off its end, which returns `Ok(none)`.
+Whether a path can reach the end is decided from the statements alone:
+
+- `return`, `throw`, `break` and `continue` end a path, and so does a call
+  of a function or method that never returns;
+- an `if` ends every path only if it has an `else` and both branches do;
+- a `match` does if each of its arms does;
+- a `for true` loop does unless it can `break` out of itself; any other
+  `for` loop, including `for … in`, may finish.
+
+Code after a statement that ends every path is never run and isn't
+considered.
+
 ## `main`
 
 Every executable must define `main`. It can take no arguments or receive the command-line argument list:

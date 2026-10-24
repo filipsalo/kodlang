@@ -3378,6 +3378,101 @@ type Codegen = struct {
         }
     }
 
+    // Whether control can run off the end of `stmts`; dead code after a `return` doesn't count.
+    func block_completes(self, anon stmts: [int64]) -> bool {
+        for stmt_id in stmts {
+            if self.stmt_completes(stmt_id) == false {
+                return false
+            }
+        }
+        return true
+    }
+
+    func stmt_completes(self, anon stmt_id: int64) -> bool {
+        match self.p.stmts[stmt_id] {
+            .Return(_value) -> return false
+            .Throw(_value) -> return false
+            .Break -> return false
+            .Continue -> return false
+            .ExprStmt(expr) -> return self.is_diverging_call(expr) == false
+            .If(_cond, then_body, else_body) -> return self.block_completes(then_body) or self.block_completes(else_body)
+            // A match statement is exhaustive, so it completes only through an arm.
+            .MatchStmt(_subject, arms) -> {
+                for arm_id in arms {
+                    if self.block_completes(self.p.match_arms[arm_id].body) {
+                        return true
+                    }
+                }
+                return len(arms) == 0
+            }
+            .For(cond, body) -> {
+                mut forever = cond == 0
+                if cond != 0 {
+                    if self.p.exprs[cond] is .BoolLit(value) {
+                        forever = value
+                    }
+                }
+                return forever == false or self.block_breaks(body)
+            }
+            else return true
+        }
+    }
+
+    // A `break` that leaves this loop rather than a nested one.
+    func block_breaks(self, anon stmts: [int64]) -> bool {
+        for stmt_id in stmts {
+            match self.p.stmts[stmt_id] {
+                .Break -> return true
+                .If(_cond, then_body, else_body) -> {
+                    if self.block_breaks(then_body) or self.block_breaks(else_body) {
+                        return true
+                    }
+                }
+                .MatchStmt(_subject, arms) -> {
+                    for arm_id in arms {
+                        if self.block_breaks(self.p.match_arms[arm_id].body) {
+                            return true
+                        }
+                    }
+                }
+                .LetElse(_pattern, _value, else_body) -> {
+                    if self.block_breaks(else_body) {
+                        return true
+                    }
+                }
+                else none
+            }
+        }
+        return false
+    }
+
+    // Running off the end returns a zero word: `none` for an optional, garbage for anything else.
+    func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str) -> none {
+        let kind = self.return_kind
+        if self.is_void_kind(kind) or self.kind_has_unknown(kind) or self.block_completes(func_decl.body) == false {
+            return
+        }
+        if self.is_result_kind(kind) and self.is_void_kind(self.result_inner_kind(kind)) {
+            return
+        }
+        mut name = f"`{func_decl.name}`"
+        if len(struct_name) > 0 {
+            mut owner = struct_name
+            let idx = self.find_struct_idx(struct_name)
+            if idx >= 0 and self.structs[idx].template_idx >= 0 {
+                owner = self.structs[self.structs[idx].template_idx].name
+            }
+            name = f"`{owner}.{func_decl.name}`"
+        } else if func_decl.name.contains("__lambda_") {
+            name = "this function literal"
+        }
+        mut fix = "(or a `kod_panic(...)`)"
+        if kind is .KOptional(_inner) {
+            fix = "(`return none` for no value)"
+        }
+        self.report_error(f"error: {name} can reach its end without returning a value; it returns `{self.kind_display(kind)}`, so add a `return` {fix} at the end", span: func_decl.name_span)
+    }
+
     func block_has_return(self, anon stmts: [int64]) -> bool {
         for stmt_id in stmts {
             match self.p.stmts[stmt_id] {
@@ -9809,6 +9904,7 @@ type Codegen = struct {
         for stmt_id in func_decl.body {
             self.compile_stmt(stmt_id)
         }
+        self.check_reaches_end(func_decl, :struct_name)
 
         self.emit_no_value_return()
 

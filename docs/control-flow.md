@@ -101,3 +101,10 @@ func abs(n: int64) -> int64 {
 ```
 
 A bare `return` (no value) is valid in `-> none` functions.
+
+A function that returns a value must not be able to run off the end of its
+body (see [Return values](functions.md#return-values)). An `if` without an
+`else`, a `for` over a condition or an array, and a `for true` loop with a
+`break` can all finish, so a `return` has to follow them; a `match` whose
+arms all return, and a `for true` loop that only leaves through `return`,
+can't.
