@@ -6,12 +6,15 @@ icon: lucide/wrench
 
 These names live in `stdlib/builtins.kod` and are available in every Kod program without an explicit import.
 
-The compiler handles calls of `len`, `str`, `hash` and `kod_panic` itself,
-so a module can't declare a function or extern with one of those names
-(`` `hash` is a builtin function; rename this one ``). Methods can: a
-struct's `func len(self)` or `func hash(self)` is fine. The other names
-here, such as `print`, can be declared again, and a module's own `print`
-is the one its calls use.
+A call without a module name, such as `hash(x)`, goes to a local variable
+or parameter of that name first, then to a function the module declares or
+lists in an `import`, and only then to the builtin. That holds for `len`,
+`str`, `hash` and `kod_panic` too: a module can declare its own `func
+hash(anon p: Point) -> int64`, and its `hash(...)` calls use it, while
+another module's `dep.hash(x)` names that one. An f-string always converts
+its values with the builtin `str`. Only the builtin `kod_panic` counts as a
+call that never returns; a module's own `kod_panic`, or a local or
+parameter of that name, is an ordinary call.
 
 ## Output
 

@@ -265,6 +265,12 @@ class Interpreter:
             imp._resolved_module = cached
         return cached
 
+    def _is_builtin_name(self, module, name):
+        """True unless a local, a parameter or `module` itself declares `name`."""
+        if name in self.stack[-1]:
+            return False
+        return module is self.program.builtins or name not in module.names
+
     def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
         match name:
@@ -497,10 +503,13 @@ class Interpreter:
                 # type to a string representation. Primitives convert to
                 # their decimal / true-false / identity form; structs with a
                 # user-defined to_str method dispatch through it.
-                if (
-                    isinstance(callee, ast.Name)
-                    and callee.id == "str"
-                    and len(args) == 1
+                if isinstance(callee, ast.Name) and (
+                    callee.id == "$str"
+                    or (
+                        callee.id == "str"
+                        and len(args) == 1
+                        and self._is_builtin_name(module, "str")
+                    )
                 ):
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
@@ -510,6 +519,7 @@ class Interpreter:
                     isinstance(callee, ast.Name)
                     and callee.id == "hash"
                     and len(args) == 1
+                    and self._is_builtin_name(module, "hash")
                 ):
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
@@ -1321,34 +1331,23 @@ class Interpreter:
                 return types.String(result)
             return types.none_value
 
-        if (
+        builtin_len = (
             isinstance(func, ast.FunctionDeclaration)
             and func.name == "len"
-            and len(args) == 1
-            and isinstance(args[0], types.ArrayType)
-        ):
+            and func is self.program.builtins.names.get("len")
+        )
+        if builtin_len and len(args) == 1 and isinstance(args[0], types.ArrayType):
             return types.Int64(len(args[0].value))
-        if (
-            isinstance(func, ast.FunctionDeclaration)
-            and func.name == "len"
-            and len(args) == 1
-            and isinstance(args[0], types.String)
-        ):
+        if builtin_len and len(args) == 1 and isinstance(args[0], types.String):
             # str's `len` used to live in builtins.kod as a wrapper
             # around the libc strlen extern. The compile path now reads
             # the str struct's header directly; we mirror it here so
             # the interpreter doesn't fall back to a vanished function.
             return types.Int64(len(args[0].value))
-        if (
-            isinstance(func, ast.FunctionDeclaration)
-            and func.name == "len"
-            and len(args) == 1
-            and isinstance(args[0], types.Bytes)
-        ):
+        if builtin_len and len(args) == 1 and isinstance(args[0], types.Bytes):
             return types.Int64(len(args[0].value))
         if (
-            isinstance(func, ast.FunctionDeclaration)
-            and func.name == "len"
+            builtin_len
             and len(args) == 1
             and "len" in getattr(type(args[0]), "methods", {})
         ):

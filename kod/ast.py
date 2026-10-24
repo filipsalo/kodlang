@@ -259,8 +259,9 @@ def _parse_fstring(parser: Parser) -> ASTNode:
 
     def wrap_in_str(expr: ASTNode) -> ASTNode:
         """Wrap an f-string interpolation in `str(expr)` so concatenation
-        doesn't need any implicit coercion of its own."""
-        callee = Name("str", span)
+        doesn't need any implicit coercion of its own. `$str` is always
+        the builtin, whatever `str` names where the f-string is."""
+        callee = Name("$str", span)
         param = FunctionCallParam(None, expr, span)
         param_list = FunctionCallParamList([param], span)
         return FunctionCall(callee, param_list, span)
