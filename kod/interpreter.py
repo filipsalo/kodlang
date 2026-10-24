@@ -533,42 +533,10 @@ class Interpreter:
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._hash_value(value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
-                    variant_name = callee.variant_name
-                    search_scopes = [module.names, self.program.builtins.names]
-                    for val in module.names.values():
-                        if isinstance(val, ast.Import):
-                            try:
-                                search_scopes.append(
-                                    self._resolve_import(module, val).names
-                                )
-                            except Exception:
-                                pass
-                    for scope in search_scopes:
-                        for _, val in scope.items():
-                            # Direct enum type
-                            enum_type = None
-                            if (
-                                isinstance(val, type)
-                                and hasattr(val, "variants")
-                                and variant_name in val.variants
-                            ):
-                                enum_type = val
-                            # Generic enum template — the interpreter is
-                            # dynamic, so we can construct the variant off
-                            # the template directly (no monomorphisation
-                            # needed for runtime fields).
-                            elif (
-                                isinstance(val, types.GenericTemplate)
-                                and isinstance(val.template, type)
-                                and hasattr(val.template, "variants")
-                                and variant_name in val.template.variants
-                            ):
-                                enum_type = val.template
-                            if enum_type is not None:
-                                return self._variant_value(
-                                    module, enum_type, variant_name, list(args)
-                                )
-                    raise ValueError(f"No enum found with variant .{variant_name}")
+                    enum_type = self._variant_enum(module, callee.variant_name)
+                    return self._variant_value(
+                        module, enum_type, callee.variant_name, list(args)
+                    )
                 func = self.evaluate_expression(module, callee)
                 args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
@@ -576,39 +544,12 @@ class Interpreter:
                 template = self.lookup(module, name)
                 return template.instantiate(tuple(type_args))
             case ast.ImplicitEnumVariant(variant_name):
-                search_scopes = [module.names, self.program.builtins.names]
-                for val in module.names.values():
-                    if isinstance(val, ast.Import):
-                        try:
-                            search_scopes.append(
-                                self._resolve_import(module, val).names
-                            )
-                        except Exception:
-                            pass
-                for scope in search_scopes:
-                    for name_, val in scope.items():
-                        enum_type = None
-                        if (
-                            isinstance(val, type)
-                            and hasattr(val, "variants")
-                            and variant_name in val.variants
-                        ):
-                            enum_type = val
-                        elif (
-                            isinstance(val, types.GenericTemplate)
-                            and isinstance(val.template, type)
-                            and hasattr(val.template, "variants")
-                            and variant_name in val.template.variants
-                        ):
-                            enum_type = val.template
-                        if enum_type is not None:
-                            variant_info = enum_type.variants[variant_name]
-                            if not variant_info.fields:
-                                return types.EnumValue(enum_type, variant_name, {})
-                            raise ValueError(
-                                f"Implicit enum variant .{variant_name} has payload fields; use explicit syntax"
-                            )
-                raise ValueError(f"No enum found with variant .{variant_name}")
+                enum_type = self._variant_enum(module, variant_name)
+                if enum_type.variants[variant_name].fields:
+                    raise ValueError(
+                        f"Implicit enum variant .{variant_name} has payload fields; use explicit syntax"
+                    )
+                return types.EnumValue(enum_type, variant_name, {})
             case ast.StringSlice(string, start, end):
                 s = self.evaluate_expression(module, string)
                 n = len(s.value)
@@ -746,6 +687,28 @@ class Interpreter:
                 module, self._match_arm_body(value, expr.arms), slot
             )
         return self.evaluate_expression(module, expr)
+
+    def _variant_enum(self, module, variant_name):
+        """The enum of a context-free `.Variant`: one the module sees, else any loaded one."""
+        scopes = [module.names, self.program.builtins.names]
+        for val in module.names.values():
+            if isinstance(val, ast.Import):
+                try:
+                    scopes.append(self._resolve_import(module, val).names)
+                except Exception:
+                    pass
+        scopes += [loaded.names for loaded in self.program.modules.values()]
+        for scope in scopes:
+            for val in scope.values():
+                if isinstance(val, types.GenericTemplate):
+                    val = val.template
+                if (
+                    isinstance(val, type)
+                    and hasattr(val, "variants")
+                    and variant_name in val.variants
+                ):
+                    return val
+        raise ValueError(f"No enum found with variant .{variant_name}")
 
     def _variant_value(self, module, enum_type, variant_name, args):
         """`enum_type.variant_name` built from the argument expressions `args`."""
