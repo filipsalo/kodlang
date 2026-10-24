@@ -261,9 +261,7 @@ def test_missing_entry_file_is_an_error(via: str, sh_kodc):
 
 
 def test_let_else_checks_keep_memory_linear(sh_kodc, tmp_path):
-    """Deciding whether each let-else's `else` block can finish doesn't copy
-    every local of the function, so 2000 of them stay within a few times
-    the memory of compiling one."""
+    """Compile memory stays linear in the number of let-else checks."""
     lines = ["func g(anon k: int64) -> int64? {", "    return k", "}"]
     lines.append("func f(anon k: int64) -> int64 {")
     for i in range(2000):
