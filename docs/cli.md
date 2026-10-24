@@ -21,7 +21,7 @@ Build pipeline:
 
 1. Refresh the toolchain with `make stage1 kod` (a no-op unless the compiler, the C runtime, or an always-linked stdlib module changed). This only happens when `kod` runs from the repo root; invoking `build/apps/kod/kod` directly skips it. If the rebuild fails, `kod` reports it and stops.
 2. Parse the entry and walk its transitive imports. A missing entry file (`path:1:1: error: no such file`) or a missing import (`importer:line:col: error: no such module ...`) is an error.
-3. Compile each module that isn't prebuilt in `build/stage0/` to a `.o` with `sh_kodc _compile`.
+3. Compile each module that isn't prebuilt in `build/stage0/` to a `.o` with `sh_kodc _compile`, the entry first, stopping at the first that fails. A failing module's errors follow those in the imports and signatures of the modules it loads, such as an import that names no file or an unknown return type, since its own may be only their cascades.
 4. Generate and assemble the `_main` runtime shim that calls the user's `main`.
 5. Link everything with `ld` against the prebuilt `build/stage0/` objects.
 
@@ -52,7 +52,7 @@ See [Testing](testing.md) for the syntax.
 
 ### `kod check <file>`
 
-Run the full compile pipeline through codegen, report errors, but write no artifacts and skip the link step. Exits non-zero on any error.
+Run the full compile pipeline through codegen, report errors, but write no artifacts and skip the link step. Exits non-zero on any error. An error already shown for one module isn't shown again for another.
 
 ```shell
 uv run kod check src/foo.kod

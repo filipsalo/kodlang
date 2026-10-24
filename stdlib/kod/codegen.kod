@@ -489,6 +489,11 @@ type Codegen = struct {
     limit_kinds: [str] = []
     // Locals bound to one of this module's functions past the limit.
     limit_fn_locals: [str] = []
+    // Imports of other modules that name no file, shown only if this module fails.
+    dep_import_ps: [parsing.Parser] = []
+    dep_import_msgs: [str] = []
+    dep_import_spans: [ast.Span] = []
+    checking_dep: bool = false
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -6740,9 +6745,9 @@ type Codegen = struct {
         return f"error: generic {what} `{name}` needs type arguments: write `{name}[{spelled}]`"
     }
 
-    // Only the module being compiled is checked.
+    // Only the module being compiled is checked, unless report_dep_errors checks another.
     func check_type_expr(self, anon type_id: int64) -> none {
-        if type_id == 0 or self.p.path != self.entry_path {
+        if type_id == 0 or (self.p.path != self.entry_path and self.checking_dep == false) {
             return
         }
         let span = self.p.type_spans[type_id]
@@ -6763,7 +6768,7 @@ type Codegen = struct {
             .Array(inner) -> self.check_type_expr(inner)
             .Optional(inner) -> self.check_type_expr(inner)
             .Func(params, return_typ) -> {
-                if len(params) > 8 {
+                if len(params) > 8 and self.checking_dep == false {
                     self.limit_kinds += [self.canonical_kind_name(self.resolve_type(type_id))]
                     self.report_error(f"error: this function type takes {len(params)} parameters, but a function can take at most 8", :span)
                 }
@@ -6808,6 +6813,89 @@ type Codegen = struct {
             }
         }
         return false
+    }
+
+    func note_dep_import_error(self, anon msg: str, p: parsing.Parser, span: ast.Span) -> none {
+        self.dep_import_ps += [p]
+        self.dep_import_msgs += [msg]
+        self.dep_import_spans += [span]
+    }
+
+    // An unknown type in another module's signature shows here only as its cascades.
+    func report_dep_errors(self) -> none {
+        let own_errors = self.errors
+        let no_errors: [Diagnostic] = []
+        self.errors = no_errors
+        let saved_p = self.p
+        let saved_aliases = self.unresolved_aliases
+        mut i = 0
+        for msg in self.dep_import_msgs {
+            self.p = self.dep_import_ps[i]
+            self.report_message(msg, span: self.dep_import_spans[i])
+            i += 1
+        }
+        self.checking_dep = true
+        for scope in self.scopes {
+            if scope.path != saved_p.path and scope.path != self.builtins_path {
+                self.p = scope.p
+                self.check_dep_signatures(scope.module)
+            }
+        }
+        self.checking_dep = false
+        self.p = saved_p
+        self.unresolved_aliases = saved_aliases
+        self.errors += own_errors
+    }
+
+    func check_dep_signatures(self, anon module: ast.Module) -> none {
+        let saved_names = self.subst_names
+        mut aliases: [str] = []
+        for decl in module.decls {
+            if decl is .TypeAlias(name, _target, _name_span) {
+                if self.type_name_known(name) == false {
+                    aliases += [name]
+                }
+            }
+        }
+        self.unresolved_aliases = aliases
+        for decl in module.decls {
+            match decl {
+                .Func(decl_id) -> {
+                    let fd = self.p.func_decls[decl_id]
+                    self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                }
+                .Extern(_name, _name_span, params, return_typ) -> self.check_sig_types(params, :return_typ)
+                .Struct(_name, _name_span, type_params, fields, methods) -> {
+                    self.subst_names = type_params
+                    for field in fields {
+                        self.check_type_expr(field.typ)
+                    }
+                    self.check_method_sigs(methods)
+                    self.subst_names = saved_names
+                }
+                .Enum(_name, _name_span, type_params, variants) -> {
+                    self.subst_names = type_params
+                    for variant in variants {
+                        self.check_sig_types(variant.fields, return_typ: 0)
+                    }
+                    self.subst_names = saved_names
+                }
+                .Interface(_name, _name_span, methods) -> self.check_method_sigs(methods)
+                .TypeAlias(name, target, _name_span) -> {
+                    if self.is_unresolved_alias(name) {
+                        self.check_type_expr(target)
+                    }
+                }
+                else none
+            }
+        }
+    }
+
+    func check_method_sigs(self, anon methods: [int64]) -> none {
+        for method_id in methods {
+            let fd = self.p.func_decls[method_id]
+            self.check_sig_types(fd.params, return_typ: fd.return_typ)
+        }
     }
 
     func check_sig_types(self, anon params: [ast.Param], return_typ: int64) -> none {
