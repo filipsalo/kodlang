@@ -445,9 +445,7 @@ class Interpreter:
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._coerce_to_str(module, value)
-                # `hash(x)` — int64 hash of a hashable value. Python's
-                # hash() differs from the compiled one but, like it,
-                # agrees with `==`.
+                # `hash(x)`: differs from the compiled hash but, like it, agrees with `==`.
                 if (
                     isinstance(callee, ast.Name)
                     and callee.id == "hash"
