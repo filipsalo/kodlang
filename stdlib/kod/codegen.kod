@@ -463,6 +463,8 @@ type Codegen = struct {
     // Builtins (registered by register_module_funcs) back every scope's own names.
     builtins_path: str = ""
     entry_import_paths: [str] = []
+    // Canonical names of the Map/Set key types reported as unhashable.
+    bad_hash_keys: [str] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
@@ -793,13 +795,7 @@ type Codegen = struct {
     // Only the variant is compared, so a payload could only be ignored.
     func check_enum_equality(self, lhs_id: int64, rhs_id: int64, enum_idx: int64) -> none {
         let info = self.enums[enum_idx]
-        mut has_payload = false
-        for v in info.variants {
-            if len(v.field_names) > 0 {
-                has_payload = true
-            }
-        }
-        if has_payload == false {
+        if self.enum_has_payload(enum_idx) == false {
             return
         }
         mut unit_side = false
@@ -826,6 +822,86 @@ type Codegen = struct {
             let shown = self.enum_display_name(enum_idx)
             self.report_error(f"error: cannot compare two `{shown}` values; some of its variants have payloads, so test the variant with `is` or `match`", span: self.p.expr_spans[lhs_id])
         }
+    }
+
+    func enum_has_payload(self, anon enum_idx: int64) -> bool {
+        for v in self.enums[enum_idx].variants {
+            if len(v.field_names) > 0 {
+                return true
+            }
+        }
+        return false
+    }
+
+    // `hash` must agree with `==`, which compares only these by value.
+    func is_hashable(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KInt64 -> return true
+            .KBool -> return true
+            .KStr -> return true
+            .KBytes -> return true
+            .KEnum(idx) -> return self.enum_has_payload(idx) == false
+            else return false
+        }
+    }
+
+    func unhashable_note(self, anon kind: TypeKind) -> str {
+        if kind is .KEnum(_idx) {
+            return "; some of its variants have payloads"
+        }
+        return ""
+    }
+
+    // What a hashed type argument of builtins' `Map` or the `set` module's `Set` is, or "".
+    func hash_key_role(self, anon template_idx: int64) -> str {
+        let t = self.structs[template_idx]
+        if t.name == "Map" and t.def_path == self.builtins_path {
+            return "a `Map` key"
+        }
+        if t.name == "Set" and t.def_path == "stdlib/set.kod" {
+            return "a `Set` element"
+        }
+        return ""
+    }
+
+    // Once per key type; the instances' bodies then aren't compiled, as they'd only repeat it.
+    func check_hash_key(self, anon template_idx: int64, key: TypeKind, span: ast.Span) -> none {
+        let role = self.hash_key_role(template_idx)
+        if len(role) == 0 or self.kind_has_unknown(key) or self.is_hashable(key) {
+            return
+        }
+        let name = self.canonical_kind_name(key)
+        for bad in self.bad_hash_keys {
+            if bad == name {
+                return
+            }
+        }
+        self.bad_hash_keys += [name]
+        mut what = "keys"
+        if role == "a `Set` element" {
+            what = "elements"
+        }
+        self.report_error(f"error: `{self.kind_display(key)}` can't be {role}{self.unhashable_note(key)}; {what} are `int64`, `str`, `bytes`, `bool` or enums without payloads", :span)
+    }
+
+    // Only a Map or Set key is resolved, so other generic types instantiate where they did.
+    func check_hash_key_type(self, anon template_idx: int64, key_type: int64) -> none {
+        if len(self.hash_key_role(template_idx)) > 0 {
+            self.check_hash_key(template_idx, key: self.resolve_type(key_type), span: self.p.type_spans[key_type])
+        }
+    }
+
+    func skips_bad_key_bodies(self, anon instance: StructInfo) -> bool {
+        if len(instance.template_args) == 0 or len(self.hash_key_role(instance.template_idx)) == 0 {
+            return false
+        }
+        let name = self.canonical_kind_name(instance.template_args[0])
+        for bad in self.bad_hash_keys {
+            if bad == name {
+                return true
+            }
+        }
+        return false
     }
 
     // The kinds `+` and the ordering operators take, by name; "" for the rest.
@@ -5777,6 +5853,9 @@ type Codegen = struct {
         if len(kinds) == 0 {
             return template_idx
         }
+        if report {
+            self.check_hash_key(template_idx, key: kinds[0], span: self.p.expr_spans[self.index_chain_args(callee_id)[0]])
+        }
         return self.instantiate_struct(kinds, :template_idx)
     }
 
@@ -5837,6 +5916,9 @@ type Codegen = struct {
                                 let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.structs[struct_idx].type_param_names), :report)
                                 if len(kinds) == 0 {
                                     return none
+                                }
+                                if report {
+                                    self.check_hash_key(struct_idx, key: kinds[0], span: self.p.expr_spans[self.index_chain_args(expr_id)[0]])
                                 }
                                 return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx), type_args: [])
                             }
@@ -6011,6 +6093,10 @@ type Codegen = struct {
                 for arg in args {
                     self.check_type_expr(arg)
                 }
+                // A template's own type parameters have no kinds to check yet.
+                if len(msg) == 0 and struct_idx >= 0 and len(self.subst_args) == len(self.subst_names) {
+                    self.check_hash_key_type(struct_idx, key_type: args[0])
+                }
             }
         }
     }
@@ -6081,6 +6167,8 @@ type Codegen = struct {
                 if self.type_name_known(name) == false {
                     names += [name]
                     targets += [target]
+                } else {
+                    self.check_alias_hash_keys(target)
                 }
             }
         }
@@ -6094,6 +6182,24 @@ type Codegen = struct {
                 self.check_type_expr(targets[i])
             }
             i = i + 1
+        }
+    }
+
+    // A registered alias skips check_type_expr, but `type S = Set[Shape]` still creates that instance.
+    func check_alias_hash_keys(self, anon type_id: int64) -> none {
+        match self.p.type_exprs[type_id] {
+            .Array(inner) -> self.check_alias_hash_keys(inner)
+            .Optional(inner) -> self.check_alias_hash_keys(inner)
+            .Generic(name, args) -> {
+                for arg in args {
+                    self.check_alias_hash_keys(arg)
+                }
+                let struct_idx = self.find_struct_idx(name)
+                if struct_idx >= 0 and len(args) > 0 and len(args) == len(self.structs[struct_idx].type_param_names) {
+                    self.check_hash_key_type(struct_idx, key_type: args[0])
+                }
+            }
+            else none
         }
     }
 
@@ -6266,6 +6372,13 @@ type Codegen = struct {
                     if arg_kind is .KUnknown {
                         self.compile_discard(args[0].value)
                         self.report_cannot_infer(args[0].value, what: "this expression")
+                        return .VImm(value: 0)
+                    }
+                    if self.is_hashable(arg_kind) == false {
+                        self.compile_discard(args[0].value)
+                        if self.kind_has_unknown(arg_kind) == false and self.report_attempts == self.stmt_error_mark {
+                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}", span: self.p.expr_spans[args[0].value])
+                        }
                         return .VImm(value: 0)
                     }
                     if self.is_str_or_bytes(arg_kind) {
@@ -9926,7 +10039,7 @@ type Codegen = struct {
         mut cursor = 0
         for cursor < len(self.structs) {
             mut s = self.structs[cursor]
-            if s.template_idx >= 0 {
+            if s.template_idx >= 0 and self.skips_bad_key_bodies(s) == false {
                 let template = self.structs[s.template_idx]
                 let saved_p = self.p
                 let saved_names = self.subst_names

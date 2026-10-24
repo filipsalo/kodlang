@@ -49,6 +49,12 @@ let g: int64 = 99.hash()
 `int64.hash` is the identity function; `str.hash` is djb2; `bool.hash` is 0/1.
 Used internally by `Map[K, V]`.
 
+The `hash(x)` builtin takes a hashable value: an `int64`, `str`, `bytes` or
+`bool`, or a value of an enum whose variants have no payloads, which hashes
+by variant. Hashing anything else, such as a struct, an array, an optional
+or an enum with payload variants, is an error
+(`` cannot hash a value of type `[int64]` ``).
+
 ## `Map[K, V]`
 
 A built-in generic. Open-addressing hash map (PEP 468 dense + sparse).
@@ -67,8 +73,12 @@ print(len(m).to_str())   // 2
 A lookup finds the entry whose key is `==` to the one it's given, so key
 equality depends on the key type: `str` and `bytes` keys match by
 content, `int64` and `bool` keys by value, and enum keys by variant.
-A key type without an `==` (see [Operators](types.md#operators)), such as a
-struct, can't be used.
+
+The key type must be hashable, as for `hash(x)`: `int64`, `str`, `bytes`,
+`bool` or an enum without payload variants. Any other key type, such as
+`Map[[int64], int64]`, `Map[int64?, str]` or a struct, is an error at the
+type (`` `[int64]` can't be a `Map` key ``), reported once per key type. The
+same holds for the element type of a `Set[T]` from the `set` module.
 
 ## Indexing a struct
 

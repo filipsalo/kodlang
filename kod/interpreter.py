@@ -445,10 +445,9 @@ class Interpreter:
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._coerce_to_str(module, value)
-                # `hash(x)` — int64 hash. Compiled side uses identity
-                # hashing (the value's bit pattern); we use Python's
-                # hash() on the underlying value so the interpreter
-                # produces consistent (if different) hashes.
+                # `hash(x)` — int64 hash of a hashable value. Python's
+                # hash() differs from the compiled one but, like it,
+                # agrees with `==`.
                 if (
                     isinstance(callee, ast.Name)
                     and callee.id == "hash"
@@ -927,8 +926,7 @@ class Interpreter:
     def _hash_value(self, value) -> "types.Int64":
         """Hash a Kod value to an int64. Used to implement the `hash(x)`
         intrinsic. Content-based for primitives, by variant for enums;
-        pointer-id for anything else (matches the compiled-side identity
-        hash for struct keys)."""
+        the compiler rejects anything else, which falls back to its id."""
         if isinstance(value, types.Int64):
             return types.Int64(value.value)
         if isinstance(value, types.Bool):
