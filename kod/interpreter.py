@@ -183,6 +183,11 @@ def _is_variant(expr):
     return t is ast.ImplicitEnumVariant
 
 
+def _takes_side(expr):
+    """Whether `expr` takes its enum from the other side of `==`."""
+    return _is_variant(expr) or type(expr) is ast.MatchExpression
+
+
 def _implicit_variant(expr):
     if isinstance(expr, ast.ImplicitEnumVariant):
         return expr.variant_name, []
@@ -540,7 +545,7 @@ class Interpreter:
             case tokens.Minus():
                 op_func_name = "op_minus"
             case tokens.NotEqual():
-                if _is_variant(lhs) or _is_variant(rhs):
+                if _takes_side(lhs) or _takes_side(rhs):
                     lhs_val, rhs_val = self._variant_operands(module, lhs, rhs)
                     return lhs_val.op_ne(rhs_val)
                 op_func_name = "op_ne"
@@ -581,7 +586,7 @@ class Interpreter:
                 else:
                     return types.Bool((not is_none) != negate)
             case tokens.EqualEqual():
-                if _is_variant(lhs) or _is_variant(rhs):
+                if _takes_side(lhs) or _takes_side(rhs):
                     lhs_val, rhs_val = self._variant_operands(module, lhs, rhs)
                     return lhs_val.op_eq(rhs_val)
                 op_func_name = "op_eq"
@@ -669,6 +674,9 @@ class Interpreter:
                     prev = self._evaluate_for(
                         module, operands[0], self._value_slot(nxt)
                     )
+                elif type(operands[0]) is ast.MatchExpression:
+                    slot = self._static_slot(module, operands[1])
+                    prev = self._evaluate_for(module, operands[0], slot)
                 else:
                     prev = self.evaluate_expression(module, operands[0])
                 for i, op in enumerate(ops):
@@ -1016,10 +1024,13 @@ class Interpreter:
         return types.ArrayType.make(item_type)(evaled)
 
     def _variant_operands(self, module, lhs, rhs):
-        """Operands of `==` with a `.Variant`, which takes the other side's enum."""
-        if _is_variant(rhs):
+        """Operands of `==` with a `.Variant` or `match`, which takes the other side's enum."""
+        if _takes_side(rhs):
             lhs_val = self.evaluate_expression(module, lhs)
             return lhs_val, self._evaluate_for(module, rhs, self._value_slot(lhs_val))
+        if type(lhs) is ast.MatchExpression:
+            lhs_val = self._evaluate_for(module, lhs, self._static_slot(module, rhs))
+            return lhs_val, self.evaluate_expression(module, rhs)
         rhs_val = self.evaluate_expression(module, rhs)
         return self._evaluate_for(module, lhs, self._value_slot(rhs_val)), rhs_val
 
@@ -1059,14 +1070,24 @@ class Interpreter:
             target = _slot_target(operand)
             if type(target) is ast.ArrayLiteral or type(target) is ast.MatchExpression:
                 continue
-            if type(operand) is not ast.FunctionCall:
-                return self._array_slot(self._quiet_lookup(module, operand))
-            func = self._quiet_callee(module, operand.callee)
+            return self._static_slot(module, operand)
+        return None
+
+    def _static_slot(self, module, expr):
+        """The enum, or array of one, that `expr` has, found without evaluating it."""
+        if type(expr) is ast.FunctionCall:
+            func = self._quiet_callee(module, expr.callee)
             if not isinstance(func, ast.FunctionDeclaration):
                 return None
             owner = getattr(func, "module", None) or module
             return self._variant_slot(self._type_of(owner, func.return_type))
-        return None
+        if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.Dot:
+            owner = self._quiet_lookup(module, expr.lhs)
+            if isinstance(owner, type) and issubclass(owner, types.EnumType):
+                return owner
+        value = self._quiet_lookup(module, expr)
+        slot = self._value_slot(value)
+        return slot if slot is not None else self._array_slot(value)
 
     def _elem_slot(self, array):
         """The enum, or array of one, that `array`'s elements have, from its first."""

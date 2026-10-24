@@ -78,11 +78,12 @@ variant belongs to that enum: an annotated `let`
 field, element or key, an argument, a struct field, an array element, an
 array literal in a `+` chain with an array of the enum (`ms += [.Quit]`,
 `[.Quit] + ms` or `[.Quit] + [.Text(content: "a")] + load()`), a return
-value (the `T` of a `T or Error` function too), an arm of a `match` whose
-value goes to one of these, or the other side of `==` or `!=`
-(`m == .Quit`), in a comparison chain too (`.Quit == m == n`). Elsewhere,
-as in an unannotated `let`, a `match` subject, an unannotated array literal
-or a method call on the variant, it belongs to the one enum that declares a
+value (the `T` of a `T or Error` function too), the other side of `==` or
+`!=` (`m == .Quit`), in a comparison chain too (`.Quit == m == n`), or an
+arm of a `match` whose value goes to one of these
+(`d == match n { 0 -> .North else .South }`). Elsewhere, as in an
+unannotated `let`, a `match` subject, an unannotated array literal or a
+method call on the variant, it belongs to the one enum that declares a
 variant of that name among those the module sees: its own, those of the
 modules it imports and the builtin ones. When several of them declare it,
 that is an error:
