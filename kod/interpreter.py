@@ -1081,6 +1081,14 @@ class Interpreter:
             and isinstance(args[0], types.Bytes)
         ):
             return types.Int64(len(args[0].value))
+        if (
+            isinstance(func, ast.FunctionDeclaration)
+            and func.name == "len"
+            and len(args) == 1
+            and "len" in getattr(type(args[0]), "methods", {})
+        ):
+            len_method = type(args[0]).methods["len"]
+            return self.call_function(module, BoundMethod(len_method, args[0]), [])
 
         if isinstance(func, BoundMethod):
             receiver = func.receiver
