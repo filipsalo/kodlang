@@ -104,6 +104,20 @@ class _OkSlot:
         self.inner = inner
 
 
+def _enums_with(names, variant_name):
+    found = []
+    for val in names.values():
+        if isinstance(val, types.GenericTemplate):
+            val = val.template
+        if (
+            isinstance(val, type)
+            and hasattr(val, "variants")
+            and variant_name in val.variants
+        ):
+            found.append(val)
+    return found
+
+
 def _fits_result(name, args):
     """True if `.name(args)` fits the result's own `Ok` or `Err`."""
     if name not in ("Ok", "Err") or len(args) != 1:
@@ -698,7 +712,9 @@ class Interpreter:
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._hash_value(value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
-                    enum_type = self._variant_enum(module, callee.variant_name)
+                    enum_type = self._variant_enum(
+                        module, callee.variant_name, callee.span
+                    )
                     return self._variant_value(
                         module, enum_type, callee.variant_name, list(args)
                     )
@@ -712,7 +728,7 @@ class Interpreter:
                 template = self.lookup(module, name)
                 return template.instantiate(tuple(type_args))
             case ast.ImplicitEnumVariant(variant_name):
-                enum_type = self._variant_enum(module, variant_name)
+                enum_type = self._variant_enum(module, variant_name, expression.span)
                 if enum_type.variants[variant_name].fields:
                     raise ValueError(
                         f"Implicit enum variant .{variant_name} has payload fields; use explicit syntax"
@@ -859,8 +875,8 @@ class Interpreter:
             )
         return self.evaluate_expression(module, expr)
 
-    def _variant_enum(self, module, variant_name):
-        """The enum of a context-free `.Variant`: one the module sees, else any loaded one."""
+    def _variant_enum(self, module, variant_name, span):
+        """The enum of a context-free `.Variant`: one the module sees, else the only loaded one."""
         scopes = [module.names, self.program.builtins.names]
         for val in module.names.values():
             if isinstance(val, ast.Import):
@@ -868,17 +884,24 @@ class Interpreter:
                     scopes.append(self._resolve_import(module, val).names)
                 except Exception:
                     pass
-        scopes += [loaded.names for loaded in self.program.modules.values()]
         for scope in scopes:
-            for val in scope.values():
-                if isinstance(val, types.GenericTemplate):
-                    val = val.template
-                if (
-                    isinstance(val, type)
-                    and hasattr(val, "variants")
-                    and variant_name in val.variants
-                ):
-                    return val
+            found = _enums_with(scope, variant_name)
+            if found:
+                return found[0]
+        found = []
+        for loaded in self.program.modules.values():
+            for enum in _enums_with(loaded.names, variant_name):
+                if enum not in found:
+                    found.append(enum)
+        if len(found) > 1:
+            names = ", ".join(f"`{enum.name}`" for enum in found[:-1])
+            both = "both" if len(found) == 2 else "all"
+            raise KodError(
+                f"`.{variant_name}` is ambiguous: {names} and `{found[-1].name}` {both} declare it; give the value a type",
+                span,
+            )
+        if found:
+            return found[0]
         raise ValueError(f"No enum found with variant .{variant_name}")
 
     def _check_labels(self, func, args):

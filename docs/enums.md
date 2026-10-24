@@ -108,7 +108,9 @@ when several do. Enums of modules a module doesn't import don't count, so
 a generic method or a default written in an imported module means the
 same variant whichever program uses it. Only when none of the enums the
 module sees declares the variant does an enum of another loaded module
-count.
+count. When several of those do, the module can't write any of them, so
+the error only suggests giving the value a type, as by passing it straight
+to a parameter of its enum.
 
 In a `T or Error` function, a returned `.Ok(...)` or `.Err(...)` is the
 result's own variant, unless `T` declares a variant of that name whose
