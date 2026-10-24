@@ -744,8 +744,120 @@ type Codegen = struct {
             bad_shown = rhs_shown
         }
         if bad != 0 {
-            self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`", span: self.p.expr_spans[bad])
+            mut hint = ""
+            if bad == rhs_id and self.is_unary_minus(lhs_id) {
+                hint = self.negate_base_hint(rhs_id, minus: self.p.expr_spans[lhs_id].start)
+            }
+            self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`{hint}", span: self.p.expr_spans[bad])
         }
+    }
+
+    // The parser writes a prefix `-x` as `0 - x`, its `0` spanning the `-`.
+    func is_unary_minus(self, anon lhs_id: int64) -> bool {
+        let .IntLit(value) = self.p.exprs[lhs_id] else { return false }
+        let pos = self.p.expr_spans[lhs_id].start
+        return value == 0 and pos < len(self.p.source) and self.p.source[pos] == '-'
+    }
+
+    // `-n.to_str()` negates the str; point at `(-n).to_str()`.
+    func negate_base_hint(self, anon operand: int64, minus: int64) -> str {
+        mut e = operand
+        for true {
+            mut recv = 0
+            mut piece = 0
+            match self.p.exprs[e] {
+                .Call(callee, _args) -> {
+                    let .Binary(lhs, op, rhs) = self.p.exprs[callee] else { return "" }
+                    let .Dot = op else { return "" }
+                    recv = lhs
+                    piece = rhs
+                }
+                .Binary(lhs, op, rhs) -> {
+                    match op {
+                        .Dot -> piece = rhs
+                        .Index -> piece = rhs
+                        else return ""
+                    }
+                    recv = lhs
+                }
+                else return ""
+            }
+            if self.infer_kind(recv) is .KInt64 {
+                return self.negate_prefix_hint(:minus, :piece)
+            }
+            e = recv
+        }
+        return ""
+    }
+
+    // Splits the operand's tokens before the `.` or `[` that `piece` follows.
+    func negate_prefix_hint(self, minus: int64, piece: int64) -> str {
+        let toks = self.p.tokens
+        let first = self.token_at(minus) + 1
+        mut cut = self.token_at(self.p.expr_spans[piece].start) - 1
+        for cut > 0 and toks[cut].kind is .OpenParen {
+            cut -= 1
+        }
+        if first <= 0 or cut <= first or (toks[cut].kind is .Dot or toks[cut].kind is .OpenBracket) == false {
+            return ""
+        }
+        mut t = cut
+        for t < len(toks) {
+            match toks[t].kind {
+                .Dot -> t += 2
+                .OpenParen -> t = self.closing_token(t) + 1
+                .OpenBracket -> t = self.closing_token(t) + 1
+                else break
+            }
+        }
+        if t > len(toks) or t <= cut {
+            return ""
+        }
+        let src = self.p.source
+        let base = src[toks[first].start..toks[cut - 1].end]
+        let rest = src[toks[cut].start..toks[t - 1].end]
+        return f"; write `(-{base}){rest}` to negate `{base}` first"
+    }
+
+    // -1 for a position no token starts at, such as inside an f-string.
+    func token_at(self, anon pos: int64) -> int64 {
+        let toks = self.p.tokens
+        mut lo = 0
+        mut hi = len(toks)
+        for lo < hi {
+            let mid = (lo + hi) / 2
+            if toks[mid].start < pos {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < len(toks) and toks[lo].start == pos {
+            return lo
+        }
+        return -1
+    }
+
+    func closing_token(self, anon open: int64) -> int64 {
+        let toks = self.p.tokens
+        mut depth = 0
+        mut t = open
+        for t < len(toks) {
+            match toks[t].kind {
+                .OpenParen -> depth += 1
+                .OpenBracket -> depth += 1
+                .OpenCurly -> depth += 1
+                .CloseParen -> depth -= 1
+                .CloseBracket -> depth -= 1
+                .CloseCurly -> depth -= 1
+                else none
+            }
+            if depth == 0 {
+                return t
+            }
+            t += 1
+        }
+        return len(toks)
     }
 
     // `==` compares a word, or str/bytes content, so only those kinds have one.
@@ -7725,6 +7837,12 @@ type Codegen = struct {
                         }
                     }
                     .Add -> return self.concat_kind(lhs, rhs_id: rhs)
+                    .Sub -> {
+                        if self.is_unary_minus(lhs) and (self.infer_kind(rhs) is .KInt64) == false {
+                            return .KUnknown
+                        }
+                        return .KInt64
+                    }
                     .Eq -> return .KBool
                     .Ne -> return .KBool
                     .Lt -> return .KBool

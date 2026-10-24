@@ -120,7 +120,9 @@ Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
 (`n -= 3` is `n = n - 3`). A prefix `-` negates the whole call, field
 access, index or `?` after it, and binds tighter than any binary
 operator: `-xs[0]` is `-(xs[0])`, `-p.get()` is `-(p.get())`, and
-`-a * b` is `(-a) * b`.
+`-a * b` is `(-a) * b`. That includes an unwrap's default, so `-x? or 3`
+is `-(x? or 3)` and gives `-3` for a `none`. It also makes `-n.to_str()`
+the negation of a `str`, an error whose hint suggests `(-n).to_str()`.
 
 ## Boolean literals
 
