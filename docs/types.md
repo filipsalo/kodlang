@@ -224,6 +224,15 @@ let .Some(v) = y else { return -1 }
 // v is in scope and has type int64
 ```
 
+An optional can hold another optional, as `MaybeInt?` does with
+`type MaybeInt = int64?`. An `int64?` that goes where a `MaybeInt?` is
+expected becomes its value, the way an `int64` becomes the value of an
+`int64?`, so a `none` `MaybeInt?` means there is no `int64?` at all. A
+`Map[str, int64?]`'s `get` returns such an optional: `none` for a missing
+key, and `Some(v)` for a stored value, where `v` is `none` if `none` was
+stored. The Python interpreter (`kod _interpret`) doesn't tell those two
+`none`s apart.
+
 ### Postfix `?`
 
 `expr?` on a `T?` value evaluates to `T`. Without a trailing clause it
