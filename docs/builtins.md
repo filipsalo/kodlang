@@ -36,6 +36,8 @@ name, is an ordinary call.
 | `len` | `([T]) -> int64` | Number of elements in an array. |
 | `len` | `(SomeStruct) -> int64` | Dispatches to the struct's `func len(self) -> int64` method if one exists (e.g. `Map.len`); a `len` method of any other shape is an error. |
 
+As a value, `len` is its string form: `let n: func(str) -> int64 = len`.
+
 ## String conversion
 
 There is no `int_to_str` builtin — primitives carry their own `to_str` methods:
