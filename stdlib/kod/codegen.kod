@@ -474,6 +474,10 @@ type Codegen = struct {
     naming_locals: bool = false
     returns_gen: int64 = 0
     returns_pending: [str] = []
+    // Calls past the limit, reported only if nothing they go through was.
+    limit_reports: int64 = 0
+    limit_call_msgs: [str] = []
+    limit_call_spans: [ast.Span] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
@@ -1650,16 +1654,13 @@ type Codegen = struct {
         }
     }
 
-    // Check that a function declaration's parameter list places anon
-    // parameters before any labeled ones. Reports one error per
-    // out-of-order anon param. The implicit `self` receiver of a method
-    // doesn't count as a labeled parameter for ordering purposes.
     // Every argument travels in one of x0-x7, `self` included.
     func check_param_count(self, anon params: [ast.Param], what: str, span: ast.Span) -> none {
         let count = len(params)
         if count <= 8 {
             return
         }
+        self.limit_reports += 1
         if params[0].name == "self" {
             self.report_error(f"error: {what} takes {count - 1} parameters besides `self`, but a method can take at most 7", :span)
             return
@@ -1671,6 +1672,10 @@ type Codegen = struct {
         return len(name) > 9 and name[0..9] == "__lambda_"
     }
 
+    // Check that a function declaration's parameter list places anon
+    // parameters before any labeled ones. Reports one error per
+    // out-of-order anon param. The implicit `self` receiver of a method
+    // doesn't count as a labeled parameter for ordering purposes.
     func check_param_order(self, anon func_decl: ast.FuncDecl, anon name: str) -> none {
         mut seen_labeled: bool = false
         for param in func_decl.params {
@@ -6582,6 +6587,7 @@ type Codegen = struct {
             .Optional(inner) -> self.check_type_expr(inner)
             .Func(params, return_typ) -> {
                 if len(params) > 8 {
+                    self.limit_reports += 1
                     self.report_error(f"error: this function type takes {len(params)} parameters, but a function can take at most 8", :span)
                 }
                 for param in params {
@@ -6680,7 +6686,7 @@ type Codegen = struct {
         }
     }
 
-    // Aliases that never registered: an unknown target or a cycle.
+    // An alias that never registered has an unknown target or is a cycle.
     func check_type_aliases(self, anon module: ast.Module) -> none {
         mut names: [str] = []
         mut targets: [int64] = []
@@ -6694,14 +6700,14 @@ type Codegen = struct {
         }
         self.unresolved_aliases = names
         self.unresolved_alias_targets = targets
-        mut i = 0
-        for i < len(names) {
-            if self.alias_reaches(names[i], type_id: targets[i], depth: 0) {
-                self.report_error(f"error: type alias `{names[i]}` refers to itself", span: self.p.type_spans[targets[i]])
-            } else {
-                self.check_type_expr(targets[i])
+        for decl in module.decls {
+            if decl is .TypeAlias(name, target) {
+                if self.is_unresolved_alias(name) and self.alias_reaches(name, type_id: target, depth: 0) {
+                    self.report_error(f"error: type alias `{name}` refers to itself", span: self.p.type_spans[target])
+                } else {
+                    self.check_type_expr(target)
+                }
             }
-            i = i + 1
         }
     }
 
@@ -6836,7 +6842,10 @@ type Codegen = struct {
                 for arg in args {
                     self.compile_discard(arg.value)
                 }
-                self.report_error(f"error: {self.callee_desc(callee_id)} takes {len(args)} parameters, but a function can take at most 8", span: self.p.expr_spans[callee_id])
+                if self.p.path == self.entry_path {
+                    self.limit_call_msgs += [f"error: {self.callee_desc(callee_id)} takes {len(args)} parameters, but a function can take at most 8"]
+                    self.limit_call_spans += [self.p.expr_spans[callee_id]]
+                }
                 return .VImm(value: 0)
             }
             let callee_val: Val = self.compile_expr(callee_id)
@@ -10798,6 +10807,13 @@ type Codegen = struct {
                 self.subst_args = saved_args
             }
             cursor = cursor + 1
+        }
+        if self.limit_reports == 0 {
+            mut ci = 0
+            for span in self.limit_call_spans {
+                self.report_error(self.limit_call_msgs[ci], :span)
+                ci += 1
+            }
         }
 
         if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 {

@@ -17,9 +17,10 @@ Parameters are `name: Type`. The return type follows `->`. Functions that return
 Every argument is passed in a register, so a function can take at most 8
 parameters. `self` takes one of them, so a method or interface method can
 take at most 7 besides `self`. The same limit holds for externs, function
-literals and function types such as `func(int64) -> int64`; going past it is
-an error (`` `f` takes 9 parameters, but a function can take at most 8 ``).
-To pass more, group them in a struct.
+literals and function types such as `func(int64) -> int64`, in a type alias
+too; going past it is an error where the function, literal or type is
+written (`` `f` takes 9 parameters, but a function can take at most 8 ``),
+not again at each call through it. To pass more, group them in a struct.
 
 ## Calling
 
