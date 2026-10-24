@@ -516,4 +516,6 @@ match read_size(path) {
 It works in `match`, `if … is`, and the bare `is` operator (a `match` on an
 interface needs an `else`, since its set of implementors isn't enumerable).
 The test holds whichever module boxed the value, so an error struct that an
-imported function throws matches its type in the caller.
+imported function throws matches its type in the caller. The pattern names
+such a struct through its module (`e is errs.NotFound(nf)`) or, when it is
+imported as an item, by its own name (`e is NotFound(nf)`).

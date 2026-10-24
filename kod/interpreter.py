@@ -53,11 +53,19 @@ class BoundMethod:
     receiver: Any
 
 
+def _downcast_pattern(pattern, value):
+    """`alias.T(b)` over a struct, as an interface holds one, is the downcast to `T`."""
+    if not hasattr(type(value), "struct_fields") or len(pattern.bindings) > 1:
+        return pattern
+    binding = pattern.bindings[0] if pattern.bindings else ""
+    return ast.TypePattern(pattern.variant_name, binding, pattern.span)
+
+
 def _value_pattern(pattern, value):
     """`pattern` with `.Some`/`.None` and `.Ok`/`.Err` read for `value`'s kind."""
     if isinstance(pattern, ast.EnumVariantPattern):
         if pattern.enum_name not in ("Option", "Result"):
-            return pattern
+            return _downcast_pattern(pattern, value)
     elif not isinstance(pattern, ast.ImplicitEnumVariantPattern):
         return pattern
     if isinstance(value, types.EnumValue) and (
@@ -517,6 +525,19 @@ class Interpreter:
             return callee.rhs.id
         return ""
 
+    def _qualified_type_name(self, module, rhs):
+        """`T` for an `is` right-hand side `alias.T` or `alias.T(b)`; else ""."""
+        callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
+        if (
+            isinstance(callee, ast.BinaryOperator)
+            and isinstance(callee.op, tokens.Dot)
+            and isinstance(callee.lhs, (ast.Variable, ast.Name))
+            and isinstance(callee.rhs, (ast.Variable, ast.Name))
+            and self._alias_import(module, callee.lhs.id) is not None
+        ):
+            return callee.rhs.id
+        return ""
+
     def _returns_result(self, func):
         """ast.returns_result, cached on the declaration: call_function is hot."""
         fallible = func.__dict__.get("_returns_result")
@@ -739,7 +760,7 @@ class Interpreter:
                 # Interface downcast: `value is StructType` — a type name that
                 # isn't the optional `Some`/`none` marker. Interface values are
                 # the raw struct instance, so this is a class-name check.
-                name = self._is_rhs_name(rhs)
+                name = self._is_rhs_name(rhs) or self._qualified_type_name(module, rhs)
                 if name not in ("", "Some", "None", "Ok", "Err") and not isinstance(
                     rhs, ast.NoneLiteral
                 ):
