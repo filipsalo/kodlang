@@ -121,6 +121,13 @@ def _concat_operands(expr, out):
 
 def _wants_slot(expr):
     """Whether `expr` holds a `.Variant` that takes its enum from a slot."""
+    if type(expr) is ast.BinaryOperator:
+        # Kept on the node: each `+` of a chain asks this of its whole lhs.
+        wants = expr.__dict__.get("_kod_wants_slot")
+        if wants is None:
+            wants = _slot_target(expr) is not None
+            expr.__dict__["_kod_wants_slot"] = wants
+        return wants
     target = _slot_target(expr)
     if type(target) is ast.ArrayLiteral:
         return any(_wants_slot(e) for e in target.elements)

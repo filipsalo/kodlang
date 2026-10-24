@@ -292,3 +292,37 @@ def test_let_else_checks_keep_memory_linear(sh_kodc, tmp_path):
     # ru_maxrss is in bytes on macOS and in kilobytes elsewhere.
     rss = int(maxrss) if sys.platform == "darwin" else int(maxrss) * 1024
     assert rss < 300 * 2**20, f"{rss // 2**20} MB"
+
+
+def test_interpreter_reads_a_plus_chain_once(monkeypatch):
+    """Whether an operand of `+` takes its enum from a slot is worked out
+    once per operand, so a long chain is evaluated in linear time."""
+    from kod import __main__ as cli
+    from kod import interpreter
+
+    calls = 0
+    slot_target = interpreter._slot_target
+
+    def counting(expr):
+        nonlocal calls
+        calls += 1
+        return slot_target(expr)
+
+    monkeypatch.setattr(interpreter, "_slot_target", counting)
+    terms = " + ".join(["i"] * 100)
+    src = ROOT / "build" / f"plus_chain_{os.getpid()}.kod"
+    src.parent.mkdir(exist_ok=True)
+    src.write_text(
+        "func main() -> int64 {\n    mut t = 0\n    mut i = 0\n"
+        f"    for i < 20 {{\n        t = t + {terms}\n        i += 1\n    }}\n"
+        "    return t\n}\n"
+    )
+    monkeypatch.chdir(ROOT)
+    monkeypatch.setattr(sys, "argv", ["kod", "_interpret", str(src.relative_to(ROOT))])
+    try:
+        with pytest.raises(SystemExit) as exited:
+            cli.main()
+    finally:
+        src.unlink()
+    assert exited.value.code == 19000
+    assert calls < 20 * 100
