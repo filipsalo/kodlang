@@ -137,6 +137,89 @@ def _substituted(t, subst):
         return t
 
 
+_FUNC_DECLS = (ast.FunctionDeclaration, ast.ExternalFunctionDeclaration)
+
+
+def _pattern_names(pattern):
+    names = getattr(pattern, "bindings", None)
+    if names is None:
+        names = [getattr(pattern, "binding", "")]
+    return [name for name in names if name]
+
+
+def _children(node):
+    for field in dataclasses.fields(node):
+        value = getattr(node, field.name)
+        if isinstance(value, ast.ASTNode):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, ast.ASTNode):
+                    yield item
+
+
+def _mark_scopes(func):
+    """Note at each `f(...)` and `name.` whether that name is a local there."""
+    _scope_block(func.body, {p.variable.id for p in func.params})
+    func.__dict__["_kod_scoped"] = True
+
+
+def _scope_block(stmts, bound):
+    bound = set(bound)
+    for stmt in stmts:
+        _scope_stmt(stmt, bound)
+
+
+def _scope_stmt(stmt, bound):
+    t = type(stmt)
+    if t is ast.VariableDeclaration:
+        _scope_expr(stmt.value, bound)
+        bound.add(stmt.variable.id)
+    elif t is ast.LetElseStatement:
+        _scope_expr(stmt.value, bound)
+        _scope_block(stmt.else_body, bound)
+        bound.update(_pattern_names(stmt.pattern))
+    elif t is ast.IfStatement:
+        _scope_expr(stmt.condition, bound)
+        _scope_block(stmt.true_branch, bound)
+        _scope_block(stmt.false_branch, bound)
+    elif t is ast.ForStatement:
+        _scope_expr(stmt.condition, bound)
+        _scope_block(stmt.body, bound)
+    elif t is ast.ForEachStatement:
+        _scope_expr(stmt.iterable, bound)
+        _scope_block(stmt.body, bound | {stmt.binding})
+    elif t is ast.MatchStatement:
+        _scope_expr(stmt.expression, bound)
+        for arm in stmt.arms:
+            _scope_block(arm.body, bound | set(_pattern_names(arm.pattern)))
+    elif isinstance(stmt, ast.ASTNode):
+        _scope_expr(stmt, bound)
+
+
+def _scope_expr(node, bound):
+    t = type(node)
+    if t is ast.FunctionDeclaration:
+        return
+    if t is ast.FunctionCall and type(node.callee) is ast.Name:
+        node.callee.__dict__["_kod_bound"] = node.callee.id in bound
+        _scope_expr(node.args, bound)
+        return
+    if t is ast.BinaryOperator and isinstance(node.op, tokens.Dot):
+        if type(node.lhs) is ast.Name:
+            node.lhs.__dict__["_kod_bound"] = node.lhs.id in bound
+        else:
+            _scope_expr(node.lhs, bound)
+        return
+    if t is ast.MatchExpression:
+        _scope_expr(node.expression, bound)
+        for arm in node.arms:
+            _scope_expr(arm.body, bound | set(_pattern_names(arm.pattern)))
+        return
+    for child in _children(node):
+        _scope_expr(child, bound)
+
+
 def _value_arm(arm, value):
     """`arm` with its pattern read for `value`, as in _value_pattern."""
     pattern = _value_pattern(arm.pattern, value)
@@ -264,11 +347,40 @@ class Interpreter:
             imp._resolved_module = cached
         return cached
 
-    def _is_builtin_name(self, module, name):
-        """True unless a local, a parameter or `module` itself declares `name`."""
-        if name in self.stack[-1]:
+    def _local_func(self, callee):
+        """The function value a local in scope at this call holds, or None."""
+        bound = callee.__dict__.get("_kod_bound")
+        if bound is None:
+            bound = callee.id in self.stack[-1]
+        if not bound:
+            return None
+        value = self.stack[-1].get(callee.id)
+        return value if isinstance(value, (*_FUNC_DECLS, BoundMethod)) else None
+
+    def _module_func(self, module, name):
+        """The function `name` calls in `module`: its own, else the builtin."""
+        value = module.names.get(name)
+        if isinstance(value, _FUNC_DECLS):
+            return value
+        value = self.program.builtins.names.get(name)
+        return value if isinstance(value, _FUNC_DECLS) else None
+
+    def _is_builtin_call(self, module, callee):
+        if self._local_func(callee) is not None:
             return False
-        return module is self.program.builtins or name not in module.names
+        if module is self.program.builtins:
+            return True
+        return not isinstance(module.names.get(callee.id), _FUNC_DECLS)
+
+    def _call_target(self, module, callee):
+        """What `callee(...)` calls; a local that holds no function doesn't hide one."""
+        if type(callee) is ast.Name and "_kod_bound" in callee.__dict__:
+            target = self._local_func(callee)
+            if target is None:
+                target = self._module_func(module, callee.id)
+            if target is not None:
+                return target
+        return self.evaluate_expression(module, callee)
 
     def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
@@ -289,7 +401,13 @@ class Interpreter:
         """Evaluate a binary operator"""
         match op:
             case tokens.Dot():
-                lhs = self.evaluate_expression(module, lhs, as_lvalue)
+                imp = None
+                if type(lhs) is ast.Name and lhs.__dict__.get("_kod_bound") is False:
+                    imp = module.names.get(lhs.id)
+                if isinstance(imp, ast.Import):
+                    lhs = self._resolve_import(module, imp)
+                else:
+                    lhs = self.evaluate_expression(module, lhs, as_lvalue)
                 if isinstance(lhs, ast.Module):
                     return lhs.names[rhs.id]
                 methods = getattr(type(lhs), "methods", {})
@@ -515,7 +633,7 @@ class Interpreter:
                     or (
                         callee.id == "str"
                         and len(args) == 1
-                        and self._is_builtin_name(module, "str")
+                        and self._is_builtin_call(module, callee)
                     )
                 ):
                     arg_params = list(args)
@@ -526,7 +644,7 @@ class Interpreter:
                     isinstance(callee, ast.Name)
                     and callee.id == "hash"
                     and len(args) == 1
-                    and self._is_builtin_name(module, "hash")
+                    and self._is_builtin_call(module, callee)
                 ):
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
@@ -536,7 +654,7 @@ class Interpreter:
                     return self._variant_value(
                         module, enum_type, callee.variant_name, list(args)
                     )
-                func = self.evaluate_expression(module, callee)
+                func = self._call_target(module, callee)
                 self._check_labels(func, args)
                 args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
@@ -923,7 +1041,7 @@ class Interpreter:
                 module.names[name] = statement
                 setattr(statement, "module", module)
             case ast.FunctionCall():
-                callee = self.evaluate_expression(module, statement.callee)
+                callee = self._call_target(module, statement.callee)
                 args = self._evaluate_args(module, statement.args, callee)
                 self.call_function(module, callee, args)
             case ast.VariableDeclaration(variable, value, _span, mutable):
@@ -1410,6 +1528,8 @@ class Interpreter:
                         func.module, param.default, param.variable.type
                     )
             frame["self"] = receiver
+            if "_kod_scoped" not in func.__dict__:
+                _mark_scopes(func)
             self.stack.append(frame)
             self.funcs.append(func)
             param_immutable = {p.variable.id for p in explicit_params if not p.mutable}
@@ -1456,6 +1576,8 @@ class Interpreter:
                     func.module, param.default, param.variable.type
                 )
         args = frame
+        if "_kod_scoped" not in func.__dict__:
+            _mark_scopes(func)
         self.stack.append(args)
         self.funcs.append(func)
         self.immutable_stack.append(

@@ -165,13 +165,14 @@ considered.
 
 The builtin `kod_panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
-body by these rules. A local, parameter or function of the module that is
-itself named `kod_panic` hides the builtin (see
-[Built-ins](builtins.md)). So a helper that ends in `kod_panic(...)` never returns, and
-nor does one that ends in a call of another such helper (`self.fail(msg)`,
-`log.die(msg)`, or a function declared further down), or in a `for true`
-loop it can't `break` out of. A call that leads back to the function
-itself doesn't count: `func spin() -> none { spin() }` is taken to return.
+body by these rules. A function of the module or one it imports named
+`kod_panic`, or a local function value of that name declared before the
+call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
+ends in `kod_panic(...)` never returns, and nor does one that ends in a
+call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
+function declared further down), or in a `for true` loop it can't `break`
+out of. A call that leads back to the function itself doesn't count:
+`func spin() -> none { spin() }` is taken to return.
 
 ## `main`
 
@@ -243,7 +244,8 @@ Plain named functions only — no anonymous functions (lambdas) or
 closures yet. A bare identifier in value position resolves to the
 function's address when it isn't shadowed by a local variable; a
 call site `f(args)` does an indirect `blr` when `f` is a local of
-function type, falling through to the direct `bl` otherwise.
+function type declared before it, falling through to the direct `bl`
+otherwise.
 
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a

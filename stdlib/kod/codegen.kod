@@ -243,6 +243,8 @@ type VarSlot = struct {
     // params, pattern/loop bindings, and synthesized slots stay mutable; only
     // an immutable `let` binding flips this to false (set in compile_let).
     mutable: bool = true
+    // Whether the code being compiled is in the binding's scope.
+    bound: bool = false
 }
 
 // ── Expression result (what compile_expr returns) ─────────────────────────────
@@ -478,6 +480,8 @@ type Codegen = struct {
     limit_reports: int64 = 0
     limit_call_msgs: [str] = []
     limit_call_spans: [ast.Span] = []
+    // Indices into `vars` bound in the scopes entered so far, innermost last.
+    bound_log: [int64] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -2285,6 +2289,75 @@ type Codegen = struct {
         return false
     }
 
+    func var_bound(self, anon name: str) -> bool {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].bound
+            }
+            i = i - 1
+        }
+        return false
+    }
+
+    // Only a local holding a function value hides a function of its name.
+    func calls_local(self, anon name: str) -> bool {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                if self.vars[i].bound == false {
+                    return false
+                }
+                match self.vars[i].kind {
+                    .KFunc(_params, _ret) -> return true
+                    .KUnknown -> return true
+                    else return false
+                }
+            }
+            i = i - 1
+        }
+        return false
+    }
+
+    func bind_var(self, anon name: str) -> none {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                if self.vars[i].bound == false {
+                    self.vars[i].bound = true
+                    self.bound_log += [i]
+                }
+                return
+            }
+            i = i - 1
+        }
+    }
+
+    func bind_pattern(self, anon pattern: ast.Pattern) -> none {
+        for name in self.pattern_binding_names(pattern) {
+            self.bind_var(name)
+        }
+    }
+
+    // Ends the scope of every binding made since `mark`.
+    func unbind_to(self, anon mark: int64) -> none {
+        if len(self.bound_log) == mark {
+            return
+        }
+        for idx in self.bound_log[mark..] {
+            self.vars[idx].bound = false
+        }
+        self.bound_log = self.bound_log[0..mark]
+    }
+
+    func compile_block(self, anon stmts: [int64]) -> none {
+        let mark = len(self.bound_log)
+        for stmt_id in stmts {
+            self.compile_stmt(stmt_id)
+        }
+        self.unbind_to(mark)
+    }
+
     // Whether the most-recently-declared slot for `name` permits bare
     // reassignment. Returns true when not found so missing-variable
     // diagnostics stay the responsibility of the offset lookup.
@@ -2656,16 +2729,16 @@ type Codegen = struct {
         return k
     }
 
-    // In the current module: a func_* index, scope_fns[k] as -2 - k, or -1.
-    // A local, a parameter or the module's own function of the name comes first.
+    // A local function value, then the module's own function or import item, come first.
     func is_builtin_call(self, anon name: str) -> bool {
-        if self.var_declared(name) {
+        if self.calls_local(name) {
             return false
         }
         let slot = self.lookup_func(name)
         return slot == -1 or self.fn_sig(slot).src_p.path == self.builtins_path
     }
 
+    // In the current module: a func_* index, scope_fns[k] as -2 - k, or -1.
     func lookup_func(self, anon name: str) -> int64 {
         let si = self.cur_scope()
         if si < 0 {
@@ -3626,12 +3699,35 @@ type Codegen = struct {
 
     // Dead code after a `return` doesn't count.
     func block_completes(self, anon stmts: [int64]) -> bool {
+        let mark = len(self.bound_log)
+        mut completes = true
         for stmt_id in stmts {
             if self.stmt_completes(stmt_id) == false {
-                return false
+                completes = false
+                break
             }
+            self.bind_stmt_names(stmt_id)
         }
-        return true
+        self.unbind_to(mark)
+        return completes
+    }
+
+    // What a statement binds for the rest of its block.
+    func bind_stmt_names(self, anon stmt_id: int64) -> none {
+        match self.p.stmts[stmt_id] {
+            .Let(name, _typ, _value, _mutable) -> self.bind_var(name)
+            .LetElse(pattern, _value, _else_body) -> self.bind_pattern(self.p.patterns[pattern])
+            else none
+        }
+    }
+
+    func arm_completes(self, anon arm_id: int64) -> bool {
+        let arm = self.p.match_arms[arm_id]
+        let mark = len(self.bound_log)
+        self.bind_pattern(self.p.patterns[arm.pattern])
+        let completes = self.block_completes(arm.body)
+        self.unbind_to(mark)
+        return completes
     }
 
     func stmt_completes(self, anon stmt_id: int64) -> bool {
@@ -3645,7 +3741,7 @@ type Codegen = struct {
             // A match statement is exhaustive, so it completes only through an arm.
             .MatchStmt(_subject, arms) -> {
                 for arm_id in arms {
-                    if self.block_completes(self.p.match_arms[arm_id].body) {
+                    if self.arm_completes(arm_id) {
                         return true
                     }
                 }
@@ -4398,9 +4494,10 @@ type Codegen = struct {
     func compile_arm_stmts(self, anon body: [int64], pattern_id: int64, subject_kind: TypeKind) -> none {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
-        for stmt_id in body {
-            self.compile_stmt(stmt_id)
-        }
+        let mark = len(self.bound_log)
+        self.bind_pattern(pattern)
+        self.compile_block(body)
+        self.unbind_to(mark)
         self.restore_pattern_bindings(pattern, kinds: saved)
     }
 
@@ -4413,7 +4510,10 @@ type Codegen = struct {
             let arm = self.p.match_expr_arms[arm_id]
             let pattern = self.p.patterns[arm.pattern]
             let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+            let mark = len(self.bound_log)
+            self.bind_pattern(pattern)
             let k = self.infer_kind(arm.body)
+            self.unbind_to(mark)
             self.restore_pattern_bindings(pattern, kinds: saved)
             if self.is_none_kind(k) or self.is_some_optional(k) {
                 widen = true
@@ -4439,6 +4539,8 @@ type Codegen = struct {
     func compile_arm_value(self, anon body: int64, pattern_id: int64, subject_kind: TypeKind, expected: TypeKind, ok_wrap: bool, result_r: str) -> none {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+        let mark = len(self.bound_log)
+        self.bind_pattern(pattern)
         let body_kind = self.infer_kind(body)
         mut target = expected
         if ok_wrap {
@@ -4470,6 +4572,7 @@ type Codegen = struct {
                 self.check_value_kind(body, :expected)
             }
         }
+        self.unbind_to(mark)
         self.restore_pattern_bindings(pattern, kinds: saved)
     }
 
@@ -4486,7 +4589,7 @@ type Codegen = struct {
             return false
         }
         let .Ident(name) = self.p.exprs[callee] else { return false }
-        if self.var_declared(name) {
+        if self.calls_local(name) {
             return false
         }
         let slot = self.lookup_func(name)
@@ -4596,10 +4699,13 @@ type Codegen = struct {
         let saved_slots = self.frame_slots
         let saved_names = self.subst_names
         let saved_args = self.subst_args
+        let saved_log = self.bound_log
         self.p = sig.src_p
         let fd = self.p.func_decls[sig.decl_id]
         let no_vars: [VarSlot] = []
         self.vars = no_vars
+        let no_log: [int64] = []
+        self.bound_log = no_log
         mut i = 0
         for param in fd.params {
             mut kind = sig.param_kinds[i]
@@ -4607,6 +4713,7 @@ type Codegen = struct {
                 kind = .KStruct(idx: owner, type_args: [])
             }
             self.alloc_var(name: param.name, :kind)
+            self.vars[-1].bound = true
             i += 1
         }
         let no_names: [str] = []
@@ -4622,12 +4729,19 @@ type Codegen = struct {
             self.collect_stmt_vars(:stmt_id)
         }
         self.naming_locals = false
+        // Untyped here, so any of them might hold a function.
+        mut k = len(fd.params)
+        for k < len(self.vars) {
+            self.vars[k].kind = .KUnknown
+            k += 1
+        }
         let never = self.block_has_return(fd.body) == false and self.block_completes(fd.body) == false
         self.p = saved_p
         self.vars = saved_vars
         self.frame_slots = saved_slots
         self.subst_names = saved_names
         self.subst_args = saved_args
+        self.bound_log = saved_log
         return never
     }
 
@@ -5270,7 +5384,7 @@ type Codegen = struct {
         if self.p.exprs[callee] is .Binary(lhs, op, rhs) {
             if op is .Dot {
                 if self.p.exprs[lhs] is .Ident(enum_name) {
-                    if enum_name == std_enum and self.var_declared(enum_name) == false {
+                    if enum_name == std_enum and self.var_bound(enum_name) == false {
                         if self.p.exprs[rhs] is .Ident(name) {
                             return name
                         }
@@ -6344,7 +6458,7 @@ type Codegen = struct {
     }
 
     func is_import_alias(self, anon name: str) -> bool {
-        if self.var_declared(name) {
+        if self.var_bound(name) {
             return false
         }
         let si = self.cur_scope()
@@ -6975,7 +7089,7 @@ type Codegen = struct {
                 // var shadowing a function name wins. Delegating to
                 // compile_indirect_call also gives us its labelled-
                 // argument rejection for free.
-                if self.var_declared(name) {
+                if self.calls_local(name) {
                     if self.find_var_kind(name) is .KFunc(_pk, _rk) {
                         return self.compile_indirect_call(:callee_id, :args)
                     }
@@ -6994,6 +7108,10 @@ type Codegen = struct {
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p)
                     self.emit(f"bl {self.fn_label(slot)}")
                     return .VReg(name: "x0")
+                }
+                if self.var_bound(name) {
+                    self.report_error(f"error: `{name}` is a local of type `{self.kind_display(self.find_var_kind(name))}`, not a function", span: self.p.expr_spans[callee_id])
+                    return .VImm(value: 0)
                 }
                 let msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.visible_func_names())
                 self.report_error(msg, span: self.p.expr_spans[callee_id])
@@ -7509,12 +7627,15 @@ type Codegen = struct {
     func compile_default(self, anon default_id: int64, expected: TypeKind, src_p: parsing.Parser) -> str {
         let saved_p = self.p
         let saved_vars = self.vars
+        let saved_log = self.bound_log
         self.p = src_p
         self.vars = []
+        self.bound_log = []
         self.collect_expr_vars(default_id)
         let reg = self.compile_into(default_id, :expected)
         self.p = saved_p
         self.vars = saved_vars
+        self.bound_log = saved_log
         return reg
     }
 
@@ -7522,7 +7643,9 @@ type Codegen = struct {
     func check_default(self, anon default_id: int64, expected: TypeKind) -> none {
         let saved_vars = self.vars
         let saved_slots = self.frame_slots
+        let saved_log = self.bound_log
         self.vars = []
+        self.bound_log = []
         self.stmt_error_mark = self.report_attempts
         self.checking_default = true
         self.collect_expr_vars(default_id)
@@ -7530,6 +7653,7 @@ type Codegen = struct {
         self.checking_default = false
         self.vars = saved_vars
         self.frame_slots = saved_slots
+        self.bound_log = saved_log
     }
 
     func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser) -> none {
@@ -7893,7 +8017,7 @@ type Codegen = struct {
                             return .KStruct(idx: struct_idx, type_args: [])
                         }
                         // A local of function type shadows a function name.
-                        if self.var_declared(name) {
+                        if self.calls_local(name) {
                             if self.find_var_kind(name) is .KFunc(_var_params, var_ret) {
                                 return var_ret
                             }
@@ -8074,7 +8198,10 @@ type Codegen = struct {
         self.mark_stmt_line(stmt_id)
         self.stmt_error_mark = self.report_attempts
         match self.p.stmts[stmt_id] {
-            .Let(name, typ, value, mutable) -> self.compile_let(:name, :typ, :value, :mutable)
+            .Let(name, typ, value, mutable) -> {
+                self.compile_let(:name, :typ, :value, :mutable)
+                self.bind_var(name)
+            }
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
             .PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs_id: lhs, rhs_id: rhs)
             .MinusAssign(lhs, rhs) -> self.compile_minus_assign(lhs_id: lhs, rhs_id: rhs)
@@ -8089,7 +8216,10 @@ type Codegen = struct {
                 self.free_val(val)
             }
             .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
-            .LetElse(pattern, value, else_body) -> self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
+            .LetElse(pattern, value, else_body) -> {
+                self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
+                self.bind_pattern(self.p.patterns[pattern])
+            }
             .Throw(value) -> self.compile_throw(value)
             .Assert(expr, source_text, span) -> self.compile_assert(expr, :source_text, :span)
         }
@@ -8427,9 +8557,12 @@ type Codegen = struct {
                 let arm = self.p.match_expr_arms[arm_id]
                 let pattern = self.p.patterns[arm.pattern]
                 let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+                let mark = len(self.bound_log)
+                self.bind_pattern(pattern)
                 if self.is_void_kind(self.infer_kind(arm.body)) == false {
                     self.check_value_as(arm.body, :expected, :slot)
                 }
+                self.unbind_to(mark)
                 self.restore_pattern_bindings(pattern, kinds: saved)
             }
             return
@@ -8875,7 +9008,7 @@ type Codegen = struct {
     func ctor_qualifier_enum(self, anon expr_id: int64) -> int64 {
         match self.p.exprs[expr_id] {
             .Ident(name) -> {
-                if self.var_declared(name) {
+                if self.var_bound(name) {
                     return -1
                 }
                 return self.find_enum_idx(name)
@@ -9997,18 +10130,10 @@ type Codegen = struct {
         self.emit(f"cmp {cond_reg}, #0")
         self.pool.free_reg(cond_reg)
         self.emit(f"beq {false_lbl}")
-        mut i = 0
-        for i < len(then_body) {
-            self.compile_stmt(then_body[i])
-            i = i + 1
-        }
+        self.compile_block(then_body)
         self.emit(f"b {end_lbl}")
         self.emit_label(false_lbl)
-        mut j = 0
-        for j < len(else_body) {
-            self.compile_stmt(else_body[j])
-            j = j + 1
-        }
+        self.compile_block(else_body)
         self.emit_label(end_lbl)
     }
 
@@ -10026,11 +10151,7 @@ type Codegen = struct {
         self.emit(f"cmp {cond_reg}, #0")
         self.pool.free_reg(cond_reg)
         self.emit(f"beq {end_lbl}")
-        mut i = 0
-        for i < len(body) {
-            self.compile_stmt(body[i])
-            i = i + 1
-        }
+        self.compile_block(body)
         self.emit(f"b {start_lbl}")
         self.emit_label(end_lbl)
         let n = len(self.loop_stack)
@@ -10123,11 +10244,10 @@ type Codegen = struct {
         self.pool.free_reg(idx_reg)
         self.pool.free_reg(hdr_reg)
 
-        mut i = 0
-        for i < len(body) {
-            self.compile_stmt(body[i])
-            i = i + 1
-        }
+        let mark = len(self.bound_log)
+        self.bind_var(name)
+        self.compile_block(body)
+        self.unbind_to(mark)
 
         self.emit_label(incr_lbl)
         let bump_reg = self.pool.alloc_reg()
@@ -10346,11 +10466,7 @@ type Codegen = struct {
         }
         self.emit(f"b {done_lbl}")
         self.emit_label(else_lbl)
-        mut i = 0
-        for i < len(else_body) {
-            self.compile_stmt(else_body[i])
-            i = i + 1
-        }
+        self.compile_block(else_body)
         self.emit_label(done_lbl)
     }
 
@@ -10390,17 +10506,13 @@ type Codegen = struct {
             let skip_lbl = self.fresh("Lmatch_skip")
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_block(arm.body)
                     self.emit(f"b {done_lbl}")
                 }
                 .IntPat(value) -> {
                     self.emit(f"cmp {disc_r}, #{value}")
                     self.emit(f"bne {skip_lbl}")
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_block(arm.body)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10411,9 +10523,7 @@ type Codegen = struct {
                     }
                     self.emit(f"cmp {disc_r}, #{lit}")
                     self.emit(f"bne {skip_lbl}")
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_block(arm.body)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10427,9 +10537,7 @@ type Codegen = struct {
                     self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_block(arm.body)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10448,9 +10556,7 @@ type Codegen = struct {
                 .NonePat -> {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"bne {skip_lbl}")
-                    for stmt_id in arm.body {
-                        self.compile_stmt(stmt_id)
-                    }
+                    self.compile_block(arm.body)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10524,6 +10630,7 @@ type Codegen = struct {
             self.check_param_count(func_decl.params, :what, span: func_decl.name_span)
         }
         self.vars = []
+        self.bound_log = []
         self.frame_slots = 0
         self.pool.reset()
         self.loop_stack = []
@@ -10550,6 +10657,7 @@ type Codegen = struct {
             // opts the binding into reassignment. The slot otherwise defaults
             // mutable, so only params need this explicit set.
             self.vars[-1].mutable = param.mutable
+            self.vars[-1].bound = true
         }
 
         for stmt_id in func_decl.body {
@@ -10601,9 +10709,7 @@ type Codegen = struct {
         }
 
         let body_mark = self.report_attempts
-        for stmt_id in func_decl.body {
-            self.compile_stmt(stmt_id)
-        }
+        self.compile_block(func_decl.body)
         // An error in the body or a parse error may be what hides its `return`.
         if self.report_attempts == body_mark and len(self.p.errors) == 0 {
             self.check_reaches_end(func_decl, :struct_name)

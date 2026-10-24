@@ -33,8 +33,9 @@ Qualified constructors have the imported type, so `let v = vec.Vec2(x: 1, y: 2)`
 needs no annotation before `v.x`. Calling a function the module doesn't
 declare, such as `vec.lenght(v)`, is an error with a did-you-mean hint.
 A local variable or parameter named like an import alias hides the
-module in its function: after `let vec = Thing()`, `vec.len()` calls
-`Thing`'s method.
+module from its declaration on: after `let vec = Thing()`, `vec.len()`
+calls `Thing`'s method. Before that `let`, in its own initializer (`let vec
+= vec.make(1)`) and after the block that declares it, `vec.` is the module.
 
 To also use some names unqualified, list them after the path. The qualified form keeps working:
 
