@@ -106,9 +106,9 @@ The stdlib lives under `stdlib/` in the repository.
 Keep the dependency graph a DAG: the interpreter can't load circular
 imports. The compiler accepts them, and a struct, enum or interface
 declared in a module of the cycle is the same type on either side, so a
-value of it can be passed both ways, also inside an array, an optional or
-a `Map`, and `is` recovers a struct from an interface value whichever side
-boxed it.
+value of it can be passed both ways, also inside an array, an optional, a
+`Map` or another generic type's instance such as `Box[Pt]`, and `is`
+recovers a struct from an interface value whichever side boxed it.
 
 ## Visibility
 
