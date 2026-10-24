@@ -119,7 +119,6 @@ def _enums_with(names, variant_name):
 
 
 def _fits_result(name, args):
-    """True if `.name(args)` fits the result's own `Ok` or `Err`."""
     if name not in ("Ok", "Err") or len(args) != 1:
         return False
     label = args[0].label if isinstance(args[0], ast.FunctionCallParam) else None
@@ -165,7 +164,6 @@ def _implicit_variant(expr):
 
 
 def _substituted(t, subst):
-    """`t` unchanged when `subst` lacks one of its type parameters."""
     try:
         return types._substitute_type(t, subst)
     except KeyError:
@@ -393,7 +391,6 @@ class Interpreter:
         return value if isinstance(value, (*_FUNC_DECLS, BoundMethod)) else None
 
     def _item(self, module, name):
-        """What `name` is in the module whose import lists it, or None."""
         items = module.__dict__.get("_kod_items")
         if items is None:
             items = {}
@@ -407,7 +404,6 @@ class Interpreter:
         return self._resolve_import(module, imp).names.get(name)
 
     def _own_func(self, module, name):
-        """The function `module` declares or lists in an import as `name`, or None."""
         value = module.names.get(name)
         if isinstance(value, _FUNC_DECLS):
             return value
@@ -415,7 +411,6 @@ class Interpreter:
         return value if isinstance(value, _FUNC_DECLS) else None
 
     def _module_func(self, module, name):
-        """The function `name` calls in `module`: its own, else the builtin."""
         value = self._own_func(module, name)
         if value is not None:
             return value
@@ -775,7 +770,6 @@ class Interpreter:
                 )
 
     def _variant_slot(self, slot):
-        """`slot` if it's an enum, or an optional or array of one, else None."""
         inner = slot
         while isinstance(inner, type) and issubclass(inner, types.OptionalType):
             inner = inner.inner_type
@@ -789,7 +783,6 @@ class Interpreter:
         return None
 
     def _arg_slots(self, func):
-        """The `_variant_slot`s of `func`'s arguments, or () if none; cached."""
         if isinstance(func, BoundMethod):
             cls = type(func.receiver)
             cache = cls.__dict__.get("_kod_method_slots")
@@ -939,7 +932,6 @@ class Interpreter:
                 )
 
     def _variant_value(self, module, enum_type, variant_name, args):
-        """`enum_type.variant_name` built from the argument expressions `args`."""
         self._check_payload_labels(enum_type, variant_name, args)
         vinfo = enum_type.variants[variant_name]
         evaled = [
