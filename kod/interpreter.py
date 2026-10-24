@@ -120,7 +120,6 @@ def _is_variant(expr):
 
 
 def _implicit_variant(expr):
-    """The name and argument expressions of `.V` or `.V(...)`, else ("", [])."""
     if isinstance(expr, ast.ImplicitEnumVariant):
         return expr.variant_name, []
     if isinstance(expr, ast.FunctionCall) and isinstance(
@@ -131,7 +130,7 @@ def _implicit_variant(expr):
 
 
 def _substituted(t, subst):
-    """`t` with a generic instance's type arguments for its parameters."""
+    """`t` unchanged when `subst` lacks one of its type parameters."""
     try:
         return types._substitute_type(t, subst)
     except KeyError:
@@ -775,7 +774,6 @@ class Interpreter:
         return self._evaluate_for(module, lhs, self._value_slot(rhs_val)), rhs_val
 
     def _value_slot(self, value):
-        """The enum of an enum value, else None."""
         return value.enum_type if isinstance(value, types.EnumValue) else None
 
     def _assign_slot(self, module, lhs):
@@ -1222,10 +1220,7 @@ class Interpreter:
         raise ValueError(f"unknown Map method {name!r}")
 
     def _hash_value(self, value) -> "types.Int64":
-        """Hash a Kod value to an int64. Used to implement the `hash(x)`
-        intrinsic: djb2 for str and bytes, the value for int64 and bool, the
-        discriminant for enums; the compiler rejects anything else, which
-        falls back to its id."""
+        """What compiled `hash(x)` gives; a value the compiler rejects hashes by id."""
         if isinstance(value, types.Int64):
             return types.Int64(value.value)
         if isinstance(value, types.Bool):
