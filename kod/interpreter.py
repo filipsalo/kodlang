@@ -97,6 +97,21 @@ def _slot_target(expr):
     return None
 
 
+class _OkSlot:
+    """The `T` of a `T or Error` return, where `.Ok` and `.Err` can be the result's."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+
+def _fits_result(name, args):
+    """True if `.name(args)` fits the result's own `Ok` or `Err`."""
+    if name not in ("Ok", "Err") or len(args) != 1:
+        return False
+    label = args[0].label if isinstance(args[0], ast.FunctionCallParam) else None
+    return label is None or label.id == ("value" if name == "Ok" else "error")
+
+
 def _is_variant(expr):
     t = type(expr)
     if t is ast.FunctionCall:
@@ -684,6 +699,17 @@ class Interpreter:
     def _evaluate_for(self, module, expr, slot):
         """Evaluate `expr` for `slot`, whose enum its `.Variant`s belong to."""
         target = _slot_target(expr) if slot is not None else None
+        if type(slot) is _OkSlot and target is not None:
+            if isinstance(target, ast.MatchExpression):
+                value = self.evaluate_expression(module, target.expression)
+                body = self._match_arm_body(value, target.arms)
+                return self._evaluate_for(module, body, slot)
+            name, args = _implicit_variant(target)
+            if _fits_result(name, args):
+                inner = slot.inner if name == "Ok" else None
+                payload = self._evaluate_for(module, args[0], inner)
+                return types.ResultValue(name == "Ok", payload)
+            slot = slot.inner
         slot = self._variant_slot(slot) if target is not None else None
         if slot is None:
             return self.evaluate_expression(module, expr)
@@ -771,6 +797,8 @@ class Interpreter:
         slot = func.__dict__.get("_kod_return_slot", False)
         if slot is False:
             slot = self._type_of(getattr(func, "module", None), func.return_type)
+            if ast.is_result_type_expr(func.return_type):
+                slot = _OkSlot(slot)
             func.__dict__["_kod_return_slot"] = slot
         return slot
 
