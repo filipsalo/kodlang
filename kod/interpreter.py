@@ -378,10 +378,32 @@ class Interpreter:
         value = self.stack[-1].get(callee.id)
         return value if isinstance(value, (*_FUNC_DECLS, BoundMethod)) else None
 
-    def _module_func(self, module, name):
-        """The function `name` calls in `module`: its own, else the builtin."""
+    def _item(self, module, name):
+        """What `name` is in the module whose import lists it, or None."""
+        items = module.__dict__.get("_kod_items")
+        if items is None:
+            items = {}
+            for imp in module.get_imports():
+                for item in imp.items:
+                    items.setdefault(item, imp)
+            module.__dict__["_kod_items"] = items
+        imp = items.get(name)
+        if imp is None:
+            return None
+        return self._resolve_import(module, imp).names.get(name)
+
+    def _own_func(self, module, name):
+        """The function `module` declares or lists in an import as `name`, or None."""
         value = module.names.get(name)
         if isinstance(value, _FUNC_DECLS):
+            return value
+        value = self._item(module, name)
+        return value if isinstance(value, _FUNC_DECLS) else None
+
+    def _module_func(self, module, name):
+        """The function `name` calls in `module`: its own, else the builtin."""
+        value = self._own_func(module, name)
+        if value is not None:
             return value
         value = self.program.builtins.names.get(name)
         return value if isinstance(value, _FUNC_DECLS) else None
@@ -391,7 +413,7 @@ class Interpreter:
             return False
         if module is self.program.builtins:
             return True
-        return not isinstance(module.names.get(callee.id), _FUNC_DECLS)
+        return self._own_func(module, callee.id) is None
 
     def _call_target(self, module, callee):
         """What `callee(...)` calls; a local that holds no function doesn't hide one."""
@@ -408,7 +430,7 @@ class Interpreter:
         match name:
             case ast.Variable() | ast.Name():
                 name = name.id
-        for frame in self.stack[-1], module.names, self.program.builtins.names:
+        for frame in self.stack[-1], module.names:
             if name in frame:
                 value = frame[name]
                 if isinstance(value, ast.StringLiteral):
@@ -416,6 +438,11 @@ class Interpreter:
                 elif isinstance(value, ast.Import):
                     return self._resolve_import(module, value)
                 return value
+        item = self._item(module, name)
+        if item is not None:
+            return item
+        if name in self.program.builtins.names:
+            return self.program.builtins.names[name]
         raise ValueError(f"Unknown name {name!r}")
 
     def evaluate_binary_operator(self, module, op, lhs, rhs, as_lvalue=False):
