@@ -164,12 +164,15 @@ class Parser:
             fields = []
             methods = {}
             seen: dict[str, int] = {}
+            method_spans = []
             while not self.try_consume(CloseCurly):
                 if self.try_consume(EOL) or self.try_consume(Comment):
                     continue
                 if self.peeking_at(Func):
+                    name_span = self.tokens[self.pos + 1].span
                     method = ast.FunctionDeclaration.parse_method(self, name)
                     methods[method.name] = method
+                    method_spans.append((f"{name}.{method.name}", name_span))
                 else:
                     field = ast.Variable.parse(self)
                     self._check_first(seen, f"{name}.{field.id}", field.span)
@@ -177,6 +180,9 @@ class Parser:
                     if self.try_consume(Equal):
                         field.default = ast.Expression.parse(self)
                     fields.append(field)
+            for shown, name_span in method_spans:
+                if shown in seen:
+                    self._check_first(seen, shown, name_span)
             self.try_consume(EOL)
             return ast.ResolvedTypeExpr(types.StructType.make(name, fields, methods))
         elif self.try_consume(Enum):
