@@ -6,6 +6,13 @@ icon: lucide/wrench
 
 These names live in `stdlib/builtins.kod` and are available in every Kod program without an explicit import.
 
+The compiler handles calls of `len`, `str`, `hash` and `kod_panic` itself,
+so a module can't declare a function or extern with one of those names
+(`` `hash` is a builtin function; rename this one ``). Methods can: a
+struct's `func len(self)` or `func hash(self)` is fine. The other names
+here, such as `print`, can be declared again, and a module's own `print`
+is the one its calls use.
+
 ## Output
 
 | Function | Signature | Description |
