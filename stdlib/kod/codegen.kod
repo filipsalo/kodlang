@@ -466,12 +466,14 @@ type Codegen = struct {
     inst_depth: int64 = 0
     // Bad-key instances, reported at the outermost instantiation's site.
     pending_bad_keys: [int64] = []
-    // 1 never returns, 0 may, -1 undecided, 2 + depth while deciding.
+    // 1 never, 0 may return, 2 + depth deciding, -2 - returns_gen may for now.
     returns_memo: FuncIdx = FuncIdx()
     deciding_depth: int64 = 0
     deciding_low: int64 = 0
     // Typing another function's locals could instantiate generics early.
     naming_locals: bool = false
+    returns_gen: int64 = 0
+    returns_pending: [str] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str) -> none {
@@ -4346,7 +4348,7 @@ type Codegen = struct {
         return false
     }
 
-    // Recursion returns; a `false` resting on an unfinished caller isn't kept.
+    // A `false` resting on an unfinished caller lasts one generation.
     func never_returns(self, anon sig: SigInfo, owner: int64) -> bool {
         if sig.decl_id <= 0 or self.is_void_kind(sig.return_kind) == false {
             return false
@@ -4363,6 +4365,10 @@ type Codegen = struct {
             if v >= 0 {
                 return v == 1
             }
+            if v == -2 - self.returns_gen {
+                self.deciding_low = 0
+                return false
+            }
         }
         let depth = self.deciding_depth
         let outer_low = self.deciding_low
@@ -4371,17 +4377,36 @@ type Codegen = struct {
         self.deciding_low = depth + 1
         let never = self.body_never_returns(sig, :owner)
         self.deciding_depth = depth
-        mut settled = -1
         if never {
-            settled = 1
+            memo.set(key, 1)
+            self.returns_gen += 1
         } else if self.deciding_low >= depth {
-            settled = 0
+            memo.set(key, 0)
+        } else {
+            memo.set(key, -2 - self.returns_gen)
+            self.returns_pending += [key]
         }
-        memo.set(key, settled)
         if outer_low < self.deciding_low {
             self.deciding_low = outer_low
         }
+        if depth == 0 {
+            self.settle_pending_returns()
+        }
         return never
+    }
+
+    // The callers these assumed to return have all done so.
+    func settle_pending_returns(self) -> none {
+        let memo = self.returns_memo
+        for key in self.returns_pending {
+            if memo.get(key) is Some(v) {
+                if v == -2 - self.returns_gen {
+                    memo.set(key, 0)
+                }
+            }
+        }
+        let none_pending: [str] = []
+        self.returns_pending = none_pending
     }
 
     // Locals are named so a call of one isn't taken for a same-named function.
@@ -9371,7 +9396,7 @@ type Codegen = struct {
             self.emit("bl _kod_panic")
         } else {
             let inner = self.optional_inner(value_kind)
-            let panics = self.is_panic_call(default_id)
+            let panics = self.is_diverging_call(default_id)
             if panics == false and self.converts_for(default_id, kind: inner) {
                 let dreg = self.compile_value_for_kind(default_id, expected: inner)
                 self.mov_to(.VReg(name: dreg), dest: reg)
