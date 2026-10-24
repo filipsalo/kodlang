@@ -77,6 +77,12 @@ type SigInfo = struct {
     decl_id: int64 = 0
 }
 
+// Whether control can run off the end of a block, and leave the loop around it by `break`.
+type Flow = struct {
+    completes: bool
+    breaks: bool
+}
+
 // Name → entry-index map for the parallel `func_names` / `func_labels`
 // / `func_sigs` arrays. Keys are function names, values are indices
 // into those arrays. Using a primitive int64 value keeps the type
@@ -3733,17 +3739,26 @@ type Codegen = struct {
 
     // Dead code after a `return` doesn't count.
     func block_completes(self, anon stmts: [int64]) -> bool {
+        return self.block_flow(stmts).completes
+    }
+
+    // Both answers in one walk, so a nested `for true` body is walked once per level.
+    func block_flow(self, anon stmts: [int64]) -> Flow {
         let mark = len(self.bound_log)
-        mut completes = true
+        let flow = Flow(completes: true, breaks: false)
         for stmt_id in stmts {
-            if self.stmt_completes(stmt_id) == false {
-                completes = false
+            let f = self.stmt_flow(stmt_id)
+            if f.breaks {
+                flow.breaks = true
+            }
+            if f.completes == false {
+                flow.completes = false
                 break
             }
             self.bind_stmt_names(stmt_id)
         }
         self.unbind_to(mark)
-        return completes
+        return flow
     }
 
     // What a statement binds for the rest of its block.
@@ -3755,31 +3770,31 @@ type Codegen = struct {
         }
     }
 
-    func arm_completes(self, anon arm_id: int64) -> bool {
+    func arm_flow(self, anon arm_id: int64) -> Flow {
         let arm = self.p.match_arms[arm_id]
         let mark = len(self.bound_log)
         self.bind_pattern(self.p.patterns[arm.pattern])
-        let completes = self.block_completes(arm.body)
+        let flow = self.block_flow(arm.body)
         self.unbind_to(mark)
-        return completes
+        return flow
     }
 
-    func stmt_completes(self, anon stmt_id: int64) -> bool {
+    // `breaks` is for a `break` that leaves the enclosing loop, not one nested here.
+    func stmt_flow(self, anon stmt_id: int64) -> Flow {
         match self.p.stmts[stmt_id] {
-            .Return(_value) -> return false
-            .Throw(_value) -> return false
-            .Break -> return false
-            .Continue -> return false
-            .ExprStmt(expr) -> return self.is_diverging_call(expr) == false
-            .If(_cond, then_body, else_body) -> return self.block_completes(then_body) or self.block_completes(else_body)
+            .Return(_value) -> return Flow(completes: false, breaks: false)
+            .Throw(_value) -> return Flow(completes: false, breaks: false)
+            .Break -> return Flow(completes: false, breaks: true)
+            .Continue -> return Flow(completes: false, breaks: false)
+            .ExprStmt(expr) -> return Flow(completes: self.is_diverging_call(expr) == false, breaks: false)
+            .If(_cond, then_body, else_body) -> return either_flow(self.block_flow(then_body), self.block_flow(else_body))
             // A match statement is exhaustive, so it completes only through an arm.
             .MatchStmt(_subject, arms) -> {
+                mut flow = Flow(completes: len(arms) == 0, breaks: false)
                 for arm_id in arms {
-                    if self.arm_completes(arm_id) {
-                        return true
-                    }
+                    flow = either_flow(flow, self.arm_flow(arm_id))
                 }
-                return len(arms) == 0
+                return flow
             }
             .For(cond, body) -> {
                 mut forever = cond == 0
@@ -3788,49 +3803,10 @@ type Codegen = struct {
                         forever = value
                     }
                 }
-                return forever == false or self.block_breaks(body)
+                return Flow(completes: forever == false or self.block_flow(body).breaks, breaks: false)
             }
-            else return true
-        }
-    }
-
-    // A `break` that leaves this loop rather than a nested one, and that runs.
-    func block_breaks(self, anon stmts: [int64]) -> bool {
-        let mark = len(self.bound_log)
-        mut breaks = false
-        for stmt_id in stmts {
-            if self.stmt_breaks(stmt_id) {
-                breaks = true
-                break
-            }
-            if self.stmt_completes(stmt_id) == false {
-                break
-            }
-            self.bind_stmt_names(stmt_id)
-        }
-        self.unbind_to(mark)
-        return breaks
-    }
-
-    func stmt_breaks(self, anon stmt_id: int64) -> bool {
-        match self.p.stmts[stmt_id] {
-            .Break -> return true
-            .If(_cond, then_body, else_body) -> return self.block_breaks(then_body) or self.block_breaks(else_body)
-            .MatchStmt(_subject, arms) -> {
-                for arm_id in arms {
-                    let arm = self.p.match_arms[arm_id]
-                    let mark = len(self.bound_log)
-                    self.bind_pattern(self.p.patterns[arm.pattern])
-                    let breaks = self.block_breaks(arm.body)
-                    self.unbind_to(mark)
-                    if breaks {
-                        return true
-                    }
-                }
-                return false
-            }
-            .LetElse(_pattern, _value, else_body) -> return self.block_breaks(else_body)
-            else return false
+            .LetElse(_pattern, _value, else_body) -> return Flow(completes: true, breaks: self.block_flow(else_body).breaks)
+            else return Flow(completes: true, breaks: false)
         }
     }
 
@@ -11457,6 +11433,10 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+func either_flow(anon a: Flow, anon b: Flow) -> Flow {
+    return Flow(completes: a.completes or b.completes, breaks: a.breaks or b.breaks)
 }
 
 func with_dep(anon deps: str, key: str) -> str {
