@@ -428,11 +428,19 @@ class Interpreter:
                     tokens.GreaterThan: "op_gt",
                     tokens.GreaterEqual: "op_ge",
                 }
-                prev = self.evaluate_expression(module, operands[0])
-                for i, op in enumerate(ops):
-                    nxt = self._evaluate_for(
-                        module, operands[i + 1], self._value_slot(prev)
+                first_is_variant = _is_variant(operands[0])
+                if first_is_variant:
+                    nxt = self.evaluate_expression(module, operands[1])
+                    prev = self._evaluate_for(
+                        module, operands[0], self._value_slot(nxt)
                     )
+                else:
+                    prev = self.evaluate_expression(module, operands[0])
+                for i, op in enumerate(ops):
+                    if i > 0 or not first_is_variant:
+                        nxt = self._evaluate_for(
+                            module, operands[i + 1], self._value_slot(prev)
+                        )
                     method = getattr(prev, cmp_methods[type(op)])
                     if not method(nxt).to_bool().value:
                         return types.Bool(False)
