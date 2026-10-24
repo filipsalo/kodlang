@@ -6,7 +6,7 @@ from typing import Generator, Optional
 
 from kod import ast
 from kod import values as types
-from kod.exceptions import KodError
+from kod.exceptions import KodError, get_source
 from kod.filesys import FileWrapper
 from kod.span import Span
 from kod.tokens import (
@@ -148,6 +148,12 @@ class Parser:
             )
         return base
 
+    def _check_first(self, seen: dict[str, int], shown: str, span: Span) -> None:
+        if shown in seen:
+            line = get_source(span.filename).count("\n", 0, seen[shown]) + 1
+            raise KodError(f"`{shown}` is already declared on line {line}", span)
+        seen[shown] = span.start
+
     def _parse_base_type_expr(self, name=None) -> ast.TypeExpr:
         """Parse a base type (no `?` / `or Error` suffix) into a TypeExpr.
         Struct / enum literals and bare `none` are resolved eagerly here
@@ -157,6 +163,7 @@ class Parser:
             self.consume(OpenCurly)
             fields = []
             methods = {}
+            seen: dict[str, int] = {}
             while not self.try_consume(CloseCurly):
                 if self.try_consume(EOL) or self.try_consume(Comment):
                     continue
@@ -165,6 +172,7 @@ class Parser:
                     methods[method.name] = method
                 else:
                     field = ast.Variable.parse(self)
+                    self._check_first(seen, f"{name}.{field.id}", field.span)
                     # `field: Type = expr` — optional default value.
                     if self.try_consume(Equal):
                         field.default = ast.Expression.parse(self)
@@ -174,10 +182,13 @@ class Parser:
         elif self.try_consume(Enum):
             self.consume(OpenCurly)
             variants = []
+            seen = {}
             while not self.try_consume(CloseCurly):
                 if self.try_consume(EOL) or self.try_consume(Comment):
                     continue
-                variant_name = self.consume(Identifier).value
+                variant_tok = self.consume(Identifier)
+                variant_name = variant_tok.value
+                self._check_first(seen, f"{name}.{variant_name}", variant_tok.span)
                 fields = []
                 if self.try_consume(OpenParen):
                     while not self.try_consume(CloseParen):
