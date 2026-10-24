@@ -40,6 +40,10 @@ func greet(name: str) -> none {
 greet(name: "Alice")
 ```
 
+Labeled arguments go in parameter order: with `func move(x: int64, y: int64)`,
+`move(y: 2, x: 1)` is an error
+(`` parameter 0 of `move` expected label `x`, got `y` ``).
+
 `anon` removes the label requirement for that parameter:
 
 ```kod

@@ -538,6 +538,7 @@ class Interpreter:
                         module, enum_type, callee.variant_name, list(args)
                     )
                 func = self.evaluate_expression(module, callee)
+                self._check_labels(func, args)
                 args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
             case ast.GenericInstantiation(name, type_args):
@@ -710,8 +711,43 @@ class Interpreter:
                     return val
         raise ValueError(f"No enum found with variant .{variant_name}")
 
+    def _check_labels(self, func, args):
+        if isinstance(func, BoundMethod):
+            name, params = func.func.name, list(func.func.params)[1:]
+        elif isinstance(
+            func, (ast.FunctionDeclaration, ast.ExternalFunctionDeclaration)
+        ):
+            name, params = func.name, list(func.params)
+        elif isinstance(func, types.EnumVariantConstructor):
+            self._check_payload_labels(func.enum_type, func.variant_name, args)
+            return
+        else:
+            return
+        for i, (arg, param) in enumerate(zip(args, params)):
+            label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
+            if (
+                label is not None
+                and param.label is not None
+                and label.id != param.label
+            ):
+                raise KodError(
+                    f"parameter {i} of `{name}` expected label `{param.label}`, got `{label.id}`",
+                    label.span,
+                )
+
+    def _check_payload_labels(self, enum_type, variant_name, args):
+        fields = enum_type.variants[variant_name].fields
+        for arg, field in zip(args, fields):
+            label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
+            if label is not None and label.id != field.id:
+                raise KodError(
+                    f"`{enum_type.name}.{variant_name}` takes its payload in declaration order: expected `{field.id}`, got `{label.id}`",
+                    label.span,
+                )
+
     def _variant_value(self, module, enum_type, variant_name, args):
         """`enum_type.variant_name` built from the argument expressions `args`."""
+        self._check_payload_labels(enum_type, variant_name, args)
         vinfo = enum_type.variants[variant_name]
         evaled = [
             self._evaluate_for(module, arg, field.type)
