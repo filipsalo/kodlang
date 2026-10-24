@@ -97,6 +97,14 @@ def _slot_target(expr):
     return None
 
 
+def _wants_slot(expr):
+    """Whether `expr` holds a `.Variant` that takes its enum from a slot."""
+    target = _slot_target(expr)
+    if type(target) is ast.ArrayLiteral:
+        return any(_wants_slot(e) for e in target.elements)
+    return target is not None
+
+
 class _OkSlot:
     """The `T` of a `T or Error` return, where `.Ok` and `.Err` can be the result's."""
 
@@ -454,8 +462,10 @@ class Interpreter:
             return self.program.builtins.names[name]
         raise ValueError(f"Unknown name {name!r}")
 
-    def evaluate_binary_operator(self, module, op, lhs, rhs, as_lvalue=False):
-        """Evaluate a binary operator"""
+    def evaluate_binary_operator(
+        self, module, op, lhs, rhs, as_lvalue=False, rhs_slot=None
+    ):
+        """Evaluate a binary operator; an array `+` builds `rhs` as `rhs_slot`."""
         match op:
             case tokens.Dot():
                 imp = None
@@ -566,7 +576,22 @@ class Interpreter:
                 op_func_name = "op_shr"
             case _:
                 raise ValueError(f"Don't know how to evaluate binary operator {op}")
-        lhs = self.evaluate_expression(module, lhs)
+        if (
+            op_func_name == "op_plus"
+            and type(lhs) is ast.ArrayLiteral
+            and _wants_slot(lhs)
+        ):
+            slot = self._array_slot(self._quiet_lookup(module, rhs))
+            lhs = self._evaluate_for(module, lhs, slot)
+        else:
+            lhs = self.evaluate_expression(module, lhs)
+            if (
+                type(rhs) is ast.ArrayLiteral
+                and isinstance(lhs, types.ArrayType)
+                and _wants_slot(rhs)
+            ):
+                slot = rhs_slot if rhs_slot is not None else self._array_slot(lhs)
+                return lhs.op_plus(self._evaluate_for(module, rhs, slot))
         if op_func := getattr(lhs, op_func_name):
             rhs = self.evaluate_expression(module, rhs)
             return op_func(rhs)
@@ -858,7 +883,7 @@ class Interpreter:
             if name in slot.variants:
                 return self._variant_value(module, slot, name, args)
         elif isinstance(expr, ast.ArrayLiteral):
-            return self._array_value(
+            return slot(
                 [self._evaluate_for(module, e, slot.item_type) for e in expr.elements]
             )
         if isinstance(expr, ast.MatchExpression):
@@ -962,6 +987,40 @@ class Interpreter:
     def _value_slot(self, value):
         return value.enum_type if isinstance(value, types.EnumValue) else None
 
+    def _quiet_lookup(self, module, expr):
+        """The value of a plain name, read without side effects; else None."""
+        if not isinstance(expr, (ast.Name, ast.Variable)):
+            return None
+        try:
+            return self.lookup(module, expr)
+        except ValueError:
+            return None
+
+    def _elem_slot(self, array):
+        """The enum, or array of one, that `array`'s elements have, from its first."""
+        item = getattr(type(array), "item_type", None)
+        if self._variant_slot(item) is not None:
+            return item
+        elements = getattr(array, "value", None)
+        if not isinstance(elements, list) or not elements:
+            return None
+        if isinstance(elements[0], types.EnumValue):
+            return elements[0].enum_type
+        return self._array_slot(elements[0])
+
+    def _array_slot(self, array):
+        """`array`'s own type, as a slot for the `.Variant`s added to it."""
+        if not isinstance(array, types.ArrayType):
+            return None
+        elem = self._elem_slot(array)
+        return types.ArrayType.make(elem) if elem is not None else None
+
+    def _field_slot(self, obj, name):
+        for field in getattr(type(obj), "struct_fields", []):
+            if field.id == name:
+                return field.type
+        return None
+
     def _assign_slot(self, module, lhs):
         """What an assignment to `lhs` stores, if known without side effects."""
         if isinstance(lhs, (ast.Name, ast.Variable)):
@@ -977,17 +1036,18 @@ class Interpreter:
             obj = self.lookup(module, lhs.lhs)
         except ValueError:
             return None
+        return self._store_slot(obj, lhs)
+
+    def _store_slot(self, obj, lhs):
+        """What a store into field or element `lhs` of `obj` takes."""
         if isinstance(lhs.op, tokens.Dot):
-            for field in getattr(type(obj), "struct_fields", []):
-                if field.id == lhs.rhs.id:
-                    return field.type
-            return None
+            return self._field_slot(obj, lhs.rhs.id)
         if isinstance(lhs.op, tokens.OpenBracket):
             setter = getattr(type(obj), "methods", {}).get("op_index_set")
             if setter is not None:
                 slots = self._arg_slots(BoundMethod(setter, obj))
                 return slots[1] if len(slots) > 1 else None
-            return getattr(type(obj), "item_type", None)
+            return self._elem_slot(obj)
         return None
 
     def _return_slot(self):
@@ -1154,7 +1214,8 @@ class Interpreter:
                         method.module = module
             case ast.Assignment(lhs, rhs):
                 slot = None
-                if _slot_target(rhs) is not None:
+                target = _slot_target(rhs)
+                if target is not None:
                     slot = self._assign_slot(module, lhs)
                 # `+=` and `-=` share their target node with the operator's lhs.
                 compound = isinstance(rhs, ast.BinaryOperator) and rhs.lhs is lhs
@@ -1164,10 +1225,15 @@ class Interpreter:
                     obj = self.evaluate_expression(module, lhs.lhs)
                     if compound:
                         current = getattr(obj, lhs.rhs.id)
+                        rhs_slot = None
+                        if type(rhs.rhs) is ast.ArrayLiteral and _wants_slot(rhs.rhs):
+                            rhs_slot = self._field_slot(obj, lhs.rhs.id)
                         rhs_val = self.evaluate_binary_operator(
-                            module, rhs.op, current, rhs.rhs
+                            module, rhs.op, current, rhs.rhs, rhs_slot=rhs_slot
                         )
                     else:
+                        if slot is None and target is not None:
+                            slot = self._store_slot(obj, lhs)
                         rhs_val = self._evaluate_for(module, rhs, slot)
                     setattr(obj, lhs.rhs.id, rhs_val)
                 elif isinstance(lhs, ast.BinaryOperator) and isinstance(
@@ -1191,6 +1257,8 @@ class Interpreter:
                             module, rhs.op, current, rhs.rhs
                         )
                     else:
+                        if slot is None and target is not None:
+                            slot = self._store_slot(obj, lhs)
                         rhs_val = self._evaluate_for(module, rhs, slot)
                     if setter is not None:
                         self.call_function(module, bound, [key_val, rhs_val])

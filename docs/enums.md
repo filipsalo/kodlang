@@ -74,10 +74,12 @@ let d: Direction = .North
 
 A payload variant can use it too. Wherever the enum type is known, the
 variant belongs to that enum: an annotated `let`
-(`let m: Message = .Text(content: "hi")`), an assignment, an argument, a
-struct field, an array element, a return value (the `T` of a `T or Error`
-function too), an arm of a `match` whose value goes to one of these, or the
-other side of `==` or `!=` (`m == .Quit`), in a comparison chain too
+(`let m: Message = .Text(content: "hi")`), an assignment to a variable,
+field, element or key, an argument, a struct field, an array element, an
+array literal added to an array of the enum (`ms += [.Quit]` or
+`[.Quit] + ms`), a return value (the `T` of a `T or Error` function too),
+an arm of a `match` whose value goes to one of these, or the other side of
+`==` or `!=` (`m == .Quit`), in a comparison chain too
 (`.Quit == m == n`). Elsewhere, as in an unannotated `let`, a `match` subject,
 an unannotated array literal or a method call on the variant, it belongs to
 the one enum that declares a variant of that name among those the module
