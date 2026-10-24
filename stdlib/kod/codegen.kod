@@ -1012,7 +1012,10 @@ type Codegen = struct {
     // "" for a non-name, so the hint shows just the `?`.
     func unwrap_name(self, anon expr_id: int64) -> str {
         if self.p.exprs[expr_id] is .Ident(name) {
-            return name
+            // A `$` name is a compiler temporary the user can't write.
+            if name.contains("$") == false {
+                return name
+            }
         }
         return ""
     }
@@ -4734,38 +4737,27 @@ type Codegen = struct {
         return self.compile_enum_construct(empty, enum_idx: ei3, variant_idx: vi3, span: self.p.expr_spans[dot_rhs])
     }
 
-    // Python-style chained comparison: `a < b < c` evaluates as
-    // `(a < b) and (b < c)` with `b` computed once. Strategy: stash each
-    // middle operand in a fresh local, build synthetic Binary(prev, op,
-    // next) pairs that share the temp idents, and AND them with
-    // short-circuit branches so the rhs of an early-falsifying link
-    // never runs.
+    // `a < b < c` is `(a < b) and (b < c)` with `b` computed once, left to right.
     func compile_chain(self, exprs: [int64], ops: [ast.Op]) -> Val {
         let span: ast.Span = self.p.expr_spans[exprs[0]]
-        // Bind each middle operand (everything except the first and last)
-        // to a fresh local so the value is computed exactly once.
-        mut operand_exprs: [int64] = [exprs[0]]
-        mut i: int64 = 1
-        for i < len(exprs) - 1 {
-            let name: str = self.fresh("__chain")
-            let kind: TypeKind = self.infer_kind(exprs[i])
-            let off: int64 = self.alloc_var(:name, :kind)
-            self.compile_store(dest_off: off, :kind, value_id: exprs[i])
-            operand_exprs += [self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[exprs[i]])]
-            i = i + 1
-        }
-        operand_exprs += [exprs[len(exprs) - 1]]
-        // Emit each link as `if (lhs op rhs) == false { goto false }`.
         let false_lbl: str = self.fresh("Lchain_false")
         let done_lbl: str = self.fresh("Lchain_done")
+        mut lhs = exprs[0]
+        if self.chain_operand_moves(lhs) {
+            lhs = self.stash_chain_operand(lhs)
+        }
         mut k: int64 = 0
         for k < len(ops) {
-            let pair: int64 = self.p.alloc_expr(ast.Expr.Binary(lhs: operand_exprs[k], op: ops[k], rhs: operand_exprs[k + 1]), :span)
-            let v: Val = self.compile_expr(pair)
-            mut r: str = self.load(v)
+            mut rhs = exprs[k + 1]
+            if k + 1 < len(ops) {
+                rhs = self.stash_chain_operand(rhs)
+            }
+            let pair: int64 = self.p.alloc_expr(ast.Expr.Binary(:lhs, op: ops[k], :rhs), :span)
+            let r: str = self.load(self.compile_expr(pair))
             self.emit(f"cmp {r}, #0")
             self.emit(f"beq {false_lbl}")
             self.pool.free_reg(r)
+            lhs = rhs
             k = k + 1
         }
         mut result: str = self.pool.alloc_reg()
@@ -4775,6 +4767,27 @@ type Codegen = struct {
         self.emit(f"mov {result}, #0")
         self.emit_label(done_lbl)
         return .VReg(name: result)
+    }
+
+    // Whether computing a chain's first operand after the second could change its value.
+    func chain_operand_moves(self, anon expr_id: int64) -> bool {
+        if self.emits_nothing(expr_id) or self.kind_has_unknown(self.infer_kind(expr_id)) {
+            return false
+        }
+        match self.p.exprs[expr_id] {
+            .BoolLit(_value) -> return false
+            .NoneLit -> return false
+            .ImplicitVariant(_name) -> return false
+            else return true
+        }
+    }
+
+    func stash_chain_operand(self, anon expr_id: int64) -> int64 {
+        let name: str = self.fresh("__chain")
+        let kind: TypeKind = self.infer_kind(expr_id)
+        let off: int64 = self.alloc_var(:name, :kind)
+        self.compile_store(dest_off: off, :kind, value_id: expr_id)
+        return self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[expr_id])
     }
 
     // Try `EnumName.Variant` — bare two-part unit-variant access.
@@ -4857,13 +4870,20 @@ type Codegen = struct {
                         self.report_error(f"error: `{self.struct_display_name(idx)}.op_index` must take one key", span: self.p.expr_spans[lhs])
                         return .VImm(value: 0)
                     }
-                    let key_reg = self.compile_key(rhs, kind: sig.param_kinds[1])
-                    let key_spilled = self.preserve_begin(key_reg)
-                    let ov = self.compile_expr(lhs)
-                    self.mov_to(ov, dest: "x0")
-                    let key_r = self.preserve_end(key_reg, spilled: key_spilled)
-                    self.emit(f"mov x1, {key_r}")
-                    self.pool.free_reg(key_r)
+                    if self.emits_nothing(lhs) or self.emits_nothing(rhs) {
+                        let key_reg = self.compile_key(rhs, kind: sig.param_kinds[1])
+                        let key_spilled = self.preserve_begin(key_reg)
+                        self.mov_to(self.compile_expr(lhs), dest: "x0")
+                        let key_r = self.preserve_end(key_reg, spilled: key_spilled)
+                        self.emit(f"mov x1, {key_r}")
+                        self.pool.free_reg(key_r)
+                    } else {
+                        let parked = self.park_value(self.compile_expr(lhs))
+                        let key_r = self.compile_key(rhs, kind: sig.param_kinds[1])
+                        self.mov_to(.VReg(name: self.unpark_value(parked)), dest: "x0")
+                        self.emit(f"mov x1, {key_r}")
+                        self.pool.free_reg(key_r)
+                    }
                     mut method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}$op_index"
                     self.emit(f"bl {method_lbl}")
                     return .VReg(name: "x0")
@@ -5830,48 +5850,31 @@ type Codegen = struct {
                 return .VImm(value: 0)
             }
         }
-        // Stash each value on the stack so that compile_expr calls (which can
-        // issue bl into len/strlen/etc.) don't clobber prior args still held
-        // in caller-saved pool registers or in x0.
+        // Each part waits on the stack while the later ones, which may call, are computed.
         self.emit("sub sp, sp, #32")
-        // For an open-ended slice (`s[lo..]`) the parser stores hi=0; treat
-        // that as len(s) at runtime so the slice extends to the end. We
-        // emit `bl _len_<runtime>` only when the source actually omitted hi.
-        mut hi_omitted: bool = false
-        if hi_id == 0 {
-            hi_omitted = true
-        }
-        if hi_omitted {
-            // Push len(s) — the helpers expect the subject in x0 and
-            // return its length in x0. Both kod_str / kod_array share
-            // the {ptr, len, …} layout, so a direct ldr at offset 8
-            // works for either; we don't need a separate `bl` here.
-            let subj_for_len: Val = self.compile_expr(s_id)
-            let sr0: str = self.load(subj_for_len)
-            let lr: str = self.pool.alloc_reg()
-            self.emit(f"ldr {lr}, [{sr0}, #8]")
-            self.emit(f"str {lr}, [sp, #16]")
-            self.pool.free_reg(lr)
-            self.pool.free_reg(sr0)
-        } else {
+        let s_r = self.load(self.compile_expr(s_id))
+        self.emit(f"str {s_r}, [sp]")
+        self.pool.free_reg(s_r)
+        let lo_v = self.compile_expr(lo_id)
+        self.check_int_operand(lo_id, what: "a slice bound")
+        let lo_r = self.load(lo_v)
+        self.emit(f"str {lo_r}, [sp, #8]")
+        self.pool.free_reg(lo_r)
+        // The parser stores hi=0 for `s[lo..]`, which runs to the end.
+        if hi_id != 0 {
             let hi_v = self.compile_expr(hi_id)
             self.check_int_operand(hi_id, what: "a slice bound")
             let hi_r = self.load(hi_v)
             self.emit(f"str {hi_r}, [sp, #16]")
             self.pool.free_reg(hi_r)
         }
-        let lo_v = self.compile_expr(lo_id)
-        self.check_int_operand(lo_id, what: "a slice bound")
-        let lo_r = self.load(lo_v)
-        self.emit(f"str {lo_r}, [sp, #8]")
-        self.pool.free_reg(lo_r)
-        let subj_val = self.compile_expr(s_id)
-        let s_r = self.load(subj_val)
-        self.emit(f"str {s_r}, [sp]")
-        self.pool.free_reg(s_r)
         self.emit("ldr x0, [sp]")
         self.emit("ldr x1, [sp, #8]")
-        self.emit("ldr x2, [sp, #16]")
+        if hi_id == 0 {
+            self.emit("ldr x2, [x0, #8]")
+        } else {
+            self.emit("ldr x2, [sp, #16]")
+        }
         self.emit("add sp, sp, #32")
         // Dispatch to the runtime that matches the subject. Strings and
         // arrays have different cell layouts; the str routine returns

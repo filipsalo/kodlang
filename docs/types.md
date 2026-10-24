@@ -140,7 +140,7 @@ another `bool`, so `b == 1`, `true + 1` and `if flags & 1` are errors.
 Comparisons bind tighter than `&`, `|` and `^`, so a bit test is written
 `(flags & 1) != 0`.
 
-Chained comparisons are supported Python-style: `a < b < c` evaluates `b` once and is equivalent to `(a < b) and (b < c)`. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
+Chained comparisons are supported Python-style: `a < b < c` is `(a < b) and (b < c)` with `b` evaluated once. The operands are evaluated left to right, and a chain stops at the first comparison that is false, so in `a < b < f()` `f` isn't called when `a < b` is false. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
 
 ## Operators
 
