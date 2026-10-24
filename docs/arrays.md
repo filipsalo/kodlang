@@ -18,7 +18,8 @@ A literal with no type to go to takes its first element's type, and every
 other element must have that type: `let xs = [1, "a"]` is an error
 (`` expected `int64`, got `str` ``), and so is `[Sq(s: 1), Circle(r: 1)]`
 even when both implement `Shape`. Annotate the array to mix structs behind
-an interface: `let shapes: [Shape] = [Sq(s: 1), Circle(r: 1)]`.
+an interface: `let shapes: [Shape] = [Sq(s: 1), Circle(r: 1)]`, which the
+error suggests when the module has an interface both implement.
 
 ## Indexing
 

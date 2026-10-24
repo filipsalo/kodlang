@@ -2729,30 +2729,42 @@ type Codegen = struct {
         self.report_error(f"error: `.{variant_name}` is ambiguous: {names} and `{last}` {all} declare it; write `{self.enum_written_name(pick)}.{variant_name}` or give the value a type", :span)
     }
 
-    // An imported enum is written through the alias the current module imports it as.
     func enum_written_name(self, anon idx: int64) -> str {
-        let info = self.enums[idx]
-        if info.def_path == self.p.path or info.def_path == self.builtins_path {
-            return info.name
+        return self.written_type_name(self.enums[idx].name, def_path: self.enums[idx].def_path)
+    }
+
+    // An imported type is written through the alias the current module imports it as.
+    func written_type_name(self, anon name: str, def_path: str) -> str {
+        if def_path == self.p.path or def_path == self.builtins_path {
+            return name
         }
+        let alias = self.import_alias_of(def_path)
+        if len(alias) == 0 {
+            return name
+        }
+        return f"{alias}.{name}"
+    }
+
+    // The alias the current module imports the module at `path` as, or "".
+    func import_alias_of(self, anon path: str) -> str {
         mut aliases = self.import_local
         mut paths = self.entry_import_paths
         if self.p.path != self.entry_path {
             let si = self.cur_scope()
             if si < 0 {
-                return info.name
+                return ""
             }
             aliases = self.scopes[si].alias_names
             paths = self.scopes[si].alias_paths
         }
         mut i = 0
-        for path in paths {
-            if path == info.def_path {
-                return f"{aliases[i]}.{info.name}"
+        for imported in paths {
+            if imported == path {
+                return aliases[i]
             }
             i += 1
         }
-        return info.name
+        return ""
     }
 
     // Extract the enum index from a TypeKind, or -1 if not an enum.
@@ -5984,7 +5996,7 @@ type Codegen = struct {
                 self.report_if_unknown(elements[i])
                 elem_reg = self.load(elem_val)
                 if i > 0 and check_rest {
-                    self.check_value_kind(elements[i], expected: rest_kind)
+                    self.check_rest_elem(elements[i], first: rest_kind)
                 }
             }
             // Reload buf from stack — any bl in compile_expr above would
@@ -6009,6 +6021,36 @@ type Codegen = struct {
         self.pool.free_reg(len_r)
         self.pool.free_reg(buf_r)
         return .VReg(name: hdr_r)
+    }
+
+    // `[Sq(..), Circle(..)]` takes `Sq` from its first element, so an interface both share was likely meant.
+    func check_rest_elem(self, anon elem_id: int64, first: TypeKind) -> none {
+        let actual = self.infer_kind(elem_id)
+        let iface = self.shared_iface(first, actual)
+        if iface < 0 or self.report_attempts > self.stmt_error_mark {
+            self.check_value_kind(elem_id, expected: first)
+            return
+        }
+        let shown = self.written_type_name(self.interfaces[iface].name, def_path: self.interfaces[iface].def_path)
+        self.report_error(f"error: expected `{self.kind_display(first)}`, got `{self.kind_display(actual)}`; annotate the array to mix them, as in `let xs: [{shown}] = ...`", span: self.p.expr_spans[elem_id])
+    }
+
+    // An interface with methods, of this module or one it imports, that two different structs implement; -1 if none.
+    func shared_iface(self, anon a: TypeKind, anon b: TypeKind) -> int64 {
+        let .KStruct(a_idx, _a_args) = a else { return -1 }
+        let .KStruct(b_idx, _b_args) = b else { return -1 }
+        if self.same_struct(a_idx, b_idx) {
+            return -1
+        }
+        mut i = 0
+        for iface in self.interfaces {
+            let reachable = iface.def_path == self.p.path or len(self.import_alias_of(iface.def_path)) > 0
+            if reachable and len(iface.methods) > 0 and len(self.iface_gap(a, iface_idx: i)) == 0 and len(self.iface_gap(b, iface_idx: i)) == 0 {
+                return i
+            }
+            i += 1
+        }
+        return -1
     }
 
     // Try `mod.Enum.Variant(args)` — succeed iff the callee shape is
