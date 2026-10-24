@@ -117,7 +117,10 @@ let bad: int64 = 1 23 456       // lex error — middle group isn't 3 digits
 
 Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
 `+=` and `-=` update a variable, field, or array element in place
-(`n -= 3` is `n = n - 3`).
+(`n -= 3` is `n = n - 3`). A prefix `-` negates the whole call, field
+access, index or `?` after it, and binds tighter than any binary
+operator: `-xs[0]` is `-(xs[0])`, `-p.get()` is `-(p.get())`, and
+`-a * b` is `(-a) * b`.
 
 ## Boolean literals
 
