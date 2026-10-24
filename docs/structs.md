@@ -168,6 +168,12 @@ let q = p.swap()    // Pair[int64, str]
 Construction always spells the type arguments; a bare `Pair(...)` is an
 error.
 
+Every method of an instance is compiled for its type arguments, whether
+it's called or not, so each must make sense for them. An error in one
+names the instance, as in
+`` `<` doesn't take `Color` operands (in `Box[Color]`) ``, and a line of
+the template is reported for one instance only.
+
 A generic struct or enum may name itself, with any type arguments, in its
 fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
 `Pair[B, A]` above. The Python interpreter (`kod _interpret`) does not
