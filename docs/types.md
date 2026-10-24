@@ -50,7 +50,8 @@ interface is, and `[]` as any array type. A `T?` isn't accepted where a `T`
 is declared; unwrap it first with `x?` or `x? or default`. An optional is
 passed on as it is, so a `T?` where a `U?` is declared needs `T` to be `U`:
 like an `[Sq]` isn't a `[Shape]`, an `Sq?` or `int64?` isn't a `Shape?` even
-when `Sq` and `int64` implement `Shape`. A function value
+when `Sq` and `int64` implement `Shape`; rewrap it instead, as in
+`match sq { Some(v) -> v none -> none }`. A function value
 must match a function type exactly, since a function is never adapted: a
 function taking a struct isn't a `func(SomeInterface) -> ...`, and one
 returning `int64` isn't a `func() -> int64?`. Without an annotation,
