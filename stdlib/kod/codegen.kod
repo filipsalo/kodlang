@@ -5653,21 +5653,40 @@ type Codegen = struct {
     // Left to right: the lhs may come back in x0 and the rhs may call.
     func compile_str_operands(self, anon lhs_id: int64, rhs_id: int64) -> none {
         let lhs_val = self.compile_expr(lhs_id)
-        if self.emits_nothing(rhs_id) {
+        if self.emits_nothing(lhs_id) or self.emits_nothing(rhs_id) {
             self.mov_to(self.compile_expr(rhs_id), dest: "x1")
             self.mov_to(lhs_val, dest: "x0")
             return
         }
-        let lhs_reg = self.pool.alloc_reg()
-        self.mov_to(lhs_val, dest: lhs_reg)
-        let lhs_spilled = self.spill_across(lhs_reg)
+        let parked = self.park_lhs(lhs_val)
         self.mov_to(self.compile_expr(rhs_id), dest: "x1")
-        self.restore_across(lhs_reg, spilled: lhs_spilled)
-        self.emit(f"mov x0, {lhs_reg}")
-        self.pool.free_reg(lhs_reg)
+        self.unpark_lhs(parked)
     }
 
-    // A literal or a local is read where it's moved, so the lhs needn't be parked across it.
+    // A right-nested chain parks one lhs per level, so past the callee-saved registers they go on the stack.
+    func park_lhs(self, anon val: Val) -> str {
+        if self.pool.next_is_callee_saved() {
+            let reg = self.pool.alloc_reg()
+            self.mov_to(val, dest: reg)
+            return reg
+        }
+        self.mov_to(val, dest: "x0")
+        self.emit("sub sp, sp, #16")
+        self.emit("str x0, [sp]")
+        return ""
+    }
+
+    func unpark_lhs(self, anon reg: str) -> none {
+        if len(reg) == 0 {
+            self.emit("ldr x0, [sp]")
+            self.emit("add sp, sp, #16")
+            return
+        }
+        self.emit(f"mov x0, {reg}")
+        self.pool.free_reg(reg)
+    }
+
+    // A literal or a local is read where it's moved, so it needn't be parked or kept parked across.
     func emits_nothing(self, anon expr_id: int64) -> bool {
         match self.p.exprs[expr_id] {
             .StrLit(_value) -> return true
@@ -5680,17 +5699,13 @@ type Codegen = struct {
     // `typed_anchor` is the first operand of a chain typed by where it goes, or 0.
     func compile_concat(self, lhs_id: int64, rhs_id: int64, kind: TypeKind, typed_anchor: int64) -> Val {
         let lhs_val = self.compile_concat_operand(lhs_id, :kind, :typed_anchor)
-        if self.emits_nothing(rhs_id) {
+        if self.emits_nothing(lhs_id) or self.emits_nothing(rhs_id) {
             self.mov_to(self.compile_concat_operand(rhs_id, :kind, :typed_anchor), dest: "x1")
             self.mov_to(lhs_val, dest: "x0")
         } else {
-            let lhs_reg = self.pool.alloc_reg()
-            self.mov_to(lhs_val, dest: lhs_reg)
-            let lhs_spilled = self.spill_across(lhs_reg)
+            let parked = self.park_lhs(lhs_val)
             self.mov_to(self.compile_concat_operand(rhs_id, :kind, :typed_anchor), dest: "x1")
-            self.restore_across(lhs_reg, spilled: lhs_spilled)
-            self.emit(f"mov x0, {lhs_reg}")
-            self.pool.free_reg(lhs_reg)
+            self.unpark_lhs(parked)
         }
         if lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path {
             self.emit("bl _kod_array_concat")
