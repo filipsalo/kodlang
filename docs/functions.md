@@ -172,9 +172,10 @@ body by these rules. A function of the module or one it imports named
 `kod_panic`, or a local function value of that name declared before the
 call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
 ends in `kod_panic(...)` never returns, and nor does one that ends in a
-call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
-function declared further down), or in a `for true` loop it can't `break`
-out of. A call that leads back to the function itself doesn't count:
+call of another such helper (`self.fail(msg)`, `log.die(msg)`, a method
+of a local, as in `let r = Reporter(); r.fail(msg)`, or a function declared
+further down), or in a `for true` loop it can't `break` out of. A call
+that leads back to the function itself doesn't count:
 `func spin() -> none { spin() }` is taken to return.
 
 ## `main`

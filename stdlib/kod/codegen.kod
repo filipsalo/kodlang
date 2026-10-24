@@ -477,7 +477,7 @@ type Codegen = struct {
     // 1 never, 0 may return, 2 deciding, -2 may while what it rests on does, -1 decide again.
     returns_memo: FuncIdx = FuncIdx()
     deciding_depth: int64 = 0
-    // Typing another function's locals could instantiate generics early.
+    // Typing another function's locals mustn't instantiate a generic early.
     naming_locals: bool = false
     returns_pending: [str] = []
     // Calls past the limit, reported unless the function type they go through was.
@@ -505,6 +505,8 @@ type Codegen = struct {
     dependent_heads: FuncIdx = FuncIdx()
     dependent_keys: [str] = []
     dependent_next: [int64] = []
+    // Typing each `let` as the walk reaches it, for another function's body.
+    replaying_lets: bool = false
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -2819,6 +2821,9 @@ type Codegen = struct {
             if s.funcs.get(name) is Some(k) {
                 return -2 - k
             }
+            if self.naming_locals {
+                return -1
+            }
             return -2 - self.add_scope_fn(si, name, decl_idx: -1, lambda_id: decl_id)
         }
         return -1
@@ -3475,6 +3480,9 @@ type Codegen = struct {
         if existing >= 0 {
             return existing
         }
+        if self.naming_locals {
+            return -1
+        }
         let empty_params: [str] = []
         // Registered before its fields and sigs resolve, so a self-reference finds it.
         self.structs += [StructInfo(name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0))]
@@ -3623,6 +3631,9 @@ type Codegen = struct {
                         resolved += [arg_kind]
                     }
                     let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx, arg_spans: self.type_arg_spans(args), whole: self.p.type_spans[type_id])
+                    if inst_idx < 0 {
+                        return .KUnknown
+                    }
                     return .KStruct(idx: inst_idx, type_args: [])
                 }
                 let enum_idx = self.find_enum_idx(name)
@@ -3643,6 +3654,9 @@ type Codegen = struct {
                         resolved += [arg_kind]
                     }
                     let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx, arg_spans: self.type_arg_spans(args), whole: self.p.type_spans[type_id])
+                    if inst_idx < 0 {
+                        return .KUnknown
+                    }
                     return .KEnum(idx: inst_idx)
                 }
                 return .KUnknown
@@ -3669,6 +3683,9 @@ type Codegen = struct {
         let existing = self.find_enum_idx(canonical)
         if existing >= 0 {
             return existing
+        }
+        if self.naming_locals {
+            return -1
         }
         let empty_params: [str] = []
         self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args)]
@@ -3766,10 +3783,30 @@ type Codegen = struct {
     // What a statement binds for the rest of its block.
     func bind_stmt_names(self, anon stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
-            .Let(name, _typ, _value, _mutable) -> self.bind_var(name)
+            .Let(name, typ, value, _mutable) -> {
+                if self.replaying_lets {
+                    self.update_var_kind(:name, kind: self.quiet_let_kind(typ, :value))
+                }
+                self.bind_var(name)
+            }
             .LetElse(pattern, _value, _else_body) -> self.bind_pattern(self.p.patterns[pattern])
             else none
         }
+    }
+
+    // The kind compile_let gives a local, unknown where that needs a new generic instance.
+    func quiet_let_kind(self, anon typ: int64, value: int64) -> TypeKind {
+        let saved = self.naming_locals
+        self.naming_locals = true
+        mut kind = self.resolve_type(typ)
+        if typ == 0 {
+            kind = self.infer_kind(value)
+            if self.is_untyped_literal(value) or self.is_none_kind(kind) {
+                kind = .KUnknown
+            }
+        }
+        self.naming_locals = saved
+        return kind
     }
 
     func arm_flow(self, anon arm_id: int64) -> Flow {
@@ -4812,18 +4849,22 @@ type Codegen = struct {
             self.subst_names = self.structs[self.structs[owner].template_idx].type_param_names
             self.subst_args = self.structs[owner].template_args
         }
+        let saved_naming = self.naming_locals
         self.naming_locals = true
         for stmt_id in fd.body {
             self.collect_stmt_vars(:stmt_id)
         }
-        self.naming_locals = false
-        // Untyped here, so any of them might hold a function.
+        self.naming_locals = saved_naming
+        // Until its `let` is replayed, any of them might hold a function.
         mut k = len(fd.params)
         for k < len(self.vars) {
             self.vars[k].kind = .KUnknown
             k += 1
         }
+        let saved_replaying = self.replaying_lets
+        self.replaying_lets = true
         let never = self.block_has_return(fd.body) == false and self.block_completes(fd.body) == false
+        self.replaying_lets = saved_replaying
         self.p = saved_p
         self.vars = saved_vars
         self.frame_slots = saved_slots
@@ -6652,7 +6693,11 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id]), type_args: [])
+                                let inst_idx = self.instantiate_struct(kinds, template_idx: struct_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id])
+                                if inst_idx < 0 {
+                                    return none
+                                }
+                                return .KStruct(idx: inst_idx, type_args: [])
                             }
                             let enum_idx = self.find_enum_idx(name)
                             if enum_idx >= 0 {
@@ -6660,7 +6705,11 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id]))
+                                let inst_idx = self.instantiate_enum(kinds, template_idx: enum_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id])
+                                if inst_idx < 0 {
+                                    return none
+                                }
+                                return .KEnum(idx: inst_idx)
                             }
                         }
                     }
