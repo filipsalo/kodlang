@@ -513,6 +513,8 @@ type Codegen = struct {
     alias_shapes: StrMap = StrMap()
     // Type names two modules declare, already reported.
     clashed_types: [str] = []
+    // A call through a local of no known type in a body being decided counts as never returning.
+    trust_locals: bool = false
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -4656,8 +4658,8 @@ type Codegen = struct {
         if ok_wrap {
             target = self.result_inner_kind(expected)
         }
-        if self.is_void_kind(body_kind) and self.is_void_kind(target) == false and self.call_diverges(body) == false {
-            self.report_error("error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement", span: self.p.expr_spans[body])
+        if self.is_void_kind(body_kind) and self.is_void_kind(target) == false and self.is_diverging_call(body) == false {
+            self.report_error(f"error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement{self.scopes_hint(body)}", span: self.p.expr_spans[body])
         }
         mut wrap = false
         if ok_wrap and self.is_ctor_for(body, kind: expected) == false and self.is_result_kind(body_kind) == false {
@@ -4700,13 +4702,17 @@ type Codegen = struct {
         }
         let .Ident(name) = self.p.exprs[callee] else { return false }
         if self.calls_local(name) {
-            return false
+            return self.trusts(self.find_var_kind(name))
         }
         let slot = self.lookup_func(name)
         if slot != -1 {
             return self.never_returns(self.fn_sig(slot), owner: -1)
         }
         return false
+    }
+
+    func trusts(self, anon kind: TypeKind) -> bool {
+        return self.trust_locals and self.deciding_depth > 0 and kind is .KUnknown
     }
 
     // `alias.f` or a struct method, resolved as try_two_part_call does.
@@ -4721,7 +4727,8 @@ type Codegen = struct {
                 return self.never_returns(self.import_fn_at(slot).sig, owner: -1)
             }
         }
-        if self.infer_kind(lhs) is .KStruct(sidx, _ta) {
+        let recv = self.infer_kind(lhs)
+        if recv is .KStruct(sidx, _ta) {
             if self.has_field(name, struct_idx: sidx) and self.find_field_kind(name, struct_idx: sidx) is .KFunc(_p, _r) {
                 return false
             }
@@ -4729,7 +4736,7 @@ type Codegen = struct {
                 return self.never_returns(self.structs[sidx].methods[mi].sig, owner: sidx)
             }
         }
-        return false
+        return self.trusts(recv)
     }
 
     func is_panic_call(self, anon expr_id: int64) -> bool {
@@ -4937,12 +4944,20 @@ type Codegen = struct {
         return completes
     }
 
-    // Whether a call in a value's place never returns, decided as the walks decide it.
-    func call_diverges(self, anon expr_id: int64) -> bool {
-        let kinds = self.untype_locals()
-        let never = self.is_diverging_call(expr_id)
-        self.retype_locals(kinds)
-        return never
+    // For a call that returns only because a call through a local in what it calls is taken to.
+    func scopes_hint(self, anon expr_id: int64) -> str {
+        if self.p.exprs[expr_id] is .Call(_callee, _args) {
+            let saved = self.returns_memo
+            self.returns_memo = FuncIdx()
+            self.trust_locals = true
+            let never = self.is_diverging_call(expr_id)
+            self.trust_locals = false
+            self.returns_memo = saved
+            if never {
+                return "; the call is taken to return, as what it calls ends in a call through a local, which counts as returning until blocks get scopes; if that one never returns, add a `kod_panic(...)` after it"
+            }
+        }
+        return ""
     }
 
     // A call through a local other than a fixed parameter is taken to return.
@@ -9014,6 +9029,8 @@ type Codegen = struct {
             if expected is .KOptional(_inner) {
                 hint = self.rewrap_hint(value_id)
             }
+        } else if self.is_void_kind(actual) {
+            hint = self.scopes_hint(value_id)
         }
         self.report_error(f"error: expected `{self.kind_display(slot)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
     }
@@ -10162,7 +10179,7 @@ type Codegen = struct {
 
     // A call that never returns has no value to check.
     func check_return_value(self, anon value_id: int64, expected: TypeKind) -> none {
-        if self.call_diverges(value_id) == false {
+        if self.is_diverging_call(value_id) == false {
             self.check_value_kind(value_id, :expected)
         }
     }
@@ -10427,7 +10444,7 @@ type Codegen = struct {
             self.emit("bl _kod_panic")
         } else {
             let inner = self.optional_inner(value_kind)
-            let panics = self.call_diverges(default_id)
+            let panics = self.is_diverging_call(default_id)
             if panics == false and self.converts_for(default_id, kind: inner) {
                 let dreg = self.compile_value_for_kind(default_id, expected: inner)
                 self.mov_to(.VReg(name: dreg), dest: reg)

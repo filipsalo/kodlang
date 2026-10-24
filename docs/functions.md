@@ -189,11 +189,15 @@ receiver uses no local but `self` and parameters that no `let`, pattern,
 whether a `let` (`let r = Reporter(); r.fail(msg)`), a match arm,
 `if … is`, let-else or `for` binds it, and so is a plain call of a name
 that such a local has at that point, even when it doesn't hold a function
-(`kod_panic(msg)` after `let kod_panic = 5`). That holds wherever a call
-that never returns counts: at the end of a body or a let-else's `else`
-block, and as a returned value, a match arm's value or an `x? or ...`
-default. To end the path there, put a `kod_panic(...)` or a `return`
-after the call.
+(`kod_panic(msg)` after `let kod_panic = 5`). To end the path there, put
+a `kod_panic(...)` or a `return` after the call.
+
+A call in a value's place, as a returned value, a match arm's value or an
+`x? or ...` default, is decided where it is written, from the type its
+receiver has there, so `return r.fail(msg)` never returns after
+`let r = Reporter()`. What it calls is still decided by the rules above:
+`return die(msg)` is an error when `die` ends in `r.fail(msg)` on such a
+local, and the error says to put a `kod_panic(...)` after that call.
 
 ## `main`
 
