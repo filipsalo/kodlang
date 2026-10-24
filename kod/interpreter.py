@@ -941,6 +941,8 @@ class Interpreter:
         struct with `to_str` method → call that method."""
         if isinstance(value, types.String):
             return value
+        if isinstance(value, types.Bytes):
+            return types.String(value.value)
         if isinstance(value, types.Int64):
             return types.String(str(value.value).encode("utf8"))
         if isinstance(value, types.Bool):
