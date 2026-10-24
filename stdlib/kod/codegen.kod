@@ -509,6 +509,10 @@ type Codegen = struct {
     dependent_next: [int64] = []
     // Parameters of the function walked that no binding in its body reuses.
     fixed_names: [str] = []
+    // Alias name → the type the first module's alias of that name stands for.
+    alias_shapes: StrMap = StrMap()
+    // Type names two modules declare, already reported.
+    clashed_types: [str] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -3044,6 +3048,13 @@ type Codegen = struct {
             return
         }
         let found = self.enums_with_variant(variant_name)
+        // A cascade of a type clash: still an attempt, so the statement stays quiet.
+        for f in found {
+            if regalloc.str_in(self.clashed_types, p: self.enums[f].name) {
+                self.report_attempts = self.report_attempts + 1
+                return
+            }
+        }
         mut fitting: [int64] = []
         for f in found {
             if self.args_fit(args, enum_idx: f, variant_idx: self.find_variant_idx(variant_name, enum_idx: f)) {
@@ -3985,17 +3996,34 @@ type Codegen = struct {
 
 
     // Types are found by name alone, so two modules can't both declare one yet.
-    func note_type_decl(self, anon name: str, p: parsing.Parser, span: ast.Span) -> none {
+    func note_type_decl(self, anon name: str, p: parsing.Parser, span: ast.Span, alias_of: str = "") -> none {
         if self.type_paths.get(name) is Some(first) {
-            if first != p.path {
-                let saved_p = self.p
-                self.p = p
-                self.report_error(f"error: type `{name}` is also declared in {first}; types share one namespace across modules for now, so rename one", :span)
-                self.p = saved_p
+            if first == p.path {
+                return
             }
+            // Aliases of one type resolve alike wherever the name is looked up.
+            if len(alias_of) > 0 {
+                if self.alias_shapes.get(name) is Some(shape) {
+                    if shape == alias_of {
+                        return
+                    }
+                }
+            }
+            self.clashed_types += [name]
+            mut hint = "so rename one of them"
+            if is_test_file(first) and is_test_file(p.path) {
+                hint = "and `kod test` on a directory builds its test files into one program, so rename one or test the files one at a time"
+            }
+            let saved_p = self.p
+            self.p = p
+            self.report_error(f"error: type `{name}` is also declared in {first}; the modules of a program share type names for now, {hint}", :span)
+            self.p = saved_p
             return
         }
         self.type_paths.set(name, p.path)
+        if len(alias_of) > 0 {
+            self.alias_shapes.set(name, alias_of)
+        }
     }
 
     func register_enum(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
@@ -4158,11 +4186,12 @@ type Codegen = struct {
         self.p = p
         mut names: [str] = []
         mut targets: [int64] = []
+        mut spans: [ast.Span] = []
         for decl in module.decls {
             if decl is .TypeAlias(name, target, name_span) {
-                self.note_type_decl(name, :p, span: name_span)
                 names += [name]
                 targets += [target]
+                spans += [name_span]
             }
         }
         mut done: [bool] = []
@@ -4175,7 +4204,8 @@ type Codegen = struct {
             mut i: int64 = 0
             for i < len(names) {
                 if done[i] == false and self.type_resolvable(targets[i]) {
-                    self.register_type_alias(names[i], target: targets[i])
+                    let kind = self.register_type_alias(names[i], target: targets[i])
+                    self.note_type_decl(names[i], :p, span: spans[i], alias_of: self.canonical_kind_name(kind))
                     done[i] = true
                     progress = true
                 }
@@ -4185,7 +4215,7 @@ type Codegen = struct {
         self.p = saved_p
     }
 
-    func register_type_alias(self, anon name: str, target: int64) -> none {
+    func register_type_alias(self, anon name: str, target: int64) -> TypeKind {
         let kind: TypeKind = self.resolve_type(target)
         match kind {
             .KStruct(idx, _struct_type_args) -> {
@@ -4213,6 +4243,7 @@ type Codegen = struct {
                 }
             }
         }
+        return kind
     }
 
     // Map has no remove; -1 marks a shadowed alias.
@@ -11587,6 +11618,11 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+// What `kod test <dir>` gathers into one program.
+func is_test_file(anon path: str) -> bool {
+    return len(path) >= 9 and path[len(path) - 9..len(path)] == "_test.kod"
 }
 
 func either_flow(anon a: Flow, anon b: Flow) -> Flow {

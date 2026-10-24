@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -36,4 +37,5 @@ class Program:
                 path = relative_to.parent / path
         else:
             fs = self.stdlib_fs
-        return fs.open(path)
+        # One spelling per file, so a module reached two ways is loaded once.
+        return fs.open(Path(os.path.normpath(path)))

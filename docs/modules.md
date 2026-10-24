@@ -79,7 +79,7 @@ The same holds for a function literal or a function value used as a default (`cb
 
 A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method, field or variant with the name of an earlier one of the same struct, interface or enum (`` `Kind.A` is already declared on line 2 ``).
 
-Type names are shared by every module a program loads, for now: `pa.Pt` and `pb.Pt` would be one type. So two modules in one program can't both declare a struct, enum, interface or type alias of the same name, the builtins included. The declaration loaded second is an error naming the file of the first (`` type `Pt` is also declared in lib/pa.kod ``); rename one of them.
+Type names are shared by every module a program loads, for now: `pa.Pt` and `pb.Pt` would be one type. So two modules in one program can't both declare a struct, enum or interface of the same name, the builtins included, and a type alias can't take the name of one. Two modules may each declare an alias of the same name when both stand for the same type (`type Num = int64` in each), but not aliases of different types. The declaration loaded second is an error naming the file of the first (`` type `Pt` is also declared in lib/pa.kod ``); rename one of them. A module is one module however its path is spelled: `import "./lib/../lib/pa"` and `import "./lib/pa"` load the same file once.
 
 ## Standard library
 

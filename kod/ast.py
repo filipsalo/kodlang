@@ -1,6 +1,7 @@
 """Abstract syntax tree."""
 
 import dataclasses
+import os
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Optional, Self, Union
@@ -1307,8 +1308,8 @@ class Module(ASTNode):
         """Resolve an import. Relative (./foo) imports are resolved against
         the importing module; stdlib imports are just the bare path."""
         if module_name.startswith("./"):
-            return self.canonical_name.parent / module_name
-        return Path(module_name)
+            return Path(os.path.normpath(self.canonical_name.parent / module_name))
+        return Path(os.path.normpath(module_name))
 
 
 @dataclasses.dataclass
