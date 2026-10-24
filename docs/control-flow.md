@@ -110,7 +110,9 @@ arms all return, and a `for true` loop that only leaves through `return`,
 can't. Nor can a call that never returns: `kod_panic(...)`, or a `-> none`
 function or method without a `return` whose body can't finish by these
 same rules, such as one that ends in another such call or in a `for true`
-loop without a `break`. Until blocks get their own scopes, a method called
-on a local rather than on `self` or a parameter is taken to return; end
-the path with a `kod_panic(...)` or a `return` after it (see
+loop without a `break`. Until blocks get their own scopes, a method is
+taken to return when its receiver's type depends on a local other than
+`self` or a parameter, and a parameter that a `let`, pattern, `for` or
+let-else in the body binds again counts as a local; end the path with a
+`kod_panic(...)` or a `return` after the call (see
 [Return values](functions.md#return-values)).
