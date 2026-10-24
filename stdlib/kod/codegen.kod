@@ -8853,12 +8853,32 @@ type Codegen = struct {
                 field_kind = self.find_field_kind(field_name, :struct_idx)
             }
         }
-        // Compute rhs first (kind-aware, so an int assigned to an
-        // optional field gets wrapped), stash on stack, then compute
-        // the lhs pointer. Stashing matters because the lhs evaluation
-        // can itself hit `bl` (e.g. a method call) and clobber rhs_reg.
+        let recv_first = self.commutes(lhs, rhs_id) == false
+        mut ptr_reg = ""
+        mut ptr_spilled = false
+        if recv_first {
+            ptr_reg = self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
+            ptr_spilled = self.preserve_begin(ptr_reg)
+        }
+        // Kind-aware, so an int assigned to an optional field gets wrapped.
         let rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
         let rhs_spilled = self.preserve_begin(rhs_reg)
+        if recv_first == false {
+            ptr_reg = self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
+        }
+        if lhs_is_struct {
+            self.check_value_kind(rhs_id, expected: field_kind)
+        }
+        let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
+        if recv_first {
+            ptr_reg = self.preserve_end(ptr_reg, spilled: ptr_spilled)
+        }
+        self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
+        self.pool.free_reg(tmp_reg)
+        self.pool.free_reg(ptr_reg)
+    }
+
+    func compile_field_base(self, anon lhs: int64, field_name: str, rhs: int64, lhs_kind: TypeKind, lhs_is_struct: bool) -> str {
         let attempts_before = self.report_attempts
         let ptr_val = self.compile_expr(lhs)
         if self.report_attempts == attempts_before and lhs_is_struct == false {
@@ -8869,14 +8889,49 @@ type Codegen = struct {
             let hint = f"; unwrap it first, as in `if {opt_name} is Some(v) " + "{" + f" v.{field_name} = ... " + "}`"
             self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs], optional_hint: hint)
         }
-        if lhs_is_struct {
-            self.check_value_kind(rhs_id, expected: field_kind)
+        return self.load(ptr_val)
+    }
+
+    // Built from literals and variables only, so nothing computed around it can change it.
+    func is_stable(self, anon expr_id: int64) -> bool {
+        if self.emits_nothing(expr_id) {
+            return true
         }
-        let ptr_reg = self.load(ptr_val)
-        let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
-        self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
-        self.pool.free_reg(tmp_reg)
-        self.pool.free_reg(ptr_reg)
+        match self.p.exprs[expr_id] {
+            .BoolLit(_value) -> return true
+            .NoneLit -> return true
+            .ImplicitVariant(_name) -> return true
+            .Binary(lhs, op, rhs) -> {
+                match op {
+                    .Dot -> return false
+                    .Index -> return false
+                    else return self.is_stable(lhs) and self.is_stable(rhs)
+                }
+            }
+            else return false
+        }
+    }
+
+    // Computing it calls nothing, so it has no effect but a possible panic.
+    func is_pure(self, anon expr_id: int64) -> bool {
+        if self.is_stable(expr_id) {
+            return true
+        }
+        match self.p.exprs[expr_id] {
+            .Ident(_name) -> return true
+            .Binary(lhs, op, rhs) -> {
+                match op {
+                    .Dot -> return self.is_pure(lhs)
+                    else return self.is_pure(lhs) and self.is_pure(rhs)
+                }
+            }
+            else return false
+        }
+    }
+
+    // Whether computing `a` and `b` in either order gives the same results.
+    func commutes(self, anon a: int64, anon b: int64) -> bool {
+        return self.is_stable(a) or self.is_stable(b) or (self.is_pure(a) and self.is_pure(b))
     }
 
     func struct_method_sig(self, anon struct_idx: int64, name: str) -> SigInfo {
@@ -8963,9 +9018,13 @@ type Codegen = struct {
                     self.report_error(f"error: `{self.struct_display_name(setter_struct)}.op_index_set` must take a key and a value", span: self.p.expr_spans[lhs])
                     return
                 }
-                // Compile rhs first (clean register state), stash, then key,
-                // then load the array pointer and call.
                 let value_kind = sig.param_kinds[2]
+                let recv_late = self.commutes(lhs, rhs) and self.commutes(lhs, rhs_id)
+                if recv_late == false or self.commutes(rhs, rhs_id) == false {
+                    self.compile_ordered_index_set(lhs, key: rhs, value: rhs_id, :sig, :method_lbl, :recv_late)
+                    return
+                }
+                // No order can be told apart here, so the value goes first.
                 let rhs_r = self.pool.alloc_reg()
                 if self.converts_for(rhs_id, kind: value_kind) {
                     let converted = self.compile_value_for_kind(rhs_id, expected: value_kind)
@@ -8998,6 +9057,14 @@ type Codegen = struct {
                 self.emit(f"bl {method_lbl}")
             }
             none -> {
+                let recv_late = self.commutes(lhs, rhs) and self.commutes(lhs, rhs_id)
+                mut early_r = ""
+                mut early_spilled = false
+                if recv_late == false {
+                    early_r = self.pool.alloc_reg()
+                    self.mov_to(self.compile_expr(lhs), dest: early_r)
+                    early_spilled = self.preserve_begin(early_r)
+                }
                 let idx_v = self.compile_expr(rhs)
                 self.check_int_operand(rhs, what: "an index")
                 let idx_r = self.load(idx_v)
@@ -9014,16 +9081,24 @@ type Codegen = struct {
                 let rhs_r = self.compile_into(rhs_id, expected: self.array_elem_kind(lhs_kind))
                 // Preserve rhs across the lhs computation too.
                 let rhs_spilled = self.preserve_begin(rhs_r)
-                let arr_val = self.compile_expr(lhs)
-                let arr_ptr_r = self.pool.alloc_reg()
-                self.mov_to(arr_val, dest: arr_ptr_r)
-                let buf_r = self.pool.alloc_reg()
-                self.emit(f"ldr {buf_r}, [{arr_ptr_r}]")
-                let len_r = self.pool.alloc_reg()
-                self.emit(f"ldr {len_r}, [{arr_ptr_r}, #8]")
-                self.pool.free_reg(arr_ptr_r)
+                mut buf_r = ""
+                mut len_r = ""
+                if recv_late {
+                    let arr_val = self.compile_expr(lhs)
+                    let arr_ptr_r = self.pool.alloc_reg()
+                    self.mov_to(arr_val, dest: arr_ptr_r)
+                    buf_r = self.array_buf_len(arr_ptr_r, len_out: false)
+                    len_r = self.array_buf_len(arr_ptr_r, len_out: true)
+                    self.pool.free_reg(arr_ptr_r)
+                }
                 let reloaded_rhs_r = self.preserve_end(rhs_r, spilled: rhs_spilled)
                 let reloaded_idx_r = self.preserve_end(idx_r, spilled: idx_spilled)
+                if recv_late == false {
+                    let arr_ptr_r = self.preserve_end(early_r, spilled: early_spilled)
+                    buf_r = self.array_buf_len(arr_ptr_r, len_out: false)
+                    len_r = self.array_buf_len(arr_ptr_r, len_out: true)
+                    self.pool.free_reg(arr_ptr_r)
+                }
                 // Normalise negative index: if idx < 0, idx += len.
                 // Then bounds-check via unsigned compare. Mirrors the
                 // read path in compile_index — without the check a
@@ -9052,6 +9127,83 @@ type Codegen = struct {
                 self.pool.free_reg(reloaded_rhs_r)
             }
         }
+    }
+
+    func array_buf_len(self, anon arr_ptr_r: str, len_out: bool) -> str {
+        let r = self.pool.alloc_reg()
+        if len_out {
+            self.emit(f"ldr {r}, [{arr_ptr_r}, #8]")
+        } else {
+            self.emit(f"ldr {r}, [{arr_ptr_r}]")
+        }
+        return r
+    }
+
+    // `op_index_set` with the receiver (unless `recv_late`), the key and the value in that order.
+    func compile_ordered_index_set(self, anon lhs: int64, key: int64, value: int64, sig: SigInfo, method_lbl: str, recv_late: bool) -> none {
+        mut recv_r = ""
+        mut recv_spilled = false
+        if recv_late == false {
+            recv_r = self.pool.alloc_reg()
+            self.mov_to(self.compile_expr(lhs), dest: recv_r)
+            recv_spilled = self.preserve_begin(recv_r)
+        }
+        let key_reg = self.compile_key(key, kind: sig.param_kinds[1])
+        let key_spilled = self.preserve_begin(key_reg)
+        let value_kind = sig.param_kinds[2]
+        let rhs_r = self.pool.alloc_reg()
+        if self.converts_for(value, kind: value_kind) {
+            let converted = self.compile_value_for_kind(value, expected: value_kind)
+            self.mov_to(.VReg(name: converted), dest: rhs_r)
+        } else {
+            self.mov_to(self.compile_expr(value), dest: rhs_r)
+        }
+        if self.is_match_expr(value) == false {
+            self.check_value_kind(value, expected: value_kind)
+        }
+        let key_r = self.preserve_end(key_reg, spilled: key_spilled)
+        if recv_late {
+            recv_r = self.pool.alloc_reg()
+            self.mov_to(self.compile_expr(lhs), dest: recv_r)
+        } else {
+            recv_r = self.preserve_end(recv_r, spilled: recv_spilled)
+        }
+        self.emit(f"mov x0, {recv_r}")
+        self.emit(f"mov x1, {key_r}")
+        self.emit(f"mov x2, {rhs_r}")
+        self.pool.free_reg(recv_r)
+        self.pool.free_reg(key_r)
+        self.pool.free_reg(rhs_r)
+        self.emit(f"bl {method_lbl}")
+    }
+
+    // `f().x += 1` reads and stores through one receiver and one index.
+    func stash_store_target(self, anon lhs_id: int64, value: int64) -> int64 {
+        let .Binary(recv, op, rhs) = self.p.exprs[lhs_id] else { return lhs_id }
+        mut index = false
+        match op {
+            .Dot -> index = false
+            .Index -> index = true
+            else return lhs_id
+        }
+        if self.is_pure(recv) and (index == false or self.is_pure(rhs)) and self.is_pure(value) {
+            return lhs_id
+        }
+        if self.kind_has_unknown(self.infer_kind(recv)) or (index and self.kind_has_unknown(self.infer_kind(rhs))) {
+            return lhs_id
+        }
+        mut new_recv = recv
+        mut new_rhs = rhs
+        if self.is_stable(recv) == false {
+            new_recv = self.stash_chain_operand(recv)
+        }
+        if index and self.is_stable(rhs) == false {
+            new_rhs = self.stash_chain_operand(rhs)
+        }
+        if new_recv == recv and new_rhs == rhs {
+            return lhs_id
+        }
+        return self.p.alloc_expr(ast.Expr.Binary(lhs: new_recv, :op, rhs: new_rhs), span: self.p.expr_spans[lhs_id])
     }
 
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
@@ -9102,17 +9254,17 @@ type Codegen = struct {
     // lhs shape compile_assign supports (Ident, nested field, indexed)
     // and every type-specific .Add lowering compile_expr supports
     // (int add, str concat, array concat) without duplicating the
-    // case-by-case wiring. Caveat: lhs is evaluated twice (once to
-    // load, once to store) — fine for the LHS shapes Kod actually
-    // produces, which are all side-effect-free.
+    // case-by-case wiring. A receiver or index with effects is computed
+    // once beforehand, so the load and the store share it.
     func compile_plus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
-        let span = self.p.expr_spans[lhs_id]
-        let sum_id = self.p.alloc_expr(ast.Expr.Binary(lhs: lhs_id, op: .Add, rhs: rhs_id), :span)
+        let target = self.stash_store_target(lhs_id, value: rhs_id)
+        let span = self.p.expr_spans[target]
+        let sum_id = self.p.alloc_expr(ast.Expr.Binary(lhs: target, op: .Add, rhs: rhs_id), :span)
         let saved_append = self.append_lhs_id
         let saved_append_path = self.append_lhs_path
-        self.append_lhs_id = lhs_id
+        self.append_lhs_id = target
         self.append_lhs_path = self.p.path
-        self.compile_assign(:lhs_id, rhs_id: sum_id)
+        self.compile_assign(lhs_id: target, rhs_id: sum_id)
         self.append_lhs_id = saved_append
         self.append_lhs_path = saved_append_path
     }
@@ -9121,9 +9273,10 @@ type Codegen = struct {
     // compile_plus_assign; `-` is int-only (no str/array form), so a
     // bad operand type surfaces as a normal binary-op error.
     func compile_minus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
-        let span = self.p.expr_spans[lhs_id]
-        let diff_id = self.p.alloc_expr(ast.Expr.Binary(lhs: lhs_id, op: .Sub, rhs: rhs_id), :span)
-        self.compile_assign(:lhs_id, rhs_id: diff_id)
+        let target = self.stash_store_target(lhs_id, value: rhs_id)
+        let span = self.p.expr_spans[target]
+        let diff_id = self.p.alloc_expr(ast.Expr.Binary(lhs: target, op: .Sub, rhs: rhs_id), :span)
+        self.compile_assign(lhs_id: target, rhs_id: diff_id)
     }
 
     func compile_return(self, anon value_id: int64) -> none {

@@ -958,25 +958,48 @@ class Interpreter:
                 slot = None
                 if _slot_target(rhs) is not None:
                     slot = self._assign_slot(module, lhs)
-                rhs_val = self._evaluate_for(module, rhs, slot)
+                # `+=` and `-=` share their target node with the operator's lhs.
+                compound = isinstance(rhs, ast.BinaryOperator) and rhs.lhs is lhs
                 if isinstance(lhs, ast.BinaryOperator) and isinstance(
                     lhs.op, tokens.Dot
                 ):
                     obj = self.evaluate_expression(module, lhs.lhs)
+                    if compound:
+                        current = getattr(obj, lhs.rhs.id)
+                        rhs_val = self.evaluate_binary_operator(
+                            module, rhs.op, current, rhs.rhs
+                        )
+                    else:
+                        rhs_val = self._evaluate_for(module, rhs, slot)
                     setattr(obj, lhs.rhs.id, rhs_val)
                 elif isinstance(lhs, ast.BinaryOperator) and isinstance(
                     lhs.op, tokens.OpenBracket
                 ):
                     obj = self.evaluate_expression(module, lhs.lhs)
                     struct_methods = getattr(type(obj), "methods", {})
-                    if "op_index_set" in struct_methods:
-                        bound = BoundMethod(struct_methods["op_index_set"], obj)
+                    setter = struct_methods.get("op_index_set")
+                    if setter is not None:
+                        bound = BoundMethod(setter, obj)
                         key_val = self._evaluate_args(module, [lhs.rhs], bound)[0]
-                        self.call_function(module, bound, [key_val, rhs_val])
                     else:
                         key_val = self.evaluate_expression(module, lhs.rhs)
+                    if compound:
+                        if "op_index" in struct_methods:
+                            getter = BoundMethod(struct_methods["op_index"], obj)
+                            current = self.call_function(module, getter, [key_val])
+                        else:
+                            current = obj.op_index(key_val)
+                        rhs_val = self.evaluate_binary_operator(
+                            module, rhs.op, current, rhs.rhs
+                        )
+                    else:
+                        rhs_val = self._evaluate_for(module, rhs, slot)
+                    if setter is not None:
+                        self.call_function(module, bound, [key_val, rhs_val])
+                    else:
                         obj.value[key_val.value] = rhs_val
                 else:
+                    rhs_val = self._evaluate_for(module, rhs, slot)
                     lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
                     if (
                         _ENFORCE_IMMUTABILITY

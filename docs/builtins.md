@@ -110,7 +110,9 @@ func op_index_set(self, anon key: K, anon value: V) -> none { ... }
 ```
 
 The key and value must have those parameters' types, like a method's
-arguments.
+arguments. `m[k] = v` evaluates `m`, then `k`, then `v` before the call,
+and `m[k] += v` calls `op_index` and then `op_index_set` with the same `m`
+and `k`, each evaluated once.
 
 ## Error handling
 

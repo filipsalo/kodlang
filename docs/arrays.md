@@ -61,6 +61,12 @@ box the value. On a struct, the key of `m[k]` and the key and value of
 parameters (see [Indexing a struct](builtins.md#indexing-a-struct)), so
 `m[5]` on a `Map[str, int64]` is an error.
 
+A store evaluates its parts left to right: in `rows()[i()] = v()` and
+`m[k()] = v()` the receiver comes first, then the index or key, then the
+value, and `f().x = v()` calls `f` before `v`. A compound
+`rows()[i()] += v()` evaluates the receiver and the index once, reads the
+element and then evaluates `v()`, so `rows` and `i` are each called once.
+
 ## Length
 
 ```kod
