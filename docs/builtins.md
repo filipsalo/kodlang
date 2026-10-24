@@ -100,8 +100,10 @@ argument of that type that is or holds the key: with
 `Index[int64, Pt]` is an error at `Pt`
 (`` `Pt` can't be a `Map` key in `Index[int64, Pt]` ``). A `Map[T, V]` in
 a generic type's method names the instance whose `T` is the bad key
-(`` `Pt` can't be a `Map` key in `Box[Pt]` ``). The same holds for the
-element type of a `Set[T]` from the `set` module.
+(`` `Pt` can't be a `Map` key in `Box[Pt]` ``); any other bad key in a
+method ends with the instance it's compiled for, as other errors there do
+(`` (in `Box[int64]`) ``). The same holds for the element type of a
+`Set[T]` from the `set` module.
 
 ## Indexing a struct
 
