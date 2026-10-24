@@ -60,7 +60,9 @@ The `hash(x)` builtin takes a hashable value: an `int64`, `str`, `bytes` or
 `bool`, or a value of an enum whose variants have no payloads, which hashes
 by variant. Hashing anything else, such as a struct, an array, an optional
 or an enum with payload variants, is an error
-(`` cannot hash a value of type `[int64]` ``).
+(`` cannot hash a value of type `[int64]` ``). It gives what the methods
+above give, a `bytes` value hashes like the `str` with the same bytes, and
+an enum value hashes to its variant's position, counting from 1.
 
 ## `Map[K, V]`
 

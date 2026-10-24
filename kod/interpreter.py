@@ -445,7 +445,7 @@ class Interpreter:
                     arg_params = list(args)
                     value = self.evaluate_expression(module, arg_params[0])
                     return self._coerce_to_str(module, value)
-                # `hash(x)`: differs from the compiled hash but, like it, agrees with `==`.
+                # `hash(x)`: the values compiled code computes.
                 if (
                     isinstance(callee, ast.Name)
                     and callee.id == "hash"
@@ -923,16 +923,21 @@ class Interpreter:
 
     def _hash_value(self, value) -> "types.Int64":
         """Hash a Kod value to an int64. Used to implement the `hash(x)`
-        intrinsic. Content-based for primitives, by variant for enums;
-        the compiler rejects anything else, which falls back to its id."""
+        intrinsic: djb2 for str and bytes, the value for int64 and bool, the
+        discriminant for enums; the compiler rejects anything else, which
+        falls back to its id."""
         if isinstance(value, types.Int64):
             return types.Int64(value.value)
         if isinstance(value, types.Bool):
             return types.Int64(1 if value.value else 0)
         if isinstance(value, (types.String, types.Bytes)):
-            return types.Int64(hash(value.value))
+            h = 5381
+            for byte in value.value:
+                h = (h * 33 + byte) & 0xFFFF_FFFF_FFFF_FFFF
+            return types.Int64(h - (1 << 64) if h >= 1 << 63 else h)
         if isinstance(value, types.EnumValue):
-            return types.Int64(hash((id(value.enum_type), value.variant_name)))
+            info = value.enum_type.variants[value.variant_name]
+            return types.Int64(info.discriminant)
         return types.Int64(id(value))
 
     def _coerce_to_str(self, module, value):
