@@ -87,6 +87,32 @@ match direction {
 }
 ```
 
+## Blocks and bindings
+
+A `let` or let-else binding lasts from its statement to the end of the
+block it's in. The bindings of a match arm's pattern, or of `if … is`,
+last for that arm, a `for … in` variable for the loop body, and
+parameters for the whole function.
+
+Blocks don't have their own scopes yet: a function keeps one slot for
+each name. So a block can't bind a name again while an enclosing block
+or a parameter still has it bound:
+
+```kod
+func show(anon item: A, anon flag: bool) -> str {
+    if flag {
+        let item = B(x: 9)   // error: `item` is already a local here (line 1); ...
+        return item.show()
+    }
+    return item.show()
+}
+```
+
+The same goes for a pattern binding (`Some(x)` while a `let x` is still
+bound) and a `for` variable; give the inner binding another name. A
+block may bind a name again itself (`let x = 1`, then `let x = x + 1`),
+and so may a block after one whose binding of the name has ended.
+
 ## `return`
 
 Return a value from a function:
@@ -112,7 +138,7 @@ function or method without a `return` whose body can't finish by these
 same rules, such as one that ends in another such call or in a `for true`
 loop without a `break`. Until blocks get their own scopes, a method is
 taken to return when its receiver's type depends on a local other than
-`self` or a parameter, and a parameter that a `let`, pattern, `for` or
-let-else in the body binds again counts as a local; end the path with a
-`kod_panic(...)` or a `return` after the call (see
+`self` or a parameter, and a parameter that a `let` or let-else in the
+body binds again counts as a local; end the path with a `kod_panic(...)`
+or a `return` after the call (see
 [Return values](functions.md#return-values)).

@@ -253,6 +253,9 @@ type VarSlot = struct {
     bound: bool = false
     // Bound at some point before, so a block that bound it may have ended.
     seen: bool = false
+    // The block depth and source offset of the binding in scope.
+    depth: int64 = 0
+    bind_off: int64 = 0
 }
 
 // ── Expression result (what compile_expr returns) ─────────────────────────────
@@ -521,6 +524,7 @@ type Codegen = struct {
     walk_kinds: [TypeKind] = []
     // Slots a walk bound for the first time, to unmark when it ends.
     seen_log: [int64] = []
+    block_depth: int64 = 0
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -2465,10 +2469,80 @@ type Codegen = struct {
 
     func compile_block(self, anon stmts: [int64]) -> none {
         let mark = len(self.bound_log)
+        self.block_depth += 1
         for stmt_id in stmts {
             self.compile_stmt(stmt_id)
         }
+        self.block_depth -= 1
         self.unbind_to(mark)
+    }
+
+    func var_index(self, anon name: str) -> int64 {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return i
+            }
+            i = i - 1
+        }
+        return -1
+    }
+
+    // Until blocks get scopes, a nested binding would share the outer one's slot.
+    func rebinds_outer(self, anon name: str, off: int64, depth: int64) -> bool {
+        let i = self.var_index(name)
+        if i < 0 or self.vars[i].bound == false or self.vars[i].depth >= depth {
+            return false
+        }
+        let line = self.line_of_offset(self.vars[i].bind_off)
+        self.report_error(f"error: `{name}` is already a local here (line {line}); blocks don't have their own scopes yet, so give this one another name", span: ast.Span(start: off))
+        return true
+    }
+
+    func bind_at(self, anon name: str, off: int64, depth: int64) -> none {
+        let i = self.var_index(name)
+        if i < 0 or (self.vars[i].bound and self.vars[i].depth < depth) {
+            return
+        }
+        self.bind_var(name)
+        self.vars[i].depth = depth
+        self.vars[i].bind_off = off
+    }
+
+    func pattern_rebinds_outer(self, anon pattern_id: int64, depth: int64) -> bool {
+        let end = self.p.pattern_ends[pattern_id]
+        mut clash = false
+        for name in self.pattern_binding_names(self.p.patterns[pattern_id]) {
+            if self.rebinds_outer(name, off: self.name_before(name, off: end), :depth) {
+                clash = true
+            }
+        }
+        return clash
+    }
+
+    func bind_pattern_at(self, anon pattern_id: int64, depth: int64) -> none {
+        let end = self.p.pattern_ends[pattern_id]
+        for name in self.pattern_binding_names(self.p.patterns[pattern_id]) {
+            self.bind_at(name, off: self.name_before(name, off: end), :depth)
+        }
+    }
+
+    // Where `name` last occurs as a whole word shortly before `off`.
+    func name_before(self, anon name: str, off: int64) -> int64 {
+        let source = self.p.source
+        let n = len(name)
+        mut i = off - n
+        for i >= 0 and i > off - 256 {
+            if source[i] == name[0] and source[i..i + n] == name {
+                let clear_before = i == 0 or lexing.is_alnum(source[i - 1]) == false
+                let clear_after = i + n >= len(source) or lexing.is_alnum(source[i + n]) == false
+                if clear_before and clear_after {
+                    return i
+                }
+            }
+            i = i - 1
+        }
+        return off
     }
 
     // Whether the most-recently-declared slot for `name` permits bare
@@ -4639,7 +4713,8 @@ type Codegen = struct {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
         let mark = len(self.bound_log)
-        self.bind_pattern(pattern)
+        self.pattern_rebinds_outer(pattern_id, depth: self.block_depth + 1)
+        self.bind_pattern_at(pattern_id, depth: self.block_depth + 1)
         self.compile_block(body)
         self.unbind_to(mark)
         self.restore_pattern_bindings(pattern, kinds: saved)
@@ -4684,7 +4759,9 @@ type Codegen = struct {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
         let mark = len(self.bound_log)
-        self.bind_pattern(pattern)
+        self.block_depth += 1
+        self.pattern_rebinds_outer(pattern_id, depth: self.block_depth)
+        self.bind_pattern_at(pattern_id, depth: self.block_depth)
         let body_kind = self.infer_kind(body)
         mut target = expected
         if ok_wrap {
@@ -4716,6 +4793,7 @@ type Codegen = struct {
                 self.check_value_kind(body, :expected)
             }
         }
+        self.block_depth -= 1
         self.unbind_to(mark)
         self.restore_pattern_bindings(pattern, kinds: saved)
     }
@@ -8668,8 +8746,18 @@ type Codegen = struct {
         self.stmt_error_mark = self.report_attempts
         match self.p.stmts[stmt_id] {
             .Let(name, typ, value, mutable) -> {
-                self.compile_let(:name, :typ, :value, :mutable)
-                self.bind_var(name)
+                mut before = self.p.expr_spans[value].start
+                if typ != 0 {
+                    before = self.p.type_spans[typ].start
+                }
+                let off = self.name_before(name, off: before)
+                if self.rebinds_outer(name, :off, depth: self.block_depth) {
+                    self.compile_discard(value)
+                    self.update_var_kind(:name, kind: .KUnknown)
+                } else {
+                    self.compile_let(:name, :typ, :value, :mutable)
+                    self.bind_at(name, :off, depth: self.block_depth)
+                }
             }
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
             .PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs_id: lhs, rhs_id: rhs)
@@ -8686,8 +8774,15 @@ type Codegen = struct {
             }
             .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
             .LetElse(pattern, value, else_body) -> {
-                self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
-                self.bind_pattern(self.p.patterns[pattern])
+                if self.pattern_rebinds_outer(pattern, depth: self.block_depth) {
+                    self.compile_discard(value)
+                    for name in self.pattern_binding_names(self.p.patterns[pattern]) {
+                        self.update_var_kind(:name, kind: .KUnknown)
+                    }
+                } else {
+                    self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
+                    self.bind_pattern_at(pattern, depth: self.block_depth)
+                }
             }
             .Throw(value) -> self.compile_throw(value)
             .Assert(expr, source_text, span) -> self.compile_assert(expr, :source_text, :span)
@@ -10708,6 +10803,9 @@ type Codegen = struct {
 
     func compile_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
         self.note_wide_fn_local(name, value: iter_id)
+        let name_off = self.name_before(name, off: self.p.expr_spans[iter_id].start)
+        let clash = self.rebinds_outer(name, off: name_off, depth: self.block_depth + 1)
+        let outer_kind = self.find_var_kind(name)
         // Pin the element binding's kind for THIS loop. Collection only
         // pre-reserved a slot (with a placeholder kind) because two loops
         // can share an element name with different iterator types — the
@@ -10788,9 +10886,12 @@ type Codegen = struct {
         self.pool.free_reg(hdr_reg)
 
         let mark = len(self.bound_log)
-        self.bind_var(name)
+        self.bind_at(name, off: name_off, depth: self.block_depth + 1)
         self.compile_block(body)
         self.unbind_to(mark)
+        if clash {
+            self.update_var_kind(:name, kind: outer_kind)
+        }
 
         self.emit_label(incr_lbl)
         let bump_reg = self.pool.alloc_reg()
@@ -11182,6 +11283,7 @@ type Codegen = struct {
         self.vars = []
         self.limit_fn_locals = []
         self.bound_log = []
+        self.block_depth = 0
         self.frame_slots = 0
         self.pool.reset()
         self.loop_stack = []
@@ -11209,6 +11311,8 @@ type Codegen = struct {
             // mutable, so only params need this explicit set.
             self.vars[-1].mutable = param.mutable
             self.vars[-1].bound = true
+            self.vars[-1].depth = 1
+            self.vars[-1].bind_off = param.span.start
         }
 
         for stmt_id in func_decl.body {

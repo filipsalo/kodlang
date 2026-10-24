@@ -4,13 +4,15 @@
 import ctypes
 import dataclasses
 import os
+import re
 import sys
 from typing import Any
 
 from kod import ast, tokens
 from kod import values as types
-from kod.exceptions import KodError
+from kod.exceptions import KodError, get_source
 from kod.program import Program
+from kod.span import Span
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
@@ -235,64 +237,118 @@ def _children(node):
 
 def _mark_scopes(func):
     """Note at each `f(...)` and `name.` whether that name is a local there."""
-    _scope_block(func.body, {p.variable.id for p in func.params})
     func.__dict__["_kod_scoped"] = True
+    _scope_block(func.body, {p.variable.id: (1, p.span) for p in func.params}, 1)
 
 
-def _scope_block(stmts, bound):
-    bound = set(bound)
+def _mark_program_scopes(program):
+    for module in program:
+        for stmt in module.body:
+            funcs = []
+            if isinstance(stmt, ast.FunctionDeclaration):
+                funcs = [stmt]
+            elif isinstance(stmt, ast.TypeDeclaration):
+                owner = getattr(stmt.type, "template", stmt.type)
+                funcs = getattr(owner, "methods", {}).values()
+            for func in funcs:
+                if "_kod_scoped" not in func.__dict__:
+                    _mark_scopes(func)
+
+
+def _line_of(span):
+    return get_source(span.filename)[: span.start].count("\n") + 1
+
+
+def _name_span(span, name, end=None):
+    """The last whole-word `name` in `span` before `end` and any `->`."""
+    text = get_source(span.filename)[span.start : end or span.end].split("->")[0]
+    for m in reversed(list(re.finditer(rf"\b{re.escape(name)}\b", text))):
+        start = span.start + m.start()
+        return Span(span.filename, start, start + len(name))
+    return span
+
+
+def _bind(bound, name, span, depth):
+    # Until blocks get scopes, a nested binding would share the outer one's slot.
+    outer = bound.get(name)
+    if outer is not None and outer[0] < depth:
+        raise KodError(
+            f"`{name}` is already a local here (line {_line_of(outer[1])}); blocks"
+            " don't have their own scopes yet, so give this one another name",
+            span,
+        )
+    bound[name] = (depth, span)
+
+
+def _bind_pattern(bound, pattern, depth, end=None):
+    for name in _pattern_names(pattern):
+        _bind(bound, name, _name_span(pattern.span, name, end), depth)
+
+
+def _scope_block(stmts, bound, depth):
+    bound = dict(bound)
     for stmt in stmts:
-        _scope_stmt(stmt, bound)
+        _scope_stmt(stmt, bound, depth)
 
 
-def _scope_stmt(stmt, bound):
+def _scope_stmt(stmt, bound, depth):
     t = type(stmt)
+    inner = depth + 1
     if t is ast.VariableDeclaration:
-        _scope_expr(stmt.value, bound)
-        bound.add(stmt.variable.id)
+        _scope_expr(stmt.value, bound, depth)
+        _bind(bound, stmt.variable.id, stmt.variable.span, depth)
     elif t is ast.LetElseStatement:
-        _scope_expr(stmt.value, bound)
-        _scope_block(stmt.else_body, bound)
-        bound.update(_pattern_names(stmt.pattern))
+        _scope_expr(stmt.value, bound, depth)
+        _scope_block(stmt.else_body, bound, inner)
+        _bind_pattern(bound, stmt.pattern, depth, stmt.value.span.start)
     elif t is ast.IfStatement:
-        _scope_expr(stmt.condition, bound)
-        _scope_block(stmt.true_branch, bound)
-        _scope_block(stmt.false_branch, bound)
+        _scope_expr(stmt.condition, bound, depth)
+        _scope_block(stmt.true_branch, bound, inner)
+        _scope_block(stmt.false_branch, bound, inner)
     elif t is ast.ForStatement:
-        _scope_expr(stmt.condition, bound)
-        _scope_block(stmt.body, bound)
+        _scope_expr(stmt.condition, bound, depth)
+        _scope_block(stmt.body, bound, inner)
     elif t is ast.ForEachStatement:
-        _scope_expr(stmt.iterable, bound)
-        _scope_block(stmt.body, bound | {stmt.binding})
+        _scope_expr(stmt.iterable, bound, depth)
+        body = dict(bound)
+        name_span = _name_span(stmt.span, stmt.binding, stmt.iterable.span.start)
+        _bind(body, stmt.binding, name_span, inner)
+        _scope_block(stmt.body, body, inner)
     elif t is ast.MatchStatement:
-        _scope_expr(stmt.expression, bound)
+        _scope_expr(stmt.expression, bound, depth)
         for arm in stmt.arms:
-            _scope_block(arm.body, bound | set(_pattern_names(arm.pattern)))
+            body = dict(bound)
+            _bind_pattern(body, arm.pattern, inner)
+            _scope_block(arm.body, body, inner)
     elif isinstance(stmt, ast.ASTNode):
-        _scope_expr(stmt, bound)
+        _scope_expr(stmt, bound, depth)
 
 
-def _scope_expr(node, bound):
+def _scope_expr(node, bound, depth):
     t = type(node)
     if t is ast.FunctionDeclaration:
+        if "_kod_scoped" not in node.__dict__:
+            _mark_scopes(node)
         return
     if t is ast.FunctionCall and type(node.callee) is ast.Name:
         node.callee.__dict__["_kod_bound"] = node.callee.id in bound
-        _scope_expr(node.args, bound)
+        _scope_expr(node.args, bound, depth)
         return
     if t is ast.BinaryOperator and isinstance(node.op, tokens.Dot):
         if type(node.lhs) is ast.Name:
             node.lhs.__dict__["_kod_bound"] = node.lhs.id in bound
         else:
-            _scope_expr(node.lhs, bound)
+            _scope_expr(node.lhs, bound, depth)
         return
     if t is ast.MatchExpression:
-        _scope_expr(node.expression, bound)
+        _scope_expr(node.expression, bound, depth)
         for arm in node.arms:
-            _scope_expr(arm.body, bound | set(_pattern_names(arm.pattern)))
+            body = dict(bound)
+            _bind_pattern(body, arm.pattern, depth + 1)
+            _scope_expr(arm.body, body, depth + 1)
         return
     for child in _children(node):
-        _scope_expr(child, bound)
+        _scope_expr(child, bound, depth)
 
 
 def _value_arm(arm, value):
@@ -322,6 +378,7 @@ class Interpreter:
             for statement in module.body:
                 self.execute_statement(module, statement)
         entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
+        _mark_program_scopes(self.program)
         main = self.lookup(entry_module, "main")
         if len(main.params) > 0:
             string_array = types.ArrayType.make(types.String)

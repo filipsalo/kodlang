@@ -183,17 +183,18 @@ only when what it calls doesn't depend on such a type: the builtin
 `kod_panic`, a function of the module or one it imports (`die(msg)`), a
 function of an imported module (`log.die(msg)`), or a method whose
 receiver's type depends on no local but `self` and parameters that no
-`let`, pattern, `for` or let-else in the body binds again
-(`self.fail(msg)`, `self.log.fail(msg)`, `r.fail(msg)` for such a
-parameter `r`, `reporter().fail(msg)`, and `make(t).fail(msg)` or
+`let` or let-else in the body binds again (`self.fail(msg)`,
+`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r`,
+`reporter().fail(msg)`, and `make(t).fail(msg)` or
 `self.reps[i].fail(msg)` even for locals `t` and `i`, since the type of
-the receiver doesn't depend on them). A method whose receiver's type depends on any other local
-is taken to return, whether a `let` (`let r = Reporter(); r.fail(msg)`),
-a match arm, `if … is`, let-else or `for` binds it, and a parameter that
-the body binds again counts as such a local. So is a plain call of a name
-that such a local has at that point, even when it doesn't hold a function
-(`kod_panic(msg)` after `let kod_panic = 5`). To end the path there, put
-a `kod_panic(...)` or a `return` after the call.
+the receiver doesn't depend on them). A method whose receiver's type
+depends on any other local is taken to return, whether a `let`
+(`let r = Reporter(); r.fail(msg)`), a match arm, `if … is`, let-else or
+`for` binds it, and a parameter that the body binds again counts as such
+a local. So is a plain call of a name that such a local has at that
+point, even when it doesn't hold a function (`kod_panic(msg)` after
+`let kod_panic = 5`). To end the path there, put a `kod_panic(...)` or a
+`return` after the call.
 
 A call in a value's place, as a returned value, a match arm's value or an
 `x? or ...` default, is decided where it is written, from the type its
