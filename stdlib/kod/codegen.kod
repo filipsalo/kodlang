@@ -476,14 +476,19 @@ type Codegen = struct {
     naming_locals: bool = false
     returns_gen: int64 = 0
     returns_pending: [str] = []
-    // Calls past the limit, reported only if nothing they go through was.
-    limit_reports: int64 = 0
+    // Calls past the limit, reported unless the function type they go through was.
     limit_call_msgs: [str] = []
     limit_call_spans: [ast.Span] = []
     // Indices into `vars` bound in the scopes entered so far, innermost last.
     bound_log: [int64] = []
     // Type name → the file that first declared it.
     type_paths: StrMap = StrMap()
+    limit_call_insts: [int64] = []
+    limit_call_kinds: [str] = []
+    // Function types and literals past the limit that this module reported.
+    limit_kinds: [str] = []
+    // Locals bound to one of this module's functions past the limit.
+    limit_fn_locals: [str] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -1684,7 +1689,6 @@ type Codegen = struct {
         if count <= 8 {
             return
         }
-        self.limit_reports += 1
         if params[0].name == "self" {
             self.report_error(f"error: {what} takes {count - 1} parameters besides `self`, but a method can take at most 7", :span)
             return
@@ -6756,7 +6760,7 @@ type Codegen = struct {
             .Optional(inner) -> self.check_type_expr(inner)
             .Func(params, return_typ) -> {
                 if len(params) > 8 {
-                    self.limit_reports += 1
+                    self.limit_kinds += [self.canonical_kind_name(self.resolve_type(type_id))]
                     self.report_error(f"error: this function type takes {len(params)} parameters, but a function can take at most 8", :span)
                 }
                 for param in params {
@@ -7033,6 +7037,40 @@ type Codegen = struct {
         return self.compile_method_call(args, receiver_id: callee_lhs, :method_name, span: self.p.expr_spans[callee_lhs])
     }
 
+    // `let h = f` with `f` one of this module's functions past the limit, reported at `f`.
+    func note_wide_fn_local(self, anon name: str, value: int64) -> none {
+        mut wide = false
+        if self.p.exprs[value] is .Ident(fn_name) {
+            if self.var_bound(fn_name) {
+                wide = regalloc.str_in(self.limit_fn_locals, p: fn_name)
+            } else {
+                let slot = self.lookup_func(fn_name)
+                wide = slot >= 0 and self.func_def_paths[slot] == self.p.path and len(self.fn_sig(slot).param_kinds) > 8
+            }
+        }
+        if wide == regalloc.str_in(self.limit_fn_locals, p: name) {
+            return
+        }
+        if wide {
+            self.limit_fn_locals += [name]
+            return
+        }
+        mut kept: [str] = []
+        for local in self.limit_fn_locals {
+            if local != name {
+                kept += [local]
+            }
+        }
+        self.limit_fn_locals = kept
+    }
+
+    func holds_own_wide_fn(self, anon callee_id: int64) -> bool {
+        if self.p.exprs[callee_id] is .Ident(name) {
+            return regalloc.str_in(self.limit_fn_locals, p: name)
+        }
+        return false
+    }
+
     // Indirect call on any expression of `KFunc` type. The callee
     // expression may itself be a Call (`getfn()(x)`), a field load
     // (`obj.handler(x)` where handler is a field, not a method), an
@@ -7070,9 +7108,11 @@ type Codegen = struct {
                 for arg in args {
                     self.compile_discard(arg.value)
                 }
-                if self.p.path == self.entry_path {
+                if self.p.path == self.entry_path and self.holds_own_wide_fn(callee_id) == false {
                     self.limit_call_msgs += [f"error: {self.callee_desc(callee_id)} takes {len(args)} parameters, but a function can take at most 8"]
                     self.limit_call_spans += [self.p.expr_spans[callee_id]]
+                    self.limit_call_insts += [self.body_instance]
+                    self.limit_call_kinds += [self.canonical_kind_name(callee_kind)]
                 }
                 return .VImm(value: 0)
             }
@@ -8292,6 +8332,7 @@ type Codegen = struct {
 
     func compile_let(self, name: str, typ: int64, value: int64, mutable: bool) -> none {
         self.check_type_expr(typ)
+        self.note_wide_fn_local(name, :value)
         let off = self.find_var_offset(name)
         mut kind = self.resolve_type(typ)
         if typ == 0 {
@@ -10725,10 +10766,18 @@ type Codegen = struct {
                 what = f"`{struct_name}.{func_decl.name}`"
             } else if self.is_lambda_name(func_decl.name) {
                 what = "this function literal"
+                if len(func_decl.params) > 8 {
+                    let slot = self.lookup_func(func_decl.name)
+                    if slot != -1 {
+                        let sig = self.fn_sig(slot)
+                        self.limit_kinds += [self.canonical_kind_name(.KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind))]
+                    }
+                }
             }
             self.check_param_count(func_decl.params, :what, span: func_decl.name_span)
         }
         self.vars = []
+        self.limit_fn_locals = []
         self.bound_log = []
         self.frame_slots = 0
         self.pool.reset()
@@ -11062,13 +11111,16 @@ type Codegen = struct {
             }
             cursor = cursor + 1
         }
-        if self.limit_reports == 0 {
-            mut ci = 0
-            for span in self.limit_call_spans {
+        let saved_instance = self.body_instance
+        mut ci = 0
+        for span in self.limit_call_spans {
+            if regalloc.str_in(self.limit_kinds, p: self.limit_call_kinds[ci]) == false {
+                self.body_instance = self.limit_call_insts[ci]
                 self.report_error(self.limit_call_msgs[ci], :span)
-                ci += 1
             }
+            ci += 1
         }
+        self.body_instance = saved_instance
 
         if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 {
             self.println(".data")
