@@ -98,7 +98,11 @@ The stdlib lives under `stdlib/` in the repository.
 
 ## Circular imports
 
-Circular imports are not supported. The dependency graph must be a DAG.
+Keep the dependency graph a DAG: the interpreter can't load circular
+imports. The compiler accepts them, and a struct, enum or interface
+declared in a module of the cycle is the same type on either side, so a
+value of it can be passed both ways, also inside an array, an optional or
+a `Map`.
 
 ## Visibility
 
