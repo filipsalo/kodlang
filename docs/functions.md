@@ -121,10 +121,8 @@ conversions as an argument: `func f() -> str { return 5 }` is an error
 (`` expected `str`, got `int64` ``), and so is returning a `[Sq]` variable
 from a `-> [Shape]` function. A `-> none` function returns no value; it
 can end with a bare `return`, `return none`, or `return` of a call that
-itself returns `none`. Any function can return a call that doesn't return,
-such as `return self.fail("bad")` or `return log.die("bad")`, where the
-method or function returns `none`, has no `return` and ends in
-`kod_panic(...)` on every path.
+itself returns `none`. Any function can return a call that never returns
+(see below), such as `return self.fail("bad")` or `return log.die("bad")`.
 
 In a `-> T or Error` function, a returned `T` becomes a successful result.
 A returned `T or Error` value must have the same `T`, so returning an
@@ -147,6 +145,14 @@ Whether a path can reach the end is decided from the statements alone:
 
 Code after a statement that ends every path is never run and isn't
 considered.
+
+`kod_panic(...)` never returns, and neither does a function or method that
+returns `none`, has no `return`, and can't reach the end of its body by
+these rules. So a helper that ends in `kod_panic(...)` never returns, and
+nor does one that ends in a call of another such helper (`self.fail(msg)`,
+`log.die(msg)`, or a function declared further down), or in a `for true`
+loop it can't `break` out of. A call that leads back to the function
+itself doesn't count: `func spin() -> none { spin() }` is taken to return.
 
 ## `main`
 

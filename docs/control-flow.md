@@ -107,4 +107,7 @@ body (see [Return values](functions.md#return-values)). An `if` without an
 `else`, a `for` over a condition or an array, and a `for true` loop with a
 `break` can all finish, so a `return` has to follow them; a `match` whose
 arms all return, and a `for true` loop that only leaves through `return`,
-can't.
+can't. Nor can a call that never returns: `kod_panic(...)`, or a `-> none`
+function or method without a `return` whose body can't finish by these
+same rules, such as one that ends in another such call or in a `for true`
+loop without a `break`.

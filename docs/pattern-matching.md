@@ -197,10 +197,10 @@ which is how arms of different structs become one interface value:
 `let s: Shape = match k { 1 -> Sq(s: 2) else -> Circle(r: 1) }`.
 
 When the match's value is used, every arm needs a value: an arm that calls
-a function returning `none` is an error, unless the call doesn't return.
-`kod_panic(...)` doesn't, and neither does a function or method returning
-`none` that has no `return` and ends in `kod_panic(...)` on every path, an
-imported module's function (`log.die(...)`) included. In a `-> none`
+a function returning `none` is an error, unless the call never returns,
+like `kod_panic(...)` or a helper that ends in one, an imported module's
+function (`log.die(...)`) included (see
+[Return values](functions.md#return-values)). In a `-> none`
 or `-> none or Error` function, `return match k { 1 -> a() else -> b() }`
 doesn't use the value, so its arms may return `none`. Without an annotation, a match whose arms are
 all `none` is an error too, as `let x = none` is, since its type can't be
@@ -255,10 +255,11 @@ if v is .Some(x) {
 Destructure with an early-exit on the non-matching case. The `else`
 block must exit the enclosing scope (return / throw / panic, or
 break / continue in a loop) so the bindings are guaranteed-in-scope
-below. A block that can reach its end is an error. It may end in an
-`if`/`else` or a `match` whose every branch exits, and a panic is
-`kod_panic(...)` or a call to a function that doesn't return, as for
-match arms above:
+below. A block that can reach its end is an error, decided by the same
+rules as the end of a function (see
+[Return values](functions.md#return-values)): it may end in an `if`/`else`
+or a `match` whose every branch exits, in a `for true` loop it can't
+`break` out of, or in a call that never returns, as for match arms above:
 
 ```kod
 let .Some(v) = m.get(key) else { return -1 }
