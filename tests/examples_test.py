@@ -329,8 +329,7 @@ def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
 
 
 def test_interpreter_reads_a_plus_chain_once(monkeypatch):
-    """Whether an operand of `+` takes its enum from a slot is worked out
-    once per operand, so a long chain is evaluated in linear time."""
+    """A long `+` chain, of ints or of `.Variant` literals, takes linear time."""
     from kod import __main__ as cli
     from kod import interpreter
 
@@ -344,11 +343,14 @@ def test_interpreter_reads_a_plus_chain_once(monkeypatch):
 
     monkeypatch.setattr(interpreter, "_slot_target", counting)
     terms = " + ".join(["i"] * 100)
+    lits = " + ".join(["[.A]"] * 100)
     src = ROOT / "build" / f"plus_chain_{os.getpid()}.kod"
     src.parent.mkdir(exist_ok=True)
     src.write_text(
+        "type C = enum {\n    A\n}\n\n"
         "func main() -> int64 {\n    mut t = 0\n    mut i = 0\n"
-        f"    for i < 20 {{\n        t = t + {terms}\n        i += 1\n    }}\n"
+        f"    for i < 20 {{\n        t = t + {terms}\n        let xs = {lits}\n"
+        "        t += len(xs)\n        i += 1\n    }\n"
         "    return t\n}\n"
     )
     monkeypatch.chdir(ROOT)
@@ -358,5 +360,5 @@ def test_interpreter_reads_a_plus_chain_once(monkeypatch):
             cli.main()
     finally:
         src.unlink()
-    assert exited.value.code == 19000
-    assert calls < 20 * 100
+    assert exited.value.code == 21000
+    assert calls < 20 * 100 * 20

@@ -112,13 +112,21 @@ def _unlabelled_field(shown, fields, args, i):
     return f"argument {i + 1} of `{shown}` needs a field label{hint}"
 
 
-def _concat_operands(expr, out):
+def _chain_anchor(expr):
+    """The first operand of a `+` chain that isn't a literal or `match`; else None."""
     if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.Plus:
-        _concat_operands(expr.lhs, out)
-        _concat_operands(expr.rhs, out)
-    else:
-        out.append(expr)
-    return out
+        # Kept on the node: each `+` of a chain with no anchor asks this of its lhs.
+        anchor = expr.__dict__.get("_kod_anchor", False)
+        if anchor is False:
+            anchor = _chain_anchor(expr.lhs)
+            if anchor is None:
+                anchor = _chain_anchor(expr.rhs)
+            expr.__dict__["_kod_anchor"] = anchor
+        return anchor
+    target = _slot_target(expr)
+    if type(target) is ast.ArrayLiteral or type(target) is ast.MatchExpression:
+        return None
+    return expr
 
 
 def _wants_slot(expr):
@@ -1192,9 +1200,9 @@ class Interpreter:
                     module, lhs, self._static_slot(module, rhs)
                 )
                 return lhs_val, self.evaluate_expression(module, rhs)
-            # A unit variant is built without effects, so it can wait for the other side.
-            if type(rhs) is ast.MatchExpression:
-                rhs = self._match_leaf(module, rhs)
+        # A unit variant is built without effects, so it can wait for the other side.
+        if type(lhs) is ast.ImplicitEnumVariant and type(rhs) is ast.MatchExpression:
+            rhs = self._match_leaf(module, rhs)
         if _takes_side(rhs):
             lhs_val = self.evaluate_expression(module, lhs)
             return lhs_val, self._evaluate_for(module, rhs, self._value_slot(lhs_val))
@@ -1211,25 +1219,55 @@ class Interpreter:
     def _value_slot(self, value):
         return value.enum_type if isinstance(value, types.EnumValue) else None
 
-    def _quiet_lookup(self, module, expr):
-        """The value of a name or a field of one, read without side effects; else None."""
-        if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.Dot:
-            obj = self._quiet_lookup(module, expr.lhs)
-            if not hasattr(type(obj), "struct_fields"):
+    def _quiet_kind(self, module, expr):
+        """A value `expr` would have, or else its type, found without evaluating it; else None."""
+        t = type(expr)
+        if t is ast.Expression:
+            return self._quiet_kind(module, expr.value)
+        if t is ast.Name or t is ast.Variable:
+            try:
+                return self.lookup(module, expr)
+            except ValueError:
                 return None
-            return getattr(obj, expr.rhs.id, None)
-        if not isinstance(expr, (ast.Name, ast.Variable)):
+        if t is ast.FunctionCall:
+            func = self._quiet_callee(module, expr.callee)
+            if not isinstance(func, ast.FunctionDeclaration):
+                return None
+            owner = getattr(func, "module", None) or module
+            return self._type_of(owner, func.return_type, any_type=True)
+        if t is not ast.BinaryOperator:
             return None
-        try:
-            return self.lookup(module, expr)
-        except ValueError:
+        if type(expr.op) is tokens.Dot:
+            owner = self._quiet_kind(module, expr.lhs)
+            if isinstance(owner, type) and issubclass(owner, types.EnumType):
+                return owner
+            if isinstance(owner, type):
+                return self._field_slot(owner, expr.rhs.id)
+            if isinstance(owner, ast.Module):
+                return owner.names.get(expr.rhs.id)
+            if hasattr(type(owner), "struct_fields"):
+                return getattr(owner, expr.rhs.id, None)
             return None
+        if type(expr.op) is tokens.OpenBracket:
+            array = self._quiet_kind(module, expr.lhs)
+            if isinstance(array, type):
+                return getattr(array, "item_type", None)
+            if isinstance(array, types.ArrayType):
+                item = getattr(type(array), "item_type", None)
+                if self._variant_slot(item) is not None:
+                    return item
+                elements = array.value
+                return elements[0] if isinstance(elements, list) and elements else None
+        return None
 
     def _quiet_callee(self, module, callee):
         """What a call of `callee` calls, if found without side effects; else None."""
         if type(callee) is ast.BinaryOperator and type(callee.op) is tokens.Dot:
             if not isinstance(callee.lhs, (ast.Name, ast.Variable)):
-                return None
+                owner = self._quiet_kind(module, callee.lhs)
+                cls = owner if isinstance(owner, type) else type(owner)
+                methods = getattr(cls, "methods", None)
+                return methods.get(callee.rhs.id) if isinstance(methods, dict) else None
         elif not isinstance(callee, (ast.Name, ast.Variable)):
             return None
         try:
@@ -1240,33 +1278,18 @@ class Interpreter:
 
     def _chain_slot(self, module, lhs, rhs):
         """The array slot of a `+` chain's first operand that isn't a literal or `match`."""
-        for operand in _concat_operands(rhs, _concat_operands(lhs, [])):
-            target = _slot_target(operand)
-            if type(target) is ast.ArrayLiteral or type(target) is ast.MatchExpression:
-                continue
-            return self._static_slot(module, operand)
-        return None
+        anchor = _chain_anchor(lhs)
+        if anchor is None:
+            anchor = _chain_anchor(rhs)
+        return None if anchor is None else self._static_slot(module, anchor)
 
     def _static_slot(self, module, expr):
         """The enum, or array of one, that `expr` has, found without evaluating it."""
-        if type(expr) is ast.FunctionCall:
-            func = self._quiet_callee(module, expr.callee)
-            if not isinstance(func, ast.FunctionDeclaration):
-                return None
-            owner = getattr(func, "module", None) or module
-            return self._variant_slot(self._type_of(owner, func.return_type))
-        if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.Dot:
-            owner = self._quiet_lookup(module, expr.lhs)
-            if isinstance(owner, type) and issubclass(owner, types.EnumType):
-                return owner
-        if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.OpenBracket:
-            array = self._quiet_lookup(module, expr.lhs)
-            return (
-                self._elem_slot(array) if isinstance(array, types.ArrayType) else None
-            )
-        value = self._quiet_lookup(module, expr)
-        slot = self._value_slot(value)
-        return slot if slot is not None else self._array_slot(value)
+        kind = self._quiet_kind(module, expr)
+        if isinstance(kind, type):
+            return self._variant_slot(kind)
+        slot = self._value_slot(kind)
+        return slot if slot is not None else self._array_slot(kind)
 
     def _elem_slot(self, array):
         """The enum, or array of one, that `array`'s elements have, from its first."""
@@ -1288,7 +1311,8 @@ class Interpreter:
         return types.ArrayType.make(elem) if elem is not None else None
 
     def _field_slot(self, obj, name):
-        for field in getattr(type(obj), "struct_fields", []):
+        cls = obj if isinstance(obj, type) else type(obj)
+        for field in getattr(cls, "struct_fields", []):
             if field.id == name:
                 return field.type
         return None
@@ -1337,19 +1361,19 @@ class Interpreter:
             func.__dict__["_kod_return_slot"] = slot
         return slot
 
-    def _type_of(self, module, expr):
-        """The enum, or array of one, that a return type names in `module`."""
+    def _type_of(self, module, expr, any_type=False):
+        """The enum, or array of one, that a return type names in `module`; any type if `any_type`."""
         if module is None:
             return None
         if ast.is_result_type_expr(expr):
-            return self._type_of(module, expr.args[0])
+            return self._type_of(module, expr.args[0], any_type)
         if isinstance(expr, ast.OptionalTypeExpr):
-            return self._type_of(module, expr.inner)
+            return self._type_of(module, expr.inner, any_type)
         if isinstance(expr, ast.ArrayTypeExpr):
-            inner = self._type_of(module, expr.element)
+            inner = self._type_of(module, expr.element, any_type)
             return types.ArrayType.make(inner) if inner is not None else None
         if isinstance(expr, ast.ResolvedTypeExpr):
-            return self._variant_slot(expr.resolved)
+            return expr.resolved if any_type else self._variant_slot(expr.resolved)
         owner = None
         if isinstance(expr, ast.QualifiedTypeExpr):
             owner = self._alias_import(module, expr.module)
@@ -1368,7 +1392,9 @@ class Interpreter:
         named = owner.names.get(expr.name)
         if isinstance(named, type) and issubclass(named, types.EnumType):
             if self._is_result_enum(named):
-                return self._variant_slot(named.variants["Ok"].fields[0].type)
+                named = named.variants["Ok"].fields[0].type
+        if any_type:
+            return named if isinstance(named, type) else None
         return self._variant_slot(named)
 
     def _match_arm_body(self, value, arms):
