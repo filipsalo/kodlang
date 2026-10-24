@@ -668,19 +668,13 @@ class Interpreter:
                     tokens.GreaterThan: "op_gt",
                     tokens.GreaterEqual: "op_ge",
                 }
-                first_is_variant = _is_variant(operands[0])
-                if first_is_variant:
-                    nxt = self.evaluate_expression(module, operands[1])
-                    prev = self._evaluate_for(
-                        module, operands[0], self._value_slot(nxt)
-                    )
-                elif type(operands[0]) is ast.MatchExpression:
-                    slot = self._static_slot(module, operands[1])
-                    prev = self._evaluate_for(module, operands[0], slot)
+                first_takes_side = _takes_side(operands[0])
+                if first_takes_side:
+                    prev, nxt = self._variant_operands(module, operands[0], operands[1])
                 else:
                     prev = self.evaluate_expression(module, operands[0])
                 for i, op in enumerate(ops):
-                    if i > 0 or not first_is_variant:
+                    if i > 0 or not first_takes_side:
                         nxt = self._evaluate_for(
                             module, operands[i + 1], self._value_slot(prev)
                         )
@@ -1025,14 +1019,32 @@ class Interpreter:
 
     def _variant_operands(self, module, lhs, rhs):
         """Operands of `==` with a `.Variant` or `match`, which takes the other side's enum."""
+        if type(lhs) is ast.MatchExpression:
+            lhs = self._match_leaf(module, lhs)
+            if type(lhs) is not ast.ImplicitEnumVariant:
+                if _takes_side(rhs):
+                    lhs_val = self.evaluate_expression(module, lhs)
+                    slot = self._value_slot(lhs_val)
+                    return lhs_val, self._evaluate_for(module, rhs, slot)
+                lhs_val = self._evaluate_for(
+                    module, lhs, self._static_slot(module, rhs)
+                )
+                return lhs_val, self.evaluate_expression(module, rhs)
+            # A unit variant is built without effects, so it can wait for the other side.
+            if type(rhs) is ast.MatchExpression:
+                rhs = self._match_leaf(module, rhs)
         if _takes_side(rhs):
             lhs_val = self.evaluate_expression(module, lhs)
             return lhs_val, self._evaluate_for(module, rhs, self._value_slot(lhs_val))
-        if type(lhs) is ast.MatchExpression:
-            lhs_val = self._evaluate_for(module, lhs, self._static_slot(module, rhs))
-            return lhs_val, self.evaluate_expression(module, rhs)
         rhs_val = self.evaluate_expression(module, rhs)
         return self._evaluate_for(module, lhs, self._value_slot(rhs_val)), rhs_val
+
+    def _match_leaf(self, module, expr):
+        """The arm body a `match` reaches, through nested ones, with its bindings set."""
+        while type(expr) is ast.MatchExpression:
+            value = self.evaluate_expression(module, expr.expression)
+            expr = self._match_arm_body(value, expr.arms)
+        return expr
 
     def _value_slot(self, value):
         return value.enum_type if isinstance(value, types.EnumValue) else None
