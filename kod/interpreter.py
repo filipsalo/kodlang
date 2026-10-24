@@ -1108,6 +1108,11 @@ class Interpreter:
             owner = self._quiet_lookup(module, expr.lhs)
             if isinstance(owner, type) and issubclass(owner, types.EnumType):
                 return owner
+        if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.OpenBracket:
+            array = self._quiet_lookup(module, expr.lhs)
+            return (
+                self._elem_slot(array) if isinstance(array, types.ArrayType) else None
+            )
         value = self._quiet_lookup(module, expr)
         slot = self._value_slot(value)
         return slot if slot is not None else self._array_slot(value)
