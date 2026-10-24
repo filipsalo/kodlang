@@ -202,8 +202,9 @@ receiver has there, so `return r.fail(msg)` never returns after
 `let r = Reporter()`. What it calls is still decided by the rules above:
 `return die(msg)` is an error when `die` ends in `r.fail(msg)` on such a
 local, and the error names that call and its line
-(`` as `die` ends in `r.fail(msg)` (line 19) ``) and says to put a
-`kod_panic(...)` after it. The `can reach its end` error names it too
+(`` as `die` ends in `r.fail(msg)` (line 19) ``, or
+`` (line 19 of lib/log.kod) `` when the call is in another module) and
+says to put a `kod_panic(...)` after it. The `can reach its end` error names it too
 when the body ends in such a call, or in a call through a local of its
 own. A method called through an interface value is taken to return
 wherever it is called, since the method that runs is chosen at run
