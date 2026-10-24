@@ -49,9 +49,9 @@ print(f"flag={true}")             // flag=true
 print(f"items: {items.len()}")    // any type with to_str works
 ```
 
-Interpolations are evaluated left to right, like the operands of `+`, `==`
-and the other operators, so in `f"{bump(:c)} then {c.n}"` the second part
-sees what `bump` did.
+Interpolations are evaluated left to right, as are the operands of a `str`,
+`bytes` or array `+` and of a string comparison, so in
+`f"{bump(:c)} then {c.n}"` the second part sees what `bump` did.
 
 What can be interpolated:
 

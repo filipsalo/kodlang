@@ -71,7 +71,7 @@ func main() -> int64 {
 }
 ```
 
-The same holds for a function literal or a function value used as a default (`cb: func() -> int64 = helper`). A name the defining module doesn't have is an error at the default, even when the caller happens to declare it.
+The same holds for a function literal or a function value used as a default (`cb: func() -> int64 = helper`). A name the defining module doesn't have is an error, reported at the default when a call leaves the parameter out, even when the caller happens to declare it.
 
 ## Standard library
 

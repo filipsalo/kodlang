@@ -153,7 +153,7 @@ and of the same type:
 | `-` `*` `/` `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `str` or two `bytes` | `bool` |
-| `==` `!=` | two `int64`, `bool`, `str` or `bytes`, two values of one enum, or an optional and `none` | `bool` |
+| `==` `!=` | two `int64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, or an optional and `none` | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
