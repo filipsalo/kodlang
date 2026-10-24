@@ -466,6 +466,9 @@ type Codegen = struct {
     entry_import_paths: [str] = []
     // Canonical names of the Map/Set key types reported as unhashable.
     bad_hash_keys: [str] = []
+    inst_depth: int64 = 0
+    // Bad-key Map and Set instances, reported where the outermost instantiation is written.
+    pending_bad_keys: [int64] = []
     // By declaration: 1 never returns, 0 may, -1 undecided, 2 + depth while deciding.
     returns_memo: FuncIdx = FuncIdx()
     deciding_depth: int64 = 0
@@ -871,44 +874,44 @@ type Codegen = struct {
         return ""
     }
 
-    // Once per key type; the instances' bodies then aren't compiled, as they'd only repeat it.
-    func check_hash_key(self, anon template_idx: int64, key: TypeKind, span: ast.Span) -> none {
-        let role = self.hash_key_role(template_idx)
-        if len(role) == 0 or self.kind_has_unknown(key) or self.is_hashable(key) {
+    // Once per key type; the instance's bodies then aren't compiled, as they'd only repeat it.
+    func note_bad_key(self, anon inst_idx: int64) -> none {
+        if self.has_bad_key(self.structs[inst_idx]) == false {
             return
         }
-        let name = self.canonical_kind_name(key)
-        for bad in self.bad_hash_keys {
-            if bad == name {
-                return
-            }
+        let name = self.canonical_kind_name(self.structs[inst_idx].template_args[0])
+        if regalloc.str_in(self.bad_hash_keys, p: name) {
+            return
         }
         self.bad_hash_keys += [name]
-        mut what = "keys"
-        if role == "a `Set` element" {
-            what = "elements"
-        }
-        self.report_error(f"error: `{self.kind_display(key)}` can't be {role}{self.unhashable_note(key)}; {what} are `int64`, `str`, `bytes`, `bool` or enums without payloads", :span)
+        self.pending_bad_keys += [inst_idx]
     }
 
-    // Only a Map or Set key is resolved, so other generic types instantiate where they did.
-    func check_hash_key_type(self, anon template_idx: int64, key_type: int64) -> none {
-        if len(self.hash_key_role(template_idx)) > 0 {
-            self.check_hash_key(template_idx, key: self.resolve_type(key_type), span: self.p.type_spans[key_type])
+    // `outer` is the outermost instance, or -1 for an enum.
+    func report_bad_keys(self, anon outer: int64, shown: str, site: ast.Span) -> none {
+        for inst_idx in self.pending_bad_keys {
+            let key = self.structs[inst_idx].template_args[0]
+            let role = self.hash_key_role(self.structs[inst_idx].template_idx)
+            mut what = "keys"
+            if role == "a `Set` element" {
+                what = "elements"
+            }
+            mut where = ""
+            if inst_idx != outer {
+                where = f" in `{shown}`"
+            }
+            self.report_error(f"error: `{self.kind_display(key)}` can't be {role}{where}{self.unhashable_note(key)}; {what} are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: site)
         }
+        let none_pending: [int64] = []
+        self.pending_bad_keys = none_pending
     }
 
-    func skips_bad_key_bodies(self, anon instance: StructInfo) -> bool {
+    func has_bad_key(self, anon instance: StructInfo) -> bool {
         if len(instance.template_args) == 0 or len(self.hash_key_role(instance.template_idx)) == 0 {
             return false
         }
-        let name = self.canonical_kind_name(instance.template_args[0])
-        for bad in self.bad_hash_keys {
-            if bad == name {
-                return true
-            }
-        }
-        return false
+        let key = instance.template_args[0]
+        return self.kind_has_unknown(key) == false and self.is_hashable(key) == false
     }
 
     // The kinds `+` and the ordering operators take, by name; "" for the rest.
@@ -3092,7 +3095,7 @@ type Codegen = struct {
     // with `type_args`, creating a new monomorphised struct entry if it
     // doesn't already exist. The new entry shares the template's method
     // func_decls but has substituted field kinds and method sigs.
-    func instantiate_struct(self, anon type_args: [TypeKind], template_idx: int64) -> int64 {
+    func instantiate_struct(self, anon type_args: [TypeKind], template_idx: int64, site: ast.Span) -> int64 {
         for ta in type_args {
             if self.kind_has_unknown(ta) {
                 return template_idx
@@ -3112,12 +3115,14 @@ type Codegen = struct {
         self.structs += [StructInfo(name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0))]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
+        self.note_bad_key(new_idx)
         let saved_names = self.subst_names
         let saved_args = self.subst_args
         let saved_p = self.p
         self.subst_names = template.type_param_names
         self.subst_args = type_args
         self.p = template.src_p
+        self.inst_depth += 1
         mut cloned_fields: [FieldInfo] = []
         for field in template.fields {
             let new_kind = self.resolve_type(field.type_expr)
@@ -3126,9 +3131,13 @@ type Codegen = struct {
         self.structs[new_idx].fields = cloned_fields
         // Re-resolve each method's sig with the new substitution context.
         self.structs[new_idx].methods = self.resolve_method_infos(template.methods, p: template.src_p)
+        self.inst_depth -= 1
         self.p = saved_p
         self.subst_names = saved_names
         self.subst_args = saved_args
+        if self.inst_depth == 0 {
+            self.report_bad_keys(new_idx, shown: self.struct_display_name(new_idx), :site)
+        }
         return new_idx
     }
 
@@ -3240,7 +3249,7 @@ type Codegen = struct {
                         }
                         resolved += [arg_kind]
                     }
-                    let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx)
+                    let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx, site: self.p.type_spans[args[0]])
                     return .KStruct(idx: inst_idx, type_args: [])
                 }
                 let enum_idx = self.find_enum_idx(name)
@@ -3260,7 +3269,7 @@ type Codegen = struct {
                         }
                         resolved += [arg_kind]
                     }
-                    let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx)
+                    let inst_idx = self.instantiate_enum(resolved, template_idx: enum_idx, site: self.p.type_spans[args[0]])
                     return .KEnum(idx: inst_idx)
                 }
                 return .KUnknown
@@ -3273,7 +3282,7 @@ type Codegen = struct {
     // instantiate_struct: variant field type_exprs are re-resolved under the
     // template's substitution context so K/V in `Some(T)` become the concrete
     // kinds. Canonical name is `Template$arg1$arg2` to match struct mangling.
-    func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64) -> int64 {
+    func instantiate_enum(self, anon type_args: [TypeKind], template_idx: int64, site: ast.Span) -> int64 {
         for ta in type_args {
             if self.kind_has_unknown(ta) {
                 return template_idx
@@ -3298,6 +3307,7 @@ type Codegen = struct {
         self.subst_names = template.type_param_names
         self.subst_args = type_args
         self.p = template.src_p
+        self.inst_depth += 1
         mut new_variants: [VariantInfo] = []
         for v in template.variants {
             mut new_kinds: [TypeKind] = []
@@ -3309,9 +3319,13 @@ type Codegen = struct {
             new_variants += [VariantInfo(name: v.name, discriminant: v.discriminant, field_names: v.field_names, field_offsets: v.field_offsets, field_kinds: new_kinds, field_type_exprs: v.field_type_exprs)]
         }
         self.enums[new_idx].variants = new_variants
+        self.inst_depth -= 1
         self.p = saved_p
         self.subst_names = saved_names
         self.subst_args = saved_args
+        if self.inst_depth == 0 {
+            self.report_bad_keys(-1, shown: self.enum_display_name(new_idx), :site)
+        }
         return new_idx
     }
 
@@ -6011,10 +6025,7 @@ type Codegen = struct {
         if len(kinds) == 0 {
             return template_idx
         }
-        if report {
-            self.check_hash_key(template_idx, key: kinds[0], span: self.p.expr_spans[self.index_chain_args(callee_id)[0]])
-        }
-        return self.instantiate_struct(kinds, :template_idx)
+        return self.instantiate_struct(kinds, :template_idx, site: self.p.expr_spans[self.index_chain_args(callee_id)[0]])
     }
 
     // Empty on an error, reported only when `report` is set.
@@ -6075,10 +6086,7 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                if report {
-                                    self.check_hash_key(struct_idx, key: kinds[0], span: self.p.expr_spans[self.index_chain_args(expr_id)[0]])
-                                }
-                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx), type_args: [])
+                                return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx, site: self.p.expr_spans[self.index_chain_args(expr_id)[0]]), type_args: [])
                             }
                             let enum_idx = self.find_enum_idx(name)
                             if enum_idx >= 0 {
@@ -6086,7 +6094,7 @@ type Codegen = struct {
                                 if len(kinds) == 0 {
                                     return none
                                 }
-                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx))
+                                return .KEnum(idx: self.instantiate_enum(kinds, template_idx: enum_idx, site: self.p.expr_spans[self.index_chain_args(expr_id)[0]]))
                             }
                         }
                     }
@@ -6251,10 +6259,6 @@ type Codegen = struct {
                 for arg in args {
                     self.check_type_expr(arg)
                 }
-                // A template's own type parameters have no kinds to check yet.
-                if len(msg) == 0 and struct_idx >= 0 and len(self.subst_args) == len(self.subst_names) {
-                    self.check_hash_key_type(struct_idx, key_type: args[0])
-                }
             }
         }
     }
@@ -6325,8 +6329,6 @@ type Codegen = struct {
                 if self.type_name_known(name) == false {
                     names += [name]
                     targets += [target]
-                } else {
-                    self.check_alias_hash_keys(target)
                 }
             }
         }
@@ -6340,24 +6342,6 @@ type Codegen = struct {
                 self.check_type_expr(targets[i])
             }
             i = i + 1
-        }
-    }
-
-    // A registered alias skips check_type_expr, but `type S = Set[Shape]` still creates that instance.
-    func check_alias_hash_keys(self, anon type_id: int64) -> none {
-        match self.p.type_exprs[type_id] {
-            .Array(inner) -> self.check_alias_hash_keys(inner)
-            .Optional(inner) -> self.check_alias_hash_keys(inner)
-            .Generic(name, args) -> {
-                for arg in args {
-                    self.check_alias_hash_keys(arg)
-                }
-                let struct_idx = self.find_struct_idx(name)
-                if struct_idx >= 0 and len(args) > 0 and len(args) == len(self.structs[struct_idx].type_param_names) {
-                    self.check_hash_key_type(struct_idx, key_type: args[0])
-                }
-            }
-            else none
         }
     }
 
@@ -10198,7 +10182,7 @@ type Codegen = struct {
         mut cursor = 0
         for cursor < len(self.structs) {
             mut s = self.structs[cursor]
-            if s.template_idx >= 0 and self.skips_bad_key_bodies(s) == false {
+            if s.template_idx >= 0 and self.has_bad_key(s) == false {
                 let template = self.structs[s.template_idx]
                 let saved_p = self.p
                 let saved_names = self.subst_names

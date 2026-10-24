@@ -77,8 +77,13 @@ content, `int64` and `bool` keys by value, and enum keys by variant.
 The key type must be hashable, as for `hash(x)`: `int64`, `str`, `bytes`,
 `bool` or an enum without payload variants. Any other key type, such as
 `Map[[int64], int64]`, `Map[int64?, str]` or a struct, is an error at the
-type (`` `[int64]` can't be a `Map` key ``), reported once per key type. The
-same holds for the element type of a `Set[T]` from the `set` module.
+type argument that names it, in whichever module it's written
+(`` `[int64]` can't be a `Map` key ``), reported once per key type. A key
+that comes from another generic type's parameter is reported where that
+type gets its argument: with `type Index[T] = struct { m: Map[T, int64] }`,
+a parameter of type `Index[Pt]` is an error at `Pt`
+(`` `Pt` can't be a `Map` key in `Index[Pt]` ``). The same holds for the
+element type of a `Set[T]` from the `set` module.
 
 ## Indexing a struct
 
