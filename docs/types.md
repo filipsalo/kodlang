@@ -505,3 +505,5 @@ match read_size(path) {
 
 It works in `match`, `if … is`, and the bare `is` operator (a `match` on an
 interface needs an `else`, since its set of implementors isn't enumerable).
+The test holds whichever module boxed the value, so an error struct that an
+imported function throws matches its type in the caller.
