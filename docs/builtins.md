@@ -7,17 +7,17 @@ icon: lucide/wrench
 These names live in `stdlib/builtins.kod` and are available in every Kod program without an explicit import.
 
 A call without a module name, such as `hash(x)`, goes to a local variable
-or parameter of that name that holds a function, from its declaration on,
-then to a function the module declares or lists in an `import`, and only
-then to the builtin. A local that holds anything else doesn't hide a
-function, so `let len = len(xs)` and a later `len(ys)` both call the
-builtin. That holds for `len`, `str`, `hash` and `kod_panic` too: a module
-can declare its own `func hash(anon p: Point) -> int64`, and its
-`hash(...)` calls use it, while another module's `dep.hash(x)` names that
-one. An f-string always converts its values with the builtin `str`. Only
-the builtin `kod_panic` counts as a call that never returns; a module's
-own or imported `kod_panic`, or a local function value of that name, is an
-ordinary call.
+or parameter of that name that holds a function, from its declaration to
+the end of its block, then to a function the module declares or lists in
+an `import`, and only then to the builtin. A local that holds anything
+else doesn't hide a function, so `let len = len(xs)` and a later `len(ys)`
+both call the builtin. That holds for `len`, `str`, `hash` and `kod_panic`
+too: a module can declare its own `func hash(anon p: Point) -> int64`, and
+its `hash(...)` calls use it, while another module's `dep.hash(x)` names
+that one. An f-string always converts its values with the builtin `str`.
+Only the builtin `kod_panic` counts as a call that never returns; a
+module's own or imported `kod_panic`, or a local function value of that
+name, is an ordinary call.
 
 ## Output
 

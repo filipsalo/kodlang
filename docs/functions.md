@@ -263,9 +263,12 @@ closures yet. A bare identifier in value position resolves to the
 function's address when it isn't shadowed by a local variable; a
 call site `f(args)` does an indirect `blr` when `f` is a local of
 function type declared before it, falling through to the direct `bl`
-otherwise. Blocks don't have their own scopes yet, so a function value
-declared in an `if` or loop body can still be called after the block
-when no function is named like it.
+otherwise. A function value declared in a block, such as an `if` or
+loop body, is called that way only from its `let` to the end of the
+block. Elsewhere `f(args)` calls the module's or an imported function, or
+the builtin, named `f`, and with none of those it is an error:
+`` `f` is declared in a block that has ended `` after the block, and
+`` `f` is called before its `let` `` before the declaration.
 
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a

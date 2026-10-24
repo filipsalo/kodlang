@@ -440,6 +440,12 @@ class Interpreter:
                 target = self._module_func(module, callee.id)
             if target is not None:
                 return target
+            # Left in the frame by a block that has ended, or by a later `let`.
+            stale = self.stack[-1].get(callee.id)
+            if not callee.__dict__["_kod_bound"] and isinstance(
+                stale, (*_FUNC_DECLS, BoundMethod)
+            ):
+                raise ValueError(f"Unknown name {callee.id!r}")
         return self.evaluate_expression(module, callee)
 
     def lookup(self, module, name) -> Any:
