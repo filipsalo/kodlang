@@ -66,6 +66,8 @@ A store evaluates its parts left to right: in `rows()[i()] = v()` and
 value, and `f().x = v()` calls `f` before `v`. A compound
 `rows()[i()] += v()` evaluates the receiver and the index once, reads the
 element and then evaluates `v()`, so `rows` and `i` are each called once.
+Indexing a struct calls its `op_index`, so it counts as a call too:
+`xs[a[k]] += b[k]` calls `a`'s `op_index` once, before `b`'s.
 
 ## Length
 
