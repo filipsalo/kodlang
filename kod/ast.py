@@ -239,7 +239,8 @@ def _parse_fstring(parser: Parser) -> ASTNode:
 
     token = parser.consume(tokens.FStringLiteral)
     raw = token.value
-    if len(raw) >= 7 and raw.startswith('f"""') and raw.endswith('"""'):
+    triple = len(raw) >= 7 and raw.startswith('f"""') and raw.endswith('"""')
+    if triple:
         inner = _dedent_triple_body(raw[4:-3])
     else:
         inner = raw[2:-1]  # strip f" and trailing "
@@ -250,8 +251,14 @@ def _parse_fstring(parser: Parser) -> ASTNode:
             types.String(process_escapes(text).encode("utf8")), span=span
         )
 
-    def parse_expr(expr_text: str) -> ASTNode:
+    def parse_expr(expr_text: str, at: int) -> ASTNode:
         sub_tokens = Lexer(expr_text, span.filename).lex()
+        # Spans into the file; a dedented triple-quoted body only gets the f-string's.
+        shift = span.start if triple else span.start + 2 + at
+        for tok in sub_tokens:
+            tok.span = Span(
+                tok.span.filename, tok.span.start + shift, tok.span.end + shift
+            )
         sub_parser = Parser(
             sub_tokens, parser.file, parser.program, parser.resolve_import
         )
@@ -279,7 +286,7 @@ def _parse_fstring(parser: Parser) -> ASTNode:
         k = interp_end(inner, j + 1)
         if k == len(inner):
             raise parser.error("Unterminated { in f-string", span)
-        parts.append(wrap_in_str(parse_expr(inner[j + 1 : k])))
+        parts.append(wrap_in_str(parse_expr(inner[j + 1 : k], j + 1)))
         i = k + 1
 
     if not parts:
