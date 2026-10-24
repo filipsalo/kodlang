@@ -36,6 +36,8 @@ A local variable or parameter named like an import alias hides the
 module from its declaration on: after `let vec = Thing()`, `vec.len()`
 calls `Thing`'s method. Before that `let`, in its own initializer (`let vec
 = vec.make(1)`) and after the block that declares it, `vec.` is the module.
+A function named like an import alias doesn't hide it: with `func vec()`
+declared too, `vec()` calls the function and `vec.make(1)` the module's.
 
 To also use some names unqualified, list them after the path. The qualified form keeps working:
 

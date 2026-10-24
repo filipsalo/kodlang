@@ -420,6 +420,17 @@ class Interpreter:
         value = self.stack[-1].get(callee.id)
         return value if isinstance(value, (*_FUNC_DECLS, BoundMethod)) else None
 
+    def _aliases(self, module):
+        """Each import by its alias, though a function may share the name."""
+        aliases = module.__dict__.get("_kod_aliases")
+        if aliases is None:
+            aliases = {imp.local_name: imp for imp in module.get_imports()}
+            module.__dict__["_kod_aliases"] = aliases
+        return aliases
+
+    def _alias_import(self, module, name):
+        return self._aliases(module).get(name)
+
     def _item(self, module, name):
         items = module.__dict__.get("_kod_items")
         if items is None:
@@ -498,7 +509,7 @@ class Interpreter:
             case tokens.Dot():
                 imp = None
                 if type(lhs) is ast.Name and lhs.__dict__.get("_kod_bound") is False:
-                    imp = module.names.get(lhs.id)
+                    imp = self._alias_import(module, lhs.id)
                 if isinstance(imp, ast.Import):
                     lhs = self._resolve_import(module, imp)
                 else:
@@ -925,12 +936,11 @@ class Interpreter:
     def _variant_enum(self, module, variant_name, span):
         """The enum of a context-free `.Variant`: one the module sees, else the only loaded one."""
         scopes = [module.names, self.program.builtins.names]
-        for val in module.names.values():
-            if isinstance(val, ast.Import):
-                try:
-                    scopes.append(self._resolve_import(module, val).names)
-                except Exception:
-                    pass
+        for imp in self._aliases(module).values():
+            try:
+                scopes.append(self._resolve_import(module, imp).names)
+            except Exception:
+                pass
         for scope in scopes:
             found = _enums_with(scope, variant_name)
             if found:
@@ -1142,7 +1152,7 @@ class Interpreter:
             return self._variant_slot(expr.resolved)
         owner = None
         if isinstance(expr, ast.QualifiedTypeExpr):
-            owner = module.names.get(expr.module)
+            owner = self._alias_import(module, expr.module)
         elif isinstance(expr, ast.NamedTypeExpr):
             owner = module
             if expr.name not in module.names:
