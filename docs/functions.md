@@ -130,10 +130,13 @@ A returned `T or Error` value must have the same `T`, so returning an
 
 A function with a return type other than `none` must end every path with a
 `return`, a `throw`, or a call that doesn't return, like `kod_panic(...)`.
-One that can reach the end of its body is an error at its name
+One that can reach the end of its body is an error at its name, or at the
+`func` of a function literal
 (`` `pick` can reach its end without returning a value ``), and that
 includes a `-> T?` function: write `return none` at the end. Only a
 `-> none or Error` function may run off its end, which returns `Ok(none)`.
+The error isn't reported for a body that already has other errors, or in
+a file that doesn't parse, since those may hide the missing `return`.
 Whether a path can reach the end is decided from the statements alone:
 
 - `return`, `throw`, `break` and `continue` end a path, and so does a call
