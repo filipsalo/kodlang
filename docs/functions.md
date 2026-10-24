@@ -161,7 +161,8 @@ Whether a path can reach the end is decided from the statements alone:
   `for` loop, including `for … in`, may finish.
 
 Code after a statement that ends every path is never run and isn't
-considered.
+considered, so a `break` placed after a `return` or `kod_panic(...)` doesn't
+let a `for true` loop finish.
 
 The builtin `kod_panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
