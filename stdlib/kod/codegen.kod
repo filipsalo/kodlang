@@ -525,6 +525,8 @@ type Codegen = struct {
     // Slots a walk bound for the first time, to unmark when it ends.
     seen_log: [int64] = []
     block_depth: int64 = 0
+    // Set once a body's locals are collected, so a read goes by where its name is bound.
+    reads_scoped: bool = false
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -1207,6 +1209,21 @@ type Codegen = struct {
             .Ge -> return true
             else return false
         }
+    }
+
+    func fn_address(self, anon slot: int64) -> Val {
+        let lbl: str = self.fn_label(slot)
+        let reg: str = self.pool.alloc_reg()
+        self.emit(f"adrp {reg}, {lbl}@PAGE")
+        self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
+        return .VReg(name: reg)
+    }
+
+    func unbound_msg(self, anon name: str, verb: str) -> str {
+        if self.var_seen(name) {
+            return f"error: `{name}` is declared in a block that has ended; declare it outside the block to use it here"
+        }
+        return f"error: `{name}` is {verb} before its `let`"
     }
 
     // Compile an expression only for the errors it reports.
@@ -5315,11 +5332,7 @@ type Codegen = struct {
                     // `foo` as a callback.
                     let slot = self.lookup_func(name)
                     if slot != -1 {
-                        let lbl: str = self.fn_label(slot)
-                        let reg: str = self.pool.alloc_reg()
-                        self.emit(f"adrp {reg}, {lbl}@PAGE")
-                        self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
-                        return .VReg(name: reg)
+                        return self.fn_address(slot)
                     }
                     // Candidates for the typo hint: in-scope variables
                     // plus visible function names. Type and import
@@ -5336,6 +5349,14 @@ type Codegen = struct {
                     let msg: str = self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands)
                     self.report_error(msg, span: self.p.expr_spans[expr_id])
                     return .VImm(value: 0)
+                }
+                if self.reads_scoped and self.var_bound(name) == false {
+                    // Outside where it's bound, a name means what it would without the local.
+                    let slot = self.lookup_func(name)
+                    if slot != -1 {
+                        return self.fn_address(slot)
+                    }
+                    self.report_error(self.unbound_msg(name, verb: "read"), span: self.p.expr_spans[expr_id])
                 }
                 let off = self.find_var_offset(name)
                 return .VStack(offset: off)
@@ -5494,6 +5515,7 @@ type Codegen = struct {
     func stash_operand_as(self, anon expr_id: int64, kind: TypeKind) -> int64 {
         let name: str = self.fresh("__chain")
         let off: int64 = self.alloc_var(:name, :kind)
+        self.vars[-1].bound = true
         self.compile_store(dest_off: off, :kind, value_id: expr_id)
         return self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[expr_id])
     }
@@ -8504,13 +8526,17 @@ type Codegen = struct {
             .BytesLit(value) -> return .KBytes
             .NoneLit -> return .KOptional(inner: .KVoid)
             .Ident(name) -> {
-                if self.var_declared(name) {
+                let local = self.var_declared(name)
+                if local and (self.reads_scoped == false or self.var_bound(name)) {
                     return self.find_var_kind(name)
                 }
                 // Function-as-value reference: synthesise a KFunc
                 // from the function's pre-resolved signature so
                 // `let f = foo` infers `f: func(...) -> R`.
                 let slot = self.lookup_func(name)
+                if local and slot == -1 {
+                    return self.find_var_kind(name)
+                }
                 if slot != -1 {
                     let sig: SigInfo = self.fn_sig(slot)
                     return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
@@ -10116,6 +10142,10 @@ type Codegen = struct {
                     self.report_error(msg, span: self.p.expr_spans[lhs_id])
                     return none
                 }
+                if self.var_bound(name) == false {
+                    self.report_error(self.unbound_msg(name, verb: "assigned"), span: self.p.expr_spans[lhs_id])
+                    return none
+                }
                 if self.enforce_immutability() and self.find_var_mutable(name) == false {
                     self.report_error("cannot reassign immutable binding `" + name + "`; declare it with `mut`", span: self.p.expr_spans[lhs_id])
                     return none
@@ -11362,11 +11392,13 @@ type Codegen = struct {
         }
 
         let body_mark = self.report_attempts
+        self.reads_scoped = true
         self.compile_block(func_decl.body)
         // An error in the body or a parse error may be what hides its `return`.
         if self.report_attempts == body_mark and len(self.p.errors) == 0 {
             self.check_reaches_end(func_decl, :struct_name)
         }
+        self.reads_scoped = false
 
         self.emit_no_value_return()
 

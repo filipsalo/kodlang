@@ -235,10 +235,74 @@ def _children(node):
                     yield item
 
 
-def _mark_scopes(func):
-    """Note at each `f(...)` and `name.` whether that name is a local there."""
+class _Scope:
+    """What the static pass knows of a function besides the names bound so far."""
+
+    def __init__(self, func, program, module):
+        self.program = program
+        self.module = getattr(func, "module", None) or module
+        params = {p.variable.id for p in func.params}
+        self.seen = set(params)
+        self.declared = set(params)
+        for stmt in func.body:
+            _local_names(stmt, self.declared)
+        imports = self.module.get_imports() if self.module is not None else ()
+        self.aliases = {imp.local_name for imp in imports}
+
+    def fallback(self, name, call=False):
+        """What `name` means where no local of it is bound, if anything."""
+        if call and name in ("str", "hash"):
+            return name
+        module = self.module
+        value = module.names.get(name) if module is not None else None
+        if value is None and module is not None:
+            for imp in module.get_imports():
+                if name in imp.items:
+                    path = module.resolve_import(imp.module_name)
+                    value = self.program.get_module(path).names.get(name)
+                    break
+        if value is None:
+            value = self.program.builtins.names.get(name)
+        if call or isinstance(value, _FUNC_DECLS):
+            return value
+        return None
+
+    def unbound(self, name, verb):
+        if name in self.seen:
+            use = "call" if verb == "called" else "use"
+            return (
+                f"`{name}` is declared in a block that has ended; declare it"
+                f" outside the block to {use} it here"
+            )
+        return f"`{name}` is {verb} before its `let`"
+
+
+def _local_names(node, names):
+    """Every name a binding in `node` declares, outside function literals."""
+    t = type(node)
+    if t is ast.FunctionDeclaration:
+        return
+    if t is ast.VariableDeclaration:
+        names.add(node.variable.id)
+    elif t is ast.LetElseStatement:
+        names.update(_pattern_names(node.pattern))
+    elif t is ast.ForEachStatement:
+        names.add(node.binding)
+    elif t is ast.MatchStatement or t is ast.MatchExpression:
+        for arm in node.arms:
+            names.update(_pattern_names(arm.pattern))
+            for child in arm.body if isinstance(arm.body, list) else [arm.body]:
+                _local_names(child, names)
+    for child in _children(node):
+        _local_names(child, names)
+
+
+def _mark_scopes(func, program, module=None):
+    """Note at each name whether a local of it is bound there, and check its use."""
     func.__dict__["_kod_scoped"] = True
-    _scope_block(func.body, {p.variable.id: (1, p.span) for p in func.params}, 1)
+    scope = _Scope(func, program, module)
+    params = {p.variable.id: (1, p.span) for p in func.params}
+    _scope_block(func.body, params, 1, scope)
 
 
 def _mark_program_scopes(program):
@@ -252,7 +316,7 @@ def _mark_program_scopes(program):
                 funcs = getattr(owner, "methods", {}).values()
             for func in funcs:
                 if "_kod_scoped" not in func.__dict__:
-                    _mark_scopes(func)
+                    _mark_scopes(func, program, module)
 
 
 def _line_of(span):
@@ -268,7 +332,7 @@ def _name_span(span, name, end=None):
     return span
 
 
-def _bind(bound, name, span, depth):
+def _bind(bound, name, span, depth, scope):
     # Until blocks get scopes, a nested binding would share the outer one's slot.
     outer = bound.get(name)
     if outer is not None and outer[0] < depth:
@@ -278,77 +342,104 @@ def _bind(bound, name, span, depth):
             span,
         )
     bound[name] = (depth, span)
+    scope.seen.add(name)
 
 
-def _bind_pattern(bound, pattern, depth, end=None):
+def _bind_pattern(bound, pattern, depth, scope, end=None):
     for name in _pattern_names(pattern):
-        _bind(bound, name, _name_span(pattern.span, name, end), depth)
+        _bind(bound, name, _name_span(pattern.span, name, end), depth, scope)
 
 
-def _scope_block(stmts, bound, depth):
+def _scope_use(node, bound, scope, verb, fallback=True):
+    """A local's name used where no binding of it is: its fallback, or an error."""
+    name = node.id
+    if name in bound or name not in scope.declared:
+        return
+    target = scope.fallback(name, call=verb == "called") if fallback else None
+    if target is None:
+        raise KodError(scope.unbound(name, verb), node.span)
+    if verb == "read":
+        node.__dict__["_kod_func"] = target
+
+
+def _scope_block(stmts, bound, depth, scope):
     bound = dict(bound)
     for stmt in stmts:
-        _scope_stmt(stmt, bound, depth)
+        _scope_stmt(stmt, bound, depth, scope)
 
 
-def _scope_stmt(stmt, bound, depth):
+def _scope_stmt(stmt, bound, depth, scope):
     t = type(stmt)
     inner = depth + 1
     if t is ast.VariableDeclaration:
-        _scope_expr(stmt.value, bound, depth)
-        _bind(bound, stmt.variable.id, stmt.variable.span, depth)
+        _scope_expr(stmt.value, bound, depth, scope)
+        _bind(bound, stmt.variable.id, stmt.variable.span, depth, scope)
     elif t is ast.LetElseStatement:
-        _scope_expr(stmt.value, bound, depth)
-        _scope_block(stmt.else_body, bound, inner)
-        _bind_pattern(bound, stmt.pattern, depth, stmt.value.span.start)
+        _scope_expr(stmt.value, bound, depth, scope)
+        _scope_block(stmt.else_body, bound, inner, scope)
+        _bind_pattern(bound, stmt.pattern, depth, scope, stmt.value.span.start)
     elif t is ast.IfStatement:
-        _scope_expr(stmt.condition, bound, depth)
-        _scope_block(stmt.true_branch, bound, inner)
-        _scope_block(stmt.false_branch, bound, inner)
+        _scope_expr(stmt.condition, bound, depth, scope)
+        _scope_block(stmt.true_branch, bound, inner, scope)
+        _scope_block(stmt.false_branch, bound, inner, scope)
     elif t is ast.ForStatement:
-        _scope_expr(stmt.condition, bound, depth)
-        _scope_block(stmt.body, bound, inner)
+        _scope_expr(stmt.condition, bound, depth, scope)
+        _scope_block(stmt.body, bound, inner, scope)
     elif t is ast.ForEachStatement:
-        _scope_expr(stmt.iterable, bound, depth)
+        _scope_expr(stmt.iterable, bound, depth, scope)
         body = dict(bound)
         name_span = _name_span(stmt.span, stmt.binding, stmt.iterable.span.start)
-        _bind(body, stmt.binding, name_span, inner)
-        _scope_block(stmt.body, body, inner)
+        _bind(body, stmt.binding, name_span, inner, scope)
+        _scope_block(stmt.body, body, inner, scope)
     elif t is ast.MatchStatement:
-        _scope_expr(stmt.expression, bound, depth)
+        _scope_expr(stmt.expression, bound, depth, scope)
         for arm in stmt.arms:
             body = dict(bound)
-            _bind_pattern(body, arm.pattern, inner)
-            _scope_block(arm.body, body, inner)
+            _bind_pattern(body, arm.pattern, inner, scope)
+            _scope_block(arm.body, body, inner, scope)
+    elif t is ast.Assignment and type(stmt.lhs) is ast.Name:
+        _scope_use(stmt.lhs, bound, scope, "assigned", fallback=False)
+        _scope_expr(stmt.rhs, bound, depth, scope)
     elif isinstance(stmt, ast.ASTNode):
-        _scope_expr(stmt, bound, depth)
+        _scope_expr(stmt, bound, depth, scope)
 
 
-def _scope_expr(node, bound, depth):
+def _scope_expr(node, bound, depth, scope):
     t = type(node)
+    if t is ast.Name:
+        _scope_use(node, bound, scope, "read")
+        return
     if t is ast.FunctionDeclaration:
         if "_kod_scoped" not in node.__dict__:
-            _mark_scopes(node)
+            _mark_scopes(node, scope.program, scope.module)
+        return
+    if t is ast.FunctionCallParam:
+        _scope_expr(node.expression, bound, depth, scope)
+        return
+    if t is ast.GenericInstantiation:
         return
     if t is ast.FunctionCall and type(node.callee) is ast.Name:
         node.callee.__dict__["_kod_bound"] = node.callee.id in bound
-        _scope_expr(node.args, bound, depth)
+        _scope_use(node.callee, bound, scope, "called")
+        _scope_expr(node.args, bound, depth, scope)
         return
     if t is ast.BinaryOperator and isinstance(node.op, tokens.Dot):
         if type(node.lhs) is ast.Name:
             node.lhs.__dict__["_kod_bound"] = node.lhs.id in bound
+            if node.lhs.id not in scope.aliases:
+                _scope_use(node.lhs, bound, scope, "read", fallback=False)
         else:
-            _scope_expr(node.lhs, bound, depth)
+            _scope_expr(node.lhs, bound, depth, scope)
         return
     if t is ast.MatchExpression:
-        _scope_expr(node.expression, bound, depth)
+        _scope_expr(node.expression, bound, depth, scope)
         for arm in node.arms:
             body = dict(bound)
-            _bind_pattern(body, arm.pattern, depth + 1)
-            _scope_expr(arm.body, body, depth + 1)
+            _bind_pattern(body, arm.pattern, depth + 1, scope)
+            _scope_expr(arm.body, body, depth + 1, scope)
         return
     for child in _children(node):
-        _scope_expr(child, bound, depth)
+        _scope_expr(child, bound, depth, scope)
 
 
 def _value_arm(arm, value):
@@ -795,7 +886,10 @@ class Interpreter:
                 arg_values = [self.evaluate_expression(module, arg) for arg in args]
                 return self.call_function(module, bound, arg_values)
             case ast.Name() | ast.Variable() as name:
-                return name if as_lvalue else self.lookup(module, name)
+                if as_lvalue:
+                    return name
+                target = name.__dict__.get("_kod_func")
+                return self.lookup(module, name) if target is None else target
             case ast.Literal(value):
                 return value
             case ast.Expression(value):
@@ -1894,7 +1988,7 @@ class Interpreter:
                     )
             frame["self"] = receiver
             if "_kod_scoped" not in func.__dict__:
-                _mark_scopes(func)
+                _mark_scopes(func, self.program)
             self.stack.append(frame)
             self.funcs.append(func)
             param_immutable = {p.variable.id for p in explicit_params if not p.mutable}
@@ -1942,7 +2036,7 @@ class Interpreter:
                 )
         args = frame
         if "_kod_scoped" not in func.__dict__:
-            _mark_scopes(func)
+            _mark_scopes(func, self.program)
         self.stack.append(args)
         self.funcs.append(func)
         self.immutable_stack.append(

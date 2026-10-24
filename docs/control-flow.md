@@ -115,6 +115,23 @@ binding, even when its type differs (`let x = 1`, then
 `let x = f"#{x}"`). So may a block after one whose binding of the name
 has ended.
 
+A name is a local only where its binding lasts. Before its `let`, or
+after the block, arm or loop that bound it, the name means a function of
+the module, an imported one or a builtin of that name, as it does in a
+call (see [Function-pointer types](functions.md#function-pointer-types)),
+and with none of those, reading or assigning it is an error:
+`` `x` is read before its `let` `` or
+`` `x` is declared in a block that has ended ``. Declare a name before
+the block to use it after the block:
+
+```kod
+mut label = "other"
+if n > 0 {
+    label = "positive"
+}
+print(label)
+```
+
 ## `return`
 
 Return a value from a function:
