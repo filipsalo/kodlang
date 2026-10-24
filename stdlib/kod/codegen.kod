@@ -681,6 +681,99 @@ type Codegen = struct {
         self.report_error(f"error: `{self.op_symbol(op)}` doesn't take an optional operand{hint}", span: self.p.expr_spans[bad])
     }
 
+    func check_operand_kinds(self, lhs_id: int64, op: ast.Op, rhs_id: int64, lhs_kind: TypeKind, rhs_kind: TypeKind) -> none {
+        if self.report_attempts > self.stmt_error_mark or self.either_unknown(lhs_kind, rhs_kind) {
+            return
+        }
+        if op is .Eq or op is .Ne {
+            return
+        }
+        let sym = self.op_symbol(op)
+        let lhs_name = self.operand_scalar(lhs_kind)
+        let rhs_name = self.operand_scalar(rhs_kind)
+        let lhs_shown = self.kind_display(lhs_kind)
+        let rhs_shown = self.kind_display(rhs_kind)
+        let ordering = self.is_comparison_op(op)
+        if op is .Add or ordering {
+            if op is .Add and self.is_array_kind(lhs_kind) {
+                return
+            }
+            if lhs_name == "" {
+                self.report_error(f"error: `{sym}` doesn't take `{lhs_shown}` operands", span: self.p.expr_spans[lhs_id])
+                return
+            }
+            if lhs_name == rhs_name {
+                return
+            }
+            if ordering {
+                self.report_error(f"error: cannot compare `{lhs_shown}` with `{rhs_shown}`", span: self.p.expr_spans[rhs_id])
+                return
+            }
+            mut bad = rhs_id
+            mut hint = ""
+            let convert = "; convert with `str(...)` or use an f-string"
+            if lhs_name == "str" and self.prints_as_str(rhs_kind) {
+                hint = convert
+            }
+            let appending = lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path
+            if rhs_name == "str" and self.prints_as_str(lhs_kind) and appending == false {
+                hint = convert
+                bad = lhs_id
+            }
+            self.report_error(f"error: cannot add `{lhs_shown}` and `{rhs_shown}`{hint}", span: self.p.expr_spans[bad])
+            return
+        }
+        mut bad = 0
+        mut bad_shown = lhs_shown
+        if lhs_name != "int64" {
+            bad = lhs_id
+        } else if rhs_name != "int64" {
+            bad = rhs_id
+            bad_shown = rhs_shown
+        }
+        if bad != 0 {
+            self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`", span: self.p.expr_spans[bad])
+        }
+    }
+
+    // The kinds `+` and the ordering operators take, by name; "" for the rest.
+    func operand_scalar(self, anon kind: TypeKind) -> str {
+        match kind {
+            .KInt64 -> return "int64"
+            .KStr -> return "str"
+            .KBytes -> return "bytes"
+            else return ""
+        }
+    }
+
+    func prints_as_str(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KInt64 -> return true
+            .KBool -> return true
+            else return false
+        }
+    }
+
+    // An index or slice bound, compiled already, so its own errors come first.
+    func check_int_operand(self, anon expr_id: int64, what: str) -> none {
+        let k = self.infer_kind(expr_id)
+        if k is .KInt64 {
+            return
+        }
+        if k is .KUnknown {
+            self.report_cannot_infer(expr_id, what: "this expression")
+            return
+        }
+        if self.kind_has_unknown(k) or self.report_attempts > self.stmt_error_mark {
+            return
+        }
+        mut hint = ""
+        if self.is_some_optional(k) {
+            hint = self.unwrap_hint(expr_id)
+        }
+        self.report_error(f"error: {what} must be `int64`, got `{self.kind_display(k)}`{hint}", span: self.p.expr_spans[expr_id])
+    }
+
     func is_some_optional(self, anon kind: TypeKind) -> bool {
         if kind is .KOptional(_inner) {
             return self.is_none_kind(kind) == false
@@ -4279,7 +4372,7 @@ type Codegen = struct {
             let kind: TypeKind = self.infer_kind(exprs[i])
             let off: int64 = self.alloc_var(:name, :kind)
             self.compile_store(dest_off: off, :kind, value_id: exprs[i])
-            operand_exprs += [self.p.alloc_expr(ast.Expr.Ident(:name), :span)]
+            operand_exprs += [self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[exprs[i]])]
             i = i + 1
         }
         operand_exprs += [exprs[len(exprs) - 1]]
@@ -4412,6 +4505,7 @@ type Codegen = struct {
         }
         let ptr_v = self.compile_expr(lhs)
         let idx_v = self.compile_expr(rhs)
+        self.check_int_operand(rhs, what: "an index")
         let ptr_r = self.load(ptr_v)
         let idx_r = self.load(idx_v)
         mut result = self.pool.alloc_reg()
@@ -4708,6 +4802,9 @@ type Codegen = struct {
         self.check_bool_operands(:lhs_id, :op, :rhs_id, :lhs_kind)
         if self.report_attempts == attempts_before {
             self.check_optional_operands(:lhs_id, :op, :rhs_id, :lhs_kind)
+        }
+        if self.report_attempts == attempts_before {
+            self.check_operand_kinds(:lhs_id, :op, :rhs_id, :lhs_kind, rhs_kind: rhs_kind0)
         }
         // Comparing against `none` only makes sense for optional types;
         // for other kinds it would silently compile to `x == 0`.
@@ -5286,11 +5383,13 @@ type Codegen = struct {
             self.pool.free_reg(sr0)
         } else {
             let hi_v = self.compile_expr(hi_id)
+            self.check_int_operand(hi_id, what: "a slice bound")
             let hi_r = self.load(hi_v)
             self.emit(f"str {hi_r}, [sp, #16]")
             self.pool.free_reg(hi_r)
         }
         let lo_v = self.compile_expr(lo_id)
+        self.check_int_operand(lo_id, what: "a slice bound")
         let lo_r = self.load(lo_v)
         self.emit(f"str {lo_r}, [sp, #8]")
         self.pool.free_reg(lo_r)
@@ -8159,6 +8258,7 @@ type Codegen = struct {
             }
             none -> {
                 let idx_v = self.compile_expr(rhs)
+                self.check_int_operand(rhs, what: "an index")
                 let idx_r = self.load(idx_v)
                 // Preserve the index across the RHS *and* the lhs pointer
                 // computation. If either includes a `bl` (e.g. a struct

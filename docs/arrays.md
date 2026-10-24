@@ -29,6 +29,8 @@ let third: int64 = nums[2]
 ```
 
 Negative indices wrap around: `arr[-1]` is equivalent to `arr[len(arr) - 1]`.
+An index must be an `int64`: `nums["a"]`, `nums[true]` and an `int64?`
+index such as `nums[m.get(k)]` are errors.
 
 Arrays nest: an element of a `[[int64]]` is an `[int64]`, so `grid[i][j]`
 and `for row in grid { for x in row { ... } }` work, and an element of a
@@ -76,6 +78,7 @@ let copy: [int64] = nums[..]     // shallow copy
 Both endpoints clamp to `[0, len]`: a negative bound becomes 0 and a bound past
 the end becomes `len`, so `[1, 2, 3][1..10]` is `[2, 3]`. An end before the
 start yields an empty slice. Unlike indexing, slice bounds never wrap.
+Both bounds must be `int64`.
 
 ## Concatenation
 

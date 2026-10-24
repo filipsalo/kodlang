@@ -59,10 +59,9 @@ inferred.
 
 Function and method arguments, struct constructor fields and enum payloads
 are checked the same way (see [Argument types](functions.md#argument-types)),
-so `m.set(5, 1)` on a `Map[str, int64]` is an error. Element stores
-(`xs[i] = v`, `m[k] = v`) and `return` values aren't checked against their
-declared types yet, apart from the optional cases described below, so a
-value of the wrong type there compiles and misbehaves at run time.
+so `m.set(5, 1)` on a `Map[str, int64]` is an error. So are element stores
+(`xs[i] = v`, `m[k] = v`, see [Indexing](arrays.md#indexing)) and `return`
+values (see [Return values](functions.md#return-values)).
 
 Parameters are immutable too — `mut` makes one reassignable inside the
 body (`mut self` for a method receiver). This is **callee-local**: params
@@ -140,6 +139,27 @@ Comparisons bind tighter than `&`, `|` and `^`, so a bit test is written
 `(flags & 1) != 0`.
 
 Chained comparisons are supported Python-style: `a < b < c` evaluates `b` once and is equivalent to `(a < b) and (b < c)`. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
+
+## Operators
+
+An operator never converts its operands; both must be of a type it takes,
+and of the same type:
+
+| Operator | Operands | Result |
+|----------|----------|--------|
+| `+` | two `int64`, two `str`, two `bytes` or two arrays of one type | the operands' type |
+| `-` `*` `/` `%` | two `int64` | `int64` |
+| `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
+| `<` `<=` `>` `>=` | two `int64`, two `str` or two `bytes` | `bool` |
+| `and` `or` | two `bool` | `bool` |
+
+So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
+`"n = " + str(5)` or `f"n = {5}"`. `s - t` on two strings, `xs * 2` on an
+array, `-s` on a string, `s + b` with `b: bytes` and `red < blue` on an enum
+are errors too. `+=` and `-=` follow the rules of `+` and `-`. An index,
+as in `xs[i]`, `s[i]` and `xs[i] = v`, and the bounds of a slice must be
+`int64`, so `xs["a"]` and `xs[true]` are errors, and so is an `int64?`
+index; unwrap it first.
 
 ## `none`
 

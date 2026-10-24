@@ -81,6 +81,10 @@ buf += "  two\n"
 
 `+=` works on struct fields too: `obj.message += " (cont.)"`.
 
+Both operands of `+` must be `str`; nothing else is converted, so
+`"n = " + 5` is an error. Convert with `str(...)` or use an f-string:
+`"n = " + str(n)` or `f"n = {n}"`. `bytes` concatenate only with `bytes`.
+
 ## Multi-line strings
 
 Triple-quoted strings span multiple lines:
@@ -140,6 +144,8 @@ Negative indices count from the end:
 let last: int64 = s[-1]
 ```
 
+The index must be an `int64`, so `s["a"]` is an error.
+
 Strings are immutable, so assigning to an element (`s[0] = 'H'`) is an
 error. A `str` can't be iterated with `for … in` either; iterate over
 `s.code_points()` instead.
@@ -154,8 +160,8 @@ Either endpoint may be omitted: `s[..k]` is `s[0..k]` and `s[k..]` is `s[k..len(
 
 Both endpoints clamp to `[0, len(s)]`: a negative bound becomes 0 and a bound
 past the end becomes `len(s)`, so `"hello"[3..40]` is `"lo"`. An end before
-the start yields `""`. Unlike indexing, slice bounds never wrap. `bytes`
-slices follow the same rules.
+the start yields `""`. Unlike indexing, slice bounds never wrap. Both
+bounds must be `int64`. `bytes` slices follow the same rules.
 
 ## Comparison
 
