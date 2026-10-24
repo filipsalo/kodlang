@@ -513,8 +513,12 @@ class Interpreter:
         match op:
             case tokens.Dot():
                 imp = None
-                if type(lhs) is ast.Name and lhs.__dict__.get("_kod_bound") is False:
-                    imp = self._alias_import(module, lhs.id)
+                if type(lhs) is ast.Name:
+                    bound = lhs.__dict__.get("_kod_bound")
+                    if bound is None:
+                        bound = lhs.id in self.stack[-1]
+                    if not bound:
+                        imp = self._alias_import(module, lhs.id)
                 if isinstance(imp, ast.Import):
                     lhs = self._resolve_import(module, imp)
                 else:

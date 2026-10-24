@@ -109,7 +109,8 @@ def returns_result(func, module, program) -> bool:
     if is_result_type_expr(expr):
         return True
     if isinstance(expr, QualifiedTypeExpr):
-        owner = module.names.get(expr.module)
+        imports = module.get_imports()
+        owner = next((i for i in imports if i.local_name == expr.module), None)
     elif isinstance(expr, NamedTypeExpr) and expr.name not in module.names:
         owner = next((i for i in module.get_imports() if expr.name in i.items), None)
     elif isinstance(expr, NamedTypeExpr):
