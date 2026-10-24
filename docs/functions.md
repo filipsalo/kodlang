@@ -61,11 +61,11 @@ type (e.g. `slice(arr, from: 0, to: 3)` is fine; passing a label for `arr`
 is just noise).
 
 If a passed argument is a bare identifier with the same name as the
-parameter, the label can be elided:
+parameter, the label can be shortened to a leading `:`:
 
 ```kod
 let name: str = "Alice"
-greet(name)           // shorthand for greet(name: name)
+greet(:name)          // shorthand for greet(name: name)
 ```
 
 ## Label / binding split
