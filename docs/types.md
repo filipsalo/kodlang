@@ -44,9 +44,10 @@ an error (`` expected `int64`, got `str` ``), and so is storing an `int64` in
 a `bool` or an `[int64]` in a `[str]`. A `T` is accepted where a `T?` is
 declared and is checked as a `T`: with `type Words = [str]`,
 `let w: Words? = []` is fine and `let w: Words? = [1]` reports the element
-(`` expected `str`, got `int64` ``). `none` is accepted wherever an optional
-or `none` is declared, a struct or primitive other than `bytes` where an
-interface is, and `[]` as any array type. A `T?` isn't accepted where a `T`
+(`` expected `str`, got `int64` ``), while `let x: int64? = "s"` names the
+declared type (`` expected `int64?`, got `str` ``). `none` is accepted
+wherever an optional or `none` is declared, a struct or primitive other
+than `bytes` where an interface is, and `[]` as any array type. A `T?` isn't accepted where a `T`
 is declared; unwrap it first with `x?` or `x? or default`. An optional is
 passed on as it is, so a `T?` where a `U?` is declared needs `T` to be `U`:
 like an `[Sq]` isn't a `[Shape]`, an `Sq?` or `int64?` isn't a `Shape?` even
