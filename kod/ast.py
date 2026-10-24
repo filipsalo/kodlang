@@ -316,6 +316,16 @@ def _literal_value(parser: Parser, token, negated=False) -> int:
     return value
 
 
+def _check_min_receiver(parser: Parser, token) -> None:
+    """`-9223372036854775808.f()`: the `-` takes the call, so the digits stand alone."""
+    if _literal_value(parser, token, negated=True) == _INT64_MAX + 1:
+        raise parser.error(
+            f"integer literal `{token.value}` doesn't fit in `int64`, whose largest value is {_INT64_MAX}; "
+            f"the `-` negates the whole expression after it, so write `(-{token.value})` for the smallest `int64`",
+            token.span,
+        )
+
+
 @dataclasses.dataclass
 class IntegerLiteral(ASTNode, Literal):
     """An integerliteral."""
@@ -1032,12 +1042,15 @@ class Expression(ASTNode):
                 value = NoneLiteral.parse(parser)
             case tokens.Minus():
                 op_token = parser.consume(tokens.Minus)
-                if parser.peeking_at(tokens.IntegerLiteral) and not isinstance(
+                literal = parser.peeking_at(tokens.IntegerLiteral)
+                if literal and not isinstance(
                     parser.tokens[parser.pos + 1],
                     (tokens.OpenParen, tokens.Dot, tokens.OpenBracket, tokens.Question),
                 ):
                     operand = IntegerLiteral.parse(parser, negated=True)
                 else:
+                    if literal:
+                        _check_min_receiver(parser, parser.peek())
                     operand = Expression.parse(parser, 17)
                 zero = IntegerLiteral(types.Int64(0), span=op_token.span)
                 value = BinaryOperator(zero, op_token, operand, op_token.span)
