@@ -76,6 +76,8 @@ func main() -> int64 {
 
 The same holds for a function literal or a function value used as a default (`cb: func() -> int64 = helper`). A name the defining module doesn't have is an error, reported at the default when a call leaves the parameter out, even when the caller happens to declare it.
 
+A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method with the name of an earlier method of the same struct or interface.
+
 ## Standard library
 
 The stdlib lives under `stdlib/` in the repository.
