@@ -515,6 +515,12 @@ type Codegen = struct {
     clashed_types: [str] = []
     // A call through a local of no known type in a body being decided counts as never returning.
     trust_locals: bool = false
+    // In a walk only fixed parameters keep their kinds; others have the ones the walk gives them.
+    untyped_walk: bool = false
+    walk_slots: [int64] = []
+    walk_kinds: [TypeKind] = []
+    // Slots a walk bound for the first time, to unmark when it ends.
+    seen_log: [int64] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -2326,9 +2332,27 @@ type Codegen = struct {
         mut i = len(self.vars) - 1
         for i >= 0 {
             if self.vars[i].name == name {
-                return self.vars[i].kind
+                return self.slot_kind(i)
             }
             i = i - 1
+        }
+        return .KUnknown
+    }
+
+    // A call through a local other than a fixed parameter is taken to return.
+    func slot_kind(self, anon i: int64) -> TypeKind {
+        if self.untyped_walk == false {
+            return self.vars[i].kind
+        }
+        mut j = len(self.walk_slots) - 1
+        for j >= 0 {
+            if self.walk_slots[j] == i {
+                return self.walk_kinds[j]
+            }
+            j -= 1
+        }
+        if regalloc.str_in(self.fixed_names, p: self.vars[i].name) {
+            return self.vars[i].kind
         }
         return .KUnknown
     }
@@ -2340,7 +2364,12 @@ type Codegen = struct {
         mut i = len(self.vars) - 1
         for i >= 0 {
             if self.vars[i].name == name {
-                self.vars[i].kind = kind
+                if self.untyped_walk {
+                    self.walk_slots += [i]
+                    self.walk_kinds += [kind]
+                } else {
+                    self.vars[i].kind = kind
+                }
                 return none
             }
             i = i - 1
@@ -2388,7 +2417,7 @@ type Codegen = struct {
                 if self.vars[i].bound == false {
                     return false
                 }
-                match self.vars[i].kind {
+                match self.slot_kind(i) {
                     .KFunc(_params, _ret) -> return true
                     .KUnknown -> return true
                     else return false
@@ -2405,6 +2434,9 @@ type Codegen = struct {
             if self.vars[i].name == name {
                 if self.vars[i].bound == false {
                     self.vars[i].bound = true
+                    if self.untyped_walk and self.vars[i].seen == false {
+                        self.seen_log += [i]
+                    }
                     self.vars[i].seen = true
                     self.bound_log += [i]
                 }
@@ -4864,6 +4896,17 @@ type Codegen = struct {
         let saved_args = self.subst_args
         let saved_log = self.bound_log
         let saved_fixed = self.fixed_names
+        let saved_walk = self.untyped_walk
+        let saved_walk_slots = self.walk_slots
+        let saved_walk_kinds = self.walk_kinds
+        let saved_seen = self.seen_log
+        self.untyped_walk = false
+        let no_slots: [int64] = []
+        let no_kinds: [TypeKind] = []
+        let no_seen: [int64] = []
+        self.walk_slots = no_slots
+        self.walk_kinds = no_kinds
+        self.seen_log = no_seen
         self.p = sig.src_p
         let fd = self.p.func_decls[sig.decl_id]
         self.fixed_names = self.fixed_params(fd)
@@ -4902,6 +4945,10 @@ type Codegen = struct {
         self.subst_args = saved_args
         self.bound_log = saved_log
         self.fixed_names = saved_fixed
+        self.untyped_walk = saved_walk
+        self.walk_slots = saved_walk_slots
+        self.walk_kinds = saved_walk_kinds
+        self.seen_log = saved_seen
         return never
     }
 
@@ -4929,17 +4976,21 @@ type Codegen = struct {
     }
 
     func walk_completes(self, anon stmts: [int64]) -> bool {
-        mut seen: [bool] = []
-        for v in self.vars {
-            seen += [v.seen]
-        }
-        let kinds = self.untype_locals()
+        let outer = self.untyped_walk
+        let kinds_mark = len(self.walk_slots)
+        let seen_mark = len(self.seen_log)
+        self.untyped_walk = true
         let completes = self.block_completes(stmts)
-        self.retype_locals(kinds)
-        mut i = 0
-        for s in seen {
-            self.vars[i].seen = s
-            i += 1
+        self.untyped_walk = outer
+        if len(self.walk_slots) > kinds_mark {
+            self.walk_slots = self.walk_slots[0..kinds_mark]
+            self.walk_kinds = self.walk_kinds[0..kinds_mark]
+        }
+        if len(self.seen_log) > seen_mark {
+            for idx in self.seen_log[seen_mark..] {
+                self.vars[idx].seen = false
+            }
+            self.seen_log = self.seen_log[0..seen_mark]
         }
         return completes
     }
@@ -4958,28 +5009,6 @@ type Codegen = struct {
             }
         }
         return ""
-    }
-
-    // A call through a local other than a fixed parameter is taken to return.
-    func untype_locals(self) -> [TypeKind] {
-        mut kinds: [TypeKind] = []
-        mut i = 0
-        for i < len(self.vars) {
-            kinds += [self.vars[i].kind]
-            if regalloc.str_in(self.fixed_names, p: self.vars[i].name) == false {
-                self.vars[i].kind = .KUnknown
-            }
-            i += 1
-        }
-        return kinds
-    }
-
-    func retype_locals(self, anon kinds: [TypeKind]) -> none {
-        mut i = 0
-        for kind in kinds {
-            self.vars[i].kind = kind
-            i += 1
-        }
     }
 
     func converts_for(self, anon value_id: int64, kind: TypeKind) -> bool {

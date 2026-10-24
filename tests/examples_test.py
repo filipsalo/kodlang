@@ -258,3 +258,37 @@ def test_missing_entry_file_is_an_error(via: str, sh_kodc):
     )
     assert result.returncode == 1
     assert f"{missing}:1:1: error: no such file" in result.stderr
+
+
+def test_let_else_checks_keep_memory_linear(sh_kodc, tmp_path):
+    """Deciding whether each let-else's `else` block can finish doesn't copy
+    every local of the function, so 2000 of them stay within a few times
+    the memory of compiling one."""
+    lines = ["func g(anon k: int64) -> int64? {", "    return k", "}"]
+    lines.append("func f(anon k: int64) -> int64 {")
+    for i in range(2000):
+        lines += [
+            f"    let .Some(v{i}) = g(k + {i}) else {{",
+            f"        return {i}",
+            "    }",
+        ]
+    lines += ["    return v0", "}", "func main() -> int64 {", "    return f(1)", "}"]
+    src = tmp_path / "let_else_many.kod"
+    src.write_text("\n".join(lines) + "\n")
+    probe = (
+        "import resource, subprocess, sys\n"
+        "r = subprocess.run(sys.argv[1:], capture_output=True)\n"
+        "print(r.returncode, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(sh_kodc), str(src)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    rc, maxrss = result.stdout.split()
+    assert rc == "0", result.stderr
+    # ru_maxrss is in bytes on macOS and in kilobytes elsewhere.
+    rss = int(maxrss) if sys.platform == "darwin" else int(maxrss) * 1024
+    assert rss < 300 * 2**20, f"{rss // 2**20} MB"
