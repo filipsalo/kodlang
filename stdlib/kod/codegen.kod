@@ -862,14 +862,14 @@ type Codegen = struct {
         return ""
     }
 
-    // What a hashed type argument of builtins' `Map` or the `set` module's `Set` is, or "".
-    func hash_key_role(self, anon template_idx: int64) -> str {
+    // "key" for builtins' `Map`, "element" for the `set` module's `Set`, else "".
+    func hashed_arg_noun(self, anon template_idx: int64) -> str {
         let t = self.structs[template_idx]
         if t.name == "Map" and t.def_path == self.builtins_path {
-            return "a `Map` key"
+            return "key"
         }
-        if t.name == "Set" and t.def_path == "stdlib/set.kod" {
-            return "a `Set` element"
+        if t.name == "Set" and t.def_path == set_module_path() {
+            return "element"
         }
         return ""
     }
@@ -891,23 +891,20 @@ type Codegen = struct {
     func report_bad_keys(self, anon outer: int64, shown: str, site: ast.Span) -> none {
         for inst_idx in self.pending_bad_keys {
             let key = self.structs[inst_idx].template_args[0]
-            let role = self.hash_key_role(self.structs[inst_idx].template_idx)
-            mut what = "keys"
-            if role == "a `Set` element" {
-                what = "elements"
-            }
+            let template_idx = self.structs[inst_idx].template_idx
+            let noun = self.hashed_arg_noun(template_idx)
             mut where = ""
             if inst_idx != outer {
                 where = f" in `{shown}`"
             }
-            self.report_error(f"error: `{self.kind_display(key)}` can't be {role}{where}{self.unhashable_note(key)}; {what} are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: site)
+            self.report_error(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: site)
         }
         let none_pending: [int64] = []
         self.pending_bad_keys = none_pending
     }
 
     func has_bad_key(self, anon instance: StructInfo) -> bool {
-        if len(instance.template_args) == 0 or len(self.hash_key_role(instance.template_idx)) == 0 {
+        if len(instance.template_args) == 0 or len(self.hashed_arg_noun(instance.template_idx)) == 0 {
             return false
         }
         let key = instance.template_args[0]
@@ -2279,9 +2276,6 @@ type Codegen = struct {
         return self.prim_vtable_label(iface_idx, :kind)
     }
 
-    // Find the cached signature for a function by name. Returns an empty
-    // SigInfo (no params, void return) if the name isn't registered or
-    // wasn't resolved with full signature info.
     // Return the closest name in `candidates` to `typo` within
     // `max_distance` Levenshtein edits, or "" if none qualifies.
     // Used to attach "did you mean X?" hints to unknown-identifier
@@ -2313,17 +2307,6 @@ type Codegen = struct {
             return f"{msg}; did you mean `{s}`?"
         }
         return msg
-    }
-
-    func find_func_sig(self, anon name: str) -> SigInfo {
-        let slot = self.lookup_func(name)
-        if slot != -1 {
-            return self.fn_sig(slot)
-        }
-        let empty_kinds: [TypeKind] = []
-        let empty_strs: [str] = []
-        let empty_defaults: [int64] = []
-        return SigInfo(param_kinds: empty_kinds, param_labels: empty_strs, param_names: empty_strs, return_kind: .KVoid, param_default_exprs: empty_defaults, src_p: self.p)
     }
 
     func find_import_fn_idx(self, anon local_mod: str, anon name: str) -> int64 {
@@ -3592,14 +3575,6 @@ type Codegen = struct {
         let return_kind = self.resolve_type(return_typ)
         self.p = saved_p
         return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p)
-    }
-
-    func func_label(self, anon name: str) -> str {
-        let m = self.func_idx
-        if m.get(name) is Some(idx) {
-            return self.func_labels[idx]
-        }
-        return f"$builtins${name}"
     }
 
 
@@ -6100,19 +6075,9 @@ type Codegen = struct {
     func is_import_alias(self, anon name: str) -> bool {
         let si = self.cur_scope()
         if si >= 0 {
-            for alias in self.scopes[si].alias_names {
-                if alias == name {
-                    return true
-                }
-            }
-            return false
+            return regalloc.str_in(self.scopes[si].alias_names, p: name)
         }
-        for alias in self.import_local {
-            if alias == name {
-                return true
-            }
-        }
-        return false
+        return regalloc.str_in(self.import_local, p: name)
     }
 
     // `Type[A, B]` parses to the left-nested chain Index(Index(Type, A), B).
@@ -8401,12 +8366,8 @@ type Codegen = struct {
         self.emit(f"mov {ptr_r}, x0")
         mut provided: [str] = []
         for arg in field_args {
-            if self.check_field(arg.label, :struct_idx, span: arg.label_span) {
-                for pname in provided {
-                    if pname == arg.label {
-                        self.report_error(f"error: field `{arg.label}` is given twice", span: arg.label_span)
-                    }
-                }
+            if self.check_field(arg.label, :struct_idx, span: arg.label_span) and regalloc.str_in(provided, p: arg.label) {
+                self.report_error(f"error: field `{arg.label}` is given twice", span: arg.label_span)
             }
             provided += [arg.label]
             mut foff = self.find_field_offset(arg.label, :struct_idx)
@@ -10399,8 +10360,7 @@ type Codegen = struct {
         }
     }
 
-    // Register all functions and externs from a dependency module without compiling it.
-    // Call this for each imported module (e.g. builtins) before compile_module.
+    // The builtins' functions and externs, registered before compile_module; sets builtins_path.
     func register_module_funcs(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
         self.builtins_path = p.path
         let idx_m = self.func_idx
@@ -10539,6 +10499,11 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+// Where `import "set"` loads from, as build.resolve_import spells it.
+func set_module_path() -> str {
+    return "stdlib/set.kod"
 }
 
 func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
