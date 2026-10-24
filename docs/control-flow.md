@@ -110,8 +110,10 @@ func show(anon item: A, anon flag: bool) -> str {
 
 The same goes for a pattern binding (`Some(x)` while a `let x` is still
 bound) and a `for` variable; give the inner binding another name. A
-block may bind a name again itself (`let x = 1`, then `let x = x + 1`),
-and so may a block after one whose binding of the name has ended.
+block may bind a name again itself, and the new value still sees the old
+binding, even when its type differs (`let x = 1`, then
+`let x = f"#{x}"`). So may a block after one whose binding of the name
+has ended.
 
 ## `return`
 
