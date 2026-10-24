@@ -116,6 +116,12 @@ let pop: int64 = 1 000 000      // ok
 let bad: int64 = 1 23 456       // lex error — middle group isn't 3 digits
 ```
 
+A literal must fit in `int64`, in any base: `9223372036854775808` or
+`0x8000000000000000` is an error at the literal, not a value that wraps
+around. The one exception is the smallest `int64`, written with a prefix
+`-` directly before its digits: `-9223372036854775808` (but not
+`-9223372036854775808.to_str()`, where the `-` negates the call).
+
 Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
 `+=` and `-=` update a variable, field, or array element in place
 (`n -= 3` is `n = n - 3`). A prefix `-` negates the whole call, field

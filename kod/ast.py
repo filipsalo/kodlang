@@ -291,6 +291,24 @@ def _parse_fstring(parser: Parser) -> ASTNode:
     return result
 
 
+_INT64_MAX = (1 << 63) - 1
+
+
+def _literal_value(parser: Parser, token, negated=False) -> int:
+    """`token`'s value, which must fit in int64 (or be 2^63 when `negated`)."""
+    text = token.value.replace(" ", "")
+    try:
+        value = int(text, 0)
+    except ValueError:
+        value = int(text, 10)
+    if value > _INT64_MAX + negated:
+        raise parser.error(
+            f"integer literal `{token.value}` doesn't fit in `int64`, whose largest value is {_INT64_MAX}",
+            token.span,
+        )
+    return value
+
+
 @dataclasses.dataclass
 class IntegerLiteral(ASTNode, Literal):
     """An integerliteral."""
@@ -299,12 +317,12 @@ class IntegerLiteral(ASTNode, Literal):
     span: Span
 
     @classmethod
-    def parse(cls, parser: Parser) -> Self:
+    def parse(cls, parser: Parser, negated=False) -> Self:
         """Parse an integer literal. Handles thousands-grouping (strip
         spaces — `int()` doesn't accept them) and base-prefix forms
         (`0x…`, `0o…`, `0b…` — `int(s, 0)` auto-detects)."""
         token = parser.consume(tokens.IntegerLiteral)
-        value = types.Int64(int(token.value.replace(" ", ""), 0))
+        value = types.Int64(_literal_value(parser, token, negated))
         return cls(value, span=token.span)
 
 
@@ -1007,7 +1025,13 @@ class Expression(ASTNode):
                 value = NoneLiteral.parse(parser)
             case tokens.Minus():
                 op_token = parser.consume(tokens.Minus)
-                operand = Expression.parse(parser, 17)
+                if parser.peeking_at(tokens.IntegerLiteral) and not isinstance(
+                    parser.tokens[parser.pos + 1],
+                    (tokens.OpenParen, tokens.Dot, tokens.OpenBracket, tokens.Question),
+                ):
+                    operand = IntegerLiteral.parse(parser, negated=True)
+                else:
+                    operand = Expression.parse(parser, 17)
                 zero = IntegerLiteral(types.Int64(0), span=op_token.span)
                 value = BinaryOperator(zero, op_token, operand, op_token.span)
             case tokens.Try():
@@ -1432,7 +1456,7 @@ def _parse_match_pattern(parser, span):
     """Parse a single match pattern (the bit before `->`)."""
     if parser.peeking_at(tokens.IntegerLiteral):
         tok = parser.consume(tokens.IntegerLiteral)
-        return IntegerPattern(int(tok.value.replace(" ", ""), 0), span)
+        return IntegerPattern(_literal_value(parser, tok), span)
     if parser.peeking_at(tokens.StringLiteral):
         tok = StringLiteral.parse(parser)
         return StringPattern(tok.value.to_py_str(), span)
@@ -1704,7 +1728,7 @@ class MatchExpressionArm:
                 return cls(pattern, body, span)
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
-                pattern = IntegerPattern(int(tok.value), span)
+                pattern = IntegerPattern(_literal_value(parser, tok), span)
             elif parser.peeking_at(tokens.StringLiteral):
                 tok = StringLiteral.parse(parser)
                 pattern = StringPattern(tok.value.to_py_str(), span)
@@ -1832,7 +1856,7 @@ class MatchArm:
             # Parse pattern
             if parser.peeking_at(tokens.IntegerLiteral):
                 tok = parser.consume(tokens.IntegerLiteral)
-                pattern = IntegerPattern(int(tok.value), span)
+                pattern = IntegerPattern(_literal_value(parser, tok), span)
             elif parser.peeking_at(tokens.StringLiteral):
                 tok = StringLiteral.parse(parser)
                 pattern = StringPattern(tok.value.to_py_str(), span)

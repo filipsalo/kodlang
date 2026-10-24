@@ -30,6 +30,51 @@ func str_to_int(anon s: str) -> int64 {
 	return result
 }
 
+// 0 when the literal fits int64, 1 when it is 2^63 (whose negation does), 2 when larger.
+func literal_excess(anon s: str) -> int64 {
+	mut base: int64 = 10
+	mut i: int64 = 0
+	if len(s) >= 2 and s[0] == '0' {
+		if s[1] == 'x' {
+			base = 16
+			i = 2
+		} else if s[1] == 'o' {
+			base = 8
+			i = 2
+		} else if s[1] == 'b' {
+			base = 2
+			i = 2
+		}
+	}
+	let max: int64 = 9223372036854775807
+	mut value: int64 = 0
+	mut excess: int64 = 0
+	for i < len(s) {
+		let c = s[i]
+		if c != ' ' {
+			mut d: int64 = c - '0'
+			if c >= 'a' and c <= 'f' {
+				d = c - 'a' + 10
+			}
+			if c >= 'A' and c <= 'F' {
+				d = c - 'A' + 10
+			}
+			if excess > 0 {
+				excess = 2
+			} else if value > (max - d) / base {
+				excess = 2
+				if (max - d) % base == base - 1 and value == (max - d) / base + 1 {
+					excess = 1
+				}
+			} else {
+				value = value * base + d
+			}
+		}
+		i = i + 1
+	}
+	return excess
+}
+
 // Parse a 0/1/.../7 string starting at `start` in base `base`. Used
 // for `0o…` and `0b…` literals — both narrow enough to share one loop.
 func parse_int_radix(anon s: str, base: int64, start: int64) -> int64 {
@@ -357,6 +402,23 @@ type Parser = struct {
 		self.errors += [ParseError(path: self.path, :line, :col, :end_col, :message, source_line: line_text, :caret)]
 	}
 
+	func check_literal_range(self, anon tok: lexing.Token) -> none {
+		if literal_excess(tok.value) > 0 {
+			self.record_error(f"error: integer literal `{tok.value}` doesn't fit in `int64`, whose largest value is 9223372036854775807", got: tok)
+		}
+	}
+
+	// Whether the token `offset` ahead continues a postfix chain.
+	func postfix_at(self, anon offset: int64) -> bool {
+		match self.peek_kind_at(offset) {
+			.OpenParen -> return true
+			.Dot -> return true
+			.OpenBracket -> return true
+			.Question -> return true
+			else return false
+		}
+	}
+
 	func skip_newlines(self) -> none {
 		for self.at(.EOL) or self.at(.Comment) {
 			self.advance()
@@ -640,6 +702,7 @@ type Parser = struct {
 		// Integer
 		if self.at(.IntegerLit) {
 			let tok: lexing.Token = self.advance()
+			self.check_literal_range(tok)
 			return self.alloc_pattern(ast.Pattern.IntPat(value: str_to_int(tok.value)))
 		}
 		// String
@@ -823,6 +886,13 @@ type Parser = struct {
 		let span: ast.Span = self.here()
 		// Unary minus: desugar -x to 0 - x, x with its postfix chain.
 		if self.try_consume(.Minus) {
+			if self.at(.IntegerLit) and literal_excess(self.peek().value) == 1 and self.postfix_at(1) == false {
+				let min_span: ast.Span = self.here()
+				let min_tok: lexing.Token = self.advance()
+				let min_lit: int64 = self.alloc_expr(ast.Expr.IntLit(value: str_to_int(min_tok.value)), span: min_span)
+				let min_zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0), :span)
+				return self.alloc_expr(ast.Expr.Binary(lhs: min_zero, op: ast.Op.Sub, rhs: min_lit), :span)
+			}
 			let operand: int64 = self.parse_postfix(self.parse_primary())
 			let zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0), :span)
 			return self.alloc_expr(ast.Expr.Binary(lhs: zero, op: ast.Op.Sub, rhs: operand), :span)
@@ -845,6 +915,7 @@ type Parser = struct {
 		// Integer literal
 		if self.at(.IntegerLit) {
 			let tok: lexing.Token = self.advance()
+			self.check_literal_range(tok)
 			return self.alloc_expr(ast.Expr.IntLit(value: str_to_int(tok.value)), :span)
 		}
 		// F-string literal
