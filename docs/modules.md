@@ -79,6 +79,8 @@ The same holds for a function literal or a function value used as a default (`cb
 
 A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method with the name of an earlier method of the same struct or interface.
 
+Type names are shared by every module a program loads, for now: `pa.Pt` and `pb.Pt` would be one type. So two modules in one program can't both declare a struct, enum, interface or type alias of the same name, the builtins included. The declaration loaded second is an error naming the file of the first (`` type `Pt` is also declared in lib/pa.kod ``); rename one of them.
+
 ## Standard library
 
 The stdlib lives under `stdlib/` in the repository.
