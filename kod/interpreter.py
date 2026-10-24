@@ -100,6 +100,16 @@ def _slot_target(expr):
     return None
 
 
+def _unlabelled_field(shown, fields, args, i):
+    """`Point(10, 20)`: offer the value the next field that no label names."""
+    args = list(args)
+    labels = {a.label.id for a in args if getattr(a, "label", None) is not None}
+    free = [name for name in fields if name not in labels]
+    nth = sum(1 for a in args[:i] if getattr(a, "label", None) is None)
+    hint = f" (`{free[nth]}:`)" if nth < len(free) else ""
+    return f"argument {i + 1} of `{shown}` needs a field label{hint}"
+
+
 def _concat_operands(expr, out):
     if type(expr) is ast.BinaryOperator and type(expr.op) is tokens.Plus:
         _concat_operands(expr.lhs, out)
@@ -1578,10 +1588,12 @@ class Interpreter:
             setattr(struct_type, "_kod_fields", fields)
         shown = struct_type.__name__
         names = []
-        for arg in args:
+        for i, arg in enumerate(args):
             label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
-            name = label.id if label is not None else ""
-            where = label.span if label is not None else arg.span
+            if label is None:
+                raise KodError(_unlabelled_field(shown, fields, args, i), arg.span)
+            name = label.id
+            where = label.span
             if name not in fields:
                 raise KodError(f"struct `{shown}` has no field `{name}`", where)
             if name in names:

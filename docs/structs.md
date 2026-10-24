@@ -48,7 +48,16 @@ let q: Point = Point(y: 20, x: 10)   // the same point
 ```
 
 The values are computed in the order they're written. Every value needs
-its label: `Point(10, 20)` is an error, since it names no field.
+its label, so `Point(10, 20)` is an error at each value:
+
+```kod
+let p: Point = Point(10, 20)
+// error: argument 1 of `Point` needs a field label (`x:`)
+// error: argument 2 of `Point` needs a field label (`y:`)
+```
+
+Each unlabelled value is offered the next field, in declaration order,
+that no label names.
 
 Every field must be supplied unless it has a [default](#field-defaults).
 Omitting a field with no default is a compile error — there's no
