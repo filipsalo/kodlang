@@ -172,11 +172,25 @@ body by these rules. A function of the module or one it imports named
 `kod_panic`, or a local function value of that name declared before the
 call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
 ends in `kod_panic(...)` never returns, and nor does one that ends in a
-call of another such helper (`self.fail(msg)`, `log.die(msg)`, a method
-of a local, as in `let r = Reporter(); r.fail(msg)`, or a function declared
-further down), or in a `for true` loop it can't `break` out of. A call
-that leads back to the function itself doesn't count:
+call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
+function declared further down), or in a `for true` loop it can't `break`
+out of. A call that leads back to the function itself doesn't count:
 `func spin() -> none { spin() }` is taken to return.
+
+Blocks don't have their own scopes yet, so a local's type can change
+between its bindings. Until they do, a call counts as never returning
+only when what it calls doesn't depend on such a type: the builtin
+`kod_panic`, a function of the module or one it imports (`die(msg)`), a
+function of an imported module (`log.die(msg)`), or a method whose
+receiver uses no local but `self` and parameters that no `let`, pattern,
+`for` or let-else in the body binds again (`self.fail(msg)`,
+`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r`,
+`reporter().fail(msg)`). A method on any other local is taken to return,
+whether a `let` (`let r = Reporter(); r.fail(msg)`), a match arm,
+`if … is`, let-else or `for` binds it, and so is a plain call of a name
+that such a local has at that point, even when it doesn't hold a function
+(`kod_panic(msg)` after `let kod_panic = 5`). To end the path there, put
+a `kod_panic(...)` or a `return` after the call.
 
 ## `main`
 
