@@ -468,13 +468,11 @@ type Codegen = struct {
     inst_depth: int64 = 0
     // Bad-key instances, reported at the outermost instantiation's site.
     pending_bad_keys: [int64] = []
-    // 1 never, 0 may return, 2 + depth deciding, -2 - returns_gen may for now.
+    // 1 never, 0 may return, 2 + depth deciding, -2 may while its deps do, -1 decide again.
     returns_memo: FuncIdx = FuncIdx()
     deciding_depth: int64 = 0
-    deciding_low: int64 = 0
     // Typing another function's locals could instantiate generics early.
     naming_locals: bool = false
-    returns_gen: int64 = 0
     returns_pending: [str] = []
     // Calls past the limit, reported unless the function type they go through was.
     limit_call_msgs: [str] = []
@@ -494,6 +492,11 @@ type Codegen = struct {
     dep_import_msgs: [str] = []
     dep_import_spans: [ast.Span] = []
     checking_dep: bool = false
+    // Keys, as `|a|b|`, of the functions still being decided that a may-return rests on.
+    deciding_deps: str = ""
+    returns_deps: StrMap = StrMap()
+    // The pending keys resting on each key.
+    returns_dependents: StrMap = StrMap()
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -4692,7 +4695,7 @@ type Codegen = struct {
         return false
     }
 
-    // A `false` resting on an unfinished caller lasts one generation.
+    // A `false` resting on functions still being decided holds until one of them never returns.
     func never_returns(self, anon sig: SigInfo, owner: int64) -> bool {
         if sig.decl_id <= 0 or self.is_void_kind(sig.return_kind) == false {
             return false
@@ -4701,37 +4704,41 @@ type Codegen = struct {
         let memo = self.returns_memo
         if memo.get(key) is Some(v) {
             if v >= 2 {
-                if v - 2 < self.deciding_low {
-                    self.deciding_low = v - 2
-                }
+                self.deciding_deps = with_dep(self.deciding_deps, :key)
                 return false
             }
             if v >= 0 {
                 return v == 1
             }
-            if v == -2 - self.returns_gen {
-                self.deciding_low = 0
+            if v == -2 {
+                self.deciding_deps = self.with_deps_of(key)
                 return false
             }
         }
         let depth = self.deciding_depth
-        let outer_low = self.deciding_low
+        let outer_deps = self.deciding_deps
         memo.set(key, depth + 2)
         self.deciding_depth = depth + 1
-        self.deciding_low = depth + 1
+        self.deciding_deps = ""
         let never = self.body_never_returns(sig, :owner)
         self.deciding_depth = depth
+        let deps = without_dep(self.deciding_deps, :key)
+        self.deciding_deps = outer_deps
         if never {
             memo.set(key, 1)
-            self.returns_gen += 1
-        } else if self.deciding_low >= depth {
+            self.drop_resting_on(key)
+        } else if len(deps) == 0 {
             memo.set(key, 0)
         } else {
-            memo.set(key, -2 - self.returns_gen)
+            memo.set(key, -2)
+            let deps_m = self.returns_deps
+            deps_m.set(key, deps)
+            let dependents = self.returns_dependents
+            for dep in dep_keys(deps) {
+                dependents.set(dep, with_dep(str_at(dependents, key: dep), :key))
+            }
             self.returns_pending += [key]
-        }
-        if outer_low < self.deciding_low {
-            self.deciding_low = outer_low
+            self.deciding_deps = self.with_deps_of(key)
         }
         if depth == 0 {
             self.settle_pending_returns()
@@ -4739,18 +4746,41 @@ type Codegen = struct {
         return never
     }
 
+    func with_deps_of(self, anon key: str) -> str {
+        mut deps = self.deciding_deps
+        for dep in dep_keys(str_at(self.returns_deps, :key)) {
+            deps = with_dep(deps, key: dep)
+        }
+        return deps
+    }
+
+    // What rested on `key` returning has to be decided again.
+    func drop_resting_on(self, anon key: str) -> none {
+        let memo = self.returns_memo
+        for dependent in dep_keys(str_at(self.returns_dependents, :key)) {
+            if memo.get(dependent) is Some(v) {
+                if v == -2 {
+                    memo.set(dependent, -1)
+                    self.drop_resting_on(dependent)
+                }
+            }
+        }
+    }
+
     // The callers these assumed to return have all done so.
     func settle_pending_returns(self) -> none {
         let memo = self.returns_memo
         for key in self.returns_pending {
             if memo.get(key) is Some(v) {
-                if v == -2 - self.returns_gen {
+                if v == -2 {
                     memo.set(key, 0)
                 }
             }
         }
         let none_pending: [str] = []
         self.returns_pending = none_pending
+        self.returns_deps = StrMap()
+        self.returns_dependents = StrMap()
     }
 
     // Locals are named so a call of one isn't taken for a same-named function.
@@ -11427,6 +11457,50 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+func with_dep(anon deps: str, key: str) -> str {
+    if len(deps) == 0 {
+        return f"|{key}|"
+    }
+    if deps.contains(f"|{key}|") {
+        return deps
+    }
+    return f"{deps}{key}|"
+}
+
+func without_dep(anon deps: str, key: str) -> str {
+    if deps.contains(f"|{key}|") == false {
+        return deps
+    }
+    mut kept = ""
+    for dep in dep_keys(deps) {
+        if dep != key {
+            kept = with_dep(kept, key: dep)
+        }
+    }
+    return kept
+}
+
+func str_at(anon m: StrMap, key: str) -> str {
+    if m.get(key) is Some(value) {
+        return value
+    }
+    return ""
+}
+
+func dep_keys(anon deps: str) -> [str] {
+    mut keys: [str] = []
+    mut start = 1
+    mut i = 1
+    for i < len(deps) {
+        if deps[i] == '|' {
+            keys += [deps[start..i]]
+            start = i + 1
+        }
+        i += 1
+    }
+    return keys
 }
 
 // Where `import "set"` loads from, as build.resolve_import spells it.
