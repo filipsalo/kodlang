@@ -1294,7 +1294,7 @@ type Codegen = struct {
         if self.p.exprs[expr_id] is .Ident(name) {
             // A `$` name is a compiler temporary the user can't write.
             if name.contains("$") == false {
-                return name
+                return self.source_name(name)
             }
         }
         return ""
@@ -2553,15 +2553,19 @@ type Codegen = struct {
         return -1
     }
 
-    // Until blocks get scopes, a nested binding would share the outer one's slot.
-    func rebinds_outer(self, anon name: str, off: int64, depth: int64) -> bool {
-        let i = self.var_index(name)
-        if i < 0 or self.vars[i].bound == false or self.vars[i].depth >= depth {
-            return false
+    // A local's name as written: the parser calls a binding that hides `x` `x#1`.
+    func source_name(self, anon name: str) -> str {
+        if self.p.renames == 0 {
+            return name
         }
-        let line = self.line_of_offset(self.vars[i].bind_off)
-        self.report_error(f"error: `{name}` is already a local here (line {line}); blocks don't have their own scopes yet, so give this one another name", span: ast.Span(start: off))
-        return true
+        mut i = len(name) - 1
+        for i > 0 {
+            if name[i] == '#' {
+                return name[0..i]
+            }
+            i -= 1
+        }
+        return name
     }
 
     func bind_at(self, anon name: str, off: int64, depth: int64) -> none {
@@ -2572,17 +2576,6 @@ type Codegen = struct {
         self.bind_var(name)
         self.vars[i].depth = depth
         self.vars[i].bind_off = off
-    }
-
-    func pattern_rebinds_outer(self, anon pattern_id: int64, depth: int64) -> bool {
-        let end = self.p.pattern_ends[pattern_id]
-        mut clash = false
-        for name in self.pattern_binding_names(self.p.patterns[pattern_id]) {
-            if self.rebinds_outer(name, off: self.name_before(name, off: end), :depth) {
-                clash = true
-            }
-        }
-        return clash
     }
 
     func bind_pattern_at(self, anon pattern_id: int64, depth: int64) -> none {
@@ -2986,7 +2979,7 @@ type Codegen = struct {
         if self.calls_local(name) {
             return false
         }
-        let slot = self.lookup_func(name)
+        let slot = self.lookup_func(self.source_name(name))
         return slot == -1 or self.fn_sig(slot).src_p.path == self.builtins_path
     }
 
@@ -4092,7 +4085,7 @@ type Codegen = struct {
             return f"; {at} is a method called through an interface value, which is taken to return"
         }
         if self.is_diverging_call(expr) {
-            return f"; {at} is a call through a local, which counts as returning until blocks get scopes"
+            return f"; {at} is a call through a local, which counts as returning"
         }
         let site = self.trusted_site(expr)
         if len(site) == 0 {
@@ -4819,7 +4812,6 @@ type Codegen = struct {
         let pattern = self.p.patterns[pattern_id]
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
         let mark = len(self.bound_log)
-        self.pattern_rebinds_outer(pattern_id, depth: self.block_depth + 1)
         self.bind_pattern_at(pattern_id, depth: self.block_depth + 1)
         self.allow_reassign(self.pattern_binding_names(pattern))
         self.compile_block(body)
@@ -4867,7 +4859,6 @@ type Codegen = struct {
         let saved = self.retype_pattern_bindings(pattern, :subject_kind)
         let mark = len(self.bound_log)
         self.block_depth += 1
-        self.pattern_rebinds_outer(pattern_id, depth: self.block_depth)
         self.bind_pattern_at(pattern_id, depth: self.block_depth)
         let body_kind = self.infer_kind(body)
         mut target = expected
@@ -4921,7 +4912,7 @@ type Codegen = struct {
         if self.calls_local(name) {
             return self.trusts(self.find_var_kind(name))
         }
-        let slot = self.lookup_func(name)
+        let slot = self.lookup_func(self.source_name(name))
         if slot != -1 {
             return self.never_returns(self.fn_sig(slot), owner: -1)
         }
@@ -4933,7 +4924,7 @@ type Codegen = struct {
             return false
         }
         match kind {
-            .KUnknown -> self.trust_why = "a call through a local, which counts as returning until blocks get scopes"
+            .KUnknown -> self.trust_why = "a call through a local, which counts as returning"
             .KInterface(_idx) -> self.trust_why = "a method called through an interface value, which is taken to return"
             else return false
         }
@@ -4967,7 +4958,7 @@ type Codegen = struct {
     func is_panic_call(self, anon expr_id: int64) -> bool {
         if self.p.exprs[expr_id] is .Call(callee, _args) {
             if self.p.exprs[callee] is .Ident(name) {
-                return name == "kod_panic" and self.is_builtin_call(name)
+                return self.source_name(name) == "kod_panic" and self.is_builtin_call(name)
             }
         }
         return false
@@ -5155,7 +5146,7 @@ type Codegen = struct {
         return never
     }
 
-    // Until blocks get scopes, only these keep one kind throughout the body.
+    // Only parameters the body doesn't bind again keep one kind throughout it.
     func fixed_params(self, anon fd: ast.FuncDecl) -> [str] {
         let saved_vars = self.vars
         let saved_slots = self.frame_slots
@@ -5547,7 +5538,7 @@ type Codegen = struct {
                     // them out keeps the suggestions relevant.
                     mut cands: [str] = []
                     for v in self.vars {
-                        cands += [v.name]
+                        cands += [self.source_name(v.name)]
                     }
                     for n in self.visible_func_names() {
                         cands += [n]
@@ -5728,7 +5719,7 @@ type Codegen = struct {
     // Try `EnumName.Variant` — bare two-part unit-variant access.
     func try_two_part_unit_variant(self, dot_lhs: int64, dot_rhs: int64) -> Val? {
         let .Ident(type_name) = self.p.exprs[dot_lhs] else { return none }
-        let enum_idx = self.find_enum_idx(type_name)
+        let enum_idx = self.find_enum_idx(self.source_name(type_name))
         if enum_idx < 0 { return none }
         let .Ident(variant_name) = self.p.exprs[dot_rhs] else { return none }
         let variant_idx = self.check_variant(variant_name, :enum_idx, span: self.p.expr_spans[dot_rhs])
@@ -7078,7 +7069,7 @@ type Codegen = struct {
     // The enum that an `Enum.Variant(...)` callee constructs, or -1.
     func two_part_ctor_enum(self, anon callee_lhs: int64, variant_name: str) -> int64 {
         let .Ident(enum_name) = self.p.exprs[callee_lhs] else { return -1 }
-        let enum_idx = self.find_enum_idx(enum_name)
+        let enum_idx = self.find_enum_idx(self.source_name(enum_name))
         if enum_idx < 0 or self.find_variant_idx(variant_name, :enum_idx) < 0 {
             return -1
         }
@@ -7123,7 +7114,8 @@ type Codegen = struct {
 
     // Returns the template for bad type arguments, reporting them only when `report`.
     func generic_ctor_instance(self, anon callee_id: int64, report: bool) -> int64 {
-        let .Ident(name) = self.p.exprs[self.index_chain_root(callee_id)] else { return -1 }
+        let .Ident(key) = self.p.exprs[self.index_chain_root(callee_id)] else { return -1 }
+        let name = self.source_name(key)
         let template_idx = self.find_struct_idx(name)
         if template_idx < 0 {
             return -1
@@ -7159,7 +7151,7 @@ type Codegen = struct {
     // none for anything but a type spelling, reported when `report` is set.
     func type_kind_of_expr(self, anon expr_id: int64, report: bool) -> TypeKind? {
         match self.p.exprs[expr_id] {
-            .Ident(name) -> return self.type_arg_name_kind(name, span: self.p.expr_spans[expr_id], :report)
+            .Ident(name) -> return self.type_arg_name_kind(self.source_name(name), span: self.p.expr_spans[expr_id], :report)
             .ArrayLit(elements) -> {
                 if len(elements) == 1 {
                     if self.type_kind_of_expr(elements[0], :report) is Some(elem) {
@@ -7186,7 +7178,8 @@ type Codegen = struct {
                         }
                     }
                     .Index -> {
-                        if self.p.exprs[self.index_chain_root(expr_id)] is .Ident(name) {
+                        if self.p.exprs[self.index_chain_root(expr_id)] is .Ident(key) {
+                            let name = self.source_name(key)
                             let struct_idx = self.find_struct_idx(name)
                             if struct_idx >= 0 {
                                 let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.structs[struct_idx].type_param_names), :report)
@@ -7672,7 +7665,7 @@ type Codegen = struct {
         if enum_idx >= 0 {
             return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(method_name, :enum_idx), span: self.p.expr_spans[callee_rhs])
         }
-        let named_enum = self.find_enum_idx(mod_or_obj)
+        let named_enum = self.find_enum_idx(self.source_name(mod_or_obj))
         if named_enum >= 0 {
             self.check_variant(method_name, enum_idx: named_enum, span: self.p.expr_spans[callee_rhs])
             return .VImm(value: 0)
@@ -7773,7 +7766,7 @@ type Codegen = struct {
     // clobber it), then `blr`.
     func callee_desc(self, anon callee_id: int64) -> str {
         if self.p.exprs[callee_id] is .Ident(callee_name) {
-            return f"`{callee_name}`"
+            return f"`{self.source_name(callee_name)}`"
         }
         return "this function value"
     }
@@ -7838,8 +7831,10 @@ type Codegen = struct {
 
     func compile_call(self, anon args: [ast.CallArg], callee_id: int64) -> Val {
         match self.p.exprs[callee_id] {
-            .Ident(name) -> {
-                let builtin = self.is_builtin_call(name)
+            .Ident(key) -> {
+                // `key` finds the local; anything else goes by the name as written.
+                let name = self.source_name(key)
+                let builtin = self.is_builtin_call(key)
                 if name == "len" and len(args) == 1 and builtin {
                     return self.compile_len(args[0].value)
                 }
@@ -7887,11 +7882,11 @@ type Codegen = struct {
                 // var shadowing a function name wins. Delegating to
                 // compile_indirect_call also gives us its labelled-
                 // argument rejection for free.
-                if self.calls_local(name) {
-                    if self.find_var_kind(name) is .KFunc(_pk, _rk) {
+                if self.calls_local(key) {
+                    if self.find_var_kind(key) is .KFunc(_pk, _rk) {
                         return self.compile_indirect_call(:callee_id, :args)
                     }
-                    if self.find_var_kind(name) is .KUnknown {
+                    if self.find_var_kind(key) is .KUnknown {
                         for arg in args {
                             self.compile_discard(arg.value)
                         }
@@ -7907,13 +7902,13 @@ type Codegen = struct {
                     self.emit(f"bl {self.fn_label(slot)}")
                     return .VReg(name: "x0")
                 }
-                if self.var_bound(name) {
-                    self.report_error(f"error: `{name}` is a local of type `{self.kind_display(self.find_var_kind(name))}`, not a function", span: self.p.expr_spans[callee_id])
+                if self.var_bound(key) {
+                    self.report_error(f"error: `{name}` is a local of type `{self.kind_display(self.find_var_kind(key))}`, not a function", span: self.p.expr_spans[callee_id])
                     return .VImm(value: 0)
                 }
-                if self.find_var_kind(name) is .KFunc(_pk, _rk) {
+                if self.find_var_kind(key) is .KFunc(_pk, _rk) {
                     mut msg = f"error: `{name}` is called before its `let`"
-                    if self.var_seen(name) {
+                    if self.var_seen(key) {
                         msg = f"error: `{name}` is declared in a block that has ended; declare it outside the block to call it here"
                     }
                     self.report_error(msg, span: self.p.expr_spans[callee_id])
@@ -8213,7 +8208,7 @@ type Codegen = struct {
         if len(method_lbl) == 0 {
             mut recv_desc: str = "receiver"
             if self.p.exprs[receiver_id] is .Ident(recv_name) {
-                recv_desc = recv_name
+                recv_desc = self.source_name(recv_name)
             }
             // Collect candidate method names for the typo hint: the
             // receiver's struct methods (if any) plus the primitive
@@ -8730,7 +8725,7 @@ type Codegen = struct {
     // For `EnumName.X`, return KEnum(idx). (X is checked at the call site.)
     func two_part_enum_kind(self, dot_lhs: int64) -> TypeKind? {
         let .Ident(type_name) = self.p.exprs[dot_lhs] else { return none }
-        let enum_idx = self.find_enum_idx(type_name)
+        let enum_idx = self.find_enum_idx(self.source_name(type_name))
         if enum_idx < 0 { return none }
         return self.ctor_kind(enum_idx)
     }
@@ -8816,11 +8811,12 @@ type Codegen = struct {
             }
             .Call(callee, args) -> {
                 match self.p.exprs[callee] {
-                    .Ident(name) -> {
-                        if name == "$str" or (name == "str" and self.is_builtin_call(name)) {
+                    .Ident(key) -> {
+                        let name = self.source_name(key)
+                        if name == "$str" or (name == "str" and self.is_builtin_call(key)) {
                             return .KStr
                         }
-                        if name == "hash" and self.is_builtin_call(name) {
+                        if name == "hash" and self.is_builtin_call(key) {
                             return .KInt64
                         }
                         // Struct or enum constructor: TypeName(...)
@@ -8832,8 +8828,8 @@ type Codegen = struct {
                             return .KStruct(idx: struct_idx, type_args: [])
                         }
                         // A local of function type shadows a function name.
-                        if self.calls_local(name) {
-                            if self.find_var_kind(name) is .KFunc(_var_params, var_ret) {
+                        if self.calls_local(key) {
+                            if self.find_var_kind(key) is .KFunc(_var_params, var_ret) {
                                 return var_ret
                             }
                         }
@@ -9019,13 +9015,8 @@ type Codegen = struct {
                     before = self.p.type_spans[typ].start
                 }
                 let off = self.name_before(name, off: before)
-                if self.rebinds_outer(name, :off, depth: self.block_depth) {
-                    self.compile_discard(value)
-                    self.update_var_kind(:name, kind: .KUnknown)
-                } else {
-                    self.compile_let(:name, :typ, :value, :mutable)
-                    self.bind_at(name, :off, depth: self.block_depth)
-                }
+                self.compile_let(:name, :typ, :value, :mutable)
+                self.bind_at(name, :off, depth: self.block_depth)
             }
             .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
             .PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs_id: lhs, rhs_id: rhs)
@@ -9042,16 +9033,9 @@ type Codegen = struct {
             }
             .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
             .LetElse(pattern, value, else_body) -> {
-                if self.pattern_rebinds_outer(pattern, depth: self.block_depth) {
-                    self.compile_discard(value)
-                    for name in self.pattern_binding_names(self.p.patterns[pattern]) {
-                        self.update_var_kind(:name, kind: .KUnknown)
-                    }
-                } else {
-                    self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
-                    self.bind_pattern_at(pattern, depth: self.block_depth)
-                    self.allow_reassign(self.pattern_binding_names(self.p.patterns[pattern]))
-                }
+                self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
+                self.bind_pattern_at(pattern, depth: self.block_depth)
+                self.allow_reassign(self.pattern_binding_names(self.p.patterns[pattern]))
             }
             .Throw(value) -> self.compile_throw(value)
             .Assert(expr, source_text, span) -> self.compile_assert(expr, :source_text, :span)
@@ -9073,7 +9057,7 @@ type Codegen = struct {
         self.compile_store(dest_off: off, :kind, value_id: value)
         if typ == 0 {
             if kind is .KUnknown {
-                self.report_cannot_infer(value, what: f"`{name}`")
+                self.report_cannot_infer(value, what: f"`{self.source_name(name)}`")
             } else {
                 self.check_unannotated_literal(value, :kind)
             }
@@ -10037,7 +10021,7 @@ type Codegen = struct {
         if self.report_attempts == attempts_before and lhs_is_struct == false {
             mut opt_name = "x"
             if self.p.exprs[lhs] is .Ident(lhs_name) {
-                opt_name = lhs_name
+                opt_name = self.source_name(lhs_name)
             }
             let hint = f"; unwrap it first, as in `if {opt_name} is Some(v) " + "{" + f" v.{field_name} = ... " + "}`"
             self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs], optional_hint: hint)
@@ -10379,7 +10363,7 @@ type Codegen = struct {
                 if self.var_declared(name) == false {
                     mut cands: [str] = []
                     for v in self.vars {
-                        cands += [v.name]
+                        cands += [self.source_name(v.name)]
                     }
                     let msg: str = self.with_suggestion(f"error: unknown name `{name}`; declare it with `mut {name} = ...`", typo: name, candidates: cands)
                     self.report_error(msg, span: self.p.expr_spans[lhs_id])
@@ -10390,7 +10374,7 @@ type Codegen = struct {
                     return none
                 }
                 if self.enforce_immutability() and self.find_var_mutable(name) == false {
-                    self.report_error("cannot reassign immutable binding `" + name + "`; declare it with `mut`", span: self.p.expr_spans[lhs_id])
+                    self.report_error("cannot reassign immutable binding `" + self.source_name(name) + "`; declare it with `mut`", span: self.p.expr_spans[lhs_id])
                     return none
                 }
                 let off = self.find_var_offset(name)
@@ -11081,8 +11065,6 @@ type Codegen = struct {
     func compile_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
         self.note_wide_fn_local(name, value: iter_id)
         let name_off = self.name_before(name, off: self.p.expr_spans[iter_id].start)
-        let clash = self.rebinds_outer(name, off: name_off, depth: self.block_depth + 1)
-        let outer_kind = self.find_var_kind(name)
         // Pin the element binding's kind for THIS loop. Collection only
         // pre-reserved a slot (with a placeholder kind) because two loops
         // can share an element name with different iterator types — the
@@ -11167,9 +11149,6 @@ type Codegen = struct {
         self.allow_reassign([name])
         self.compile_block(body)
         self.unbind_to(mark)
-        if clash {
-            self.update_var_kind(:name, kind: outer_kind)
-        }
 
         self.emit_label(incr_lbl)
         let bump_reg = self.pool.alloc_reg()
@@ -11208,7 +11187,7 @@ type Codegen = struct {
             return msg
         }
         if self.p.exprs[iter_id] is .Ident(name) {
-            return f"{msg}; iterate over `{name}{hint}` instead"
+            return f"{msg}; iterate over `{self.source_name(name)}{hint}` instead"
         }
         return f"{msg}; iterate over its `{hint}` instead"
     }

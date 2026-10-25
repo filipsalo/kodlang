@@ -320,19 +320,24 @@ def _children(node):
 class _Scope:
     """What the static pass knows of a function besides the names bound so far."""
 
-    def __init__(self, func, program, module):
+    def __init__(self, func, program, module, default=None):
+        """For a parameter or field `default`, which sees no parameters."""
         self.program = program
         self.module = getattr(func, "module", None) or module
-        params = {p.variable.id for p in func.params}
+        params = {p.variable.id for p in func.params} if default is None else set()
         self.seen = set(params)
         self.declared = set(params)
         # Names a `let` or a parameter without `mut` binds, which the frame
         # holds as immutable until another binding of the name thaws them.
-        self.fixed = {p.variable.id for p in func.params if not p.mutable}
-        for stmt in func.body:
+        self.fixed = set()
+        if default is None:
+            self.fixed = {p.variable.id for p in func.params if not p.mutable}
+        for stmt in func.body if default is None else [default]:
             _local_names(stmt, self.declared, self.fixed)
         imports = self.module.get_imports() if self.module is not None else ()
         self.aliases = {imp.local_name for imp in imports}
+        # Inside the right-hand side of `is`, whose names are no uses of locals.
+        self.plain = 0
 
     def named(self, name):
         """What the module, an item it imports or a builtin calls `name`."""
@@ -400,11 +405,26 @@ def _local_names(node, names, fixed):
 
 
 def _mark_scopes(func, program, module=None):
-    """Note at each name whether a local of it is bound there, and check its use."""
+    """Note at each name whether a local of it is bound there, and check its use.
+
+    A binding that hides one still in force gets a frame key of its own, as
+    the compiler's parser names it: `x#k` for one that hides k bindings of
+    `x`. The reads and stores it reaches are renamed to that key.
+    """
     func.__dict__["_kod_scoped"] = True
     scope = _Scope(func, program, module)
-    params = {p.variable.id: (1, p.span) for p in func.params}
+    params = {p.variable.id: (1, p.span, p.variable.id, 0) for p in func.params}
     _scope_block(func.body, params, 1, scope)
+    for param in func.params:
+        _mark_default(param.default, program, scope.module)
+
+
+def _mark_default(expr, program, module):
+    """A parameter or field default sees no locals, but its match arms bind."""
+    if expr is None or "_kod_scoped" in expr.__dict__:
+        return
+    expr.__dict__["_kod_scoped"] = True
+    _scope_expr(expr, {}, 1, _Scope(None, program, module, default=expr))
 
 
 def _mark_program_scopes(program):
@@ -416,6 +436,16 @@ def _mark_program_scopes(program):
             elif isinstance(stmt, ast.TypeDeclaration):
                 owner = getattr(stmt.type, "template", stmt.type)
                 funcs = getattr(owner, "methods", {}).values()
+                where = getattr(owner, "decl_module", None) or module
+                for field in getattr(owner, "struct_fields", ()):
+                    _mark_default(field.default, program, where)
+            elif isinstance(stmt, ast.InterfaceDeclaration):
+                for sig in stmt.methods:
+                    for param in sig.params:
+                        _mark_default(param.default, program, module)
+            elif isinstance(stmt, ast.ExternalFunctionDeclaration):
+                for param in stmt.params:
+                    _mark_default(param.default, program, module)
             for func in funcs:
                 if "_kod_scoped" not in func.__dict__:
                     _mark_scopes(func, program, module)
@@ -435,27 +465,53 @@ def _name_span(span, name, end=None):
 
 
 def _bind(bound, name, span, depth, scope):
-    # Until blocks get scopes, a nested binding would share the outer one's slot.
+    """Bind `name` at `depth`; return the frame key its value goes to."""
+    key, level = name, 0
     outer = bound.get(name)
-    if outer is not None and outer[0] < depth:
-        raise KodError(
-            f"`{name}` is already a local here (line {_line_of(outer[1])}); blocks"
-            " don't have their own scopes yet, so give this one another name",
-            span,
-        )
-    bound[name] = (depth, span)
+    if outer is not None:
+        key, level = outer[2], outer[3]
+        if outer[0] < depth:
+            level += 1
+            key = f"{name}#{level}"
+    bound[name] = (depth, span, key, level)
     scope.seen.add(name)
+    return key
 
 
 def _bind_pattern(bound, pattern, depth, scope, end=None):
-    for name in _pattern_names(pattern):
+    # By the names as written, so a node `+=` shares binds alike the second time.
+    names = pattern.__dict__.get("_kod_names")
+    if names is None:
+        names = pattern.__dict__["_kod_names"] = _pattern_names(pattern)
+    keys = [
         _bind(bound, name, _name_span(pattern.span, name, end), depth, scope)
+        for name in names
+    ]
+    if keys == _pattern_names(pattern):
+        return
+    bindings = getattr(pattern, "bindings", None)
+    if bindings is None:
+        pattern.binding = keys[0]
+    else:
+        renamed = iter(keys)
+        pattern.bindings = [next(renamed) if b else b for b in bindings]
 
 
 def _scope_use(node, bound, scope, verb, fallback=True):
-    """A local's name used where no binding of it is: its fallback, or an error."""
-    name = node.id
-    if name in bound or name not in scope.declared:
+    """A local's name used where no binding of it is: its fallback, or an error.
+
+    Where a binding of it is in force, the name becomes that binding's key.
+    """
+    if scope.plain:
+        return
+    name = node.__dict__.get("_kod_name", node.id)
+    entry = bound.get(name)
+    if entry is not None:
+        if entry[2] != node.id:
+            node.__dict__["_kod_name"] = name
+            node.id = entry[2]
+        return
+    if name not in scope.declared:
         return
     target = scope.fallback(name, call=verb == "called") if fallback else None
     if target is None:
@@ -481,7 +537,8 @@ def _scope_stmt(stmt, bound, depth, scope):
     inner = depth + 1
     if t is ast.VariableDeclaration:
         _scope_expr(stmt.value, bound, depth, scope)
-        _bind(bound, stmt.variable.id, stmt.variable.span, depth, scope)
+        variable = stmt.variable
+        variable.id = _bind(bound, variable.id, variable.span, depth, scope)
     elif t is ast.LetElseStatement:
         _scope_expr(stmt.value, bound, depth, scope)
         _scope_block(stmt.else_body, bound, inner, scope)
@@ -500,7 +557,7 @@ def _scope_stmt(stmt, bound, depth, scope):
         body = dict(bound)
         _note_thaw(stmt, [stmt.binding], scope)
         name_span = _name_span(stmt.span, stmt.binding, stmt.iterable.span.start)
-        _bind(body, stmt.binding, name_span, inner, scope)
+        stmt.binding = _bind(body, stmt.binding, name_span, inner, scope)
         _scope_block(stmt.body, body, inner, scope)
     elif t is ast.MatchStatement:
         _scope_expr(stmt.expression, bound, depth, scope)
@@ -529,27 +586,43 @@ def _scope_expr(node, bound, depth, scope):
             _mark_scopes(node, scope.program, scope.module)
         return
     if t is ast.FunctionCallParam:
+        # `:name` shares its Name between the label and the value.
+        if node.label is node.expression:
+            entry = bound.get(node.label.id)
+            if entry is not None and entry[2] != node.label.id:
+                node.expression = dataclasses.replace(node.expression)
         _scope_expr(node.expression, bound, depth, scope)
         return
     if t is ast.GenericInstantiation:
         return
     if t is ast.FunctionCall and type(node.callee) is ast.Name:
-        node.callee.__dict__["_kod_bound"] = node.callee.id in bound
-        _scope_use(node.callee, bound, scope, "called")
+        # The callee keeps its name; the key of the binding in force goes alongside.
+        entry = bound.get(node.callee.id)
+        node.callee.__dict__["_kod_bound"] = entry[2] if entry is not None else False
+        if entry is None:
+            _scope_use(node.callee, bound, scope, "called")
         _scope_expr(node.args, bound, depth, scope)
         return
     if t is ast.BinaryOperator and isinstance(node.op, tokens.Dot):
         if type(node.lhs) is ast.Name:
-            enum = scope.enum_named(node.lhs.id)
+            name = node.lhs.__dict__.get("_kod_name", node.lhs.id)
+            enum = scope.enum_named(name)
             if enum is not None:
                 # As in the compiler, the enum wins over a local of its name.
                 node.lhs = enum
                 return
-            node.lhs.__dict__["_kod_bound"] = node.lhs.id in bound
-            if node.lhs.id not in scope.aliases:
+            entry = bound.get(name)
+            node.lhs.__dict__["_kod_bound"] = entry[2] if entry is not None else False
+            if entry is not None or name not in scope.aliases:
                 _scope_use(node.lhs, bound, scope, "read", fallback=False)
         elif type(node.lhs) is not type:  # an enum already, in a `+=` target seen twice
             _scope_expr(node.lhs, bound, depth, scope)
+        return
+    if t is ast.BinaryOperator and isinstance(node.op, (tokens.Is, tokens.IsNot)):
+        _scope_expr(node.lhs, bound, depth, scope)
+        scope.plain += 1
+        _scope_expr(node.rhs, bound, depth, scope)
+        scope.plain -= 1
         return
     if t is ast.MatchExpression:
         _scope_expr(node.expression, bound, depth, scope)
@@ -709,12 +782,12 @@ class Interpreter:
 
     def _local_func(self, callee):
         """The function value a local in scope at this call holds, or None."""
-        bound = callee.__dict__.get("_kod_bound")
-        if bound is None:
-            bound = callee.id in self.stack[-1]
-        if not bound:
+        key = callee.__dict__.get("_kod_bound")
+        if key is None:
+            key = callee.id if callee.id in self.stack[-1] else False
+        if not key:
             return None
-        value = self.stack[-1].get(callee.id)
+        value = self.stack[-1].get(key)
         return value if isinstance(value, (*_FUNC_DECLS, BoundMethod)) else None
 
     def _aliases(self, module):
@@ -793,7 +866,7 @@ class Interpreter:
             if target is not None:
                 return target
             if callee.__dict__["_kod_bound"]:
-                value = self.stack[-1].get(callee.id)
+                value = self.stack[-1].get(callee.__dict__["_kod_bound"])
                 raise KodError(
                     f"`{callee.id}` is a local of type `{_type_name(value)}`,"
                     " not a function",
@@ -1784,7 +1857,8 @@ class Interpreter:
                         and lhs_val.id in self.immutable_stack[-1]
                     ):
                         raise KodError(
-                            f"cannot reassign immutable binding `{lhs_val.id}`; "
+                            "cannot reassign immutable binding"
+                            f" `{lhs_val.id.partition('#')[0]}`; "
                             "declare it with `mut`",
                             lhs.span,
                         )
