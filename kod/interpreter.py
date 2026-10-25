@@ -11,7 +11,12 @@ from typing import Any
 from kod import ast, tokens
 from kod import values as types
 from kod.exceptions import KodError, get_source
-from kod.parser import qualified_type_error, with_suggestion
+from kod.parser import (
+    UnknownTypeError,
+    qualified_type_error,
+    type_hint,
+    with_suggestion,
+)
 from kod.program import Program
 from kod.span import Span
 
@@ -605,7 +610,8 @@ class Interpreter:
         for module in self.program:
             errors = module.__dict__.get("_kod_type_errors")
             if errors:
-                raise errors[0]
+                err = errors[0]
+                raise err.word() if isinstance(err, UnknownTypeError) else err
         for module in self.program:
             for statement in module.body:
                 self.execute_statement(module, statement)
@@ -1654,6 +1660,11 @@ class Interpreter:
             value = self._item(module, name)
         if value is None:
             value = self.program.builtins.names.get(name)
+        if value is None:
+            aliases = {imp.local_name: imp.module_name for imp in module.get_imports()}
+            hint = type_hint(self.program, module.source_file.path, aliases, name)
+            if hint:
+                raise KodError(f"unknown type `{name}`; {hint}", span)
         return value
 
     def _holds_type(self, value, cls, name, span, alias=None):

@@ -1635,6 +1635,8 @@ type Codegen = struct {
                     if len(msg) == 0 and self.is_import_alias(enum_name) == false and self.pattern_named_enum(enum_name) < 0 {
                         if name_dot(enum_name) >= 0 {
                             msg = self.pattern_qual_error(enum_name)
+                        } else if len(self.type_elsewhere_hint(enum_name)) > 0 {
+                            msg = f"error: unknown type `{enum_name}`; {self.type_elsewhere_hint(enum_name)}"
                         } else if self.type_name_known(enum_name) == false {
                             msg = self.qualified_type_error(enum_name, name: variant_name, call: false)
                         }
@@ -2661,13 +2663,11 @@ type Codegen = struct {
 
 
     func find_enum_idx(self, anon name: str) -> int64 {
-        if self.enum_idx.get(name) is Some(i) {
+        if self.enum_idx.contains(name) {
             let r = self.module_type_ref(name)
             if r >= 0 and r % 4 == 1 {
                 return r / 4
             }
-            // Any loaded module's, until a bare name resolves only where it's visible.
-            return i
         }
         return -1
     }
@@ -2958,23 +2958,21 @@ type Codegen = struct {
     }
 
     func find_struct_idx(self, anon name: str) -> int64 {
-        if self.struct_idx.get(name) is Some(i) {
+        if self.struct_idx.contains(name) {
             let r = self.module_type_ref(name)
             if r >= 0 and r % 4 == 0 {
                 return r / 4
             }
-            return i
         }
         return -1
     }
 
     func find_iface_idx(self, anon name: str) -> int64 {
-        if self.iface_idx.get(name) is Some(i) {
+        if self.iface_idx.contains(name) {
             let r = self.module_type_ref(name)
             if r >= 0 and r % 4 == 2 {
                 return r / 4
             }
-            return i
         }
         return -1
     }
@@ -3713,13 +3711,12 @@ type Codegen = struct {
                     self.report_error(f"error: unknown enum `{enum_name}`", :span)
                     return -1
                 }
-                mut names: [str] = []
-                for e in self.enums {
-                    if e.template_idx < 0 {
-                        names += [e.name]
-                    }
+                let hint = self.type_elsewhere_hint(enum_name)
+                if len(hint) > 0 {
+                    self.report_error(f"error: unknown type `{enum_name}`; {hint}", :span)
+                    return -1
                 }
-                self.report_error(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: names), :span)
+                self.report_error(self.with_suggestion(f"error: unknown enum `{enum_name}`", typo: enum_name, candidates: self.visible_type_names(1)), :span)
                 return -1
             }
             if self.enums_compatible(subj_enum_idx, a_idx: enum_idx) == false {
@@ -4177,21 +4174,6 @@ type Codegen = struct {
         let r = self.module_type_ref(name)
         if r >= 0 {
             return self.type_ref_kind(r)
-        }
-        // Any loaded module's, until a bare name resolves only where it's visible.
-        if self.alias_idx.get(name) is Some(alias_i) {
-            if alias_i >= 0 {
-                return self.alias_kinds[alias_i]
-            }
-        }
-        if self.enum_idx.get(name) is Some(enum_idx) {
-            return .KEnum(idx: enum_idx)
-        }
-        if self.struct_idx.get(name) is Some(struct_idx) {
-            return .KStruct(idx: struct_idx, type_args: [])
-        }
-        if self.iface_idx.get(name) is Some(iface_idx) {
-            return .KInterface(idx: iface_idx)
         }
         return .KUnknown
     }
@@ -4962,15 +4944,7 @@ type Codegen = struct {
         if name == "int64" or name == "bool" or name == "str" or name == "bytes" or name == "none" {
             return true
         }
-        if self.module_type_ref(name) >= 0 {
-            return true
-        }
-        if self.alias_idx.get(name) is Some(alias_i) {
-            if alias_i >= 0 {
-                return true
-            }
-        }
-        return self.enum_idx.contains(name) or self.struct_idx.contains(name) or self.iface_idx.contains(name)
+        return self.module_type_ref(name) >= 0
     }
 
     // Register all struct and enum declarations from another module under the
@@ -5995,7 +5969,11 @@ type Codegen = struct {
                     for n in self.visible_func_names() {
                         cands += [n]
                     }
-                    let msg: str = self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands)
+                    mut msg: str = self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands)
+                    let hint = self.type_elsewhere_hint(name)
+                    if len(hint) > 0 {
+                        msg = f"error: unknown type `{name}`; {hint}"
+                    }
                     self.report_error(msg, span: self.p.expr_spans[expr_id])
                     return .VImm(value: 0)
                 }
@@ -6451,6 +6429,10 @@ type Codegen = struct {
         if self.type_name_known(qualifier) {
             return ""
         }
+        let hint = self.type_elsewhere_hint(qualifier)
+        if len(hint) > 0 {
+            return f"error: unknown type `{qualifier}`; {hint}"
+        }
         return self.qualified_type_error(qualifier, :name, call: false)
     }
 
@@ -6538,6 +6520,8 @@ type Codegen = struct {
                 let qual_msg = self.is_rhs_qual_error(rhs)
                 if len(qual_msg) > 0 {
                     msg = qual_msg
+                } else if len(self.type_elsewhere_hint(type_name)) > 0 {
+                    msg = f"error: unknown type `{type_name}`; {self.type_elsewhere_hint(type_name)}"
                 }
                 self.report_error(msg, span: self.p.expr_spans[rhs])
                 return .VImm(value: 0)
@@ -7039,6 +7023,8 @@ type Codegen = struct {
             mut msg = f"error: `{type_name}` is not a struct type"
             if self.qualified_type_ref_of(type_name) == -1 {
                 msg = self.pattern_qual_error(type_name)
+            } else if len(self.type_elsewhere_hint(type_name)) > 0 {
+                msg = f"error: unknown type `{type_name}`; {self.type_elsewhere_hint(type_name)}"
             }
             self.report_error(msg, span: self.p.expr_spans[subject_id])
             return none
@@ -7799,25 +7785,82 @@ type Codegen = struct {
     }
 
     func unknown_type_error(self, anon name: str) -> str {
+        let hint = self.type_elsewhere_hint(name)
+        if len(hint) > 0 {
+            return f"error: unknown type `{name}`; {hint}"
+        }
         mut names: [str] = ["int64", "bool", "str", "bytes", "none"]
         for n in self.subst_names {
             names += [n]
         }
-        for n in self.struct_idx.keys {
-            names += [n]
-        }
-        for n in self.enum_idx.keys {
-            names += [n]
-        }
-        for n in self.iface_idx.keys {
-            names += [n]
-        }
-        for n in self.alias_idx.keys {
-            if self.type_name_known(n) {
-                names += [n]
+        names += self.visible_type_names(-1)
+        return self.with_suggestion(f"error: unknown type `{name}`", typo: name, candidates: names)
+    }
+
+    // The types the module sees: its own, those its imports list, then the
+    // builtins'; only the structs (what 0), enums (1) or interfaces (2), or all.
+    func visible_type_names(self, anon what: int64) -> [str] {
+        mut names: [str] = []
+        let ti = self.cur_type_scope()
+        if ti >= 0 {
+            let ts = self.type_scopes[ti]
+            names += self.own_type_names(ti, :what)
+            mut i = 0
+            for item in ts.item_names {
+                let r = self.listed_type_ref(ts, alias: ts.item_aliases[i], name: item)
+                if r >= 0 and (what < 0 or r % 4 == what) {
+                    names += [item]
+                }
+                i += 1
             }
         }
-        return self.with_suggestion(f"error: unknown type `{name}`", typo: name, candidates: names)
+        if self.type_scope_idx.get(self.builtins_path) is Some(bi) {
+            if bi != ti {
+                names += self.own_type_names(bi, :what)
+            }
+        }
+        return names
+    }
+
+    func own_type_names(self, anon ti: int64, what: int64) -> [str] {
+        mut names: [str] = []
+        let own = self.type_scopes[ti].own
+        for n in own.keys {
+            if own.get(n) is Some(r) {
+                if what < 0 or r % 4 == what {
+                    names += [n]
+                }
+            }
+        }
+        return names
+    }
+
+    // For a type `name` the module doesn't see, where it is declared and how to
+    // name it here; "" when the module sees it or no module declares it.
+    func type_elsewhere_hint(self, anon name: str) -> str {
+        if self.type_names.contains(name) == false or self.module_type_ref(name) >= 0 {
+            return ""
+        }
+        let listing = "` or list it in the import (`{ " + name + " }`)"
+        let ti = self.cur_type_scope()
+        if ti >= 0 {
+            let ts = self.type_scopes[ti]
+            mut i = 0
+            for path in ts.alias_paths {
+                if self.type_scope_idx.get(path) is Some(mi) {
+                    if self.type_scopes[mi].own.contains(name) {
+                        return f"{path} declares `{name}`: write `{ts.alias_names[i]}.{name}" + listing
+                    }
+                }
+                i += 1
+            }
+        }
+        for ts in self.type_scopes {
+            if ts.own.contains(name) {
+                return f"{ts.path} declares `{name}`: import it to use it here"
+            }
+        }
+        return ""
     }
 
     // "" unless `name` is a generic struct or enum missing its type arguments.
@@ -7830,13 +7873,6 @@ type Codegen = struct {
         let r = self.module_type_ref(name)
         if r >= 0 and r % 4 == 3 {
             return ""
-        }
-        if r < 0 {
-            if self.alias_idx.get(name) is Some(alias_i) {
-                if alias_i >= 0 {
-                    return ""
-                }
-            }
         }
         mut params: [str] = []
         mut what = "struct"
@@ -8517,7 +8553,11 @@ type Codegen = struct {
                     self.report_error(msg, span: self.p.expr_spans[callee_id])
                     return .VImm(value: 0)
                 }
-                let msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.visible_func_names())
+                mut msg: str = self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.visible_func_names())
+                let hint = self.type_elsewhere_hint(name)
+                if len(hint) > 0 {
+                    msg = f"error: unknown type `{name}`; {hint}"
+                }
                 self.report_error(msg, span: self.p.expr_spans[callee_id])
                 return .VImm(value: 0)
             }

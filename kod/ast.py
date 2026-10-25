@@ -571,7 +571,7 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type_expr()
+            return_type = parser.parse_return_type()
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
@@ -636,7 +636,7 @@ class FunctionDeclaration(ASTNode):
             name = f"__lambda_{counter}"
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type_expr()
+            return_type = parser.parse_return_type()
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
@@ -657,7 +657,7 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             if parser.try_consume(tokens.Arrow):
-                return_type = parser.parse_type_expr()
+                return_type = parser.parse_return_type()
             else:
                 return_type = ResolvedTypeExpr(types.NoneType)
         variables = {param.variable.id: param.variable for param in params}
@@ -672,7 +672,7 @@ class FunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type_expr()
+            return_type = parser.parse_return_type()
             parser.consume(tokens.OpenCurly)
             body = []
             variables = {param.variable.id: param.variable for param in params}
@@ -889,7 +889,7 @@ class ExternalFunctionDeclaration(ASTNode):
             name = parser.consume(tokens.Identifier).value
             params = FunctionParamList.parse(parser)
             parser.consume(tokens.Arrow)
-            return_type = parser.parse_type_expr()
+            return_type = parser.parse_return_type()
         label_name = f"_{name}"
         return cls(name, label_name, params, [], return_type, span)
 

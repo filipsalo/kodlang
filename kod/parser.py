@@ -82,6 +82,53 @@ def qualified_type_error(alias: str, name: str, mod, call: bool = False) -> str:
     return with_suggestion(f"module `{alias}` has no {what} `{name}`", name, candidates)
 
 
+def _declares_type(module, name: str) -> bool:
+    return isinstance(module.names.get(name), (type, types.GenericTemplate))
+
+
+def shown_path(program, module) -> str:
+    """`module`'s file as the compiler prints it: relative to the project root."""
+    path = module.source_file.path
+    if path.is_relative_to(program.root_fs.root_path):
+        return str(path.relative_to(program.root_fs.root_path))
+    return str(module.source_file.canonical_path)
+
+
+def type_hint(program, path, aliases: dict, name: str) -> str:
+    """Where a type `name` that the module at `path` doesn't see is declared, or ""."""
+    if program is None:
+        return ""
+    for alias, module_name in aliases.items():
+        target = program.resolve_import(module_name, relative_to=path)
+        module = program.modules.get(target.canonical_path.with_suffix(""))
+        if module is not None and _declares_type(module, name):
+            where = shown_path(program, module)
+            return (
+                f"{where} declares `{name}`: write `{alias}.{name}` or list it in"
+                f" the import (`{{ {name} }}`)"
+            )
+    for module in program.modules.values():
+        # The module itself isn't one to import: its later types are just not read yet.
+        if module.source_file.path != path and _declares_type(module, name):
+            where = shown_path(program, module)
+            return f"{where} declares `{name}`: import it to use it here"
+    return ""
+
+
+class UnknownTypeError(KodError):
+    """A bare type name that names nothing here, worded by `word` once every
+    module of the program is loaded, so the hint can name any of them."""
+
+    def __init__(self, parser, name: str, span: Span):
+        super().__init__(f"unknown type `{name}`", span)
+        self.parser = parser
+        self.name = name
+
+    def word(self) -> "UnknownTypeError":
+        self.msg = self.parser.unknown_type_error(self.name)
+        return self
+
+
 class Parser:
     """A parser for the kod language."""
 
@@ -105,6 +152,10 @@ class Parser:
         # Type names that name nothing, raised when the program runs: compiling
         # still parses here first, and the compiler reports every such error.
         self.type_errors: list[KodError] = []
+        # Return types, checked once the module is parsed so a type declared
+        # later resolves: each with its first and last token and the type
+        # parameters in scope there.
+        self.return_types: list = []
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -194,7 +245,90 @@ class Parser:
         """Parse a type and resolve it to a concrete values.Type. Shim over
         parse_type_expr + resolve_type_expr, kept so the many callers that
         want a resolved type (struct layout, params, etc.) are unchanged."""
-        return self.resolve_type_expr(self.parse_type_expr(name))
+        start = self.pos
+        expr = self.parse_type_expr(name)
+        try:
+            return self.resolve_type_expr(expr)
+        except types.UnknownTypeName as err:
+            span = self._name_token_span(err.name, start, self.pos)
+            self.type_errors.append(UnknownTypeError(self, err.name, span))
+            return types.InterfaceType
+
+    def parse_return_type(self) -> ast.TypeExpr:
+        """A function's return type, whose names check_return_types resolves."""
+        start = self.pos
+        expr = self.parse_type_expr()
+        params = frozenset(
+            name
+            for name, t in self.type_registry.items()
+            if isinstance(t, type) and issubclass(t, types.TypeParam)
+        )
+        self.return_types.append((expr, start, self.pos, params))
+        return expr
+
+    def check_return_types(self) -> None:
+        """Note each bare name in a return type that names no type of the module."""
+        for expr, start, end, params in self.return_types:
+            for name in self.unknown_type_names(expr, params):
+                span = self._name_token_span(name, start, end)
+                self.type_errors.append(UnknownTypeError(self, name, span))
+
+    def unknown_type_names(self, expr: ast.TypeExpr, params: frozenset) -> list:
+        """The bare names in `expr` that name no type here, in order."""
+        if isinstance(expr, ast.NamedTypeExpr):
+            if expr.name in params or self.lookup_type(expr.name) is not None:
+                return []
+            try:
+                types.Type.from_name(expr.name)
+            except types.UnknownTypeName:
+                return [expr.name]
+            return []
+        if isinstance(expr, ast.ArrayTypeExpr):
+            return self.unknown_type_names(expr.element, params)
+        if isinstance(expr, ast.OptionalTypeExpr):
+            return self.unknown_type_names(expr.inner, params)
+        if isinstance(expr, ast.GenericTypeExpr):
+            names = self.unknown_type_names(expr.base, params)
+            for arg in expr.args:
+                names += self.unknown_type_names(arg, params)
+            return names
+        if isinstance(expr, ast.FuncTypeExpr):
+            names = []
+            for param in expr.params:
+                names += self.unknown_type_names(param, params)
+            return names + self.unknown_type_names(expr.return_typ, params)
+        return []
+
+    def _name_token_span(self, name: str, start: int, end: int) -> Span:
+        """The span of the identifier `name` among the tokens from `start` to `end`."""
+        for token in self.tokens[start:end]:
+            if isinstance(token, Identifier) and token.value == name:
+                return token.span
+        return self.tokens[start].span
+
+    def _name_span_in(self, name: str, within: Span) -> Span:
+        """The span of the last identifier `name` inside `within`."""
+        found = within
+        for token in self.tokens:
+            span = token.span
+            if within.start <= span.start and span.end <= within.end:
+                if isinstance(token, Identifier) and token.value == name:
+                    found = span
+        return found
+
+    def unknown_type_error(self, name: str) -> str:
+        """Why the bare type name `name` names nothing here, as the compiler says it."""
+        hint = type_hint(self.program, self.file.path, self.import_aliases, name)
+        if hint:
+            return f"unknown type `{name}`; {hint}"
+        candidates = ["int64", "bool", "str", "bytes", "none", *self.type_registry]
+        candidates += [n for n in self.import_items if self.lookup_type(n) is not None]
+        if self.program is not None and hasattr(self.program, "builtins"):
+            builtins = self.program.builtins
+            candidates += [n for n in builtins.names if _declares_type(builtins, n)]
+        # A type declared further down this file is registered by now, but not yet read.
+        candidates = [n for n in candidates if n != name]
+        return with_suggestion(f"unknown type `{name}`", name, candidates)
 
     def parse_type_expr(self, name=None) -> ast.TypeExpr:
         """Parse a type into its data-only ast.TypeExpr form, including the
@@ -452,9 +586,15 @@ class Parser:
         """Parse the program."""
         with self.span() as span:
             statements = list(self)
-        for _decl, type_expr in self.pending_aliases:
-            # Still unresolved: report the unknown target.
-            self.resolve_type_expr(type_expr)
+        for decl, type_expr in self.pending_aliases:
+            # Still unresolved: report the unknown target when the program runs.
+            try:
+                self.resolve_type_expr(type_expr)
+            except types.UnknownTypeName as err:
+                span = self._name_span_in(err.name, decl.span)
+                self.type_errors.append(UnknownTypeError(self, err.name, span))
+        self.check_return_types()
+        self.type_errors.sort(key=lambda err: err.span.start)
         module = ast.Module(self.file, statements, span)
         module.__dict__["_kod_type_errors"] = self.type_errors
         return module

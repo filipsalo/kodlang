@@ -16,6 +16,14 @@ class ResultValue:
     payload: Any
 
 
+class UnknownTypeName(ValueError):
+    """A type name that names no type where it is written."""
+
+    def __init__(self, name):
+        super().__init__(f"Unknown type {name!r}")
+        self.name = name
+
+
 class Type:
     """A type in Kod."""
 
@@ -41,7 +49,7 @@ class Type:
                 return Bool
             case "none":
                 return NoneType
-        raise ValueError(f"Unknown type {name!r}")
+        raise UnknownTypeName(name)
 
     def to_str(self) -> "String":
         """Return the value as a Kod string."""
