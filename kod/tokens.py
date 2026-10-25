@@ -88,7 +88,8 @@ class Minus(BinaryOperator):
 class Equal(BinaryOperator):
     """An equals sign."""
 
-    precedence = 10
+    precedence = 1
+    left_associative = False
 
 
 @dataclasses.dataclass

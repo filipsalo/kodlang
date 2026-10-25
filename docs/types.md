@@ -127,7 +127,8 @@ stands alone and is an error; the second suggests `(-9223372036854775808)`.
 
 Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
 `+=` and `-=` update a variable, field, or array element in place
-(`n -= 3` is `n = n - 3`). A prefix `-` negates the whole call, field
+(`n -= 3` is `n = n - 3`). An assignment binds looser than every
+operator, so `ok = a and b` assigns `a and b`. A prefix `-` negates the whole call, field
 access, index or `?` after it, and binds tighter than any binary
 operator: `-xs[0]` is `-(xs[0])`, `-p.get()` is `-(p.get())`, and
 `-a * b` is `(-a) * b`. That includes an unwrap's default, so `-x? or 3`
