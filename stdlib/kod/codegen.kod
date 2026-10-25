@@ -1591,9 +1591,19 @@ type Codegen = struct {
             .IntPat(_value) -> return self.check_literal_pattern(.KInt64, :subject_id)
             .StrPat(_value) -> return self.check_literal_pattern(.KStr, :subject_id)
             .BoolPat(_value) -> return self.check_literal_pattern(.KBool, :subject_id)
-            .EnumPat(enum_name, variant_name, _bindings) -> {
+            .EnumPat(enum_name, variant_name, bindings) -> {
                 target = f"`{enum_name}.{variant_name}`"
                 variant = variant_name
+                if kind is .KInterface(_iface) {
+                    mut msg = self.hidden_alias_msg(enum_name, type_name: variant_name)
+                    if len(msg) == 0 and len(bindings) > 1 and self.is_import_alias(enum_name) {
+                        msg = f"error: a downcast to {target} binds one name, got {len(bindings)}; bind the value and read its fields"
+                    }
+                    if len(msg) > 0 {
+                        self.report_error(msg, span: self.p.expr_spans[subject_id])
+                        return false
+                    }
+                }
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
                 target = f"`.{variant_name}`"
@@ -5931,22 +5941,33 @@ type Codegen = struct {
 
     // `T`, `T(b)`, `alias.T` or `alias.T(b)`: the struct an interface downcast names.
     func downcast_name(self, anon expr_id: int64) -> str {
+        let parts = self.qualified_parts(expr_id)
+        if len(parts) == 2 and self.is_import_alias(parts[0]) {
+            return parts[1]
+        }
+        return self.is_pattern_name(expr_id)
+    }
+
+    // `X` and `T` of `X.T` or `X.T(...)`, else none.
+    func qualified_parts(self, anon expr_id: int64) -> [str] {
         mut callee = expr_id
         if self.p.exprs[expr_id] is .Call(call_callee, _args) {
             callee = call_callee
         }
-        if self.p.exprs[callee] is .Binary(lhs, op, rhs) {
-            if op is .Dot {
-                if self.p.exprs[lhs] is .Ident(alias) {
-                    if self.is_import_alias(alias) {
-                        if self.p.exprs[rhs] is .Ident(name) {
-                            return name
-                        }
-                    }
-                }
-            }
+        let no_parts: [str] = []
+        let .Binary(lhs, op, rhs) = self.p.exprs[callee] else { return no_parts }
+        let .Dot = op else { return no_parts }
+        let .Ident(qualifier) = self.p.exprs[lhs] else { return no_parts }
+        let .Ident(name) = self.p.exprs[rhs] else { return no_parts }
+        return [qualifier, name]
+    }
+
+    // `X.T` names no type of the module `X` where a local `X` is bound.
+    func hidden_alias_msg(self, anon qualifier: str, type_name: str) -> str {
+        if self.var_bound(qualifier) == false or self.declares_alias(qualifier) == false {
+            return ""
         }
-        return self.is_pattern_name(expr_id)
+        return f"error: `{qualifier}` is a local here, so `{qualifier}.{type_name}` doesn't name a type of its module; give the local another name"
     }
 
     // `Option.Some` and `Result.Ok` name the variants `T?` and `T or Error` test.
@@ -5998,7 +6019,12 @@ type Codegen = struct {
             let type_name = self.downcast_name(rhs)
             let struct_idx = self.find_struct_idx(type_name)
             if struct_idx < 0 {
-                self.report_error(f"error: `is {type_name}` — `{type_name}` is not a struct type", span: self.p.expr_spans[rhs])
+                mut msg = f"error: `is {type_name}` — `{type_name}` is not a struct type"
+                let parts = self.qualified_parts(rhs)
+                if len(parts) == 2 and len(self.hidden_alias_msg(parts[0], type_name: parts[1])) > 0 {
+                    msg = self.hidden_alias_msg(parts[0], type_name: parts[1])
+                }
+                self.report_error(msg, span: self.p.expr_spans[rhs])
                 return .VImm(value: 0)
             }
             let vt_lbl = self.register_vtable(struct_idx, iface_idx)
@@ -7035,9 +7061,10 @@ type Codegen = struct {
     }
 
     func is_import_alias(self, anon name: str) -> bool {
-        if self.var_bound(name) {
-            return false
-        }
+        return self.var_bound(name) == false and self.declares_alias(name)
+    }
+
+    func declares_alias(self, anon name: str) -> bool {
         let si = self.cur_scope()
         if si >= 0 {
             return regalloc.str_in(self.scopes[si].alias_names, p: name)

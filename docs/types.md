@@ -518,4 +518,7 @@ interface needs an `else`, since its set of implementors isn't enumerable).
 The test holds whichever module boxed the value, so an error struct that an
 imported function throws matches its type in the caller. The pattern names
 such a struct through its module (`e is errs.NotFound(nf)`) or, when it is
-imported as an item, by its own name (`e is NotFound(nf)`).
+imported as an item, by its own name (`e is NotFound(nf)`). Either way it binds
+one name, the struct, whose fields are read from it. A local or parameter
+named like the module hides it, so `errs.NotFound(nf)` after `let errs = 3`
+is an error.

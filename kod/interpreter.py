@@ -55,10 +55,53 @@ class BoundMethod:
 
 def _downcast_pattern(pattern, value):
     """`alias.T(b)` over a struct, as an interface holds one, is the downcast to `T`."""
-    if not hasattr(type(value), "struct_fields") or len(pattern.bindings) > 1:
+    if not hasattr(type(value), "struct_fields"):
+        return pattern
+    qualifier = pattern.__dict__.get("_kod_qualifier")
+    if qualifier is not None:
+        error = _downcast_error(pattern.enum_name, pattern.variant_name, qualifier)
+        raise KodError(error or _many_bindings(pattern), pattern.span)
+    if len(pattern.bindings) > 1:
         return pattern
     binding = pattern.bindings[0] if pattern.bindings else ""
     return ast.TypePattern(pattern.variant_name, binding, pattern.span)
+
+
+def _downcast_error(qualifier, type_name, kind):
+    """Why `qualifier.T(...)` over an interface isn't a downcast; "" if it is one."""
+    shown = f"`{qualifier}.{type_name}`"
+    if kind == "local":
+        return (
+            f"`{qualifier}` is a local here, so {shown} doesn't name a type of"
+            " its module; give the local another name"
+        )
+    if kind == "other":
+        return f"{shown} needs an enum value"
+    return ""
+
+
+def _many_bindings(pattern):
+    n = len(pattern.bindings)
+    if n <= 1:
+        return ""
+    return (
+        f"a downcast to `{pattern.enum_name}.{pattern.variant_name}` binds one"
+        f" name, got {n}; bind the value and read its fields"
+    )
+
+
+def _note_qualifier(pattern, bound, scope):
+    """Whether `X` in a pattern `X.T(...)` names an import there, for a downcast."""
+    if type(pattern) is not ast.EnumVariantPattern:
+        return
+    name = pattern.enum_name
+    if name in ("Option", "Result"):
+        return
+    kind = "other"
+    if name in scope.aliases:
+        kind = "local" if name in bound else ""
+    if kind or len(pattern.bindings) > 1:
+        pattern.__dict__["_kod_qualifier"] = kind
 
 
 def _value_pattern(pattern, value):
@@ -407,6 +450,7 @@ def _scope_stmt(stmt, bound, depth, scope):
     elif t is ast.LetElseStatement:
         _scope_expr(stmt.value, bound, depth, scope)
         _scope_block(stmt.else_body, bound, inner, scope)
+        _note_qualifier(stmt.pattern, bound, scope)
         _bind_pattern(bound, stmt.pattern, depth, scope, stmt.value.span.start)
     elif t is ast.IfStatement:
         _scope_expr(stmt.condition, bound, depth, scope)
@@ -425,6 +469,7 @@ def _scope_stmt(stmt, bound, depth, scope):
         _scope_expr(stmt.expression, bound, depth, scope)
         for arm in stmt.arms:
             body = dict(bound)
+            _note_qualifier(arm.pattern, bound, scope)
             _bind_pattern(body, arm.pattern, inner, scope)
             _scope_block(arm.body, body, inner, scope)
     elif t is ast.Assignment and type(stmt.lhs) is ast.Name:
@@ -465,6 +510,7 @@ def _scope_expr(node, bound, depth, scope):
         _scope_expr(node.expression, bound, depth, scope)
         for arm in node.arms:
             body = dict(bound)
+            _note_qualifier(arm.pattern, bound, scope)
             _bind_pattern(body, arm.pattern, depth + 1, scope)
             _scope_expr(arm.body, body, depth + 1, scope)
         return
@@ -549,6 +595,9 @@ class Interpreter:
             and isinstance(callee.rhs, (ast.Variable, ast.Name))
             and self._alias_import(module, callee.lhs.id) is not None
         ):
+            if callee.lhs.__dict__.get("_kod_bound"):
+                error = _downcast_error(callee.lhs.id, callee.rhs.id, "local")
+                raise KodError(error, rhs.span)
             return callee.rhs.id
         return ""
 
