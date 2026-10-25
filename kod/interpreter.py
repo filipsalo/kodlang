@@ -331,10 +331,8 @@ class _Scope:
         imports = self.module.get_imports() if self.module is not None else ()
         self.aliases = {imp.local_name for imp in imports}
 
-    def fallback(self, name, call=False):
-        """What `name` means where no local of it is bound, if anything."""
-        if call and name in ("str", "hash"):
-            return name
+    def named(self, name):
+        """What the module, an item it imports or a builtin calls `name`."""
         module = self.module
         value = module.names.get(name) if module is not None else None
         if value is None and module is not None:
@@ -345,7 +343,23 @@ class _Scope:
                     break
         if value is None:
             value = self.program.builtins.names.get(name)
+        return value
+
+    def fallback(self, name, call=False):
+        """What `name` means where no local of it is bound, if anything."""
+        if call and name in ("str", "hash"):
+            return name
+        value = self.named(name)
         if call or isinstance(value, _FUNC_DECLS):
+            return value
+        return None
+
+    def enum_named(self, name):
+        """The enum `name` means before a `.`, where a local has the name too."""
+        if name not in self.declared:
+            return None
+        value = self.named(name)
+        if isinstance(value, type) and issubclass(value, types.EnumType):
             return value
         return None
 
@@ -509,10 +523,15 @@ def _scope_expr(node, bound, depth, scope):
         return
     if t is ast.BinaryOperator and isinstance(node.op, tokens.Dot):
         if type(node.lhs) is ast.Name:
+            enum = scope.enum_named(node.lhs.id)
+            if enum is not None:
+                # As in the compiler, the enum wins over a local of its name.
+                node.lhs = enum
+                return
             node.lhs.__dict__["_kod_bound"] = node.lhs.id in bound
             if node.lhs.id not in scope.aliases:
                 _scope_use(node.lhs, bound, scope, "read", fallback=False)
-        else:
+        elif type(node.lhs) is not type:  # an enum already, in a `+=` target seen twice
             _scope_expr(node.lhs, bound, depth, scope)
         return
     if t is ast.MatchExpression:
@@ -726,13 +745,18 @@ class Interpreter:
             return True
         return self._own_func(module, callee.id) is None
 
-    def _struct_named(self, module, name):
-        """The struct `name` means in the module: its own, an item or a builtin."""
+    def _named(self, module, name):
+        """What `name` means in the module, past its locals: its own, an item or a builtin."""
         value = module.names.get(name)
         if value is None:
             value = self._item(module, name)
         if value is None:
             value = self.program.builtins.names.get(name)
+        return value
+
+    def _struct_named(self, module, name):
+        """The struct `name` means in the module: its own, an item or a builtin."""
+        value = self._named(module, name)
         if isinstance(value, type) and issubclass(value, types.StructType):
             return value
         return None
@@ -1077,7 +1101,8 @@ class Interpreter:
                 args = self._evaluate_args(module, args, func)
                 return self.call_function(module, func, args)
             case ast.GenericInstantiation(name, type_args):
-                template = self.lookup(module, name)
+                # The generic type, whatever local has its name.
+                template = self._named(module, name.id)
                 return template.instantiate(tuple(type_args))
             case ast.ImplicitEnumVariant(variant_name):
                 enum_type = self._variant_enum(module, variant_name, expression.span)
@@ -1353,6 +1378,8 @@ class Interpreter:
                 return self.lookup(module, expr)
             except ValueError:
                 return None
+        if t is type:
+            return expr  # an enum the static pass put before a `.`
         if t is ast.FunctionCall:
             func, receiver = self._quiet_callee(module, expr.callee)
             if isinstance(func, type) and issubclass(func, types.StructType):
