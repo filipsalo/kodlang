@@ -298,7 +298,7 @@ class Parser:
             return types.FunctionType.make(params, ret)
         raise self.error(f"cannot resolve type expression {expr!r}", self.peek().span)
 
-    def parse_statement(self) -> "Optional[ast.Statement]":
+    def parse_statement(self, check_end: bool = True) -> "Optional[ast.Statement]":
         """Parse a statement."""
         stmt = None
         match self.peek():
@@ -345,7 +345,20 @@ class Parser:
                 self.consume(EOL)
             case _:
                 raise self.error(f"Unexpected token {self.peek()}")
+        if stmt is not None and check_end:
+            self.expect_statement_end(stmt)
         return stmt
+
+    def expect_statement_end(self, stmt: "ast.Statement") -> None:
+        prev = self.tokens[self.pos - 1]
+        if isinstance(prev, (EOL, CloseCurly)):
+            return
+        if isinstance(self.peek(), (EOL, Comment, CloseCurly, EOF)):
+            return
+        what = f"`{stmt.id}`" if isinstance(stmt, ast.Name) else "this statement"
+        raise self.error(
+            f"expected the end of the line after {what}, got {self.peek()}"
+        )
 
     def peek(self) -> Token:
         """Return the next token"""
@@ -409,5 +422,21 @@ class Parser:
         while True:
             if self.eof():
                 return
+            self.expect_declaration()
             if statement := self.parse_statement():
                 yield statement
+
+    def expect_declaration(self) -> None:
+        token = self.peek()
+        if isinstance(token, (Let, Mut)):
+            raise self.error(
+                f"a top-level `{token.value}` isn't supported; for a module-wide"
+                " constant, use a function with no arguments"
+            )
+        if not isinstance(
+            token, (Import, Type, Interface, Extern, Func, Test, Comment, EOL)
+        ):
+            raise self.error(
+                "expected a declaration (`func`, `type`, `interface`, `import`,"
+                f" `extern` or `test`), got {token}"
+            )

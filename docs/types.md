@@ -113,7 +113,7 @@ groups of exactly 3 digits each:
 
 ```kod
 let pop: int64 = 1 000 000      // ok
-let bad: int64 = 1 23 456       // lex error — middle group isn't 3 digits
+let bad: int64 = 1 23 456       // error — `23 456` isn't a group of 3, so it's another literal
 ```
 
 A literal must fit in `int64`, in any base: `9223372036854775808` or

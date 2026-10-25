@@ -1330,7 +1330,17 @@ type Parser = struct {
 
 
 	func parse_block(self) -> [int64] {
-		self.expect(.OpenCurly)
+		if self.at(.OpenCurly) == false {
+			self.record_unexpected(expected: lexing.kind_name(.OpenCurly), got: self.peek())
+			// Resume at a `{` later on the line, or give up on the block.
+			for self.at(.OpenCurly) == false and self.at(.EOL) == false and self.at(.EOF) == false {
+				self.advance()
+			}
+			if self.at(.OpenCurly) == false {
+				return []
+			}
+		}
+		self.advance()
 		self.skip_newlines()
 		mut stmts: [int64] = []
 		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
@@ -1338,11 +1348,60 @@ type Parser = struct {
 			if self.peek_kind() == .CloseCurly {
 				break
 			}
-			stmts += [self.parse_stmt()]
+			let errors_before = len(self.errors)
+			let stmt_id = self.parse_stmt()
+			stmts += [stmt_id]
+			self.expect_stmt_end(:stmt_id, :errors_before)
 			self.skip_newlines()
 		}
 		self.expect(.CloseCurly)
 		return stmts
+	}
+
+	// A statement ends its line unless a block's `}` ended it.
+	func expect_stmt_end(self, stmt_id: int64, errors_before: int64) -> none {
+		let prev = self.tokens[self.pos - 1].kind
+		if prev == .EOL or prev == .CloseCurly {
+			return
+		}
+		if self.at(.EOL) or self.at(.Comment) or self.at(.CloseCurly) or self.at(.EOF) {
+			return
+		}
+		if len(self.errors) == errors_before {
+			mut what = "this statement"
+			if stmt_id >= 0 {
+				match self.stmts[stmt_id] {
+					.ExprStmt(expr) -> {
+						if self.exprs[expr] is .Ident(name) {
+							what = f"`{name}`"
+							// A misspelled keyword: don't also report the name.
+							self.stmts[stmt_id] = ast.Stmt.ExprStmt(expr: 0)
+						}
+					}
+					else none
+				}
+			}
+			self.record_error(f"error: expected the end of the line after {what}, got {lexing.kind_name(self.peek_kind())}", got: self.peek())
+		}
+		self.skip_rest_of_stmt(depth: 0)
+	}
+
+	// Skip to the end of the statement, past any block it opens.
+	func skip_rest_of_stmt(self, depth: int64) -> none {
+		mut open = depth
+		for self.at(.EOF) == false {
+			if open == 0 {
+				if self.at(.EOL) or self.at(.CloseCurly) {
+					return
+				}
+			}
+			if self.at(.OpenCurly) {
+				open = open + 1
+			} else if self.at(.CloseCurly) {
+				open = open - 1
+			}
+			self.advance()
+		}
 	}
 
 	func parse_stmt(self) -> int64 {
@@ -1757,9 +1816,36 @@ type Parser = struct {
 			return ast.Decl.TypeAlias(:name, :target, :name_span)
 		}
 
-		// Unknown token: skip it
-		self.advance()
+		let tok = self.advance()
+		if tok.kind == .KwLet or tok.kind == .KwMut {
+			self.record_error(f"error: a top-level `{tok.value}` isn't supported; for a module-wide constant, use a function with no arguments", got: tok)
+		} else {
+			self.record_error(f"error: expected a declaration (`func`, `type`, `interface`, `import`, `extern` or `test`), got {lexing.kind_name(tok.kind)}", got: tok)
+		}
+		// Stray words before a declaration (`pub func f`) keep the declaration.
+		if tok.kind == .Identifier {
+			for self.at(.Identifier) {
+				self.advance()
+			}
+		}
+		if self.at(.KwFunc) or self.at(.KwType) or self.at(.KwInterface) or self.at(.KwExtern) or self.at(.KwImport) or self.at(.KwTest) {
+			return self.parse_decl(:doc)
+		}
+		mut open = 0
+		if tok.kind == .OpenCurly {
+			open = 1
+		}
+		self.skip_rest_of_stmt(depth: open)
+		if self.at(.CloseCurly) {
+			self.advance()
+		}
 		self.skip_newlines()
+		// The bad line's block may start on the next line.
+		if self.at(.OpenCurly) {
+			self.advance()
+			self.skip_rest_of_stmt(depth: 1)
+			self.skip_newlines()
+		}
 		return ast.Decl.Import(module_name: "", local_name: "", items: [])
 	}
 
@@ -1779,7 +1865,9 @@ type Parser = struct {
 			if self.peek_kind() == .EOF {
 				break
 			}
+			let errors_before = len(self.errors)
 			decls += [self.parse_decl(:doc)]
+			self.expect_stmt_end(stmt_id: -1, :errors_before)
 		}
 		return ast.Module(:decls)
 	}

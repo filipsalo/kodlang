@@ -119,7 +119,7 @@ recovers a struct from an interface value whichever side boxed it.
 
 Top-level functions and types are visible to importing modules. There is no explicit `pub`/`private` distinction yet.
 
-Top-level `let` and `mut` bindings are not supported by the compiler. They are skipped when parsing, so any later reference to the name fails with `unknown name`, both inside the module and from an importer. For a module-wide constant, use a function with no arguments:
+A module's top level holds only declarations (`func`, `type`, `interface`, `import`, `extern` and `test`). Top-level `let` and `mut` bindings aren't supported, and they and any other statement there are an error. For a module-wide constant, use a function with no arguments:
 
 ```kod
 func max_block() -> int64 {

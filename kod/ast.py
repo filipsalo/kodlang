@@ -1872,7 +1872,7 @@ class MatchArm:
                             body.append(stmt)
                 else:
                     body = []
-                    if stmt := parser.parse_statement():
+                    if stmt := parser.parse_statement(check_end=False):
                         body.append(stmt)
                 return cls(pattern, body, span)
             # Parse pattern
@@ -1958,7 +1958,7 @@ class MatchArm:
                         body.append(stmt)
             else:
                 body = []
-                if stmt := parser.parse_statement():
+                if stmt := parser.parse_statement(check_end=False):
                     body.append(stmt)
         return cls(pattern, body, span)
 

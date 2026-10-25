@@ -28,7 +28,7 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
    non-integer numbers, and pretty-printing.
 
 Language work along the way, as these modules need it: `\x` / `\u` string escapes,
-module-level constants (top-level `let` is currently dropped by the parser), and the
+module-level constants (top-level `let` is currently an error), and the
 open codegen bugs that this kind of code is most likely to hit.
 
 ## Later

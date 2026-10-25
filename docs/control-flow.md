@@ -89,6 +89,10 @@ match direction {
 
 ## Blocks and bindings
 
+A statement ends at the end of its line or at a `}`, so two statements
+can share a line only after a block (`if c { a() } b()`). Anything else
+after a statement on its line is an error: `let x = 5 print_int(x)`.
+
 A `let` or let-else binding lasts from its statement to the end of the
 block it's in. The bindings of a match arm's pattern, or of `if … is`,
 last for that arm, a `for … in` variable for the loop body, and
