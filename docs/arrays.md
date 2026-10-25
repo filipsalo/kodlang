@@ -117,6 +117,14 @@ and so is `names + [1]`, whose literal's element isn't a `str`.
 amortized O(1) per element. `+` always copies both operands, so
 `xs = xs + [x]` costs O(len(xs)); prefer `xs += [x]` in loops.
 
+`+=` appends to the array itself, not to a copy, so everything that holds
+the same array sees the new elements: after `let a = xs` and `xs += [3]`,
+`a` ends in 3 too. That holds for an array kept in a field or in another
+array (`rows[0] += [4]`) as well. A `for x in xs` loop also reaches the
+elements appended to `xs` while it runs. To keep the old contents, copy
+the array first with `xs + []` or `xs[..]`. Both copies are shallow: the
+inner arrays of a `[[T]]` are still shared.
+
 ## Iterating
 
 **Index-based:**

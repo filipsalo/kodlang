@@ -754,9 +754,12 @@ class Interpreter:
         raise ValueError(f"Unknown name {name!r}")
 
     def evaluate_binary_operator(
-        self, module, op, lhs, rhs, as_lvalue=False, slot=None
+        self, module, op, lhs, rhs, as_lvalue=False, slot=None, append=False
     ):
-        """Evaluate a binary operator; an array `+` chain is built as `slot`."""
+        """Evaluate a binary operator; an array `+` chain is built as `slot`.
+
+        `append` is `+=`'s `+`: an array on the left grows in place.
+        """
         match op:
             case tokens.Dot():
                 imp = None
@@ -878,10 +881,14 @@ class Interpreter:
                 lhs = self.evaluate_expression(module, lhs)
             else:
                 lhs = self._evaluate_for(module, lhs, slot)
-            if isinstance(lhs, types.ArrayType) and _wants_slot(rhs):
-                if slot is None:
-                    slot = self._array_slot(lhs)
-                return lhs.op_plus(self._evaluate_for(module, rhs, slot))
+            if isinstance(lhs, types.ArrayType):
+                if _wants_slot(rhs):
+                    if slot is None:
+                        slot = self._array_slot(lhs)
+                    rhs = self._evaluate_for(module, rhs, slot)
+                else:
+                    rhs = self.evaluate_expression(module, rhs)
+                return lhs.op_plus_assign(rhs) if append else lhs.op_plus(rhs)
         else:
             lhs = self.evaluate_expression(module, lhs)
         if op_func := getattr(lhs, op_func_name):
@@ -1631,7 +1638,12 @@ class Interpreter:
                         if _wants_slot(rhs.rhs):
                             rhs_slot = self._field_slot(obj, lhs.rhs.id)
                         rhs_val = self.evaluate_binary_operator(
-                            module, rhs.op, current, rhs.rhs, slot=rhs_slot
+                            module,
+                            rhs.op,
+                            current,
+                            rhs.rhs,
+                            slot=rhs_slot,
+                            append=type(rhs.op) is tokens.Plus,
                         )
                     else:
                         if slot is None and target is not None:
@@ -1656,7 +1668,11 @@ class Interpreter:
                         else:
                             current = obj.op_index(key_val)
                         rhs_val = self.evaluate_binary_operator(
-                            module, rhs.op, current, rhs.rhs
+                            module,
+                            rhs.op,
+                            current,
+                            rhs.rhs,
+                            append=type(rhs.op) is tokens.Plus,
                         )
                     else:
                         if slot is None and target is not None:
@@ -1667,7 +1683,18 @@ class Interpreter:
                     else:
                         obj.value[key_val.value] = rhs_val
                 else:
-                    rhs_val = self._evaluate_for(module, rhs, slot)
+                    if compound and type(rhs.op) is tokens.Plus:
+                        current = self.evaluate_expression(module, lhs)
+                        rhs_val = self.evaluate_binary_operator(
+                            module,
+                            rhs.op,
+                            current,
+                            rhs.rhs,
+                            slot=self._variant_slot(slot) if slot is not None else None,
+                            append=True,
+                        )
+                    else:
+                        rhs_val = self._evaluate_for(module, rhs, slot)
                     lhs_val = self.evaluate_expression(module, lhs, as_lvalue=True)
                     if (
                         _ENFORCE_IMMUTABILITY

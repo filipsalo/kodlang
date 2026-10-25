@@ -255,6 +255,13 @@ class ArrayType(Type, ABC):
         """Concatenate two arrays."""
         return type(self)(self.value + other.value)
 
+    def op_plus_assign(self, other: "ArrayType") -> "ArrayType":
+        """`xs += ys`: grow `xs` in place, as compiled code's kod_array_concat does."""
+        if not isinstance(other, ArrayType):
+            raise TypeError(f"can't append a {type(other).__name__} to {self.name}")
+        self.value.extend(other.value)
+        return self
+
 
 class StructType(Type, ABC):
     """A struct type."""
