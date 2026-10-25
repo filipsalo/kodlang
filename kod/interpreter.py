@@ -297,6 +297,15 @@ def _pattern_names(pattern):
     return [name for name in names if name]
 
 
+def _type_name(value):
+    """How Kod writes the type of a primitive, struct or enum value."""
+    if isinstance(value, types.StructType):
+        return type(value).__name__
+    if isinstance(value, types.EnumValue):
+        return value.enum_type.name
+    return getattr(type(value), "name", type(value).__name__)
+
+
 def _children(node):
     for field in dataclasses.fields(node):
         value = getattr(node, field.name)
@@ -717,14 +726,38 @@ class Interpreter:
             return True
         return self._own_func(module, callee.id) is None
 
+    def _struct_named(self, module, name):
+        """The struct `name` means in the module: its own, an item or a builtin."""
+        value = module.names.get(name)
+        if value is None:
+            value = self._item(module, name)
+        if value is None:
+            value = self.program.builtins.names.get(name)
+        if isinstance(value, type) and issubclass(value, types.StructType):
+            return value
+        return None
+
     def _call_target(self, module, callee):
-        """What `callee(...)` calls; a local that holds no function doesn't hide one."""
+        """What `callee(...)` calls, in the compiler's order: a struct of the
+        name, a function value the local holds, then a function of the name."""
         if type(callee) is ast.Name and "_kod_bound" in callee.__dict__:
-            target = self._local_func(callee)
+            target = callee.__dict__.get("_kod_struct", False)
+            if target is False:
+                target = self._struct_named(module, callee.id)
+                callee.__dict__["_kod_struct"] = target
+            if target is None:
+                target = self._local_func(callee)
             if target is None:
                 target = self._module_func(module, callee.id)
             if target is not None:
                 return target
+            if callee.__dict__["_kod_bound"]:
+                value = self.stack[-1].get(callee.id)
+                raise KodError(
+                    f"`{callee.id}` is a local of type `{_type_name(value)}`,"
+                    " not a function",
+                    callee.span,
+                )
             # Left in the frame by a block that has ended, or by a later `let`.
             stale = self.stack[-1].get(callee.id)
             if not callee.__dict__["_kod_bound"] and isinstance(
