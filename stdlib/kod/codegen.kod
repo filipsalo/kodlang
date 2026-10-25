@@ -248,6 +248,9 @@ type TypeScope = struct {
     // Each name an import lists, and the alias of that import.
     item_names: [str] = []
     item_aliases: [str] = []
+    // The types the module declares, its own aliases too: name → idx * 4 + what
+    // (0 a struct, 1 an enum, 2 an interface, 3 another type in alias_kinds).
+    own: FuncIdx = FuncIdx()
 }
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
@@ -559,6 +562,11 @@ type Codegen = struct {
     // Per module, entry included: how it names other modules' types.
     type_scopes: [TypeScope] = []
     type_scope_idx: FuncIdx = FuncIdx()
+    // Every name a module declares a type of → how many modules declare it.
+    type_names: FuncIdx = FuncIdx()
+    // The type scope of the module self.p belongs to, found again when that changes.
+    cur_types_path: str = ""
+    cur_types: int64 = -1
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -2636,9 +2644,89 @@ type Codegen = struct {
 
     func find_enum_idx(self, anon name: str) -> int64 {
         if self.enum_idx.get(name) is Some(i) {
+            let r = self.module_type_ref(name)
+            if r >= 0 and r % 4 == 1 {
+                return r / 4
+            }
+            // Any loaded module's, until a bare name resolves only where it's visible.
             return i
         }
         return -1
+    }
+
+    // What `name` means in the module being compiled: a type it declares, one an
+    // import lists, then a builtin. idx * 4 + what (see TypeScope.own), or -1.
+    func module_type_ref(self, anon name: str) -> int64 {
+        if self.p.path != self.cur_types_path {
+            self.cur_types_path = self.p.path
+            self.cur_types = -1
+            if self.type_scope_idx.get(self.p.path) is Some(ti) {
+                self.cur_types = ti
+            }
+        }
+        if self.cur_types >= 0 {
+            let ts = self.type_scopes[self.cur_types]
+            if ts.own.get(name) is Some(r) {
+                return r
+            }
+            mut i = 0
+            for item in ts.item_names {
+                if item == name {
+                    let r = self.listed_type_ref(ts, alias: ts.item_aliases[i], :name)
+                    if r >= 0 {
+                        return r
+                    }
+                }
+                i += 1
+            }
+        }
+        if self.type_scope_idx.get(self.builtins_path) is Some(bi) {
+            if self.type_scopes[bi].own.get(name) is Some(r) {
+                return r
+            }
+        }
+        return -1
+    }
+
+    // The type `name` that the module `ts` imports as `alias` declares, or -1.
+    func listed_type_ref(self, anon ts: TypeScope, alias: str, name: str) -> int64 {
+        mut i = 0
+        for a in ts.alias_names {
+            if a == alias {
+                if self.type_scope_idx.get(ts.alias_paths[i]) is Some(ti) {
+                    if self.type_scopes[ti].own.get(name) is Some(r) {
+                        return r
+                    }
+                }
+                return -1
+            }
+            i += 1
+        }
+        return -1
+    }
+
+    func type_ref_kind(self, anon r: int64) -> TypeKind {
+        let idx = r / 4
+        match r % 4 {
+            0 -> return .KStruct(:idx, type_args: [])
+            1 -> return .KEnum(:idx)
+            2 -> return .KInterface(:idx)
+            else return self.alias_kinds[idx]
+        }
+    }
+
+    // `name` is a type the module at `path` declares, or one of its own aliases.
+    func declare_type(self, anon name: str, path: str, ref: int64) -> none {
+        let own = self.type_scopes[self.type_scope_of(path)].own
+        if own.contains(name) == false {
+            mut n = 0
+            if self.type_names.get(name) is Some(k) {
+                n = k
+            }
+            let names = self.type_names
+            names.set(name, n + 1)
+        }
+        own.set(name, ref)
     }
 
     // True if `idx` names the stdlib Result enum — either the template
@@ -2707,6 +2795,10 @@ type Codegen = struct {
 
     func find_struct_idx(self, anon name: str) -> int64 {
         if self.struct_idx.get(name) is Some(i) {
+            let r = self.module_type_ref(name)
+            if r >= 0 and r % 4 == 0 {
+                return r / 4
+            }
             return i
         }
         return -1
@@ -2714,6 +2806,10 @@ type Codegen = struct {
 
     func find_iface_idx(self, anon name: str) -> int64 {
         if self.iface_idx.get(name) is Some(i) {
+            let r = self.module_type_ref(name)
+            if r >= 0 and r % 4 == 2 {
+                return r / 4
+            }
             return i
         }
         return -1
@@ -2953,6 +3049,7 @@ type Codegen = struct {
         let m = self.type_scope_idx
         m.set(path, len(self.type_scopes))
         self.type_scopes += [TypeScope(:path)]
+        self.cur_types_path = ""
         return len(self.type_scopes) - 1
     }
 
@@ -3859,21 +3956,23 @@ type Codegen = struct {
         if name == "none" {
             return .KVoid
         }
+        let r = self.module_type_ref(name)
+        if r >= 0 {
+            return self.type_ref_kind(r)
+        }
+        // Any loaded module's, until a bare name resolves only where it's visible.
         if self.alias_idx.get(name) is Some(alias_i) {
             if alias_i >= 0 {
                 return self.alias_kinds[alias_i]
             }
         }
-        let enum_idx = self.find_enum_idx(name)
-        if enum_idx >= 0 {
+        if self.enum_idx.get(name) is Some(enum_idx) {
             return .KEnum(idx: enum_idx)
         }
-        let struct_idx = self.find_struct_idx(name)
-        if struct_idx >= 0 {
+        if self.struct_idx.get(name) is Some(struct_idx) {
             return .KStruct(idx: struct_idx, type_args: [])
         }
-        let iface_idx = self.find_iface_idx(name)
-        if iface_idx >= 0 {
+        if self.iface_idx.get(name) is Some(iface_idx) {
             return .KInterface(idx: iface_idx)
         }
         return .KUnknown
@@ -4374,6 +4473,7 @@ type Codegen = struct {
                 let no_template_args: [TypeKind] = []
                 self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
                 self.enum_idx.set(name, len(self.enums) - 1)
+                self.declare_type(name, path: p.path, ref: (len(self.enums) - 1) * 4 + 1)
                 self.drop_alias(name)
             }
             else none
@@ -4430,6 +4530,7 @@ type Codegen = struct {
                 let no_template_args: [TypeKind] = []
                 self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span)]
                 self.struct_idx.set(name, len(self.structs) - 1)
+                self.declare_type(name, path: p.path, ref: (len(self.structs) - 1) * 4)
                 self.drop_alias(name)
             }
             else none
@@ -4459,6 +4560,7 @@ type Codegen = struct {
                 }
                 self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span, src_p: p, method_decl_ids: methods)]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
+                self.declare_type(name, path: p.path, ref: (len(self.interfaces) - 1) * 4 + 2)
                 self.drop_alias(name)
             }
             else none
@@ -4525,14 +4627,17 @@ type Codegen = struct {
         match kind {
             .KStruct(idx, _struct_type_args) -> {
                 self.struct_idx.set(name, idx)
+                self.declare_type(name, path: self.p.path, ref: idx * 4)
                 self.drop_alias(name)
             }
             .KEnum(idx) -> {
                 self.enum_idx.set(name, idx)
+                self.declare_type(name, path: self.p.path, ref: idx * 4 + 1)
                 self.drop_alias(name)
             }
             .KInterface(idx) -> {
                 self.iface_idx.set(name, idx)
+                self.declare_type(name, path: self.p.path, ref: idx * 4 + 2)
                 self.drop_alias(name)
             }
             else {
@@ -4543,9 +4648,11 @@ type Codegen = struct {
                 if slot >= 0 {
                     self.alias_kinds[slot] = kind
                 } else {
-                    self.alias_idx.set(name, len(self.alias_kinds))
+                    slot = len(self.alias_kinds)
+                    self.alias_idx.set(name, slot)
                     self.alias_kinds += [kind]
                 }
+                self.declare_type(name, path: self.p.path, ref: slot * 4 + 3)
             }
         }
         return kind
@@ -4616,12 +4723,15 @@ type Codegen = struct {
         if name == "int64" or name == "bool" or name == "str" or name == "bytes" or name == "none" {
             return true
         }
+        if self.module_type_ref(name) >= 0 {
+            return true
+        }
         if self.alias_idx.get(name) is Some(alias_i) {
             if alias_i >= 0 {
                 return true
             }
         }
-        return self.find_enum_idx(name) >= 0 or self.find_struct_idx(name) >= 0 or self.find_iface_idx(name) >= 0
+        return self.enum_idx.contains(name) or self.struct_idx.contains(name) or self.iface_idx.contains(name)
     }
 
     // Register all struct and enum declarations from another module under the
@@ -7385,9 +7495,15 @@ type Codegen = struct {
                 return ""
             }
         }
-        if self.alias_idx.get(name) is Some(alias_i) {
-            if alias_i >= 0 {
-                return ""
+        let r = self.module_type_ref(name)
+        if r >= 0 and r % 4 == 3 {
+            return ""
+        }
+        if r < 0 {
+            if self.alias_idx.get(name) is Some(alias_i) {
+                if alias_i >= 0 {
+                    return ""
+                }
             }
         }
         mut params: [str] = []
