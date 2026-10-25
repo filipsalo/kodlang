@@ -84,6 +84,11 @@ greet(who: "Alice")
 Useful for prepositions that make call sites read naturally without forcing
 short variable names inside the function.
 
+Each parameter binds a name of its own, `self` included, so two parameters
+can't share one: `func f(anon a: int64, b a: str)` is an error
+(`` parameter `a` is declared twice; give one of them another name ``). The
+same holds for methods, interface methods, externs and function literals.
+
 ## Default values
 
 Trailing parameters may declare a default with `= expr`, and a call can

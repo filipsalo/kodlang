@@ -410,11 +410,25 @@ def _mark_scopes(func, program, module=None):
     `x`. The reads and stores it reaches are renamed to that key.
     """
     func.__dict__["_kod_scoped"] = True
+    _check_param_names(func.params)
     scope = _Scope(func, program, module)
     params = {p.variable.id: (1, p.variable.id, 0) for p in func.params}
     _scope_block(func.body, params, 1, scope)
     for param in func.params:
         _mark_default(param.default, program, scope.module)
+
+
+def _check_param_names(params):
+    """Each parameter binds a name of its own."""
+    seen = set()
+    for param in params:
+        name = param.variable.id
+        if name in seen:
+            raise KodError(
+                f"parameter `{name}` is declared twice; give one of them another name",
+                param.span,
+            )
+        seen.add(name)
 
 
 def _mark_default(expr, program, module):
@@ -439,9 +453,11 @@ def _mark_program_scopes(program):
                     _mark_default(field.default, program, where)
             elif isinstance(stmt, ast.InterfaceDeclaration):
                 for sig in stmt.methods:
+                    _check_param_names(sig.params)
                     for param in sig.params:
                         _mark_default(param.default, program, module)
             elif isinstance(stmt, ast.ExternalFunctionDeclaration):
+                _check_param_names(stmt.params)
                 for param in stmt.params:
                     _mark_default(param.default, program, module)
             for func in funcs:
