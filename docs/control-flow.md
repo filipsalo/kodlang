@@ -95,30 +95,51 @@ after a statement on its line is an error: `let x = 5 print_int(x)`.
 
 A `let` or let-else binding lasts from its statement to the end of the
 block it's in. The bindings of a match arm's pattern, or of `if … is`,
-last for that arm, a `for … in` variable for the loop body, and
-parameters for the whole function.
+last for that arm. A `for … in` variable lasts for the loop body, and
+parameters (`self` included) for the whole function. Parameter and field
+defaults follow the same rules.
 
-Blocks don't have their own scopes yet: a function keeps one slot for
-each name. So a block can't bind a name again while an enclosing block
-or a parameter still has it bound:
+Every block has its own scope. A binding may take the name of one still
+in force, whatever kind of binding either is: a `let`, `mut` or
+let-else, a name in a pattern, a `for` variable, a parameter or `self`.
+Inside its block, arm or loop body the new binding hides the old one,
+and reading or assigning the name there means the new one. When that
+block, arm or loop ends, the old binding is back with its own value,
+type and mutability:
 
 ```kod
 func show(anon item: A, anon flag: bool) -> str {
     if flag {
-        let item = B(x: 9)   // error: `item` is already a local here (line 1); ...
-        return item.show()
+        let item = B(x: 9)   // hides the parameter until the `}`
+        return item.show()   // B's show
     }
-    return item.show()
+    return item.show()       // A's show
 }
 ```
 
-The same goes for a pattern binding (`Some(x)` while a `let x` is still
-bound) and a `for` variable; give the inner binding another name. A
-block may bind a name again itself, and the new value still sees the old
-binding, even when its type differs (`let x = 1`, then
-`let x = f"#{x}"`). So may a block after one whose binding of the name
-has ended. A let-else's else block runs when the pattern doesn't match,
-so there the name still has its old binding:
+```kod
+mut total = 0
+for x in xs {
+    let total = x * 2        // this loop body's own `total`
+    print(f"{total}")
+}
+total = total + 1            // the `mut total` again
+```
+
+A block may also bind a name again itself. The new binding then replaces
+the old one for the rest of that block. These count as binding the name
+again in the same block:
+
+- a function's top block reusing a parameter's name;
+- an arm reusing its pattern's name;
+- a loop body reusing its `for` variable's name.
+
+A binding's value, the array of a `for … in` and the value that
+`if … is` tests all see the binding the name had before, even when the
+type differs: `let x = x + 1`, `let x = f"#{x}"`, `for x in x`,
+`if o is Some(o)`. A let-else's else block runs when the pattern doesn't
+match, so there the name still has the binding it had before the
+let-else:
 
 ```kod
 for arg in args {
@@ -130,11 +151,13 @@ for arg in args {
 }
 ```
 
-A name is a local only where its binding lasts. Before its `let`, or
-after the block, arm or loop that bound it, the name means a function of
-the module, an imported one or a builtin of that name, as it does in a
-call (see [Function-pointer types](functions.md#function-pointer-types)),
-and with none of those, reading or assigning it is an error:
+A name is a local only where a binding of it is in force. Elsewhere it
+means a function of the module, an imported one or a builtin of that
+name, as it does in a call (see
+[Function-pointer types](functions.md#function-pointer-types)).
+Elsewhere means before its `let`, or after the block, arm or loop that
+bound it when no outer binding is in force. With none of those
+functions, reading or assigning the name is an error:
 `` `x` is read before its `let` `` or
 `` `x` is declared in a block that has ended ``. Declare a name before
 the block to use it after the block:
@@ -146,6 +169,14 @@ if n > 0 {
 }
 print(label)
 ```
+
+An enum's name before a `.`, and a type's name as a type argument, still
+mean the type where a local of that name is in force: after
+`let Color = 3`, `Color.Blue` is the enum's variant and `Box[Color]` an
+instance of `Box`.
+
+A function literal doesn't see the locals of the function it's written
+in.
 
 ## `return`
 
@@ -170,11 +201,10 @@ arms all return, and a `for true` loop that only leaves through `return`,
 can't. Nor can a call that never returns: `kod_panic(...)`, or a `-> none`
 function or method without a `return` whose body can't finish by these
 same rules, such as one that ends in another such call or in a `for true`
-loop without a `break`. Until blocks get their own scopes, a method is
-taken to return when its receiver's type depends on a local other than
-`self` or a parameter, and a parameter that a `let` or let-else in the
-body binds again counts as a local; end the path with a `kod_panic(...)`
-or a `return` after the call (see
-[Return values](functions.md#return-values)). A method called through an
+loop without a `break`. A method is taken to return when its receiver's
+type depends on a local other than `self` or a parameter, and a
+parameter that a `let` or let-else in the body binds again counts as a
+local; end the path with a `kod_panic(...)` or a `return` after the call
+(see [Return values](functions.md#return-values)). A method called through an
 interface value is taken to return too, so call it as a statement and
 end the path with `kod_panic(...)`.

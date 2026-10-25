@@ -169,7 +169,7 @@ let a `for true` loop finish.
 The builtin `kod_panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
 body by these rules. A function of the module or one it imports named
-`kod_panic`, or a local function value of that name declared before the
+`kod_panic`, or a local function value of that name in force at the
 call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
 ends in `kod_panic(...)` never returns, and nor does one that ends in a
 call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
@@ -177,9 +177,8 @@ function declared further down), or in a `for true` loop it can't `break`
 out of. A call that leads back to the function itself doesn't count:
 `func spin() -> none { spin() }` is taken to return.
 
-Blocks don't have their own scopes yet, so a local's type can change
-between its bindings. Until they do, a call counts as never returning
-only when what it calls doesn't depend on such a type: the builtin
+A local's type can change between its bindings, so a call never
+returns only when what it calls doesn't depend on such a type: the builtin
 `kod_panic`, a function of the module or one it imports (`die(msg)`), a
 function of an imported module (`log.die(msg)`), or a method whose
 receiver's type depends on no local but `self` and parameters that no
@@ -276,19 +275,26 @@ print_int(g(21))             // 42 — indirect call through g
 print_int(apply(triple, 14)) // 42 — function passed as callback
 ```
 
-Plain named functions only — no anonymous functions (lambdas) or
-closures yet. A bare identifier in value position resolves to the
-function's address when no local of that name is bound there; a
-call site `f(args)` does an indirect `blr` when `f` is a local of
-function type declared before it, falling through to the direct `bl`
-otherwise. A function value declared in a block, such as an `if` or
-loop body, is called that way only from its `let` to the end of the
-block. Elsewhere `f(args)` calls the module's or an imported function, or
-the builtin, named `f`, and `f` as a value is that function; with none
-of those it is an error:
+A function literal, `func(anon n: int64) -> int64 { return n + 1 }`, is
+a value of its function type too. It doesn't see the locals of the
+function it's written in, since there are no closures yet.
+
+A bare identifier in value position resolves to the function's address
+when no local of that name is in force there. A call `f(args)` goes to a
+struct named `f` first, so `Pt(x: 1)` constructs even where a local
+named `Pt` is in force. Otherwise it does an indirect `blr` when the
+innermost binding of `f` in force holds a function value, and a direct
+`bl` of the module's, an imported or the builtin function named `f` when
+no binding of `f` is in force or it holds anything else. A function value
+declared in a block, such as an `if` or loop body, is called that way
+only from its `let` to the end of the block, and after the block `f(args)`
+calls an outer function value of that name again. Elsewhere `f(args)`
+calls the module's or an imported function, or the builtin, named `f`,
+and `f` as a value is that function; with none of those it is an error:
 `` `f` is declared in a block that has ended `` after the block, and
 `` `f` is called before its `let` `` (or `` read ``) before the
-declaration (see [Blocks and bindings](control-flow.md#blocks-and-bindings)).
+declaration (see [Blocks and bindings](control-flow.md#blocks-and-bindings)
+and [Built-ins](builtins.md)).
 
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a

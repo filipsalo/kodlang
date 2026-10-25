@@ -34,6 +34,12 @@ total += max          // ok — total is mutable
 max = 50              // error: cannot reassign immutable binding `max`
 ```
 
+Mutability belongs to each binding. A `let x` in a block that hides an
+outer `mut x` (see [Blocks and bindings](control-flow.md#blocks-and-bindings))
+can't be reassigned inside that block, and after the block the outer `x`
+can be again. Likewise a `mut x` in a block leaves an outer `let x`
+immutable once the block ends.
+
 Assigning to a name that was never declared is an error too (declare it
 with `mut` first), and so is assigning to anything other than a name, a
 field (`p.x = 1`) or an element (`xs[0] = 1`).
