@@ -51,7 +51,7 @@ func norm2(anon v: Vec2) -> int64 {
 
 ## Where names resolve
 
-Parameter defaults, struct field defaults and the method bodies of a generic type resolve function names and import aliases in the module that wrote them, even though they run as part of the caller's code. A default in `util.kod` that calls `helper()` calls util's own `helper`, a function util imports with `{ helper }`, or the builtin of that name, never one that belongs to the caller. Likewise `rng.seed()` in that default means util's own `import "./rng"`, whether or not the caller imports a module named `rng`:
+Parameter defaults, struct field defaults and the method bodies of a generic type resolve function names, type names and import aliases in the module that wrote them, even though they run as part of the caller's code. A default in `util.kod` that calls `helper()` calls util's own `helper`, a function util imports with `{ helper }`, or the builtin of that name, never one that belongs to the caller. Likewise `rng.seed()` in that default means util's own `import "./rng"`, whether or not the caller imports a module named `rng`:
 
 ```kod
 // util.kod
@@ -78,6 +78,10 @@ func main() -> int64 {
 ```
 
 The same holds for a function literal or a function value used as a default (`cb: func() -> int64 = helper`). A name the defining module doesn't have is an error, reported at the default when a call leaves the parameter out, even when the caller happens to declare it.
+
+A bare type name `T` means, in this order: a type parameter of the generic declaration around it, a primitive (`int64`, `bool`, `str`, `bytes`, `none`), a type the module declares (its own aliases included), a type it lists in an import (`import "./pa" { Pt }`), then a builtin type. A type of a module imported without listing it, or loaded only because another module imports it, is written through the module: `pa.Pt`. Otherwise it's an error with a hint naming the file that declares it: `` unknown type `Pt`; lib/pa.kod declares `Pt`: write `pa.Pt` or list it in the import (`{ Pt }`) ``, or `` unknown type `Pt`; lib/pa.kod declares `Pt`: import it to use it here `` when the module doesn't import that file.
+
+`m.T` means a type that the module imported as `m` declares, its own aliases included. This holds in a type, a constructor `m.T(...)`, a type argument, `m.E.V`, `is m.T` and a pattern `m.T(b)`. Types that `m` only imports aren't reachable through it. Otherwise it's an error: `` module `m` has no type `T` ``, with a did-you-mean over m's types (`` module `m` has no function or type `T` `` for a call `m.T(...)`). When `m` isn't a module this one imports, the error spells what was written: `` unknown type `m.T` ``.
 
 A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method, field or variant with the name of an earlier one of the same struct, interface or enum (`` `Kind.A` is already declared on line 2 ``). A method can't take the name of a field of its struct either; the error is at the method (`` `Bag.len` is already declared on line 3 ``).
 
