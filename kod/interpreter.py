@@ -133,6 +133,66 @@ class _NoModuleMember(KodError):
         self.imp, self.rhs, self.mod = imp, rhs, mod
 
 
+def _word_span(span, word, after=""):
+    """`word`, whole, in `span`'s text, past the first `after` there."""
+    text = get_source(span.filename)
+    start = span.start
+    if after and text.find(after, start, span.end) >= 0:
+        start = text.find(after, start, span.end) + len(after)
+    m = re.compile(rf"\b{re.escape(word)}\b").search(text, start, span.end)
+    at = m.start() if m else span.start
+    return Span(span.filename, at, at + len(word))
+
+
+def _path_span(imp):
+    """The quoted path of the import `imp`."""
+    text = get_source(imp.span.filename)
+    quoted = f'"{imp.module_name}"'
+    at = text.find(quoted, imp.span.start, imp.span.end)
+    if at < 0:
+        return imp.span
+    return Span(imp.span.filename, at, at + len(quoted))
+
+
+def _listed_name_clash(module):
+    """A name the module both declares and lists in an import, or that two imports list."""
+    seen = {}
+    # Each import's alias: its path's span and the file it loads.
+    aliases = {}
+    for stmt in module.body:
+        if isinstance(stmt, ast.Import):
+            names = [
+                (item, _word_span(stmt.span, item, "{"), True) for item in stmt.items
+            ]
+            target = module.resolve_import(stmt.module_name)
+            first = aliases.get(stmt.local_name)
+            if first is None:
+                aliases[stmt.local_name] = (_path_span(stmt), target)
+            elif first[1] != target:
+                # Two imports can't share a name unless they load one file.
+                line = _line_of(first[0])
+                return KodError(
+                    f"`{stmt.local_name}` is already imported on line {line}",
+                    _path_span(stmt),
+                )
+        elif isinstance(stmt, ast.TypeDeclaration):
+            names = [(stmt.name.id, stmt.name.span, False)]
+        elif isinstance(stmt, (*_FUNC_DECLS, ast.InterfaceDeclaration)):
+            # The name follows its keyword.
+            names = [(stmt.name, _word_span(stmt.span, stmt.name, " "), False)]
+        else:
+            continue
+        for name, span, imported in names:
+            first = seen.get(name)
+            if first is None:
+                seen[name] = (span, imported)
+            elif imported or first[1]:
+                what = "imported" if first[1] else "declared"
+                line = _line_of(first[0])
+                return KodError(f"`{name}` is already {what} on line {line}", span)
+    return None
+
+
 # A cache entry not filled yet: None is a cached miss.
 _UNSET = object()
 
@@ -862,6 +922,9 @@ class Interpreter:
             if errors:
                 err = errors[0]
                 raise err.word() if isinstance(err, UnknownTypeError) else err
+            clash = _listed_name_clash(module)
+            if clash is not None:
+                raise clash
         for module in self.program:
             for statement in module.body:
                 self.execute_statement(module, statement)

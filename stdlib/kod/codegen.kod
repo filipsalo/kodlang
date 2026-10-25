@@ -8152,14 +8152,51 @@ type Codegen = struct {
     // A second declaration would replace the first or only fail in the assembler.
     func check_duplicate_decls(self, anon module: ast.Module) -> none {
         let seen = FuncIdx()
+        // The names an import lists before any declaration of them.
+        let listed = FuncIdx()
+        // Each import's alias, by the position of its path.
+        let aliases = FuncIdx()
+        let path_ats = self.import_token_offsets(items: false)
+        let item_ats = self.import_token_offsets(items: true)
+        mut import_i = 0
+        mut item_i = 0
         for decl in module.decls {
             match decl {
+                .Import(_module_name, local_name, items) -> {
+                    mut path_at = 0
+                    if import_i < len(path_ats) {
+                        path_at = path_ats[import_i]
+                    }
+                    import_i += 1
+                    // Two imports can't share a name unless they load one file.
+                    if aliases.get(local_name) is Some(first) {
+                        if self.alias_target_count(local_name) > 1 {
+                            self.report_error(f"error: `{local_name}` is already imported on line {self.line_of_offset(first)}", span: ast.Span(start: path_at))
+                        }
+                    } else {
+                        aliases.set(local_name, path_at)
+                    }
+                    for item in items {
+                        mut item_at = 0
+                        if item_i < len(item_ats) {
+                            item_at = item_ats[item_i]
+                        }
+                        item_i += 1
+                        let span = ast.Span(start: item_at)
+                        if seen.contains(item) {
+                            self.check_first_name(seen, :listed, name: item, :span)
+                        } else {
+                            seen.set(item, span.start)
+                            listed.set(item, 1)
+                        }
+                    }
+                }
                 .Func(decl_id) -> {
                     let fd = self.p.func_decls[decl_id]
-                    self.check_first_decl(seen, name: fd.name, shown: fd.name, span: fd.name_span)
+                    self.check_first_name(seen, :listed, name: fd.name, span: fd.name_span)
                 }
                 .Struct(name, name_span, _type_params, fields, methods) -> {
-                    self.check_first_decl(seen, :name, shown: name, span: name_span)
+                    self.check_first_name(seen, :listed, :name, span: name_span)
                     let seen_fields = FuncIdx()
                     for field in fields {
                         self.check_first_member(seen_fields, name: f"{name}.{field.name}", span: field.name_span)
@@ -8173,21 +8210,75 @@ type Codegen = struct {
                     self.check_duplicate_methods(name, :methods)
                 }
                 .Enum(name, name_span, _type_params, variants) -> {
-                    self.check_first_decl(seen, :name, shown: name, span: name_span)
+                    self.check_first_name(seen, :listed, :name, span: name_span)
                     let seen_variants = FuncIdx()
                     for variant in variants {
                         self.check_first_member(seen_variants, name: f"{name}.{variant.name}", span: variant.name_span)
                     }
                 }
                 .Interface(name, name_span, methods) -> {
-                    self.check_first_decl(seen, :name, shown: name, span: name_span)
+                    self.check_first_name(seen, :listed, :name, span: name_span)
                     self.check_duplicate_methods(name, :methods)
                 }
-                .Extern(name, name_span, _params, _return_typ) -> self.check_first_decl(seen, :name, shown: name, span: name_span)
-                .TypeAlias(name, _target, name_span) -> self.check_first_decl(seen, :name, shown: name, span: name_span)
+                .Extern(name, name_span, _params, _return_typ) -> self.check_first_name(seen, :listed, :name, span: name_span)
+                .TypeAlias(name, _target, name_span) -> self.check_first_name(seen, :listed, :name, span: name_span)
                 else none
             }
         }
+    }
+
+    // A module's own name, which an earlier import may have listed already.
+    func check_first_name(self, anon seen: FuncIdx, listed: FuncIdx, name: str, span: ast.Span) -> none {
+        if listed.contains(name) {
+            if seen.get(name) is Some(first) {
+                self.report_error(f"error: `{name}` is already imported on line {self.line_of_offset(first)}", :span)
+                return
+            }
+        }
+        self.check_first_decl(seen, :name, shown: name, :span)
+    }
+
+    // Where each import's path starts in the module's source, or with `items`
+    // where each name the imports list starts; both in source order, as the
+    // module's Import decls (which carry no spans) come.
+    func import_token_offsets(self, items: bool) -> [int64] {
+        mut offsets: [int64] = []
+        let toks = self.p.tokens
+        mut i = 0
+        for i < len(toks) {
+            if toks[i].kind is .KwImport and i + 1 < len(toks) {
+                i += 1
+                if items == false {
+                    offsets += [toks[i].start]
+                } else if i + 1 < len(toks) and toks[i + 1].kind is .OpenCurly {
+                    i += 2
+                    for i < len(toks) and toks[i].kind is .Identifier {
+                        offsets += [toks[i].start]
+                        i += 1
+                        if i < len(toks) and toks[i].kind is .Comma {
+                            i += 1
+                        }
+                    }
+                }
+            }
+            i += 1
+        }
+        return offsets
+    }
+
+    // How many files the module imports as `alias`.
+    func alias_target_count(self, anon alias: str) -> int64 {
+        let ti = self.cur_type_scope()
+        if ti < 0 {
+            return 0
+        }
+        mut n = 0
+        for a in self.type_scopes[ti].alias_names {
+            if a == alias {
+                n += 1
+            }
+        }
+        return n
     }
 
     func check_duplicate_methods(self, anon owner: str, methods: [int64]) -> none {
