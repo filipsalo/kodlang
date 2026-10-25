@@ -113,7 +113,18 @@ bound) and a `for` variable; give the inner binding another name. A
 block may bind a name again itself, and the new value still sees the old
 binding, even when its type differs (`let x = 1`, then
 `let x = f"#{x}"`). So may a block after one whose binding of the name
-has ended.
+has ended. A let-else's else block runs when the pattern doesn't match,
+so there the name still has its old binding:
+
+```kod
+for arg in args {
+    let .Some(arg) = parse_num(arg) else {
+        print(f"bad: {arg}")   // the str from `args`
+        continue
+    }
+    total += arg               // the parsed int64
+}
+```
 
 A name is a local only where its binding lasts. Before its `let`, or
 after the block, arm or loop that bound it, the name means a function of
