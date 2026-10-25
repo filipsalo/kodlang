@@ -230,6 +230,18 @@ def _enums_with(names, variant_name):
     return found
 
 
+def _args_fit(enum, variant_name, args):
+    """Whether `args` fit the payload of `enum.variant_name`, as codegen's args_fit."""
+    fields = enum.variants[variant_name].fields
+    if len(args) != len(fields):
+        return False
+    for arg, field in zip(args, fields):
+        label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
+        if label is not None and label.id != field.id:
+            return False
+    return True
+
+
 def _fits_result(name, args):
     if name not in ("Ok", "Err") or len(args) != 1:
         return False
@@ -538,6 +550,9 @@ class Interpreter:
         self.immutable_stack = [set()]
         # The running functions, innermost last; a `return` goes to the last.
         self.funcs = []
+        # The modules in the order the compiler registers their types.
+        self.type_order = None
+        self.entry_module = None
 
     def run(self, file, argv=()):
         """Run the program"""
@@ -545,6 +560,7 @@ class Interpreter:
             for statement in module.body:
                 self.execute_statement(module, statement)
         entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
+        self.entry_module = entry_module
         _mark_program_scopes(self.program)
         main = self.lookup(entry_module, "main")
         if len(main.params) > 0:
@@ -968,7 +984,11 @@ class Interpreter:
                 if not isinstance(v, types.NoneType):
                     return v
                 if default is not None:
-                    return self.evaluate_expression(module, default)
+                    # Built as the unwrapped type, so its `.Variant`s are its enum's.
+                    kind = self._quiet_kind(module, value)
+                    if not isinstance(kind, type):
+                        kind = None
+                    return self._evaluate_for(module, default, kind)
                 sys.stderr.write("panic: unwrap on none\n")
                 sys.exit(1)
             case ast.OptionalDot(value, field, _span):
@@ -1032,7 +1052,7 @@ class Interpreter:
                     return self._hash_value(value)
                 if isinstance(callee, ast.ImplicitEnumVariant):
                     enum_type = self._variant_enum(
-                        module, callee.variant_name, callee.span
+                        module, callee.variant_name, callee.span, list(args)
                     )
                     return self._variant_value(
                         module, enum_type, callee.variant_name, list(args)
@@ -1196,33 +1216,81 @@ class Interpreter:
             )
         return self.evaluate_expression(module, expr)
 
-    def _variant_enum(self, module, variant_name, span):
-        """The enum of a context-free `.Variant`: one the module sees, else the only loaded one."""
-        scopes = [module.names, self.program.builtins.names]
+    def _variant_enum(self, module, variant_name, span, args=()):
+        """The enum of a context-free `.Variant`: the one the module sees, else the only loaded one."""
+        seen = {id(module), id(self.program.builtins)}
         for imp in self._aliases(module).values():
             try:
-                scopes.append(self._resolve_import(module, imp).names)
+                seen.add(id(self._resolve_import(module, imp)))
             except Exception:
                 pass
-        for scope in scopes:
-            found = _enums_with(scope, variant_name)
-            if found:
-                return found[0]
         found = []
-        for loaded in self.program.modules.values():
+        owners = []
+        for loaded in self._type_modules():
             for enum in _enums_with(loaded.names, variant_name):
-                if enum not in found:
+                owner = getattr(enum, "decl_module", loaded)
+                if owner is loaded and enum not in found:
                     found.append(enum)
-        if len(found) > 1:
-            names = ", ".join(f"`{enum.name}`" for enum in found[:-1])
-            both = "both" if len(found) == 2 else "all"
-            raise KodError(
-                f"`.{variant_name}` is ambiguous: {names} and `{found[-1].name}` {both} declare it; give the value a type",
-                span,
-            )
-        if found:
+                    owners.append(owner)
+        visible = [e for e, owner in zip(found, owners) if id(owner) in seen]
+        if visible:
+            found = visible
+        if len(found) == 1:
             return found[0]
-        raise ValueError(f"No enum found with variant .{variant_name}")
+        if not found:
+            raise ValueError(f"No enum found with variant .{variant_name}")
+        # Worded as the compiler's report_ambiguous_variant.
+        fitting = [e for e in found if _args_fit(e, variant_name, args)] or found
+        pick = fitting[-1]
+        for enum in fitting:
+            if getattr(enum, "decl_module", None) is module:
+                pick = enum
+        written = [self._written_enum(module, enum) for enum in found]
+        names = ", ".join(f"`{name}`" for name in written[:-1])
+        both = "both" if len(found) == 2 else "all"
+        advice = "give the value a type"
+        if visible:
+            advice = (
+                f"write `{self._written_enum(module, pick)}.{variant_name}` or {advice}"
+            )
+        raise KodError(
+            f"`.{variant_name}` is ambiguous: {names} and `{written[-1]}` {both} declare it; {advice}",
+            span,
+        )
+
+    def _type_modules(self):
+        """The builtins, then each module before the ones it imports, then the entry."""
+        if self.type_order is None:
+            order = [self.program.builtins]
+            entry = self.entry_module
+            if entry is None:
+                order += list(self.program.modules.values())
+            else:
+                self._add_imported(entry, order, {id(entry)})
+                order.append(entry)
+            self.type_order = order
+        return self.type_order
+
+    def _add_imported(self, module, order, seen):
+        for imp in module.get_imports():
+            dep = self._resolve_import(module, imp)
+            if id(dep) not in seen:
+                seen.add(id(dep))
+                order.append(dep)
+                self._add_imported(dep, order, seen)
+
+    def _written_enum(self, module, enum):
+        """How `module` writes `enum`: bare when it's its own or a builtin, else through its alias."""
+        owner = getattr(enum, "decl_module", None)
+        if (
+            owner is not None
+            and owner is not module
+            and owner is not self.program.builtins
+        ):
+            for imp in module.get_imports():
+                if self._resolve_import(module, imp) is owner:
+                    return f"{imp.local_name}.{enum.name}"
+        return enum.name
 
     def _check_labels(self, func, args):
         if isinstance(func, BoundMethod):
