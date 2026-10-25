@@ -34,7 +34,9 @@ its `hash(...)` calls use it, while another module's `dep.hash(x)` names
 that one. An f-string always converts its values with the builtin `str`.
 Only the builtin `kod_panic` counts as a call that never returns; a
 module's own or imported `kod_panic`, or a local function value of that
-name, is an ordinary call.
+name, is an ordinary call. A local named `kod_panic` that holds anything
+else doesn't hide the builtin, so `kod_panic(msg)` after
+`let kod_panic = 5` never returns.
 
 ## Output
 

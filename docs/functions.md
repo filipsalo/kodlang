@@ -175,44 +175,52 @@ The builtin `kod_panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
 body by these rules. A function of the module or one it imports named
 `kod_panic`, or a local function value of that name in force at the
-call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
-ends in `kod_panic(...)` never returns, and nor does one that ends in a
-call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
-function declared further down), or in a `for true` loop it can't `break`
-out of. A call that leads back to the function itself doesn't count:
+call, hides the builtin (see [Built-ins](builtins.md)). A local named
+`kod_panic` that holds anything else doesn't, so `kod_panic(msg)` after
+`let kod_panic = 5` never returns. So a helper that ends in
+`kod_panic(...)` never returns, and nor does one that ends in a call of
+another such helper (`self.fail(msg)`, `log.die(msg)`, or a function
+declared further down), or in a `for true` loop it can't `break` out of.
+A call that leads back to the function itself doesn't count:
 `func spin() -> none { spin() }` is taken to return.
 
-A local's type can change between its bindings, so a call never
-returns only when what it calls doesn't depend on such a type: the builtin
-`kod_panic`, a function of the module or one it imports (`die(msg)`), a
-function of an imported module (`log.die(msg)`), or a method whose
-receiver's type depends on no local but `self` and parameters that no
-`let` or let-else in the body binds again (`self.fail(msg)`,
-`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r` of a
-struct type, `reporter().fail(msg)`, and `make(t).fail(msg)` or
-`self.reps[i].fail(msg)` even for locals `t` and `i`, since the type of
-the receiver doesn't depend on them). A method whose receiver's type
-depends on any other local is taken to return, whether a `let`
-(`let r = Reporter(); r.fail(msg)`), a match arm, `if … is`, let-else or
-`for` binds it, and a parameter that the body binds again counts as such
-a local. So is a plain call of a name that such a local has at that
-point, even when it doesn't hold a function (`kod_panic(msg)` after
-`let kod_panic = 5`). To end the path there, put a `kod_panic(...)` or a
-`return` after the call.
+This holds for a call of:
+
+- a function of the module or one it imports (`die(msg)`), or a function
+  of an imported module (`log.die(msg)`);
+- a method of a struct, whatever it's called on: `self`, a parameter,
+  any local, a field or a call's result (`self.fail(msg)`,
+  `self.log.fail(msg)`, `r.fail(msg)`, `self.reps[i].fail(msg)`,
+  `reporter().fail(msg)`), as long as that expression's type is known at
+  the call. A local has the type of its binding in force there, whether a
+  `let`, let-else, match arm, `if … is` or `for` binds it, so
+  `r.fail(msg)` never returns after `let r = Reporter()`, even where `r`
+  is also a parameter of another type.
+
+Two kinds of call are always taken to return, because what they call is
+chosen at run time:
+
+- a call through a function value (a local, parameter or field of a
+  function type);
+- a method called through an interface value.
+
+End such a path with a `kod_panic(...)` or a `return` after the call.
 
 A call in a value's place, as a returned value, a match arm's value or an
-`x? or ...` default, is decided where it is written, from the type its
-receiver has there, so `return r.fail(msg)` never returns after
-`let r = Reporter()`. What it calls is still decided by the rules above:
-`return die(msg)` is an error when `die` ends in `r.fail(msg)` on such a
-local, and the error names that call and its line
+`x? or ...` default, is decided where it is written by the same rules, so
+`return r.fail(msg)` never returns after `let r = Reporter()`, and nor
+does `return die(msg)` when `die` ends in that call. When what it calls
+ends in a call taken to return, the error names that call and its line:
+`return die(msg)` is an error when `die` ends in `r.fail(msg)` after
+`let r: Failer = Reporter()`, for an interface `Failer`
 (`` as `die` ends in `r.fail(msg)` (line 19) ``, or
-`` (line 19 of lib/log.kod) `` when the call is in another module) and
-says to put a `kod_panic(...)` after it. The `can reach its end` error names it too
-when the body ends in such a call, or in a call through a local of its
-own. A method called through an interface value is taken to return
-wherever it is called, since the method that runs is chosen at run
-time: call it as a statement and end the path with `kod_panic(...)`.
+`` (line 19 of lib/log.kod) `` when the call is in another module), and
+it says to put a `kod_panic(...)` after it. The `can reach its end` error
+names that call too when the body ends in a call of such a function, and
+says so when the body itself ends in a call through a function value or
+a method called through an interface value. Such a call is taken to
+return wherever it is written: call it as a statement and end the path
+with `kod_panic(...)`.
 
 ## `main`
 
