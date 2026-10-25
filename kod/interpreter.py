@@ -4,15 +4,13 @@
 import ctypes
 import dataclasses
 import os
-import re
 import sys
 from typing import Any
 
 from kod import ast, tokens
 from kod import values as types
-from kod.exceptions import KodError, get_source
+from kod.exceptions import KodError
 from kod.program import Program
-from kod.span import Span
 
 libc = ctypes.cdll.LoadLibrary("libSystem.dylib")
 
@@ -413,7 +411,7 @@ def _mark_scopes(func, program, module=None):
     """
     func.__dict__["_kod_scoped"] = True
     scope = _Scope(func, program, module)
-    params = {p.variable.id: (1, p.span, p.variable.id, 0) for p in func.params}
+    params = {p.variable.id: (1, p.variable.id, 0) for p in func.params}
     _scope_block(func.body, params, 1, scope)
     for param in func.params:
         _mark_default(param.default, program, scope.module)
@@ -451,42 +449,26 @@ def _mark_program_scopes(program):
                     _mark_scopes(func, program, module)
 
 
-def _line_of(span):
-    return get_source(span.filename)[: span.start].count("\n") + 1
-
-
-def _name_span(span, name, end=None):
-    """The last whole-word `name` in `span` before `end` and any `->`."""
-    text = get_source(span.filename)[span.start : end or span.end].split("->")[0]
-    for m in reversed(list(re.finditer(rf"\b{re.escape(name)}\b", text))):
-        start = span.start + m.start()
-        return Span(span.filename, start, start + len(name))
-    return span
-
-
-def _bind(bound, name, span, depth, scope):
+def _bind(bound, name, depth, scope):
     """Bind `name` at `depth`; return the frame key its value goes to."""
     key, level = name, 0
     outer = bound.get(name)
     if outer is not None:
-        key, level = outer[2], outer[3]
+        key, level = outer[1], outer[2]
         if outer[0] < depth:
             level += 1
             key = f"{name}#{level}"
-    bound[name] = (depth, span, key, level)
+    bound[name] = (depth, key, level)
     scope.seen.add(name)
     return key
 
 
-def _bind_pattern(bound, pattern, depth, scope, end=None):
+def _bind_pattern(bound, pattern, depth, scope):
     # By the names as written, so a node `+=` shares binds alike the second time.
     names = pattern.__dict__.get("_kod_names")
     if names is None:
         names = pattern.__dict__["_kod_names"] = _pattern_names(pattern)
-    keys = [
-        _bind(bound, name, _name_span(pattern.span, name, end), depth, scope)
-        for name in names
-    ]
+    keys = [_bind(bound, name, depth, scope) for name in names]
     if keys == _pattern_names(pattern):
         return
     bindings = getattr(pattern, "bindings", None)
@@ -507,9 +489,9 @@ def _scope_use(node, bound, scope, verb, fallback=True):
     name = node.__dict__.get("_kod_name", node.id)
     entry = bound.get(name)
     if entry is not None:
-        if entry[2] != node.id:
+        if entry[1] != node.id:
             node.__dict__["_kod_name"] = name
-            node.id = entry[2]
+            node.id = entry[1]
         return
     if name not in scope.declared:
         return
@@ -538,13 +520,13 @@ def _scope_stmt(stmt, bound, depth, scope):
     if t is ast.VariableDeclaration:
         _scope_expr(stmt.value, bound, depth, scope)
         variable = stmt.variable
-        variable.id = _bind(bound, variable.id, variable.span, depth, scope)
+        variable.id = _bind(bound, variable.id, depth, scope)
     elif t is ast.LetElseStatement:
         _scope_expr(stmt.value, bound, depth, scope)
         _scope_block(stmt.else_body, bound, inner, scope)
         _note_qualifier(stmt.pattern, bound, scope)
         _note_thaw(stmt, _pattern_names(stmt.pattern), scope)
-        _bind_pattern(bound, stmt.pattern, depth, scope, stmt.value.span.start)
+        _bind_pattern(bound, stmt.pattern, depth, scope)
     elif t is ast.IfStatement:
         _scope_expr(stmt.condition, bound, depth, scope)
         _scope_block(stmt.true_branch, bound, inner, scope)
@@ -556,8 +538,7 @@ def _scope_stmt(stmt, bound, depth, scope):
         _scope_expr(stmt.iterable, bound, depth, scope)
         body = dict(bound)
         _note_thaw(stmt, [stmt.binding], scope)
-        name_span = _name_span(stmt.span, stmt.binding, stmt.iterable.span.start)
-        stmt.binding = _bind(body, stmt.binding, name_span, inner, scope)
+        stmt.binding = _bind(body, stmt.binding, inner, scope)
         _scope_block(stmt.body, body, inner, scope)
     elif t is ast.MatchStatement:
         _scope_expr(stmt.expression, bound, depth, scope)
@@ -589,7 +570,7 @@ def _scope_expr(node, bound, depth, scope):
         # `:name` shares its Name between the label and the value.
         if node.label is node.expression:
             entry = bound.get(node.label.id)
-            if entry is not None and entry[2] != node.label.id:
+            if entry is not None and entry[1] != node.label.id:
                 node.expression = dataclasses.replace(node.expression)
         _scope_expr(node.expression, bound, depth, scope)
         return
@@ -598,7 +579,7 @@ def _scope_expr(node, bound, depth, scope):
     if t is ast.FunctionCall and type(node.callee) is ast.Name:
         # The callee keeps its name; the key of the binding in force goes alongside.
         entry = bound.get(node.callee.id)
-        node.callee.__dict__["_kod_bound"] = entry[2] if entry is not None else False
+        node.callee.__dict__["_kod_bound"] = entry[1] if entry is not None else False
         if entry is None:
             _scope_use(node.callee, bound, scope, "called")
         _scope_expr(node.args, bound, depth, scope)
@@ -612,7 +593,7 @@ def _scope_expr(node, bound, depth, scope):
                 node.lhs = enum
                 return
             entry = bound.get(name)
-            node.lhs.__dict__["_kod_bound"] = entry[2] if entry is not None else False
+            node.lhs.__dict__["_kod_bound"] = entry[1] if entry is not None else False
             if entry is not None or name not in scope.aliases:
                 _scope_use(node.lhs, bound, scope, "read", fallback=False)
         elif type(node.lhs) is not type:  # an enum already, in a `+=` target seen twice
