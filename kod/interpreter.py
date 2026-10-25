@@ -11,6 +11,7 @@ from typing import Any
 from kod import ast, tokens
 from kod import values as types
 from kod.exceptions import KodError, get_source
+from kod.parser import qualified_type_error, with_suggestion
 from kod.program import Program
 from kod.span import Span
 
@@ -108,6 +109,23 @@ def _note_qualifier(pattern, bound, scope):
         kind = "local" if name in bound else ""
     if kind or len(pattern.bindings) > 1:
         pattern.__dict__["_kod_qualifier"] = kind
+
+
+def _module_member_error(imp, name, mod, call=False):
+    """Why `alias.name` names nothing the module imported as `alias` declares."""
+    alias = imp.local_name if isinstance(imp, ast.Import) else "?"
+    if name[:1].isupper():
+        return qualified_type_error(alias, name, mod, call=call)
+    funcs = [n for n, v in mod.names.items() if isinstance(v, _FUNC_DECLS)]
+    return with_suggestion(f"module `{alias}` has no function `{name}`", name, funcs)
+
+
+class _NoModuleMember(KodError):
+    """`alias.name` where the module imported as `alias` has no `name`."""
+
+    def __init__(self, imp, rhs, mod):
+        super().__init__(_module_member_error(imp, rhs.id, mod), rhs.span)
+        self.imp, self.rhs, self.mod = imp, rhs, mod
 
 
 # A cache entry not filled yet: None is a cached miss.
@@ -585,6 +603,10 @@ class Interpreter:
     def run(self, file, argv=()):
         """Run the program"""
         for module in self.program:
+            errors = module.__dict__.get("_kod_type_errors")
+            if errors:
+                raise errors[0]
+        for module in self.program:
             for statement in module.body:
                 self.execute_statement(module, statement)
         entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
@@ -775,7 +797,13 @@ class Interpreter:
                 stale, (*_FUNC_DECLS, BoundMethod)
             ):
                 raise ValueError(f"Unknown name {callee.id!r}")
-        return self.evaluate_expression(module, callee)
+        try:
+            return self.evaluate_expression(module, callee)
+        except _NoModuleMember as err:
+            if err.rhs is not getattr(callee, "rhs", None):
+                raise
+            msg = _module_member_error(err.imp, err.rhs.id, err.mod, call=True)
+            raise KodError(msg, err.rhs.span) from None
 
     def lookup(self, module, name) -> Any:
         """Look up a variable in the stack"""
@@ -818,7 +846,10 @@ class Interpreter:
                 else:
                     lhs = self.evaluate_expression(module, lhs, as_lvalue)
                 if isinstance(lhs, ast.Module):
-                    return lhs.names[rhs.id]
+                    member = lhs.names.get(rhs.id)
+                    if member is None:
+                        raise _NoModuleMember(imp, rhs, lhs)
+                    return member
                 methods = getattr(type(lhs), "methods", {})
                 if rhs.id in methods:
                     return BoundMethod(methods[rhs.id], lhs)
@@ -879,7 +910,7 @@ class Interpreter:
                     cls = rhs.__dict__.get("_kod_type", _UNSET)
                     alias = _is_rhs_alias(rhs)
                     if cls is _UNSET:
-                        cls = self._downcast_type(module, name, alias)
+                        cls = self._downcast_type(module, name, rhs.span, alias)
                         rhs.__dict__["_kod_type"] = cls
                     matches = self._holds_type(lhs_val, cls, name, rhs.span, alias)
                     return types.Bool(matches != negate)
@@ -1480,7 +1511,7 @@ class Interpreter:
             return None, None
         try:
             func = self._call_target(module, callee)
-        except (ValueError, KeyError, AttributeError):
+        except (ValueError, KeyError, AttributeError, _NoModuleMember):
             return None, None
         if isinstance(func, BoundMethod):
             return func.func, type(func.receiver)
@@ -1607,13 +1638,17 @@ class Interpreter:
             return named if isinstance(named, type) else None
         return self._variant_slot(named)
 
-    def _downcast_type(self, module, name, alias=None):
+    def _downcast_type(self, module, name, span, alias=None):
         """What `name`, or `alias.name`, names where `module` writes it, else None."""
         if alias is not None:
             imp = self._alias_import(module, alias)
             if imp is None:
                 return None
-            return self._resolve_import(module, imp).names.get(name)
+            mod = self._resolve_import(module, imp)
+            cls = mod.names.get(name)
+            if not isinstance(cls, (type, types.GenericTemplate)):
+                raise KodError(qualified_type_error(alias, name, mod), span)
+            return cls
         value = module.names.get(name)
         if value is None:
             value = self._item(module, name)
@@ -1634,7 +1669,7 @@ class Interpreter:
         cls = pattern.__dict__.get("_kod_type", _UNSET)
         alias = pattern.__dict__.get("_kod_alias")
         if cls is _UNSET:
-            cls = self._downcast_type(module, pattern.type_name, alias)
+            cls = self._downcast_type(module, pattern.type_name, pattern.span, alias)
             pattern.__dict__["_kod_type"] = cls
         return self._holds_type(value, cls, pattern.type_name, pattern.span, alias)
 

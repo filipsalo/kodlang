@@ -285,6 +285,9 @@ type Parser = struct {
 	bad_lits: [int64] = []
 	// Parallel to `patterns`: where each pattern's last token ends.
 	pattern_ends: [int64] = []
+	// Parallel to `type_exprs` up to the last qualified one: the module alias a
+	// type is written with (`pa` of `pa.Pt`), or "". Missing entries are "".
+	type_quals: [str] = []
 
 	func peek(self) -> lexing.Token {
 		if self.pos >= len(self.tokens) {
@@ -453,10 +456,16 @@ type Parser = struct {
 		return id
 	}
 
-	func alloc_type(self, anon tok: ast.TypeExpr, span: ast.Span) -> int64 {
+	func alloc_type(self, anon tok: ast.TypeExpr, span: ast.Span, qual: str = "") -> int64 {
 		mut id: int64 = len(self.type_exprs)
 		self.type_exprs += [tok]
 		self.type_spans += [span]
+		if len(qual) > 0 {
+			for len(self.type_quals) < id {
+				self.type_quals += [""]
+			}
+			self.type_quals += [qual]
+		}
 		return id
 	}
 
@@ -526,16 +535,16 @@ type Parser = struct {
 		} else {
 			name = self.expect_identifier()
 		}
-		// Module-qualified type: 'mod.Name' — we use the unqualified name
-		// since all imported types are registered globally in the codegen's
-		// struct/enum tables.
+		// Module-qualified type: 'mod.Name', with `mod` kept in type_quals.
+		mut qual = ""
 		if self.try_consume(.Dot) {
 			span = self.here()
+			qual = name
 			name = self.expect_identifier()
 		}
 		// Optional: T?
 		if self.try_consume(.Question) {
-			mut inner: int64 = self.alloc_type(ast.TypeExpr.Named(:name), :span)
+			mut inner: int64 = self.alloc_type(ast.TypeExpr.Named(:name), :span, :qual)
 			return self.alloc_type(ast.TypeExpr.Optional(:inner), :span)
 		}
 		// Generic: T[U] or T[U, V, ...]. Codegen monomorphises per
@@ -546,9 +555,9 @@ type Parser = struct {
 				args += [self.parse_type_expr()]
 			}
 			self.expect(.CloseBracket)
-			return self.alloc_type(ast.TypeExpr.Generic(:name, :args), :span)
+			return self.alloc_type(ast.TypeExpr.Generic(:name, :args), :span, :qual)
 		}
-		return self.alloc_type(ast.TypeExpr.Named(:name), :span)
+		return self.alloc_type(ast.TypeExpr.Named(:name), :span, :qual)
 	}
 
 	func parse_type_expr(self) -> int64 {
@@ -693,9 +702,10 @@ type Parser = struct {
 				if self.is_dot(mod_op) == false {
 					return -1
 				}
-				let .Ident(_mod) = self.exprs[mod_lhs] else { return -1 }
+				let .Ident(mod_name) = self.exprs[mod_lhs] else { return -1 }
 				let .Ident(enum_name) = self.exprs[enum_rhs] else { return -1 }
-				return self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings))
+				// A pattern travels without its id, so its module rides in the name.
+				return self.alloc_pattern(ast.Pattern.EnumPat(enum_name: f"{mod_name}.{enum_name}", :variant_name, :bindings))
 			}
 			else return -1
 		}
@@ -789,15 +799,16 @@ type Parser = struct {
 			return self.alloc_pattern(ast.Pattern.TypePat(:type_name, :binding))
 		}
 		// Explicit enum variant: Enum.Variant or Enum.Variant(bindings...).
-		// Also accept three-part 'module.Enum.Variant' — the module qualifier
-		// is dropped (types are registered globally in the codegen).
+		// Also accept three-part 'module.Enum.Variant', whose enum is named
+		// `module.Enum`: a pattern travels without its id, so no side array
+		// can carry the module.
 		let first: str = self.expect_identifier()
 		self.expect(.Dot)
 		let second: str = self.expect_identifier()
 		mut enum_name: str = first
 		mut variant_name: str = second
 		if self.try_consume(.Dot) {
-			enum_name = second
+			enum_name = f"{first}.{second}"
 			variant_name = self.expect_identifier()
 		}
 		mut bindings: [str] = []

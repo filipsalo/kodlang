@@ -48,6 +48,40 @@ from kod.tokens import (
 )
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance, as codegen's str.distance computes it."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        cur = [i + 1]
+        for j, cb in enumerate(b):
+            cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def with_suggestion(msg: str, typo: str, candidates) -> str:
+    """`msg; did you mean `X`?` for the first closest candidate within 2 edits."""
+    best, best_dist = "", 3
+    for candidate in candidates:
+        d = edit_distance(typo, candidate)
+        if d < best_dist:
+            best, best_dist = candidate, d
+    return f"{msg}; did you mean `{best}`?" if best else msg
+
+
+def qualified_type_error(alias: str, name: str, mod, call: bool = False) -> str:
+    """Why `alias.name` names no type of `mod`, the module imported as `alias`."""
+    candidates = [
+        n for n, v in mod.names.items() if isinstance(v, (type, types.GenericTemplate))
+    ]
+    what = "type"
+    if call:
+        what = "function or type"
+        funcs = (ast.FunctionDeclaration, ast.ExternalFunctionDeclaration)
+        candidates += [n for n, v in mod.names.items() if isinstance(v, funcs)]
+    return with_suggestion(f"module `{alias}` has no {what} `{name}`", name, candidates)
+
+
 class Parser:
     """A parser for the kod language."""
 
@@ -68,6 +102,9 @@ class Parser:
         # (declaration, target) of aliases whose target is declared later.
         self.pending_aliases: list = []
         self.pending_alias_names: set[str] = set()
+        # Type names that name nothing, raised when the program runs: compiling
+        # still parses here first, and the compiler reports every such error.
+        self.type_errors: list[KodError] = []
 
     def eof(self) -> bool:
         """Return True if at EOF."""
@@ -116,6 +153,29 @@ class Parser:
         if self.program is not None and hasattr(self.program, "builtins"):
             return self.program.builtins.names.get(name)
         return None
+
+    def qualified_type(self, alias: str, name: str, span: Span):
+        """The type `alias.name`: one the module imported as `alias` declares."""
+        import_file = self.program.resolve_import(
+            self.import_aliases[alias], relative_to=self.file.path
+        )
+        mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
+        result = mod.names.get(name)
+        if not isinstance(result, (type, types.GenericTemplate)):
+            self.type_errors.append(
+                KodError(qualified_type_error(alias, name, mod), span)
+            )
+            return types.InterfaceType
+        return result
+
+    def check_enum_qualifier(self, alias: str, name: str, span: Span) -> None:
+        """A three-part pattern's `alias.Enum` names a type of the module `alias`."""
+        if self.program is None:
+            return
+        if alias in self.import_aliases:
+            self.qualified_type(alias, name, span)
+        else:
+            self.type_errors.append(KodError(f"unknown type `{alias}.{name}`", span))
 
     def _item_type(self, name: str):
         """The type `name` names in the module whose import lists it, or None."""
@@ -258,17 +318,19 @@ class Parser:
             and param_type.id in self.import_aliases
             and self.try_consume(Dot)
         ):
-            type_name = self.consume(Identifier).value
-            module_name = self.import_aliases[param_type.id]
-            import_file = self.program.resolve_import(
-                module_name, relative_to=self.file.path
-            )
-            mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
-            result = mod.names.get(type_name)
+            name_tok = self.consume(Identifier)
+            type_name = name_tok.value
+            result = self.qualified_type(param_type.id, type_name, name_tok.span)
             qualified = ast.QualifiedTypeExpr(param_type.id, type_name)
             if isinstance(result, types.GenericTemplate):
                 return ast.GenericTypeExpr(qualified, self._parse_type_args())
             return qualified
+        if self.peeking_at(Dot) and isinstance(self.tokens[self.pos + 1], Identifier):
+            self.consume(Dot)
+            name_tok = self.consume(Identifier)
+            shown = f"{param_type.id}.{name_tok.value}"
+            self.type_errors.append(KodError(f"unknown type `{shown}`", name_tok.span))
+            return ast.ResolvedTypeExpr(types.InterfaceType)
         return ast.NamedTypeExpr(param_type.id)
 
     def _parse_type_args(self) -> tuple:
@@ -300,12 +362,7 @@ class Parser:
                 return result
             return types.Type.from_name(expr.name)
         if isinstance(expr, ast.QualifiedTypeExpr):
-            module_name = self.import_aliases[expr.module]
-            import_file = self.program.resolve_import(
-                module_name, relative_to=self.file.path
-            )
-            mod = self.program.get_module(import_file.canonical_path.with_suffix(""))
-            return mod.names.get(expr.name)
+            return self.qualified_type(expr.module, expr.name, self.peek().span)
         if isinstance(expr, ast.GenericTypeExpr):
             template = self.resolve_type_expr(expr.base)
             return template.instantiate(
@@ -398,7 +455,9 @@ class Parser:
         for _decl, type_expr in self.pending_aliases:
             # Still unresolved: report the unknown target.
             self.resolve_type_expr(type_expr)
-        return ast.Module(self.file, statements, span)
+        module = ast.Module(self.file, statements, span)
+        module.__dict__["_kod_type_errors"] = self.type_errors
+        return module
 
     def resolve_pending_aliases(self) -> None:
         """Resolve pending aliases whose targets are now declared."""

@@ -1355,7 +1355,7 @@ class IfStatement(ASTNode):
             # `if <lhs> is <rhs>` where rhs can be reinterpreted as a binding
             # pattern -> desugar to a one-arm match. Bare `<lhs> is none` /
             # unit-variant checks keep their bool semantics.
-            pat = _pattern_from_is_rhs(condition)
+            pat = _pattern_from_is_rhs(condition, parser)
             if pat is not None:
                 lhs = condition.lhs
                 parser.consume(tokens.OpenCurly)
@@ -1407,7 +1407,7 @@ class IfStatement(ASTNode):
         return cls(condition, true_branch, false_branch, span)
 
 
-def _pattern_from_is_rhs(cond):
+def _pattern_from_is_rhs(cond, parser):
     """If `cond` is `<lhs> is <rhs>` or `<lhs> is not <rhs>` where rhs
     is a binding pattern shape (Some(v), .Variant(b), Enum.Variant(b)),
     return the corresponding Pattern node. Otherwise return None —
@@ -1451,10 +1451,14 @@ def _pattern_from_is_rhs(cond):
         if isinstance(callee, BinaryOperator) and isinstance(callee.op, tokens.Dot):
             inner = callee.lhs
             if isinstance(inner, BinaryOperator) and isinstance(inner.op, tokens.Dot):
-                # module.Enum.Variant — drop the module qualifier
+                # module.Enum.Variant: the module must declare the enum.
                 if isinstance(inner.rhs, name_like) and isinstance(
                     callee.rhs, name_like
                 ):
+                    if isinstance(inner.lhs, name_like):
+                        parser.check_enum_qualifier(
+                            inner.lhs.id, inner.rhs.id, inner.rhs.span
+                        )
                     return EnumVariantPattern(
                         inner.rhs.id, callee.rhs.id, arg_names, span
                     )
@@ -1803,6 +1807,7 @@ class MatchExpressionArm:
                         parser.consume(tokens.Dot)
                         variant_name = parser.consume(tokens.Identifier).value
                         enum_name = second
+                        parser.check_enum_qualifier(first, second, span)
                     else:
                         enum_name = first
                         variant_name = second
@@ -1927,11 +1932,12 @@ class MatchArm:
                 else:
                     parser.consume(tokens.Dot)
                     second = parser.consume(tokens.Identifier).value
-                    # Three-part: module.Enum.Variant — consume the third identifier
+                    # Three-part: module.Enum.Variant, whose module must declare the enum.
                     if parser.peeking_at(tokens.Dot):
                         parser.consume(tokens.Dot)
                         variant_name = parser.consume(tokens.Identifier).value
                         enum_name = second
+                        parser.check_enum_qualifier(first, second, span)
                     else:
                         enum_name = first
                         variant_name = second

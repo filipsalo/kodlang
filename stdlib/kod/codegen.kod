@@ -1631,6 +1631,14 @@ type Codegen = struct {
                     if len(msg) == 0 and len(bindings) > 1 and self.is_import_alias(enum_name) {
                         msg = f"error: a downcast to {target} binds one name, got {len(bindings)}; bind the value and read its fields"
                     }
+                    // `x.T(b)` or `x.E.V(b)` where `x` names no module and `x` / `x.E` no type.
+                    if len(msg) == 0 and self.is_import_alias(enum_name) == false and self.pattern_named_enum(enum_name) < 0 {
+                        if name_dot(enum_name) >= 0 {
+                            msg = self.pattern_qual_error(enum_name)
+                        } else if self.type_name_known(enum_name) == false {
+                            msg = self.qualified_type_error(enum_name, name: variant_name, call: false)
+                        }
+                    }
                     if len(msg) > 0 {
                         self.report_error(msg, span: self.p.expr_spans[subject_id])
                         return false
@@ -2715,6 +2723,140 @@ type Codegen = struct {
         return -1
     }
 
+    // The type scope of the module self.p belongs to, or -1.
+    func cur_type_scope(self) -> int64 {
+        if self.p.path != self.cur_types_path {
+            self.cur_types_path = self.p.path
+            self.cur_types = -1
+            if self.type_scope_idx.get(self.p.path) is Some(ti) {
+                self.cur_types = ti
+            }
+        }
+        return self.cur_types
+    }
+
+    // `alias.name` where it is written: the type the module imported as `alias`
+    // declares, its own aliases included. idx * 4 + what (see TypeScope.own),
+    // -1 when that module declares none, -2 when no import is named `alias`.
+    func qualified_type_ref(self, anon alias: str, name: str) -> int64 {
+        let ti = self.cur_type_scope()
+        if ti < 0 {
+            return -2
+        }
+        let ts = self.type_scopes[ti]
+        mut i = 0
+        for a in ts.alias_names {
+            if a == alias {
+                if self.type_scope_idx.get(ts.alias_paths[i]) is Some(mi) {
+                    if self.type_scopes[mi].own.get(name) is Some(r) {
+                        return r
+                    }
+                }
+                return -1
+            }
+            i += 1
+        }
+        return -2
+    }
+
+    // The struct (what 0), enum (1) or interface (2) `alias.name` names, or -1.
+    func qualified_idx(self, anon alias: str, name: str, what: int64) -> int64 {
+        let r = self.qualified_type_ref(alias, :name)
+        if r >= 0 and r % 4 == what {
+            return r / 4
+        }
+        return -1
+    }
+
+    // Why `alias.name` names no type here; `call` for `alias.name(...)`.
+    func qualified_type_error(self, anon alias: str, name: str, call: bool) -> str {
+        let ti = self.cur_type_scope()
+        mut target = -1
+        if ti >= 0 {
+            let ts = self.type_scopes[ti]
+            mut i = 0
+            for a in ts.alias_names {
+                if a == alias and target == -1 {
+                    target = -2
+                    if self.type_scope_idx.get(ts.alias_paths[i]) is Some(mi) {
+                        target = mi
+                    }
+                }
+                i += 1
+            }
+        }
+        if target == -1 {
+            return f"error: unknown type `{alias}.{name}`"
+        }
+        mut candidates: [str] = []
+        if target >= 0 {
+            for n in self.type_scopes[target].own.keys {
+                candidates += [n]
+            }
+        }
+        mut what = "type"
+        if call {
+            what = "function or type"
+            candidates += self.import_fn_names(alias)
+        }
+        return self.with_suggestion(f"error: module `{alias}` has no {what} `{name}`", typo: name, :candidates)
+    }
+
+    // The struct a type pattern names: `T`, or `alias.T` of a downcast through a module.
+    func type_pat_struct(self, anon type_name: str) -> int64 {
+        let idx = self.find_struct_idx(type_name)
+        if idx >= 0 {
+            return idx
+        }
+        let dot = name_dot(type_name)
+        if dot < 0 {
+            return -1
+        }
+        return self.qualified_idx(type_name[0..dot], name: type_name[dot + 1..], what: 0)
+    }
+
+    // The enum a pattern names: `E`, or `m.E` of a three-part `m.E.V`.
+    func pattern_named_enum(self, anon enum_name: str) -> int64 {
+        let idx = self.find_enum_idx(enum_name)
+        if idx >= 0 {
+            return idx
+        }
+        let dot = name_dot(enum_name)
+        if dot < 0 {
+            return -1
+        }
+        return self.qualified_idx(enum_name[0..dot], name: enum_name[dot + 1..], what: 1)
+    }
+
+    // Why a pattern's `m.T` or `T` names no type, "" for a bare name.
+    func pattern_qual_error(self, anon written: str) -> str {
+        let dot = name_dot(written)
+        if dot < 0 {
+            return ""
+        }
+        return self.qualified_type_error(written[0..dot], name: written[dot + 1..], call: false)
+    }
+
+    // The type a type expression's module qualifier, if any, and name select:
+    // the struct (what 0) or enum (1), or -1.
+    func type_expr_idx(self, anon type_id: int64, name: str, what: int64) -> int64 {
+        let qual = self.type_qual(type_id)
+        if len(qual) > 0 {
+            return self.qualified_idx(qual, :name, :what)
+        }
+        if what == 0 {
+            return self.find_struct_idx(name)
+        }
+        return self.find_enum_idx(name)
+    }
+
+    func type_qual(self, anon type_id: int64) -> str {
+        if type_id < len(self.p.type_quals) {
+            return self.p.type_quals[type_id]
+        }
+        return ""
+    }
+
     func type_ref_kind(self, anon r: int64) -> TypeKind {
         let idx = r / 4
         match r % 4 {
@@ -3560,8 +3702,17 @@ type Codegen = struct {
             return -1
         }
         if len(enum_name) > 0 {
-            let enum_idx = self.find_enum_idx(enum_name)
+            let enum_idx = self.pattern_named_enum(enum_name)
             if enum_idx < 0 {
+                let qualified = self.qualified_type_ref_of(enum_name)
+                if qualified == -1 or qualified == -2 {
+                    self.report_error(self.pattern_qual_error(enum_name), :span)
+                    return -1
+                }
+                if qualified >= 0 {
+                    self.report_error(f"error: unknown enum `{enum_name}`", :span)
+                    return -1
+                }
                 mut names: [str] = []
                 for e in self.enums {
                     if e.template_idx < 0 {
@@ -4077,7 +4228,20 @@ type Codegen = struct {
             return .KVoid
         }
         match self.p.type_exprs[type_id] {
-            .Named(name) -> return self.resolve_type_name(name)
+            .Named(name) -> {
+                // A local never hides the module of `m.T` here.
+                if type_id < len(self.p.type_quals) {
+                    let qual = self.p.type_quals[type_id]
+                    if len(qual) > 0 {
+                        let r = self.qualified_type_ref(qual, :name)
+                        if r < 0 {
+                            return .KUnknown
+                        }
+                        return self.type_ref_kind(r)
+                    }
+                }
+                return self.resolve_type_name(name)
+            }
             .Array(inner) -> return self.array_kind_of(self.resolve_type(inner))
             .Optional(inner) -> {
                 let inner_kind = self.resolve_type(inner)
@@ -4099,7 +4263,7 @@ type Codegen = struct {
                 // `Map$str$str`) so all downstream lookups read substituted
                 // types directly from the new entry.
                 // A wrong type-argument count is reported by check_type_expr.
-                let struct_idx = self.find_struct_idx(name)
+                let struct_idx = self.type_expr_idx(type_id, :name, what: 0)
                 if struct_idx >= 0 {
                     let param_count = len(self.structs[struct_idx].type_param_names)
                     if param_count == 0 {
@@ -4119,7 +4283,7 @@ type Codegen = struct {
                     let inst_idx = self.instantiate_struct(resolved, template_idx: struct_idx, arg_spans: self.type_arg_spans(args), whole: self.p.type_spans[type_id])
                     return .KStruct(idx: inst_idx, type_args: [])
                 }
-                let enum_idx = self.find_enum_idx(name)
+                let enum_idx = self.type_expr_idx(type_id, :name, what: 1)
                 if enum_idx >= 0 {
                     let param_count = len(self.enums[enum_idx].type_param_names)
                     if param_count == 0 {
@@ -4743,6 +4907,10 @@ type Codegen = struct {
         }
         match self.p.type_exprs[type_id] {
             .Named(name) -> {
+                let qual = self.type_qual(type_id)
+                if len(qual) > 0 {
+                    return self.qualified_type_ref(qual, :name) >= 0 and len(self.qualified_generic_error(qual, :name)) == 0
+                }
                 if self.type_name_known(name) {
                     return len(self.bare_generic_error(name)) == 0
                 }
@@ -4760,11 +4928,11 @@ type Codegen = struct {
             }
             .Generic(name, args) -> {
                 mut param_count = -1
-                let struct_idx = self.find_struct_idx(name)
+                let struct_idx = self.type_expr_idx(type_id, :name, what: 0)
                 if struct_idx >= 0 {
                     param_count = len(self.structs[struct_idx].type_param_names)
                 } else {
-                    let enum_idx = self.find_enum_idx(name)
+                    let enum_idx = self.type_expr_idx(type_id, :name, what: 1)
                     if enum_idx >= 0 {
                         param_count = len(self.enums[enum_idx].type_param_names)
                     }
@@ -5005,7 +5173,7 @@ type Codegen = struct {
                 }
             }
             .TypePat(type_name, _binding) -> {
-                let struct_idx = self.find_struct_idx(type_name)
+                let struct_idx = self.type_pat_struct(type_name)
                 if struct_idx >= 0 {
                     kind = .KStruct(idx: struct_idx, type_args: [])
                 } else {
@@ -5026,7 +5194,7 @@ type Codegen = struct {
 
     // A generic enum's pattern names the template; the subject's instance has the payload kinds.
     func named_pattern_enum_idx(self, anon enum_name: str, subject_kind: TypeKind) -> int64 {
-        let named = self.find_enum_idx(enum_name)
+        let named = self.pattern_named_enum(enum_name)
         let subj = self.enum_idx_of_kind(subject_kind)
         if named < 0 or subj < 0 {
             return -1
@@ -5912,8 +6080,10 @@ type Codegen = struct {
         let .Dot = inner_op else { return none }
         let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
         let .Ident(variant_name) = self.p.exprs[dot_rhs] else { return none }
-        let ei3 = self.find_enum_idx(enum_name)
-        if ei3 < 0 { return none }
+        let ei3 = self.three_part_enum(inner_lhs, :enum_name)
+        if ei3 < 0 {
+            return self.report_three_part(inner_lhs, :enum_name, span: self.p.expr_spans[inner_rhs])
+        }
         let vi3 = self.find_variant_idx(variant_name, enum_idx: ei3)
         if vi3 < 0 {
             if self.p.exprs[inner_lhs] is .Ident(mod_name) {
@@ -6239,13 +6409,58 @@ type Codegen = struct {
         return ""
     }
 
-    // `T`, `T(b)`, `alias.T` or `alias.T(b)`: the struct an interface downcast names.
+    // `T`, `T(b)`, `alias.T` or `alias.T(b)`: the struct an interface downcast
+    // names, as `T` or `alias.T` (see type_pat_struct).
     func downcast_name(self, anon expr_id: int64) -> str {
         let parts = self.qualified_parts(expr_id)
         if len(parts) == 2 and self.is_import_alias(parts[0]) {
-            return parts[1]
+            return f"{parts[0]}.{parts[1]}"
         }
         return self.is_pattern_name(expr_id)
+    }
+
+    // Why an `is` right-hand side `m.T`, `m.T(b)`, `m.E.V` or `m.E.V(b)` names
+    // no type: `m` is hidden by a local, imports no such type, or isn't an
+    // import and names no type the module sees. "" when it names one.
+    func is_rhs_qual_error(self, anon rhs: int64) -> str {
+        mut callee = rhs
+        if self.p.exprs[rhs] is .Call(call_callee, _args) {
+            callee = call_callee
+        }
+        let .Binary(lhs, op, name_id) = self.p.exprs[callee] else { return "" }
+        let .Dot = op else { return "" }
+        // `m.T` names the type `T`; `m.E.V` names the enum `E`.
+        mut qual_id = lhs
+        mut type_id = name_id
+        if self.p.exprs[lhs] is .Binary(inner_lhs, inner_op, inner_rhs) {
+            let .Dot = inner_op else { return "" }
+            qual_id = inner_lhs
+            type_id = inner_rhs
+        }
+        let .Ident(qualifier) = self.p.exprs[qual_id] else { return "" }
+        let .Ident(name) = self.p.exprs[type_id] else { return "" }
+        if self.var_bound(qualifier) {
+            return self.hidden_alias_msg(qualifier, type_name: name)
+        }
+        if self.is_import_alias(qualifier) {
+            if self.qualified_type_ref(qualifier, :name) >= 0 {
+                return ""
+            }
+            return self.qualified_type_error(qualifier, :name, call: false)
+        }
+        if self.type_name_known(qualifier) {
+            return ""
+        }
+        return self.qualified_type_error(qualifier, :name, call: false)
+    }
+
+    // qualified_type_ref of a pattern's `m.T`, or -3 for a bare name.
+    func qualified_type_ref_of(self, anon written: str) -> int64 {
+        let dot = name_dot(written)
+        if dot < 0 {
+            return -3
+        }
+        return self.qualified_type_ref(written[0..dot], name: written[dot + 1..])
     }
 
     // `X` and `T` of `X.T` or `X.T(...)`, else none.
@@ -6317,12 +6532,12 @@ type Codegen = struct {
         // (cell offset 8) against the (StructType, iface) vtable's address.
         if lhs_kind is .KInterface(iface_idx) {
             let type_name = self.downcast_name(rhs)
-            let struct_idx = self.find_struct_idx(type_name)
+            let struct_idx = self.type_pat_struct(type_name)
             if struct_idx < 0 {
                 mut msg = f"error: `is {type_name}` — `{type_name}` is not a struct type"
-                let parts = self.qualified_parts(rhs)
-                if len(parts) == 2 and len(self.hidden_alias_msg(parts[0], type_name: parts[1])) > 0 {
-                    msg = self.hidden_alias_msg(parts[0], type_name: parts[1])
+                let qual_msg = self.is_rhs_qual_error(rhs)
+                if len(qual_msg) > 0 {
+                    msg = qual_msg
                 }
                 self.report_error(msg, span: self.p.expr_spans[rhs])
                 return .VImm(value: 0)
@@ -6366,8 +6581,11 @@ type Codegen = struct {
             let variant_idx = self.ctor_variant_idx(rhs, :enum_idx)
             if variant_idx < 0 {
                 self.compile_discard(lhs)
+                let qual_msg = self.is_rhs_qual_error(rhs)
                 let name = self.is_pattern_name(rhs)
-                if len(name) > 0 {
+                if len(qual_msg) > 0 {
+                    self.report_error(qual_msg, span: self.p.expr_spans[rhs])
+                } else if len(name) > 0 {
                     self.check_variant(name, :enum_idx, span: self.p.expr_spans[rhs])
                 } else {
                     self.report_error(f"error: `is` on a `{self.enum_display_name(enum_idx)}` value takes one of its variants", span: self.p.expr_spans[rhs])
@@ -6816,9 +7034,13 @@ type Codegen = struct {
     // skip_lbl on mismatch. On match, bind the concrete pointer (offset 0)
     // — typed `KStruct` — into `binding`'s slot.
     func emit_typepat_test(self, type_name: str, binding: str, subject_id: int64, subj_slot: int64, skip_lbl: str) -> none {
-        let struct_idx = self.find_struct_idx(type_name)
+        let struct_idx = self.type_pat_struct(type_name)
         if struct_idx < 0 {
-            self.report_error(f"error: `{type_name}` is not a struct type", span: self.p.expr_spans[subject_id])
+            mut msg = f"error: `{type_name}` is not a struct type"
+            if self.qualified_type_ref_of(type_name) == -1 {
+                msg = self.pattern_qual_error(type_name)
+            }
+            self.report_error(msg, span: self.p.expr_spans[subject_id])
             return none
         }
         if len(self.structs[struct_idx].type_param_names) > 0 {
@@ -7335,14 +7557,35 @@ type Codegen = struct {
             let .Dot = inner_op else { return none }
             let .Ident(mod_name) = self.p.exprs[inner_lhs] else { return none }
             let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
-            let named_enum = self.find_enum_idx(enum_name)
+            let named_enum = self.three_part_enum(inner_lhs, :enum_name)
             if named_enum < 0 or self.is_import_alias(mod_name) == false {
-                return none
+                return self.report_three_part(inner_lhs, :enum_name, span: self.p.expr_spans[inner_rhs])
             }
             self.check_variant(variant_name, enum_idx: named_enum, span: self.p.expr_spans[callee_rhs])
             return .VImm(value: 0)
         }
         return self.compile_enum_construct(args, :enum_idx, variant_idx: self.find_variant_idx(variant_name, :enum_idx), span: self.p.expr_spans[callee_rhs])
+    }
+
+    // The enum `m.E` of `m.E.V` names: one the module imported as `m` declares;
+    // for an `x.E.V` with no import `x`, an enum `E` the module sees.
+    func three_part_enum(self, anon inner_lhs: int64, enum_name: str) -> int64 {
+        if self.p.exprs[inner_lhs] is .Ident(mod_name) {
+            if self.is_import_alias(mod_name) {
+                return self.qualified_idx(mod_name, name: enum_name, what: 1)
+            }
+        }
+        return self.find_enum_idx(enum_name)
+    }
+
+    // `m.E.V` where the module imported as `m` declares no `E`: reported, else none.
+    func report_three_part(self, anon inner_lhs: int64, enum_name: str, span: ast.Span) -> Val? {
+        let .Ident(mod_name) = self.p.exprs[inner_lhs] else { return none }
+        if self.is_import_alias(mod_name) == false or self.qualified_type_ref(mod_name, name: enum_name) != -1 {
+            return none
+        }
+        self.report_error(self.qualified_type_error(mod_name, name: enum_name, call: false), :span)
+        return .VImm(value: 0)
     }
 
     // The enum that a `mod.Enum.Variant(...)` callee constructs, or -1.
@@ -7351,7 +7594,7 @@ type Codegen = struct {
         let .Dot = inner_op else { return -1 }
         let .Ident(_mod_name) = self.p.exprs[inner_lhs] else { return -1 }
         let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return -1 }
-        let enum_idx = self.find_enum_idx(enum_name)
+        let enum_idx = self.three_part_enum(inner_lhs, :enum_name)
         if enum_idx < 0 or self.find_variant_idx(variant_name, :enum_idx) < 0 {
             return -1
         }
@@ -7462,9 +7705,9 @@ type Codegen = struct {
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Dot -> {
-                        if self.p.exprs[lhs] is .Ident(_mod) {
+                        if self.p.exprs[lhs] is .Ident(mod_name) {
                             if self.p.exprs[rhs] is .Ident(name) {
-                                return self.type_arg_name_kind(name, span: self.p.expr_spans[rhs], :report)
+                                return self.qualified_type_arg_kind(mod_name, :name, span: self.p.expr_spans[rhs], :report)
                             }
                         }
                     }
@@ -7497,6 +7740,24 @@ type Codegen = struct {
             self.report_error("error: unsupported type argument", span: self.p.expr_spans[expr_id])
         }
         return none
+    }
+
+    // `m.T` as a type argument: a type m declares, in a type position, so a local never hides m.
+    func qualified_type_arg_kind(self, anon alias: str, name: str, span: ast.Span, report: bool) -> TypeKind? {
+        let r = self.qualified_type_ref(alias, :name)
+        mut msg = ""
+        if r < 0 {
+            msg = self.qualified_type_error(alias, :name, call: false)
+        } else {
+            msg = self.qualified_generic_error(alias, :name)
+        }
+        if len(msg) > 0 {
+            if report {
+                self.report_error(msg, :span)
+            }
+            return none
+        }
+        return self.type_ref_kind(r)
     }
 
     // none for a non-type or a generic missing its type arguments.
@@ -7589,6 +7850,25 @@ type Codegen = struct {
                 params = self.structs[struct_idx].type_param_names
             }
         }
+        return self.needs_type_args_msg(name, :params, :what)
+    }
+
+    // "" unless `alias.name` is a generic struct or enum missing its type arguments.
+    func qualified_generic_error(self, anon alias: str, name: str) -> str {
+        let r = self.qualified_type_ref(alias, :name)
+        if r < 0 {
+            return ""
+        }
+        if r % 4 == 0 {
+            return self.needs_type_args_msg(f"{alias}.{name}", params: self.structs[r / 4].type_param_names, what: "struct")
+        }
+        if r % 4 == 1 {
+            return self.needs_type_args_msg(f"{alias}.{name}", params: self.enums[r / 4].type_param_names, what: "enum")
+        }
+        return ""
+    }
+
+    func needs_type_args_msg(self, anon shown: str, params: [str], what: str) -> str {
         if len(params) == 0 {
             return ""
         }
@@ -7599,7 +7879,7 @@ type Codegen = struct {
             }
             spelled = spelled + param
         }
-        return f"error: generic {what} `{name}` needs type arguments: write `{name}[{spelled}]`"
+        return f"error: generic {what} `{shown}` needs type arguments: write `{shown}[{spelled}]`"
     }
 
     // Only the module being compiled is checked, unless report_dep_errors checks another.
@@ -7608,10 +7888,17 @@ type Codegen = struct {
             return
         }
         let span = self.p.type_spans[type_id]
+        let qual = self.type_qual(type_id)
         match self.p.type_exprs[type_id] {
             .Named(name) -> {
                 mut msg = ""
-                if self.type_name_known(name) {
+                if len(qual) > 0 {
+                    if self.qualified_type_ref(qual, :name) < 0 {
+                        msg = self.qualified_type_error(qual, :name, call: false)
+                    } else {
+                        msg = self.qualified_generic_error(qual, :name)
+                    }
+                } else if self.type_name_known(name) {
                     msg = self.bare_generic_error(name)
                 } else {
                     if self.is_unresolved_alias(name) == false {
@@ -7636,13 +7923,23 @@ type Codegen = struct {
             }
             .Generic(name, args) -> {
                 mut msg = ""
-                let struct_idx = self.find_struct_idx(name)
-                let enum_idx = self.find_enum_idx(name)
+                mut shown = name
+                if len(qual) > 0 {
+                    shown = f"{qual}.{name}"
+                }
+                let struct_idx = self.type_expr_idx(type_id, :name, what: 0)
+                let enum_idx = self.type_expr_idx(type_id, :name, what: 1)
                 if struct_idx >= 0 {
-                    msg = self.type_arity_error(name, param_count: len(self.structs[struct_idx].type_param_names), got: len(args))
+                    msg = self.type_arity_error(shown, param_count: len(self.structs[struct_idx].type_param_names), got: len(args))
                 } else {
                     if enum_idx >= 0 {
-                        msg = self.type_arity_error(name, param_count: len(self.enums[enum_idx].type_param_names), got: len(args))
+                        msg = self.type_arity_error(shown, param_count: len(self.enums[enum_idx].type_param_names), got: len(args))
+                    } else if len(qual) > 0 {
+                        if self.qualified_type_ref(qual, :name) >= 0 {
+                            msg = self.type_arity_error(shown, param_count: 0, got: len(args))
+                        } else {
+                            msg = self.qualified_type_error(qual, :name, call: false)
+                        }
                     } else {
                         if self.type_name_known(name) {
                             msg = self.type_arity_error(name, param_count: 0, got: len(args))
@@ -7933,8 +8230,13 @@ type Codegen = struct {
         if type_id == 0 {
             return names
         }
+        let qualified = len(self.type_qual(type_id)) > 0
         match self.p.type_exprs[type_id] {
-            .Named(name) -> names += [name]
+            .Named(name) -> {
+                if qualified == false {
+                    names += [name]
+                }
+            }
             .Array(inner) -> names = self.type_expr_names(inner)
             .Optional(inner) -> names = self.type_expr_names(inner)
             .Func(params, return_typ) -> {
@@ -7944,7 +8246,9 @@ type Codegen = struct {
                 names += self.type_expr_names(return_typ)
             }
             .Generic(name, args) -> {
-                names += [name]
+                if qualified == false {
+                    names += [name]
+                }
                 for arg in args {
                     names += self.type_expr_names(arg)
                 }
@@ -7967,12 +8271,17 @@ type Codegen = struct {
             return .VImm(value: 0)
         }
         if self.is_import_alias(mod_or_obj) {
-            let s_idx = self.find_struct_idx(method_name)
+            let s_idx = self.qualified_idx(mod_or_obj, name: method_name, what: 0)
             if s_idx >= 0 {
                 return self.compile_struct_construct(args, struct_idx: s_idx, span: self.p.expr_spans[callee_lhs])
             }
             let fn_idx = self.lookup_import_fn(mod_or_obj, method_name)
             if fn_idx == -1 {
+                // A capitalized name reads as a constructor.
+                if method_name[0] >= 'A' and method_name[0] <= 'Z' and self.qualified_type_ref(mod_or_obj, name: method_name) < 0 {
+                    self.report_error(self.qualified_type_error(mod_or_obj, name: method_name, call: true), span: self.p.expr_spans[callee_rhs])
+                    return .VImm(value: 0)
+                }
                 self.report_error(self.with_suggestion(f"error: module `{mod_or_obj}` has no function `{method_name}`", typo: method_name, candidates: self.import_fn_names(mod_or_obj)), span: self.p.expr_spans[callee_rhs])
                 return .VImm(value: 0)
             }
@@ -8960,7 +9269,7 @@ type Codegen = struct {
         }
         if self.p.exprs[callee_lhs] is .Ident(maybe_mod) {
             if self.is_import_alias(maybe_mod) {
-                let struct_idx = self.find_struct_idx(method_name)
+                let struct_idx = self.qualified_idx(maybe_mod, name: method_name, what: 0)
                 if struct_idx >= 0 {
                     return .KStruct(idx: struct_idx, type_args: [])
                 }
@@ -9011,7 +9320,7 @@ type Codegen = struct {
         let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[dot_lhs] else { return none }
         let .Dot = inner_op else { return none }
         let .Ident(enum_name) = self.p.exprs[inner_rhs] else { return none }
-        let enum_idx = self.find_enum_idx(enum_name)
+        let enum_idx = self.three_part_enum(inner_lhs, :enum_name)
         if enum_idx < 0 { return none }
         return self.ctor_kind(enum_idx)
     }
@@ -10175,7 +10484,7 @@ type Codegen = struct {
                     if self.p.exprs[lhs] is .Ident(mod_name) {
                         if self.is_import_alias(mod_name) {
                             if self.p.exprs[rhs] is .Ident(name) {
-                                return self.find_enum_idx(name)
+                                return self.qualified_idx(mod_name, :name, what: 1)
                             }
                         }
                     }
@@ -11558,7 +11867,8 @@ type Codegen = struct {
         if len(bindings) == 1 {
             binding = bindings[0]
         }
-        return .TypePat(:type_name, :binding)
+        // A built pattern has no id, so the module rides in the name (see type_pat_struct).
+        return .TypePat(type_name: f"{alias}.{type_name}", :binding)
     }
 
     // Refutable `let .Pat(...) = expr else { ... }`. On a successful pattern
@@ -12429,6 +12739,18 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+// Where a pattern's `m.T` splits, or -1 for a bare name.
+func name_dot(anon name: str) -> int64 {
+    mut i = 0
+    for i < len(name) {
+        if name[i] == '.' {
+            return i
+        }
+        i += 1
+    }
+    return -1
 }
 
 // What `kod test <dir>` gathers into one program.
