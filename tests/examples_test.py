@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Generator
@@ -324,6 +325,29 @@ def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
     assert hints == str(n), result.stderr
     rss = int(maxrss) if sys.platform == "darwin" else int(maxrss) * 1024
     assert rss < 300 * 2**20, f"{rss // 2**20} MB"
+
+
+def test_many_errors_take_linear_time(sh_kodc, tmp_path):
+    """8000 errors in one file are reported in about linear time."""
+    lines = ["func note(anon msg: str) -> none {", "    print(msg)", "}"]
+    n = 8000
+    for i in range(n):
+        lines += [f"func f{i}(anon k: int64) -> int64 {{", "    if k > 0 {"]
+        lines += ["        return k", "    }", '    return note("x")', "}"]
+    lines += ["func main() -> int64 {", "    return 0", "}"]
+    src = tmp_path / "many_errors.kod"
+    src.write_text("\n".join(lines) + "\n")
+    start = time.monotonic()
+    result = subprocess.run(
+        [str(sh_kodc), str(src)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    elapsed = time.monotonic() - start
+    assert result.stderr.count("error: expected `int64`, got `none`") == n
+    assert elapsed < 4, f"{elapsed:.1f} s"
 
 
 def test_interpreter_reads_a_plus_chain_once(monkeypatch):
