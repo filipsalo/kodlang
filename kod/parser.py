@@ -63,6 +63,8 @@ class Parser:
         self.program = program
         self.resolve_import = resolve_import  # Callable[[str] -> ast.Module] | None
         self.import_aliases: dict[str, str] = {}  # local_name -> module_name
+        # Each name an import lists (`import "./pa" { Pt }`) -> its module_name.
+        self.import_items: dict[str, str] = {}
         # (declaration, target) of aliases whose target is declared later.
         self.pending_aliases: list = []
         self.pending_alias_names: set[str] = set()
@@ -104,11 +106,28 @@ class Parser:
         return token
 
     def lookup_type(self, name: str):
-        """Look up a type by name in the local registry, then builtins."""
+        """Look up a type by name in the local registry, the import lists, then builtins."""
         if name in self.type_registry:
             return self.type_registry[name]
+        if name in self.import_items:
+            item = self._item_type(name)
+            if item is not None:
+                return item
         if self.program is not None and hasattr(self.program, "builtins"):
             return self.program.builtins.names.get(name)
+        return None
+
+    def _item_type(self, name: str):
+        """The type `name` names in the module whose import lists it, or None."""
+        if self.program is None:
+            return None
+        import_file = self.program.resolve_import(
+            self.import_items[name], relative_to=self.file.path
+        )
+        mod = self.program.modules.get(import_file.canonical_path.with_suffix(""))
+        value = mod.names.get(name) if mod is not None else None
+        if isinstance(value, (type, types.GenericTemplate)):
+            return value
         return None
 
     def parse_type(self, name=None) -> type[types.Type]:
@@ -307,6 +326,8 @@ class Parser:
             case Import():
                 stmt = ast.Import.parse(self)
                 self.import_aliases[stmt.local_name] = stmt.module_name
+                for item in stmt.items:
+                    self.import_items.setdefault(item, stmt.module_name)
                 if self.resolve_import:
                     self.resolve_import(stmt.module_name)
             case Return():
