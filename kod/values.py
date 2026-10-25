@@ -356,20 +356,24 @@ class OptionalType(Type):
     """Base class for optional types (T?)."""
 
     inner_type: "type[Type]"
+    # One class per inner type, so `T?` written twice is one type, as `[T]` is.
+    _cache: dict[Any, Any] = {}
 
     @classmethod
     def make(cls, inner: "type[Type]") -> "type[OptionalType]":
         """Create an optional type wrapping inner. None = null pointer, Some(v) = heap pointer."""
-        return type(
-            f"{inner.name}Optional",
-            (cls,),
-            {
-                "name": f"{inner.name}?",
-                "inner_type": inner,
-                "width": 8,
-                "data_width": 8,  # heap slot for Some payload
-            },
-        )
+        if inner not in cls._cache:
+            cls._cache[inner] = type(
+                f"{inner.name}Optional",
+                (cls,),
+                {
+                    "name": f"{inner.name}?",
+                    "inner_type": inner,
+                    "width": 8,
+                    "data_width": 8,  # heap slot for Some payload
+                },
+            )
+        return cls._cache[inner]
 
     def op_eq(self, other) -> "Bool":
         if isinstance(other, NoneType):
@@ -466,21 +470,26 @@ class FunctionType(Type):
     width = 8
     param_types: tuple = ()
     return_type: "type[Type] | None" = None
+    # One class per signature (see OptionalType._cache).
+    _cache: dict[Any, Any] = {}
 
     @classmethod
     def make(cls, params: tuple, return_type) -> "type[FunctionType]":
-        param_names = ", ".join(getattr(p, "name", repr(p)) for p in params)
-        ret_name = getattr(return_type, "name", repr(return_type))
-        return type(
-            f"FunctionType_{ret_name}",
-            (cls,),
-            {
-                "name": f"func({param_names}) -> {ret_name}",
-                "param_types": params,
-                "return_type": return_type,
-                "width": 8,
-            },
-        )
+        key = (params, return_type)
+        if key not in cls._cache:
+            param_names = ", ".join(getattr(p, "name", repr(p)) for p in params)
+            ret_name = getattr(return_type, "name", repr(return_type))
+            cls._cache[key] = type(
+                f"FunctionType_{ret_name}",
+                (cls,),
+                {
+                    "name": f"func({param_names}) -> {ret_name}",
+                    "param_types": params,
+                    "return_type": return_type,
+                    "width": 8,
+                },
+            )
+        return cls._cache[key]
 
 
 class TypeParam(Type):

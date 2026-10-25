@@ -63,8 +63,14 @@ def _downcast_pattern(pattern, value):
         raise KodError(error or _many_bindings(pattern), pattern.span)
     if len(pattern.bindings) > 1:
         return pattern
-    binding = pattern.bindings[0] if pattern.bindings else ""
-    return ast.TypePattern(pattern.variant_name, binding, pattern.span)
+    downcast = pattern.__dict__.get("_kod_downcast")
+    if downcast is None:
+        binding = pattern.bindings[0] if pattern.bindings else ""
+        downcast = ast.TypePattern(pattern.variant_name, binding, pattern.span)
+        # The struct is `alias.T`: one the module imported as `alias` declares.
+        downcast.__dict__["_kod_alias"] = pattern.enum_name
+        pattern.__dict__["_kod_downcast"] = downcast
+    return downcast
 
 
 def _downcast_error(qualifier, type_name, kind):
@@ -102,6 +108,28 @@ def _note_qualifier(pattern, bound, scope):
         kind = "local" if name in bound else ""
     if kind or len(pattern.bindings) > 1:
         pattern.__dict__["_kod_qualifier"] = kind
+
+
+# A cache entry not filled yet: None is a cached miss.
+_UNSET = object()
+
+
+def _is_rhs_alias(rhs):
+    """`alias` of an `is` right-hand side `alias.T` or `alias.T(b)`, else None."""
+    callee = rhs.callee if isinstance(rhs, ast.FunctionCall) else rhs
+    if isinstance(callee, ast.BinaryOperator) and isinstance(callee.op, tokens.Dot):
+        return callee.lhs.id
+    return None
+
+
+def _generic_downcast_error(template, name, alias=None):
+    """Why `is T` can't name the generic type `T`, spelled as written (`alias.T`)."""
+    shown = name if alias is None else f"{alias}.{name}"
+    args = ", ".join("int64" for _ in template.param_names)
+    return (
+        f"`{shown}` is generic; downcast to one of its instances through a type"
+        f" alias such as `type Int{name} = {shown}[{args}]`"
+    )
 
 
 def _value_pattern(pattern, value):
@@ -848,7 +876,12 @@ class Interpreter:
                 ):
                     if isinstance(lhs_val, types.NoneType):
                         return types.Bool(negate)
-                    matches = type(lhs_val).__name__ == name
+                    cls = rhs.__dict__.get("_kod_type", _UNSET)
+                    alias = _is_rhs_alias(rhs)
+                    if cls is _UNSET:
+                        cls = self._downcast_type(module, name, alias)
+                        rhs.__dict__["_kod_type"] = cls
+                    matches = self._holds_type(lhs_val, cls, name, rhs.span, alias)
                     return types.Bool(matches != negate)
                 is_none = isinstance(lhs_val, types.NoneType)
                 if isinstance(rhs, ast.NoneLiteral) or name == "None":
@@ -1095,7 +1128,7 @@ class Interpreter:
             case ast.MatchExpression(subject, arms):
                 value = self.evaluate_expression(module, subject)
                 return self.evaluate_expression(
-                    module, self._match_arm_body(value, arms)
+                    module, self._match_arm_body(module, value, arms)
                 )
             case ast.FunctionDeclaration():
                 # Function-as-value: `let f = foo` binds the function
@@ -1182,7 +1215,7 @@ class Interpreter:
         if type(slot) is _OkSlot and target is not None:
             if isinstance(target, ast.MatchExpression):
                 value = self.evaluate_expression(module, target.expression)
-                body = self._match_arm_body(value, target.arms)
+                body = self._match_arm_body(module, value, target.arms)
                 return self._evaluate_for(module, body, slot)
             name, args = _implicit_variant(target)
             if _fits_result(name, args):
@@ -1212,7 +1245,7 @@ class Interpreter:
         if isinstance(expr, ast.MatchExpression):
             value = self.evaluate_expression(module, expr.expression)
             return self._evaluate_for(
-                module, self._match_arm_body(value, expr.arms), slot
+                module, self._match_arm_body(module, value, expr.arms), slot
             )
         return self.evaluate_expression(module, expr)
 
@@ -1372,7 +1405,7 @@ class Interpreter:
         """The arm body a `match` reaches, through nested ones, with its bindings set."""
         while type(expr) is ast.MatchExpression:
             value = self.evaluate_expression(module, expr.expression)
-            expr = self._match_arm_body(value, expr.arms)
+            expr = self._match_arm_body(module, value, expr.arms)
         return expr
 
     def _value_slot(self, value):
@@ -1574,7 +1607,38 @@ class Interpreter:
             return named if isinstance(named, type) else None
         return self._variant_slot(named)
 
-    def _match_arm_body(self, value, arms):
+    def _downcast_type(self, module, name, alias=None):
+        """What `name`, or `alias.name`, names where `module` writes it, else None."""
+        if alias is not None:
+            imp = self._alias_import(module, alias)
+            if imp is None:
+                return None
+            return self._resolve_import(module, imp).names.get(name)
+        value = module.names.get(name)
+        if value is None:
+            value = self._item(module, name)
+        if value is None:
+            value = self.program.builtins.names.get(name)
+        return value
+
+    def _holds_type(self, value, cls, name, span, alias=None):
+        """Whether `value` has exactly the struct or generic instance `cls`."""
+        if isinstance(cls, types.GenericTemplate):
+            raise KodError(_generic_downcast_error(cls, name, alias), span)
+        if isinstance(cls, type) and hasattr(cls, "struct_fields"):
+            return type(value) is cls
+        return type(value).__name__ == name
+
+    def _is_type(self, module, value, pattern):
+        """Whether `value` matches the type pattern `pattern` written in `module`."""
+        cls = pattern.__dict__.get("_kod_type", _UNSET)
+        alias = pattern.__dict__.get("_kod_alias")
+        if cls is _UNSET:
+            cls = self._downcast_type(module, pattern.type_name, alias)
+            pattern.__dict__["_kod_type"] = cls
+        return self._holds_type(value, cls, pattern.type_name, pattern.span, alias)
+
+    def _match_arm_body(self, module, value, arms):
         """The body of the arm that `value` matches, its bindings set."""
         for arm in arms:
             arm = _value_arm(arm, value)
@@ -1605,7 +1669,7 @@ class Interpreter:
                         self.stack[-1][arm.pattern.binding] = value.payload
                     return arm.body
             elif isinstance(arm.pattern, ast.TypePattern):
-                if type(value).__name__ == arm.pattern.type_name:
+                if self._is_type(module, value, arm.pattern):
                     if arm.pattern.binding:
                         self.stack[-1][arm.pattern.binding] = value
                     return arm.body
@@ -1852,7 +1916,7 @@ class Interpreter:
                                 self.execute_statement(module, stmt)
                             break
                     elif isinstance(arm.pattern, ast.TypePattern):
-                        if type(value).__name__ == arm.pattern.type_name:
+                        if self._is_type(module, value, arm.pattern):
                             if arm.pattern.binding:
                                 self.stack[-1][arm.pattern.binding] = value
                             for stmt in arm.body:
