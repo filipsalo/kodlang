@@ -127,6 +127,9 @@ type EnumInfo = struct {
     template_idx: int64
     // Concrete type arguments used to monomorphise this enum.
     template_args: [TypeKind]
+    // Which declaration this is: its file and name, or for an instance its
+    // template's key and its arguments' keys.
+    key: str = ""
 }
 
 type FieldInfo = struct {
@@ -181,6 +184,8 @@ type StructInfo = struct {
     // original location).
     def_path: str
     def_span: ast.Span
+    // See EnumInfo.key.
+    key: str = ""
 }
 
 // Interface metadata. Interface values are an 8-byte pointer to an arena
@@ -194,6 +199,8 @@ type IfaceInfo = struct {
     // Let resolve_method_sigs redo the sigs once every type is registered.
     src_p: parsing.Parser
     method_decl_ids: [int64]
+    // See EnumInfo.key.
+    key: str = ""
 }
 
 // One method on a primitive type (int64.to_str, str.hash, etc.).
@@ -567,6 +574,9 @@ type Codegen = struct {
     // The type scope of the module self.p belongs to, found again when that changes.
     cur_types_path: str = ""
     cur_types: int64 = -1
+    // Generic instances by key (see EnumInfo.key).
+    struct_insts: FuncIdx = FuncIdx()
+    enum_insts: FuncIdx = FuncIdx()
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -1096,7 +1106,7 @@ type Codegen = struct {
         if self.has_bad_key(self.structs[inst_idx]) == false {
             return
         }
-        let name = self.canonical_kind_name(self.structs[inst_idx].template_args[0])
+        let name = self.type_key(self.structs[inst_idx].template_args[0])
         if regalloc.str_in(self.bad_hash_keys, p: name) {
             return
         }
@@ -1158,7 +1168,7 @@ type Codegen = struct {
     }
 
     func kind_holds(self, anon kind: TypeKind, key: TypeKind) -> bool {
-        if self.canonical_kind_name(kind) == self.canonical_kind_name(key) {
+        if self.type_key(kind) == self.type_key(key) {
             return true
         }
         match kind {
@@ -2715,6 +2725,18 @@ type Codegen = struct {
         }
     }
 
+    // The struct (what 0), enum (1) or interface (2) `name` the module at `path` declares, or -1.
+    func declared_type_idx(self, anon name: str, path: str, what: int64) -> int64 {
+        if self.type_scope_idx.get(path) is Some(ti) {
+            if self.type_scopes[ti].own.get(name) is Some(r) {
+                if r % 4 == what {
+                    return r / 4
+                }
+            }
+        }
+        return -1
+    }
+
     // `name` is a type the module at `path` declares, or one of its own aliases.
     func declare_type(self, anon name: str, path: str, ref: int64) -> none {
         let own = self.type_scopes[self.type_scope_of(path)].own
@@ -3881,6 +3903,45 @@ type Codegen = struct {
         }
     }
 
+    // A kind's identity: canonical_kind_name with each declared type named by its key.
+    func type_key(self, anon kind: TypeKind) -> str {
+        match kind {
+            .KArrayStruct(elem_idx) -> return f"arrstruct${self.structs[elem_idx].key}"
+            .KArrayEnum(elem_idx) -> return f"arrenum${self.enums[elem_idx].key}"
+            .KArrayInterface(elem_idx) -> return f"arriface${self.interfaces[elem_idx].key}"
+            .KArrayOptional(inner_kind) -> return f"arropt${self.type_key(inner_kind)}"
+            .KEnum(idx) -> return self.enums[idx].key
+            .KInterface(idx) -> return self.interfaces[idx].key
+            .KOptional(inner) -> return f"opt${self.type_key(inner)}"
+            .KStruct(idx, type_args) -> {
+                mut key = self.structs[idx].key
+                for ta in type_args {
+                    key = f"{key}${self.type_key(ta)}"
+                }
+                return key
+            }
+            .KFunc(param_kinds, return_kind) -> {
+                mut key: str = "func"
+                for pk in param_kinds {
+                    key = f"{key}${self.type_key(pk)}"
+                }
+                return f"{key}$ret${self.type_key(return_kind)}"
+            }
+            .KArrayFunc(param_kinds, return_kind) -> return f"arr${self.type_key(.KFunc(:param_kinds, :return_kind))}"
+            .KArrayArray(inner) -> return f"arrarr${self.type_key(inner)}"
+            else return self.canonical_kind_name(kind)
+        }
+    }
+
+    // A template's key and its type arguments' keys.
+    func instance_key(self, anon template_key: str, args: [TypeKind]) -> str {
+        mut key = template_key
+        for a in args {
+            key = f"{key}${self.type_key(a)}"
+        }
+        return key
+    }
+
     // Return the struct_idx for a concrete instantiation of `template_idx`
     // with `type_args`, creating a new monomorphised struct entry if it
     // doesn't already exist. The new entry shares the template's method
@@ -3892,19 +3953,25 @@ type Codegen = struct {
             }
         }
         let template = self.structs[template_idx]
+        let key = self.instance_key(template.key, args: type_args)
+        if self.struct_insts.get(key) is Some(existing) {
+            return existing
+        }
         mut canonical = template.name
         for ta in type_args {
             canonical = f"{canonical}${self.canonical_kind_name(ta)}"
         }
-        let existing = self.find_struct_idx(canonical)
-        if existing >= 0 {
-            return existing
+        // Another instance has that label: two modules declare types of one name.
+        if self.struct_idx.contains(canonical) {
+            canonical = self.decl_instance_label(f"{template.module_prefix}${template.name}", args: type_args)
         }
         let empty_params: [str] = []
         // Registered before its fields and sigs resolve, so a self-reference finds it.
-        self.structs += [StructInfo(name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0))]
+        self.structs += [StructInfo(name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key)]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
+        let insts = self.struct_insts
+        insts.set(key, new_idx)
         self.note_bad_key(new_idx)
         let saved_names = self.subst_names
         let saved_args = self.subst_args
@@ -4089,18 +4156,23 @@ type Codegen = struct {
             }
         }
         let template = self.enums[template_idx]
+        let key = self.instance_key(template.key, args: type_args)
+        if self.enum_insts.get(key) is Some(existing) {
+            return existing
+        }
         mut canonical = template.name
         for ta in type_args {
             canonical = f"{canonical}${self.canonical_kind_name(ta)}"
         }
-        let existing = self.find_enum_idx(canonical)
-        if existing >= 0 {
-            return existing
+        if self.enum_idx.contains(canonical) {
+            canonical = self.decl_instance_label(f"{template.module_prefix}${template.name}", args: type_args)
         }
         let empty_params: [str] = []
-        self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args)]
+        self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args, :key)]
         let new_idx: int64 = len(self.enums) - 1
         self.enum_idx.set(canonical, new_idx)
+        let insts = self.enum_insts
+        insts.set(key, new_idx)
         let saved_names = self.subst_names
         let saved_args = self.subst_args
         let saved_p = self.p
@@ -4248,7 +4320,7 @@ type Codegen = struct {
     }
 
     // Running off the end returns 0, which is only right as an optional's `none`.
-    func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str) -> none {
+    func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str, owner: int64) -> none {
         let kind = self.return_kind
         if self.is_void_kind(kind) or self.kind_has_unknown(kind) or self.walk_completes(func_decl.body) == false {
             return
@@ -4258,12 +4330,11 @@ type Codegen = struct {
         }
         mut name = f"`{func_decl.name}`"
         if len(struct_name) > 0 {
-            mut owner = struct_name
-            let idx = self.find_struct_idx(struct_name)
-            if idx >= 0 and self.structs[idx].template_idx >= 0 {
-                owner = self.structs[self.structs[idx].template_idx].name
+            mut shown = struct_name
+            if owner >= 0 and self.structs[owner].template_idx >= 0 {
+                shown = self.structs[self.structs[owner].template_idx].name
             }
-            name = f"`{owner}.{func_decl.name}`"
+            name = f"`{shown}.{func_decl.name}`"
         } else if func_decl.name.contains("__lambda_") {
             name = "this function literal"
         }
@@ -4471,7 +4542,7 @@ type Codegen = struct {
                 self.subst_args = saved_args
                 let data_width = 8 + max_payload
                 let no_template_args: [TypeKind] = []
-                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args)]
+                self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args, key: f"{p.path}:{name}")]
                 self.enum_idx.set(name, len(self.enums) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.enums) - 1) * 4 + 1)
                 self.drop_alias(name)
@@ -4528,7 +4599,7 @@ type Codegen = struct {
                 self.subst_names = saved_names
                 self.subst_args = saved_args
                 let no_template_args: [TypeKind] = []
-                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span)]
+                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span, key: f"{p.path}:{name}")]
                 self.struct_idx.set(name, len(self.structs) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.structs) - 1) * 4)
                 self.drop_alias(name)
@@ -4558,7 +4629,7 @@ type Codegen = struct {
                     // second pass once all types are registered.
                     method_infos += [MethodInfo(name: func_decl.name, decl_id: -1, sig: empty_sig)]
                 }
-                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span, src_p: p, method_decl_ids: methods)]
+                self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span, src_p: p, method_decl_ids: methods, key: f"{p.path}:{name}")]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.interfaces) - 1) * 4 + 2)
                 self.drop_alias(name)
@@ -4573,7 +4644,7 @@ type Codegen = struct {
     func resolve_interface_methods(self, anon decl: ast.Decl, p: parsing.Parser) -> none {
         match decl {
             .Interface(name, name_span, methods) -> {
-                let iface_idx = self.find_iface_idx(name)
+                let iface_idx = self.declared_type_idx(name, path: p.path, what: 2)
                 if iface_idx >= 0 {
                     mut new_methods: [MethodInfo] = []
                     for method_id in methods {
@@ -4612,7 +4683,7 @@ type Codegen = struct {
             for i < len(names) {
                 if done[i] == false and self.type_resolvable(targets[i]) {
                     let kind = self.register_type_alias(names[i], target: targets[i])
-                    self.note_type_decl(names[i], :p, span: spans[i], alias_of: self.canonical_kind_name(kind))
+                    self.note_type_decl(names[i], :p, span: spans[i], alias_of: self.type_key(kind))
                     done[i] = true
                     progress = true
                 }
@@ -7555,7 +7626,7 @@ type Codegen = struct {
             .Optional(inner) -> self.check_type_expr(inner)
             .Func(params, return_typ) -> {
                 if len(params) > 8 and self.checking_dep == false {
-                    self.limit_kinds += [self.canonical_kind_name(self.resolve_type(type_id))]
+                    self.limit_kinds += [self.type_key(self.resolve_type(type_id))]
                     self.report_error(f"error: this function type takes {len(params)} parameters, but a function can take at most 8", :span)
                 }
                 for param in params {
@@ -8023,7 +8094,7 @@ type Codegen = struct {
                     self.limit_call_msgs += [f"error: {self.callee_desc(callee_id)} takes {len(args)} parameters, but a function can take at most 8"]
                     self.limit_call_spans += [self.p.expr_spans[callee_id]]
                     self.limit_call_insts += [self.body_instance]
-                    self.limit_call_kinds += [self.canonical_kind_name(callee_kind)]
+                    self.limit_call_kinds += [self.type_key(callee_kind)]
                 }
                 return .VImm(value: 0)
             }
@@ -9447,7 +9518,7 @@ type Codegen = struct {
         if self.either_unknown(a, b) {
             return true
         }
-        return self.canonical_kind_name(a) == self.canonical_kind_name(b)
+        return self.type_key(a) == self.type_key(b)
     }
 
     // A bare `none` or `[]`, whose type comes only from where it goes.
@@ -9507,7 +9578,7 @@ type Codegen = struct {
 
     // Kinds without payloads compare by variant.
     func same_primitive(self, anon expected: TypeKind, actual: TypeKind) -> bool {
-        return self.canonical_kind_name(expected) == self.canonical_kind_name(actual)
+        return self.type_key(expected) == self.type_key(actual)
     }
 
     func array_elem_kind(self, anon kind: TypeKind) -> TypeKind {
@@ -11773,7 +11844,8 @@ type Codegen = struct {
     // `regalloc.pack` to collapse the chosen callee-saved set into a
     // dense `x19..` prefix.
 
-    func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str) -> none {
+    // `owner` is the struct whose method this is, or -1.
+    func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.check_param_order(func_decl, func_decl.name)
         // A generic template's methods are checked once, in check_module_types.
@@ -11787,7 +11859,7 @@ type Codegen = struct {
                     let slot = self.lookup_func(func_decl.name)
                     if slot != -1 {
                         let sig = self.fn_sig(slot)
-                        self.limit_kinds += [self.canonical_kind_name(.KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind))]
+                        self.limit_kinds += [self.type_key(.KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind))]
                     }
                 }
             }
@@ -11809,11 +11881,8 @@ type Codegen = struct {
             mut kind = self.resolve_type(param.typ)
             // The method receiver `self` has no type annotation; give it
             // the kind of the enclosing struct so field/method access works.
-            if param.name == "self" and len(struct_name) > 0 {
-                let struct_idx = self.find_struct_idx(struct_name)
-                if struct_idx >= 0 {
-                    kind = .KStruct(idx: struct_idx, type_args: [])
-                }
+            if param.name == "self" and owner >= 0 {
+                kind = .KStruct(idx: owner, type_args: [])
             }
             if param.default_expr != 0 {
                 self.check_default(param.default_expr, expected: kind)
@@ -11882,7 +11951,7 @@ type Codegen = struct {
         self.compile_block(func_decl.body)
         // An error in the body or a parse error may be what hides its `return`.
         if self.report_attempts == body_mark and len(self.p.errors) == 0 {
-            self.check_reaches_end(func_decl, :struct_name)
+            self.check_reaches_end(func_decl, :struct_name, :owner)
         }
         self.reads_scoped = false
 
@@ -12046,8 +12115,10 @@ type Codegen = struct {
                 .Struct(name, _name_span, struct_type_params, fields, methods) -> {
                     // A generic template's methods only compile per instance.
                     if len(struct_type_params) == 0 {
+                        // The later copy of a type an import cycle registers twice is this module's own.
+                        let owner = self.declared_type_idx(name, path: self.p.path, what: 0)
                         for method_id in methods {
-                            self.compile_func(fd_id: method_id, struct_name: name, override_lbl: "")
+                            self.compile_func(fd_id: method_id, struct_name: name, override_lbl: "", :owner)
                         }
                     }
                 }
@@ -12125,7 +12196,7 @@ type Codegen = struct {
                 self.subst_args = s.template_args
                 self.body_instance = cursor
                 for m in s.methods {
-                    self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "")
+                    self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "", owner: cursor)
                 }
                 self.body_instance = -1
                 self.p = saved_p
