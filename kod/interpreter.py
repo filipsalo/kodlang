@@ -86,6 +86,20 @@ def _value_pattern(pattern, value):
     return pattern
 
 
+def _param_type(expr, subst):
+    """The type a return type naming a type parameter has in an instance; else None."""
+    if ast.is_result_type_expr(expr):
+        return _param_type(expr.args[0], subst)
+    if isinstance(expr, ast.OptionalTypeExpr):
+        return _param_type(expr.inner, subst)
+    if isinstance(expr, ast.ArrayTypeExpr):
+        inner = _param_type(expr.element, subst)
+        return types.ArrayType.make(inner) if inner is not None else None
+    if isinstance(expr, ast.NamedTypeExpr):
+        return subst.get(expr.name)
+    return None
+
+
 def _slot_target(expr):
     """`expr` unwrapped if its `.Variant`s take their enum from its slot."""
     while True:
@@ -1251,11 +1265,25 @@ class Interpreter:
             except ValueError:
                 return None
         if t is ast.FunctionCall:
-            func = self._quiet_callee(module, expr.callee)
+            func, receiver = self._quiet_callee(module, expr.callee)
+            if isinstance(func, type) and issubclass(func, types.StructType):
+                return func
             if not isinstance(func, ast.FunctionDeclaration):
                 return None
+            subst = getattr(receiver, "type_subst", None)
+            if subst:
+                kind = _param_type(func.return_type, subst)
+                if kind is not None:
+                    return kind
             owner = getattr(func, "module", None) or module
             return self._type_of(owner, func.return_type, any_type=True)
+        if t is ast.MustExpression or t is ast.TryExpression:
+            return self._quiet_kind(module, expr.expression)
+        if t is ast.OptionalUnwrap:
+            kind = self._quiet_kind(module, expr.value)
+            if expr.default is not None and (kind is None or kind is types.none_value):
+                return self._quiet_kind(module, expr.default)
+            return kind
         if t is not ast.BinaryOperator:
             return None
         if type(expr.op) is tokens.Dot:
@@ -1282,20 +1310,24 @@ class Interpreter:
         return None
 
     def _quiet_callee(self, module, callee):
-        """What a call of `callee` calls, if found without side effects; else None."""
+        """What a call of `callee` calls and its receiver's type, found without side effects."""
         if type(callee) is ast.BinaryOperator and type(callee.op) is tokens.Dot:
             if not isinstance(callee.lhs, (ast.Name, ast.Variable)):
                 owner = self._quiet_kind(module, callee.lhs)
                 cls = owner if isinstance(owner, type) else type(owner)
                 methods = getattr(cls, "methods", None)
-                return methods.get(callee.rhs.id) if isinstance(methods, dict) else None
-        elif not isinstance(callee, (ast.Name, ast.Variable)):
-            return None
+                if not isinstance(methods, dict):
+                    return None, None
+                return methods.get(callee.rhs.id), cls
+        elif not isinstance(callee, (ast.Name, ast.Variable, ast.GenericInstantiation)):
+            return None, None
         try:
             func = self._call_target(module, callee)
         except (ValueError, KeyError, AttributeError):
-            return None
-        return func.func if isinstance(func, BoundMethod) else func
+            return None, None
+        if isinstance(func, BoundMethod):
+            return func.func, type(func.receiver)
+        return func, None
 
     def _chain_slot(self, module, lhs, rhs):
         """The array slot of a `+` chain's first operand that isn't a literal or `match`."""
