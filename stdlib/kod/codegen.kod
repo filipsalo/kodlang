@@ -508,15 +508,13 @@ type Codegen = struct {
     dependent_heads: FuncIdx = FuncIdx()
     dependent_keys: [str] = []
     dependent_next: [int64] = []
-    // Parameters of the function walked that no binding in its body reuses.
-    fixed_names: [str] = []
     // Alias name → the type the first module's alias of that name stands for.
     alias_shapes: StrMap = StrMap()
     // Type names two modules declare, already reported.
     clashed_types: [str] = []
-    // A call through a local of no known type in a body being decided counts as never returning.
+    // A call through a function value or an interface value in a body being decided counts as never returning.
     trust_locals: bool = false
-    // In a walk only fixed parameters keep their kinds; others have the ones the walk gives them.
+    // In a walk a local has the kind the walk gave its binding in force, else its slot's.
     untyped_walk: bool = false
     walk_slots: [int64] = []
     walk_kinds: [TypeKind] = []
@@ -2405,7 +2403,7 @@ type Codegen = struct {
         return .KUnknown
     }
 
-    // A call through a local other than a fixed parameter is taken to return.
+    // A walk types each binding as it reaches it, since a slot holds the kind its last compiled one had.
     func slot_kind(self, anon i: int64) -> TypeKind {
         if self.untyped_walk == false {
             return self.vars[i].kind
@@ -2417,10 +2415,7 @@ type Codegen = struct {
             }
             j -= 1
         }
-        if regalloc.str_in(self.fixed_names, p: self.vars[i].name) {
-            return self.vars[i].kind
-        }
-        return .KUnknown
+        return self.vars[i].kind
     }
 
     // Overwrite the most-recently-allocated slot for `name` with a new
@@ -3932,6 +3927,7 @@ type Codegen = struct {
     // Both answers in one walk, so a nested `for true` body is walked once per level.
     func block_flow(self, anon stmts: [int64]) -> Flow {
         let mark = len(self.bound_log)
+        let kinds_mark = len(self.walk_slots)
         let flow = Flow(completes: true, breaks: false)
         for stmt_id in stmts {
             let f = self.stmt_flow(stmt_id)
@@ -3945,24 +3941,46 @@ type Codegen = struct {
             self.bind_stmt_names(stmt_id)
         }
         self.unbind_to(mark)
+        self.drop_walk_kinds(kinds_mark)
         return flow
     }
 
-    // What a statement binds for the rest of its block.
+    // Ends the kinds a walk gave the bindings made since `mark`.
+    func drop_walk_kinds(self, anon mark: int64) -> none {
+        if len(self.walk_slots) > mark {
+            self.walk_slots = self.walk_slots[0..mark]
+            self.walk_kinds = self.walk_kinds[0..mark]
+        }
+    }
+
+    // What a statement binds for the rest of its block, with the kinds its bindings get.
     func bind_stmt_names(self, anon stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
-            .Let(name, _typ, _value, _mutable) -> self.bind_var(name)
-            .LetElse(pattern, _value, _else_body) -> self.bind_pattern(self.p.patterns[pattern])
+            .Let(name, typ, value, _mutable) -> {
+                mut kind = self.resolve_type(typ)
+                if typ == 0 {
+                    kind = self.infer_kind(value)
+                }
+                self.update_var_kind(:name, :kind)
+                self.bind_var(name)
+            }
+            .LetElse(pattern, value, _else_body) -> {
+                self.retype_pattern_bindings(self.p.patterns[pattern], subject_kind: self.infer_kind(value))
+                self.bind_pattern(self.p.patterns[pattern])
+            }
             else none
         }
     }
 
-    func arm_flow(self, anon arm_id: int64) -> Flow {
+    func arm_flow(self, anon arm_id: int64, subject_kind: TypeKind) -> Flow {
         let arm = self.p.match_arms[arm_id]
         let mark = len(self.bound_log)
+        let kinds_mark = len(self.walk_slots)
+        self.retype_pattern_bindings(self.p.patterns[arm.pattern], :subject_kind)
         self.bind_pattern(self.p.patterns[arm.pattern])
         let flow = self.block_flow(arm.body)
         self.unbind_to(mark)
+        self.drop_walk_kinds(kinds_mark)
         return flow
     }
 
@@ -3984,10 +4002,11 @@ type Codegen = struct {
             }
             .If(_cond, then_body, else_body) -> return either_flow(self.block_flow(then_body), self.block_flow(else_body))
             // A match statement is exhaustive, so it completes only through an arm.
-            .MatchStmt(_subject, arms) -> {
+            .MatchStmt(subject, arms) -> {
                 mut flow = Flow(completes: len(arms) == 0, breaks: false)
+                let subject_kind = self.infer_kind(subject)
                 for arm_id in arms {
-                    flow = either_flow(flow, self.arm_flow(arm_id))
+                    flow = either_flow(flow, self.arm_flow(arm_id, :subject_kind))
                 }
                 return flow
             }
@@ -4006,12 +4025,21 @@ type Codegen = struct {
     }
 
     // Running off the end returns 0, which is only right as an optional's `none`.
-    func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str) -> none {
+    // The walk starts from the parameters' declared kinds, not the ones the body left in their slots.
+    func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str, param_kinds: [TypeKind]) -> none {
         let kind = self.return_kind
-        if self.is_void_kind(kind) or self.kind_has_unknown(kind) or self.walk_completes(func_decl.body) == false {
+        if self.is_void_kind(kind) or self.kind_has_unknown(kind) {
             return
         }
-        if self.is_result_kind(kind) and self.is_void_kind(self.result_inner_kind(kind)) {
+        let seeds = len(self.walk_slots)
+        mut i = 0
+        for param_kind in param_kinds {
+            self.walk_slots += [i]
+            self.walk_kinds += [param_kind]
+            i += 1
+        }
+        if self.walk_completes(func_decl.body) == false or (self.is_result_kind(kind) and self.is_void_kind(self.result_inner_kind(kind))) {
+            self.drop_walk_kinds(seeds)
             return
         }
         mut name = f"`{func_decl.name}`"
@@ -4029,7 +4057,9 @@ type Codegen = struct {
         if kind is .KOptional(_inner) {
             fix = "(`return none` for no value)"
         }
-        self.report_error(f"error: {name} can reach its end without returning a value; it returns `{self.kind_display(kind)}`, so add a `return` {fix} at the end{self.end_hint(func_decl.body)}", span: func_decl.name_span)
+        let hint = self.end_hint(func_decl.body)
+        self.drop_walk_kinds(seeds)
+        self.report_error(f"error: {name} can reach its end without returning a value; it returns `{self.kind_display(kind)}`, so add a `return` {fix} at the end{hint}", span: func_decl.name_span)
     }
 
     // Why a body that ends in a call that may not return is taken to finish.
@@ -4041,12 +4071,17 @@ type Codegen = struct {
         if (self.p.exprs[expr] is .Call(_callee, _args)) == false {
             return ""
         }
+        let outer = self.untyped_walk
         let mark = len(self.bound_log)
+        let kinds_mark = len(self.walk_slots)
+        self.untyped_walk = true
         for stmt_id in body[0..len(body) - 1] {
             self.bind_stmt_names(stmt_id)
         }
         let hint = self.end_call_hint(expr)
         self.unbind_to(mark)
+        self.drop_walk_kinds(kinds_mark)
+        self.untyped_walk = outer
         return hint
     }
 
@@ -4055,8 +4090,8 @@ type Codegen = struct {
         if self.is_iface_method_call(expr) {
             return f"; {at} is a method called through an interface value, which is taken to return"
         }
-        if self.is_diverging_call(expr) {
-            return f"; {at} is a call through a local, which counts as returning"
+        if self.is_func_value_call(expr) {
+            return f"; {at} is a call through a function value, which is taken to return"
         }
         let site = self.trusted_site(expr)
         if len(site) == 0 {
@@ -4893,7 +4928,7 @@ type Codegen = struct {
             return false
         }
         match kind {
-            .KUnknown -> self.trust_why = "a call through a local, which counts as returning"
+            .KFunc(_params, _ret) -> self.trust_why = "a call through a function value, which is taken to return"
             .KInterface(_idx) -> self.trust_why = "a method called through an interface value, which is taken to return"
             else return false
         }
@@ -4914,8 +4949,11 @@ type Codegen = struct {
         }
         let recv = self.infer_kind(lhs)
         if recv is .KStruct(sidx, _ta) {
-            if self.has_field(name, struct_idx: sidx) and self.find_field_kind(name, struct_idx: sidx) is .KFunc(_p, _r) {
-                return false
+            if self.has_field(name, struct_idx: sidx) {
+                let field_kind = self.find_field_kind(name, struct_idx: sidx)
+                if field_kind is .KFunc(_p, _r) {
+                    return self.trusts(field_kind)
+                }
             }
             if self.structs[sidx].method_idx.get(name) is Some(mi) {
                 return self.never_returns(self.structs[sidx].methods[mi].sig, owner: sidx)
@@ -5052,7 +5090,6 @@ type Codegen = struct {
         let saved_names = self.subst_names
         let saved_args = self.subst_args
         let saved_log = self.bound_log
-        let saved_fixed = self.fixed_names
         let saved_walk = self.untyped_walk
         let saved_walk_slots = self.walk_slots
         let saved_walk_kinds = self.walk_kinds
@@ -5071,7 +5108,6 @@ type Codegen = struct {
         if owner >= 0 {
             self.walking_fn = f"{self.struct_display_name(owner)}.{fd.name}"
         }
-        self.fixed_names = self.fixed_params(fd)
         let no_vars: [VarSlot] = []
         self.vars = no_vars
         let no_log: [int64] = []
@@ -5106,36 +5142,12 @@ type Codegen = struct {
         self.subst_names = saved_names
         self.subst_args = saved_args
         self.bound_log = saved_log
-        self.fixed_names = saved_fixed
         self.untyped_walk = saved_walk
         self.walk_slots = saved_walk_slots
         self.walk_kinds = saved_walk_kinds
         self.seen_log = saved_seen
         self.walking_fn = saved_fn
         return never
-    }
-
-    // Only parameters the body doesn't bind again keep one kind throughout it.
-    func fixed_params(self, anon fd: ast.FuncDecl) -> [str] {
-        let saved_vars = self.vars
-        let saved_slots = self.frame_slots
-        let saved_naming = self.naming_locals
-        let no_vars: [VarSlot] = []
-        self.vars = no_vars
-        self.naming_locals = true
-        for stmt_id in fd.body {
-            self.collect_stmt_vars(:stmt_id)
-        }
-        self.naming_locals = saved_naming
-        mut fixed: [str] = []
-        for param in fd.params {
-            if self.var_declared(param.name) == false {
-                fixed += [param.name]
-            }
-        }
-        self.vars = saved_vars
-        self.frame_slots = saved_slots
-        return fixed
     }
 
     func walk_completes(self, anon stmts: [int64]) -> bool {
@@ -5145,10 +5157,7 @@ type Codegen = struct {
         self.untyped_walk = true
         let completes = self.block_completes(stmts)
         self.untyped_walk = outer
-        if len(self.walk_slots) > kinds_mark {
-            self.walk_slots = self.walk_slots[0..kinds_mark]
-            self.walk_kinds = self.walk_kinds[0..kinds_mark]
-        }
+        self.drop_walk_kinds(kinds_mark)
         if len(self.seen_log) > seen_mark {
             for idx in self.seen_log[seen_mark..] {
                 self.vars[idx].seen = false
@@ -5177,6 +5186,9 @@ type Codegen = struct {
         if self.is_iface_method_call(expr_id) {
             return "; a method called through an interface value is taken to return, so call it as a statement and end the path with `kod_panic(...)`"
         }
+        if self.is_func_value_call(expr_id) {
+            return "; a call through a function value is taken to return, so call it as a statement and end the path with `kod_panic(...)`"
+        }
         let site = self.trusted_site(expr_id)
         if len(site) == 0 {
             return ""
@@ -5191,6 +5203,21 @@ type Codegen = struct {
             return self.infer_kind(lhs) is .KInterface(_idx)
         }
         return false
+    }
+
+    // `f(..)` through a local or parameter of a function type, or `x.f(..)` through such a field.
+    func is_func_value_call(self, anon expr_id: int64) -> bool {
+        let .Call(callee, _args) = self.p.exprs[expr_id] else { return false }
+        if self.p.exprs[callee] is .Ident(name) {
+            return self.calls_local(name) and self.find_var_kind(name) is .KFunc(_params, _ret)
+        }
+        let .Binary(lhs, op, rhs) = self.p.exprs[callee] else { return false }
+        let .Ident(name) = self.p.exprs[rhs] else { return false }
+        if (op is .Dot) == false {
+            return false
+        }
+        let .KStruct(sidx, _ta) = self.infer_kind(lhs) else { return false }
+        return self.has_field(name, struct_idx: sidx) and self.find_field_kind(name, struct_idx: sidx) is .KFunc(_p, _r)
     }
 
     // Names the call taken on trust when only trusting locals makes this one never return.
@@ -11554,11 +11581,14 @@ type Codegen = struct {
             self.vars[-1].mutable = param.mutable
             self.vars[-1].bound = true
         }
+        mut param_kinds: [TypeKind] = []
+        for v in self.vars {
+            param_kinds += [v.kind]
+        }
 
         for stmt_id in func_decl.body {
             self.collect_stmt_vars(:stmt_id)
         }
-        self.fixed_names = self.fixed_params(func_decl)
 
         mut func_lbl = f"${self.path_prefix}${func_decl.name}"
         if len(struct_name) > 0 {
@@ -11609,7 +11639,7 @@ type Codegen = struct {
         self.compile_block(func_decl.body)
         // An error in the body or a parse error may be what hides its `return`.
         if self.report_attempts == body_mark and len(self.p.errors) == 0 {
-            self.check_reaches_end(func_decl, :struct_name)
+            self.check_reaches_end(func_decl, :struct_name, :param_kinds)
         }
         self.reads_scoped = false
 

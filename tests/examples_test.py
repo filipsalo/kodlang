@@ -299,10 +299,14 @@ def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
     lines = ["type Hard = struct {", "    tag: str"]
     lines += ["    func fail(self, anon msg: str) -> none {", "        kod_panic(msg)"]
     lines += ["    }", "}"]
+    lines += ["interface Failer {", "    func fail(self, anon msg: str) -> none", "}"]
     n = 1000
     for i in range(n):
         lines += [f"func d{i}(anon msg: str) -> none {{", f"    d{i + 1}(msg)", "}"]
-    lines += [f"func d{n}(anon msg: str) -> none {{", '    let h = Hard(tag: "x")']
+    lines += [
+        f"func d{n}(anon msg: str) -> none {{",
+        '    let h: Failer = Hard(tag: "x")',
+    ]
     lines += ["    h.fail(msg)", "}"]
     for i in range(n):
         lines += [f"func f{i}(anon k: int64) -> int64 {{", f'    return d{i}("x")', "}"]
