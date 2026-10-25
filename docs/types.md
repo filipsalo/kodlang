@@ -38,7 +38,9 @@ Mutability belongs to each binding. A `let x` in a block that hides an
 outer `mut x` (see [Blocks and bindings](control-flow.md#blocks-and-bindings))
 can't be reassigned inside that block, and after the block the outer `x`
 can be again. Likewise a `mut x` in a block leaves an outer `let x`
-immutable once the block ends.
+immutable once the block ends. A `for` variable and the names a pattern
+binds, in a `match` arm, `if … is` or a let-else, can be reassigned
+without `mut`, whatever binding the name had in another block.
 
 Assigning to a name that was never declared is an error too (declare it
 with `mut` first), and so is assigning to anything other than a name, a

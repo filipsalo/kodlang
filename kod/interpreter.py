@@ -326,8 +326,11 @@ class _Scope:
         params = {p.variable.id for p in func.params}
         self.seen = set(params)
         self.declared = set(params)
+        # Names a `let` or a parameter without `mut` binds, which the frame
+        # holds as immutable until another binding of the name thaws them.
+        self.fixed = {p.variable.id for p in func.params if not p.mutable}
         for stmt in func.body:
-            _local_names(stmt, self.declared)
+            _local_names(stmt, self.declared, self.fixed)
         imports = self.module.get_imports() if self.module is not None else ()
         self.aliases = {imp.local_name for imp in imports}
 
@@ -373,13 +376,16 @@ class _Scope:
         return f"`{name}` is {verb} before its `let`"
 
 
-def _local_names(node, names):
-    """Every name a binding in `node` declares, outside function literals."""
+def _local_names(node, names, fixed):
+    """Every name a binding in `node` declares, outside function literals;
+    those an immutable `let` declares go to `fixed` too."""
     t = type(node)
     if t is ast.FunctionDeclaration:
         return
     if t is ast.VariableDeclaration:
         names.add(node.variable.id)
+        if not node.mutable:
+            fixed.add(node.variable.id)
     elif t is ast.LetElseStatement:
         names.update(_pattern_names(node.pattern))
     elif t is ast.ForEachStatement:
@@ -388,9 +394,9 @@ def _local_names(node, names):
         for arm in node.arms:
             names.update(_pattern_names(arm.pattern))
             for child in arm.body if isinstance(arm.body, list) else [arm.body]:
-                _local_names(child, names)
+                _local_names(child, names, fixed)
     for child in _children(node):
-        _local_names(child, names)
+        _local_names(child, names, fixed)
 
 
 def _mark_scopes(func, program, module=None):
@@ -458,6 +464,12 @@ def _scope_use(node, bound, scope, verb, fallback=True):
         node.__dict__["_kod_func"] = target
 
 
+def _note_thaw(stmt, names, scope):
+    """Mark `stmt` if a name it binds may be one a `let` left immutable."""
+    if any(name in scope.fixed for name in names):
+        stmt.__dict__["_kod_thaw"] = True
+
+
 def _scope_block(stmts, bound, depth, scope):
     bound = dict(bound)
     for stmt in stmts:
@@ -474,6 +486,7 @@ def _scope_stmt(stmt, bound, depth, scope):
         _scope_expr(stmt.value, bound, depth, scope)
         _scope_block(stmt.else_body, bound, inner, scope)
         _note_qualifier(stmt.pattern, bound, scope)
+        _note_thaw(stmt, _pattern_names(stmt.pattern), scope)
         _bind_pattern(bound, stmt.pattern, depth, scope, stmt.value.span.start)
     elif t is ast.IfStatement:
         _scope_expr(stmt.condition, bound, depth, scope)
@@ -485,11 +498,15 @@ def _scope_stmt(stmt, bound, depth, scope):
     elif t is ast.ForEachStatement:
         _scope_expr(stmt.iterable, bound, depth, scope)
         body = dict(bound)
+        _note_thaw(stmt, [stmt.binding], scope)
         name_span = _name_span(stmt.span, stmt.binding, stmt.iterable.span.start)
         _bind(body, stmt.binding, name_span, inner, scope)
         _scope_block(stmt.body, body, inner, scope)
     elif t is ast.MatchStatement:
         _scope_expr(stmt.expression, bound, depth, scope)
+        _note_thaw(
+            stmt, [n for arm in stmt.arms for n in _pattern_names(arm.pattern)], scope
+        )
         for arm in stmt.arms:
             body = dict(bound)
             _note_qualifier(arm.pattern, bound, scope)
@@ -1616,6 +1633,11 @@ class Interpreter:
                     return arm.body
         raise ValueError("Non-exhaustive match expression")
 
+    def _thaw(self, patterns):
+        """Unlike a `let`'s, the names `patterns` bind can be reassigned."""
+        for pattern in patterns:
+            self.immutable_stack[-1].difference_update(_pattern_names(pattern))
+
     def execute_statement(self, module, statement):
         """Execute a statement"""
         match statement:
@@ -1790,8 +1812,11 @@ class Interpreter:
                         continue
             case ast.ForEachStatement(binding, iterable, body):
                 array = self.evaluate_expression(module, iterable)
+                thaw = "_kod_thaw" in statement.__dict__
                 for element in array.value:
                     self.stack[-1][binding] = element
+                    if thaw:
+                        self.immutable_stack[-1].discard(binding)
                     try:
                         for stmt in body:
                             self.execute_statement(module, stmt)
@@ -1800,6 +1825,8 @@ class Interpreter:
                     except ContinueSignal:
                         continue
             case ast.MatchStatement(expression, arms):
+                if "_kod_thaw" in statement.__dict__:
+                    self._thaw(arm.pattern for arm in arms)
                 value = self.evaluate_expression(module, expression)
                 for arm in arms:
                     arm = _value_arm(arm, value)
@@ -1898,6 +1925,8 @@ class Interpreter:
                 if not matched:
                     for stmt in else_body:
                         self.execute_statement(module, stmt)
+                elif "_kod_thaw" in statement.__dict__:
+                    self._thaw([statement.pattern])
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
