@@ -340,25 +340,17 @@ func handle_definition(id_val: json.Value, params: json.Value) -> none {
             return none
         }
     }
-    // Type-name targets: hover on `Foo` in `let f: Foo = ...` or
-    // `Foo(x: 5)` jumps to the `type Foo = struct/enum ...` decl.
-    // Skip monomorphised entries (def_path empty); the template
-    // carries the user-visible source location.
-    mut si: int64 = 0
-    for si < len(cg.structs) {
-        if cg.structs[si].name == word and len(cg.structs[si].def_path) > 0 {
-            write_definition_response(:id_val, def_path: cg.structs[si].def_path, def_span: cg.structs[si].def_span, buffer_path: entry_path, buffer_text: text)
-            return none
-        }
-        si = si + 1
+    // Type-name targets: `Foo` in `let f: Foo = ...` or `Foo(x: 5)` jumps to
+    // the `type Foo = struct/enum ...` decl the buffer means by `Foo`, and
+    // `pa.Foo` to the one the module imported as `pa` declares.
+    let type_ref: int64 = buffer_type(:cg, qualifier: qualifier_before_dot(source: text, :offset), :word)
+    if type_ref >= 0 and type_ref % 4 == 0 {
+        write_definition_response(:id_val, def_path: cg.structs[type_ref / 4].def_path, def_span: cg.structs[type_ref / 4].def_span, buffer_path: entry_path, buffer_text: text)
+        return none
     }
-    mut ei: int64 = 0
-    for ei < len(cg.enums) {
-        if cg.enums[ei].name == word and len(cg.enums[ei].def_path) > 0 {
-            write_definition_response(:id_val, def_path: cg.enums[ei].def_path, def_span: cg.enums[ei].def_span, buffer_path: entry_path, buffer_text: text)
-            return none
-        }
-        ei = ei + 1
+    if type_ref >= 0 {
+        write_definition_response(:id_val, def_path: cg.enums[type_ref / 4].def_path, def_span: cg.enums[type_ref / 4].def_span, buffer_path: entry_path, buffer_text: text)
+        return none
     }
     // Method targets: cursor on `method` in `obj.method(...)`. We don't
     // do receiver-type inference yet, so this is "first struct with a
@@ -459,30 +451,14 @@ func handle_hover(id_val: json.Value, params: json.Value) -> none {
             }
         }
     }
-    // Type-name hover: `type Foo = struct/enum { ... }`. Walk
-    // self.structs / self.enums by name. Skip monomorphised struct
-    // entries (their canonical names contain `$`-separated type args
-    // and wouldn't match a user-typed identifier anyway).
+    // Type-name hover: `type Foo = struct/enum { ... }` of the type the
+    // buffer means by `Foo`, or by `pa.Foo`.
     if len(signature) == 0 {
-        mut si: int64 = 0
-        for si < len(cg.structs) {
-            if cg.structs[si].name == word and len(cg.structs[si].def_path) > 0 {
-                signature = cg.struct_display(si)
-                si = len(cg.structs)
-            } else {
-                si = si + 1
-            }
-        }
-    }
-    if len(signature) == 0 {
-        mut ei: int64 = 0
-        for ei < len(cg.enums) {
-            if cg.enums[ei].name == word and len(cg.enums[ei].def_path) > 0 {
-                signature = cg.enum_display(ei)
-                ei = len(cg.enums)
-            } else {
-                ei = ei + 1
-            }
+        let type_ref: int64 = buffer_type(:cg, qualifier: qualifier_before_dot(source: text, :offset), :word)
+        if type_ref >= 0 and type_ref % 4 == 0 {
+            signature = cg.struct_display(type_ref / 4)
+        } else if type_ref >= 0 {
+            signature = cg.enum_display(type_ref / 4)
         }
     }
     // Method hover: render the matching method's signature. Without
@@ -619,6 +595,25 @@ func base_type_name(expr: str) -> str {
     return head
 }
 
+// The module alias a type expression is written through:
+//   "ast.Module"        → "ast"
+//   "Codegen?"          → ""
+func type_qualifier(expr: str) -> str {
+    let n: int64 = len(expr)
+    mut i: int64 = 0
+    for i < n and (is_ident_char(expr[i]) or expr[i] == '.') {
+        i = i + 1
+    }
+    mut j: int64 = 0
+    for j < i {
+        if expr[j] == '.' {
+            return expr[0..j]
+        }
+        j = j + 1
+    }
+    return ""
+}
+
 // Return the identifier characters immediately before `offset` —
 // the "partial" the user has typed so far inside the completion
 // popup. `s._u|` returns `_u`; `s.|` returns ``. Unlike
@@ -673,6 +668,38 @@ func qualifier_before_dot(source: str, offset: int64) -> str {
         return ""
     }
     return source[start..end]
+}
+
+// The struct (idx * 4) or enum (idx * 4 + 1) that `word` names in the buffer's
+// module, or -1. Written bare it is a type the module declares, one its imports
+// list or a builtin; with a `qualifier`, one the module imported under that name
+// declares. An alias gives the type it stands for, and a generic instance its
+// template, which carries the declaration.
+func buffer_type(cg: codegen.Codegen, qualifier: str, word: str) -> int64 {
+    mut ref: int64 = 0
+    if len(qualifier) > 0 {
+        ref = cg.qualified_type_ref(qualifier, name: word)
+    } else {
+        ref = cg.module_type_ref(word)
+    }
+    if ref < 0 {
+        return -1
+    }
+    match cg.type_ref_kind(ref) {
+        .KStruct(idx, _type_args) -> {
+            if cg.structs[idx].template_idx >= 0 {
+                return cg.structs[idx].template_idx * 4
+            }
+            return idx * 4
+        }
+        .KEnum(idx) -> {
+            if cg.enums[idx].template_idx >= 0 {
+                return cg.enums[idx].template_idx * 4 + 1
+            }
+            return idx * 4 + 1
+        }
+        else return -1
+    }
 }
 
 func completion_item(label: str, kind: int64) -> json.Value {
@@ -749,18 +776,18 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
                         items += [completion_item(label: pm.name, kind: 3)]
                     }
                 }
-                for s in cg.structs {
-                    if s.name == typename and len(s.def_path) > 0 {
-                        for m in s.methods {
-                            if m.decl_id >= 0 and should_include(name: m.name, :show_internal) {
-                                items += [completion_item(label: m.name, kind: 3)]
-                            }
+                let type_ref: int64 = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: typename)
+                if type_ref >= 0 and type_ref % 4 == 0 {
+                    let s: codegen.StructInfo = cg.structs[type_ref / 4]
+                    for m in s.methods {
+                        if m.decl_id >= 0 and should_include(name: m.name, :show_internal) {
+                            items += [completion_item(label: m.name, kind: 3)]
                         }
-                        for f in s.fields {
-                            // LSP `CompletionItemKind` 5 = Field.
-                            if should_include(name: f.name, :show_internal) {
-                                items += [completion_item(label: f.name, kind: 5)]
-                            }
+                    }
+                    for f in s.fields {
+                        // LSP `CompletionItemKind` 5 = Field.
+                        if should_include(name: f.name, :show_internal) {
+                            items += [completion_item(label: f.name, kind: 5)]
                         }
                     }
                 }
@@ -777,17 +804,23 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
                 items += [completion_item(label: alias, kind: 9)]
             }
         }
-        // Skip monomorphised struct entries — their canonical names
-        // contain `$`-separated type args and aren't user-typeable.
+        // Only the types the buffer can write bare: its own, those its
+        // imports list and the builtins. A type of an imported module is
+        // written through the module, and a monomorphised struct's
+        // canonical name isn't user-typeable.
+        mut si: int64 = 0
         for s in cg.structs {
-            if len(s.def_path) > 0 and should_include(name: s.name, :show_internal) {
+            if len(s.def_path) > 0 and buffer_type(:cg, qualifier: "", word: s.name) == si * 4 and should_include(name: s.name, :show_internal) {
                 items += [completion_item(label: s.name, kind: 22)]
             }
+            si += 1
         }
+        mut ei: int64 = 0
         for e in cg.enums {
-            if len(e.def_path) > 0 and should_include(name: e.name, :show_internal) {
+            if len(e.def_path) > 0 and buffer_type(:cg, qualifier: "", word: e.name) == ei * 4 + 1 and should_include(name: e.name, :show_internal) {
                 items += [completion_item(label: e.name, kind: 13)]
             }
+            ei += 1
         }
     }
     write_response(:id_val, result: completion_list(:items))

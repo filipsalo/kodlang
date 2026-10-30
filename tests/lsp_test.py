@@ -1127,3 +1127,157 @@ def test_hover_includes_leading_doc_comment(lsp_binary):
     assert "Spans two lines on purpose." in value
     assert "```kod" in value
     assert "func helper()" in value
+
+
+def _same_named_types(tmp_path):
+    """Two modules that each declare a struct `Pt`, and the buffer's file name."""
+    (tmp_path / "pa.kod").write_text(
+        "type Pt = struct {\n  x: int64\n  func size(self) -> int64 { return 1 }\n}\n"
+        "func make() -> Pt {\n  return Pt(x: 1)\n}\n"
+    )
+    (tmp_path / "pb.kod").write_text(
+        "type Pt = struct {\n  y: int64\n  func area(self) -> int64 { return 2 }\n}\n"
+        "func make() -> Pt {\n  return Pt(y: 2)\n}\n"
+    )
+    return f"file://{tmp_path}/main.kod"
+
+
+def _buffer_session(lsp_binary, uri, source, request):
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {"jsonrpc": "2.0", "id": 2, **request},
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    return next(r for r in responses if r.get("id") == 2)
+
+
+def test_definition_and_hover_find_a_type_through_its_module(lsp_binary, tmp_path):
+    # `pa.Pt` and `pb.Pt` are different types of one name: the cursor on
+    # `Pt` goes to the declaration in the module written before the dot.
+    uri = _same_named_types(tmp_path)
+    source = (
+        'import "./pa"\n'
+        'import "./pb"\n'
+        "func main() -> int64 {\n"
+        "  let a: pa.Pt = pa.make()\n"
+        "  let b: pb.Pt = pb.make()\n"
+        "  return 0\n"
+        "}\n"
+    )
+    for line, module, field in ((3, "pa", "x"), (4, "pb", "y")):
+        position = {"line": line, "character": 13}
+        defn = _buffer_session(
+            lsp_binary,
+            uri,
+            source,
+            {
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": position},
+            },
+        )
+        assert defn["result"]["uri"].endswith(f"/{module}.kod"), defn
+        assert defn["result"]["range"]["start"] == {"line": 0, "character": 5}
+        hover = _buffer_session(
+            lsp_binary,
+            uri,
+            source,
+            {
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": position},
+            },
+        )
+        value = hover["result"]["contents"]["value"]
+        assert f"{field}: int64" in value, value
+        assert ("y: int64" if field == "x" else "x: int64") not in value, value
+
+
+def test_definition_finds_a_bare_type_in_the_buffer_over_an_imported_one(
+    lsp_binary, tmp_path
+):
+    # The buffer declares its own `Pt` too; a bare `Pt` is that one.
+    uri = _same_named_types(tmp_path)
+    source = (
+        'import "./pa"\n'
+        "type Pt = struct {\n  z: int64\n}\n"
+        "func main() -> int64 {\n"
+        "  let c: Pt = Pt(z: 3)\n"
+        "  let a: pa.Pt = pa.make()\n"
+        "  return c.z\n"
+        "}\n"
+    )
+    defn = _buffer_session(
+        lsp_binary,
+        uri,
+        source,
+        {
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": 5, "character": 9},
+            },
+        },
+    )
+    assert defn["result"]["uri"].endswith("/main.kod"), defn
+    assert defn["result"]["range"]["start"] == {"line": 1, "character": 5}
+
+
+def test_completion_offers_the_members_of_the_type_the_buffer_means(
+    lsp_binary, tmp_path
+):
+    uri = _same_named_types(tmp_path)
+    source = (
+        'import "./pa"\n'
+        'import "./pb"\n'
+        "type Pt = struct {\n  z: int64\n}\n"
+        "func main() -> int64 {\n"
+        "  let b: pb.Pt = pb.make()\n"
+        "  b.\n"
+        "  return 0\n"
+        "}\n"
+    )
+    resp = _buffer_session(
+        lsp_binary,
+        uri,
+        source,
+        {
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": 7, "character": 4},
+            },
+        },
+    )
+    labels = [item["label"] for item in resp["result"]["items"]]
+    assert "y" in labels and "area" in labels, labels
+    assert "x" not in labels and "size" not in labels and "z" not in labels, labels
+    # A bare completion offers the one `Pt` the buffer can write.
+    resp = _buffer_session(
+        lsp_binary,
+        uri,
+        source.replace("  b.\n", "  \n"),
+        {
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": 7, "character": 2},
+            },
+        },
+    )
+    labels = [item["label"] for item in resp["result"]["items"]]
+    assert labels.count("Pt") == 1, labels
