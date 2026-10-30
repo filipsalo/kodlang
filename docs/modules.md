@@ -41,10 +41,10 @@ argument, `vec.Vec2` always means the module, and so does the enum in a
 pattern or an `is`, such as `vec.Shape.Circle`, wherever the `is` is
 written: a condition, a `let`, an operand of `and`, an f-string. In an
 expression, where the local is in force, `vec.Vec2(...)` calls a method
-of the local and `vec.Shape.Circle` reads a field of it, and `x is
-vec.Vec2` and a pattern `vec.Vec2(b)` are errors: `` `vec` is a local
-here, so `vec.Vec2` doesn't name a type of its module; give the local
-another name ``.
+of the local and `vec.Shape.Circle` reads a field of it, also where an
+enum `Shape` is in scope, and `x is vec.Vec2` and a pattern `vec.Vec2(b)`
+are errors: `` `vec` is a local here, so `vec.Vec2` doesn't name a type
+of its module; give the local another name ``.
 A function named like an import alias doesn't hide it: with `func vec()`
 declared too, `vec()` calls the function and `vec.make(1)` the module's.
 
