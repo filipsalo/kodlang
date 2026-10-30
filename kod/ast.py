@@ -1455,13 +1455,15 @@ def _pattern_from_is_rhs(cond, parser):
                 if isinstance(inner.rhs, name_like) and isinstance(
                     callee.rhs, name_like
                 ):
+                    pattern = EnumVariantPattern(
+                        inner.rhs.id, callee.rhs.id, arg_names, span
+                    )
                     if isinstance(inner.lhs, name_like):
                         parser.check_enum_qualifier(
                             inner.lhs.id, inner.rhs.id, inner.rhs.span
                         )
-                    return EnumVariantPattern(
-                        inner.rhs.id, callee.rhs.id, arg_names, span
-                    )
+                        pattern.__dict__["_kod_module"] = inner.lhs.id
+                    return pattern
             if isinstance(inner, name_like) and isinstance(callee.rhs, name_like):
                 return EnumVariantPattern(inner.id, callee.rhs.id, arg_names, span)
     # `.Variant` (unit) — ImplicitEnumVariant without payload.
@@ -1803,10 +1805,12 @@ class MatchExpressionArm:
                 else:
                     parser.consume(tokens.Dot)
                     second = parser.consume(tokens.Identifier).value
+                    module_name = None
                     if parser.peeking_at(tokens.Dot):
                         parser.consume(tokens.Dot)
                         variant_name = parser.consume(tokens.Identifier).value
                         enum_name = second
+                        module_name = first
                         parser.check_enum_qualifier(first, second, span)
                     else:
                         enum_name = first
@@ -1821,6 +1825,8 @@ class MatchExpressionArm:
                     pattern = EnumVariantPattern(
                         enum_name, variant_name, bindings, span
                     )
+                    if module_name is not None:
+                        pattern.__dict__["_kod_module"] = module_name
             parser.consume(tokens.Arrow)
             body = Expression.parse(parser)
         return cls(pattern, body, span)
@@ -1933,10 +1939,12 @@ class MatchArm:
                     parser.consume(tokens.Dot)
                     second = parser.consume(tokens.Identifier).value
                     # Three-part: module.Enum.Variant, whose module must declare the enum.
+                    module_name = None
                     if parser.peeking_at(tokens.Dot):
                         parser.consume(tokens.Dot)
                         variant_name = parser.consume(tokens.Identifier).value
                         enum_name = second
+                        module_name = first
                         parser.check_enum_qualifier(first, second, span)
                     else:
                         enum_name = first
@@ -1951,6 +1959,8 @@ class MatchArm:
                     pattern = EnumVariantPattern(
                         enum_name, variant_name, bindings, span
                     )
+                    if module_name is not None:
+                        pattern.__dict__["_kod_module"] = module_name
             # Parse ->
             parser.consume(tokens.Arrow)
             # Parse body: block or single statement

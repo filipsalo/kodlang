@@ -455,6 +455,256 @@ def _mark_program_scopes(program):
                     _mark_scopes(func, program, module)
 
 
+def _check_program_types(interp):
+    """Resolve the type names every function body writes before `main` runs,
+    as the compiler does before it emits code: a downcast's `T` or `m.T`, a
+    pattern's enum, a constructor's struct and a member `m.X` must name what
+    the writing module sees, whether or not the code runs."""
+    for module in interp.program:
+        for stmt in module.body:
+            funcs, params = [], frozenset()
+            if isinstance(stmt, ast.FunctionDeclaration):
+                funcs = [stmt]
+            elif isinstance(stmt, ast.TypeDeclaration):
+                owner = stmt.type
+                if isinstance(owner, types.GenericTemplate):
+                    params = frozenset(owner.param_names)
+                    owner = owner.template
+                else:
+                    params = frozenset(getattr(owner, "type_subst", {}))
+                    owner = getattr(owner, "template_origin", owner)
+                # An alias of another module's type: its methods are checked there.
+                if getattr(owner, "decl_module", module) is not module:
+                    continue
+                funcs = getattr(owner, "methods", {}).values()
+            for func in funcs:
+                if "_kod_typed" not in func.__dict__:
+                    func.__dict__["_kod_typed"] = True
+                    _TypeCheck(interp, module, params).body(func.body)
+
+
+# The child-node fields of each node class (see _children).
+_node_fields: dict = {}
+
+
+def _child_nodes(node):
+    fields = _node_fields.get(type(node))
+    if fields is None:
+        fields = [f.name for f in dataclasses.fields(node)]
+        _node_fields[type(node)] = fields
+    for name in fields:
+        value = getattr(node, name)
+        if isinstance(value, ast.ASTNode):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, ast.ASTNode):
+                    yield item
+
+
+class _TypeCheck:
+    """One function body's type names, checked in the module that wrote it."""
+
+    def __init__(self, interp, module, params):
+        self.interp = interp
+        self.module = module
+        # The type parameters in scope, which name no module type.
+        self.params = params
+        self.aliases = {imp.local_name: imp.module_name for imp in module.get_imports()}
+
+    def body(self, stmts):
+        for stmt in stmts:
+            self.node(stmt)
+
+    def node(self, node):
+        t = type(node)
+        if t is ast.BinaryOperator:
+            if isinstance(node.op, (tokens.Is, tokens.IsNot)):
+                self.node(node.lhs)
+                self.is_rhs(node.rhs)
+                return
+            if isinstance(node.op, tokens.Dot):
+                self.dot(node, call=False)
+                return
+        elif t is ast.FunctionCall:
+            self.callee(node.callee)
+            self.node(node.args)
+            return
+        elif t is ast.MatchStatement or t is ast.MatchExpression:
+            self.node(node.expression)
+            for arm in node.arms:
+                self.pattern(arm.pattern)
+                if isinstance(arm.body, list):
+                    self.body(arm.body)
+                else:
+                    self.node(arm.body)
+            return
+        elif t is ast.LetElseStatement:
+            self.pattern(node.pattern)
+            self.node(node.value)
+            self.body(node.else_body)
+            return
+        elif t is ast.FunctionDeclaration:
+            # A function literal, written in the same module.
+            self.body(node.body)
+            return
+        for child in _child_nodes(node):
+            self.node(child)
+
+    def sees(self, name):
+        """Whether `name` is a type parameter or a name the module sees."""
+        if name in self.params or name in self.module.names:
+            return True
+        if self.interp._item(self.module, name) is not None:
+            return True
+        return name in self.interp.program.builtins.names
+
+    def hint(self, name):
+        path = self.module.source_file.path
+        return type_hint(self.interp.program, path, self.aliases, name)
+
+    def unseen(self, name, span, found=None):
+        """The error for a type name the module doesn't see, or `found` when
+        no other module declares it either."""
+        hint = self.hint(name)
+        if hint:
+            raise KodError(f"unknown type `{name}`; {hint}", span)
+        if found is not None:
+            raise KodError(found, span)
+
+    def is_rhs(self, rhs):
+        """`is T`, `is m.T`, `is E.V` or `is m.E.V`, each with or without bindings."""
+        callee = rhs.callee if type(rhs) is ast.FunctionCall else rhs
+        t = type(callee)
+        if t is ast.Name or t is ast.Variable:
+            if callee.id not in ("Some", "Ok", "Err", "None"):
+                self.bare_type(callee.id, rhs.span)
+            return
+        if t is not ast.BinaryOperator or not isinstance(callee.op, tokens.Dot):
+            return
+        lhs, name = callee.lhs, callee.rhs
+        downcast = True
+        if type(lhs) is ast.BinaryOperator and isinstance(lhs.op, tokens.Dot):
+            # `m.E.V` names the enum `m.E`.
+            lhs, name = lhs.lhs, lhs.rhs
+            downcast = False
+        if type(lhs) is ast.Name and type(name) is ast.Name:
+            self.qualified(lhs, name.id, rhs.span, downcast)
+
+    def bare_type(self, name, span):
+        """A downcast's `T`: a struct or generic instance the module sees."""
+        if name in self.params:
+            return
+        cls = self.interp._downcast_type(self.module, name, span)
+        if isinstance(cls, types.GenericTemplate):
+            raise KodError(_generic_downcast_error(cls, name), span)
+
+    def qualified(self, lhs, name, span, downcast):
+        """`lhs.name` where `lhs` is a module alias: a type that module declares;
+        else `lhs` itself is a type the module sees (`E.V`)."""
+        bound = lhs.__dict__.get("_kod_bound")
+        imp = self.interp._alias_import(self.module, lhs.id)
+        if bound is not False:
+            if bound and imp is not None and downcast:
+                raise KodError(_downcast_error(lhs.id, name, "local"), span)
+            return
+        if imp is not None:
+            mod = self.interp._resolve_import(self.module, imp)
+            cls = mod.names.get(name)
+            if not isinstance(cls, (type, types.GenericTemplate)):
+                raise KodError(qualified_type_error(lhs.id, name, mod), span)
+            if downcast and isinstance(cls, types.GenericTemplate):
+                raise KodError(_generic_downcast_error(cls, name, lhs.id), span)
+            return
+        if not self.sees(lhs.id):
+            self.unseen(lhs.id, span, f"unknown type `{lhs.id}.{name}`")
+
+    def pattern(self, pattern):
+        t = type(pattern)
+        if t is ast.TypePattern:
+            self.bare_type(pattern.type_name, pattern.span)
+            return
+        if t is not ast.EnumVariantPattern:
+            return
+        # A three-part pattern's module was checked when it was parsed.
+        if "_kod_module" in pattern.__dict__ or pattern.enum_name in (
+            "Option",
+            "Result",
+        ):
+            return
+        # A local hiding the alias is reported with the subject's kind, when matched.
+        if pattern.__dict__.get("_kod_qualifier") == "local":
+            return
+        imp = self.interp._alias_import(self.module, pattern.enum_name)
+        if imp is not None:
+            mod = self.interp._resolve_import(self.module, imp)
+            cls = mod.names.get(pattern.variant_name)
+            if not isinstance(cls, (type, types.GenericTemplate)):
+                error = qualified_type_error(
+                    pattern.enum_name, pattern.variant_name, mod
+                )
+                raise KodError(error, pattern.span)
+            if isinstance(cls, types.GenericTemplate):
+                error = _generic_downcast_error(
+                    cls, pattern.variant_name, pattern.enum_name
+                )
+                raise KodError(error, pattern.span)
+            return
+        if not self.sees(pattern.enum_name):
+            found = f"unknown enum `{pattern.enum_name}`"
+            found = with_suggestion(found, pattern.enum_name, self.visible_enums())
+            self.unseen(pattern.enum_name, pattern.span, found)
+
+    def visible_enums(self):
+        names = []
+        for scope in (self.module, self.interp.program.builtins):
+            names += [n for n, v in scope.names.items() if _is_enum_type(v)]
+        for imp in self.module.get_imports():
+            dep = self.interp._resolve_import(self.module, imp)
+            names += [n for n in imp.items if _is_enum_type(dep.names.get(n))]
+        return names
+
+    def callee(self, callee):
+        t = type(callee)
+        if t is ast.Name:
+            # A capitalized name reads as a constructor.
+            if callee.__dict__.get("_kod_bound") is False and callee.id[:1].isupper():
+                if not self.sees(callee.id):
+                    self.unseen(callee.id, callee.span)
+            return
+        if t is ast.BinaryOperator and isinstance(callee.op, tokens.Dot):
+            self.dot(callee, call=True)
+            return
+        self.node(callee)
+
+    def dot(self, node, call):
+        """`m.X` names something the module imported as `m` declares; `E.V`
+        names a type the module sees."""
+        lhs, rhs = node.lhs, node.rhs
+        if (
+            type(lhs) is ast.Name
+            and type(rhs) is ast.Name
+            and lhs.__dict__.get("_kod_bound") is False
+        ):
+            imp = self.interp._alias_import(self.module, lhs.id)
+            if imp is not None:
+                mod = self.interp._resolve_import(self.module, imp)
+                if rhs.id not in mod.names:
+                    raise KodError(
+                        _module_member_error(imp, rhs.id, mod, call=call), rhs.span
+                    )
+            elif not self.sees(lhs.id):
+                self.unseen(lhs.id, lhs.span)
+            return
+        self.node(lhs)
+
+
+def _is_enum_type(value):
+    if isinstance(value, types.GenericTemplate):
+        value = value.template
+    return isinstance(value, type) and issubclass(value, types.EnumType)
+
+
 def _line_of(span):
     return get_source(span.filename)[: span.start].count("\n") + 1
 
@@ -618,6 +868,7 @@ class Interpreter:
         entry_module = self.program.get_module(file.canonical_path.with_suffix(""))
         self.entry_module = entry_module
         _mark_program_scopes(self.program)
+        _check_program_types(self)
         main = self.lookup(entry_module, "main")
         if len(main.params) > 0:
             string_array = types.ArrayType.make(types.String)
