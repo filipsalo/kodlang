@@ -1329,3 +1329,49 @@ def test_completion_after_a_block_that_hid_the_receiver(lsp_binary, tmp_path):
     )
     after_param = labels_at(8, 4, hidden)
     assert "x" in after_param and "y" not in after_param, after_param
+
+
+def test_completion_ignores_braces_in_strings_chars_and_comments(lsp_binary, tmp_path):
+    # Only braces the lexer reads as braces open or close a block: a `}`
+    # in a string, a char literal or a comment between the `let` and the
+    # cursor leaves the receiver's block open, and a `{` there leaves a
+    # closed inner block closed.
+    uri = _same_named_types(tmp_path)
+
+    def labels_after(*lines):
+        source = (
+            'import "./pa"\nimport "./pb"\nfunc main() -> int64 {\n'
+            + "  let v: pa.Pt = pa.make()\n"
+            + "".join(f"  {line}\n" for line in lines)
+            + "  v.\n  return 0\n}\n"
+        )
+        line = source.count("\n", 0, source.index("  v.\n"))
+        resp = _buffer_session(
+            lsp_binary,
+            uri,
+            source,
+            {
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": 4},
+                },
+            },
+        )
+        return [item["label"] for item in resp["result"]["items"]]
+
+    for line in (
+        'print("}")',
+        "print('}')",
+        "// close } here",
+        'print(f"\\}")',
+        'print("""}""")',
+    ):
+        labels = labels_after(line)
+        assert "x" in labels and "size" in labels, (line, labels)
+    # A `{` in a string does not keep an ended block open: the `v` of the
+    # block is not the one in force after it.
+    labels = labels_after(
+        "if true {", "  let v: pb.Pt = pb.make()", "  print(v.y)", "}", 'print("{")'
+    )
+    assert "x" in labels and "y" not in labels, labels
