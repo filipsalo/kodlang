@@ -524,6 +524,18 @@ def _substitute_type(t, subst: dict):
     return t
 
 
+def _type_arg_name(t) -> str:
+    """How an instance's name writes the type argument `t`: a struct class has
+    no `name` of its own, an array or optional of one is spelled from its parts."""
+    if isinstance(t, type) and issubclass(t, StructType):
+        return t.__name__
+    if isinstance(t, type) and issubclass(t, ArrayType) and hasattr(t, "item_type"):
+        return f"[{_type_arg_name(t.item_type)}]"
+    if isinstance(t, type) and issubclass(t, OptionalType) and hasattr(t, "inner_type"):
+        return f"{_type_arg_name(t.inner_type)}?"
+    return t.name
+
+
 class GenericTemplate:
     """A parameterized type template (e.g. HashMap[K, V] or Option[T])."""
 
@@ -539,7 +551,7 @@ class GenericTemplate:
         if type_args in self._cache:
             return self._cache[type_args]
         subst = dict(zip(self.param_names, type_args))
-        inst_name = f"{self.name}[{', '.join(t.name for t in type_args)}]"
+        inst_name = f"{self.name}[{', '.join(_type_arg_name(t) for t in type_args)}]"
         if isinstance(self.template, type) and issubclass(self.template, EnumType):
             variants = []
             for vname, info in self.template.variants.items():
@@ -558,5 +570,6 @@ class GenericTemplate:
             result = StructType.make(inst_name, new_fields, self.template.methods)
             result.template_origin = self.template
             result.type_subst = subst
+        result.type_args = type_args
         self._cache[type_args] = result
         return result

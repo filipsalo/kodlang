@@ -1852,7 +1852,10 @@ class Interpreter:
         owner = getattr(cls, "decl_module", None)
         if owner is None or owner is module or owner is self.program.builtins:
             return name
-        if module.names.get(name) is cls:
+        named = module.names.get(name)
+        if isinstance(named, types.GenericTemplate):
+            named = named.template
+        if named is cls:
             return name
         imports = self._imports(module, owner)
         for imp in imports:
@@ -1865,17 +1868,35 @@ class Interpreter:
         return name
 
     def _shown_value_type(self, module, value):
-        """How an error names the type of `value`: `_type_name`, written the way
-        `module` would when another module declares a type of that name too."""
-        if isinstance(value, types.StructType):
-            return self._shown_type(module, type(value))
+        """How an error names the type of `value`, written the way `module` would
+        when another module declares a type of that name too. A `T or Error` is
+        spelled from its Ok payload, and an Err result has no `T` to show."""
         if isinstance(value, types.EnumValue):
             return self._shown_type(module, value.enum_type)
-        return _type_name(value)
+        if isinstance(value, types.ResultValue):
+            ok = self._shown_value_type(module, value.payload) if value.ok else "_"
+            return f"{ok} or Error"
+        return self._shown_class(module, type(value))
+
+    def _shown_class(self, module, cls):
+        """How an error names the type `cls` of a value, or a type argument."""
+        if isinstance(cls, type):
+            if issubclass(cls, (types.StructType, types.EnumType)):
+                return self._shown_type(module, cls)
+            if issubclass(cls, types.ArrayType) and hasattr(cls, "item_type"):
+                return f"[{self._shown_class(module, cls.item_type)}]"
+            if issubclass(cls, types.OptionalType) and hasattr(cls, "inner_type"):
+                return f"{self._shown_class(module, cls.inner_type)}?"
+        return getattr(cls, "name", cls.__name__)
 
     def _shown_type(self, module, cls):
-        """How an error names the struct `cls`: bare, unless another module declares a type
-        of that name too."""
+        """How an error names the struct or enum `cls`: bare, unless another module
+        declares a type of that name too; an instance of a generic type is its
+        template and its type arguments written the same way."""
+        origin = getattr(cls, "template_origin", None)
+        if origin is not None:
+            args = ", ".join(self._shown_class(module, t) for t in cls.type_args)
+            return f"{self._shown_type(module, origin)}[{args}]"
         owner = getattr(cls, "decl_module", None)
         if owner is None or not self._declared_elsewhere(cls, owner):
             return cls.__name__
@@ -1895,6 +1916,8 @@ class Interpreter:
         name = cls.__name__
         for other in self._type_modules():
             value = other.names.get(name)
+            if isinstance(value, types.GenericTemplate):
+                value = value.template
             if other is not owner and value is not cls:
                 if _declares_type(other, name) and _declared_name(value) == name:
                     return True
