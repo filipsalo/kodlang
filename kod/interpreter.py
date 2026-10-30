@@ -459,9 +459,17 @@ def _type_name(value):
     return getattr(type(value), "name", type(value).__name__)
 
 
+# The child-node fields of each node class (see _children).
+_node_fields: dict = {}
+
+
 def _children(node):
-    for field in dataclasses.fields(node):
-        value = getattr(node, field.name)
+    fields = _node_fields.get(type(node))
+    if fields is None:
+        fields = [f.name for f in dataclasses.fields(node)]
+        _node_fields[type(node)] = fields
+    for name in fields:
+        value = getattr(node, name)
         if isinstance(value, ast.ASTNode):
             yield value
         elif isinstance(value, (list, tuple)):
@@ -655,25 +663,6 @@ def _check_program_types(interp):
                     _TypeCheck(interp, module, params).body(func.body)
 
 
-# The child-node fields of each node class (see _children).
-_node_fields: dict = {}
-
-
-def _child_nodes(node):
-    fields = _node_fields.get(type(node))
-    if fields is None:
-        fields = [f.name for f in dataclasses.fields(node)]
-        _node_fields[type(node)] = fields
-    for name in fields:
-        value = getattr(node, name)
-        if isinstance(value, ast.ASTNode):
-            yield value
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                if isinstance(item, ast.ASTNode):
-                    yield item
-
-
 class _TypeCheck:
     """One function body's type names, checked in the module that wrote it."""
 
@@ -722,7 +711,7 @@ class _TypeCheck:
             # A function literal, written in the same module.
             self.body(node.body)
             return
-        for child in _child_nodes(node):
+        for child in _children(node):
             self.node(child)
 
     def sees(self, name):
@@ -2206,11 +2195,7 @@ class Interpreter:
             if not isinstance(cls, (type, types.GenericTemplate)):
                 raise KodError(qualified_type_error(alias, name, mod), span)
             return cls
-        value = module.names.get(name)
-        if value is None:
-            value = self._item(module, name)
-        if value is None:
-            value = self.program.builtins.names.get(name)
+        value = self._named(module, name)
         if value is None:
             aliases = {imp.local_name: imp.module_name for imp in module.get_imports()}
             hint = type_hint(self.program, module.source_file.path, aliases, name)
