@@ -403,7 +403,11 @@ transparent: a value of the alias type is a value of `T`, with all of its
 methods, fields and operators. The target can be any type, including one
 declared further down the module or one from the module's own imports
 (`type Num2 = dep.Num`, usable as `mid.Num2` from a module that imports
-only `mid`):
+only `mid`, or `type Num = dep.Num` to pass the name on as `mid.Num`).
+Each module's aliases are its own: two modules may declare aliases of one
+name whether or not they stand for the same type, and a module's alias may
+take the name of a struct, enum or interface another module declares (see
+[Modules](modules.md#where-names-resolve)):
 
 ```kod
 type Name = str

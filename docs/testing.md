@@ -68,7 +68,7 @@ test "map lookup hits" {
 ## Discovery
 
 - `kod test <file>` builds the file and every transitively imported module that contains `test` blocks, then runs them all in one binary.
-- `kod test <dir>` walks the directory for `*_test.kod`, builds them all in one binary via a temporary aggregator at the project root. The files then form one program, whose modules share type names for now (see [Modules](modules.md#where-names-resolve)): two test files that each declare a struct, enum or interface of the same name, such as a helper `type Pt`, are an error when run together. Rename one, or run each file with `kod test <file>`.
+- `kod test <dir>` walks the directory for `*_test.kod`, builds them all in one binary via a temporary aggregator at the project root. Each file keeps its own type names (see [Modules](modules.md#where-names-resolve)), so two test files may both declare a helper `type Pt`.
 - `kod test .` walks the entire project.
 
 The aggregate exit code is 0 if every test passed, non-zero otherwise.

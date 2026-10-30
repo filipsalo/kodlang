@@ -106,8 +106,10 @@ let s = .Circle(r: 2)
 
 `let s: Shape = .Circle(r: 2)` and `Shape.Circle(r: 2)` both work. The
 error writes an imported enum through its import alias, as in
-`geo.Shape`. It suggests an enum whose variant takes the payload written
-(a unit variant for a bare `.Circle`), preferring the module's own enum
+`geo.Shape`, so when the module's own `Shape` and an imported `geo.Shape`
+both declare `Circle`, the error names `Shape` and `geo.Shape`. It
+suggests an enum whose variant takes the payload written (a unit variant
+for a bare `.Circle`), preferring the module's own enum
 when several do. Enums of modules a module doesn't import don't count, so
 a generic method or a default written in an imported module means the
 same variant whichever program uses it. Only when none of the enums the
