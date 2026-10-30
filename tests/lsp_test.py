@@ -1281,3 +1281,51 @@ def test_completion_offers_the_members_of_the_type_the_buffer_means(
     )
     labels = [item["label"] for item in resp["result"]["items"]]
     assert labels.count("Pt") == 1, labels
+
+
+def test_completion_after_a_block_that_hid_the_receiver(lsp_binary, tmp_path):
+    # An inner `let v` hides the outer one until its block ends; the
+    # members offered are those of the `v` in force at the cursor.
+    uri = _same_named_types(tmp_path)
+    source = (
+        'import "./pa"\n'
+        'import "./pb"\n'
+        "func main(p: pb.Pt) -> int64 {\n"
+        "  let v: pa.Pt = pa.make()\n"
+        "  if true {\n"
+        "    let v: pb.Pt = pb.make()\n"
+        "    print_int(v.y)\n"
+        "    p.\n"
+        "  }\n"
+        "  v.\n"
+        "  return 0\n"
+        "}\n"
+    )
+
+    def labels_at(line, character, text):
+        resp = _buffer_session(
+            lsp_binary,
+            uri,
+            text,
+            {
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                },
+            },
+        )
+        return [item["label"] for item in resp["result"]["items"]]
+
+    after = labels_at(9, 4, source)
+    assert "x" in after and "size" in after, after
+    assert "y" not in after and "area" not in after, after
+    inside = labels_at(7, 6, source.replace("    p.\n", "    v.\n"))
+    assert "y" in inside and "area" in inside, inside
+    assert "x" not in inside and "size" not in inside, inside
+    # A parameter hidden in an inner block is back after it.
+    hidden = source.replace("  let v: pa.Pt = pa.make()\n", "").replace(
+        "main(p: pb.Pt)", "main(v: pa.Pt)"
+    )
+    after_param = labels_at(8, 4, hidden)
+    assert "x" in after_param and "y" not in after_param, after_param
