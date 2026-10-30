@@ -168,7 +168,9 @@ let label: str = match direction {
 ```
 
 Payload, `Some(x)`, and `Ok(v)` / `Err(e)` bindings are in scope in the
-arm's expression, just as in the statement form:
+arm's expression, just as in the statement form. They may hide a local of
+the same name, which is back after the arm (see
+[Blocks and bindings](control-flow.md#blocks-and-bindings)):
 
 ```kod
 let area: int64 = match shape {
@@ -222,7 +224,10 @@ if module.decls[i] is .Func(decl_id) {
 
 An optional `else { ... }` runs when the pattern doesn't match.
 Pattern bindings stay scoped to the matching arm — they aren't
-in scope in the `else` block. As in a `match` arm, the pattern can name
+in scope in the `else` block. There and after the `if`, a name the
+pattern binds means what it meant before the `if`, such as an outer
+local it hid in the arm: in `if o is Some(o) { … } else { … }` the
+`else` block's `o` is the optional. As in a `match` arm, the pattern can name
 the enum, `if s is Shape.Rect(w, h)`, or an imported one,
 `if s is geo.Shape.Rect(w, h)`.
 
@@ -265,6 +270,9 @@ or a `match` whose every branch exits, in a `for true` loop it can't
 let .Some(v) = m.get(key) else { return -1 }
 // v is in scope here
 ```
+
+The bindings start after the else block, so inside it a name the
+pattern binds still has the binding it had before the let-else, if any.
 
 The pattern always starts with a `.`. On a `T?` value (like
 `m.get(key)` above), `.Some(v)` binds the unwrapped payload and

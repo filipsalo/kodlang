@@ -32,10 +32,12 @@ func origin() -> vec.Vec2 {
 Qualified constructors have the imported type, so `let v = vec.Vec2(x: 1, y: 2)`
 needs no annotation before `v.x`. Calling a function the module doesn't
 declare, such as `vec.lenght(v)`, is an error with a did-you-mean hint.
-A local variable or parameter named like an import alias hides the
-module from its declaration on: after `let vec = Thing()`, `vec.len()`
-calls `Thing`'s method. Before that `let`, in its own initializer (`let vec
-= vec.make(1)`) and after the block that declares it, `vec.` is the module.
+A local or parameter named like an import alias hides the module where
+it is in force. After `let vec = Thing()`, `vec.len()` calls `Thing`'s
+method until the block that declared it ends. Before that `let`, in its
+own initializer (`let vec = vec.make(1)`) and after its block, `vec.` is
+the module again, or an outer binding of that name. In a type,
+`vec.Vec2` always means the module.
 A function named like an import alias doesn't hide it: with `func vec()`
 declared too, `vec()` calls the function and `vec.make(1)` the module's.
 

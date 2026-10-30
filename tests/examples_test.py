@@ -200,6 +200,7 @@ def test_read_file_pipe(sh_kodc):
         "tests/xmod_return_kind.kod",
         "tests/interface_dispatch.kod",
         "tests/selfhost_parity.kod",
+        "tests/block_scopes.kod",
         "tests/type_names_per_module.kod",
     ],
 )
@@ -207,10 +208,9 @@ def test_selfhost_matches_interpreter(target: str, sh_kodc):
     """Byte-identity check between the native sh_kodc binary and kodc.kod
     driven through the Python interpreter. Keeps the bootstrap path (which
     runs the compiler under the interpreter) honest. The targets cover
-    imports, structs, enums, interfaces, match, methods, (via
-    selfhost_parity.kod) the statement lowering the compiler sources use,
-    and (via type_names_per_module.kod) modules that declare types of one
-    name."""
+    imports, structs, enums, interfaces, match, methods, block scopes, (via
+    selfhost_parity.kod) the statement lowering the compiler sources use, and
+    (via type_names_per_module.kod) modules that declare types of one name."""
     sh_out = subprocess.run(
         [str(sh_kodc), target],
         cwd=ROOT,
@@ -301,10 +301,14 @@ def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
     lines = ["type Hard = struct {", "    tag: str"]
     lines += ["    func fail(self, anon msg: str) -> none {", "        kod_panic(msg)"]
     lines += ["    }", "}"]
+    lines += ["interface Failer {", "    func fail(self, anon msg: str) -> none", "}"]
     n = 1000
     for i in range(n):
         lines += [f"func d{i}(anon msg: str) -> none {{", f"    d{i + 1}(msg)", "}"]
-    lines += [f"func d{n}(anon msg: str) -> none {{", '    let h = Hard(tag: "x")']
+    lines += [
+        f"func d{n}(anon msg: str) -> none {{",
+        '    let h: Failer = Hard(tag: "x")',
+    ]
     lines += ["    h.fail(msg)", "}"]
     for i in range(n):
         lines += [f"func f{i}(anon k: int64) -> int64 {{", f'    return d{i}("x")', "}"]

@@ -4562,7 +4562,7 @@ test "a local or parameter named kod_panic doesn't end a path" {
     assert errs[1].line == 14
 }
 
-test "a method on a local may return until blocks get scopes" {
+test "a method on a local never returns when its own method doesn't" {
     let errs: [codegen.Diagnostic] = test_support.try_compile("""
         type Hard = struct {
             tag: str
@@ -4588,6 +4588,15 @@ test "a method on a local may return until blocks get scopes" {
             }
             rebound_param(Soft(tag: "s"))
         }
+        func c2(anon n: int64) -> int64 {
+            shadowed(n)
+        }
+        func c3(anon xs: [Soft]) -> int64 {
+            loop_var(xs)
+        }
+        func c4(anon xs: [Soft]) -> int64 {
+            loop_param(Hard(tag: "h"), xs)
+        }
         func c5() -> int64 {
             plain_let()
         }
@@ -4597,9 +4606,46 @@ test "a method on a local may return until blocks get scopes" {
         func c7() -> int64 {
             generic_local()
         }
+        func c8(anon n: int64) -> int64 {
+            local_fn(n)
+        }
         func rebound_param(anon r: Soft) -> none {
             let r = Hard(tag: "h")
             r.fail("x")
+        }
+        func shadowed(anon n: int64) -> none {
+            let r = Hard(tag: "outer")
+            mut i = 0
+            for i < n {
+                let r = Soft(tag: "loop")
+                i += 1
+            }
+            r.fail("x")
+        }
+        func loop_var(anon xs: [Soft]) -> none {
+            let r = Hard(tag: "outer")
+            for r in xs {
+                print(r.tag)
+            }
+            r.fail("x")
+        }
+        func loop_param(anon r: Hard, anon xs: [Soft]) -> none {
+            for r in xs {
+                print(r.tag)
+            }
+            r.fail("x")
+        }
+        func local_fn(anon n: int64) -> none {
+            let kod_panic: int64 = 1
+            mut i = 0
+            for i < n {
+                let kod_panic = func(anon m: str) -> none {
+                    print(m)
+                }
+                kod_panic("loop")
+                i += 1
+            }
+            kod_panic("end")
         }
         func plain_let() -> none {
             let r = Hard(tag: "h")
@@ -4628,17 +4674,50 @@ test "a method on a local may return until blocks get scopes" {
             return b.v
         }
         """)
-    assert len(errs) == 5
-    mut i = 0
-    for name in ["c1", "c5", "c6", "c7"] {
-        assert errs[i].message.contains(f"`{name}` can reach its end without returning a value")
-        i += 1
-    }
-    assert errs[4].message.contains("the else block of a let-else must leave the scope")
-    assert errs[4].line == 54
+    assert len(errs) == 0
 }
 
-test "a block can't bind a name an enclosing block still has" {
+test "a method on a local is the one of the binding in force at the call" {
+    let errs: [codegen.Diagnostic] = test_support.try_compile("""
+        type Hard = struct {
+            tag: str
+            func fail(self, anon msg: str) -> none {
+                kod_panic(msg)
+            }
+        }
+        type Soft = struct {
+            tag: str
+            func fail(self, anon msg: str) -> none {
+                print(msg)
+            }
+        }
+        func else_block(anon o: int64?) -> int64 {
+            let r = Hard(tag: "h")
+            let .Some(v) = o else {
+                let r = Soft(tag: "s")
+                r.fail("none")
+            }
+            return v
+        }
+        func retyped(anon n: int64) -> int64 {
+            if n > 0 {
+                return n
+            }
+            let r = Hard(tag: "h")
+            let r = Soft(tag: "s")
+            r.fail("x")
+        }
+        func main() -> int64 {
+            return else_block(1) + retyped(2)
+        }
+        """)
+    assert len(errs) == 2
+    assert errs[0].message.contains("the else block of a let-else must leave the scope")
+    assert errs[0].line == 15
+    assert errs[1].message.contains("`retyped` can reach its end without returning a value")
+}
+
+test "a block can bind a name an enclosing block has" {
     let errs: [codegen.Diagnostic] = test_support.try_compile("""
         func main() -> int64 {
             let r = 1
@@ -4675,14 +4754,7 @@ test "a block can't bind a name an enclosing block still has" {
             return 3
         }
         """)
-    assert len(errs) == 3
-    for e in errs {
-        assert e.message == "error: `r` is already a local here (line 2); blocks don't have their own scopes yet, so give this one another name"
-    }
-    assert errs[0].line == 5
-    assert errs[0].col == 13
-    assert errs[1].line == 9
-    assert errs[2].line == 15
+    assert len(errs) == 0
 }
 
 test "an integer literal must fit in int64" {
@@ -4790,7 +4862,7 @@ test "a local hides a function of its name only from its declaration on" {
     assert errs[0].line == 31
 }
 
-test "a value's call is taken to return when what it calls ends in a method on a local" {
+test "a value's call is taken to return when what it calls ends in a method on an interface value" {
     let errs: [codegen.Diagnostic] = test_support.try_compile("""
         type Hard = struct {
             tag: str
@@ -4798,8 +4870,15 @@ test "a value's call is taken to return when what it calls ends in a method on a
                 kod_panic(msg)
             }
         }
+        interface Failer {
+            func fail(self, anon msg: str) -> none
+        }
         func die(anon msg: str) -> none {
             let h = Hard(tag: "d")
+            h.fail(msg)
+        }
+        func vague(anon msg: str) -> none {
+            let h: Failer = Hard(tag: "v")
             h.fail(msg)
         }
         func note(anon msg: str) -> none {
@@ -4810,6 +4889,7 @@ test "a value's call is taken to return when what it calls ends in a method on a
             let x = match k {
                 1 -> r.fail("one")
                 2 -> die("two")
+                3 -> vague("three")
                 else -> 5
             }
             return x
@@ -4822,27 +4902,30 @@ test "a value's call is taken to return when what it calls ends in a method on a
             if h.tag == "b" {
                 return note("b")
             }
-            return die("c")
+            if h.tag == "c" {
+                return die("c")
+            }
+            return vague("d")
         }
         func defaulted(anon o: int64?, anon r: Hard) -> int64 {
             let h = r
             let a = o? or h.fail("none")
-            return (o? or die("none")) + a
+            return (o? or die("none")) + (o? or vague("none")) + a
         }
         func main() -> int64 {
             return 0
         }
         """)
-    let hint = "; the call is taken to return, as `die` ends in `h.fail(msg)` (line 9), a call through a local, which counts as returning until blocks get scopes; if that one never returns, add a `kod_panic(...)` after it"
+    let hint = "; the call is taken to return, as `vague` ends in `h.fail(msg)` (line 16), a method called through an interface value, which is taken to return; if that one never returns, add a `kod_panic(...)` after it"
     assert len(errs) == 4
     assert errs[0].message == f"error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement{hint}"
-    assert errs[0].line == 18
+    assert errs[0].line == 26
     assert errs[1].message == "error: expected `int64`, got `none`"
-    assert errs[1].line == 29
+    assert errs[1].line == 37
     assert errs[2].message == f"error: expected `int64`, got `none`{hint}"
-    assert errs[2].line == 31
+    assert errs[2].line == 42
     assert errs[3].message == f"error: expected `int64`, got `none`{hint}"
-    assert errs[3].line == 36
+    assert errs[3].line == 47
 }
 
 test "why a call is taken to return is told only where one that never returns is allowed" {
@@ -4901,15 +4984,84 @@ test "why a call is taken to return is told only where one that never returns is
             return 0
         }
         """)
-    assert len(errs) == 8
+    assert len(errs) == 6
     for e in errs[0..4] {
         assert e.message == "error: expected `int64`, got `none`"
     }
     assert errs[4].message == "error: expected `int64`, got `none`; a method called through an interface value is taken to return, so call it as a statement and end the path with `kod_panic(...)`"
     let end = "can reach its end without returning a value; it returns `int64`, so add a `return` (or a `kod_panic(...)`) at the end"
-    assert errs[5].message == f"error: `ends` {end}; `die(\"neg\")` (line 36) is taken to return, as `die` ends in `h.fail(msg)` (line 12), a call through a local, which counts as returning until blocks get scopes"
-    assert errs[6].message == f"error: `ends_local` {end}; `h.fail(\"neg\")` (line 43) is a call through a local, which counts as returning until blocks get scopes"
-    assert errs[7].message == f"error: `ends_iface` {end}; `f.fail(\"neg\")` (line 49) is a method called through an interface value, which is taken to return"
+    assert errs[5].message == f"error: `ends_iface` {end}; `f.fail(\"neg\")` (line 49) is a method called through an interface value, which is taken to return"
+}
+
+test "a call that ends in a call through a function value is taken to return" {
+    let errs: [codegen.Diagnostic] = test_support.try_compile("""
+        type Hooks = struct {
+            on_fail: func(str) -> none
+            func fail(self, anon msg: str) -> none {
+                self.on_fail(msg)
+            }
+        }
+        func soft(anon m: str) -> none {
+            print(m)
+        }
+        func die(anon msg: str) -> none {
+            let f = soft
+            f(msg)
+        }
+        func die_param(anon f: func(str) -> none, anon msg: str) -> none {
+            f(msg)
+        }
+        func ends(anon n: int64) -> int64 {
+            if n > 0 {
+                return n
+            }
+            die("neg")
+        }
+        func ends_param(anon n: int64) -> int64 {
+            if n > 0 {
+                return n
+            }
+            die_param(soft, "neg")
+        }
+        func ends_field(anon n: int64, h: Hooks) -> int64 {
+            if n > 0 {
+                return n
+            }
+            h.fail("neg")
+        }
+        func ends_direct(anon n: int64) -> int64 {
+            if n > 0 {
+                return n
+            }
+            let f = soft
+            f("neg")
+        }
+        func ends_direct_field(anon n: int64, h: Hooks) -> int64 {
+            if n > 0 {
+                return n
+            }
+            h.on_fail("neg")
+        }
+        func value_direct(anon f: func(str) -> none, anon n: int64) -> int64 {
+            if n > 0 {
+                return f("pos")
+            }
+            return 0
+        }
+        func main() -> int64 {
+            return ends(1) + ends_param(2) + ends_field(3, h: Hooks(on_fail: soft))
+        }
+        """)
+    let end = "can reach its end without returning a value; it returns `int64`, so add a `return` (or a `kod_panic(...)`) at the end"
+    let why = "a call through a function value, which is taken to return"
+    assert len(errs) == 6
+    assert errs[0].message == f"error: `ends` {end}; `die(\"neg\")` (line 21) is taken to return, as `die` ends in `f(msg)` (line 12), {why}"
+    assert errs[1].message == f"error: `ends_param` {end}; `die_param(soft, \"neg\")` (line 27) is taken to return, as `die_param` ends in `f(msg)` (line 15), {why}"
+    assert errs[2].message == f"error: `ends_field` {end}; `h.fail(\"neg\")` (line 33) is taken to return, as `Hooks.fail` ends in `self.on_fail(msg)` (line 4), {why}"
+    assert errs[3].message == f"error: `ends_direct` {end}; `f(\"neg\")` (line 40) is {why}"
+    assert errs[4].message == f"error: `ends_direct_field` {end}; `h.on_fail(\"neg\")` (line 46) is {why}"
+    assert errs[5].message == "error: expected `int64`, got `none`; a call through a function value is taken to return, so call it as a statement and end the path with `kod_panic(...)`"
+    assert errs[5].line == 50
 }
 
 test "the hint for a body that reaches its end reads the body's own locals" {
@@ -4919,6 +5071,9 @@ test "the hint for a body that reaches its end reads the body's own locals" {
             func fail(self, anon msg: str) -> none {
                 kod_panic(msg)
             }
+        }
+        interface Failer {
+            func fail(self, anon msg: str) -> none
         }
         func f() -> none {
             kod_panic("f")
@@ -4940,7 +5095,7 @@ test "the hint for a body that reaches its end reads the body's own locals" {
             if n > 0 {
                 return n
             }
-            let h = Hard(tag: "x")
+            let h: Failer = Hard(tag: "x")
             h.fail("neg")
         }
         func main() -> int64 {
@@ -4949,8 +5104,8 @@ test "the hint for a body that reaches its end reads the body's own locals" {
         """)
     assert len(errs) == 2
     let end = "can reach its end without returning a value; it returns `int64`, so add a `return` (or a `kod_panic(...)`) at the end"
-    assert errs[0].message == f"error: `by_value` {end}"
-    assert errs[1].message == f"error: `by_method` {end}; `h.fail(\"neg\")` (line 28) is a call through a local, which counts as returning until blocks get scopes"
+    assert errs[0].message == f"error: `by_value` {end}; `f()` (line 24) is a call through a function value, which is taken to return"
+    assert errs[1].message == f"error: `by_method` {end}; `h.fail(\"neg\")` (line 31) is a method called through an interface value, which is taken to return"
 }
 
 test "a function value can be called only from its `let` to the end of its block" {

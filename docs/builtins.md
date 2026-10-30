@@ -6,18 +6,37 @@ icon: lucide/wrench
 
 These names live in `stdlib/builtins.kod` and are available in every Kod program without an explicit import.
 
-A call without a module name, such as `hash(x)`, goes to a local variable
-or parameter of that name that holds a function, from its declaration to
-the end of its block, then to a function the module declares or lists in
-an `import`, and only then to the builtin. A local that holds anything
-else doesn't hide a function, so `let len = len(xs)` and a later `len(ys)`
-both call the builtin. That holds for `len`, `str`, `hash` and `kod_panic`
-too: a module can declare its own `func hash(anon p: Point) -> int64`, and
+A call without a module name, `f(args)`, goes to the first of these that
+exists:
+
+1. a struct named `f` that the module sees (`Pt(x: 1)` constructs even
+   where a local named `Pt` is in force);
+2. the innermost binding of `f` in force, when it holds a function value;
+3. a function the module declares or lists in an `import`;
+4. the builtin of that name.
+
+A binding that holds anything else doesn't hide a function, so
+`let len = len(xs)` and a later `len(ys)` both call the builtin. It does
+hide any outer binding of its name: after `let g = double`, a call
+`g(1)` in a block that binds `let g = 5` goes to the module's or the
+builtin `g`. With neither, it is an error:
+`` `g` is a local of type `int64`, not a function ``.
+
+A function value declared in a block hides an outer one only inside that
+block; after the block, `f(args)` calls the outer one again. With no
+binding of `f` in force and no function of that name, the call is an
+error: `` `f` is called before its `let` `` or
+`` `f` is declared in a block that has ended; declare it outside the block to call it here ``.
+
+The same holds for `len`, `str`, `hash` and `kod_panic`: a module can
+declare its own `func hash(anon p: Point) -> int64`, and
 its `hash(...)` calls use it, while another module's `dep.hash(x)` names
 that one. An f-string always converts its values with the builtin `str`.
 Only the builtin `kod_panic` counts as a call that never returns; a
 module's own or imported `kod_panic`, or a local function value of that
-name, is an ordinary call.
+name, is an ordinary call. A local named `kod_panic` that holds anything
+else doesn't hide the builtin, so `kod_panic(msg)` after
+`let kod_panic = 5` never returns.
 
 ## Output
 

@@ -84,6 +84,11 @@ greet(who: "Alice")
 Useful for prepositions that make call sites read naturally without forcing
 short variable names inside the function.
 
+Each parameter binds a name of its own, `self` included, so two parameters
+can't share one: `func f(anon a: int64, b a: str)` is an error
+(`` parameter `a` is declared twice; give one of them another name ``). The
+same holds for methods, interface methods, externs and function literals.
+
 ## Default values
 
 Trailing parameters may declare a default with `= expr`, and a call can
@@ -169,46 +174,53 @@ let a `for true` loop finish.
 The builtin `kod_panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
 body by these rules. A function of the module or one it imports named
-`kod_panic`, or a local function value of that name declared before the
-call, hides the builtin (see [Built-ins](builtins.md)). So a helper that
-ends in `kod_panic(...)` never returns, and nor does one that ends in a
-call of another such helper (`self.fail(msg)`, `log.die(msg)`, or a
-function declared further down), or in a `for true` loop it can't `break`
-out of. A call that leads back to the function itself doesn't count:
+`kod_panic`, or a local function value of that name in force at the
+call, hides the builtin (see [Built-ins](builtins.md)). A local named
+`kod_panic` that holds anything else doesn't, so `kod_panic(msg)` after
+`let kod_panic = 5` never returns. So a helper that ends in
+`kod_panic(...)` never returns, and nor does one that ends in a call of
+another such helper (`self.fail(msg)`, `log.die(msg)`, or a function
+declared further down), or in a `for true` loop it can't `break` out of.
+A call that leads back to the function itself doesn't count:
 `func spin() -> none { spin() }` is taken to return.
 
-Blocks don't have their own scopes yet, so a local's type can change
-between its bindings. Until they do, a call counts as never returning
-only when what it calls doesn't depend on such a type: the builtin
-`kod_panic`, a function of the module or one it imports (`die(msg)`), a
-function of an imported module (`log.die(msg)`), or a method whose
-receiver's type depends on no local but `self` and parameters that no
-`let` or let-else in the body binds again (`self.fail(msg)`,
-`self.log.fail(msg)`, `r.fail(msg)` for such a parameter `r` of a
-struct type, `reporter().fail(msg)`, and `make(t).fail(msg)` or
-`self.reps[i].fail(msg)` even for locals `t` and `i`, since the type of
-the receiver doesn't depend on them). A method whose receiver's type
-depends on any other local is taken to return, whether a `let`
-(`let r = Reporter(); r.fail(msg)`), a match arm, `if … is`, let-else or
-`for` binds it, and a parameter that the body binds again counts as such
-a local. So is a plain call of a name that such a local has at that
-point, even when it doesn't hold a function (`kod_panic(msg)` after
-`let kod_panic = 5`). To end the path there, put a `kod_panic(...)` or a
-`return` after the call.
+This holds for a call of:
+
+- a function of the module or one it imports (`die(msg)`), or a function
+  of an imported module (`log.die(msg)`);
+- a method of a struct, whatever it's called on: `self`, a parameter,
+  any local, a field or a call's result (`self.fail(msg)`,
+  `self.log.fail(msg)`, `r.fail(msg)`, `self.reps[i].fail(msg)`,
+  `reporter().fail(msg)`), as long as that expression's type is known at
+  the call. A local has the type of its binding in force there, whether a
+  `let`, let-else, match arm, `if … is` or `for` binds it, so
+  `r.fail(msg)` never returns after `let r = Reporter()`, even where `r`
+  is also a parameter of another type.
+
+Two kinds of call are always taken to return, because what they call is
+chosen at run time:
+
+- a call through a function value (a local, parameter or field of a
+  function type);
+- a method called through an interface value.
+
+End such a path with a `kod_panic(...)` or a `return` after the call.
 
 A call in a value's place, as a returned value, a match arm's value or an
-`x? or ...` default, is decided where it is written, from the type its
-receiver has there, so `return r.fail(msg)` never returns after
-`let r = Reporter()`. What it calls is still decided by the rules above:
-`return die(msg)` is an error when `die` ends in `r.fail(msg)` on such a
-local, and the error names that call and its line
+`x? or ...` default, is decided where it is written by the same rules, so
+`return r.fail(msg)` never returns after `let r = Reporter()`, and nor
+does `return die(msg)` when `die` ends in that call. When what it calls
+ends in a call taken to return, the error names that call and its line:
+`return die(msg)` is an error when `die` ends in `r.fail(msg)` after
+`let r: Failer = Reporter()`, for an interface `Failer`
 (`` as `die` ends in `r.fail(msg)` (line 19) ``, or
-`` (line 19 of lib/log.kod) `` when the call is in another module) and
-says to put a `kod_panic(...)` after it. The `can reach its end` error names it too
-when the body ends in such a call, or in a call through a local of its
-own. A method called through an interface value is taken to return
-wherever it is called, since the method that runs is chosen at run
-time: call it as a statement and end the path with `kod_panic(...)`.
+`` (line 19 of lib/log.kod) `` when the call is in another module), and
+it says to put a `kod_panic(...)` after it. The `can reach its end` error
+names that call too when the body ends in a call of such a function, and
+says so when the body itself ends in a call through a function value or
+a method called through an interface value. Such a call is taken to
+return wherever it is written: call it as a statement and end the path
+with `kod_panic(...)`.
 
 ## `main`
 
@@ -276,19 +288,26 @@ print_int(g(21))             // 42 — indirect call through g
 print_int(apply(triple, 14)) // 42 — function passed as callback
 ```
 
-Plain named functions only — no anonymous functions (lambdas) or
-closures yet. A bare identifier in value position resolves to the
-function's address when no local of that name is bound there; a
-call site `f(args)` does an indirect `blr` when `f` is a local of
-function type declared before it, falling through to the direct `bl`
-otherwise. A function value declared in a block, such as an `if` or
-loop body, is called that way only from its `let` to the end of the
-block. Elsewhere `f(args)` calls the module's or an imported function, or
-the builtin, named `f`, and `f` as a value is that function; with none
-of those it is an error:
+A function literal, `func(anon n: int64) -> int64 { return n + 1 }`, is
+a value of its function type too. It doesn't see the locals of the
+function it's written in, since there are no closures yet.
+
+A bare identifier in value position resolves to the function's address
+when no local of that name is in force there. A call `f(args)` goes to a
+struct named `f` first, so `Pt(x: 1)` constructs even where a local
+named `Pt` is in force. Otherwise it does an indirect `blr` when the
+innermost binding of `f` in force holds a function value, and a direct
+`bl` of the module's, an imported or the builtin function named `f` when
+no binding of `f` is in force or it holds anything else. A function value
+declared in a block, such as an `if` or loop body, is called that way
+only from its `let` to the end of the block, and after the block `f(args)`
+calls an outer function value of that name again. Elsewhere `f(args)`
+calls the module's or an imported function, or the builtin, named `f`,
+and `f` as a value is that function; with none of those it is an error:
 `` `f` is declared in a block that has ended `` after the block, and
 `` `f` is called before its `let` `` (or `` read ``) before the
-declaration (see [Blocks and bindings](control-flow.md#blocks-and-bindings)).
+declaration (see [Blocks and bindings](control-flow.md#blocks-and-bindings)
+and [Built-ins](builtins.md)).
 
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a
