@@ -13,7 +13,9 @@ from kod import values as types
 from kod.exceptions import KodError, get_source
 from kod.parser import (
     UnknownTypeError,
+    _declares_type,
     qualified_type_error,
+    shown_path,
     type_hint,
     with_suggestion,
 )
@@ -193,6 +195,25 @@ def _listed_name_clash(module):
     return None
 
 
+def _builtin_name_clash(module, builtins):
+    """A type the module declares under the name of a builtin one, or None."""
+    if module is builtins:
+        return None
+    for stmt in module.body:
+        if isinstance(stmt, ast.TypeDeclaration):
+            name, span = stmt.name.id, stmt.name.span
+        elif isinstance(stmt, ast.InterfaceDeclaration):
+            name, span = stmt.name, _word_span(stmt.span, stmt.name, " ")
+        else:
+            continue
+        if _declares_type(builtins, name):
+            return KodError(
+                f"`{name}` is the name of a builtin type; give this type another name",
+                span,
+            )
+    return None
+
+
 # A cache entry not filled yet: None is a cached miss.
 _UNSET = object()
 
@@ -332,13 +353,22 @@ def _enums_with(names, variant_name):
     for val in names.values():
         if isinstance(val, types.GenericTemplate):
             val = val.template
+        # An alias of a generic instance is no enum of its own: the template is.
         if (
             isinstance(val, type)
             and hasattr(val, "variants")
             and variant_name in val.variants
+            and not hasattr(val, "template_origin")
         ):
             found.append(val)
     return found
+
+
+def _declared_name(value):
+    """The name a struct, enum or generic type was declared with; an alias keeps its target's."""
+    if isinstance(value, types.GenericTemplate):
+        return value.name
+    return getattr(value, "__name__", None)
 
 
 def _args_fit(enum, variant_name, args):
@@ -922,7 +952,9 @@ class Interpreter:
             if errors:
                 err = errors[0]
                 raise err.word() if isinstance(err, UnknownTypeError) else err
-            clash = _listed_name_clash(module)
+            clash = _builtin_name_clash(module, self.program.builtins)
+            if clash is None:
+                clash = _listed_name_clash(module)
             if clash is not None:
                 raise clash
         for module in self.program:
@@ -1629,13 +1661,13 @@ class Interpreter:
         for enum in fitting:
             if getattr(enum, "decl_module", None) is module:
                 pick = enum
-        written = [self._written_enum(module, enum) for enum in found]
+        written = [self._written_type(module, enum) for enum in found]
         names = ", ".join(f"`{name}`" for name in written[:-1])
         both = "both" if len(found) == 2 else "all"
         advice = "give the value a type"
         if visible:
             advice = (
-                f"write `{self._written_enum(module, pick)}.{variant_name}` or {advice}"
+                f"write `{self._written_type(module, pick)}.{variant_name}` or {advice}"
             )
         raise KodError(
             f"`.{variant_name}` is ambiguous: {names} and `{written[-1]}` {both} declare it; {advice}",
@@ -1663,18 +1695,52 @@ class Interpreter:
                 order.append(dep)
                 self._add_imported(dep, order, seen)
 
-    def _written_enum(self, module, enum):
-        """How `module` writes `enum`: bare when it's its own or a builtin, else through its alias."""
-        owner = getattr(enum, "decl_module", None)
-        if (
-            owner is not None
-            and owner is not module
-            and owner is not self.program.builtins
-        ):
-            for imp in module.get_imports():
-                if self._resolve_import(module, imp) is owner:
-                    return f"{imp.local_name}.{enum.name}"
-        return enum.name
+    def _written_type(self, module, cls):
+        """How `module` writes the enum or struct `cls`: bare when it's its own, a builtin,
+        aliased or listed in an import, else through its import alias, else with its file
+        if another module declares the name."""
+        name = cls.__name__
+        owner = getattr(cls, "decl_module", None)
+        if owner is None or owner is module or owner is self.program.builtins:
+            return name
+        if module.names.get(name) is cls:
+            return name
+        imports = self._imports(module, owner)
+        for imp in imports:
+            if name in imp.items:
+                return name
+        if imports:
+            return f"{imports[0].local_name}.{name}"
+        if self._declared_elsewhere(cls, owner):
+            return f"{name} ({shown_path(self.program, owner)})"
+        return name
+
+    def _shown_type(self, module, cls):
+        """How an error names the struct `cls`: bare, unless another module declares a type
+        of that name too."""
+        owner = getattr(cls, "decl_module", None)
+        if owner is None or not self._declared_elsewhere(cls, owner):
+            return cls.__name__
+        return self._written_type(module, cls)
+
+    def _imports(self, module, owner):
+        """The imports of `module` that load `owner`."""
+        return [
+            imp
+            for imp in module.get_imports()
+            if self._resolve_import(module, imp) is owner
+        ]
+
+    def _declared_elsewhere(self, cls, owner):
+        """Whether a module other than `owner` declares a different type of `cls`'s name;
+        an alias doesn't count, as a message writes the type an alias stands for."""
+        name = cls.__name__
+        for other in self._type_modules():
+            value = other.names.get(name)
+            if other is not owner and value is not cls:
+                if _declares_type(other, name) and _declared_name(value) == name:
+                    return True
+        return False
 
     def _check_labels(self, func, args):
         if isinstance(func, BoundMethod):
@@ -2443,21 +2509,23 @@ class Interpreter:
                 for v in getattr(struct_type, "struct_fields", [])
             }
             setattr(struct_type, "_kod_fields", fields)
-        shown = struct_type.__name__
         names = []
         for i, arg in enumerate(args):
             label = arg.label if isinstance(arg, ast.FunctionCallParam) else None
             if label is None:
+                shown = self._shown_type(module, struct_type)
                 raise KodError(_unlabelled_field(shown, fields, args, i), arg.span)
             name = label.id
             where = label.span
             if name not in fields:
+                shown = self._shown_type(module, struct_type)
                 raise KodError(f"struct `{shown}` has no field `{name}`", where)
             if name in names:
                 raise KodError(f"field `{name}` is given twice", where)
             names.append(name)
         for name, (field, _slot) in fields.items():
             if field.default is None and name not in names:
+                shown = self._shown_type(module, struct_type)
                 raise KodError(
                     f"struct `{shown}` requires field `{name}` (it has no default)",
                     span,

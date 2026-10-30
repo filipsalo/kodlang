@@ -469,8 +469,8 @@ type Codegen = struct {
     append_lhs_id: int64 = 0
     append_lhs_path: str = ""
 
-    // Non-nominal aliases (`type Ids = [int64]`): name → index into alias_kinds.
-    alias_idx: FuncIdx = FuncIdx()
+    // What non-nominal aliases (`type Ids = [int64]`) stand for; a module's own
+    // table (TypeScope.own) holds the index of each of its aliases.
     alias_kinds: [TypeKind] = []
 
     // Keys of the errors report_error has already emitted.
@@ -511,8 +511,6 @@ type Codegen = struct {
     limit_call_spans: [ast.Span] = []
     // Indices into `vars` bound in the scopes entered so far, innermost last.
     bound_log: [int64] = []
-    // Type name → the file that first declared it.
-    type_paths: StrMap = StrMap()
     limit_call_insts: [int64] = []
     limit_call_kinds: [str] = []
     // Function types and literals past the limit that this module reported.
@@ -533,10 +531,6 @@ type Codegen = struct {
     dependent_next: [int64] = []
     // Parameters of the function walked that no binding in its body reuses.
     fixed_names: [str] = []
-    // Alias name → the type the first module's alias of that name stands for.
-    alias_shapes: StrMap = StrMap()
-    // Type names two modules declare, already reported.
-    clashed_types: [str] = []
     // A call through a local of no known type in a body being decided counts as never returning.
     trust_locals: bool = false
     // In a walk only fixed parameters keep their kinds; others have the ones the walk gives them.
@@ -3571,13 +3565,6 @@ type Codegen = struct {
             return
         }
         let found = self.enums_with_variant(variant_name)
-        // A cascade of a type clash: still an attempt, so the statement stays quiet.
-        for f in found {
-            if regalloc.str_in(self.clashed_types, p: self.enums[f].name) {
-                self.report_attempts = self.report_attempts + 1
-                return
-            }
-        }
         mut fitting: [int64] = []
         for f in found {
             if self.args_fit(args, enum_idx: f, variant_idx: self.find_variant_idx(variant_name, enum_idx: f)) {
@@ -3615,15 +3602,76 @@ type Codegen = struct {
         return self.written_type_name(self.enums[idx].name, def_path: self.enums[idx].def_path)
     }
 
+    // A type declared in `def_path` as the module being compiled writes it: bare
+    // when it sees that declaration bare, `alias.name` through an import, else
+    // with its file if another module declares a type of that name.
     func written_type_name(self, anon name: str, def_path: str) -> str {
         if def_path == self.p.path or def_path == self.builtins_path {
             return name
         }
-        let alias = self.import_alias_of(def_path)
-        if len(alias) == 0 {
+        let r = self.module_type_ref(name)
+        if r >= 0 and self.ref_def_path(r) == def_path {
             return name
         }
-        return f"{alias}.{name}"
+        let alias = self.import_alias_of(def_path)
+        if len(alias) > 0 {
+            return f"{alias}.{name}"
+        }
+        if self.declared_elsewhere(name, :def_path) {
+            return f"{name} ({def_path})"
+        }
+        return name
+    }
+
+    // How a message writes a type: its bare name, unless another module declares a type of that name.
+    func shown_type_name(self, anon name: str, def_path: str) -> str {
+        if self.declared_elsewhere(name, :def_path) {
+            return self.written_type_name(name, :def_path)
+        }
+        return name
+    }
+
+    // Whether a module other than the one at `def_path` declares a struct, enum or
+    // interface called `name`; an alias doesn't count, as a message writes the type
+    // an alias stands for.
+    func declared_elsewhere(self, anon name: str, def_path: str) -> bool {
+        if self.type_names.get(name) is Some(n) {
+            if n < 2 {
+                return false
+            }
+        } else {
+            return false
+        }
+        for ts in self.type_scopes {
+            if ts.path != def_path {
+                if ts.own.get(name) is Some(r) {
+                    if r % 4 < 3 and self.ref_def_path(r) != def_path and self.ref_name(r) == name {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    // The file that declares the struct, enum or interface `r` refers to (see TypeScope.own).
+    func ref_def_path(self, anon r: int64) -> str {
+        match r % 4 {
+            0 -> return self.structs[r / 4].def_path
+            1 -> return self.enums[r / 4].def_path
+            2 -> return self.interfaces[r / 4].def_path
+            else return ""
+        }
+    }
+
+    // The name the struct, enum or interface `r` refers to was declared with.
+    func ref_name(self, anon r: int64) -> str {
+        match r % 4 {
+            0 -> return self.structs[r / 4].name
+            1 -> return self.enums[r / 4].name
+            2 -> return self.interfaces[r / 4].name
+            else return ""
+        }
     }
 
     func import_alias_of(self, anon path: str) -> str {
@@ -3839,16 +3887,16 @@ type Codegen = struct {
             .KArrayBytes -> return "[bytes]"
             .KArrayStruct(elem_idx) -> return f"[{self.struct_display_name(elem_idx)}]"
             .KArrayEnum(elem_idx) -> return f"[{self.enum_display_name(elem_idx)}]"
-            .KArrayInterface(elem_idx) -> return f"[{self.interfaces[elem_idx].name}]"
+            .KArrayInterface(elem_idx) -> return f"[{self.iface_display_name(elem_idx)}]"
             .KArrayOptional(inner_kind) -> return f"[{self.kind_display(inner_kind)}?]"
             .KEnum(idx) -> return self.enum_display_name(idx)
-            .KInterface(idx) -> return self.interfaces[idx].name
+            .KInterface(idx) -> return self.iface_display_name(idx)
             .KOptional(inner) -> return f"{self.kind_display(inner)}?"
             .KStruct(idx, type_args) -> {
-                let base: str = self.structs[idx].name
                 if len(type_args) == 0 {
                     return self.struct_display_name(idx)
                 }
+                let base: str = self.shown_type_name(self.structs[idx].name, def_path: self.structs[idx].def_path)
                 mut result: str = f"{base}["
                 mut i: int64 = 0
                 for i < len(type_args) {
@@ -3885,31 +3933,38 @@ type Codegen = struct {
     func struct_display_name(self, anon idx: int64) -> str {
         let info = self.structs[idx]
         if info.template_idx < 0 {
-            return info.name
+            return self.shown_type_name(info.name, def_path: info.def_path)
         }
-        return self.instance_display(self.structs[info.template_idx].name, args: info.template_args)
+        let template = self.structs[info.template_idx]
+        return self.instance_display(self.shown_type_name(template.name, def_path: template.def_path), args: info.template_args)
     }
 
     func enum_display_name(self, anon idx: int64) -> str {
         let info = self.enums[idx]
         if info.template_idx < 0 {
-            return info.name
+            return self.shown_type_name(info.name, def_path: info.def_path)
         }
         if self.is_result_enum_idx(idx) and len(info.template_args) == 2 {
             if self.kind_display(info.template_args[1]) == "Error" {
                 return f"{self.kind_display(info.template_args[0])} or Error"
             }
         }
-        return self.instance_display(self.enums[info.template_idx].name, args: info.template_args)
+        let template = self.enums[info.template_idx]
+        return self.instance_display(self.shown_type_name(template.name, def_path: template.def_path), args: info.template_args)
     }
 
     // `Maybe` for `Maybe[int64]`: how a variant is spelled in source.
     func enum_base_name(self, anon idx: int64) -> str {
         let info = self.enums[idx]
         if info.template_idx < 0 {
-            return info.name
+            return self.shown_type_name(info.name, def_path: info.def_path)
         }
-        return self.enums[info.template_idx].name
+        let template = self.enums[info.template_idx]
+        return self.shown_type_name(template.name, def_path: template.def_path)
+    }
+
+    func iface_display_name(self, anon idx: int64) -> str {
+        return self.shown_type_name(self.interfaces[idx].name, def_path: self.interfaces[idx].def_path)
     }
 
     func instance_display(self, anon base: str, args: [TypeKind]) -> str {
@@ -4616,41 +4671,25 @@ type Codegen = struct {
     }
 
 
-    // Types are found by name alone, so two modules can't both declare one yet.
-    func note_type_decl(self, anon name: str, p: parsing.Parser, span: ast.Span, alias_of: str = "") -> none {
-        if self.type_paths.get(name) is Some(first) {
-            if first == p.path {
-                return
-            }
-            // Aliases of one type resolve alike wherever the name is looked up.
-            if len(alias_of) > 0 {
-                if self.alias_shapes.get(name) is Some(shape) {
-                    if shape == alias_of {
-                        return
-                    }
-                }
-            }
-            self.clashed_types += [name]
-            mut hint = "so rename one of them"
-            if is_test_file(first) and is_test_file(p.path) {
-                hint = "and `kod test` on a directory builds its test files into one program, so rename one or test the files one at a time"
-            }
-            let saved_p = self.p
-            self.p = p
-            self.report_error(f"error: type `{name}` is also declared in {first}; the modules of a program share type names for now, {hint}", :span)
-            self.p = saved_p
+    // The compiler finds the builtins' types by name, so no other module declares one.
+    func check_builtin_type_name(self, anon name: str, p: parsing.Parser, span: ast.Span) -> none {
+        if p.path == self.builtins_path {
             return
         }
-        self.type_paths.set(name, p.path)
-        if len(alias_of) > 0 {
-            self.alias_shapes.set(name, alias_of)
+        if self.type_scope_idx.get(self.builtins_path) is Some(bi) {
+            if self.type_scopes[bi].own.contains(name) {
+                let saved_p = self.p
+                self.p = p
+                self.report_error(f"error: `{name}` is the name of a builtin type; give this type another name", :span)
+                self.p = saved_p
+            }
         }
     }
 
     func register_enum(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
             .Enum(name, name_span, type_params, variants) -> {
-                self.note_type_decl(name, :p, span: name_span)
+                self.check_builtin_type_name(name, :p, span: name_span)
                 let saved_p = self.p
                 self.p = p
                 let saved_names = self.subst_names
@@ -4691,7 +4730,6 @@ type Codegen = struct {
                 self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args, key: f"{p.path}:{name}")]
                 self.enum_idx.set(name, len(self.enums) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.enums) - 1) * 4 + 1)
-                self.drop_alias(name)
             }
             else none
         }
@@ -4713,7 +4751,7 @@ type Codegen = struct {
     func register_struct(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
             .Struct(name, name_span, type_params, fields, methods) -> {
-                self.note_type_decl(name, :p, span: name_span)
+                self.check_builtin_type_name(name, :p, span: name_span)
                 mut field_infos: [FieldInfo] = []
                 mut offset = 0
                 // Temporarily swap parser so resolve_type reads field type
@@ -4748,7 +4786,6 @@ type Codegen = struct {
                 self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span, key: f"{p.path}:{name}")]
                 self.struct_idx.set(name, len(self.structs) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.structs) - 1) * 4)
-                self.drop_alias(name)
             }
             else none
         }
@@ -4761,7 +4798,7 @@ type Codegen = struct {
     func register_interface(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
             .Interface(name, name_span, methods) -> {
-                self.note_type_decl(name, :p, span: name_span)
+                self.check_builtin_type_name(name, :p, span: name_span)
                 let empty_kinds: [TypeKind] = []
                 let empty_strs: [str] = []
                 let empty_defaults: [int64] = []
@@ -4778,7 +4815,6 @@ type Codegen = struct {
                 self.interfaces += [IfaceInfo(:name, methods: method_infos, module_prefix: prefix, def_path: p.path, def_span: name_span, src_p: p, method_decl_ids: methods, key: f"{p.path}:{name}")]
                 self.iface_idx.set(name, len(self.interfaces) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.interfaces) - 1) * 4 + 2)
-                self.drop_alias(name)
             }
             else none
         }
@@ -4828,8 +4864,8 @@ type Codegen = struct {
             mut i: int64 = 0
             for i < len(names) {
                 if done[i] == false and self.type_resolvable(targets[i]) {
-                    let kind = self.register_type_alias(names[i], target: targets[i])
-                    self.note_type_decl(names[i], :p, span: spans[i], alias_of: self.type_key(kind))
+                    self.register_type_alias(names[i], target: targets[i])
+                    self.check_builtin_type_name(names[i], :p, span: spans[i])
                     done[i] = true
                     progress = true
                 }
@@ -4839,46 +4875,37 @@ type Codegen = struct {
         self.p = saved_p
     }
 
-    func register_type_alias(self, anon name: str, target: int64) -> TypeKind {
+    // The alias is the module's own, whatever another module's alias of that name stands for.
+    func register_type_alias(self, anon name: str, target: int64) -> none {
         let kind: TypeKind = self.resolve_type(target)
         match kind {
             .KStruct(idx, _struct_type_args) -> {
                 self.struct_idx.set(name, idx)
                 self.declare_type(name, path: self.p.path, ref: idx * 4)
-                self.drop_alias(name)
             }
             .KEnum(idx) -> {
                 self.enum_idx.set(name, idx)
                 self.declare_type(name, path: self.p.path, ref: idx * 4 + 1)
-                self.drop_alias(name)
             }
             .KInterface(idx) -> {
                 self.iface_idx.set(name, idx)
                 self.declare_type(name, path: self.p.path, ref: idx * 4 + 2)
-                self.drop_alias(name)
             }
             else {
-                mut slot: int64 = -1
-                if self.alias_idx.get(name) is Some(i) {
-                    slot = i
+                // Registered again, an alias keeps the slot it took the first time.
+                mut slot: int64 = len(self.alias_kinds)
+                if self.type_scopes[self.type_scope_of(self.p.path)].own.get(name) is Some(r) {
+                    if r % 4 == 3 {
+                        slot = r / 4
+                    }
                 }
-                if slot >= 0 {
-                    self.alias_kinds[slot] = kind
-                } else {
-                    slot = len(self.alias_kinds)
-                    self.alias_idx.set(name, slot)
+                if slot == len(self.alias_kinds) {
                     self.alias_kinds += [kind]
+                } else {
+                    self.alias_kinds[slot] = kind
                 }
                 self.declare_type(name, path: self.p.path, ref: slot * 4 + 3)
             }
-        }
-        return kind
-    }
-
-    // Map has no remove; -1 marks a shadowed alias.
-    func drop_alias(self, anon name: str) -> none {
-        if self.alias_idx.contains(name) {
-            self.alias_idx.set(name, -1)
         }
     }
 
@@ -6052,7 +6079,7 @@ type Codegen = struct {
     }
 
     // Try `module.Enum.Variant` — bare three-part unit-variant access.
-    // Drops the module qualifier (types are global in the codegen).
+    // `Enum` is one of the types `module` declares.
     func try_three_part_unit_variant(self, dot_lhs: int64, dot_rhs: int64) -> Val? {
         let .Binary(inner_lhs, inner_op, inner_rhs) = self.p.exprs[dot_lhs] else { return none }
         let .Dot = inner_op else { return none }
@@ -8785,7 +8812,7 @@ type Codegen = struct {
     // arena cell {data_ptr at 0, vtable_ptr at 8}. The method index in the
     // vtable matches its order in the interface declaration.
     func compile_iface_method_call(self, anon args: [ast.CallArg], receiver_id: int64, iface_idx: int64, method_name: str, span: ast.Span) -> Val {
-        let iface_name = self.interfaces[iface_idx].name
+        let iface_name = self.iface_display_name(iface_idx)
         mut i = 0
         mut method_idx = -1
         for i < len(self.interfaces[iface_idx].methods) {
@@ -9067,7 +9094,7 @@ type Codegen = struct {
             if actual is .KStruct(struct_idx, _type_args) {
                 what = f"struct `{self.struct_display_name(struct_idx)}`"
             }
-            self.report_error(f"error: {what} doesn't implement interface `{self.interfaces[iface_idx].name}`: {gap}", :span)
+            self.report_error(f"error: {what} doesn't implement interface `{self.iface_display_name(iface_idx)}`: {gap}", :span)
         }
         match actual {
             .KStruct(struct_idx, _struct_type_args) -> return self.emit_iface_box(arg_reg, :struct_idx, :iface_idx)
@@ -12781,7 +12808,7 @@ type Codegen = struct {
     // Register selected items from an imported module into the local
     // namespace so they can be referenced without the module prefix.
     // For functions/externs this appends to func_names/func_labels/func_sigs.
-    // Types (struct/enum) are already global-by-name, so they need no entry.
+    // Types need no entry: a module's import list names them (see TypeScope).
     func register_imported_items(self, anon items: [str], anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
         let idx_m = self.func_idx
         for want in items {
@@ -12882,11 +12909,6 @@ func name_dot(anon name: str) -> int64 {
         i += 1
     }
     return -1
-}
-
-// What `kod test <dir>` gathers into one program.
-func is_test_file(anon path: str) -> bool {
-    return len(path) >= 9 and path[len(path) - 9..len(path)] == "_test.kod"
 }
 
 // A call's source, from its start through the closing bracket that ends its postfix chain.

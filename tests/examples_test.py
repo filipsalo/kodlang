@@ -200,14 +200,17 @@ def test_read_file_pipe(sh_kodc):
         "tests/xmod_return_kind.kod",
         "tests/interface_dispatch.kod",
         "tests/selfhost_parity.kod",
+        "tests/type_names_per_module.kod",
     ],
 )
 def test_selfhost_matches_interpreter(target: str, sh_kodc):
     """Byte-identity check between the native sh_kodc binary and kodc.kod
     driven through the Python interpreter. Keeps the bootstrap path (which
     runs the compiler under the interpreter) honest. The targets cover
-    imports, structs, enums, interfaces, match, methods, and (via
-    selfhost_parity.kod) the statement lowering the compiler sources use."""
+    imports, structs, enums, interfaces, match, methods, (via
+    selfhost_parity.kod) the statement lowering the compiler sources use,
+    and (via type_names_per_module.kod) modules that declare types of one
+    name."""
     sh_out = subprocess.run(
         [str(sh_kodc), target],
         cwd=ROOT,

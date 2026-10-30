@@ -549,6 +549,7 @@ class GenericTemplate:
                 ]
                 variants.append((vname, new_fields))
             result = EnumType.make(inst_name, variants)
+            result.template_origin = self.template
         else:
             new_fields = [
                 dataclasses.replace(f, type=_substitute_type(f.type, subst))
