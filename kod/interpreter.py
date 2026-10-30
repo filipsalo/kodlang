@@ -1298,8 +1298,8 @@ class Interpreter:
             if callee.__dict__["_kod_bound"]:
                 value = self.stack[-1].get(callee.__dict__["_kod_bound"])
                 raise KodError(
-                    f"`{callee.id}` is a local of type `{_type_name(value)}`,"
-                    " not a function",
+                    f"`{callee.id}` is a local of type"
+                    f" `{self._shown_value_type(module, value)}`, not a function",
                     callee.span,
                 )
             # Left in the frame by a block that has ended, or by a later `let`.
@@ -1874,6 +1874,15 @@ class Interpreter:
         if self._declared_elsewhere(cls, owner):
             return f"{name} ({shown_path(self.program, owner)})"
         return name
+
+    def _shown_value_type(self, module, value):
+        """How an error names the type of `value`: `_type_name`, written the way
+        `module` would when another module declares a type of that name too."""
+        if isinstance(value, types.StructType):
+            return self._shown_type(module, type(value))
+        if isinstance(value, types.EnumValue):
+            return self._shown_type(module, value.enum_type)
+        return _type_name(value)
 
     def _shown_type(self, module, cls):
         """How an error names the struct `cls`: bare, unless another module declares a type
