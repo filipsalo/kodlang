@@ -38,11 +38,13 @@ method until the block that declared it ends. Before that `let`, in its
 own initializer (`let vec = vec.make(1)`) and after its block, `vec.` is
 the module again, or an outer binding of that name. In a type or a type
 argument, `vec.Vec2` always means the module, and so does the enum in a
-pattern or an `is`, such as `vec.Shape.Circle`. In an expression, where
-the local is in force, `vec.Vec2(...)` calls a method of the local and
-`vec.Shape.Circle` reads a field of it, and `x is vec.Vec2` and a pattern
-`vec.Vec2(b)` are errors: `` `vec` is a local here, so `vec.Vec2` doesn't
-name a type of its module; give the local another name ``.
+pattern or an `is`, such as `vec.Shape.Circle`, wherever the `is` is
+written: a condition, a `let`, an operand of `and`, an f-string. In an
+expression, where the local is in force, `vec.Vec2(...)` calls a method
+of the local and `vec.Shape.Circle` reads a field of it, and `x is
+vec.Vec2` and a pattern `vec.Vec2(b)` are errors: `` `vec` is a local
+here, so `vec.Vec2` doesn't name a type of its module; give the local
+another name ``.
 A function named like an import alias doesn't hide it: with `func vec()`
 declared too, `vec()` calls the function and `vec.make(1)` the module's.
 
