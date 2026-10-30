@@ -1740,6 +1740,8 @@ class Interpreter:
                     return
                 args = self._evaluate_args(module, statement.args, callee)
                 self.call_function(module, callee, args)
+            case ast.OptionalMethodCall():
+                self.evaluate_expression(module, statement)
             case ast.VariableDeclaration(variable, value, _span, mutable):
                 lhs = self.evaluate_expression(module, variable, as_lvalue=True)
                 value = self._evaluate_for(module, value, variable.type)
