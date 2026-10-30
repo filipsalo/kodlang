@@ -159,8 +159,12 @@ Elsewhere means before its `let`, or after the block, arm or loop that
 bound it when no outer binding is in force. With none of those
 functions, reading or assigning the name is an error:
 `` `x` is read before its `let` `` or
-`` `x` is declared in a block that has ended ``. Declare a name before
-the block to use it after the block:
+`` `x` is declared in a block that has ended ``. When another module
+declares a type of that name and this one doesn't see it, the error is
+the one for that type (`` unknown type `Mode`; lib/modes.kod declares
+`Mode`: write `modes.Mode` or list it in the import (`{ Mode }`) ``), as
+with no local at all. Declare a name before the block to use it after
+the block:
 
 ```kod
 mut label = "other"

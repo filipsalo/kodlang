@@ -488,7 +488,7 @@ class _Scope:
         for stmt in func.body if default is None else [default]:
             _local_names(stmt, self.declared, self.fixed)
         imports = self.module.get_imports() if self.module is not None else ()
-        self.aliases = {imp.local_name for imp in imports}
+        self.aliases = {imp.local_name: imp.module_name for imp in imports}
         # Inside the right-hand side of `is`, whose names are no uses of locals.
         self.plain = 0
 
@@ -525,6 +525,13 @@ class _Scope:
         return None
 
     def unbound(self, name, verb):
+        # A type only another module declares gets its hint, as without the local.
+        if verb != "assigned" and self.module is not None and self.named(name) is None:
+            hint = type_hint(
+                self.program, self.module.source_file.path, self.aliases, name
+            )
+            if hint:
+                return f"unknown type `{name}`; {hint}"
         if name in self.seen:
             use = "call" if verb == "called" else "use"
             return (
