@@ -515,12 +515,13 @@ class Parser:
             case BooleanLiteral():
                 stmt = ast.BooleanLiteral.parse(self)
             case Import():
-                stmt = ast.Import.parse(self)
-                self.import_aliases[stmt.local_name] = stmt.module_name
-                for item in stmt.items:
-                    self.import_items.setdefault(item, stmt.module_name)
+                imp = ast.Import.parse(self)
+                stmt = imp
+                self.import_aliases[imp.local_name] = imp.module_name
+                for item in imp.items:
+                    self.import_items.setdefault(item, imp.module_name)
                 if self.resolve_import:
-                    self.resolve_import(stmt.module_name)
+                    self.resolve_import(imp.module_name)
             case Return():
                 stmt = ast.Return.parse(self)
             case Throw():
