@@ -18,10 +18,9 @@ from kod.span import Span
 # Parser.parse_type_expr; Parser.resolve_type_expr turns one into a
 # concrete values.Type. `parse_type` is the shim that does both, so most
 # callers still get resolved types. Only positions that genuinely don't
-# need resolution (function / extern return types — read by builder's
-# `main` Result-detection and the interpreter's extern-return mapping)
-# store the data form. Struct fields and params still hold resolved types
-# because struct layout reads `.width` off them.
+# need resolution (function / extern return types — read by `main`
+# Result-detection) store the data form. Struct fields and params still
+# hold resolved types because struct layout reads `.width` off them.
 #
 # Mirrors the Kod-side type AST shape so the two frontends don't drift.
 
@@ -125,22 +124,6 @@ def returns_result(func, module, program) -> bool:
         and issubclass(resolved, types.EnumType)
         and resolved.name.startswith("Result[")
     )
-
-
-def dump(node, indent=""):
-    """Dump the AST node."""
-    print(f"{indent}{node.__class__.__name__}(")
-    for field in dataclasses.fields(node):
-        value = getattr(node, field.name)
-        if isinstance(value, list) and len(value) > 0:
-            newindent = indent + "    "
-            print(f"{newindent}{field.name}=[")
-            for item in value:
-                dump(item, newindent + "    ")
-            print(f"{newindent}],")
-        else:
-            print(f"{indent + '    '}{field.name}={value!r},")
-    print(f"{indent}),")
 
 
 Statement = Union[
@@ -1293,18 +1276,6 @@ class Module(ASTNode):
         """Return the canonical module name."""
         return self.source_file.canonical_path.with_suffix("")
 
-    @property
-    def mangled_name(self):
-        return f"_{self.canonical_name.name.replace('/', '$')}"
-
-    @property
-    def asm_path(self):
-        return Path(self.mangled_name).with_suffix(".s")
-
-    @property
-    def obj_path(self):
-        return Path(self.mangled_name).with_suffix(".o")
-
     def resolve_import(self, module_name) -> Path:
         """Resolve an import. Relative (./foo) imports are resolved against
         the importing module; stdlib imports are just the bare path."""
@@ -1478,62 +1449,6 @@ def _pattern_from_is_rhs(cond, parser):
     if isinstance(rhs, name_like) and rhs.id not in ("Some", "Ok", "Err", "none"):
         return TypePattern(rhs.id, "", span)
     return None
-
-
-def _parse_match_pattern(parser, span):
-    """Parse a single match pattern (the bit before `->`)."""
-    if parser.peeking_at(tokens.IntegerLiteral):
-        tok = parser.consume(tokens.IntegerLiteral)
-        return IntegerPattern(_literal_value(parser, tok), span)
-    if parser.peeking_at(tokens.StringLiteral):
-        tok = StringLiteral.parse(parser)
-        return StringPattern(tok.value.to_py_str(), span)
-    if parser.peeking_at(tokens.NoneLiteral):
-        parser.consume(tokens.NoneLiteral)
-        return OptionalNonePattern(span)
-    if parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
-        parser.consume(tokens.Identifier)
-        binding = ""
-        if parser.try_consume(tokens.OpenParen):
-            binding = parser.consume(tokens.Identifier).value
-            parser.consume(tokens.CloseParen)
-        return OptionalSomePattern(binding, span)
-    if parser.peeking_at(tokens.Identifier) and parser.peek().value in ("Ok", "Err"):
-        kind = parser.consume(tokens.Identifier).value
-        binding = ""
-        if parser.try_consume(tokens.OpenParen):
-            binding = parser.consume(tokens.Identifier).value
-            parser.consume(tokens.CloseParen)
-        return (ResultOkPattern if kind == "Ok" else ResultErrPattern)(binding, span)
-    if parser.peeking_at(tokens.Dot):
-        parser.consume(tokens.Dot)
-        variant_name = parser.consume(tokens.Identifier).value
-        bindings = []
-        if parser.try_consume(tokens.OpenParen):
-            while not parser.try_consume(tokens.CloseParen):
-                bindings.append(parser.consume(tokens.Identifier).value)
-                if not parser.try_consume(tokens.Comma):
-                    parser.consume(tokens.CloseParen)
-                    break
-        return ImplicitEnumVariantPattern(variant_name, bindings, span)
-    first = parser.consume(tokens.Identifier).value
-    parser.consume(tokens.Dot)
-    second = parser.consume(tokens.Identifier).value
-    if parser.peeking_at(tokens.Dot):
-        parser.consume(tokens.Dot)
-        variant_name = parser.consume(tokens.Identifier).value
-        enum_name = second
-    else:
-        enum_name = first
-        variant_name = second
-    bindings = []
-    if parser.try_consume(tokens.OpenParen):
-        while not parser.try_consume(tokens.CloseParen):
-            bindings.append(parser.consume(tokens.Identifier).value)
-            if not parser.try_consume(tokens.Comma):
-                parser.consume(tokens.CloseParen)
-                break
-    return EnumVariantPattern(enum_name, variant_name, bindings, span)
 
 
 @dataclasses.dataclass
