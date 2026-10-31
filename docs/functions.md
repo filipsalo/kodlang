@@ -320,11 +320,11 @@ function type carries no defaults.
 Declare external C functions with `extern`:
 
 ```kod
-extern func strlen(anon s: str) -> int64
-extern func putchar(anon c: int64) -> int64
+extern func strlen(anon s: str) -> int64     // compiled programs only
+extern func putchar(anon c: int64) -> int64  // also runs in the interpreter
 ```
 
-These link against the C runtime and any object files passed at link time.
+These link against the C runtime and any object files passed at link time. The interpreter runs only the twelve externs it mirrors (`putchar` is one); calling any other stops with ``error: extern `NAME` is not available in the interpreter``.
 
 ## Recursion
 

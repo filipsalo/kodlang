@@ -4,7 +4,7 @@ icon: lucide/terminal
 
 # CLI reference
 
-The CLI is `kod` (installed as a [project script](install.md)). Run via `uv run kod ...` from the project, or install globally with `uv tool install .`.
+The CLI is `kod` (installed as a [project script](install.md)). Run it as `uv run kod ...` from the repository root: it refreshes the toolchain with `make` and hands off to the native tool `build/apps/kod/kod`. From any other directory it prints one line saying where to run it from and exits 1.
 
 ## Public commands
 
@@ -70,11 +70,9 @@ uv run kod check src/foo.kod
 
 ## Internal / debug commands
 
-These exist to support the bootstrap and for debugging. Their shape may change.
+These exist to support the bootstrap and for debugging. Their shape may change. `sh_kodc` has its own internal subcommands (`_compile`, `_emit-runtime-main`, `_emit-test-runtime-main`).
 
 | Command | Purpose |
 |---------|---------|
 | `kod _interpret <file>` | Run via the Python interpreter (slow; used by sh_kodc's bootstrap). |
-| `kod _emit-asm <file>` | Print the assembly for the entry module to stdout. |
-| `kod _dump-ast <file>` | Pretty-print the parsed AST. |
-| `kod _emit-runtime-main <entry.kod> <out.s>` | Write the `_main` shim for the given entry. Delegates to sh_kodc when available. |
+| `kod _emit-runtime-main <entry.kod> <out.s>` | Write the `_main` shim for the given entry: the bootstrap's version, which the Makefile uses when there is no snapshot. `build/stage1/sh_kodc _emit-runtime-main` writes the same shim. Run from the repository root. |
