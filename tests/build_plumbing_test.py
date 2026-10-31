@@ -50,15 +50,23 @@ def build_and_run(entry: Path | str, stem: str) -> str:
 
 
 @contextlib.contextmanager
-def app_dir(stem: str) -> Iterator[Path]:
-    """`build/apps/<stem>`, removed afterwards unless it was there before."""
-    path = ROOT / "build" / "apps" / stem
+def cleaned(path: Path) -> Iterator[Path]:
+    """`path`, a file or a directory, removed afterwards unless it was there
+    before."""
     existed = path.exists()
     try:
         yield path
     finally:
         if not existed:
-            shutil.rmtree(path, ignore_errors=True)
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+
+def app_dir(stem: str) -> contextlib.AbstractContextManager[Path]:
+    """`build/apps/<stem>`, removed afterwards unless it was there before."""
+    return cleaned(ROOT / "build" / "apps" / stem)
 
 
 @pytest.fixture
@@ -440,3 +448,95 @@ def test_a_tool_that_cannot_be_started_is_named(scratch: Path):
         result.stderr
         == "kod: mkdir could not be run (not found, killed, or its argument list too long)\n"
     )
+
+
+@contextlib.contextmanager
+def preserved(path: Path) -> Iterator[None]:
+    """Put the file `path` back as it was (or remove it, if it was not there)
+    when the body changes it."""
+    before = path.read_bytes() if path.exists() else None
+    try:
+        yield
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        elif not path.exists() or path.read_bytes() != before:
+            # A new file, not a rewrite: macOS kills an executable that was
+            # changed in place after it ran.
+            fresh = path.with_name(path.name + ".restore")
+            fresh.write_bytes(before)
+            fresh.chmod(0o755)
+            os.replace(fresh, path)
+
+
+def tool_is_up_to_date() -> bool:
+    made = subprocess.run(["make", "-s", "-q", "kod"], cwd=ROOT, check=False)
+    return made.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "spelling,name,what",
+    [
+        ("kod", "kod", "the build tool"),
+        ("lsp", "lsp", "the language server"),
+        # What a case-insensitive volume takes for the tool's directory
+        # (U+212A, the Kelvin sign, is a k to it).
+        ("KOD", "kod", "the build tool"),
+        ("Kod", "kod", "the build tool"),
+        ("\u212aod", "kod", "the build tool"),
+        ("Lsp", "lsp", "the language server"),
+    ],
+)
+def test_an_entry_that_would_replace_a_tool_is_refused(
+    scratch: Path, spelling: str, name: str, what: str
+):
+    entry = scratch / f"{spelling}.kod"
+    entry.write_text(program("not the tool"))
+    tool = ROOT / "build" / "apps" / name / name
+    existed = tool.exists()
+    before = tool.read_bytes() if existed else b""
+    # Without the guard the build replaces the tool, so put it back.
+    with (
+        cleaned(tool.parent),
+        cleaned(tool.parent / f"{spelling}.obj"),
+        preserved(tool),
+    ):
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        if not (tool.parent.parent / spelling).exists():
+            pytest.skip("this volume tells that name from the tool's")
+        assert tool_is_up_to_date()
+        result = kod_build(entry.relative_to(ROOT))
+        assert result.returncode == 1
+        assert result.stderr == f"kod: an entry named {spelling} would replace {what}\n"
+        assert result.stdout == ""
+        assert tool.exists() == existed
+        assert not existed or tool.read_bytes() == before
+        assert tool_is_up_to_date()
+
+
+@pytest.mark.parametrize(
+    "tool,spelling",
+    [
+        ("kod", "tools/kod.kod"),
+        ("kod", str(ROOT / "tools" / "kod.kod")),
+        ("kod", "./tools/../tools/kod.kod"),
+        ("lsp", str(ROOT / "tools" / "lsp.kod")),
+    ],
+)
+def test_the_source_of_a_tool_is_not_refused_however_it_is_spelled(
+    scratch: Path, tool: str, spelling: str
+):
+    # The build replaces the tool, so run a copy of it.
+    copy = scratch / "kod_copy"
+    shutil.copy2(KOD, copy)
+    exe = ROOT / "build" / "apps" / tool / tool
+    with cleaned(exe.parent), cleaned(exe.parent / f"{tool}.obj"), preserved(exe):
+        result = subprocess.run(
+            [str(copy), "build", spelling],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
