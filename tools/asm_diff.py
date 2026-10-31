@@ -27,6 +27,16 @@ def git(*args: str) -> str:
     ).stdout
 
 
+def copy_link_local_cfg(dest: Path) -> None:
+    """link.local.cfg is not tracked, so a `git archive` copy lacks it, and a
+    machine that needs it (a `clang` that does not find the SDK) could not
+    build the base compiler there. Give the copy this checkout's."""
+    local = ROOT / "link.local.cfg"
+    if local.is_file():
+        shutil.copy2(local, dest / "link.local.cfg")
+        print("asm-diff: copied link.local.cfg into the base copy", file=sys.stderr)
+
+
 def build_base_compiler(rev: str) -> Path:
     try:
         sha = git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").strip()
@@ -43,6 +53,7 @@ def build_base_compiler(rev: str) -> Path:
         ["git", "archive", sha], cwd=ROOT, check=True, capture_output=True
     ).stdout
     subprocess.run(["tar", "-x", "-C", str(src)], input=archive, check=True)
+    copy_link_local_cfg(src)
     if not (src / "bootstrap" / "sh_kodc").exists():
         print(
             f"asm-diff: {rev} has no bootstrap snapshot; building it through the"

@@ -1,8 +1,11 @@
-// The naming rules of kod/build (docs/modules.md, "Symbol and object
-// names"): the symbol prefix a path gets and the object file a module is
-// written to. Run from the repository root, since the twin check looks
-// for `stdlib/<path>.kod` there.
+// kod/build: the naming rules (docs/modules.md, "Symbol and object
+// names"), the symbol prefix a path gets and the object file a module is
+// written to, and the reader of the link configuration (docs/self-hosting.md,
+// "The link configuration"). Run from the repository root, since the twin
+// check looks for `stdlib/<path>.kod` there and the configuration is read
+// from `link.cfg`.
 import "fs"
+import "io"
 import "process"
 import "kod/build"
 import "kod/test_support"
@@ -337,4 +340,265 @@ func main() -> int64 {
 }
 """)
     expect_program_prints(files, entry: "my-app/with space.kod", want: "spaced\n")
+}
+
+// The link configuration. Make reads link.cfg too (`include`), so the reader
+// accepts exactly the lines whose words Make and the driver read alike.
+
+func parse_cfg(anon text: str) -> build.LinkVars {
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    let error: str = build.parse_link_config(text, path: "link.cfg", into: vars, overrides: false)
+    if len(error) > 0 {
+        fail(f"parse_link_config rejected the text: {error}")
+    }
+    return vars
+}
+
+func cfg_error(anon text: str) -> str {
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    return build.parse_link_config(text, path: "link.cfg", into: vars, overrides: false)
+}
+
+// `text` is rejected at `line` with a message that mentions `mentions`.
+func expect_cfg_error(anon text: str, line: int64, mentions: str) -> none {
+    let error: str = cfg_error(text)
+    if build.starts_with(error, prefix: f"link.cfg:{line}:") == false {
+        fail(f"the error for {text} is {error}, want it at line {line}")
+    }
+    if error.contains(": error: ") == false or error.contains(mentions) == false {
+        fail(f"the error for {text} is {error}, want it to mention {mentions}")
+    }
+}
+
+func expect_words(anon vars: build.LinkVars, name: str, want: [str]) -> none {
+    let got: [str] = build.split_words(build.link_value(vars, :name))
+    if len(got) != len(want) {
+        fail(f"{name} has {len(got)} words, want {len(want)}")
+    }
+    mut i: int64 = 0
+    for i < len(want) {
+        if got[i] != want[i] {
+            fail(f"word {i} of {name} is {got[i]}, want {want[i]}")
+        }
+        i = i + 1
+    }
+}
+
+test "a link configuration is NAME := words lines, comments and empty lines" {
+    let vars: build.LinkVars = parse_cfg("""
+# how programs are linked
+LINK := clang -target arm64-apple-darwin -Wl,-dead_strip
+
+# C
+CC := clang
+CFLAGS := -target arm64-apple-darwin -I stdlib -DKOD=1
+OPENSSL := /opt/homebrew/opt/openssl@3
+""")
+    expect_words(vars, name: "LINK", want: ["clang", "-target", "arm64-apple-darwin", "-Wl,-dead_strip"])
+    expect_words(vars, name: "CC", want: ["clang"])
+    expect_words(vars, name: "CFLAGS", want: ["-target", "arm64-apple-darwin", "-I", "stdlib", "-DKOD=1"])
+    expect_words(vars, name: "OPENSSL", want: ["/opt/homebrew/opt/openssl@3"])
+    assert build.link_value(vars, name: "LINK") == "clang -target arm64-apple-darwin -Wl,-dead_strip"
+    assert build.link_value(vars, name: "NOPE") == ""
+    assert build.link_has(vars, name: "CC")
+    assert build.link_has(vars, name: "NOPE") == false
+    assert len(vars.items) == 4
+}
+
+test "an empty value is a value, and a name that is not set is not" {
+    let vars: build.LinkVars = parse_cfg("EMPTY :=\nSET := a\n")
+    assert build.link_has(vars, name: "EMPTY")
+    assert build.link_value(vars, name: "EMPTY") == ""
+    assert len(build.split_words(build.link_value(vars, name: "EMPTY"))) == 0
+    assert build.link_has(vars, name: "NEVER") == false
+}
+
+test "the last line needs no newline, and an empty text sets nothing" {
+    let vars: build.LinkVars = parse_cfg("A := 1\nB := 2")
+    assert build.link_value(vars, name: "B") == "2"
+    assert len(parse_cfg("").items) == 0
+    assert len(parse_cfg("\n\n# only a comment\n").items) == 0
+    assert len(parse_cfg("#").items) == 0
+}
+
+test "a repeated word is kept as written" {
+    let vars: build.LinkVars = parse_cfg("LIBS := -lz -lz -lssl -lz\n")
+    expect_words(vars, name: "LIBS", want: ["-lz", "-lz", "-lssl", "-lz"])
+}
+
+test "a comment may hold anything the grammar forbids in a line" {
+    // The lines are comments to Make as well, whatever follows the #.
+    parse_cfg("# NAME = $(shell x) \"quoted\" 'q' \\ # again: := é\n")
+    parse_cfg("#NAME := a  b \n")
+    parse_cfg("# a comment with a trailing space \n")
+}
+
+test "a second file sets names again and overrides what the first set" {
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    let first: str = build.parse_link_config("LINK := clang\nCC := clang\n", path: "link.cfg", into: vars, overrides: false)
+    assert first == ""
+    let second: str = build.parse_link_config("# this machine\nLINK := /usr/bin/clang -v\nCC := /usr/bin/clang\n", path: "link.local.cfg", into: vars, overrides: true)
+    assert second == ""
+    assert build.link_value(vars, name: "LINK") == "/usr/bin/clang -v"
+    assert build.link_value(vars, name: "CC") == "/usr/bin/clang"
+    assert len(vars.items) == 2
+}
+
+test "a second file only overrides: a name the first did not set is an error" {
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    assert build.parse_link_config("LINK := clang\nCC := clang\n", path: "link.cfg", into: vars, overrides: false) == ""
+    // A typo, a name of Make's own, a name nothing reads.
+    for name in ["LNK", "CFLAG", "STAGE0", "SHELL", "MAKEFLAGS", "OPENSSL"] {
+        let error: str = build.parse_link_config(f"# machine\nLINK := clang -v\n{name} := x\n", path: "link.local.cfg", into: vars, overrides: true)
+        assert build.starts_with(error, prefix: "link.local.cfg:3:1: error: ")
+        assert error.contains(f"{name} is not set in link.cfg")
+    }
+    // What came before the error was read; the first file may set any name.
+    assert build.link_value(vars, name: "LINK") == "clang -v"
+    let again: build.LinkVars = build.LinkVars(items: [])
+    assert build.parse_link_config("OPENSSL := /x\nSTAGE0 := y\n", path: "link.cfg", into: again, overrides: false) == ""
+    assert len(again.items) == 2
+}
+
+test "a name set twice in one file is an error at the second" {
+    expect_cfg_error("LINK := a\nCC := b\nLINK := c\n", line: 3, mentions: "LINK is set twice")
+    expect_cfg_error("A :=\nA :=\n", line: 2, mentions: "twice")
+    // The error names the file it came from.
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    let error: str = build.parse_link_config("X := 1\nX := 2\n", path: "link.local.cfg", into: vars, overrides: false)
+    assert build.starts_with(error, prefix: "link.local.cfg:2:1: error: ")
+}
+
+test "a line is reported at its line number, empty lines and comments counted" {
+    expect_cfg_error("# one\n\nLINK := a\nbad line\n", line: 4, mentions: ":=")
+    expect_cfg_error("\n\n\n\nlink := a\n", line: 5, mentions: "name")
+}
+
+test "a line that does not fit NAME := words is an error" {
+    // A name is capital letters, digits and _, starting with a letter.
+    expect_cfg_error("link := a\n", line: 1, mentions: "name")
+    expect_cfg_error("Link := a\n", line: 1, mentions: "name")
+    expect_cfg_error("1X := a\n", line: 1, mentions: "name")
+    expect_cfg_error("_X := a\n", line: 1, mentions: "name")
+    expect_cfg_error(" X := a\n", line: 1, mentions: "name")
+    expect_cfg_error(":= a\n", line: 1, mentions: "name")
+    expect_cfg_error("X-Y := a\n", line: 1, mentions: ":=")
+    // `:=` follows the name after one space.
+    expect_cfg_error("X\n", line: 1, mentions: ":=")
+    expect_cfg_error("X a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X = a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X: a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X:= a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X  := a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X ?= a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X += a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X ::= a\n", line: 1, mentions: ":=")
+    expect_cfg_error("X =: a\n", line: 1, mentions: ":=")
+    // A space follows `:=`, unless the value is empty.
+    expect_cfg_error("X :=a\n", line: 1, mentions: "space")
+}
+
+test "words are separated by one space, with none at the end" {
+    expect_cfg_error("X := a  b\n", line: 1, mentions: "one space")
+    expect_cfg_error("X := a \n", line: 1, mentions: "one space")
+    expect_cfg_error("X := \n", line: 1, mentions: "one space")
+    expect_cfg_error("X :=  a\n", line: 1, mentions: "one space")
+    expect_cfg_error("X :=   \n", line: 1, mentions: "one space")
+}
+
+test "a tab or a carriage return is an error anywhere, a CRLF file included" {
+    expect_cfg_error("\tX := a\n", line: 1, mentions: "tab")
+    expect_cfg_error("X :=\ta\n", line: 1, mentions: "tab")
+    expect_cfg_error("X := a\t\n", line: 1, mentions: "tab")
+    expect_cfg_error("# a\tcomment\n", line: 1, mentions: "tab")
+    expect_cfg_error("X := a\r\nY := b\r\n", line: 1, mentions: "carriage return")
+    expect_cfg_error("# a comment\r\n", line: 1, mentions: "carriage return")
+    expect_cfg_error("A := 1\n\r\n", line: 2, mentions: "carriage return")
+    expect_cfg_error("X :=\r\n", line: 1, mentions: "carriage return")
+}
+
+test "a # is a comment only at the start of a line" {
+    expect_cfg_error("X := a # not a comment\n", line: 1, mentions: "#")
+    expect_cfg_error("X := a#b\n", line: 1, mentions: "#")
+    expect_cfg_error("X := #a\n", line: 1, mentions: "#")
+    expect_cfg_error("  # indented\n", line: 1, mentions: "name")
+    expect_cfg_error("X :=# a\n", line: 1, mentions: "space")
+}
+
+test "an empty line is empty, and a comment does not end in a backslash" {
+    expect_cfg_error("A := 1\n \n", line: 2, mentions: "name")
+    expect_cfg_error("# continued \\\nB := 2\n", line: 1, mentions: "backslash")
+    expect_cfg_error("#\\\n", line: 1, mentions: "backslash")
+    parse_cfg("# a backslash \\ inside is fine\n")
+}
+
+test "no byte Make or the shell would read specially is in a word" {
+    expect_cfg_error("X := $(CC)\n", line: 1, mentions: "$")
+    expect_cfg_error("X := ${CC}\n", line: 1, mentions: "$")
+    expect_cfg_error("X := $$\n", line: 1, mentions: "$")
+    expect_cfg_error("X := a \\\n", line: 1, mentions: "\\")
+    expect_cfg_error("X := a\\\n", line: 1, mentions: "\\")
+    expect_cfg_error("X := \"a b\"\n", line: 1, mentions: "\"")
+    expect_cfg_error("X := 'a'\n", line: 1, mentions: "'")
+    expect_cfg_error("X := `cc`\n", line: 1, mentions: "`")
+    expect_cfg_error("X := a;b\n", line: 1, mentions: ";")
+    expect_cfg_error("X := a&b\n", line: 1, mentions: "&")
+    expect_cfg_error("X := a|b\n", line: 1, mentions: "|")
+    expect_cfg_error("X := a<b\n", line: 1, mentions: "<")
+    expect_cfg_error("X := a>b\n", line: 1, mentions: ">")
+    expect_cfg_error("X := (a)\n", line: 1, mentions: "(")
+    expect_cfg_error("X := *.c\n", line: 1, mentions: "*")
+    expect_cfg_error("X := ~/x\n", line: 1, mentions: "~")
+    expect_cfg_error("X := %.c\n", line: 1, mentions: "%")
+    expect_cfg_error("X := a:b\n", line: 1, mentions: ":")
+    expect_cfg_error("X := !a\n", line: 1, mentions: "!")
+    expect_cfg_error("X := café\n", line: 1, mentions: "cannot be in a word")
+}
+
+test "a word may hold what a flag, a path or a prefix needs" {
+    let vars: build.LinkVars = parse_cfg("W := -Wl,-dead_strip -DKOD=1 -std=c11 /opt/homebrew/opt/openssl@3/lib libc++.a ../a_b-c.d +x\n")
+    expect_words(vars, name: "W", want: ["-Wl,-dead_strip", "-DKOD=1", "-std=c11", "/opt/homebrew/opt/openssl@3/lib", "libc++.a", "../a_b-c.d", "+x"])
+}
+
+// Does `lines` hold `want`?
+func holds_line(anon lines: [str], want: str) -> bool {
+    for l in lines {
+        if l == want {
+            return true
+        }
+    }
+    return false
+}
+
+test "Make reads the real link.cfg as the reader does" {
+    let vars: build.LinkVars = build.LinkVars(items: [])
+    let error: str = build.parse_link_config(io.read_file("link.cfg"), path: "link.cfg", into: vars, overrides: false)
+    if len(error) > 0 {
+        fail(error)
+    }
+    // Make's database, printed after "no targets": a variable the file set
+    // follows a `# makefile (from 'link.cfg', line N)` line. (Make lists its
+    // own MAKEFILE_LIST there too.)
+    let made: process.ProcessResult = process.run(["make", "-pq", "-f", "link.cfg"])
+    mut from_make: [str] = []
+    mut previous: str = ""
+    for line in build.lines_of(made.stdout) {
+        if build.starts_with(previous, prefix: "# makefile (from ") and previous.contains("link.cfg") and build.starts_with(line, prefix: "MAKEFILE_LIST ") == false {
+            from_make += [line]
+        }
+        previous = line
+    }
+    assert len(from_make) == len(vars.items)
+    for v in vars.items {
+        let line: str = f"{v.name} := {v.value}"
+        if holds_line(from_make, want: line) == false {
+            fail(f"Make did not read `{line}` from link.cfg")
+        }
+    }
+    // What every program needs is set.
+    for name in ["LINK", "CC", "CFLAGS", "RUNTIME_C", "STAGE0_KOD"] {
+        if len(build.split_words(build.link_value(vars, :name))) == 0 {
+            fail(f"link.cfg sets no {name}")
+        }
+    }
 }

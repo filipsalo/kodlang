@@ -465,3 +465,212 @@ func compile_program(entry_parser: parsing.Parser, entry_module: ast.Module, ent
     }
     return cg
 }
+
+// The link configuration (docs/self-hosting.md, "The link configuration").
+// `link.cfg` and `link.local.cfg` hold `NAME := word word ...` lines, which
+// the Makefile `include`s and the driver reads here. The format is the part
+// of Make syntax that Make and this reader take the same way.
+
+type LinkVar = struct {
+    name: str
+    value: str
+}
+
+type LinkVars = struct {
+    items: [LinkVar]
+}
+
+// The value of `name`, its words separated by one space; "" when it is not
+// set (or set to nothing).
+func link_value(anon vars: LinkVars, name: str) -> str {
+    for v in vars.items {
+        if v.name == name {
+            return v.value
+        }
+    }
+    return ""
+}
+
+func link_has(anon vars: LinkVars, name: str) -> bool {
+    for v in vars.items {
+        if v.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+// Set `name`, replacing what an earlier file set.
+func link_set(anon vars: LinkVars, name: str, value: str) -> none {
+    mut kept: [LinkVar] = []
+    for v in vars.items {
+        if v.name != name {
+            kept += [v]
+        }
+    }
+    kept += [LinkVar(name: name, value: value)]
+    vars.items = kept
+}
+
+// The words of `s`, separated by spaces.
+func split_words(anon s: str) -> [str] {
+    mut words: [str] = []
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i <= len(s) {
+        if i == len(s) or s[i] == ' ' {
+            if i > start {
+                words += [s[start..i]]
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return words
+}
+
+// The lines of `s` without their `\n`, empty ones included (so that a line
+// number is a position in the file); a final newline ends the last line.
+func lines_of(anon s: str) -> [str] {
+    mut lines: [str] = []
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i < len(s) {
+        if s[i] == '\n' {
+            lines += [s[start..i]]
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < len(s) {
+        lines += [s[start..len(s)]]
+    }
+    return lines
+}
+
+func is_cfg_name_byte(anon b: int64) -> bool {
+    return (b >= 'A' and b <= 'Z') or lexing.is_digit(b) or b == '_'
+}
+
+// What a word is made of: nothing Make or a shell would take for anything
+// but itself.
+func is_cfg_word_byte(anon b: int64) -> bool {
+    return lexing.is_alnum(b) or b == '.' or b == '/' or b == ',' or b == '=' or b == '+' or b == '@' or b == '-'
+}
+
+func cfg_error(path: str, line: int64, col: int64, message: str) -> str {
+    return f"{path}:{line}:{col}: error: {message}"
+}
+
+// The byte at `at` as an error message shows it.
+func cfg_byte(anon line: str, at: int64) -> str {
+    let b: int64 = line[at]
+    if b > 32 and b < 127 {
+        let shown: str = line[at..at+1]
+        return f"`{shown}`"
+    }
+    return f"byte {b}"
+}
+
+func cfg_bad_word_byte(anon line: str, at: int64, path: str, number: int64) -> str {
+    return cfg_error(:path, line: number, col: at + 1, message: f"{cfg_byte(line, :at)} cannot be in a word; a word is letters, digits and _ . / , = + @ -")
+}
+
+// The end of the name a line starts with.
+func cfg_name_end(anon line: str) -> int64 {
+    mut end: int64 = 1
+    for end < len(line) and is_cfg_name_byte(line[end]) {
+        end = end + 1
+    }
+    return end
+}
+
+// "" if `line` is empty, a comment or `NAME := words`, else the error.
+func check_link_line(anon line: str, path: str, number: int64) -> str {
+    mut i: int64 = 0
+    for i < len(line) {
+        if line[i] == '\t' {
+            return cfg_error(:path, line: number, col: i + 1, message: "a tab is not allowed")
+        }
+        if line[i] == '\r' {
+            return cfg_error(:path, line: number, col: i + 1, message: "a carriage return is not allowed; the file needs LF line ends")
+        }
+        i = i + 1
+    }
+    if len(line) == 0 {
+        return ""
+    }
+    if line[0] == '#' {
+        // Make would go on with the next line as part of the comment.
+        if line[len(line) - 1] == '\\' {
+            return cfg_error(:path, line: number, col: len(line), message: "a comment cannot end in a backslash")
+        }
+        return ""
+    }
+    if line[0] < 'A' or line[0] > 'Z' {
+        return cfg_error(:path, line: number, col: 1, message: "expected `NAME := words`; a name is capital letters, digits and _, starting with a letter")
+    }
+    let end: int64 = cfg_name_end(line)
+    if end + 3 > len(line) or line[end..end+3] != " :=" {
+        return cfg_error(:path, line: number, col: end + 1, message: "expected ` :=` after the name")
+    }
+    i = end + 3
+    if i < len(line) and line[i] != ' ' {
+        return cfg_error(:path, line: number, col: i + 1, message: "expected a space after `:=`")
+    }
+    // Each word follows one space.
+    for i < len(line) {
+        i = i + 1
+        let start: int64 = i
+        for i < len(line) and is_cfg_word_byte(line[i]) {
+            i = i + 1
+        }
+        if i == start {
+            if i == len(line) or line[i] == ' ' {
+                return cfg_error(:path, line: number, col: i + 1, message: "words are separated by one space, with none at the end")
+            }
+            return cfg_bad_word_byte(line, at: i, :path, :number)
+        }
+        if i < len(line) and line[i] != ' ' {
+            return cfg_bad_word_byte(line, at: i, :path, :number)
+        }
+    }
+    return ""
+}
+
+// Read the text of the file `path` (`link.cfg` or `link.local.cfg`) into
+// `into`: each `NAME := words` line sets a name, replacing what an earlier
+// file set. Returns "" or the first error, `path:line:col: error: ...`
+// (`into` then holds what was read before it). A name is set once per file.
+// With `overrides`, the file may only set names `into` already has: it is
+// `link.local.cfg`, which overrides what `link.cfg` sets and adds nothing.
+func parse_link_config(anon source: str, path: str, into: LinkVars, overrides: bool) -> str {
+    mut seen: [str] = []
+    mut number: int64 = 0
+    for line in lines_of(source) {
+        number = number + 1
+        let bad: str = check_link_line(line, :path, :number)
+        if len(bad) > 0 {
+            return bad
+        }
+        if len(line) > 0 and line[0] != '#' {
+            let end: int64 = cfg_name_end(line)
+            let name: str = line[0..end]
+            if overrides and link_has(into, :name) == false {
+                return cfg_error(:path, line: number, col: 1, message: f"{name} is not set in link.cfg; this file only overrides the names it sets")
+            }
+            for s in seen {
+                if s == name {
+                    return cfg_error(:path, line: number, col: 1, message: f"{name} is set twice in this file")
+                }
+            }
+            seen += [name]
+            mut value: str = ""
+            if len(line) > end + 3 {
+                value = line[end+4..len(line)]
+            }
+            link_set(into, :name, :value)
+        }
+    }
+    return ""
+}

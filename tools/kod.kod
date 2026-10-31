@@ -11,7 +11,13 @@
 //   1. Parse the entry, walk its imports transitively.
 //   2. `sh_kodc _compile` each module to a .o.
 //   3. `sh_kodc _emit-runtime-main` for the entry; `as` it to a .o.
-//   4. `ld` everything together with the prebuilt stage0 .o set.
+//   4. Link everything together with the prebuilt stage0 .o set, with the
+//      `LINK` command of link.cfg (`clang`).
+//
+// link.cfg (and link.local.cfg, which overrides single names on one
+// machine) is read from the working directory: the Makefile includes the same
+// file, so the compiler and every program are linked the same way. It also
+// names the always-linked C files and Kod modules.
 //
 // `run` and `test` end by replacing this process with the program
 // (`become`), so it has the terminal, its output streams as it is
@@ -27,36 +33,33 @@ import "kod/parsing"
 import "kod/ast"
 import "kod/build"
 
-// Stage0 stdlib modules, in the order they should be linked. Each
-// has a prebuilt `build/stage0/_<basename>.o`. Mirrors `STAGE0_OBJS`
-// in the Makefile and `_stage0_module_paths` in test_support.kod. Update
-// all three when a new stdlib module joins stage0. (Kod doesn't have
-// module-level `let`s, so this is a nullary function returning the
-// list each time — cheap.)
-func stage0_module_paths() -> [str] {
-    return ["stdlib/builtins.kod", "stdlib/primitives/int64.kod", "stdlib/primitives/str.kod", "stdlib/primitives/bool.kod", "stdlib/io.kod", "stdlib/process.kod", "stdlib/time.kod", "stdlib/kod/inspect.kod"]
-}
-
 func main(argv: [str]) -> int64 {
-    if len(argv) < 2 {
+    if len(argv) < 3 {
         return usage()
     }
     let cmd: str = argv[1]
+    if cmd != "build" and cmd != "run" and cmd != "test" and cmd != "check" {
+        return usage()
+    }
+    if require_repo_root() != 0 {
+        return 1
+    }
+    let cfg: build.LinkVars = build.LinkVars(items: [])
+    if read_link_config(into: cfg) == false {
+        return 1
+    }
+    if cmd != "check" and require_stage0_objects(cfg) != 0 {
+        return 1
+    }
     if cmd == "build" {
-        if len(argv) < 3 {
-            return usage()
-        }
-        let exe: str = build_executable(argv[2])
+        let exe: str = build_executable(argv[2], :cfg)
         if len(exe) == 0 {
             return 1
         }
         return 0
     }
     if cmd == "run" {
-        if len(argv) < 3 {
-            return usage()
-        }
-        let exe: str = build_executable(argv[2])
+        let exe: str = build_executable(argv[2], :cfg)
         if len(exe) == 0 {
             return 1
         }
@@ -67,18 +70,72 @@ func main(argv: [str]) -> int64 {
         return become(child_argv)
     }
     if cmd == "test" {
-        if len(argv) < 3 {
-            return usage()
-        }
-        return run_test(argv[2])
+        return run_test(argv[2], :cfg)
     }
-    if cmd == "check" {
-        if len(argv) < 3 {
-            return usage()
-        }
-        return run_check_cmd(argv[2])
+    return run_check_cmd(argv[2], stage0: stage0_modules(cfg))
+}
+
+// The commands read `link.cfg` and run `build/stage1/sh_kodc`, both relative
+// to the working directory: say so, rather than fail later with a tool that
+// could not be run. Returns 0 in the repository root of a built tree.
+func require_repo_root() -> int64 {
+    if io.is_file("link.cfg") == false {
+        kod_eprint("kod: link.cfg not found; run kod from the repository root")
+        return 1
     }
-    return usage()
+    if io.is_file("build/stage1/sh_kodc") == false {
+        kod_eprint("kod: build/stage1/sh_kodc not found; run make")
+        return 1
+    }
+    return 0
+}
+
+// Read `link.cfg`, then `link.local.cfg` if there is one (it overrides single
+// names), into `into`. Prints the first error and returns false. The names
+// every build needs must be set.
+func read_link_config(into: build.LinkVars) -> bool {
+    for path in ["link.cfg", "link.local.cfg"] {
+        if io.is_file(path) {
+            let text: str = io.read_file(path)
+            // read_file gives "" for a file it cannot read, which for
+            // link.cfg is no configuration at all.
+            if len(text) == 0 and path == "link.cfg" {
+                kod_eprint("kod: link.cfg is empty or cannot be read")
+                return false
+            }
+            let error: str = build.parse_link_config(text, :path, :into, overrides: path == "link.local.cfg")
+            if len(error) > 0 {
+                kod_eprint(error)
+                return false
+            }
+        }
+    }
+    for name in ["LINK", "RUNTIME_C", "STAGE0_KOD"] {
+        if len(build.split_words(build.link_value(into, :name))) == 0 {
+            kod_eprint(f"kod: link.cfg and link.local.cfg set no {name}")
+            return false
+        }
+    }
+    return true
+}
+
+// `make` builds the always-linked objects, not the driver. Say so when the
+// configuration names one that is not there (a module added to it since the
+// last `make`), rather than let the link fail on it. Returns 0 when all are.
+func require_stage0_objects(anon cfg: build.LinkVars) -> int64 {
+    for o in stage0_objects(cfg) {
+        if io.is_file(o) == false {
+            kod_eprint(f"kod: {o} not found; run make")
+            return 1
+        }
+    }
+    return 0
+}
+
+// The always-linked Kod modules (`STAGE0_KOD`), in link order. Each has a
+// prebuilt `build/stage0/_<basename>.o`.
+func stage0_modules(anon cfg: build.LinkVars) -> [str] {
+    return build.split_words(build.link_value(cfg, name: "STAGE0_KOD"))
 }
 
 // Replace this process with `argv` (a path with a `/`, so no PATH search): the
@@ -105,8 +162,8 @@ func usage() -> int64 {
 // forwarded so the user sees the error. Exits 1 if any module
 // failed, 0 otherwise. The pre-built stage0 modules are skipped
 // (they were already typechecked when their .o was built).
-func run_check_cmd(anon entry_path: str) -> int64 {
-    let modules: [str] = collect_user_modules(entry_path)
+func run_check_cmd(anon entry_path: str, stage0: [str]) -> int64 {
+    let modules: [str] = collect_user_modules(entry_path, :stage0)
     let sh_kodc: str = "build/stage1/sh_kodc"
     mut errors: int64 = 0
     mut shown: [str] = []
@@ -182,15 +239,15 @@ func split_lines(anon s: str) -> [str] {
 // The walk uses `find` to avoid a new io extern; results
 // aren't sorted, since the test runner's `__run_tests` dispatchers
 // don't care about order.
-func run_test(anon path: str) -> int64 {
+func run_test(anon path: str, cfg: build.LinkVars) -> int64 {
     if ends_with(path, suffix: ".kod") {
-        return run_single_test(path)
+        return run_single_test(path, :cfg)
     }
-    return run_dir_tests(path)
+    return run_dir_tests(path, :cfg)
 }
 
-func run_single_test(anon entry: str) -> int64 {
-    let exe: str = build_test_executable(entry)
+func run_single_test(anon entry: str, cfg: build.LinkVars) -> int64 {
+    let exe: str = build_test_executable(entry, :cfg)
     if len(exe) == 0 {
         return 1
     }
@@ -255,7 +312,7 @@ func tests_stem(anon dir: str) -> str {
     return stem + "_tests"
 }
 
-func run_dir_tests(anon dir: str) -> int64 {
+func run_dir_tests(anon dir: str, cfg: build.LinkVars) -> int64 {
     // `find` takes an argument that starts with `-` for an option. Its paths
     // end at a NUL byte, not at a newline, which a file name can hold.
     mut root: str = dir
@@ -287,7 +344,7 @@ func run_dir_tests(anon dir: str) -> int64 {
     }
     // One program for all of them, so no temporary module is needed.
     let stem: str = tests_stem(dir)
-    let exe: str = build_program(entries: test_files, app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
+    let exe: str = build_program(entries: test_files, app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain", :cfg)
     if len(exe) == 0 {
         return 1
     }
@@ -296,25 +353,25 @@ func run_dir_tests(anon dir: str) -> int64 {
 
 // Walk the entry's import graph and return the full list of .kod
 // files that need their own .o, in load order. The entry is the
-// first element; stdlib eager-loads (builtins, primitives, io,
-// process, time) are *not* included — those already have prebuilt
-// .o files under build/stage0/ and are added separately at link time.
-func collect_user_modules(anon entry_path: str) -> [str] {
+// first element; the always-linked modules `stage0` (builtins, the
+// primitives, io, process, time, ...) are *not* included — those already
+// have prebuilt .o files under build/stage0/ and are added at link time.
+func collect_user_modules(anon entry_path: str, stage0: [str]) -> [str] {
     mut result: [str] = [build.normalize_path(entry_path)]
     let p: parsing.Parser = build.parse_file(entry_path)
     let module: ast.Module = p.parse_module()
-    walk_imports(module: module, importer_path: entry_path, modules: result)
+    walk_imports(module: module, importer_path: entry_path, :stage0, modules: result)
     return result
 }
 
-func walk_imports(module: ast.Module, importer_path: str, mut modules: [str]) -> none {
+func walk_imports(module: ast.Module, importer_path: str, stage0: [str], mut modules: [str]) -> none {
     for d in module.decls {
         match d {
             ast.Decl.Import(module_name, _local_name, _items) -> {
                 if len(module_name) > 0 {
                     let resolved: build.Resolved = build.resolve_import(target_path: importer_path, :module_name)
                     // A missing file is reported by its importer's compile.
-                    if is_stage0(resolved.file) == false and io.is_file(resolved.file) {
+                    if is_stage0(resolved.file, :stage0) == false and io.is_file(resolved.file) {
                         mut already: bool = false
                         for m in modules {
                             if m == resolved.file {
@@ -325,7 +382,7 @@ func walk_imports(module: ast.Module, importer_path: str, mut modules: [str]) ->
                             modules += [resolved.file]
                             let p: parsing.Parser = build.parse_file(resolved.file)
                             let im: ast.Module = p.parse_module()
-                            walk_imports(module: im, importer_path: resolved.file, :modules)
+                            walk_imports(module: im, importer_path: resolved.file, :stage0, :modules)
                         }
                     }
                 }
@@ -335,8 +392,8 @@ func walk_imports(module: ast.Module, importer_path: str, mut modules: [str]) ->
     }
 }
 
-func is_stage0(anon path: str) -> bool {
-    for s in stage0_module_paths() {
+func is_stage0(anon path: str, stage0: [str]) -> bool {
+    for s in stage0 {
         if s == path {
             return true
         }
@@ -349,6 +406,11 @@ func is_stage0(anon path: str) -> bool {
 // directory under `build/apps/<basename>/` and its executable; the
 // stage0 objects `build/stage0/_<basename>.o` are named the same way.
 func basename_no_ext(anon path: str) -> str {
+    return basename_without(path, ext: ".kod")
+}
+
+// Strip directory + the extension `ext`, if the name has it.
+func basename_without(anon path: str, ext: str) -> str {
     mut last_slash: int64 = -1
     mut i: int64 = 0
     for i < len(path) {
@@ -359,24 +421,11 @@ func basename_no_ext(anon path: str) -> str {
     }
     let after_slash: int64 = last_slash + 1
     mut end: int64 = len(path)
-    // Strip a `.kod` suffix if present.
-    if end - after_slash >= 4 and path[end-4..end] == ".kod" {
-        end = end - 4
+    // Strip the suffix if present.
+    if end - after_slash >= len(ext) and path[end-len(ext)..end] == ext {
+        end = end - len(ext)
     }
     return path[after_slash..end]
-}
-
-// `sw_vers -productVersion` — needed for `ld -macos_version_min`.
-// Cached on first call so a build doesn't pay for it twice.
-func macos_version() -> str {
-    let r: process.ProcessResult = process.run(["sw_vers", "-productVersion"])
-    // Trim a trailing newline if present.
-    mut v: str = r.stdout
-    let n: int64 = len(v)
-    if n > 0 and v[n-1] == '\n' {
-        v = v[0..n-1]
-    }
-    return v
 }
 
 // Run a process, forwarding its stderr to ours when it fails so the
@@ -404,9 +453,10 @@ func run_check(anon argv: [str]) -> int64 {
 // `_emit-test-runtime-main` (the dispatcher that calls every module's
 // `__run_tests` then prints the aggregate summary). The objects go to
 // `build/apps/<app>/<app>.obj/`, in a tree that mirrors the source
-// tree. Returns the executable path on success, "" on failure (the
-// underlying tool already printed via `run_check`).
-func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, shim_kind: str) -> str {
+// tree. `cfg` is the link configuration. Returns the executable path on
+// success, "" on failure (the underlying tool already printed via
+// `run_check`).
+func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, shim_kind: str, cfg: build.LinkVars) -> str {
     if app == "" or app == "." or app == ".." {
         kod_eprint(f"kod: cannot name a program after {entries[0]}; rename the file")
         return ""
@@ -418,9 +468,10 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
 
     // 1. User modules: the entries + transitive imports (skipping
     //    stage0), each to the object named after its source path.
+    let stage0: [str] = stage0_modules(cfg)
     mut user_modules: [str] = []
     for entry in entries {
-        for m in collect_user_modules(entry) {
+        for m in collect_user_modules(entry, :stage0) {
             if str_listed(user_modules, m) == false {
                 user_modules += [m]
             }
@@ -470,30 +521,52 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
         return ""
     }
 
-    // 3. Stage0 set: one .o per eagerly-loaded stdlib module, plus
-    //    the two C runtime objects. `make stage0` is responsible for
-    //    keeping these fresh; we don't try to rebuild them here.
-    mut stage0_objs: [str] = []
-    for s in stage0_module_paths() {
-        stage0_objs += [f"build/stage0/_{basename_no_ext(s)}.o"]
-    }
-    stage0_objs += ["build/stage0/arena.o"]
-    stage0_objs += ["build/stage0/runtime.o"]
-
-    // 4. Link.
-    mut link_argv: [str] = ["ld", "-macos_version_min", macos_version(), "-lc", "-L", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib", "-dead_strip", "-o", exe_path]
-    for o in stage0_objs {
-        link_argv += [o]
-    }
+    // 3. Link: the program's objects and its shim, after the always-linked
+    //    set that `make stage0` keeps fresh.
+    mut inputs: [str] = []
     for o in user_objs {
-        link_argv += [o]
+        inputs += [o]
     }
-    link_argv += [main_o]
-    let rc_ld: int64 = run_check(link_argv)
-    if rc_ld != 0 {
+    inputs += [main_o]
+    let rc_link: int64 = run_check(link_argv(cfg, :exe_path, objs: inputs))
+    if rc_link != 0 {
         return ""
     }
     return exe_path
+}
+
+// The objects every program links first, in link order: one per `RUNTIME_C`
+// file (`build/stage0/<name>.o`) and one per `STAGE0_KOD` module
+// (`build/stage0/_<basename>.o`), named as the Makefile names them. We don't
+// try to rebuild them here; `make stage0` does.
+func stage0_objects(anon cfg: build.LinkVars) -> [str] {
+    mut objs: [str] = []
+    for c in build.split_words(build.link_value(cfg, name: "RUNTIME_C")) {
+        let name: str = basename_without(c, ext: ".c")
+        objs += [f"build/stage0/{name}.o"]
+    }
+    for m in stage0_modules(cfg) {
+        let name: str = basename_no_ext(m)
+        objs += [f"build/stage0/_{name}.o"]
+    }
+    return objs
+}
+
+// The command that links `exe_path`: the `LINK` words, `-o exe_path`, the
+// always-linked objects, then `objs`, the program's own in link order.
+func link_argv(anon cfg: build.LinkVars, exe_path: str, objs: [str]) -> [str] {
+    mut argv: [str] = []
+    for w in build.split_words(build.link_value(cfg, name: "LINK")) {
+        argv += [w]
+    }
+    argv += ["-o", exe_path]
+    for o in stage0_objects(cfg) {
+        argv += [o]
+    }
+    for o in objs {
+        argv += [o]
+    }
+    return argv
 }
 
 // Are `a` and `b` one file or directory, whatever they are spelled like?
@@ -525,15 +598,15 @@ func refuse_tool_names(app: str, entry: str) -> bool {
     return false
 }
 
-func build_executable(anon entry_path: str) -> str {
+func build_executable(anon entry_path: str, cfg: build.LinkVars) -> str {
     let stem: str = basename_no_ext(entry_path)
     if refuse_tool_names(app: stem, entry: entry_path) {
         return ""
     }
-    return build_program(entries: [entry_path], app: stem, exe_name: stem, emit_main_cmd: "_emit-runtime-main", shim_kind: "main")
+    return build_program(entries: [entry_path], app: stem, exe_name: stem, emit_main_cmd: "_emit-runtime-main", shim_kind: "main", :cfg)
 }
 
-func build_test_executable(anon entry_path: str) -> str {
+func build_test_executable(anon entry_path: str, cfg: build.LinkVars) -> str {
     let stem: str = basename_no_ext(entry_path)
-    return build_program(entries: [entry_path], app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
+    return build_program(entries: [entry_path], app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain", :cfg)
 }
