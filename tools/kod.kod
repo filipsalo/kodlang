@@ -8,11 +8,16 @@
 // always built via `python -m kod _interpret`.
 //
 // Pipeline:
-//   1. Parse the entry, walk its imports transitively.
-//   2. `sh_kodc _compile` each module to a .o.
+//   1. Parse the entry, walk its imports transitively. Read what each
+//      module declares in the comment lines at its top (`// kod:cc`,
+//      `kod:link`, `kod:require`; docs/modules.md, "Link inputs"), and stop
+//      at a mistake in them or a required file that is not there.
+//   2. `sh_kodc _compile` each module to a .o, and compile each C file the
+//      modules name (once, however many name it) with `CC` and `CFLAGS`.
 //   3. `sh_kodc _emit-runtime-main` for the entry; `as` it to a .o.
 //   4. Link everything together with the prebuilt stage0 .o set, with the
-//      `LINK` command of link.cfg (`clang`).
+//      `LINK` command of link.cfg (`clang`), and the `kod:link` arguments
+//      last.
 //
 // link.cfg (and link.local.cfg, which overrides single names on one
 // machine) is read from the working directory: the Makefile includes the same
@@ -32,6 +37,31 @@ import "process"
 import "kod/parsing"
 import "kod/ast"
 import "kod/build"
+
+// A C file that modules of a program name, with the flags of the first
+// `kod:cc` line that does, and where that line is (`path:line`).
+type CcJob = struct {
+    file: str
+    flags: [str]
+    origin: str
+}
+
+// A `kod:require` file and the line that asks for it.
+type Need = struct {
+    path: str
+    line: int64
+    file: str
+    hint: str
+}
+
+// What the modules of a program declare, merged: the C files to compile,
+// once each, the arguments for the link, in the order of the modules with a
+// `-lname` once, and the files that must exist.
+type LinkPlan = struct {
+    jobs: [CcJob]
+    link_args: [str]
+    needs: [Need]
+}
 
 func main(argv: [str]) -> int64 {
     if len(argv) < 3 {
@@ -72,7 +102,7 @@ func main(argv: [str]) -> int64 {
     if cmd == "test" {
         return run_test(argv[2], :cfg)
     }
-    return run_check_cmd(argv[2], stage0: stage0_modules(cfg))
+    return run_check_cmd(argv[2], stage0: stage0_modules(cfg), :cfg)
 }
 
 // The commands read `link.cfg` and run `build/stage1/sh_kodc`, both relative
@@ -159,13 +189,16 @@ func usage() -> int64 {
 // Compile the entry and every transitive user import through sh_kodc,
 // counting failures. No artifacts emitted — sh_kodc's asm goes to
 // captured stdout and is discarded; stderr (the diagnostic) is
-// forwarded so the user sees the error. Exits 1 if any module
-// failed, 0 otherwise. The pre-built stage0 modules are skipped
-// (they were already typechecked when their .o was built).
-func run_check_cmd(anon entry_path: str, stage0: [str]) -> int64 {
+// forwarded so the user sees the error. The link directives at the top of
+// the modules are checked too, but no C file is compiled and no `kod:require`
+// file looked for. Exits 1 if any module failed, 0 otherwise. The pre-built
+// stage0 modules are skipped (they were already typechecked when their .o
+// was built).
+func run_check_cmd(anon entry_path: str, stage0: [str], cfg: build.LinkVars) -> int64 {
     let modules: [str] = collect_user_modules(entry_path, :stage0)
     let sh_kodc: str = "build/stage1/sh_kodc"
-    mut errors: int64 = 0
+    let plan: LinkPlan = LinkPlan(jobs: [], link_args: [], needs: [])
+    mut errors: int64 = read_link_inputs(modules, :cfg, into: plan)
     mut shown: [str] = []
     for m in modules {
         let r: process.ProcessResult = process.run([sh_kodc, m])
@@ -197,15 +230,6 @@ func str_listed(anon xs: [str], anon x: str) -> bool {
         }
     }
     return false
-}
-
-func ends_with(anon s: str, suffix: str) -> bool {
-    let n: int64 = len(s)
-    let m: int64 = len(suffix)
-    if m > n {
-        return false
-    }
-    return s[n-m..n] == suffix
 }
 
 // The non-empty pieces of `s` between the bytes `sep`.
@@ -240,7 +264,7 @@ func split_lines(anon s: str) -> [str] {
 // aren't sorted, since the test runner's `__run_tests` dispatchers
 // don't care about order.
 func run_test(anon path: str, cfg: build.LinkVars) -> int64 {
-    if ends_with(path, suffix: ".kod") {
+    if build.ends_with(path, suffix: ".kod") {
         return run_single_test(path, :cfg)
     }
     return run_dir_tests(path, :cfg)
@@ -453,7 +477,9 @@ func run_check(anon argv: [str]) -> int64 {
 // `_emit-test-runtime-main` (the dispatcher that calls every module's
 // `__run_tests` then prints the aggregate summary). The objects go to
 // `build/apps/<app>/<app>.obj/`, in a tree that mirrors the source
-// tree. `cfg` is the link configuration. Returns the executable path on
+// tree: a module's `<path>.o`, the object of a C file a module names
+// (`<path>.c.o`). The C files are compiled on every build, as the modules
+// are. `cfg` is the link configuration. Returns the executable path on
 // success, "" on failure (the underlying tool already printed via
 // `run_check`).
 func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, shim_kind: str, cfg: build.LinkVars) -> str {
@@ -476,6 +502,18 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
                 user_modules += [m]
             }
         }
+    }
+    // What the modules declare for the link; a mistake there, or a required
+    // file that is not there, stops the build before anything is made.
+    let plan: LinkPlan = LinkPlan(jobs: [], link_args: [], needs: [])
+    if plan_link_inputs(user_modules, :cfg, into: plan) == false {
+        return ""
+    }
+    // The object of a C file goes beside the object of the module that names
+    // it, so these are all the directories there are.
+    mut c_objs: [str] = []
+    for job in plan.jobs {
+        c_objs += [build.obj_path(root: obj_root, source: job.file)]
     }
     mut obj_dirs: [str] = [obj_root]
     for m in user_modules {
@@ -501,6 +539,12 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
         }
         user_objs += [obj]
     }
+    // The C files the modules name.
+    for job in plan.jobs {
+        if compile_c(job, :obj_root, :cfg) == false {
+            return ""
+        }
+    }
 
     // 2. Runtime main shim — variant selected by `emit_main_cmd`, next
     //    to the first entry's object.
@@ -521,14 +565,18 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
         return ""
     }
 
-    // 3. Link: the program's objects and its shim, after the always-linked
-    //    set that `make stage0` keeps fresh.
+    // 3. Link: the program's objects, those of its C files and its shim,
+    //    after the always-linked set that `make stage0` keeps fresh, and
+    //    the arguments the modules give last.
     mut inputs: [str] = []
     for o in user_objs {
         inputs += [o]
     }
+    for o in c_objs {
+        inputs += [o]
+    }
     inputs += [main_o]
-    let rc_link: int64 = run_check(link_argv(cfg, :exe_path, objs: inputs))
+    let rc_link: int64 = run_check(link_argv(cfg, :exe_path, objs: inputs, args: plan.link_args))
     if rc_link != 0 {
         return ""
     }
@@ -553,8 +601,9 @@ func stage0_objects(anon cfg: build.LinkVars) -> [str] {
 }
 
 // The command that links `exe_path`: the `LINK` words, `-o exe_path`, the
-// always-linked objects, then `objs`, the program's own in link order.
-func link_argv(anon cfg: build.LinkVars, exe_path: str, objs: [str]) -> [str] {
+// always-linked objects, then `objs`, the program's own in link order, and
+// the arguments `args` that its modules ask for.
+func link_argv(anon cfg: build.LinkVars, exe_path: str, objs: [str], args: [str]) -> [str] {
     mut argv: [str] = []
     for w in build.split_words(build.link_value(cfg, name: "LINK")) {
         argv += [w]
@@ -566,7 +615,154 @@ func link_argv(anon cfg: build.LinkVars, exe_path: str, objs: [str]) -> [str] {
     for o in objs {
         argv += [o]
     }
+    for a in args {
+        argv += [a]
+    }
     return argv
+}
+
+// Compile the C file of `job` to its object in the tree under `obj_root`,
+// with `CC` and `CFLAGS` of the link configuration and then the flags of its
+// `kod:cc` line. Always, since the modules are compiled on every build too and
+// a C file is small. On failure the compiler has said why; false.
+func compile_c(anon job: CcJob, obj_root: str, cfg: build.LinkVars) -> bool {
+    mut argv: [str] = build.split_words(build.link_value(cfg, name: "CC"))
+    if len(argv) == 0 {
+        kod_eprint("kod: link.cfg and link.local.cfg set no CC")
+        return false
+    }
+    for w in build.split_words(build.link_value(cfg, name: "CFLAGS")) {
+        argv += [w]
+    }
+    for w in job.flags {
+        argv += [w]
+    }
+    // The compiler takes a name that starts with `-` for an option (`-x.c` is
+    // `-x .c`); in the root of the project the path is the bare name.
+    mut source: str = job.file
+    if source[0] == '-' {
+        source = f"./{source}"
+    }
+    argv += ["-c", "-o", build.obj_path(root: obj_root, source: job.file), source]
+    if run_check(argv) != 0 {
+        kod_eprint(f"kod: compiling {job.file} failed")
+        return false
+    }
+    return true
+}
+
+// An always-linked module cannot declare link inputs: make builds it without
+// reading them, so they would be ignored and the link would fail for every
+// program. Say so (`path:line:1: error: ...`); how many modules there are.
+func reject_stage0_decls(anon cfg: build.LinkVars) -> int64 {
+    mut rejected: int64 = 0
+    for m in stage0_modules(cfg) {
+        if io.is_file(m) {
+            let decls: build.LinkDecls = build.parse_link_decls(path: m, source: io.read_file(m), vars: cfg)
+            if decls.first > 0 {
+                kod_eprint(f"{m}:{decls.first}:1: error: a module in STAGE0_KOD cannot declare link inputs; make builds it without reading them")
+                rejected = rejected + 1
+            }
+        }
+    }
+    return rejected
+}
+
+func same_strs(anon a: [str], anon b: [str]) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    mut i: int64 = 0
+    for x in a {
+        if x != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Add the C file of `c`, declared by `module`, to the jobs of `plan`: once
+// per file, however many modules name it, but only with the same flags. 1 if
+// that is an error (printed), else 0.
+func add_cc_job(anon c: build.CcDecl, module: str, plan: LinkPlan) -> int64 {
+    let origin: str = f"{module}:{c.line}"
+    for job in plan.jobs {
+        if job.file == c.file {
+            if same_strs(job.flags, c.flags) {
+                return 0
+            }
+            kod_eprint(f"{origin}:1: error: {c.file} is also compiled by the kod:cc line at {job.origin}, with other flags")
+            return 1
+        }
+    }
+    plan.jobs += [CcJob(file: c.file, flags: c.flags, :origin)]
+    return 0
+}
+
+// Add the `kod:link` arguments `args` to `plan`, in order, but a `-lname`
+// that is there already only once.
+func add_link_args(anon args: [str], plan: LinkPlan) -> none {
+    for a in args {
+        let library: bool = len(a) > 2 and build.starts_with(a, prefix: "-l")
+        if library == false or str_listed(plan.link_args, a) == false {
+            plan.link_args += [a]
+        }
+    }
+}
+
+// Read what `modules` declare in the comment lines at their top into `into`,
+// printing each mistake, and return how many there were: a directive that is
+// wrong, a C file that is not there, one named with other flags by two modules,
+// and a module in `STAGE0_KOD` that has directives at all.
+func read_link_inputs(anon modules: [str], cfg: build.LinkVars, into: LinkPlan) -> int64 {
+    mut errors: int64 = reject_stage0_decls(cfg)
+    for m in modules {
+        let decls: build.LinkDecls = build.parse_link_decls(path: m, source: io.read_file(m), vars: cfg)
+        for e in decls.errors {
+            kod_eprint(e)
+            errors = errors + 1
+        }
+        for c in decls.cc {
+            if io.is_file(c.file) {
+                errors = errors + add_cc_job(c, module: m, plan: into)
+            } else {
+                kod_eprint(f"{m}:{c.line}:1: error: no such file {c.file}")
+                errors = errors + 1
+            }
+        }
+        add_link_args(decls.link, plan: into)
+        for r in decls.require {
+            into.needs += [Need(path: m, line: r.line, file: r.file, hint: r.hint)]
+        }
+    }
+    return errors
+}
+
+// Print each file that a `kod:require` line asks for and that is not there;
+// how many.
+func missing_needs(anon plan: LinkPlan) -> int64 {
+    mut missing: int64 = 0
+    for n in plan.needs {
+        if io.is_file(n.file) == false {
+            if len(n.hint) > 0 {
+                kod_eprint(f"{n.path}:{n.line}:1: error: needs {n.file} ({n.hint})")
+            } else {
+                kod_eprint(f"{n.path}:{n.line}:1: error: needs {n.file}")
+            }
+            missing = missing + 1
+        }
+    }
+    return missing
+}
+
+// What the modules declare, in `into`; false, with the reasons printed, if
+// that has a mistake or a file that a `kod:require` line asks for is missing.
+func plan_link_inputs(anon modules: [str], cfg: build.LinkVars, into: LinkPlan) -> bool {
+    if read_link_inputs(modules, :cfg, :into) > 0 {
+        return false
+    }
+    return missing_needs(into) == 0
 }
 
 // Are `a` and `b` one file or directory, whatever they are spelled like?

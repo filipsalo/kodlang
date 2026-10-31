@@ -1444,3 +1444,822 @@ def test_make_rebuilds_when_link_local_cfg_loses_a_name(make_root: Path, target:
         assert make_in(make_root, "-q", target).returncode == 1, kept
         record_link_config(make_root)
         assert make_in(make_root, "-q", target).returncode == 0
+
+
+# Link inputs a module declares (docs/modules.md, "Link inputs"): the comment
+# lines at the top of a module name its C files, link arguments and required
+# files. The tests run the driver in a `driver_root`, whose `clang` logs every
+# call before it runs the real one.
+
+CLANG_SHIM = (
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$KOD_CLANG_LOG"\nexec /usr/bin/clang "$@"\n'
+)
+
+
+class Project:
+    """A directory the driver takes for the repository root, where `clang`
+    (the compiler and the linker alike) is a script that logs its arguments."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        shims = root / "shims"
+        shims.mkdir()
+        shim = shims / "clang"
+        shim.write_text(CLANG_SHIM)
+        shim.chmod(0o755)
+        self.log = root / "clang.log"
+        self.env = {
+            **os.environ,
+            "PATH": f"{shims}:{os.environ['PATH']}",
+            "KOD_CLANG_LOG": str(self.log),
+        }
+
+    def write(self, files: dict[str, str]) -> None:
+        for name, text in files.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+    def run(self, *args: str) -> tuple[int, str, str]:
+        return run_driver(list(args), self.root, env=self.env)
+
+    def clang_calls(self) -> list[str]:
+        """The arguments of every `clang` call so far, one string each."""
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def compiles(self) -> list[str]:
+        return [c for c in self.clang_calls() if " -c " in f" {c} "]
+
+    def link(self) -> list[str]:
+        """The arguments of the one call that is not a compile."""
+        links = [c for c in self.clang_calls() if " -c " not in f" {c} "]
+        assert len(links) == 1, self.clang_calls()
+        return links[0].split()
+
+    def apps(self) -> list[str]:
+        return sorted(p.name for p in (self.root / "build" / "apps").iterdir())
+
+    def exe(self, stem: str) -> Path:
+        return self.root / "build" / "apps" / stem / stem
+
+
+@pytest.fixture
+def project(driver_root: Path) -> Project:
+    return Project(driver_root)
+
+
+def cc_module(name: str, directives: str, value: int | str, extra: str = "") -> dict:
+    """`<name>.kod` with `directives` at the top and a function `value()` that
+    calls `kod_<name>_value`, and `<name>.c`, which returns `value`."""
+    stem = Path(name).name
+    return {
+        f"{name}.kod": (
+            f"{directives}\n\nextern func kod_{stem}_value() -> int64\n\n"
+            f"func value() -> int64 {{\n    return kod_{stem}_value()\n}}\n"
+        ),
+        f"{name}.c": (
+            f'#include "kod_rt.h"\n{extra}\n'
+            f"int64_t kod_{stem}_value(void) {{ return {value}; }}\n"
+        ),
+    }
+
+
+def entry_of(*modules: str) -> str:
+    """A `main` that prints `value()` of each module (`./lib` is `lib`)."""
+    imports = "".join(f'import "./{m}"\n' for m in modules)
+    prints = "".join(
+        f'    let v{i}: int64 = {Path(m).name}.value()\n    print(f"{{v{i}}}")\n'
+        for i, m in enumerate(modules)
+    )
+    return f"{imports}\nfunc main() -> int64 {{\n{prints}    return 0\n}}\n"
+
+
+def copy_zlib_fixture(project: Project) -> None:
+    """The fixture of tests/link_zlib.kod, in the project."""
+    shutil.copytree(ROOT / "tests" / "link", project.root / "tests" / "link")
+    shutil.copyfile(
+        ROOT / "tests" / "link_zlib.kod", project.root / "tests" / "link_zlib.kod"
+    )
+
+
+def test_a_module_that_names_a_c_file_and_a_library_builds_and_runs(project: Project):
+    copy_zlib_fixture(project)
+    status, out, err = project.run("run", "tests/link_zlib.kod")
+    assert (status, out, err) == (0, "907060870\n", "")
+    # The module and its C file are objects of their own in the tree.
+    objects = project.root / "build/apps/link_zlib/link_zlib.obj/tests/link"
+    assert (objects / "zlib_crc.kod.o").is_file()
+    assert (objects / "zlib_crc.c.o").is_file()
+    # The C file is compiled as the runtime is, then the link names it, after
+    # the modules and before the shim and the library.
+    cflags = " ".join(cfg_values(LINK_CFG)["CFLAGS"])
+    c_object = "build/apps/link_zlib/link_zlib.obj/tests/link/zlib_crc.c.o"
+    assert project.compiles() == [f"{cflags} -c -o {c_object} tests/link/zlib_crc.c"]
+    prefix = "build/apps/link_zlib/link_zlib.obj"
+    assert project.link()[-5:] == [
+        f"{prefix}/tests/link_zlib.kod.o",
+        f"{prefix}/tests/link/zlib_crc.kod.o",
+        c_object,
+        f"{prefix}/tests/link_zlib.kod.main.o",
+        "-lz",
+    ]
+
+
+def test_the_zlib_fixture_links_the_system_libz(project: Project):
+    copy_zlib_fixture(project)
+    status, _, err = project.run("build", "tests/link_zlib.kod")
+    assert status == 0, err
+    shown = subprocess.run(
+        ["otool", "-L", str(project.exe("link_zlib"))],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    libraries = [line.split()[0] for line in shown.splitlines()[1:]]
+    assert "/usr/lib/libz.1.dylib" in libraries
+    # Everything it loads is the system's, not a Homebrew or other prefix.
+    assert all(lib.startswith(("/usr/lib/", "/System/")) for lib in libraries)
+
+
+def test_a_module_a_program_reaches_through_another_still_counts(project: Project):
+    copy_zlib_fixture(project)
+    project.write(
+        {
+            "mid.kod": (
+                'import "./tests/link/zlib_crc"\n\n'
+                "func checksum(anon s: str) -> int64 {\n"
+                "    return zlib_crc.crc32(s)\n}\n"
+            ),
+            "entry.kod": (
+                'import "./mid"\n\nfunc main() -> int64 {\n'
+                '    let c: int64 = mid.checksum("hello")\n'
+                '    print(f"{c}")\n    return 0\n}\n'
+            ),
+        }
+    )
+    assert project.run("run", "entry.kod") == (0, "907060870\n", "")
+
+
+def test_a_plain_program_runs_no_c_compiler_and_one_link(project: Project):
+    status, _, err = project.run("build", "hello.kod")
+    assert status == 0, err
+    assert project.compiles() == []
+    link = project.link()
+    assert link[-1].endswith("/hello.kod.main.o")
+    assert [w for w in link if w.startswith("-l")] == []
+    # Nothing but the module, the shim and the executable is made.
+    made = sorted(
+        str(p.relative_to(project.root / "build/apps"))
+        for p in (project.root / "build/apps").rglob("*")
+        if p.is_file()
+    )
+    assert made == [
+        "hello/hello",
+        "hello/hello.obj/hello.kod.main.o",
+        "hello/hello.obj/hello.kod.main.s",
+        "hello/hello.obj/hello.kod.o",
+        "hello/hello.obj/hello.kod.s",
+    ]
+
+
+def test_a_c_file_and_a_module_of_one_name_are_objects_of_their_own(project: Project):
+    # lib.kod and lib.c: <path>.kod.o and <path>.c.o. The fixture of zlib does
+    # the same with tests/link/zlib_crc.{kod,c}.
+    project.write(cc_module("lib", "// kod:cc lib.c", 7))
+    project.write({"entry.kod": entry_of("lib")})
+    assert project.run("run", "entry.kod") == (0, "7\n", "")
+    objects = project.root / "build/apps/entry/entry.obj"
+    assert sorted(p.name for p in objects.iterdir() if p.is_file()) == [
+        "entry.kod.main.o",
+        "entry.kod.main.s",
+        "entry.kod.o",
+        "entry.kod.s",
+        "lib.c.o",
+        "lib.kod.o",
+        "lib.kod.s",
+    ]
+
+
+UNKNOWN = "lib.kod:1:1: error: unknown directive kod:linkk\n"
+
+
+@pytest.mark.parametrize(
+    "command,entry",
+    [
+        ("build", "entry.kod"),
+        ("run", "entry.kod"),
+        ("test", "lib_test.kod"),
+        ("check", "entry.kod"),
+    ],
+)
+def test_a_mistake_in_a_directive_stops_every_command_before_anything_is_made(
+    project: Project, command: str, entry: str
+):
+    project.write(cc_module("lib", "// kod:linkk -lz", 1))
+    project.write(
+        {"entry.kod": entry_of("lib"), "lib_test.kod": 'import "./lib"\n' + PASSING}
+    )
+    assert project.run(command, entry) == (1, "", UNKNOWN)
+    assert project.clang_calls() == []
+    assert project.apps() == []
+
+
+def test_every_mistake_is_shown_with_its_line(project: Project):
+    project.write(
+        {
+            "lib.kod": (
+                "// lib\n// kod:link -lz\n// kod:cc sub/x.c\n// kod:link -L${NOPE}\n"
+                "// kod:require\n// kod:cc missing.c\n\nfunc f() -> int64 {\n    return 1\n}\n"
+            ),
+            "entry.kod": 'import "./lib"\n\nfunc main() -> int64 {\n    return 0\n}\n',
+        }
+    )
+    status, out, err = project.run("build", "entry.kod")
+    assert (status, out) == (1, "")
+    assert err.splitlines() == [
+        "lib.kod:3:1: error: kod:cc names `sub/x.c`, which is not the name of a .c file beside the module (a bare name that ends in .c)",
+        "lib.kod:4:1: error: `${NOPE}` is not set in link.cfg or link.local.cfg",
+        "lib.kod:5:1: error: kod:require needs the file that must exist",
+        "lib.kod:6:1: error: no such file missing.c",
+    ]
+    assert project.apps() == []
+
+
+def test_a_directive_after_the_first_declaration_is_a_comment(project: Project):
+    project.write(
+        {
+            "late.kod": (
+                'import "io"\n// kod:link -lnosuchlibrary\n// kod:linkk\n'
+                "func f() -> int64 {\n    return 4\n}\n"
+            ),
+            "entry.kod": (
+                'import "./late"\n\nfunc main() -> int64 {\n'
+                '    let v: int64 = late.f()\n    print(f"{v}")\n    return 0\n}\n'
+            ),
+        }
+    )
+    assert project.run("run", "entry.kod") == (0, "4\n", "")
+    assert project.compiles() == []
+
+
+def test_kod_check_checks_the_lines_but_compiles_no_c_and_looks_for_no_file(
+    project: Project,
+):
+    directives = (
+        "// kod:require /no/such/header.h  brew install nothing\n"
+        "// kod:cc lib.c\n// kod:link -lnosuchlibrary"
+    )
+    project.write(cc_module("lib", directives, 1))
+    project.write({"lib.c": "this is not C\n", "entry.kod": entry_of("lib")})
+    assert project.run("check", "entry.kod") == (0, "", "")
+    assert project.clang_calls() == []
+    # A C file that is not there is a mistake in the lines, though.
+    (project.root / "lib.c").unlink()
+    status, out, err = project.run("check", "entry.kod")
+    assert (status, out, err) == (1, "", "lib.kod:2:1: error: no such file lib.c\n")
+    # A mistake in the Kod itself is still found, and shown with the other.
+    project.write(
+        {
+            "lib.kod": "// kod:linkk\n\nfunc value() -> int64 {\n    return nope\n}\n",
+        }
+    )
+    status, _, err = project.run("check", "entry.kod")
+    assert status == 1
+    assert err.startswith("lib.kod:1:1: error: unknown directive kod:linkk\n")
+    assert "unknown name `nope`" in err
+
+
+def test_a_required_file_that_is_missing_stops_the_build_with_its_hint(
+    project: Project,
+):
+    project.write(
+        cc_module(
+            "lib",
+            "// kod:require /no/such/header.h  brew install nothing\n"
+            "// kod:require /no/such/other.h\n"
+            "// kod:require hello.kod\n"
+            "// kod:cc lib.c",
+            1,
+        )
+    )
+    project.write({"entry.kod": entry_of("lib")})
+    for command in ["build", "run"]:
+        status, out, err = project.run(command, "entry.kod")
+        assert (status, out) == (1, "")
+        assert err == (
+            "lib.kod:1:1: error: needs /no/such/header.h (brew install nothing)\n"
+            "lib.kod:2:1: error: needs /no/such/other.h\n"
+        )
+        # Before anything is compiled, and nothing is made.
+        assert project.clang_calls() == []
+        assert project.apps() == []
+
+
+def test_a_required_file_that_is_there_lets_the_build_go_on(project: Project):
+    project.write(
+        cc_module(
+            "lib", "// kod:require hello.kod  nothing to install\n// kod:cc lib.c", 5
+        )
+    )
+    project.write({"entry.kod": entry_of("lib")})
+    assert project.run("run", "entry.kod") == (0, "5\n", "")
+
+
+def test_a_required_file_can_be_named_through_a_name_of_link_cfg(project: Project):
+    with (project.root / "link.cfg").open("a") as cfg:
+        cfg.write(f"PROBE_ROOT := {project.root}\n")
+    project.write(
+        cc_module(
+            "lib", "// kod:require ${PROBE_ROOT}/lib.c  mkdir it\n// kod:cc lib.c", 8
+        )
+    )
+    project.write({"entry.kod": entry_of("lib")})
+    assert project.run("run", "entry.kod") == (0, "8\n", "")
+    (project.root / "link.local.cfg").write_text("PROBE_ROOT := /no/such/root\n")
+    status, _, err = project.run("build", "entry.kod")
+    assert (status, err) == (
+        1,
+        "lib.kod:1:1: error: needs /no/such/root/lib.c (mkdir it)\n",
+    )
+
+
+def test_a_c_file_gets_the_flags_and_names_the_module_gives_it(project: Project):
+    with (project.root / "link.cfg").open("a") as cfg:
+        cfg.write(f"PROBE_INC := {project.root}/inc\n")
+    project.write(
+        {
+            "inc/probe_value.h": "#define PROBE_VALUE 37\n",
+            "second/second.h": "#define SECOND 100\n",
+            "lib/probe.kod": (
+                "// kod:cc probe.c -I${PROBE_INC} -Isecond -DEXTRA=5\n\n"
+                "extern func kod_probe_value() -> int64\n"
+                "extern func kod_probe_bytes() -> str\n\n"
+                "func value() -> int64 {\n    return kod_probe_value()\n}\n\n"
+                "func bytes() -> str {\n    return kod_probe_bytes()\n}\n"
+            ),
+            "lib/probe.c": (
+                '#include "kod_rt.h"\n#include "probe_value.h"\n#include "second.h"\n'
+                "int64_t kod_probe_value(void) { return PROBE_VALUE + EXTRA + SECOND; }\n"
+                'KodStr *kod_probe_bytes(void) { return kod_str_from_bytes("a\\0b", 3); }\n'
+            ),
+            "entry.kod": (
+                'import "./lib/probe"\n\nfunc main() -> int64 {\n'
+                "    let v: int64 = probe.value()\n    let b: str = probe.bytes()\n"
+                "    let n: int64 = len(b)\n    let b0: int64 = b[0]\n"
+                "    let b1: int64 = b[1]\n    let b2: int64 = b[2]\n"
+                '    print(f"{v} {n} {b0} {b1} {b2}")\n    return 0\n}\n'
+            ),
+        }
+    )
+    # `-I second` is relative to the repository root, the cwd of the compile;
+    # the string with a NUL in it has all three bytes, and they are the ones given.
+    assert project.run("run", "entry.kod") == (0, "142 3 97 0 98\n", "")
+    cflags = " ".join(cfg_values(LINK_CFG)["CFLAGS"])
+    assert project.compiles() == [
+        f"{cflags} -I{project.root}/inc -Isecond -DEXTRA=5 -c -o "
+        "build/apps/entry/entry.obj/lib/probe.c.o lib/probe.c"
+    ]
+
+
+def test_a_name_that_link_cfg_does_not_set_or_sets_to_several_words_is_an_error(
+    project: Project,
+):
+    project.write(cc_module("lib", "// kod:link -L${NOPE}/lib\n// kod:cc lib.c", 1))
+    project.write({"entry.kod": entry_of("lib")})
+    status, _, err = project.run("build", "entry.kod")
+    assert (status, err) == (
+        1,
+        "lib.kod:1:1: error: `${NOPE}` is not set in link.cfg or link.local.cfg\n",
+    )
+    project.write(cc_module("lib", "// kod:link ${LINK}\n// kod:cc lib.c", 1))
+    status, _, err = project.run("build", "entry.kod")
+    assert (status, err) == (
+        1,
+        "lib.kod:1:1: error: `${LINK}` must be one word to be used in a directive\n",
+    )
+    assert project.clang_calls() == []
+
+
+def test_a_c_file_that_two_modules_name_is_compiled_and_linked_once(project: Project):
+    shared = {
+        "shared.c": '#include "kod_rt.h"\nint64_t kod_shared_value(void) { return 3; }\n'
+    }
+    for name in ["m1", "m2"]:
+        shared[f"{name}.kod"] = (
+            "// kod:cc shared.c\n\nextern func kod_shared_value() -> int64\n\n"
+            "func value() -> int64 {\n    return kod_shared_value()\n}\n"
+        )
+    project.write(shared)
+    project.write({"entry.kod": entry_of("m1", "m2")})
+    assert project.run("run", "entry.kod") == (0, "3\n3\n", "")
+    assert len(project.compiles()) == 1
+    link = project.link()
+    assert link.count("build/apps/entry/entry.obj/shared.c.o") == 1
+
+
+def test_one_c_file_named_with_other_flags_by_two_modules_is_an_error(project: Project):
+    shared = {
+        "shared.c": '#include "kod_rt.h"\nint64_t kod_shared_value(void) { return 3; }\n'
+    }
+    for name, flags in [("m1", ""), ("m2", " -DX=1")]:
+        shared[f"{name}.kod"] = (
+            f"// kod:cc shared.c{flags}\n\nextern func kod_shared_value() -> int64\n\n"
+            "func value() -> int64 {\n    return kod_shared_value()\n}\n"
+        )
+    project.write(shared)
+    project.write({"entry.kod": entry_of("m1", "m2")})
+    status, _, err = project.run("build", "entry.kod")
+    assert (status, err) == (
+        1,
+        "m2.kod:1:1: error: shared.c is also compiled by the kod:cc line at m1.kod:1, with other flags\n",
+    )
+    assert project.clang_calls() == []
+
+
+def test_c_files_of_one_name_in_two_directories_are_two_objects(project: Project):
+    # Two modules `lib`, each with a lib.c, reached through different importers.
+    # (C symbols share one namespace, so the functions differ.)
+    for side, value in [("a", 1), ("b", 2)]:
+        project.write(
+            {
+                f"{side}/lib.kod": (
+                    "// kod:cc lib.c\n\n"
+                    f"extern func kod_{side}_lib_value() -> int64\n\n"
+                    f"func value() -> int64 {{\n    return kod_{side}_lib_value()\n}}\n"
+                ),
+                f"{side}/lib.c": (
+                    '#include "kod_rt.h"\n'
+                    f"int64_t kod_{side}_lib_value(void) {{ return {value}; }}\n"
+                ),
+                f"{side}/use_{side}.kod": (
+                    'import "./lib"\n\nfunc value() -> int64 {\n'
+                    "    return lib.value()\n}\n"
+                ),
+            }
+        )
+    project.write({"entry.kod": entry_of("a/use_a", "b/use_b")})
+    assert project.run("run", "entry.kod") == (0, "1\n2\n", "")
+    objects = project.root / "build/apps/entry/entry.obj"
+    assert (objects / "a/lib.c.o").is_file()
+    assert (objects / "b/lib.c.o").is_file()
+    assert len(project.compiles()) == 2
+
+
+def test_a_c_file_whose_name_starts_with_a_dash_is_not_taken_for_an_option(
+    project: Project,
+):
+    # In the root of the project the path of the C file is its bare name.
+    project.write(
+        {
+            "dash.kod": (
+                "// kod:cc -x.c\n\nextern func kod_dash_value() -> int64\n\n"
+                'func main() -> int64 {\n    print(f"{kod_dash_value()}")\n'
+                "    return 0\n}\n"
+            ),
+            "-x.c": '#include "kod_rt.h"\nint64_t kod_dash_value(void) { return 42; }\n',
+        }
+    )
+    assert project.run("run", "dash.kod") == (0, "42\n", "")
+    assert (project.root / "build/apps/dash/dash.obj/-x.c.o").is_file()
+    assert [c.split()[-1] for c in project.compiles()] == ["./-x.c"]
+
+
+def test_link_arguments_are_passed_in_order_and_a_library_once(project: Project):
+    project.write(
+        cc_module("a", "// kod:link -lz -framework Foundation\n// kod:cc a.c", 1)
+    )
+    project.write(
+        cc_module("b", "// kod:link -framework Foundation -lz -lm\n// kod:cc b.c", 2)
+    )
+    project.write(
+        cc_module(
+            "c",
+            "// kod:cc c.c\n// kod:link -lm -L/usr/lib -lz -lc++",
+            3,
+        )
+    )
+    project.write({"entry.kod": entry_of("a", "b", "c")})
+    assert project.run("run", "entry.kod") == (0, "1\n2\n3\n", "")
+    link = project.link()
+    shim = link.index("build/apps/entry/entry.obj/entry.kod.main.o")
+    assert link[shim + 1 :] == [
+        "-lz",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Foundation",
+        "-lm",
+        "-L/usr/lib",
+        "-lc++",
+    ]
+
+
+def test_a_failing_c_compile_shows_the_compiler_names_the_file_and_links_nothing(
+    project: Project,
+):
+    project.write(cc_module("lib", "// kod:cc lib.c", 1))
+    project.write({"lib.c": "this is not C\n", "entry.kod": entry_of("lib")})
+    for command in ["build", "run"]:
+        status, out, err = project.run(command, "entry.kod")
+        assert (status, out) == (1, "")
+        assert "lib.c:1:1: error:" in err
+        assert err.endswith("kod: compiling lib.c failed\n")
+        assert not project.exe("entry").exists()
+        # The compile was the one call: no link followed it.
+        assert len(project.clang_calls()) == 1
+        (project.root / "clang.log").unlink()
+    (project.root / "lib.c").write_text(
+        '#include "kod_rt.h"\nint64_t kod_lib_value(void) { return 6; }\n'
+    )
+    assert project.run("run", "entry.kod") == (0, "6\n", "")
+
+
+def test_a_c_file_needs_a_compiler_but_a_program_without_one_does_not(project: Project):
+    (project.root / "link.local.cfg").write_text("CC :=\n")
+    project.write(cc_module("lib", "// kod:cc lib.c", 1))
+    project.write({"entry.kod": entry_of("lib")})
+    status, out, err = project.run("build", "entry.kod")
+    assert (status, out, err) == (1, "", "kod: link.cfg and link.local.cfg set no CC\n")
+    assert project.clang_calls() == []
+    # Nothing asks for CC when no module names a C file.
+    status, _, err = project.run("build", "hello.kod")
+    assert (status, err) == (0, "")
+
+
+def test_a_failing_c_compile_in_a_test_program_stops_kod_test(project: Project):
+    project.write(cc_module("lib", "// kod:cc lib.c", 1))
+    project.write(
+        {"lib.c": "this is not C\n", "lib_test.kod": 'import "./lib"\n' + PASSING}
+    )
+    status, out, err = project.run("test", "lib_test.kod")
+    assert (status, out) == (1, "")
+    assert err.endswith("kod: compiling lib.c failed\n")
+
+
+def test_a_c_file_is_compiled_again_when_it_or_its_header_or_the_flags_change(
+    project: Project,
+):
+    project.write(
+        {
+            "lib.kod": (
+                "// kod:cc lib.c\n\nextern func kod_lib_value() -> int64\n\n"
+                "func value() -> int64 {\n    return kod_lib_value()\n}\n"
+            ),
+            "lib.h": "#define BASE 10\n",
+            "lib.c": (
+                '#include "kod_rt.h"\n#include "lib.h"\n'
+                "int64_t kod_lib_value(void) { return BASE + WHO; }\n"
+            ),
+            "entry.kod": entry_of("lib"),
+        }
+    )
+    flags = " ".join(cfg_values(LINK_CFG)["CFLAGS"])
+    local = project.root / "link.local.cfg"
+    local.write_text(f"CFLAGS := {flags} -DWHO=1\n")
+    assert project.run("run", "entry.kod") == (0, "11\n", "")
+    project.write({"lib.h": "#define BASE 20\n"})
+    assert project.run("run", "entry.kod") == (0, "21\n", "")
+    project.write(
+        {
+            "lib.c": (
+                '#include "kod_rt.h"\n#include "lib.h"\n'
+                "int64_t kod_lib_value(void) { return BASE + WHO + 100; }\n"
+            )
+        }
+    )
+    assert project.run("run", "entry.kod") == (0, "121\n", "")
+    local.write_text(f"CFLAGS := {flags} -DWHO=2\n")
+    assert project.run("run", "entry.kod") == (0, "122\n", "")
+    # Every build compiled it: four builds, four compiles.
+    assert len(project.compiles()) == 4
+
+
+def test_an_always_linked_module_cannot_declare_link_inputs(
+    project: Project,
+):
+    modules = cfg_values(project.root / "link.cfg")["STAGE0_KOD"]
+    # Named `time`, so that the object `make` built for stdlib/time.kod is the
+    # one the configuration expects; nothing is linked here.
+    project.write(
+        {
+            "hello_test.kod": PASSING,
+            "zzmod/time.kod": (
+                "// This module is linked into every program.\n"
+                "// kod:link -lz\n\nfunc stamp() -> int64 {\n    return 1\n}\n"
+            ),
+        }
+    )
+    (project.root / "link.local.cfg").write_text(
+        f"STAGE0_KOD := {' '.join(modules)} zzmod/time.kod\n"
+    )
+    wanted = (
+        "zzmod/time.kod:2:1: error: a module in STAGE0_KOD cannot declare link inputs; "
+        "make builds it without reading them\n"
+    )
+    for command in ["build", "run", "test", "check"]:
+        entry = "hello_test.kod" if command == "test" else "hello.kod"
+        assert project.run(command, entry) == (1, "", wanted), command
+    assert project.clang_calls() == []
+    assert project.apps() == []
+
+
+def test_a_module_only_a_test_file_imports_gives_its_inputs_to_kod_test(
+    project: Project,
+):
+    project.write(
+        {
+            "lib.kod": (
+                "// kod:cc lib.c\n// kod:link -lz\n\nextern func kod_lib_value() -> int64\n\n"
+                "func value() -> int64 {\n    return kod_lib_value()\n}\n"
+            ),
+            "lib.c": '#include "kod_rt.h"\nint64_t kod_lib_value(void) { return 9; }\n',
+            "lib_test.kod": (
+                'import "./lib"\n\ntest "the C file is linked in" {\n'
+                "    assert lib.value() == 9\n}\n"
+            ),
+        }
+    )
+    status, out, err = project.run("test", "lib_test.kod")
+    assert status == 0, err
+    assert "1/1 passed" in out
+    assert len(project.compiles()) == 1
+    assert project.link()[-1] == "-lz"
+
+
+def test_kod_test_of_a_directory_compiles_a_c_file_once_for_all_its_test_files(
+    project: Project,
+):
+    shared = {
+        "t/shared.c": '#include "kod_rt.h"\nint64_t kod_shared_value(void) { return 3; }\n'
+    }
+    for name in ["m1", "m2"]:
+        shared[f"t/{name}.kod"] = (
+            "// kod:cc shared.c\n// kod:link -lz\n\nextern func kod_shared_value() -> int64\n\n"
+            "func value() -> int64 {\n    return kod_shared_value()\n}\n"
+        )
+        shared[f"t/{name}_test.kod"] = (
+            f'import "./{name}"\n\ntest "{name} sees the C file" {{\n'
+            f"    assert {name}.value() == 3\n}}\n"
+        )
+    shared["t/plain_test.kod"] = PASSING
+    project.write(shared)
+    status, out, err = project.run("test", "t")
+    assert status == 0, err
+    assert "3/3 passed" in out
+    assert len(project.compiles()) == 1
+    assert project.link().count("-lz") == 1
+
+
+def test_a_directory_of_tests_stops_at_a_required_file_that_is_missing(
+    project: Project,
+):
+    project.write(
+        {
+            "t/needs.kod": "// kod:require /no/such/thing  install it\n\nfunc f() -> int64 {\n    return 1\n}\n",
+            "t/a_test.kod": 'import "./needs"\n' + PASSING,
+            "t/b_test.kod": PASSING,
+        }
+    )
+    status, out, err = project.run("test", "t")
+    assert (status, out) == (1, "")
+    assert err == "t/needs.kod:1:1: error: needs /no/such/thing (install it)\n"
+    assert project.apps() == []
+
+
+def test_a_byte_order_mark_does_not_hide_the_directives(project: Project):
+    # The lexer skips the mark, so such a module compiles; its lines count too.
+    project.write(cc_module("lib", "\ufeff// kod:cc lib.c", 21))
+    project.write({"entry.kod": entry_of("lib")})
+    assert project.run("run", "entry.kod") == (0, "21\n", "")
+    assert len(project.compiles()) == 1
+    project.write(cc_module("lib", "\ufeff// kod:linkk", 21))
+    assert project.run("check", "entry.kod") == (1, "", UNKNOWN)
+
+
+SLIP = (
+    "lib.kod:1:1: error: a directive is written `// kod:name`, in lower case, "
+    "with one space after the slashes and none before the colon\n"
+)
+
+
+@pytest.mark.parametrize(
+    "first",
+    ["//kod:cc lib.c", "//  kod:cc lib.c", "// Kod:cc lib.c", "// kod :cc lib.c"],
+)
+def test_a_directive_with_a_slip_in_its_spelling_is_an_error_not_a_comment(
+    project: Project, first: str
+):
+    project.write(cc_module("lib", first, 1))
+    project.write({"entry.kod": entry_of("lib")})
+    for command in ["check", "build"]:
+        assert project.run(command, "entry.kod") == (1, "", SLIP), command
+    assert project.clang_calls() == []
+    assert project.apps() == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["// kod:link -lz \t", "// kod:link\t-lz", "// kod:cc lib.c\t"],
+)
+def test_a_tab_in_a_directive_line_is_an_error_at_that_line(
+    project: Project, line: str
+):
+    project.write(cc_module("lib", line, 1))
+    project.write({"entry.kod": entry_of("lib")})
+    wanted = (
+        "lib.kod:1:1: error: a tab or another control character in a directive "
+        "line; its words are separated by spaces\n"
+    )
+    for command in ["check", "build"]:
+        assert project.run(command, "entry.kod") == (1, "", wanted), command
+    assert project.clang_calls() == []
+
+
+# More than a directive of this size needs, with room for the program itself.
+RSS_LIMIT = 64 * 2**20
+
+
+def test_a_very_long_word_or_hint_costs_memory_in_proportion(project: Project):
+    # Put together a byte or a word at a time, these cost about 1.4 GB.
+    project.write(
+        {
+            "long.kod": (
+                "// kod:link -L" + "a" * 40_000 + "\n"
+                "// kod:link " + "${CC}" * 5_000 + "\n"
+                "// kod:require /no/such " + "hint " * 10_000 + "\n\n"
+                "func f() -> int64 {\n    return 1\n}\n"
+            ),
+            "entry.kod": 'import "./long"\n' + program("x"),
+        }
+    )
+    with running([KOD, "check", "entry.kod"], cwd=project.root, env=project.env) as p:
+        assert p.stdout is not None
+        p.stdout.read()
+        _, wait_status, usage = os.wait4(p.pid, 0)
+        p.returncode = os.waitstatus_to_exitcode(wait_status)
+        assert (p.returncode, stderr_text(p)) == (0, "")
+    # Bytes on macOS.
+    assert usage.ru_maxrss < RSS_LIMIT, usage.ru_maxrss / 2**20
+
+
+def test_no_module_make_builds_declares_link_inputs():
+    # Make builds the always-linked modules, the compiler library and the two
+    # compiler entries without reading `// kod:` lines (docs/modules.md, "Link
+    # inputs"). The driver refuses lines in an always-linked module; for the
+    # others, which it would read, this test is the guard.
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    compiler = make_variables(ROOT / "Makefile")["COMPILER_KOD"].split()
+    modules = [*config["STAGE0_KOD"], *compiler, "kodc.kod", "tools/kod.kod"]
+    assert len(modules) > 14
+    for module in modules:
+        for line in (ROOT / module).read_text().split("\n"):
+            text = line.strip()
+            if text and not text.startswith("//"):
+                break
+            assert not re.match(r"//\s*kod\s*:", text, re.IGNORECASE), (module, line)
+
+
+def test_a_signal_during_the_build_of_the_lsp_server_stops_what_it_started():
+    # The LSP tests build the server before they run. A signal to pytest then
+    # must not leave `kod` and the compilers it started running.
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from lsp_test import build_lsp\n"
+        "build_lsp(Path(sys.argv[2]))\n"
+    )
+    with temp_dir("kod_lspbuild_") as path:
+        pidfile = path / "pid"
+        stand_in = path / "kod"
+        stand_in.write_text(
+            f"#!/bin/sh\nsleep 60 &\necho $! > '{pidfile}.tmp'\n"
+            f"mv '{pidfile}.tmp' '{pidfile}'\nwait\n"
+        )
+        stand_in.chmod(0o755)
+        sleeper = 0
+        gone = False
+        argv = [sys.executable, "-c", code, ROOT / "tests", stand_in]
+        try:
+            with running(argv) as build:
+                for _ in range(600):
+                    if pidfile.exists():
+                        break
+                    time.sleep(0.05)
+                else:
+                    pytest.fail("the build never started its program")
+                sleeper = int(pidfile.read_text())
+                build.send_signal(signal.SIGTERM)
+                assert build.wait(timeout=30) == -signal.SIGTERM
+                for _ in range(100):  # init reaps it once its parent is gone
+                    try:
+                        os.kill(sleeper, 0)
+                    except ProcessLookupError:
+                        gone = True
+                        break
+                    time.sleep(0.05)
+                assert gone, "the program the build started is still running"
+        finally:
+            if sleeper and not gone:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(sleeper, signal.SIGKILL)
