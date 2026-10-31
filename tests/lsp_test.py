@@ -5,19 +5,19 @@ on each one. Builds the binary via `kod build` on first run."""
 import json
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+KOD = ROOT / "build" / "apps" / "kod" / "kod"
 BIN = ROOT / "build" / "apps" / "lsp" / "lsp"
 
 
 @pytest.fixture(scope="module")
-def lsp_binary():
+def lsp_binary(sh_kodc):
     subprocess.run(
-        [sys.executable, "-m", "kod", "build", "tools/lsp.kod"],
+        [str(KOD), "build", "tools/lsp.kod"],
         cwd=ROOT,
         check=True,
         capture_output=True,
