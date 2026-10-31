@@ -23,6 +23,13 @@
 #   make clean-apps       drop build/apps/ (per-app outputs)
 #   make clean            drop build/ entirely (keeps bootstrap/sh_kodc)
 #
+# Linking: link.cfg (and link.local.cfg, untracked, which overrides single
+# names on one machine) holds the linker command, the C compiler and its
+# flags, and the always-linked C files and Kod modules. This Makefile
+# includes it and tools/kod.kod reads the same files, so both link alike.
+# The objects and links are rebuilt when the files change, or when the
+# configuration in force differs from the one build/.link-config records.
+#
 # Layout:
 #   bootstrap/sh_kodc     arm64-darwin sh_kodc snapshot — checked in so a
 #                         fresh clone (or `make clean`) can rebuild stage1

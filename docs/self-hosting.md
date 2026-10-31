@@ -35,17 +35,39 @@ build/stage1/       sh_kodc + its .s/.o, plus runtime_main.{s,o}
 build/apps/kod/     the native kod driver
 build/apps/<stem>/  the final executable; its objects are in <stem>.obj/, a tree that
                     mirrors the source tree (see Modules, "Symbol and object names")
+link.cfg            how everything is linked, read by the Makefile and by kod
 ```
 
 Driven by the `Makefile`:
 
 1. **stage0**: the checked-in snapshot `bootstrap/sh_kodc` compiles the always-linked stdlib modules and the compiler library to assembly; `as` assembles them and `clang` builds `arena.c` / `runtime.c`.
-2. **stage1**: the snapshot compiles `kodc.kod` and writes the `_main` shim; `ld` links everything into `build/stage1/sh_kodc`. So `sh_kodc` is the *current* compiler sources, compiled by the *snapshot*.
+2. **stage1**: the snapshot compiles `kodc.kod` and writes the `_main` shim; `clang` links everything into `build/stage1/sh_kodc`. So `sh_kodc` is the *current* compiler sources, compiled by the *snapshot*.
 3. **apps**: `kod build foo.kod` compiles each of the program's modules with `build/stage1/sh_kodc` to `build/apps/foo/foo.obj/<path>.o` and links them against `build/stage0/`.
 
 Two consequences: a codegen change reaches user programs right away, but the stage0 stdlib modules keep the snapshot's codegen until `make bootstrap-snapshot` refreshes it. And the compiler sources themselves may only use features the snapshot can compile.
 
 If the snapshot is missing, the Makefile falls back to running `kodc.kod` under the Python interpreter (`make bootstrap-snapshot` forces this path; it takes minutes).
+
+### The link configuration
+
+`link.cfg` at the repository root describes the link once. The Makefile `include`s it and `tools/kod.kod` reads it, so both link the same way. One `NAME := word word ...` per line, and nothing else:
+
+- A name is capital letters, digits and `_`, starting with a letter, and is set once per file.
+- Words are separated by one space. A word is letters, digits and the characters `_ . / , = + @ -`; there is no quoting, no `$(...)`, no continuation line, no tab, no trailing space.
+- A line that starts with `#` is a comment, and an empty line is skipped. A `#` anywhere else in a line is an error, and so is a comment that ends in `\`.
+
+`kod` rejects a line that does not fit, naming the file and line; for a line that fits, Make and `kod` read the same words. `link.local.cfg` (untracked) is read after `link.cfg` and overrides single names on one machine; a new `git worktree` needs its own copy. It overrides and does not add: a name there that `link.cfg` does not set (a typo, or a name of Make's own such as `STAGE0` or `SHELL`) is an error in both. Neither accepts a `LINK`, `RUNTIME_C` or `STAGE0_KOD` that ends up empty.
+
+| Name | Meaning |
+|---|---|
+| `LINK` | command that links an executable: `clang -target arm64-apple-darwin -Wl,-dead_strip`. `clang` finds the SDK and the macOS version. |
+| `CC`, `CFLAGS` | compile a C file: `clang`, `-target arm64-apple-darwin -I stdlib`. The target is pinned as in `LINK` (and `as`), so a `clang` that follows the architecture of the shell it runs in (one under Rosetta) does not produce x86_64 objects that the arm64 link rejects. |
+| `RUNTIME_C` | C files linked into every program; built to `build/stage0/<name>.o` |
+| `STAGE0_KOD` | Kod modules linked into every program, in link order; prebuilt by the snapshot compiler to `build/stage0/_<basename>.o`, so their basenames must be unique |
+
+A program links, in order: `LINK`, `-o <exe>`, the `RUNTIME_C` objects, the `STAGE0_KOD` objects, the program's module objects and its `_main` shim. Adding an always-linked module is one more word in `STAGE0_KOD`; the Makefile derives its rule. `make` rebuilds the C runtime objects and relinks `sh_kodc` and `kod` when `link.cfg` or `link.local.cfg` changes, and also when the configuration in force is not the one they were built with (it keeps that in `build/.link-config`), so removing `link.local.cfg`, or a name from it, rebuilds too. A program gets the deployment target of the machine that builds it, as `clang` chooses it (`MACOSX_DEPLOYMENT_TARGET` in the environment overrides that).
+
+Requirements: `clang` and `as` (Xcode Command Line Tools). `kod` is run from the repository root; from another directory `uv run kod` says that `build/apps/kod/kod` is not found, and that tool, called by its path, says `link.cfg not found`. Calling `build/apps/kod/kod` directly does not rebuild `build/stage0/`, so after a change to `runtime.c` or `link.cfg` run `make kod` (or `uv run kod`, which does); when the configuration names an always-linked object that is not there yet, `kod` says `build/stage0/_name.o not found; run make`.
 
 ## What's still Python
 

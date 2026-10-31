@@ -9,7 +9,7 @@ icon: lucide/download
 - macOS on Apple Silicon (AArch64)
 - Python 3.13+
 - [uv](https://docs.astral.sh/uv/) (recommended)
-- Xcode Command Line Tools (`xcode-select --install`) — provides `as`, `ld`, and `clang`
+- Xcode Command Line Tools (`xcode-select --install`) — provides `as` and `clang`, which compiles the C runtime and links every program
 
 ## From source
 
@@ -43,5 +43,15 @@ uv run kod check hello.kod   # parse + codegen; report errors but emit nothing
 ```
 
 Run `kod` from the repository root. A global `uv tool install .` is not supported: the package carries no stdlib.
+
+## Linking
+
+`link.cfg` at the repository root says how programs are linked: the `clang` command and the C files and Kod modules every program contains. Nothing in it is specific to one machine, so most machines never touch it. One that needs something else (a Homebrew LLVM `clang` first on `PATH` that does not find the SDK, an unusual SDK) puts the names it changes in `link.local.cfg` next to it (only names `link.cfg` sets), for example:
+
+```
+LINK := /usr/bin/clang -target arm64-apple-darwin -Wl,-dead_strip
+```
+
+`link.local.cfg` is not tracked by git, so each new `git worktree` needs its own copy (`cp ../link.local.cfg .`). See [Self-hosting](self-hosting.md) for the format.
 
 See [CLI reference](cli.md) for the full command surface.
