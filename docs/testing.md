@@ -68,8 +68,9 @@ test "map lookup hits" {
 ## Discovery
 
 - `kod test <file>` builds the file and every transitively imported module that contains `test` blocks, then runs them all in one binary.
-- `kod test <dir>` walks the directory for `*_test.kod`, builds them all in one binary via a temporary aggregator at the project root. Each file keeps its own type names (see [Modules](modules.md#where-names-resolve)), so two test files may both declare a helper `type Pt`.
+- `kod test <dir>` walks the directory for `*_test.kod` and builds them all into one binary, with no temporary module. Each file keeps its own type names (see [Modules](modules.md#where-names-resolve)), so two test files may both declare a helper `type Pt`, and two test files may share a file name (`a/dup_test.kod` and `b/dup_test.kod`).
 - `kod test .` walks the entire project.
+- The walk skips a file with a path component below the directory that starts with `.` (worktrees under `.claude/`, editor files, scratch files such as `.kod_compile_test.kod`) and a `build` directory directly below it. (The test suite's own finder skips the dot-directories and a top-level `build/`, but not dot-files.) Only files count: a directory named `x_test.kod` is walked, not run. A match that is not a readable file (a link to nothing) stops the run with `kod test: cannot read <path>`, since a test skipped without a word reads as one that passed. `kod test <file>` takes the file named, whatever its path.
 
 The aggregate exit code is 0 if every test passed, non-zero otherwise.
 
@@ -93,7 +94,7 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 ## How it works (briefly)
 
 - The parser turns `test "..." { ... }` into a `Decl.Test` carrying a synthesized `FuncDecl`.
-- The codegen emits each test as a regular function (`<prefix>$__test_N`) and, per module, a `<prefix>$__run_tests` dispatcher.
+- The codegen emits each test as a regular function (`<prefix>$__test_N`) and, per module, a `<prefix>$__run_tests` dispatcher. `<prefix>` is described in [Modules](modules.md#symbol-and-object-names).
 - `kod test` builds a runtime `_main` that calls every test-bearing module's `__run_tests` in turn, then `_kod_test_summary` once at the end. Counters live in C runtime statics.
 - `fail`/`assert` set a per-test "failed" flag the dispatcher reads after each test returns; that flag drives the `ok` / `FAIL` line and the aggregate count.
 

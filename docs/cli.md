@@ -40,7 +40,7 @@ uv run kod run hello.kod
 Run `test "..." { ... }` blocks. Path can be a file or a directory.
 
 - File: builds the file + all transitively-imported modules that contain tests, runs everything in one binary, prints a rolled-up summary.
-- Directory: walks for `*_test.kod` and runs them all together via a temporary aggregator.
+- Directory: walks for `*_test.kod` and builds them all into one program, with no temporary module, so two test files may share a file name. A file with a path component below the directory that starts with `.` (worktrees under `.claude/`, editor files) and a `build` directory directly below it are skipped; a `*_test.kod` that cannot be read (a link to nothing) stops the run. `kod test <file>` takes the file named, whatever its path.
 
 ```shell
 uv run kod test stdlib/map_test.kod
@@ -64,7 +64,8 @@ uv run kod check src/foo.kod
 |------|-------------|
 | `build/stage0/` | Shared stdlib objects: `arena.o`, `runtime.o`, `_builtins.o`, `_int64.o`, `_str.o`, `_bool.o`. Reused by `sh_kodc` and every app. |
 | `build/stage1/` | The self-hosted compiler `sh_kodc` and its parts (`lexing.{s,o}`, `parsing.{s,o}`, `codegen.{s,o}`, `kodc.{s,o}`, `runtime_main.{s,o}`). |
-| `build/apps/<stem>/` | Per-app artifacts: each module's `.s` and `.o`, the runtime_main shim, and the final executable (or `<stem>_test` for `kod test`). |
+| `build/apps/<stem>/` | The final executable, `<stem>` (or `<stem>_test` for `kod test`). `<stem>` is the entry's file name without `.kod`; for `kod test <dir>` it is the directory with every byte outside letters, digits, `_` and `-` replaced by `_` (its last 200 bytes, when it is longer), then `_tests`. A file whose name without `.kod` is empty, `.` or `..` has no program name and is refused. An entry named `kod` or `lsp` (other than `tools/kod.kod` and `tools/lsp.kod`, however they are spelled) is refused, because its executable would replace the tool. So is one whose directory the volume takes for the tool's, such as `KOD` on a case-insensitive volume. |
+| `build/apps/<stem>/<stem>.obj/` | The program's objects, in a tree that mirrors the source tree: each module's `.s` and `.o` (`lib/json.kod` is `<stem>.obj/lib/json.kod.o`) and the `_main` shim (`<entry>.main.{s,o}`, or `<first entry>.testmain.{s,o}` for tests). So `json` and `./json`, or `a/util` and `b/util`, are different objects. |
 
 `make clean-apps`, `make clean-stage1`, `make clean` give scoped cleanup.
 

@@ -143,3 +143,21 @@ func max_block() -> int64 {
     return 65535
 }
 ```
+
+## Symbol and object names
+
+A module is identified by its normalized path: `./x` and `./a/../x` are one module, while `x` (the file under `stdlib/`) and `./x` (the project's own) are two. Everything a module emits (functions, types, tests) is labelled `$<prefix>$<name>`. The prefix is computed from the path and from whether `stdlib/<path>.kod` exists (step 5):
+
+1. Drop the `.kod` extension, and the leading `/` of an absolute path.
+2. A path under `stdlib/` drops that directory: `stdlib/io.kod` is `io`, `stdlib/kod/ast.kod` is `kod$ast`.
+3. Each remaining byte becomes symbol characters. `/` becomes `$`. Letters, digits and `_` stay. `.` stays, except as the first byte. Every other byte (space, `-`, `+`, `@`, `$`, each byte of a non-ASCII character) becomes `$$` followed by its two lowercase hex digits: `my-app` is `my$$2dapp`.
+4. The label is `$<prefix>$<name>`, and the assembler reads `$` followed by a digit as a number, and takes no `$$name` at all, so a prefix is never empty and never starts with `$` or a digit. If it would, a `.` is put in front: `-x` is `.$$2dx`, `01_hello` is `.01_hello`, `2024/report` is `.2024$report`, and a file named `.kod` is `.`. (A digit after an inner `$` is fine: `tests/3d` is `tests$3d`.) The assembler also reads `.` and digits followed by `e` or `E` as a number (`.1e5`), so then that letter is written `$$65` or `$$45` as well: `1e5` is `.1$$655`, `2East/lib` is `.2$$45ast$lib`.
+5. A module outside `stdlib/` whose path also exists under `stdlib/` is in the namespace `.user$`: a project's `io.kod` is `.user$io` and does not clash with the stdlib `io`. The check is a file test, so on a case-insensitive volume a project's `Io.kod` also gets the marker; that is harmless, because every project module is recompiled for each program.
+
+Two different normalized paths never get the same prefix: a prefix's own leading `.` is always escaped by step 3, so a raw leading `.` comes only from step 4, the marker `.user$` starts `.u`, which step 4 never produces, and `$$65` and `$$45` are escapes that step 3 never writes (it keeps letters). (An absolute path and the relative path with the same components still collide, as before.)
+
+`kod build` writes a program's objects under `build/apps/<stem>/<stem>.obj/`, mirroring the source tree: `stdlib/json.kod` becomes `<stem>.obj/stdlib/json.kod.o`, a project's `lib/json.kod` becomes `<stem>.obj/lib/json.kod.o`; the assembly `.s` sits beside each `.o`. A `..` directory is written `%2e%2e` (a `.` one `%2e`), the root of an absolute path `%2f`, and a literal `%` in a name `%25`. The `_main` shim is `<stem>.obj/<entry>.main.{s,o}` (`<stem>.obj/<first entry>.testmain.{s,o}` for tests). The executable is `build/apps/<stem>/<stem>`, or `<stem>_test` for `kod test`; `<stem>.obj` can equal neither. `<stem>` is the entry's file name without `.kod`; for `kod test <dir>` it is the directory with every byte outside letters, digits, `_` and `-` replaced by `_` (its last 200 bytes, when it is longer), then `_tests`. A file whose name without `.kod` is empty, `.` or `..` (`.kod`, `..kod`, `...kod`) has no program name and is refused. An entry named `kod` or `lsp` (other than `tools/kod.kod` and `tools/lsp.kod`, however they are spelled) is refused, because its executable would replace the tool. So is one whose directory the volume takes for the tool's, such as `KOD` on a case-insensitive volume.
+
+The object path has to fit the file system as well: a file name of more than about 240 bytes (the shim adds `.kod.main.s`), or an absolute entry path of more than about 950 bytes (`build/apps/<stem>/<stem>.obj/%2f/` goes in front of it), is too long, and the build stops with a message that a file could not be opened or a directory made.
+
+`kod test <dir>` builds every `*_test.kod` below `<dir>` into one program, except a file with a path component below `<dir>` that starts with `.` (worktrees under `.claude/`, editor files, the scratch `.kod_compile_test.kod`) and a `build` directory directly below `<dir>`. `kod test <file>` takes the file named, whatever its path.
