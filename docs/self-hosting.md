@@ -33,14 +33,15 @@ build/stage0/       C runtime objects, the always-linked stdlib modules, and the
                     compiler library shared by sh_kodc and the kod driver
 build/stage1/       sh_kodc + its .s/.o, plus runtime_main.{s,o}
 build/apps/kod/     the native kod driver
-build/apps/<stem>/  per-app outputs + the final executable
+build/apps/<stem>/  the final executable; its objects are in <stem>.obj/, a tree that
+                    mirrors the source tree (see Modules, "Symbol and object names")
 ```
 
 Driven by the `Makefile`:
 
 1. **stage0**: the checked-in snapshot `bootstrap/sh_kodc` compiles the always-linked stdlib modules and the compiler library to assembly; `as` assembles them and `clang` builds `arena.c` / `runtime.c`.
 2. **stage1**: the snapshot compiles `kodc.kod` and writes the `_main` shim; `ld` links everything into `build/stage1/sh_kodc`. So `sh_kodc` is the *current* compiler sources, compiled by the *snapshot*.
-3. **apps**: `kod build foo.kod` compiles each of the program's modules with `build/stage1/sh_kodc` and links them against `build/stage0/`.
+3. **apps**: `kod build foo.kod` compiles each of the program's modules with `build/stage1/sh_kodc` to `build/apps/foo/foo.obj/<path>.o` and links them against `build/stage0/`.
 
 Two consequences: a codegen change reaches user programs right away, but the stage0 stdlib modules keep the snapshot's codegen until `make bootstrap-snapshot` refreshes it. And the compiler sources themselves may only use features the snapshot can compile.
 
