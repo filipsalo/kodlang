@@ -13,6 +13,10 @@ import _pytest
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+# The native tools every test but the interpreter's goes through (the
+# `sh_kodc` fixture builds them).
+KOD = ROOT / "build" / "apps" / "kod" / "kod"
+SH_KODC = ROOT / "build" / "stage1" / "sh_kodc"
 
 
 def run_interpreted(path: str) -> subprocess.CompletedProcess:
@@ -28,10 +32,9 @@ def run_interpreted(path: str) -> subprocess.CompletedProcess:
 
 
 def run_compiled(path: str) -> subprocess.CompletedProcess:
-    """Run a program compiled to an executable. The Builder picks the native
-    self-hosted compiler at build/stage1/sh_kodc automatically when it exists."""
+    """Build a program with the native `kod` tool and run it."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "run", path],
+        [str(KOD), "run", path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -41,9 +44,9 @@ def run_compiled(path: str) -> subprocess.CompletedProcess:
 
 
 def compile_to_assembly(path: str) -> subprocess.CompletedProcess:
-    """Compile a program to assembly."""
+    """Compile a program to assembly with sh_kodc."""
     result = subprocess.run(
-        [sys.executable, "-m", "kod", "_emit-asm", path],
+        [str(SH_KODC), path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -122,7 +125,7 @@ TEST_SUMMARY = re.compile(r"^(\d+)/(\d+) passed", re.MULTILINE)
 
 def run_kod_test(path: Path | str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "kod", "test", str(path)],
+        [str(KOD), "test", str(path)],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -177,7 +180,7 @@ def test_read_file_pipe(sh_kodc):
     path = "tests/read_file_stdin.kod"
     data = b"".join(b"line %06d of piped input\n" % i for i in range(12000))
     build = subprocess.run(
-        [sys.executable, "-m", "kod", "build", path],
+        [str(KOD), "build", path],
         cwd=ROOT,
         capture_output=True,
         check=False,
@@ -256,7 +259,7 @@ def test_missing_entry_file_is_an_error(via: str, sh_kodc):
     if via == "sh_kodc":
         cmd = [str(sh_kodc), missing]
     else:
-        cmd = [sys.executable, "-m", "kod", "build", missing]
+        cmd = [str(KOD), "build", missing]
     result = subprocess.run(
         cmd, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False
     )
