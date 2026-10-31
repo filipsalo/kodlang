@@ -161,3 +161,37 @@ Two different normalized paths never get the same prefix: a prefix's own leading
 The object path has to fit the file system as well: a file name of more than about 240 bytes (the shim adds `.kod.main.s`), or an absolute entry path of more than about 950 bytes (`build/apps/<stem>/<stem>.obj/%2f/` goes in front of it), is too long, and the build stops with a message that a file could not be opened or a directory made.
 
 `kod test <dir>` builds every `*_test.kod` below `<dir>` into one program, except a file with a path component below `<dir>` that starts with `.` (worktrees under `.claude/`, editor files, the scratch `.kod_compile_test.kod`) and a `build` directory directly below `<dir>`. `kod test <file>` takes the file named, whatever its path.
+
+## Link inputs
+
+A module that needs C code or a system library says so in the comment lines at the top of its file, before its first declaration:
+
+```
+// kod:require ${OPENSSL}/include/openssl/ssl.h  brew install openssl@3
+// kod:cc tls.c -I${OPENSSL}/include
+// kod:link -L${OPENSSL}/lib -lssl -lcrypto
+
+import "io"
+```
+
+- `kod:cc <file.c> [flags...]`: a C file beside the module. `kod build` compiles it with `CC` and `CFLAGS` of `link.cfg` followed by the flags given, and links the object. Flags are passed as written; a relative `-I` is relative to the repository root, where `kod` runs. The file is compiled on every build, like the modules, so an edit to it, to a header it includes or to `CC` and `CFLAGS` is picked up by the next one. A C file that several modules of a program name (or several test files of one `kod test <dir>`) is compiled and linked once; naming it with different flags is an error.
+- `kod:link <args...>`: arguments for the final link, after all objects: `-lz`, `-L...`, `-framework Security`, a path to a `.a`. They are passed in the order the modules appear in the program, and a `-lname` that comes up again is passed once.
+- `kod:require <file> [hint...]`: the file (a path from the repository root, or an absolute one) must exist before anything is compiled; otherwise the build stops with `path:line:1: error: needs <file> (<hint>)` (`needs <file>` when there is no hint), for each such file, naming the line of the directive. Use it for a file outside the repository that the other lines rely on, so that a machine without it gets the hint instead of `'openssl/err.h' file not found`.
+
+`${NAME}` in a word is replaced by the value of `NAME` in `link.cfg`, or in `link.local.cfg` when that overrides it (the example assumes `link.cfg` has an `OPENSSL` line). A name that neither file sets, or one whose value is not exactly one word, is an error, and so is a `$` that does not start `${NAME}`. Words are separated by spaces; there is no quoting, and a tab or another control character in a directive line is an error.
+
+Only the leading block counts: the lines from the top of the file that are blank or start with `//`, up to the first other line. In it a line that starts with `// kod:` (after any indent) is a directive, and any other comment line is just a comment; a `// kod:` line further down is a comment too and does nothing. A line in the block that is spelled like a directive but not so (`//kod:cc x.c`, `//  kod:cc x.c`, `// Kod:cc x.c`, `// kod :cc x.c`) is an error, so that a slip is not taken for a comment. A UTF-8 byte order mark at the start of the file is skipped, as the compiler skips it. Put a blank line after the block, or the first declaration takes it as its doc comment (shown on hover).
+
+These are errors, `path:line:1: error: ...`, from `kod build`, `kod run`, `kod test` and `kod check`: an unknown directive (`unknown directive kod:linkk`), a directive spelled almost right, a tab in a directive line, a directive without its argument, a `kod:cc` that does not name a `.c` file beside the module (a bare file name ending in `.c`, which has to exist), and a `${NAME}` that cannot be replaced. `kod check` validates the lines, and that the C file is there, but it does not test `kod:require` and compiles no C.
+
+Only a program that imports the module compiles its C file or passes its arguments, and that includes a module that only a test file imports: `kod test` reads the lines of every module of its program, and `kod test <dir>` builds all its files into one program, so one test file's missing `kod:require` file stops them all. A program that imports no such module compiles no C file. A C file's object is `<stem>.obj/<path>.c.o` in the tree of [Symbol and object names](#symbol-and-object-names), next to the module's own `<path>.kod.o`. If the C compiler fails, `kod` shows its output and `kod: compiling <file> failed`, exits 1 and links nothing.
+
+A module that declares link inputs cannot be one that the Makefile builds: it does not read their lines. That is a module listed in `STAGE0_KOD` of `link.cfg`, one of the compiler's own modules (`COMPILER_KOD` in the Makefile) and `kodc.kod` and `tools/kod.kod`. For a `STAGE0_KOD` module the driver says so (`path:line:1: error: ...`) and stops, rather than leave the lines unread; for the others a test of the repository checks that there are none. And the interpreter cannot call the module's `extern func`s (see [Extern functions](functions.md#extern-functions)).
+
+C files export bare symbols into one namespace shared with libc and `runtime.c`: name them `kod_<module>_...`. `#include "kod_rt.h"` (`CFLAGS` has `-I stdlib`) declares what they need of the runtime:
+
+- `KodStr`: what a Kod `str` is when it crosses into C. `buf` points at `len` bytes followed by a NUL byte, and a `str` parameter or result is a `KodStr *`.
+- `KodArray`: a Kod `[T]`: `ptr` points at `len` 8-byte slots, with room for `cap`.
+- `arena_alloc(size)`: memory that is never freed, as for everything Kod allocates.
+- `kod_str_new(len)`: a new `str` of `len` bytes for the caller to fill in. `kod_str_from_bytes(p, n)`: a `str` that is a copy of `n` bytes at `p`, which may contain NUL bytes.
+- `kod_panic(msg)`: print `panic: ` and the message with a backtrace, and exit 1.

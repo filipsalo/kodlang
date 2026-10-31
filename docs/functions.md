@@ -320,11 +320,11 @@ function type carries no defaults.
 Declare external C functions with `extern`:
 
 ```kod
-extern func strlen(anon s: str) -> int64     // compiled programs only
+extern func labs(anon n: int64) -> int64     // compiled programs only
 extern func putchar(anon c: int64) -> int64  // also runs in the interpreter
 ```
 
-These link against the C runtime and any object files passed at link time. The interpreter runs only the twelve externs it mirrors (`putchar` is one); calling any other stops with ``error: extern `NAME` is not available in the interpreter``.
+An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`, so a libc function that takes a C string does not fit. The interpreter runs only the twelve externs it mirrors (`putchar` is one); calling any other stops with ``error: extern `NAME` is not available in the interpreter``.
 
 ## Recursion
 

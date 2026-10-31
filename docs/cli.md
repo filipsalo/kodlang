@@ -20,10 +20,10 @@ uv run kod build hello.kod
 Build pipeline:
 
 1. Refresh the toolchain with `make stage1 kod` (a no-op unless the compiler, the C runtime, or an always-linked stdlib module changed). This only happens when `kod` runs from the repo root; invoking `build/apps/kod/kod` directly skips it. If the rebuild fails, `kod` reports it and stops.
-2. Parse the entry and walk its transitive imports. A missing entry file (`path:1:1: error: no such file`) or a missing import (`importer:line:col: error: no such module ...`) is an error.
-3. Compile each module that isn't prebuilt in `build/stage0/` to a `.o` with `sh_kodc _compile`, the entry first, stopping at the first that fails. A failing module's errors follow those in the declarations of the modules it loads, such as an import that names no file, an unknown return type, a field declared twice or a parse error, since its own may be only their cascades.
+2. Parse the entry and walk its transitive imports. A missing entry file (`path:1:1: error: no such file`) or a missing import (`importer:line:col: error: no such module ...`) is an error. Then read the comment lines at the top of each module for the C files, link arguments and required files it declares ([Link inputs](modules.md#link-inputs)); a mistake in them, or a required file that isn't there, stops the build before anything is compiled.
+3. Compile each module that isn't prebuilt in `build/stage0/` to a `.o` with `sh_kodc _compile`, the entry first, stopping at the first that fails, and then each C file the modules name, once. A failing module's errors follow those in the declarations of the modules it loads, such as an import that names no file, an unknown return type, a field declared twice or a parse error, since its own may be only their cascades.
 4. Generate and assemble the `_main` runtime shim that calls the user's `main`.
-5. Link everything against the prebuilt `build/stage0/` objects with the `LINK` command of `link.cfg` (`clang`, see [Self-hosting](self-hosting.md)). The driver reads `link.cfg`, and `link.local.cfg` if there is one, from the working directory: run it from the repository root, or it says `link.cfg not found`.
+5. Link everything against the prebuilt `build/stage0/` objects with the `LINK` command of `link.cfg` (`clang`, see [Self-hosting](self-hosting.md)), followed by the arguments the modules give with `kod:link`. The driver reads `link.cfg`, and `link.local.cfg` if there is one, from the working directory: run it from the repository root, or it says `link.cfg not found`.
 
 The native driver (`build/apps/kod/kod`, built from `tools/kod.kod`) runs steps 2–5.
 
@@ -56,7 +56,7 @@ See [Testing](testing.md) for the syntax.
 
 ### `kod check <file>`
 
-Run the full compile pipeline through codegen, report errors, but write no artifacts and skip the link step. Exits non-zero on any error. An error already shown for one module isn't shown again for another.
+Run the full compile pipeline through codegen, report errors, but write no artifacts and skip the link step. Exits non-zero on any error. It also checks the link directives at the top of each module (see [Link inputs](modules.md#link-inputs)), but compiles no C file and does not look for a `kod:require` file. An error already shown for one module isn't shown again for another.
 
 ```shell
 uv run kod check src/foo.kod
@@ -69,7 +69,7 @@ uv run kod check src/foo.kod
 | `build/stage0/` | The objects `sh_kodc`, `kod` and every app share: the C files and Kod modules `link.cfg` lists as `RUNTIME_C` and `STAGE0_KOD` (`arena.o`, `runtime.o`, `_<name>.o`; see [Self-hosting](self-hosting.md#build-chain)) and the compiler library the two tools link. |
 | `build/stage1/` | The self-hosted compiler `sh_kodc` and the objects it is linked from (`kodc.{s,o}`, `runtime_main.{s,o}`). |
 | `build/apps/<stem>/` | The final executable, `<stem>` (or `<stem>_test` for `kod test`). `<stem>` is the entry's file name without `.kod`; for `kod test <dir>` it is the directory with every byte outside letters, digits, `_` and `-` replaced by `_` (its last 200 bytes, when it is longer), then `_tests`. A file whose name without `.kod` is empty, `.` or `..` has no program name and is refused. An entry named `kod` or `lsp` (other than `tools/kod.kod` and `tools/lsp.kod`, however they are spelled) is refused, because its executable would replace the tool. So is one whose directory the volume takes for the tool's, such as `KOD` on a case-insensitive volume. |
-| `build/apps/<stem>/<stem>.obj/` | The program's objects, in a tree that mirrors the source tree: each module's `.s` and `.o` (`lib/json.kod` is `<stem>.obj/lib/json.kod.o`) and the `_main` shim (`<entry>.main.{s,o}`, or `<first entry>.testmain.{s,o}` for tests). So `json` and `./json`, or `a/util` and `b/util`, are different objects. |
+| `build/apps/<stem>/<stem>.obj/` | The program's objects, in a tree that mirrors the source tree: each module's `.s` and `.o` (`lib/json.kod` is `<stem>.obj/lib/json.kod.o`), the object of each C file a module names (`<stem>.obj/lib/json.c.o`) and the `_main` shim (`<entry>.main.{s,o}`, or `<first entry>.testmain.{s,o}` for tests). So `json` and `./json`, or `a/util` and `b/util`, are different objects. |
 
 `make clean-apps`, `make clean-stage1`, `make clean` give scoped cleanup.
 

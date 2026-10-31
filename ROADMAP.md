@@ -19,10 +19,14 @@ CRC-32, deflate / gzip, a minimal JSON, and LSP-style JSON-RPC framing.
 
 Grow the stdlib far enough to talk to HTTP services and handle real JSON. In order:
 
-1. **Networking** — TCP sockets (`getaddrinfo`, connect, read, write, close) as runtime
-   externs with a small Kod wrapper. Errors come back as `T or Error`, not panics.
+1. **Networking** — TCP sockets (`getaddrinfo`, connect, read, write, close) as a small
+   C shim and Kod wrapper in `stdlib/net/tcp.{kod,c}`, linked only into the programs that
+   import them (see Link inputs in `docs/modules.md`). Errors come back as `T or Error`,
+   not panics.
 2. **TLS** — a client-side TLS stream with the same read/write shape as a plain socket,
-   most likely by binding the system TLS library rather than implementing it in Kod.
+   by binding OpenSSL rather than implementing it in Kod: `stdlib/net/tls.{kod,c}`, which
+   names its C file, `-lssl -lcrypto` and the OpenSSL headers it needs in its leading
+   `// kod:` lines, so only programs that import it compile the shim or need OpenSSL.
 3. **HTTP/1.1 client** — request building, status line and header parsing,
    `Content-Length` and chunked bodies, over either stream type.
 4. **Robust JSON** — parse errors returned as values instead of panics, `\uXXXX` escapes,
