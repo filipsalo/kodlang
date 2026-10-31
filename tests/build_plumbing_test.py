@@ -1,17 +1,26 @@
 """Names and objects (docs/modules.md, "Symbol and object names"): a path of
 any shape builds, modules with the same name link, and each object is named
-after its source path. Everything goes through the native `kod` tool."""
+after its source path. And the link configuration (docs/self-hosting.md, "The
+link configuration"): `link.cfg` is read by Make and by the driver, and
+programs are linked the way it says. Everything goes through the native `kod`
+tool."""
 
 import contextlib
+import importlib.util
 import os
+import platform
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
 import pytest
+from stdio_test import removed_if_signalled, running, stderr_text
 
 ROOT = Path(__file__).resolve().parent.parent
 KOD = ROOT / "build" / "apps" / "kod" / "kod"
@@ -540,3 +549,783 @@ def test_the_source_of_a_tool_is_not_refused_however_it_is_spelled(
             check=False,
         )
         assert result.returncode == 0, result.stderr
+
+
+# --- The link configuration ------------------------------------------------
+
+LINK_CFG = ROOT / "link.cfg"
+LOCAL_CFG = ROOT / "link.local.cfg"
+
+# The grammar of a line of link.cfg: empty, a comment, or `NAME := words`.
+# Make and the driver read a line of this shape the same way; anything else
+# is a line one of them would read differently.
+CFG_NAME = r"[A-Z][A-Z0-9_]*"
+CFG_WORD = r"[A-Za-z0-9_./,=+@-]+"
+CFG_COMMENT = r"#(?:[^\t\r]*[^\t\r\\])?"
+CFG_LINE = re.compile(rf"(?:{CFG_COMMENT}|{CFG_NAME} :=(?: {CFG_WORD})*)?")
+
+
+def cfg_values(*files: Path) -> dict[str, list[str]]:
+    """The names the files set and their words; a later file overrides an
+    earlier one, as for Make and the driver."""
+    values: dict[str, list[str]] = {}
+    for path in files:
+        if path.exists():
+            for line in path.read_text().split("\n"):
+                if line and not line.startswith("#"):
+                    name, _, rest = line.partition(" :=")
+                    values[name] = rest.split()
+    return values
+
+
+def make_in(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run `make <args>` in `root`."""
+    return subprocess.run(
+        ["make", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def make_recipes(*args: str, root: Path = ROOT) -> list[str]:
+    """The recipe lines `make -n -B <args>` prints, a continued line as one."""
+    made = make_in(root, "-n", "-B", *args)
+    assert made.returncode == 0, made.stderr
+    assert "No rule to make target" not in made.stderr
+    return made.stdout.replace("\\\n", " ").split("\n")
+
+
+def make_variables(path: Path) -> dict[str, str]:
+    """What Make reads from the makefile `path`: its variables and their
+    values, from Make's database."""
+    made = subprocess.run(
+        ["make", "-pq", "-f", path.name],
+        cwd=path.parent,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    variables = {}
+    previous = ""
+    for line in made.stdout.split("\n"):
+        if previous.startswith("# makefile (from ") and path.name in previous:
+            name, _, value = line.partition(" := ")
+            if name != "MAKEFILE_LIST":  # Make's own, listed there too
+                variables[name] = value
+        previous = line
+    return variables
+
+
+def test_no_file_but_the_docs_names_the_linker_flags_and_sdk_it_used_to():
+    # In pieces, so that this file does not hold them.
+    needles = ["Command" + "LineTools", "macos_" + "version", "sw_" + "vers"]
+    found = subprocess.run(
+        ["git", "grep", "-n", "-i", "-I", *[f"-e{n}" for n in needles]]
+        + ["--", ".", ":!docs"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert found.returncode == 1, found.stdout
+
+
+def test_link_cfg_is_tracked_and_link_local_cfg_is_not():
+    listed = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "link.cfg"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert listed.returncode == 0, listed.stderr
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "link.local.cfg"], cwd=ROOT, check=False
+    )
+    assert ignored.returncode == 0
+
+
+def test_link_cfg_obeys_the_restricted_grammar():
+    text = LINK_CFG.read_text()
+    assert text.endswith("\n")
+    names = []
+    for number, line in enumerate(text.split("\n")[:-1], 1):
+        assert CFG_LINE.fullmatch(line), f"link.cfg:{number}: {line!r}"
+        if line and not line.startswith("#"):
+            names.append(line.split(" ")[0])
+    assert len(names) == len(set(names)), "a name is set twice"
+    assert {"LINK", "CC", "CFLAGS", "RUNTIME_C", "STAGE0_KOD"} <= set(names)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        " ",  # an empty line is empty
+        "  # indented comment",
+        "# comment ending in a backslash \\",
+        "# a\tb",
+        "# crlf\r",
+        "link := a",  # a name is capitals, digits and _
+        "1X := a",
+        "_X := a",
+        "X-Y := a",
+        "X",  # := follows the name after one space
+        "X = a",
+        "X: a",
+        "X:= a",
+        "X  := a",
+        "X ?= a",
+        "X += a",
+        "X ::= a",
+        "X :=a",  # a space follows :=
+        "X := a ",  # one space between words, none at the end
+        "X := a  b",
+        "X := ",
+        "X :=  a",
+        "\tX := a",
+        "X :=\ta",
+        "X := a\r",
+        "X := a # trailing comment",
+        "X := a#b",
+        "X := $(CC)",
+        "X := ${CC}",
+        "X := a\\",
+        'X := "a"',
+        "X := 'a'",
+        "X := `a`",
+        "X := a;b",
+        "X := a b|c",
+        "X := a>b",
+        "X := ~/a",
+        "X := *.c",
+        "X := %.c",
+        "X := a:b",
+        "X := caf\u00e9",
+    ],
+)
+def test_the_grammar_of_link_cfg_leaves_out_what_make_would_read_differently(
+    line: str,
+):
+    assert CFG_LINE.fullmatch(line) is None
+
+
+def test_make_reads_every_line_the_grammar_accepts_as_its_words(elsewhere: Path):
+    lines = [
+        "# a comment: := $(shell false) \\ anything",
+        "",
+        "LINK := clang -target arm64-apple-darwin -Wl,-dead_strip",
+        "EMPTY :=",
+        "FLAGS := -DKOD=1 -std=c11 +x a=b -,- @ = - . / ,",
+        "PATHS := /opt/homebrew/opt/openssl@3/lib ../a_b-c.d libc++.a",
+        "N2_X := 1",
+    ]
+    assert all(CFG_LINE.fullmatch(line) for line in lines)
+    cfg = elsewhere / "words.cfg"
+    cfg.write_text("\n".join(lines) + "\n")
+    want = {
+        line.partition(" :=")[0]: line.partition(" :=")[2].removeprefix(" ")
+        for line in lines
+        if line and not line.startswith("#")
+    }
+    assert make_variables(cfg) == want
+
+
+def test_make_keeps_what_the_grammar_leaves_out(elsewhere: Path):
+    # Why the grammar is as strict as it is: Make keeps a trailing space, the
+    # space before a #, and a doubled space, and it joins a line that ends in a
+    # backslash with the next one.
+    cfg = elsewhere / "loose.cfg"
+    cfg.write_text("A := a b \nB := a # note\nC := a  b\nD := d \\\nE := e\n")
+    assert make_variables(cfg) == {
+        "A": "a b ",
+        "B": "a ",
+        "C": "a  b",
+        "D": "d E := e",
+    }
+
+
+def test_the_lists_of_link_cfg_are_what_the_link_lines_name():
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    objects = [f"build/stage0/{Path(c).stem}.o" for c in config["RUNTIME_C"]] + [
+        f"build/stage0/_{Path(m).stem}.o" for m in config["STAGE0_KOD"]
+    ]
+    for target, exe in [
+        ("stage1", "build/stage1/sh_kodc"),
+        ("kod", "build/apps/kod/kod"),
+    ]:
+        links = [
+            line.split() for line in make_recipes(target) if f" -o {exe} " in line + " "
+        ]
+        assert len(links) == 1, target
+        words = links[0]
+        at = words.index("-o")
+        assert words[:at] == config["LINK"]
+        assert words[at + 1] == exe
+        assert words[at + 2 : at + 2 + len(objects)] == objects
+
+
+def test_the_always_linked_objects_have_names_of_their_own():
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    made = subprocess.run(
+        ["make", "-pq", "stage0"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    compiler = next(
+        line.partition(" := ")[2]
+        for line in made.stdout.split("\n")
+        if line.startswith("COMPILER_KOD := ")
+    ).split()
+    stage0 = [Path(m).stem for m in config["STAGE0_KOD"]]
+    runtime = [Path(c).stem for c in config["RUNTIME_C"]]
+    others = [Path(m).stem for m in compiler]
+    assert len(set(stage0)) == len(stage0)
+    assert len(set(runtime)) == len(runtime)
+    # build/stage0/_<name>.o and <name>.o
+    assert not set(stage0) & set(others)
+    assert not {f"_{s}" for s in stage0} & set(runtime)
+
+
+def test_make_stage0_has_a_rule_for_everything_link_cfg_lists():
+    recipes = make_recipes("stage0")
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    for module in config["STAGE0_KOD"]:
+        assert any(f" {module} >" in line for line in recipes), module
+    for source in config["RUNTIME_C"]:
+        assert any(line.endswith(f" {source}") for line in recipes), source
+
+
+def adjacent(words: list[str], *want: str) -> bool:
+    return any(words[i : i + len(want)] == list(want) for i in range(len(words)))
+
+
+def test_link_cfg_pins_the_target_and_the_flags_the_links_rely_on():
+    own = cfg_values(LINK_CFG)
+    assert own["LINK"][0] == "clang"
+    # The target of the link is that of the objects and of `as`; dead code and
+    # the functions only it calls are left out of an executable.
+    assert adjacent(own["LINK"], "-target", "arm64-apple-darwin")
+    assert "-Wl,-dead_strip" in own["LINK"]
+    assert adjacent(own["CFLAGS"], "-target", "arm64-apple-darwin")
+    # Where a companion C file finds the runtime header.
+    assert adjacent(own["CFLAGS"], "-I", "stdlib")
+
+
+def test_the_c_runtime_is_compiled_with_cc_and_cflags_of_link_cfg():
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    cflags = " ".join(config["CFLAGS"])
+    assert "-target arm64-apple-darwin" in " ".join(cfg_values(LINK_CFG)["CFLAGS"])
+    recipes = make_recipes("stage0")
+    for source in config["RUNTIME_C"]:
+        want = (
+            f"{' '.join(config['CC'])} {cflags} -c -o "
+            f"build/stage0/{Path(source).stem}.o {source}"
+        )
+        assert want in recipes
+
+
+@pytest.mark.parametrize("target", ["stage0", "stage1", "kod"])
+def test_a_change_of_link_cfg_rebuilds_what_it_configures(target: str):
+    # `-W` pretends the file changed, so no file's time is touched.
+    def out_of_date(*args: str) -> int:
+        return subprocess.run(
+            ["make", "-q", *args, target], cwd=ROOT, check=False
+        ).returncode
+
+    assert out_of_date() == 0
+    assert out_of_date("-W", "link.cfg") == 1
+
+
+def test_a_change_of_link_cfg_rebuilds_the_c_objects_and_the_links_not_the_modules():
+    # `-n -W` lists what would run if the file changed, and runs nothing.
+    made = subprocess.run(
+        ["make", "-n", "-W", "link.cfg", "stage1", "kod"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert made.returncode == 0, made.stderr
+    lines = made.stdout.replace("\\\n", " ").split("\n")
+    for source in cfg_values(LINK_CFG, LOCAL_CFG)["RUNTIME_C"]:
+        assert any(
+            f"-c -o build/stage0/{Path(source).stem}.o {source}" in line
+            for line in lines
+        )
+    assert any(" -o build/stage1/sh_kodc " in line for line in lines)
+    assert any(" -o build/apps/kod/kod " in line for line in lines)
+    # A Kod module is not compiled again.
+    assert not any(" > build/" in line for line in lines)
+
+
+def run_bounded(argv: list, cwd: Path, **kwargs) -> tuple[int, str, str]:
+    """Run `argv` in `cwd` as `running` does, so that a signal to pytest stops
+    it before the directory it runs in is removed; its status, stdout and
+    stderr."""
+    with running(argv, cwd=cwd, **kwargs) as proc:
+        assert proc.stdout is not None
+        out = proc.stdout.read().decode(errors="replace")
+        proc.wait()
+        return proc.returncode, out, stderr_text(proc)
+
+
+def run_driver(argv: list, cwd: Path, **kwargs) -> tuple[int, str, str]:
+    """Run the driver in `cwd`; its status, stdout and stderr."""
+    return run_bounded([KOD, *argv], cwd, **kwargs)
+
+
+@contextlib.contextmanager
+def temp_dir(prefix: str) -> Iterator[Path]:
+    """A directory outside the project, removed afterwards, also when pytest
+    is stopped by SIGTERM or SIGHUP."""
+    path = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+
+    def remove() -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    with removed_if_signalled(remove):
+        try:
+            yield path
+        finally:
+            remove()
+
+
+def test_a_signal_removes_what_every_enclosing_block_made_and_stops_the_programs():
+    # A program started in the blocks is stopped before the directories go.
+    code = (
+        "import os, signal, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from build_plumbing_test import running, temp_dir\n"
+        "with temp_dir('kod_nest_outer_') as outer:\n"
+        "    with temp_dir('kod_nest_inner_') as inner:\n"
+        "        with running(['sleep', '60'], cwd=inner) as proc:\n"
+        "            print(outer, inner, proc.pid, flush=True)\n"
+        "            os.kill(os.getpid(), signal.SIGTERM)\n"
+        "            time.sleep(30)\n"
+    )
+    ran = subprocess.run(
+        [sys.executable, "-c", code, str(ROOT / "tests")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    outer, inner, pid = ran.stdout.split()
+    try:
+        assert ran.returncode == -signal.SIGTERM, ran.stderr
+        assert not Path(outer).exists()
+        assert not Path(inner).exists()
+        for _ in range(100):  # the program is gone once init has reaped it
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the program is still running")
+    finally:
+        for left in (outer, inner):
+            shutil.rmtree(left, ignore_errors=True)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid), signal.SIGKILL)
+
+
+@pytest.fixture
+def elsewhere() -> Iterator[Path]:
+    """An empty directory: not a repository root."""
+    with temp_dir("kod_elsewhere_") as path:
+        yield path
+
+
+@pytest.fixture
+def driver_root() -> Iterator[Path]:
+    """A directory the driver takes for the repository root: a copy of
+    link.cfg, the built stage0 and stage1 and the stdlib by link, and a
+    build/apps of its own, so that what it builds stays out of the real tree.
+    A test adds a link.local.cfg to change the link."""
+    if not re.fullmatch(r"[A-Za-z0-9_./,=+@-]+", tempfile.gettempdir()):
+        pytest.skip("the temporary directory is not a path a link.cfg can name")
+    with temp_dir("kod_root_") as path:
+        (path / "build" / "apps").mkdir(parents=True)
+        for built in ["stage0", "stage1"]:
+            (path / "build" / built).symlink_to(ROOT / "build" / built)
+        (path / "stdlib").symlink_to(ROOT / "stdlib")
+        shutil.copyfile(LINK_CFG, path / "link.cfg")
+        (path / "hello.kod").write_text(program("linked"))
+        yield path
+
+
+MISSING_ROOT = "kod: link.cfg not found; run kod from the repository root\n"
+
+
+@pytest.mark.parametrize("command", ["build", "run", "test", "check"])
+def test_the_driver_outside_the_repository_root_says_where_to_run_it(
+    elsewhere: Path, command: str
+):
+    (elsewhere / "x.kod").write_text(program("x") + PASSING)
+    status, out, err = run_driver([command, "x.kod"], cwd=elsewhere)
+    assert (status, out, err) == (1, "", MISSING_ROOT)
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["x.kod"]
+
+
+def test_the_driver_without_a_compiler_says_to_run_make(elsewhere: Path):
+    shutil.copyfile(LINK_CFG, elsewhere / "link.cfg")
+    (elsewhere / "x.kod").write_text(program("x"))
+    status, out, err = run_driver(["build", "x.kod"], cwd=elsewhere)
+    assert (status, out, err) == (
+        1,
+        "",
+        "kod: build/stage1/sh_kodc not found; run make\n",
+    )
+
+
+def test_the_driver_without_a_command_prints_its_usage_wherever_it_is(elsewhere: Path):
+    status, out, err = run_driver([], cwd=elsewhere)
+    assert status == 1 and out == ""
+    assert err.startswith("usage: kod build <file>\n")
+
+
+def linked_with(root: Path, local: str) -> list[str]:
+    """Build hello.kod in `root` with `local` as its link.local.cfg and a
+    linker that records its arguments and then links; those arguments."""
+    link = cfg_values(root / "link.cfg")["LINK"]
+    recorder = root / "linkshim"
+    recorder.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$KOD_LINK_LOG"\nexec "$KOD_REAL_LINKER" "$@"\n'
+    )
+    recorder.chmod(0o755)
+    (root / "link.local.cfg").write_text(local.replace("RECORDER", str(recorder)))
+    log = root / "link.args"
+    env = {**os.environ, "KOD_LINK_LOG": str(log), "KOD_REAL_LINKER": link[0]}
+    status, _, err = run_driver(["build", "hello.kod"], cwd=root, env=env)
+    assert status == 0, err
+    assert err == ""
+    return log.read_text().split("\n")[:-1]
+
+
+def test_the_driver_links_as_link_cfg_says(driver_root: Path):
+    config = cfg_values(driver_root / "link.cfg")
+    flags = " ".join(config["LINK"][1:])
+    argv = linked_with(driver_root, f"LINK := RECORDER {flags}\n")
+    objects = [f"build/stage0/{Path(c).stem}.o" for c in config["RUNTIME_C"]] + [
+        f"build/stage0/_{Path(m).stem}.o" for m in config["STAGE0_KOD"]
+    ]
+    assert argv == [
+        *config["LINK"][1:],
+        "-o",
+        "build/apps/hello/hello",
+        *objects,
+        "build/apps/hello/hello.obj/hello.kod.o",
+        "build/apps/hello/hello.obj/hello.kod.main.o",
+    ]
+    status, out, _ = run_bounded(
+        [driver_root / "build/apps/hello/hello"], cwd=driver_root
+    )
+    assert (status, out) == (0, "linked\n")
+
+
+def test_the_driver_links_the_always_linked_modules_in_the_order_link_cfg_gives(
+    driver_root: Path,
+):
+    config = cfg_values(driver_root / "link.cfg")
+    flags = " ".join(config["LINK"][1:])
+    reversed_kod = " ".join(reversed(config["STAGE0_KOD"]))
+    argv = linked_with(
+        driver_root, f"LINK := RECORDER {flags}\nSTAGE0_KOD := {reversed_kod}\n"
+    )
+    objects = [f"build/stage0/{Path(c).stem}.o" for c in config["RUNTIME_C"]] + [
+        f"build/stage0/_{Path(m).stem}.o" for m in reversed(config["STAGE0_KOD"])
+    ]
+    at = argv.index("-o")
+    assert argv[at + 2 : at + 2 + len(objects)] == objects
+    status, out, _ = run_bounded(
+        [driver_root / "build/apps/hello/hello"], cwd=driver_root
+    )
+    assert (status, out) == (0, "linked\n")
+
+
+def test_the_linker_is_the_one_link_cfg_names_and_link_local_cfg_overrides_it(
+    driver_root: Path,
+):
+    (driver_root / "link.local.cfg").write_text("LINK := /no/such/linker -v\n")
+    status, out, err = run_driver(["build", "hello.kod"], cwd=driver_root)
+    assert status == 1
+    assert out == ""
+    assert err == (
+        "kod: /no/such/linker could not be run "
+        "(not found, killed, or its argument list too long)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "local,wanted",
+    [
+        ("LINK = clang\n", "link.local.cfg:1:5: error: "),
+        ("# machine\n\nCC := clang \n", "link.local.cfg:3:"),
+        ("LINK := a\nLINK := b\n", "link.local.cfg:2:1: error: LINK is set twice"),
+        ("CFLAG := -DX\n", "link.local.cfg:1:1: error: CFLAG is not set in link.cfg"),
+        (
+            "# machine\n\nSTAGE0 := build/s0\n",
+            "link.local.cfg:3:1: error: STAGE0 is not set in link.cfg",
+        ),
+        ("LINK :=\n", "kod: link.cfg and link.local.cfg set no LINK\n"),
+        ("STAGE0_KOD :=\n", "kod: link.cfg and link.local.cfg set no STAGE0_KOD\n"),
+        ("RUNTIME_C :=\n", "kod: link.cfg and link.local.cfg set no RUNTIME_C\n"),
+    ],
+)
+def test_the_driver_stops_at_a_link_configuration_it_cannot_read(
+    driver_root: Path, local: str, wanted: str
+):
+    (driver_root / "link.local.cfg").write_text(local)
+    status, out, err = run_driver(["build", "hello.kod"], cwd=driver_root)
+    assert status == 1
+    assert out == ""
+    assert err.startswith(wanted), err
+    # Nothing is compiled first.
+    assert list((driver_root / "build" / "apps").iterdir()) == []
+
+
+def test_the_driver_stops_at_a_link_cfg_that_is_empty_or_cannot_be_read(
+    driver_root: Path,
+):
+    (driver_root / "link.cfg").write_text("")
+    status, out, err = run_driver(["build", "hello.kod"], cwd=driver_root)
+    assert (status, out, err) == (1, "", "kod: link.cfg is empty or cannot be read\n")
+
+
+def test_the_driver_asks_for_make_when_an_always_linked_object_is_not_built(
+    driver_root: Path,
+):
+    # A module added to STAGE0_KOD, before `make` has built its object.
+    modules = [
+        *cfg_values(driver_root / "link.cfg")["STAGE0_KOD"],
+        "stdlib/zzprobe.kod",
+    ]
+    (driver_root / "link.local.cfg").write_text(f"STAGE0_KOD := {' '.join(modules)}\n")
+    for command in ["build", "run", "test"]:
+        status, out, err = run_driver([command, "hello.kod"], cwd=driver_root)
+        assert (status, out, err) == (
+            1,
+            "",
+            "kod: build/stage0/_zzprobe.o not found; run make\n",
+        ), command
+    assert list((driver_root / "build" / "apps").iterdir()) == []
+    # `check` links nothing.
+    assert run_driver(["check", "hello.kod"], cwd=driver_root) == (0, "", "")
+
+
+def test_the_driver_stops_at_a_malformed_link_cfg_for_check_too(driver_root: Path):
+    (driver_root / "link.cfg").write_text("LINK clang\n")
+    status, out, err = run_driver(["check", "hello.kod"], cwd=driver_root)
+    assert status == 1
+    assert err.startswith("link.cfg:1:5: error: ")
+
+
+def test_a_program_linked_by_clang_is_a_signed_arm64_executable(driver_root: Path):
+    status, _, err = run_driver(["build", "hello.kod"], cwd=driver_root)
+    assert status == 0, err
+    exe = driver_root / "build" / "apps" / "hello" / "hello"
+    verified = subprocess.run(
+        ["codesign", "--verify", "--strict", str(exe)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verified.returncode == 0, verified.stderr
+    archs = subprocess.run(
+        ["lipo", "-archs", str(exe)], capture_output=True, text=True, check=False
+    )
+    assert archs.stdout.split() == ["arm64"]
+    # It starts from another directory with the bare environment of a script.
+    with temp_dir("kod_cwd_") as elsewhere:
+        status, out, _ = run_bounded(
+            [exe], cwd=elsewhere, env={"PATH": "/usr/bin:/bin"}
+        )
+    assert (status, out) == (0, "linked\n")
+    # And it does not ask for more of macOS than this one has.
+    header = subprocess.run(
+        ["otool", "-l", str(exe)], capture_output=True, text=True, check=False
+    ).stdout
+    minos = re.search(r"LC_BUILD_VERSION.*?minos (\S+)", header, re.S)
+    assert minos, header
+    here = platform.mac_ver()[0]
+    if here and "MACOSX_DEPLOYMENT_TARGET" not in os.environ:
+
+        def numbers(version: str) -> tuple[int, ...]:
+            return tuple(int(part) for part in version.split("."))
+
+        assert numbers(minos.group(1)) <= numbers(here)
+
+
+def load_asm_diff():
+    spec = importlib.util.spec_from_file_location(
+        "asm_diff", ROOT / "tools" / "asm_diff.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_asm_diff_gives_the_base_copy_the_link_local_cfg_it_has(
+    elsewhere: Path, capsys, monkeypatch
+):
+    asm_diff = load_asm_diff()
+    root = elsewhere / "checkout"
+    copy = elsewhere / "base"
+    root.mkdir()
+    copy.mkdir()
+    monkeypatch.setattr(asm_diff, "ROOT", root)
+    # None here: nothing is copied and nothing said.
+    asm_diff.copy_link_local_cfg(copy)
+    assert list(copy.iterdir()) == []
+    assert capsys.readouterr().err == ""
+    (root / "link.local.cfg").write_text("LINK := /usr/bin/clang\n")
+    asm_diff.copy_link_local_cfg(copy)
+    assert (copy / "link.local.cfg").read_text() == "LINK := /usr/bin/clang\n"
+    assert "link.local.cfg" in capsys.readouterr().err
+
+
+# --- Make and the link configuration -----------------------------------------
+
+# Older than anything built.
+LONG_AGO = 946684800
+
+
+@pytest.fixture
+def make_root() -> Iterator[Path]:
+    """A directory Make takes for the repository: the Makefile, link.cfg, the
+    sources and what is built, all by link, and a `build/` of its own, so that
+    a link.local.cfg and the record of the configuration (build/.link-config)
+    stay out of the real tree. Only `make -n`, `make -q` and the recipe that
+    writes the record are run in it."""
+    with temp_dir("kod_make_") as path:
+        for name in [
+            "Makefile",
+            "link.cfg",
+            "stdlib",
+            "kodc.kod",
+            "tools",
+            "bootstrap",
+        ]:
+            (path / name).symlink_to(ROOT / name)
+        (path / "build" / "apps").mkdir(parents=True)
+        for built in ["stage0", "stage1"]:
+            (path / "build" / built).symlink_to(ROOT / "build" / built)
+        (path / "build" / "apps" / "kod").symlink_to(ROOT / "build" / "apps" / "kod")
+        yield path
+
+
+def written_long_ago(path: Path, text: str) -> None:
+    """Write `path` and give it a time older than anything built, as a file
+    restored from a backup has, so that only its content can tell."""
+    path.write_text(text)
+    os.utime(path, (LONG_AGO, LONG_AGO))
+
+
+def record_link_config(root: Path) -> None:
+    """Have Make record the configuration in force in `root`, as a build does,
+    dated so that it is not newer than what was built."""
+    made = make_in(root, "-s", "build/.link-config")
+    assert made.returncode == 0, made.stderr
+    os.utime(root / "build" / ".link-config", (LONG_AGO, LONG_AGO))
+
+
+def test_make_takes_the_names_link_local_cfg_overrides(make_root: Path):
+    (make_root / "link.local.cfg").write_text(
+        "# this machine\n"
+        "LINK := clang -target arm64-apple-darwin -Wl,-probe\n"
+        "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n"
+    )
+    recipes = make_recipes("stage1", "kod", root=make_root)
+    for source in cfg_values(LINK_CFG)["RUNTIME_C"]:
+        want = (
+            "clang -target arm64-apple-darwin -I stdlib -DPROBE=1 -c -o "
+            f"build/stage0/{Path(source).stem}.o {source}"
+        )
+        assert want in recipes
+    for exe in ["build/stage1/sh_kodc", "build/apps/kod/kod"]:
+        links = [line for line in recipes if f" -o {exe} " in line + " "]
+        assert len(links) == 1, exe
+        assert links[0].startswith("clang -target arm64-apple-darwin -Wl,-probe -o ")
+
+
+@pytest.mark.parametrize(
+    "local,wanted",
+    [
+        ("CFLAG := -DX\n", "link.local.cfg sets CFLAG, which link.cfg does not set"),
+        ("# machine\nSTAGE0 := build/s0\n", "link.local.cfg sets STAGE0, which"),
+        ("  SHELL := /bin/false\n", "link.local.cfg sets SHELL, which"),
+        ("MAKEFLAGS := k\n", "link.local.cfg sets MAKEFLAGS, which"),
+        ("CC := clang\nLNK:=clang\n", "link.local.cfg sets LNK, which"),
+        ("LINK :=\n", "link.cfg and link.local.cfg set no LINK"),
+        ("RUNTIME_C :=\n", "link.cfg and link.local.cfg set no RUNTIME_C"),
+        ("STAGE0_KOD :=\n", "link.cfg and link.local.cfg set no STAGE0_KOD"),
+        (
+            "RUNTIME_C := stdlib/arena.c stdlib/notes.txt\n",
+            "RUNTIME_C must name only .c files",
+        ),
+        (
+            "STAGE0_KOD := stdlib/io.kod stdlib/io.c\n",
+            "STAGE0_KOD must name only .kod files",
+        ),
+    ],
+)
+def test_make_stops_at_a_link_local_cfg_it_cannot_use(
+    make_root: Path, local: str, wanted: str
+):
+    (make_root / "link.local.cfg").write_text(local)
+    made = make_in(make_root, "-n", "stage0")
+    assert made.returncode != 0
+    assert wanted in made.stderr, made.stderr
+    assert made.stdout == ""
+
+
+@pytest.mark.parametrize("target", ["stage0", "stage1", "kod"])
+def test_make_rebuilds_when_link_local_cfg_comes_or_goes(make_root: Path, target: str):
+    # Nothing below is newer than what was built, but the first time: only the
+    # record of the configuration can tell that the configuration changed.
+    record_link_config(make_root)
+    assert make_in(make_root, "-q", target).returncode == 0
+    local = make_root / "link.local.cfg"
+    written_long_ago(
+        local, "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n"
+    )
+    assert make_in(make_root, "-q", target).returncode == 1
+    record_link_config(make_root)
+    assert make_in(make_root, "-q", target).returncode == 0
+    # The file as it was, but newer than what was built.
+    os.utime(local)
+    assert make_in(make_root, "-q", target).returncode == 1
+    os.utime(local, (LONG_AGO, LONG_AGO))
+    assert make_in(make_root, "-q", target).returncode == 0
+    # Gone: what was built with it is not what the configuration says now.
+    local.unlink()
+    assert make_in(make_root, "-q", target).returncode == 1
+    record_link_config(make_root)
+    assert make_in(make_root, "-q", target).returncode == 0
+
+
+@pytest.mark.parametrize("target", ["stage0", "stage1", "kod"])
+def test_make_rebuilds_when_link_local_cfg_loses_a_name(make_root: Path, target: str):
+    local = make_root / "link.local.cfg"
+    both = (
+        "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n"
+        "LINK := clang -target arm64-apple-darwin -Wl,-dead_strip -Wl,-probe\n"
+    )
+    written_long_ago(local, both)
+    record_link_config(make_root)
+    assert make_in(make_root, "-q", target).returncode == 0
+    for kept in [both.split("\n")[0] + "\n", "# nothing now\n"]:
+        written_long_ago(local, kept)
+        assert make_in(make_root, "-q", target).returncode == 1, kept
+        record_link_config(make_root)
+        assert make_in(make_root, "-q", target).returncode == 0

@@ -99,7 +99,9 @@ def kill_group(proc: subprocess.Popen) -> None:
 def removed_if_signalled(remove: Callable[[], None]) -> Iterator[None]:
     """While the block runs, SIGTERM and SIGHUP (what `timeout` and a closing
     terminal send) stop every process `running` started, call `remove`, and
-    then end this process by that signal."""
+    then end this process by that signal. Blocks nest: each removes what it
+    made and hands the signal on to the handler it replaced, so that the
+    outermost ends the process after all have removed theirs."""
 
     def stop(signum: int, frame) -> None:
         if Launching.active:
@@ -108,6 +110,10 @@ def removed_if_signalled(remove: Callable[[], None]) -> Iterator[None]:
         for proc in list(LIVE):
             kill_group(proc)
         remove()
+        enclosing = before[signal.Signals(signum)]
+        if callable(enclosing):
+            enclosing(signum, frame)
+            return
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -141,20 +147,22 @@ def scratch() -> Iterator[Scratch]:
 
 @contextlib.contextmanager
 def running(argv: list, **kwargs) -> Iterator[subprocess.Popen]:
-    """Start `argv` from the repository root in a session of its own, with
-    stdout a pipe and stderr a file (`stderr_text(proc)` reads it) unless the
-    caller says otherwise. After `WAIT` seconds it is killed, which ends any
-    read or wait the block is blocked in. At the end of the block it is
-    killed, with everything it started, and reaped."""
+    """Start `argv` from the repository root (or the `cwd` the caller gives)
+    in a session of its own, with stdout a pipe and stderr a file
+    (`stderr_text(proc)` reads it) unless the caller says otherwise. After
+    `WAIT` seconds it is killed, which ends any read or wait the block is
+    blocked in. At the end of the block it is killed, with everything it
+    started, and reaped."""
     errors = None
     if "stderr" not in kwargs:
         errors = tempfile.TemporaryFile()
         kwargs["stderr"] = errors
     kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("cwd", ROOT)
     Launching.active = True
     try:
         proc = subprocess.Popen(
-            [str(a) for a in argv], cwd=ROOT, start_new_session=True, **kwargs
+            [str(a) for a in argv], start_new_session=True, **kwargs
         )
         LIVE.add(proc)
     finally:
