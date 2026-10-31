@@ -110,7 +110,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `primitives/int64`, `primitives/str`, `primitives/bool` | Methods on the primitive types (`to_str`, `hash`). Auto-loaded; not imported directly. |
 | `io` | `read_file`, `write_file`, and stdin/stdout/stderr helpers. |
 | `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
-| `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. |
+| `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
 | `time` | `monotonic_ns()` and `unix_ns()`. |
 | `set` | `Set[T]`, a hash set built on `Map`. |
 | `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |

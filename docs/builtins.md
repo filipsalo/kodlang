@@ -187,6 +187,17 @@ assert r.status == 0
 assert r.stdout == "hello\n"
 ```
 
+`process.run(argv)` captures stdout and stderr. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run. Compiled programs only: the interpreter does not mirror its extern.
+
+```kod
+import "process"
+
+func main() -> int64 {
+    process.exec(["echo", "hello"])
+    return 127  // not reached unless `echo` could not be run
+}
+```
+
 ## Extern (C runtime)
 
 Available for re-declaration in any module if needed:

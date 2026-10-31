@@ -35,6 +35,8 @@ The native driver (`build/apps/kod/kod`, built from `tools/kod.kod`) runs steps 
 uv run kod run hello.kod
 ```
 
+`kod` replaces itself with the program (`execvp`), so the program has your terminal. Its stdin, stdout and stderr are yours, its output appears as it is written, and its exit status, or the signal that killed it, is what your shell sees. (stdout is block-buffered when it is not a terminal; call `io.flush_stdout()` where the order of the two streams matters; a panic flushes it before its message.) If the program cannot be executed, `kod` says so and exits 127.
+
 ### `kod test <path>`
 
 Run `test "..." { ... }` blocks. Path can be a file or a directory.
@@ -47,6 +49,8 @@ uv run kod test stdlib/map_test.kod
 uv run kod test stdlib            # everything under stdlib/
 uv run kod test .                 # everything in the project
 ```
+
+Both replace `kod` with the test binary, as `kod run` does with a program: its output appears as it is written and its exit status is `kod`'s. The test reporter flushes stdout around every result line and before a failure's detail goes to stderr, so the `ok`/`FAIL` lines and the `assertion failed` detail stay in order on a pipe or in a CI log too; output a test prints itself is flushed with them.
 
 See [Testing](testing.md) for the syntax.
 
