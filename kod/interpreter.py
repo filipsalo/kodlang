@@ -450,15 +450,6 @@ def _pattern_names(pattern):
     return [name for name in names if name]
 
 
-def _type_name(value):
-    """How Kod writes the type of a primitive, struct or enum value."""
-    if isinstance(value, types.StructType):
-        return type(value).__name__
-    if isinstance(value, types.EnumValue):
-        return value.enum_type.name
-    return getattr(type(value), "name", type(value).__name__)
-
-
 # The child-node fields of each node class (see _children).
 _node_fields: dict = {}
 
@@ -2593,14 +2584,6 @@ class Interpreter:
             case _:
                 raise ValueError(f"Unexpected statement {statement}")
 
-    def c_type(self, type_):
-        """Convert a Kod type to a C type"""
-        if type_ is types.String:
-            return ctypes.c_char_p
-        if type_ is types.Int64:
-            return ctypes.c_int
-        raise ValueError(f"Unknown type {type_!r}")
-
     def _map_dict_key(self, value):
         """Turn a Kod value into a hashable Python key for the Map fast
         path, equal exactly when `==` holds: str/bytes by content,
@@ -2791,6 +2774,10 @@ class Interpreter:
                 # has its own buffer and would interleave wrong.
                 libc.puts(args[0].value)
                 return types.Int64(0)
+            if func.name == "putchar":
+                # The builtin extern: libc's putchar, so it writes into the
+                # same stdout buffer as the `kod_puts` mirror above.
+                return types.Int64(libc.putchar(args[0].value))
             if func.name == "kod_bytes_from_array":
                 # Mirror runtime kod_bytes_from_array: pack each int64
                 # entry's low 8 bits into a fresh byte buffer.
@@ -2830,17 +2817,13 @@ class Interpreter:
                 msg = args[0].value.decode("utf8")
                 sys.stdout.write(msg)
                 return types.none_value
-            c_func = getattr(libc, func.name)
-            c_func.argtypes = [self.c_type(p.variable.type) for p in func.params]
-            args = [arg.value for arg in args]
-            result = c_func(*args)
-            # return_type is the data-only ast.TypeExpr; extern returns are
-            # always primitive names, so match syntactically.
-            if func.return_type == ast.NamedTypeExpr("int64"):
-                return types.Int64(result)
-            if func.return_type == ast.NamedTypeExpr("str"):
-                return types.String(result)
-            return types.none_value
+            # Every other extern is compiled-only: stop the way `kod_panic`
+            # does rather than guess a C signature.
+            sys.stderr.write(
+                f"error: extern `{func.name}` is not available in the "
+                "interpreter; compile the program (`kod run`) to call it\n"
+            )
+            sys.exit(1)
 
         builtin_len = (
             isinstance(func, ast.FunctionDeclaration)
