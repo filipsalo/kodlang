@@ -40,31 +40,115 @@ func dirname(anon path: str) -> str {
     return ""
 }
 
+// One byte as the escape of a symbol: `$$` and two lowercase hex digits.
+func escape_byte(anon b: int64) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int64 = b / 16
+    let lo: int64 = b % 16
+    let hi_digit: str = digits[hi..hi+1]
+    let lo_digit: str = digits[lo..lo+1]
+    return "$$" + hi_digit + lo_digit
+}
+
+// The assembler reads `.1e5` as a number, so in a result that is to get a
+// `.` in front, an `e` or `E` that follows its leading digits is escaped.
+func escape_exponent(anon s: str) -> str {
+    mut end: int64 = 0
+    for end < len(s) and lexing.is_digit(s[end]) {
+        end = end + 1
+    }
+    if end > 0 and end < len(s) and (s[end] == 'e' or s[end] == 'E') {
+        return s[0..end] + escape_byte(s[end]) + s[end+1..len(s)]
+    }
+    return s
+}
+
+// A path as assembler symbol characters (docs/modules.md, "Symbol and
+// object names"). `/` is `$`; letters, digits, `_` and a `.` that is not
+// the first byte stay; every other byte is escaped. The label it ends up
+// in is `$<prefix>$<name>`, and the assembler reads `$` and a digit as a
+// number, so a result that is empty or starts with `$` or a digit gets a
+// `.` in front (and an `e` after its digits is escaped, see above). Two
+// paths without `//` never share a result.
+func mangle_path(anon name: str) -> str {
+    mut result: str = ""
+    mut i: int64 = 0
+    for i < len(name) {
+        let b: int64 = name[i]
+        if b == '/' {
+            result = result + "$"
+        } else if lexing.is_alnum(b) or (b == '.' and i > 0) {
+            result = result + name[i..i+1]
+        } else {
+            result = result + escape_byte(b)
+        }
+        i = i + 1
+    }
+    if len(result) == 0 or result[0] == '$' or lexing.is_digit(result[0]) {
+        return "." + escape_exponent(result)
+    }
+    return result
+}
+
 func path_to_prefix(anon path: str) -> str {
-    // Strip .kod suffix, and drop the leading 'stdlib/' if present so the
-    // prefix matches what 'import "kod/foo"' resolves to.
+    // Strip the .kod suffix and a leading '/' (an absolute path would
+    // otherwise start the prefix with '$'), and drop the 'stdlib/' root
+    // so the prefix matches what 'import "kod/foo"' resolves to.
     mut name: str = path[0..len(path)-4]
-    // Strip a leading '/' so an absolute path doesn't produce a
-    // prefix that starts with '$' — the codegen joins prefix +
-    // name as `${prefix}${name}`, which would yield invalid
-    // '$$tmp$foo$main' symbols for `/tmp/foo.kod`.
     if len(name) > 0 and name[0] == '/' {
         name = name[1..len(name)]
     }
     if len(name) > 7 and name[0..7] == "stdlib/" {
-        name = name[7..len(name)]
+        return mangle_path(name[7..len(name)])
     }
-    mut result: str = ""
+    // A project module whose path also exists under stdlib/ is another
+    // module than the stdlib one: it gets its own namespace.
+    if io.is_file(f"stdlib/{name}.kod") {
+        return ".user$" + mangle_path(name)
+    }
+    return mangle_path(name)
+}
+
+// A directory of a source path as one component of an object path: a
+// `.` or `..` directory, the empty root of an absolute path and a `%` are
+// written `%xx`, so no two source paths share an object.
+func escape_part(anon part: str) -> str {
+    if part == "" {
+        return "%2f"
+    }
+    if part == "." {
+        return "%2e"
+    }
+    if part == ".." {
+        return "%2e%2e"
+    }
+    mut out: str = ""
     mut i: int64 = 0
-    for i < len(name) {
-        if name[i] == '/' {
-            result = f"{result}$"
+    for i < len(part) {
+        if part[i] == '%' {
+            out = out + "%25"
         } else {
-            result = result + name[i..i+1]
+            out = out + part[i..i+1]
         }
         i = i + 1
     }
-    return result
+    return out
+}
+
+// The object file of the module at `source` (a normalized path) under
+// `root`: the source tree mirrored, `lib/json.kod` is `<root>/lib/json.kod.o`.
+func obj_path(root: str, source: str) -> str {
+    mut out: str = root
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i <= len(source) {
+        if i == len(source) or source[i] == '/' {
+            out = f"{out}/{escape_part(source[start..i])}"
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out + ".o"
 }
 
 // A missing file still yields a parser (over empty source) carrying a

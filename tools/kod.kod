@@ -285,9 +285,9 @@ func is_stage0(anon path: str) -> bool {
 }
 
 // Strip directory + `.kod` extension. `tests/hello.kod` → `hello`,
-// `stdlib/primitives/int64.kod` → `int64`. Used both for derived .o
-// names (`_<basename>.o`) and for the per-app output directory under
-// `build/apps/<basename>/`.
+// `stdlib/primitives/int64.kod` → `int64`. Names the per-app output
+// directory under `build/apps/<basename>/` and its executable; the
+// stage0 objects `build/stage0/_<basename>.o` are named the same way.
 func basename_no_ext(anon path: str) -> str {
     mut last_slash: int64 = -1
     mut i: int64 = 0
@@ -332,27 +332,43 @@ func run_check(anon argv: [str]) -> int64 {
 
 // Build an executable for `entry_path`. `exe_name` is the file
 // dropped into `build/apps/<entry-stem>/`; `emit_main_cmd` is the
-// sh_kodc subcommand that emits the runtime_main shim asm. Two
+// sh_kodc subcommand that emits the runtime_main shim asm, and
+// `shim_kind` (`main` or `testmain`) names the shim's files. Two
 // callers: `build_executable` uses `_emit-runtime-main` (plain main
 // shim), `build_test_executable` uses `_emit-test-runtime-main` (the
 // dispatcher that calls every module's `__run_tests` then prints the
-// aggregate summary). Returns the executable path on success, "" on
-// failure (the underlying tool already printed via `run_check`).
-func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str) -> str {
-    mut stem: str = basename_no_ext(entry_path)
+// aggregate summary). The objects go to `build/apps/<stem>/<stem>.obj/`,
+// in a tree that mirrors the source tree. Returns the executable path
+// on success, "" on failure (the underlying tool already printed via
+// `run_check`).
+func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str, shim_kind: str) -> str {
+    let stem: str = basename_no_ext(entry_path)
     let app_dir: str = f"build/apps/{stem}"
-    let mkdir_rc: int64 = run_check(["mkdir", "-p", app_dir])
-    if mkdir_rc != 0 {
-        return ""
-    }
+    let obj_root: str = f"{app_dir}/{stem}.obj"
     let exe_path: str = f"{app_dir}/{exe_name}"
     let sh_kodc: str = "build/stage1/sh_kodc"
 
-    // 1. User modules: entry + transitive imports (skipping stage0).
+    // 1. User modules: entry + transitive imports (skipping stage0),
+    //    each to the object named after its source path.
     let user_modules: [str] = collect_user_modules(entry_path)
+    mut obj_dirs: [str] = [obj_root]
+    for m in user_modules {
+        let dir: str = build.dirname(build.obj_path(root: obj_root, source: m))
+        let bare_dir: str = dir[0..len(dir)-1]
+        if str_listed(obj_dirs, bare_dir) == false {
+            obj_dirs += [bare_dir]
+        }
+    }
+    mut mkdir_argv: [str] = ["mkdir", "-p"]
+    for d in obj_dirs {
+        mkdir_argv += [d]
+    }
+    if run_check(mkdir_argv) != 0 {
+        return ""
+    }
     mut user_objs: [str] = []
     for m in user_modules {
-        let obj: str = f"{app_dir}/_{basename_no_ext(m)}.o"
+        let obj: str = build.obj_path(root: obj_root, source: m)
         let rc: int64 = run_check([sh_kodc, "_compile", m, obj])
         if rc != 0 {
             return ""
@@ -360,9 +376,12 @@ func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str) 
         user_objs += [obj]
     }
 
-    // 2. Runtime main shim — variant selected by `emit_main_cmd`.
-    let main_s: str = f"{app_dir}/runtime_main.s"
-    let main_o: str = f"{app_dir}/runtime_main.o"
+    // 2. Runtime main shim — variant selected by `emit_main_cmd`, next
+    //    to the entry's object.
+    let entry_obj: str = user_objs[0]
+    let shim_base: str = entry_obj[0..len(entry_obj)-2]
+    let main_s: str = f"{shim_base}.{shim_kind}.s"
+    let main_o: str = f"{shim_base}.{shim_kind}.o"
     let rc_main: int64 = run_check([sh_kodc, emit_main_cmd, entry_path, main_s])
     if rc_main != 0 {
         return ""
@@ -399,11 +418,11 @@ func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str) 
 }
 
 func build_executable(anon entry_path: str) -> str {
-    mut stem: str = basename_no_ext(entry_path)
-    return build_executable_inner(:entry_path, exe_name: stem, emit_main_cmd: "_emit-runtime-main")
+    let stem: str = basename_no_ext(entry_path)
+    return build_executable_inner(:entry_path, exe_name: stem, emit_main_cmd: "_emit-runtime-main", shim_kind: "main")
 }
 
 func build_test_executable(anon entry_path: str) -> str {
-    mut stem: str = basename_no_ext(entry_path)
-    return build_executable_inner(:entry_path, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main")
+    let stem: str = basename_no_ext(entry_path)
+    return build_executable_inner(:entry_path, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
 }
