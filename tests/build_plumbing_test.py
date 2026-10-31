@@ -866,6 +866,121 @@ def test_a_change_of_link_cfg_rebuilds_the_c_objects_and_the_links_not_the_modul
     assert not any(" > build/" in line for line in lines)
 
 
+@pytest.mark.parametrize("target", ["stage0", "stage1", "kod"])
+def test_a_change_of_a_header_rebuilds_what_includes_it(target: str):
+    # runtime.c includes stdlib/kod_rt.h, and Make is told only of the .c file
+    # (there are no dependency files), so a header is a prerequisite of its own.
+    # `-W` pretends the file changed, so no file's time is touched.
+    def out_of_date(*args: str) -> int:
+        return subprocess.run(
+            ["make", "-q", *args, target], cwd=ROOT, check=False
+        ).returncode
+
+    assert (ROOT / "stdlib" / "kod_rt.h").is_file()
+    assert out_of_date() == 0
+    assert out_of_date("-W", "stdlib/kod_rt.h") == 1
+
+
+def test_a_change_of_a_header_rebuilds_the_c_objects_not_the_modules():
+    made = subprocess.run(
+        ["make", "-n", "-W", "stdlib/kod_rt.h", "stage1", "kod"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert made.returncode == 0, made.stderr
+    lines = made.stdout.replace("\\\n", " ").split("\n")
+    for source in cfg_values(LINK_CFG, LOCAL_CFG)["RUNTIME_C"]:
+        assert any(
+            f"-c -o build/stage0/{Path(source).stem}.o {source}" in line
+            for line in lines
+        )
+    # The Kod modules are not compiled again.
+    assert not any(" > build/" in line for line in lines)
+
+
+def c_object(source: str, *flags: str) -> subprocess.CompletedProcess:
+    """Compile the C source text with `CC` and `CFLAGS` of link.cfg, to a
+    temporary object."""
+    config = cfg_values(LINK_CFG, LOCAL_CFG)
+    with temp_dir("kod_c_") as path:
+        (path / "probe.c").write_text(source)
+        return subprocess.run(
+            [
+                *config["CC"],
+                *config["CFLAGS"],
+                *flags,
+                "-c",
+                "-o",
+                str(path / "probe.o"),
+                str(path / "probe.c"),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+
+def test_the_runtime_header_has_the_layout_the_generated_code_uses():
+    # A str is {buf, len}, an array {ptr, len, cap}, each field 8 bytes.
+    compiled = c_object(
+        '#include "kod_rt.h"\n#include <stddef.h>\n'
+        '_Static_assert(sizeof(KodStr) == 16, "KodStr");\n'
+        '_Static_assert(offsetof(KodStr, buf) == 0, "buf");\n'
+        '_Static_assert(offsetof(KodStr, len) == 8, "len");\n'
+        '_Static_assert(sizeof(KodArray) == 24, "KodArray");\n'
+        '_Static_assert(offsetof(KodArray, ptr) == 0, "ptr");\n'
+        '_Static_assert(offsetof(KodArray, len) == 8, "array len");\n'
+        '_Static_assert(offsetof(KodArray, cap) == 16, "cap");\n',
+        "-Wall",
+        "-Werror",
+    )
+    assert compiled.returncode == 0, compiled.stderr
+
+
+def test_the_runtime_header_stands_alone_and_unused_helpers_cost_nothing():
+    # Included first and twice, with every warning an unused static inline
+    # function could draw, and used the way a companion would.
+    compiled = c_object(
+        '#include "kod_rt.h"\n#include "kod_rt.h"\n'
+        "KodStr *kod_probe(KodArray *a, const char *p) {\n"
+        "    if (a->len < 0) kod_panic(kod_str_new(0));\n"
+        "    return kod_str_from_bytes(p, 3);\n"
+        "}\n",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wunused-function",
+    )
+    assert compiled.returncode == 0, compiled.stderr
+
+
+def test_runtime_o_exports_what_it_did_and_nothing_from_the_header():
+    # The header's helpers are `static inline`, so they are no symbols.
+    defined = subprocess.run(
+        ["nm", "-g", "--defined-only", str(ROOT / "build" / "stage0" / "runtime.o")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert defined.returncode == 0, defined.stderr
+    names = {line.split()[-1] for line in defined.stdout.splitlines() if line.strip()}
+    for exported in [
+        "_kod_panic",
+        "_kod_str_from_cstr",
+        "_kod_str_concat",
+        "_read_file",
+    ]:
+        assert exported in names
+    for local in ["_kod_str_new", "_kod_str_from_bytes", "_kod_str_alloc"]:
+        assert local not in names
+
+
 def run_bounded(argv: list, cwd: Path, **kwargs) -> tuple[int, str, str]:
     """Run `argv` in `cwd` as `running` does, so that a signal to pytest stops
     it before the directory it runs in is removed; its status, stdout and
