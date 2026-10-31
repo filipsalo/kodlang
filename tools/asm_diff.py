@@ -59,7 +59,7 @@ def corpus() -> list[str]:
     files = git(
         "ls-files", "--cached", "--others", "--exclude-standard", "--", "*.kod"
     ).splitlines()
-    # Dot-paths are worktrees under .claude/ and the transient test aggregator.
+    # Dot-paths are worktrees under .claude/ and scratch files.
     return sorted(
         f for f in set(files) if not f.startswith(".") and (ROOT / f).is_file()
     )

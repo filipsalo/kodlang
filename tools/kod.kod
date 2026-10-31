@@ -141,12 +141,13 @@ func ends_with(anon s: str, suffix: str) -> bool {
     return s[n-m..n] == suffix
 }
 
-func split_lines(anon s: str) -> [str] {
+// The non-empty pieces of `s` between the bytes `sep`.
+func split_at(anon s: str, sep: int64) -> [str] {
     mut result: [str] = []
     mut start: int64 = 0
     mut i: int64 = 0
     for i < len(s) {
-        if s[i] == '\n' {
+        if s[i] == sep {
             if i > start {
                 result += [s[start..i]]
             }
@@ -160,12 +161,16 @@ func split_lines(anon s: str) -> [str] {
     return result
 }
 
+func split_lines(anon s: str) -> [str] {
+    return split_at(s, sep: '\n')
+}
+
 // `kod test <path>` — a `.kod` file is built as a single-module
 // test executable; anything else is treated as a directory and
-// walked recursively for `*_test.kod` files. The walk uses `find`
-// to avoid a new io extern; results aren't sorted, since the
-// test runner's `__run_tests` dispatchers don't care about
-// order.
+// walked recursively for `*_test.kod` files, which are built into one
+// program. The walk uses `find` to avoid a new io extern; results
+// aren't sorted, since the test runner's `__run_tests` dispatchers
+// don't care about order.
 func run_test(anon path: str) -> int64 {
     if ends_with(path, suffix: ".kod") {
         return run_single_test(path)
@@ -184,54 +189,104 @@ func run_single_test(anon entry: str) -> int64 {
     return r.status
 }
 
+// The part of `path` below `dir`, as `find <dir>` printed it (`dir` itself
+// first, then a `/`).
+func below_dir(anon path: str, dir: str) -> str {
+    if build.starts_with(path, prefix: dir) == false {
+        return path
+    }
+    mut start: int64 = len(dir)
+    for start < len(path) and path[start] == '/' {
+        start = start + 1
+    }
+    return path[start..len(path)]
+}
+
+// Is a test file left out of `kod test <dir>`? One with a path component
+// below `dir` that starts with `.` (worktrees under `.claude/`, editor
+// files, scratch files such as `.kod_compile_test.kod`), or below a `build`
+// directory directly in `dir`. (The tests' own finder skips the
+// directories among these, not the files.)
+func is_skipped_test_file(anon rel: str) -> bool {
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i <= len(rel) {
+        if i == len(rel) or rel[i] == '/' {
+            if i > start and rel[start] == '.' {
+                return true
+            }
+            if start == 0 and i < len(rel) and rel[0..i] == "build" {
+                return true
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The name of the program `kod test <dir>` builds: the directory with
+// every byte outside letters, digits, `_` and `-` replaced by `_` (its
+// last 200 bytes, so that the names derived from it fit a file name),
+// then `_tests`.
+func tests_stem(anon dir: str) -> str {
+    mut stem: str = ""
+    mut i: int64 = 0
+    for i < len(dir) {
+        let c: int64 = dir[i]
+        if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-' {
+            stem = stem + dir[i..i+1]
+        } else {
+            stem = stem + "_"
+        }
+        i = i + 1
+    }
+    if len(stem) > 200 {
+        stem = stem[len(stem)-200..len(stem)]
+    }
+    return stem + "_tests"
+}
+
 func run_dir_tests(anon dir: str) -> int64 {
-    let r: process.ProcessResult = process.run(["find", dir, "-name", "*_test.kod"])
+    // `find` takes an argument that starts with `-` for an option. Its paths
+    // end at a NUL byte, not at a newline, which a file name can hold.
+    mut root: str = dir
+    if len(dir) > 0 and dir[0] == '-' {
+        root = f"./{dir}"
+    }
+    let r: process.ProcessResult = process.run(["find", root, "!", "-type", "d", "-name", "*_test.kod", "-print0"])
     if r.status != 0 {
         io.write_stderr(r.stderr)
         return r.status
     }
-    let test_files: [str] = split_lines(r.stdout)
+    // `find` doesn't prune, so the paths to leave out are dropped here. A
+    // directory named like a test file is not listed. Any other path that is
+    // not a readable file (a dangling link) stops the run: a test that is
+    // skipped without a word reads as one that passed.
+    mut test_files: [str] = []
+    for tf in split_at(r.stdout, sep: 0) {
+        if is_skipped_test_file(below_dir(tf, dir: root)) == false {
+            if io.is_file(tf) == false {
+                kod_eprint(f"kod test: cannot read {tf}")
+                return 1
+            }
+            test_files += [build.normalize_path(tf)]
+        }
+    }
     if len(test_files) == 0 {
         kod_eprint(f"kod test: no `*_test.kod` files under {dir}")
         return 1
     }
-    // One fixed scratch name, so a parallel `uv run kod test`
-    // invocation fights over this file and not over several.
-    let aggregator: str = ".kod_test_runner.kod"
-    mut body: str = ""
-    for tf in test_files {
-        mut stem: str = tf
-        if ends_with(stem, suffix: ".kod") {
-            stem = stem[0..len(stem)-4]
-        }
-        // `find .` emits `./foo/bar`; strip the leading `./` so the
-        // import we synthesise is `./foo/bar` (one `./`), not the
-        // double-`./` form. With the double form, resolve_import
-        // produces `./foo/bar.kod` while the same file reached through
-        // a sibling stdlib import resolves to `foo/bar.kod` — two
-        // different module prefixes for the same file, two compiles
-        // racing for the same `.o`, half the call sites unlinkable.
-        if len(stem) >= 2 and stem[0..2] == "./" {
-            stem = stem[2..len(stem)]
-        }
-        body = body + f"import \"./{stem}\"\n"
-    }
-    if io.write_file(aggregator, body) != 0 {
-        kod_eprint(f"kod test: failed to write {aggregator}")
+    // One program for all of them, so no temporary module is needed.
+    let stem: str = tests_stem(dir)
+    let exe: str = build_program(entries: test_files, app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
+    if len(exe) == 0 {
         return 1
     }
-    let exe: str = build_test_executable(aggregator)
-    mut status: int64 = 1
-    if len(exe) > 0 {
-        let rr: process.ProcessResult = process.run([exe])
-        io.write_stdout(rr.stdout)
-        io.write_stderr(rr.stderr)
-        status = rr.status
-    }
-    // Best-effort cleanup; `kod test` shouldn't leave the aggregator
-    // behind even if the compile or run failed.
-    process.run(["rm", "-f", aggregator])
-    return status
+    let rr: process.ProcessResult = process.run([exe])
+    io.write_stdout(rr.stdout)
+    io.write_stderr(rr.stderr)
+    return rr.status
 }
 
 // Walk the entry's import graph and return the full list of .kod
@@ -327,30 +382,45 @@ func run_check(anon argv: [str]) -> int64 {
     if r.status != 0 {
         io.write_stderr(r.stderr)
     }
+    if r.status == -1 {
+        // It never ran, or was killed: it has said nothing.
+        kod_eprint(f"kod: {argv[0]} could not be run (not found, killed, or its argument list too long)")
+    }
     return r.status
 }
 
-// Build an executable for `entry_path`. `exe_name` is the file
-// dropped into `build/apps/<entry-stem>/`; `emit_main_cmd` is the
+// Build an executable from `entries` and everything they import. `app`
+// names the directory `build/apps/<app>/` that holds it and its objects,
+// `exe_name` is the file dropped into it; `emit_main_cmd` is the
 // sh_kodc subcommand that emits the runtime_main shim asm, and
 // `shim_kind` (`main` or `testmain`) names the shim's files. Two
 // callers: `build_executable` uses `_emit-runtime-main` (plain main
-// shim), `build_test_executable` uses `_emit-test-runtime-main` (the
-// dispatcher that calls every module's `__run_tests` then prints the
-// aggregate summary). The objects go to `build/apps/<stem>/<stem>.obj/`,
-// in a tree that mirrors the source tree. Returns the executable path
-// on success, "" on failure (the underlying tool already printed via
-// `run_check`).
-func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str, shim_kind: str) -> str {
-    let stem: str = basename_no_ext(entry_path)
-    let app_dir: str = f"build/apps/{stem}"
-    let obj_root: str = f"{app_dir}/{stem}.obj"
+// shim, one entry), `build_test_executable` and `run_dir_tests` use
+// `_emit-test-runtime-main` (the dispatcher that calls every module's
+// `__run_tests` then prints the aggregate summary). The objects go to
+// `build/apps/<app>/<app>.obj/`, in a tree that mirrors the source
+// tree. Returns the executable path on success, "" on failure (the
+// underlying tool already printed via `run_check`).
+func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, shim_kind: str) -> str {
+    if app == "" or app == "." or app == ".." {
+        kod_eprint(f"kod: cannot name a program after {entries[0]}; rename the file")
+        return ""
+    }
+    let app_dir: str = f"build/apps/{app}"
+    let obj_root: str = f"{app_dir}/{app}.obj"
     let exe_path: str = f"{app_dir}/{exe_name}"
     let sh_kodc: str = "build/stage1/sh_kodc"
 
-    // 1. User modules: entry + transitive imports (skipping stage0),
-    //    each to the object named after its source path.
-    let user_modules: [str] = collect_user_modules(entry_path)
+    // 1. User modules: the entries + transitive imports (skipping
+    //    stage0), each to the object named after its source path.
+    mut user_modules: [str] = []
+    for entry in entries {
+        for m in collect_user_modules(entry) {
+            if str_listed(user_modules, m) == false {
+                user_modules += [m]
+            }
+        }
+    }
     mut obj_dirs: [str] = [obj_root]
     for m in user_modules {
         let dir: str = build.dirname(build.obj_path(root: obj_root, source: m))
@@ -377,12 +447,16 @@ func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str, 
     }
 
     // 2. Runtime main shim — variant selected by `emit_main_cmd`, next
-    //    to the entry's object.
+    //    to the first entry's object.
     let entry_obj: str = user_objs[0]
     let shim_base: str = entry_obj[0..len(entry_obj)-2]
     let main_s: str = f"{shim_base}.{shim_kind}.s"
     let main_o: str = f"{shim_base}.{shim_kind}.o"
-    let rc_main: int64 = run_check([sh_kodc, emit_main_cmd, entry_path, main_s])
+    mut shim_argv: [str] = [sh_kodc, emit_main_cmd, entries[0], main_s]
+    for more in entries[1..len(entries)] {
+        shim_argv += [more]
+    }
+    let rc_main: int64 = run_check(shim_argv)
     if rc_main != 0 {
         return ""
     }
@@ -419,10 +493,10 @@ func build_executable_inner(entry_path: str, exe_name: str, emit_main_cmd: str, 
 
 func build_executable(anon entry_path: str) -> str {
     let stem: str = basename_no_ext(entry_path)
-    return build_executable_inner(:entry_path, exe_name: stem, emit_main_cmd: "_emit-runtime-main", shim_kind: "main")
+    return build_program(entries: [entry_path], app: stem, exe_name: stem, emit_main_cmd: "_emit-runtime-main", shim_kind: "main")
 }
 
 func build_test_executable(anon entry_path: str) -> str {
     let stem: str = basename_no_ext(entry_path)
-    return build_executable_inner(:entry_path, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
+    return build_program(entries: [entry_path], app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain")
 }
