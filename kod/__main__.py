@@ -21,6 +21,7 @@ bootstrap, see docs/self-hosting.md):
 import argparse
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -123,6 +124,11 @@ def _hand_off_to_native() -> int:
             file=sys.stderr,
         )
         return 1
+    # Python ignores SIGPIPE and SIGXFSZ, and exec keeps what is ignored: the
+    # program (`kod run` replaces itself with it) would not die of a closed
+    # pipe, as it does when the shell starts it.
+    for ignored in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(ignored, signal.SIG_DFL)
     os.execv(str(native), [str(native), *sys.argv[1:]])
 
 

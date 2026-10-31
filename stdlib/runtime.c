@@ -70,8 +70,11 @@ static KodStr *kod_empty_str(void) {
 }
 
 // Called by `must expr` when the expression evaluates to an error.
-// `msg` is the result of calling the error's to_str method.
+// `msg` is the result of calling the error's to_str method. Stdout is
+// flushed first, so what the program printed comes out before the message
+// when both end up in one pipe or log.
 void kod_panic(KodStr *msg) {
+    fflush(stdout);
     fwrite("panic: ", 1, 7, stderr);
     fwrite(msg->buf, 1, msg->len, stderr);
     fputc('\n', stderr);
@@ -118,6 +121,7 @@ int64_t _inspect_symtab_end(void) {
 // Negative indices are already normalised (idx += len) before this
 // runs, so any out-of-range value here is genuinely out of bounds.
 void kod_index_oob(int64_t idx, int64_t len) {
+    fflush(stdout);
     fprintf(stderr,
             "panic: index %lld out of bounds for array of length %lld\n",
             (long long)idx, (long long)len);
@@ -171,8 +175,14 @@ void kod_test_reset(void) {
     g_kod_test_failed = 0;
 }
 
+/* The result lines go to stdout and the failure detail to stderr. Stdout is
+ * block-buffered when it is a pipe or a log, stderr is not, so stdout is
+ * flushed after every line of the report and before any detail: the two
+ * streams then keep their order when they end up in one place (and what a
+ * test printed itself comes out with them). */
 void kod_test_fail(KodStr *msg) {
     g_kod_test_failed = 1;
+    fflush(stdout);
     /* 6-space indent: 2 for the per-module nesting, 4 more so failure
      * messages clearly belong to the test rather than the group. */
     fwrite("      ", 1, 6, stderr);
@@ -193,6 +203,7 @@ void kod_test_module_begin(KodStr *path) {
     g_kod_test_group_seen = 1;
     fwrite(path->buf, 1, path->len, stdout);
     fputc('\n', stdout);
+    fflush(stdout);
 }
 
 /* Resolution of CLOCK_MONOTONIC_RAW in whole ns, cached. ~42 ns on
@@ -261,6 +272,7 @@ void kod_test_report(KodStr *name) {
     char dur[32];
     format_duration(kod_monotonic_ns() - g_kod_test_case_start_ns, dur, sizeof dur);
     printf(" (%s)\n", dur);
+    fflush(stdout);
 }
 
 int64_t kod_test_summary(void) {
@@ -398,6 +410,18 @@ static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
     return buf;
 }
 
+// The NULL-terminated C `argv` for a Kod `[str]`, in the arena. What
+// posix_spawnp and execvp want is NUL-terminated C strings, not KodStr —
+// pull the underlying `buf` field out of each entry.
+static char **c_argv(KodArray *argv_arr) {
+    int64_t argc = argv_arr->len;
+    char **argv = (char **)arena_alloc((argc + 1) * sizeof(char *));
+    KodStr **kod_argv = (KodStr **)argv_arr->ptr;
+    for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i]->buf;
+    argv[argc] = NULL;
+    return argv;
+}
+
 // Spawn `argv[0]` with `argv` (NULL-terminated rebuilt from the Kod
 // `[str]`), capture stdout and stderr concurrently (via poll to avoid
 // the obvious deadlock where one pipe fills while we're blocked on the
@@ -405,13 +429,7 @@ static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
 // status is -1 and the buffers are empty. Allocates the result and
 // both buffers in the arena.
 KodProcessResult *kod_run_process(KodArray *argv_arr) {
-    int64_t argc = argv_arr->len;
-    char **argv = (char **)arena_alloc((argc + 1) * sizeof(char *));
-    KodStr **kod_argv = (KodStr **)argv_arr->ptr;
-    // argv passed to posix_spawnp wants NUL-terminated C strings, not
-    // KodStr — pull the underlying `buf` field out of each entry.
-    for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i]->buf;
-    argv[argc] = NULL;
+    char **argv = c_argv(argv_arr);
 
     KodProcessResult *result =
         (KodProcessResult *)arena_alloc(sizeof(KodProcessResult));
@@ -497,6 +515,17 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
     result->stdout_buf = out_str;
     result->stderr_buf = err_str;
     return result;
+}
+
+// Replace this process with `argv[0]` (found via PATH) and `argv`. Buffered
+// output is flushed first: the new image would never see it. Returns -1,
+// and only then, when the exec failed (nothing to run, or an empty argv).
+int64_t kod_exec(KodArray *argv_arr) {
+    if (argv_arr->len == 0) return -1;
+    char **argv = c_argv(argv_arr);
+    fflush(NULL);
+    execvp(argv[0], argv);
+    return -1;
 }
 
 // Append rhs to lhs, mutating lhs in place when its `cap` is large enough
