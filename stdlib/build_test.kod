@@ -602,3 +602,266 @@ test "Make reads the real link.cfg as the reader does" {
         }
     }
 }
+
+// The link inputs a module declares in the comment lines at its top
+// (docs/modules.md, "Link inputs"). Pure: the text of the module and the
+// link configuration go in, what it declares and what is wrong with it come
+// out.
+
+func decl_vars() -> build.LinkVars {
+    return parse_cfg("CC := clang\nOPENSSL := /opt/ssl\nTWO := a b\nNOTHING :=\n")
+}
+
+func decls_of(anon source: str) -> build.LinkDecls {
+    return build.parse_link_decls(path: "lib/mod.kod", source: source, vars: decl_vars())
+}
+
+// `source` declares nothing and nothing is wrong with it.
+func expect_no_decls(anon source: str) -> none {
+    let d: build.LinkDecls = decls_of(source)
+    if len(d.cc) != 0 or len(d.link) != 0 or len(d.require) != 0 or len(d.errors) != 0 or d.first != 0 {
+        fail(f"{source} declares something: {len(d.cc)} cc, {len(d.link)} link, {len(d.require)} require, errors {build.join_words(d.errors)}, first {d.first}")
+    }
+}
+
+// `source` has exactly the one error `want` (the text after `lib/mod.kod:<line>:1: error: `).
+func expect_decl_error(anon source: str, line: int64, want: str) -> none {
+    let d: build.LinkDecls = decls_of(source)
+    if len(d.errors) != 1 {
+        fail(f"{source} has {len(d.errors)} errors, want 1: {build.join_words(d.errors)}")
+    } else {
+        let wanted: str = f"lib/mod.kod:{line}:1: error: {want}"
+        if d.errors[0] != wanted {
+            fail(f"the error for {source} is {d.errors[0]}, want {wanted}")
+        }
+    }
+}
+
+func expect_strs(anon got: [str], anon want: [str]) -> none {
+    if len(got) != len(want) {
+        fail(f"[{build.join_words(got)}] has {len(got)} words, want [{build.join_words(want)}]")
+    }
+    mut i: int64 = 0
+    for w in want {
+        if got[i] != w {
+            fail(f"[{build.join_words(got)}] is not [{build.join_words(want)}]")
+        }
+        i = i + 1
+    }
+}
+
+test "a leading block names C files, link arguments and required files" {
+    let d: build.LinkDecls = decls_of("// kod:require ${OPENSSL}/include/openssl/ssl.h  brew install openssl@3\n// kod:cc tls.c -I${OPENSSL}/include -DKOD_TLS=1\n// kod:link -L${OPENSSL}/lib -lssl -lcrypto\n\nimport \"io\"\n")
+    expect_strs(d.errors, [])
+    assert len(d.cc) == 1
+    assert d.cc[0].file == "lib/tls.c"
+    expect_strs(d.cc[0].flags, ["-I/opt/ssl/include", "-DKOD_TLS=1"])
+    assert d.cc[0].line == 2
+    expect_strs(d.link, ["-L/opt/ssl/lib", "-lssl", "-lcrypto"])
+    assert len(d.require) == 1
+    assert d.require[0].file == "/opt/ssl/include/openssl/ssl.h"
+    assert d.require[0].hint == "brew install openssl@3"
+    assert d.require[0].line == 1
+    assert d.first == 1
+}
+
+test "a module without such lines declares nothing" {
+    expect_no_decls("")
+    expect_no_decls("\n\n")
+    expect_no_decls("import \"io\"\n")
+    expect_no_decls("// Helpers for the reports.\n// Nothing here needs C.\n\nimport \"io\"\n")
+    expect_no_decls("// kod is the compiler: a comment may say kod: and not be a line of it\nfunc f() -> int64 {\n    return 1\n}\n")
+}
+
+test "only the leading block counts" {
+    // After the first line that is neither blank nor a comment, a kod: line is a comment.
+    expect_no_decls("import \"io\"\n// kod:link -lz\n")
+    expect_no_decls("func f() -> int64 {\n    return 1\n}\n// kod:cc f.c\n")
+    expect_no_decls("let s = \"\"\"\n// kod:link -lz\n\"\"\"\n")
+    // Text after the block in a module the compiler's own tests quote.
+    let d: build.LinkDecls = decls_of("// one\n// kod:link -lz\n\n// two\n// kod:link -lm\nimport \"io\"\n// kod:link -lc\n")
+    expect_strs(d.link, ["-lz", "-lm"])
+    assert d.first == 2
+}
+
+test "blank lines, other comments and an indent are part of the block" {
+    let d: build.LinkDecls = decls_of("\n// A TLS stream.\n\n   // kod:link -lssl\n\t// kod:link -lcrypto\n// kod:cc tls.c\n")
+    expect_strs(d.errors, [])
+    expect_strs(d.link, ["-lssl", "-lcrypto"])
+    assert d.cc[0].line == 6
+    assert d.first == 4
+}
+
+test "a CRLF file reads like an LF one" {
+    let d: build.LinkDecls = decls_of("// kod:link -lz\r\n// kod:cc zlib.c -DX\r\n\r\nimport \"io\"\r\n")
+    expect_strs(d.errors, [])
+    expect_strs(d.link, ["-lz"])
+    assert d.cc[0].file == "lib/zlib.c"
+    expect_strs(d.cc[0].flags, ["-DX"])
+}
+
+test "a directive needs the space after the slashes and none before its name" {
+    // `// kod: link` (a space) is a directive without a name.
+    expect_decl_error("// kod: link -lz\n", line: 1, want: "a directive is `// kod:` and its name with no space between, as in `// kod:link -lz`")
+    expect_decl_error("// kod:\n", line: 1, want: "a directive is `// kod:` and its name with no space between, as in `// kod:link -lz`")
+}
+
+test "a comment spelled almost like a directive is an error, not a comment" {
+    let slip: str = "a directive is written `// kod:name`, in lower case, with one space after the slashes and none before the colon"
+    expect_decl_error("//kod:link -lz\n", line: 1, want: slip)
+    expect_decl_error("//  kod:link -lz\n", line: 1, want: slip)
+    expect_decl_error("//\tkod:link -lz\n", line: 1, want: slip)
+    expect_decl_error("// Kod:link -lz\n", line: 1, want: slip)
+    expect_decl_error("// KOD:link -lz\n", line: 1, want: slip)
+    expect_decl_error("// kod :link -lz\n", line: 1, want: slip)
+    expect_decl_error("// kod\t: link -lz\n", line: 1, want: slip)
+    expect_decl_error("// first\n\n   //kod:cc x.c\n", line: 3, want: slip)
+    // It counts as the first directive line, as a wrong `// kod:` line does.
+    assert decls_of("// a\n//kod:link -lz\n").first == 2
+    // Comments that only mention kod are comments.
+    expect_no_decls("// kod\n")
+    expect_no_decls("//kod\n")
+    expect_no_decls("// ko\n// k\n//\n")
+    expect_no_decls("// kod is a language\n")
+    expect_no_decls("// kodak: a film\n")
+    expect_no_decls("// the kod: line is read\n")
+    expect_no_decls("// a kod:link -lz\n")
+    // Below the block it is a comment, as a `// kod:` line is.
+    expect_no_decls("import \"io\"\n//kod:link -lz\n")
+}
+
+test "a tab or another control character in a directive line is an error" {
+    let tab: str = "a tab or another control character in a directive line; its words are separated by spaces"
+    expect_decl_error("// kod:link -lz \t\n", line: 1, want: tab)
+    expect_decl_error("// kod:link\t-lz\n", line: 1, want: tab)
+    expect_decl_error("// kod:cc ce.c\t\n", line: 1, want: tab)
+    expect_decl_error("// kod:require /x\thint\n", line: 1, want: tab)
+    expect_decl_error("// kod:link -lz\r-lm\n", line: 1, want: tab)
+    // An indent may be a tab, and a CR may end the line; other bytes are fine, non-ASCII ones too.
+    let d: build.LinkDecls = decls_of("\t// kod:link -lz\r\n// kod:link -Lcafé/lib -DX=ä\n")
+    expect_strs(d.errors, [])
+    expect_strs(d.link, ["-lz", "-Lcafé/lib", "-DX=ä"])
+}
+
+test "a byte order mark before the block is skipped, as the lexer skips it" {
+    let mark: str = kod_bytes_to_str(kod_bytes_from_array([239, 187, 191]))
+    let d: build.LinkDecls = decls_of(mark + "// kod:cc x.c -DX\n// kod:link -lz\n\nimport \"io\"\n")
+    expect_strs(d.errors, [])
+    assert len(d.cc) == 1
+    assert d.cc[0].file == "lib/x.c"
+    assert d.cc[0].line == 1
+    expect_strs(d.link, ["-lz"])
+    assert d.first == 1
+    // Lines keep their numbers, and a wrong one is found.
+    expect_decl_error(mark + "// a\n// kod:linkk\n", line: 2, want: "unknown directive kod:linkk")
+    expect_decl_error(mark + "//kod:link -lz\n", line: 1, want: "a directive is written `// kod:name`, in lower case, with one space after the slashes and none before the colon")
+    expect_no_decls(mark + "import \"io\"\n// kod:link -lz\n")
+    expect_no_decls(mark)
+    expect_no_decls(mark + "\n")
+}
+
+test "an unknown directive is an error at its line" {
+    expect_decl_error("// kod:linkk -lz\n", line: 1, want: "unknown directive kod:linkk")
+    expect_decl_error("// first\n\n// kod:CC x.c\n", line: 3, want: "unknown directive kod:CC")
+    expect_decl_error("// kod:pkg openssl\n", line: 1, want: "unknown directive kod:pkg")
+}
+
+test "kod:cc names a .c file beside the module" {
+    let d: build.LinkDecls = decls_of("// kod:cc zlib_crc.c\n")
+    assert d.cc[0].file == "lib/zlib_crc.c"
+    assert len(d.cc[0].flags) == 0
+    // The module's directory is part of the path, normalized.
+    let up: build.LinkDecls = build.parse_link_decls(path: "a/../b/./m.kod", source: "// kod:cc x.c\n", vars: decl_vars())
+    assert up.cc[0].file == "b/x.c"
+    let root: build.LinkDecls = build.parse_link_decls(path: "m.kod", source: "// kod:cc x.c\n", vars: decl_vars())
+    assert root.cc[0].file == "x.c"
+    let absolute: build.LinkDecls = build.parse_link_decls(path: "/srv/app/m.kod", source: "// kod:cc x.c\n", vars: decl_vars())
+    assert absolute.cc[0].file == "/srv/app/x.c"
+    let not_c: str = "which is not the name of a .c file beside the module (a bare name that ends in .c)"
+    expect_decl_error("// kod:cc sub/x.c\n", line: 1, want: f"kod:cc names `sub/x.c`, {not_c}")
+    expect_decl_error("// kod:cc ../x.c\n", line: 1, want: f"kod:cc names `../x.c`, {not_c}")
+    expect_decl_error("// kod:cc x.h\n", line: 1, want: f"kod:cc names `x.h`, {not_c}")
+    expect_decl_error("// kod:cc x\n", line: 1, want: f"kod:cc names `x`, {not_c}")
+    expect_decl_error("// kod:cc .c\n", line: 1, want: f"kod:cc names `.c`, {not_c}")
+    expect_decl_error("// kod:cc -DX x.c\n", line: 1, want: f"kod:cc names `-DX`, {not_c}")
+    expect_decl_error("// kod:cc\n", line: 1, want: "kod:cc needs the name of a C file")
+}
+
+test "kod:link and kod:require need their arguments" {
+    expect_decl_error("// kod:link\n", line: 1, want: "kod:link needs at least one argument")
+    expect_decl_error("// kod:link   \n", line: 1, want: "kod:link needs at least one argument")
+    expect_decl_error("// kod:require\n", line: 1, want: "kod:require needs the file that must exist")
+}
+
+test "kod:require has a file and a hint of any number of words" {
+    let d: build.LinkDecls = decls_of("// kod:require /usr/include/zlib.h\n// kod:require ${OPENSSL}/lib/libssl.dylib   brew  install   openssl@3\n")
+    expect_strs(d.errors, [])
+    assert len(d.require) == 2
+    assert d.require[0].file == "/usr/include/zlib.h"
+    assert d.require[0].hint == ""
+    assert d.require[1].file == "/opt/ssl/lib/libssl.dylib"
+    assert d.require[1].hint == "brew install openssl@3"
+    assert d.require[1].line == 2
+}
+
+test "kod:link arguments are kept as written, in order, from every line" {
+    let d: build.LinkDecls = decls_of("// kod:link -framework Security -lz\n// kod:link -lz /x/libfoo.a -lz\n")
+    expect_strs(d.link, ["-framework", "Security", "-lz", "-lz", "/x/libfoo.a", "-lz"])
+}
+
+test "${NAME} is the value link.cfg gives NAME, anywhere in a word" {
+    let d: build.LinkDecls = decls_of("// kod:link ${OPENSSL} -L${OPENSSL}/lib ${CC}${CC} ${OPENSSL}:${OPENSSL}\n")
+    expect_strs(d.errors, [])
+    expect_strs(d.link, ["/opt/ssl", "-L/opt/ssl/lib", "clangclang", "/opt/ssl:/opt/ssl"])
+}
+
+test "a ${NAME} that cannot be replaced is an error" {
+    expect_decl_error("// kod:link -L${NOPE}/lib\n", line: 1, want: "`${NOPE}` is not set in link.cfg or link.local.cfg")
+    // The value must be a word: several or none would change the count of arguments.
+    expect_decl_error("// kod:link ${TWO}\n", line: 1, want: "`${TWO}` must be one word to be used in a directive")
+    expect_decl_error("// kod:link ${NOTHING}\n", line: 1, want: "`${NOTHING}` must be one word to be used in a directive")
+    let bad: str = "a `$` must start `${NAME}` (capital letters, digits and _)"
+    expect_decl_error("// kod:link $OPENSSL\n", line: 1, want: bad)
+    expect_decl_error("// kod:link $(OPENSSL)\n", line: 1, want: bad)
+    expect_decl_error("// kod:link ${OPENSSL\n", line: 1, want: bad)
+    expect_decl_error("// kod:link ${}\n", line: 1, want: bad)
+    expect_decl_error("// kod:link ${openssl}\n", line: 1, want: bad)
+    expect_decl_error("// kod:link -lz$\n", line: 1, want: bad)
+    expect_decl_error("// kod:cc x.c -DPRICE=$5\n", line: 1, want: bad)
+}
+
+test "every line is checked, and the good ones still count" {
+    let d: build.LinkDecls = decls_of("// kod:link -lz\n// kod:linkk -lm\n// kod:cc x.h\n// kod:link ${NOPE}\n// kod:cc ok.c\n")
+    assert len(d.errors) == 3
+    assert build.starts_with(d.errors[0], prefix: "lib/mod.kod:2:1: error: unknown directive kod:linkk")
+    assert build.starts_with(d.errors[1], prefix: "lib/mod.kod:3:1: error: kod:cc names `x.h`")
+    assert build.starts_with(d.errors[2], prefix: "lib/mod.kod:4:1: error: `${NOPE}` is not set")
+    expect_strs(d.link, ["-lz"])
+    assert len(d.cc) == 1
+    assert d.cc[0].file == "lib/ok.c"
+    assert d.first == 1
+}
+
+test "the first directive line is known even when its line is wrong" {
+    let d: build.LinkDecls = decls_of("// intro\n// kod:nonsense\n")
+    assert d.first == 2
+    assert len(d.errors) == 1
+}
+
+test "the leading block is the lines up to the first one that is not blank or a comment" {
+    assert build.leading_block("") == ""
+    assert build.leading_block("import \"io\"\n") == ""
+    assert build.leading_block("// a\n\n// b\nimport \"io\"\n// c\n") == "// a\n\n// b\n"
+    assert build.leading_block("// a\n// b") == "// a\n// b"
+    assert build.leading_block("  // a\n\t\n  \nx\n") == "  // a\n\t\n  \n"
+    assert build.leading_block("/* a */\n// b\n") == ""
+    assert build.leading_block("// a\r\n\r\nx\r\n") == "// a\r\n\r\n"
+}
+
+test "ends_with compares the end of a string" {
+    assert build.ends_with("zlib_crc.c", suffix: ".c")
+    assert build.ends_with("c", suffix: "c")
+    assert build.ends_with("x", suffix: ".c") == false
+    assert build.ends_with("", suffix: ".c") == false
+    assert build.ends_with("a.kod", suffix: "") == true
+}

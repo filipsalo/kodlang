@@ -28,6 +28,15 @@ func starts_with(anon s: str, prefix: str) -> bool {
     return true
 }
 
+func ends_with(anon s: str, suffix: str) -> bool {
+    let n: int64 = len(s)
+    let m: int64 = len(suffix)
+    if m > n {
+        return false
+    }
+    return s[n-m..n] == suffix
+}
+
 func dirname(anon path: str) -> str {
     // Returns the directory portion (including trailing slash) or "" if none.
     mut i: int64 = len(path) - 1
@@ -673,4 +682,287 @@ func parse_link_config(anon source: str, path: str, into: LinkVars, overrides: b
         }
     }
     return ""
+}
+
+// The link inputs a module declares in the comment lines at its top
+// (docs/modules.md, "Link inputs"): C files to compile, arguments for the
+// link and files that must exist. Pure; the driver acts on them.
+
+// A `kod:cc` line: the C file (its path from the repository root, the
+// module's directory included), the flags after it and the line it is on.
+type CcDecl = struct {
+    file: str
+    flags: [str]
+    line: int64
+}
+
+// A `kod:require` line.
+type RequireDecl = struct {
+    file: str
+    hint: str
+    line: int64
+}
+
+// What a module declares, in the order of its lines. `errors` holds what is
+// wrong with its lines as `path:line:1: error: ...`; `first` is the line of
+// the first `// kod:` line, right or wrong, and 0 when there is none.
+type LinkDecls = struct {
+    cc: [CcDecl]
+    link: [str]
+    require: [RequireDecl]
+    errors: [str]
+    first: int64
+}
+
+// `s` without the spaces and tabs it starts with.
+func trim_indent(anon s: str) -> str {
+    mut i: int64 = 0
+    for i < len(s) and (s[i] == ' ' or s[i] == '\t') {
+        i = i + 1
+    }
+    return s[i..len(s)]
+}
+
+// `line` without a `\r` that ends it.
+func without_cr(anon line: str) -> str {
+    if len(line) > 0 and line[len(line) - 1] == '\r' {
+        return line[0..len(line) - 1]
+    }
+    return line
+}
+
+// `source` without the UTF-8 byte order mark that may start it. The lexer
+// skips the mark like any byte it has no use for, so the lines below must too.
+func without_bom(anon source: str) -> str {
+    if len(source) >= 3 and source[0] == 239 and source[1] == 187 and source[2] == 191 {
+        return source[3..len(source)]
+    }
+    return source
+}
+
+// The lower-case letter for a capital, any other byte as it is.
+func lower_byte(anon b: int64) -> int64 {
+    if b >= 'A' and b <= 'Z' {
+        return b + 32
+    }
+    return b
+}
+
+// Does the comment line `text` (without its indent) read as a directive,
+// `kod` and a colon after the slashes, although it is not spelled `// kod:`?
+// Taken for a comment, a slip such as `//kod:cc x.c` would not be found until
+// the link fails.
+func looks_like_directive(anon text: str) -> bool {
+    if starts_with(text, prefix: "//") == false {
+        return false
+    }
+    mut i: int64 = 2
+    for i < len(text) and (text[i] == ' ' or text[i] == '\t') {
+        i = i + 1
+    }
+    if i + 3 > len(text) {
+        return false
+    }
+    if lower_byte(text[i]) != 'k' or lower_byte(text[i + 1]) != 'o' or lower_byte(text[i + 2]) != 'd' {
+        return false
+    }
+    i = i + 3
+    for i < len(text) and (text[i] == ' ' or text[i] == '\t') {
+        i = i + 1
+    }
+    return i < len(text) and text[i] == ':'
+}
+
+// Is there a control character, a tab say, in `s`?
+func has_control_byte(anon s: str) -> bool {
+    mut i: int64 = 0
+    for i < len(s) {
+        if s[i] < 32 or s[i] == 127 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The start of `source` up to the first line that is neither blank nor a
+// `//` comment: the block of comment lines that a module's link inputs are
+// declared in. (Its lines are numbered as the file's are.)
+func leading_block(anon source: str) -> str {
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i <= len(source) {
+        if i == len(source) or source[i] == '\n' {
+            let text: str = trim_indent(without_cr(source[start..i]))
+            if len(text) > 0 and starts_with(text, prefix: "//") == false {
+                return source[0..start]
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return source
+}
+
+// The name in the `${NAME}` that starts at `at` in `word`, "" if what is
+// there is no `${NAME}`.
+func braced_name(anon word: str, at: int64) -> str {
+    if at + 2 >= len(word) {
+        return ""
+    }
+    if word[at + 1] != '{' {
+        return ""
+    }
+    mut end: int64 = at + 2
+    for end < len(word) and is_cfg_name_byte(word[end]) {
+        end = end + 1
+    }
+    if end == at + 2 or end >= len(word) or word[end] != '}' {
+        return ""
+    }
+    return word[at+2..end]
+}
+
+// A word with its names replaced, or what is wrong with it.
+type Expanded = struct {
+    text: str
+    error: str
+}
+
+// `word` with each `${NAME}` replaced by what link.cfg (or link.local.cfg)
+// sets NAME to, which must be one word. Any other `$` is an error, so that
+// `$(NAME)` and `$NAME` are not taken for what they are not.
+func expand_word(anon word: str, vars: LinkVars) -> Expanded {
+    mut parts: [str] = []
+    mut copied: int64 = 0
+    mut i: int64 = 0
+    for i < len(word) {
+        if word[i] != '$' {
+            i = i + 1
+        } else {
+            let name: str = braced_name(word, at: i)
+            if len(name) == 0 {
+                return Expanded(text: "", error: "a `$` must start `${NAME}` (capital letters, digits and _)")
+            }
+            if link_has(vars, :name) == false {
+                return Expanded(text: "", error: "`${" + name + "}` is not set in link.cfg or link.local.cfg")
+            }
+            let value: [str] = split_words(link_value(vars, :name))
+            if len(value) != 1 {
+                return Expanded(text: "", error: "`${" + name + "}` must be one word to be used in a directive")
+            }
+            parts += [word[copied..i], value[0]]
+            i = i + len(name) + 3
+            copied = i
+        }
+    }
+    parts += [word[copied..len(word)]]
+    return Expanded(text: joined(parts, sep: ""), error: "")
+}
+
+// `parts` joined by `sep`, put together by halves: n parts cost n log n
+// bytes, where adding them one at a time would cost n squared (the arena
+// frees nothing), more than a long word or hint can afford.
+func joined(anon parts: [str], sep: str) -> str {
+    if len(parts) == 0 {
+        return ""
+    }
+    if len(parts) == 1 {
+        return parts[0]
+    }
+    let half: int64 = len(parts) / 2
+    return joined(parts[0..half], :sep) + sep + joined(parts[half..len(parts)], :sep)
+}
+
+// The words of `words`, joined by single spaces.
+func join_words(anon words: [str]) -> str {
+    return joined(words, sep: " ")
+}
+
+// Is `file` the name of a C file beside a module: no directory, ends in `.c`?
+func is_c_file_name(anon file: str) -> bool {
+    if len(file) <= 2 or ends_with(file, suffix: ".c") == false {
+        return false
+    }
+    return file.contains("/") == false
+}
+
+// One `// kod:` line of a module at `path`, without the `// kod:`: what it
+// declares goes into `into`; the result is "" or what is wrong with it.
+func read_link_decl(anon rest: str, path: str, line: int64, vars: LinkVars, into: LinkDecls) -> str {
+    if has_control_byte(rest) {
+        return "a tab or another control character in a directive line; its words are separated by spaces"
+    }
+    mut end: int64 = 0
+    for end < len(rest) and rest[end] != ' ' {
+        end = end + 1
+    }
+    let name: str = rest[0..end]
+    if len(name) == 0 {
+        return "a directive is `// kod:` and its name with no space between, as in `// kod:link -lz`"
+    }
+    if name != "cc" and name != "link" and name != "require" {
+        return f"unknown directive kod:{name}"
+    }
+    mut words: [str] = []
+    for word in split_words(rest[end..len(rest)]) {
+        let e: Expanded = expand_word(word, :vars)
+        if len(e.error) > 0 {
+            return e.error
+        }
+        words += [e.text]
+    }
+    if len(words) == 0 {
+        if name == "cc" {
+            return "kod:cc needs the name of a C file"
+        }
+        if name == "link" {
+            return "kod:link needs at least one argument"
+        }
+        return "kod:require needs the file that must exist"
+    }
+    if name == "link" {
+        for w in words {
+            into.link += [w]
+        }
+        return ""
+    }
+    if name == "require" {
+        into.require += [RequireDecl(file: words[0], hint: join_words(words[1..len(words)]), :line)]
+        return ""
+    }
+    if is_c_file_name(words[0]) == false {
+        return f"kod:cc names `{words[0]}`, which is not the name of a .c file beside the module (a bare name that ends in .c)"
+    }
+    into.cc += [CcDecl(file: normalize_path(dirname(path) + words[0]), flags: words[1..len(words)], :line)]
+    return ""
+}
+
+// What the module at `path`, whose text is `source`, declares in the comment
+// lines at its top; `vars` is the link configuration for `${NAME}`. Only the
+// leading block is read: the lines from the top that are blank or comments.
+// In it a line that starts with `// kod:` (after any indent) is a directive,
+// and one that is spelled like it but not so (`//kod:`, `// Kod:`) is an error.
+func parse_link_decls(path: str, source: str, vars: LinkVars) -> LinkDecls {
+    let decls: LinkDecls = LinkDecls(cc: [], link: [], require: [], errors: [], first: 0)
+    mut number: int64 = 0
+    for raw in lines_of(leading_block(without_bom(source))) {
+        number = number + 1
+        let text: str = trim_indent(without_cr(raw))
+        if starts_with(text, prefix: "// kod:") {
+            if decls.first == 0 {
+                decls.first = number
+            }
+            let error: str = read_link_decl(text[7..len(text)], :path, line: number, :vars, into: decls)
+            if len(error) > 0 {
+                decls.errors += [cfg_error(:path, line: number, col: 1, message: error)]
+            }
+        } else if looks_like_directive(text) {
+            if decls.first == 0 {
+                decls.first = number
+            }
+            decls.errors += [cfg_error(:path, line: number, col: 1, message: "a directive is written `// kod:name`, in lower case, with one space after the slashes and none before the colon")]
+        }
+    }
+    return decls
 }

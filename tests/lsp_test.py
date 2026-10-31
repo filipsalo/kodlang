@@ -8,20 +8,28 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from stdio_test import removed_if_signalled, running, stderr_text
 
 ROOT = Path(__file__).resolve().parent.parent
 KOD = ROOT / "build" / "apps" / "kod" / "kod"
 BIN = ROOT / "build" / "apps" / "lsp" / "lsp"
 
 
+def build_lsp(kod: Path = KOD) -> None:
+    """`kod build tools/lsp.kod`. If pytest is stopped by SIGTERM or SIGHUP, or
+    the build runs past the bound of the other process tests, everything it
+    started is stopped."""
+    with removed_if_signalled(lambda: None):
+        with running([kod, "build", "tools/lsp.kod"]) as proc:
+            assert proc.stdout is not None
+            built = proc.stdout.read().decode(errors="replace")
+            proc.wait()
+            assert proc.returncode == 0, built + stderr_text(proc)
+
+
 @pytest.fixture(scope="module")
 def lsp_binary(sh_kodc):
-    subprocess.run(
-        [str(KOD), "build", "tools/lsp.kod"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-    )
+    build_lsp()
     assert BIN.exists()
     return BIN
 
@@ -1375,3 +1383,80 @@ def test_completion_ignores_braces_in_strings_chars_and_comments(lsp_binary, tmp
         "if true {", "  let v: pb.Pt = pb.make()", "  print(v.y)", "}", 'print("{")'
     )
     assert "x" in labels and "y" not in labels, labels
+
+
+def _hover_and_diagnostics(lsp_binary, source, line, character):
+    """The hover contents (None when there is no hover) and the diagnostics
+    published for `source`, with the cursor at `line`, `character`."""
+    uri = "file:///tmp/directives.kod"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    hover = next(r for r in responses if r.get("id") == 2)["result"]
+    published = [
+        r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
+    ]
+    diagnostics = [d for r in published for d in r["params"]["diagnostics"]]
+    return (hover["contents"]["value"] if hover else None), diagnostics
+
+
+def test_the_link_directives_of_a_module_are_comments_to_the_language_server(
+    lsp_binary,
+):
+    # tests/link/zlib_crc.kod: a block of `// kod:` lines, a blank line, then
+    # the declarations. The block is no doc comment and no diagnostic.
+    source = (ROOT / "tests" / "link" / "zlib_crc.kod").read_text()
+    line = next(
+        i for i, text in enumerate(source.splitlines()) if text.startswith("func crc32")
+    )
+    value, diagnostics = _hover_and_diagnostics(lsp_binary, source, line, 7)
+    assert value is not None and "func crc32" in value
+    assert "kod:" not in value
+    assert diagnostics == []
+
+
+def test_a_directive_block_with_no_blank_line_after_it_is_the_first_declarations_doc(
+    lsp_binary,
+):
+    # What docs/modules.md warns of: the parser takes the comment block above a
+    # declaration as its doc comment. Nothing breaks; the hover shows the lines.
+    source = (
+        "// kod:cc zlib_crc.c\n"
+        "// kod:link -lz\n"
+        "func crc(anon n: int64) -> int64 {\n"
+        "  return n\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  return crc(1)\n"
+        "}\n"
+    )
+    value, diagnostics = _hover_and_diagnostics(lsp_binary, source, 6, 10)
+    assert value is not None and "func crc" in value
+    assert "kod:link -lz" in value
+    assert diagnostics == []
