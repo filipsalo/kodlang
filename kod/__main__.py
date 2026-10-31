@@ -1,32 +1,39 @@
 #!/usr/bin/env python
 """I am the Kod language.
 
-User-facing commands:
+User-facing commands (run from the repository root; they refresh the toolchain
+with `make` and hand off to the native tool, build/apps/kod/kod):
     kod build <file>     compile to an executable
     kod run <file>       build, then execute
     kod check <file>     compile through codegen; report errors but emit no
                          artifacts (exits non-zero if anything failed)
-    kod test [path]      run `test` blocks in a file, or in every
+    kod test <path>      run `test` blocks in a file, or in every
                          `*_test.kod` under a directory
 
-Internal/debug commands (subject to change):
+Internal commands (subject to change; Python is the interpreter and the
+bootstrap, see docs/self-hosting.md):
     kod _interpret <file>          run via the Python interpreter
-    kod _emit-asm <file>           print the assembly for the entry module
-    kod _dump-ast <file>           pretty-print the parsed AST
     kod _emit-runtime-main <file> <out.s>
+                                   write the `_main` shim (the no-snapshot
+                                   bootstrap's; sh_kodc has its own)
 """
 
 import argparse
+import fcntl
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-import kod.ast as ast
-from kod.builder import Builder
+from kod.bootstrap import compose_runtime_main_asm
 from kod.exceptions import KodError
-from kod.filesys import FileSystem
+from kod.filesys import FileSystem, FileWrapper
 from kod.interpreter import Interpreter
+from kod.loader import Loader, LoadError
 from kod.paths import find_stdlib_path
+from kod.program import Program
+
+_NATIVE_COMMANDS = {"build", "run", "test", "check"}
 
 
 def _make_parser() -> argparse.ArgumentParser:
@@ -35,7 +42,8 @@ def _make_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.required = True
 
-    # Public commands.
+    # Public commands. They never get here: `main` hands them to the native
+    # tool before parsing; they are listed for `--help`.
     p = subparsers.add_parser("build", help="compile to an executable")
     p.add_argument("file", type=str)
 
@@ -49,80 +57,19 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("file", type=str)
 
     p = subparsers.add_parser("test", help="run `test` blocks")
-    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("path", type=str)
 
-    # Internal/debug commands. Underscore prefix signals "not part of the
-    # public surface; shape and existence may change."
+    # Internal commands. Underscore prefix signals "not part of the public
+    # surface; shape and existence may change."
     p = subparsers.add_parser("_interpret")
     p.add_argument("file", type=str)
     p.add_argument("args", nargs="*")
-
-    p = subparsers.add_parser("_emit-asm")
-    p.add_argument("file", type=str)
-
-    p = subparsers.add_parser("_dump-ast")
-    p.add_argument("file", type=str)
 
     p = subparsers.add_parser("_emit-runtime-main")
     p.add_argument("file", type=str)
     p.add_argument("out", type=str)
 
-    p = subparsers.add_parser("_emit-test-runtime-main")
-    p.add_argument("file", type=str)
-    p.add_argument("out", type=str)
-
     return parser
-
-
-_DIR_TEST_RUNNER = ".kod_test_runner.kod"
-
-
-def _run_dir_tests(directory: Path) -> int:
-    """Walk `directory` for `*_test.kod`, build them all into a single
-    executable via a temporary aggregator file at the project root,
-    run it, return the exit code. Cleans up the aggregator on the way
-    out (even if compilation fails)."""
-    test_files = sorted(directory.rglob("*_test.kod"))
-    if not test_files:
-        print(f"kod test: no `*_test.kod` files under {directory}", file=sys.stderr)
-        return 1
-
-    cwd = Path.cwd()
-    aggregator_path = cwd / _DIR_TEST_RUNNER
-    # Each test file gets imported via a path relative to the project root
-    # (`./stdlib/map_test`). The aggregator has no test blocks of its own;
-    # the runtime_main walks the program for every module that does.
-    imports = []
-    for test_file in test_files:
-        rel = test_file.resolve().relative_to(cwd).with_suffix("")
-        imports.append(f'import "./{rel}"')
-    aggregator_path.write_text("\n".join(imports) + "\n")
-    try:
-        bob, _, entry_module = _open_program(str(aggregator_path))
-        executable = bob.build_test_executable(entry_module)
-        result = subprocess.run([executable], check=False)
-        return result.returncode
-    finally:
-        if aggregator_path.exists():
-            aggregator_path.unlink()
-
-
-def _open_program(file: str):
-    """Resolve stdlib + project FS, parse program from `file`, return
-    (builder, program, entry_module). Exits non-zero on parse errors."""
-    stdlib_fs = FileSystem(find_stdlib_path())
-    project_fs = FileSystem(Path.cwd())
-    entry_module = project_fs.open(Path(file).absolute())
-    bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
-    try:
-        program = bob.parse_program(entry_module)
-    except KodError as err:
-        print(err, file=sys.stderr)
-        sys.exit(1)
-    return bob, program, entry_module
-
-
-_NATIVE_DELEGATED = {"build", "run", "test", "check"}
 
 
 def _refresh_toolchain(root: Path) -> None:
@@ -130,9 +77,6 @@ def _refresh_toolchain(root: Path) -> None:
     their sources changed. The up-to-date check (`make -q`) costs ~10 ms.
     A lock serializes concurrent `kod` invocations so two rebuilds never
     write the same objects at once."""
-    import fcntl
-    import os
-
     targets = ["stage1", "kod"]
     # Don't inherit an outer `make test`'s flags (-B would rebuild on
     # every call, -j prints jobserver warnings, -i hides failures).
@@ -164,135 +108,90 @@ def _refresh_toolchain(root: Path) -> None:
         sys.exit(result.returncode)
 
 
-def _maybe_delegate_to_native() -> int | None:
-    """For the subcommands the native driver implements, exec
-    `build/apps/kod/kod` with the same argv. When run from the repo root,
-    first bring the toolchain up to date. The Python path stays as the
-    fallback when the native binary is missing (e.g. invoked outside the
-    repo root) and for Python-only subcommands (anything not in
-    `_NATIVE_DELEGATED`)."""
-    if len(sys.argv) < 2 or sys.argv[1] not in _NATIVE_DELEGATED:
-        return None
+def _hand_off_to_native() -> int:
+    """Exec `build/apps/kod/kod` with the same argv. From the repo root,
+    first bring the toolchain up to date. There is no other way to build:
+    when the native tool is missing, say so."""
     root = Path.cwd()
     if (root / "Makefile").exists() and (root / "kodc.kod").exists():
         _refresh_toolchain(root)
     native = root / "build" / "apps" / "kod" / "kod"
     if not native.exists():
-        return None
-    import os
-
+        print(
+            "kod: build/apps/kod/kod not found; "
+            "run kod from the repository root after `make kod`",
+            file=sys.stderr,
+        )
+        return 1
     os.execv(str(native), [str(native), *sys.argv[1:]])
+
+
+def _load(file: str) -> tuple[Program, FileWrapper] | None:
+    """Parse the program whose entry is `file`. On failure, say why on stderr
+    and return None."""
+    project_fs = FileSystem(Path.cwd())
+    loader = Loader(project_fs=project_fs, stdlib_fs=FileSystem(find_stdlib_path()))
+    try:
+        entry_module = project_fs.open(Path(file).absolute())
+        return loader.parse_program(entry_module), entry_module
+    except KodError as err:
+        print(err, file=sys.stderr)
+    except FileNotFoundError as err:
+        # Same wording as sh_kodc, for the entry or for a module it imports.
+        name = Path(err.filename)
+        if name.is_relative_to(Path.cwd()):
+            name = name.relative_to(Path.cwd())
+        print(f"{name}:1:1: error: no such file", file=sys.stderr)
+    except LoadError as err:
+        print(err, file=sys.stderr)
+    return None
+
+
+def _interpret(file: str, args: list[str]) -> int:
+    """Run `file` in the interpreter. The program's own exit goes through
+    `sys.exit` in `Interpreter.run`."""
+    loaded = _load(file)
+    if loaded is None:
+        return 1
+    program, entry_module = loaded
+    try:
+        Interpreter(program).run(entry_module, [str(entry_module), *args])
+    except KodError as err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
+
+
+def _emit_runtime_main(file: str, out: str) -> int:
+    """Write the `_main` shim for the entry `file` to `out`: what the
+    Makefile uses for `kodc.kod` and `tools/kod.kod` when there is no
+    snapshot."""
+    loaded = _load(file)
+    if loaded is None:
+        return 1
+    program, entry_module = loaded
+    try:
+        asm = compose_runtime_main_asm(program, entry_module)
+    except ValueError as err:
+        print(f"kod: _emit-runtime-main: {err}", file=sys.stderr)
+        return 1
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(asm)
+    return 0
 
 
 def main():
     """Main entry point."""
-    rc = _maybe_delegate_to_native()
-    if rc is not None:
-        return rc
+    if len(sys.argv) > 1 and sys.argv[1] in _NATIVE_COMMANDS:
+        return _hand_off_to_native()
 
     args = _make_parser().parse_args()
-
-    if args.command == "test":
-        # `kod test <file>` builds the file with a runtime_main that
-        # calls every test-bearing module's __run_tests dispatcher
-        # (entry file + transitive imports), then runs the resulting
-        # binary and propagates its exit code.
-        # `kod test <dir>` walks <dir> for `*_test.kod` files and runs
-        # all of them in one binary via a temporary aggregator module.
-        path = Path(args.path)
-        if path.is_dir():
-            return _run_dir_tests(path)
-        bob, _, entry_module = _open_program(args.path)
-        executable = bob.build_test_executable(entry_module)
-        result = subprocess.run([executable], check=False)
-        return result.returncode
-
-    if args.command == "_emit-runtime-main":
-        # Delegate to sh_kodc when it's available and fresh — that's the
-        # Kod-native composer. Fall back to the Python composer during
-        # bootstrap (sh_kodc doesn't exist yet) or when the binary is
-        # stale relative to its sources.
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        stdlib_fs = FileSystem(find_stdlib_path())
-        project_fs = FileSystem(Path.cwd())
-        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
-        sh_kodc = bob.build_root / "stage1" / "sh_kodc"
-        if sh_kodc.exists() and not bob._sh_kodc_stale(sh_kodc):
-            result = subprocess.run(
-                [str(sh_kodc), "_emit-runtime-main", args.file, str(out)],
-                check=False,
-            )
-            return result.returncode
-        # Python fallback.
-        entry_module = project_fs.open(Path(args.file).absolute())
-        try:
-            bob.parse_program(entry_module)
-        except KodError as err:
-            print(err, file=sys.stderr)
-            return 1
-        out.write_text(bob.compose_runtime_main_asm(entry_module))
-        return 0
-
-    if args.command == "_emit-test-runtime-main":
-        # Mirrors _emit-runtime-main: prefers sh_kodc when fresh,
-        # falls back to the Python composer during bootstrap.
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        stdlib_fs = FileSystem(find_stdlib_path())
-        project_fs = FileSystem(Path.cwd())
-        bob = Builder(project_fs=project_fs, stdlib_fs=stdlib_fs)
-        sh_kodc = bob.build_root / "stage1" / "sh_kodc"
-        if sh_kodc.exists() and not bob._sh_kodc_stale(sh_kodc):
-            result = subprocess.run(
-                [str(sh_kodc), "_emit-test-runtime-main", args.file, str(out)],
-                check=False,
-            )
-            return result.returncode
-        entry_module = project_fs.open(Path(args.file).absolute())
-        try:
-            bob.parse_program(entry_module)
-        except KodError as err:
-            print(err, file=sys.stderr)
-            return 1
-        out.write_text(bob.compose_test_runtime_main_asm(entry_module))
-        return 0
-
-    bob, program, entry_module = _open_program(args.file)
-    entry_key = entry_module.canonical_path.with_suffix("")
-
     match args.command:
-        case "build":
-            bob.build_executable(entry_module)
-            return 0
-        case "run":
-            executable = bob.build_executable(entry_module)
-            result = subprocess.run([executable, *args.args], check=False)
-            return result.returncode
-        case "check":
-            # Run every module through codegen so the same error checks fire
-            # as in `build`, but don't write artifacts or link. compile_module
-            # already streams the underlying error to stderr; we just count.
-            errors = 0
-            for module in program:
-                try:
-                    bob.compile_module(module)
-                except (KodError, RuntimeError):
-                    errors += 1
-            return 1 if errors else 0
         case "_interpret":
-            argv = [str(entry_module), *args.args]
-            Interpreter(program).run(entry_module, argv)
-            return 0
-        case "_emit-asm":
-            module = program.get_module(entry_key)
-            print(bob.compile_module(module))
-            return 0
-        case "_dump-ast":
-            module = program.get_module(entry_module.path)
-            ast.dump(module)
-            return 0
-
+            return _interpret(args.file, args.args)
+        case "_emit-runtime-main":
+            return _emit_runtime_main(args.file, args.out)
     return 0
 
 

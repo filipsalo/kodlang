@@ -1657,7 +1657,7 @@ class Interpreter:
                 # Function-as-value: `let f = foo` binds the function
                 # declaration as the value. Subsequent indirect calls
                 # (`f(x)`) feed it back through call_function.
-                # Anonymous lambdas don't go through builder's
+                # Anonymous lambdas don't go through the loader's
                 # method-attaching pass, so stamp `.module` lazily
                 # so call_function can find the enclosing module's
                 # scope.
