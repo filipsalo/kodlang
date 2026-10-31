@@ -21,38 +21,23 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#include "kod_rt.h"
+
 extern char **environ;
 
-void *arena_alloc(int64_t size);
 // Defined in stdlib/kod/inspect.kod. Both panic handlers call it
 // inline with `__builtin_frame_address(0)` (NOT through a wrapper —
 // see the longer note where the asm-label declaration lives).
 extern void kod_inspect_print_backtrace_from(int64_t fp)
     __asm__("$kod$inspect$print_backtrace_from");
 
-// A Kod `str` value is a pointer to one of these. `buf` points at a
-// byte buffer of `len` bytes plus an explicit NUL terminator (kept
-// for cheap libc interop — pass `buf` directly into puts/fopen-style
-// APIs). All str-handling externs return / accept `KodStr *`; the
-// codegen passes the struct pointer in `x0` without unwrapping.
-typedef struct {
-    char *buf;
-    int64_t len;
-} KodStr;
+// KodStr and KodArray, the layout of a Kod `str` and `[T]`, are in kod_rt.h,
+// which C files that Kod modules name include too.
 
 // Allocate a fresh KodStr plus a `len`-byte NUL-terminated buffer in
 // a single arena allocation. Caller fills `buf` before returning.
 static KodStr *kod_str_alloc(int64_t len) {
-    int64_t header = (int64_t)sizeof(KodStr);
-    // Keep the byte buffer 8-aligned for the simple memcpy-into-it
-    // paths even though no field needs that alignment.
-    int64_t total = header + len + 1;
-    char *block = (char *)arena_alloc(total);
-    KodStr *s = (KodStr *)block;
-    s->buf = block + header;
-    s->len = len;
-    s->buf[len] = '\0';
-    return s;
+    return kod_str_new(len);
 }
 
 // Build a KodStr from a NUL-terminated C string (e.g. argv[i]). Copies
@@ -376,12 +361,6 @@ int64_t kod_str_cmp(KodStr *a, KodStr *b) {
     if (rc != 0) return rc;
     return a->len - b->len;
 }
-
-typedef struct {
-    void *ptr;
-    int64_t len;
-    int64_t cap;
-} KodArray;
 
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`
 // struct's field order (each slot 8 bytes). The two `*` slots hold

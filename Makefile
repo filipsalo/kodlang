@@ -28,7 +28,8 @@
 # flags, and the always-linked C files and Kod modules. This Makefile
 # includes it and tools/kod.kod reads the same files, so both link alike.
 # The objects and links are rebuilt when the files change, or when the
-# configuration in force differs from the one build/.link-config records.
+# configuration in force differs from the one build/.link-config records; the
+# C objects also when a header in stdlib/ changes.
 #
 # Layout:
 #   bootstrap/sh_kodc     arm64-darwin sh_kodc snapshot — checked in so a
@@ -173,9 +174,13 @@ stage0: $(STAGE0_OBJS)
 
 # C runtime objects (the arena allocator, the str/array primitives, panic, the
 # test runtime, ...): one rule per RUNTIME_C file. They depend on link.cfg
-# because that holds the compiler and its flags.
+# because that holds the compiler and its flags, and on the headers in stdlib/
+# (kod_rt.h declares the layout of str and arrays) since there are no
+# dependency files: a changed layout must not leave runtime.o stale next to
+# the C files programs compile against the header.
+C_HEADERS := $(wildcard stdlib/*.h)
 define runtime_c_rule
-$(STAGE0)/$(basename $(notdir $(1))).o: $(1) $(LINK_CFG)
+$(STAGE0)/$(basename $(notdir $(1))).o: $(1) $(LINK_CFG) $(C_HEADERS)
 	mkdir -p $(STAGE0)
 	$$(CC) $$(CFLAGS) -c -o $$@ $$<
 endef
