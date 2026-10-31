@@ -74,6 +74,10 @@ test "map lookup hits" {
 
 The aggregate exit code is 0 if every test passed, non-zero otherwise.
 
+## Output
+
+`kod test` replaces itself with the test binary, so the output appears as the tests run, and the exit code is the binary's. The reporter flushes stdout around every `ok`/`FAIL` line and the file header, and before a failure's detail goes to stderr, so the lines stay in order when stdout and stderr are the same pipe or log. What a test prints with `print` is flushed with them, so it comes out before that test's result line. A panic (an index out of bounds, a failed `must`) flushes stdout before its message too.
+
 ## Layout convention
 
 Test files live next to the code they test, Go-style:
