@@ -33,4 +33,4 @@ Hello, world!
 
 ## Status
 
-The self-hosted compiler (`sh_kodc`) is the production path. The Python frontend (`kod _interpret`, `kod _emit-asm`) remains for development and bootstrapping.
+The self-hosted compiler (`sh_kodc`) is the production path. The Python interpreter (`kod _interpret`) remains as the bootstrap and as a second implementation of the language; it is frozen (see [Self-hosting](self-hosting.md#whats-still-python)).

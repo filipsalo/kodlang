@@ -4,7 +4,7 @@ icon: lucide/cpu
 
 # Self-hosting
 
-The primary goal of Kod is self-hosting — a compiler written in Kod that compiles itself. The Python frontend exists to bootstrap that, and is shrinking as more orchestration moves into Kod.
+The primary goal of Kod is self-hosting — a compiler written in Kod that compiles itself. The Python side is frozen: it is the interpreter and the bootstrap, and gets no new build logic.
 
 ## Status
 
@@ -48,9 +48,11 @@ If the snapshot is missing, the Makefile falls back to running `kodc.kod` under 
 
 ## What's still Python
 
-- `kod/interpreter.py` and the Python lexer/parser: the bootstrap path (`kod _interpret kodc.kod ...`) for when the snapshot can't be used.
-- `kod/builder.py`: the older build orchestrator. From the repo root, `uv run kod build/run/test/check` no longer reach it; the internal subcommands (`_interpret`, `_emit-asm`, `_dump-ast`) still use it to load programs.
-- `kod/__main__.py`: the `uv run kod` entry point. For `build` / `run` / `test` / `check` it refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`.
+- `kod/interpreter.py`, the Python lexer, parser and `kod/loader.py`: the independent second implementation of the language (the `both`-mode fixtures and the parity tests) and the bootstrap when `bootstrap/sh_kodc` is missing (`kod _interpret kodc.kod ...`).
+- `kod/bootstrap.py`: the one piece of build logic left, `kod _emit-runtime-main`, which the Makefile uses to write the `_main` shim of `kodc.kod` and `tools/kod.kod` when there is no snapshot. `tests/bootstrap_test.py` keeps it identical to `sh_kodc _emit-runtime-main`.
+- `kod/__main__.py`: `uv run kod build|run|test|check`, run from the repository root, refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`. If `make` fails, it prints make's errors and `kod: failed to rebuild the toolchain` and stops with make's status; from any other directory, or when `make` is not installed and the tool is not built, it says that the tool is missing. Plus `_interpret`.
+
+Rules: language features and build logic are added in Kod only. The interpreter is not extended for them: their fixtures say `// expected mode:` `run`. An `extern func` the interpreter does not mirror is compiled-only. It mirrors twelve: `read_file`, `kod_is_file`, `kod_panic`, `kod_puts`, `kod_bytes_from_array`, `kod_str_to_bytes`, `kod_bytes_to_str`, `kod_eprint`, `read_stdin_line`, `read_stdin_exact`, `write_stdout` and `putchar` (the builtin; it shares libc's stdout buffer with `kod_puts`). The compiler sources and the stage0 stdlib stay within what the snapshot and the Python parser accept (types declared before use). Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool install .` is not supported: the wheel contains no stdlib.
 
 See `TODO.md` for the running list of Python-deletion work.
 

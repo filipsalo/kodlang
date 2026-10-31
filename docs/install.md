@@ -42,10 +42,6 @@ uv run kod test hello.kod    # run any `test "..." {}` blocks
 uv run kod check hello.kod   # parse + codegen; report errors but emit nothing
 ```
 
-For a global install:
-
-```shell
-uv tool install .   # puts `kod` on your PATH
-```
+Run `kod` from the repository root. A global `uv tool install .` is not supported: the package carries no stdlib.
 
 See [CLI reference](cli.md) for the full command surface.

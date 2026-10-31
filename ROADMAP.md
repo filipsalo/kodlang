@@ -4,9 +4,10 @@
 
 Kod is self-hosted. `sh_kodc` (lexer, parser, codegen in `stdlib/kod/`, driver in
 `kodc.kod`) compiles every Kod program, including itself, and the native `kod` tool
-(`tools/kod.kod`) drives build / run / test / check. The Python package in `kod/` is the
-bootstrap and fallback path: its interpreter runs `kodc.kod` when no `sh_kodc` exists, and
-its CLI hands off to the native tool once `make kod` has built it.
+(`tools/kod.kod`) drives build / run / test / check. The Python package in `kod/` is
+frozen: its interpreter runs `kodc.kod` when no `sh_kodc` exists and is a second
+implementation of the language, and its launcher hands off to the native tool once
+`make kod` has built it. Language features and build logic are added in Kod only.
 
 The language has structs, enums with payloads, `match` (statement and expression, with
 exhaustiveness checks), generics (monomorphised), interfaces, `T?`, `T or Error` with
@@ -37,4 +38,4 @@ open codegen bugs that this kind of code is most likely to hit.
 - Closures that capture enclosing locals.
 - `pub` / private visibility for module members.
 - Dead-code elimination: skip compiling functions nothing reaches.
-- Retire the remaining Python (see `TODO.md`).
+- Retire the Python interpreter and bootstrap (see `TODO.md`).
