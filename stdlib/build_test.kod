@@ -1,0 +1,340 @@
+// The naming rules of kod/build (docs/modules.md, "Symbol and object
+// names"): the symbol prefix a path gets and the object file a module is
+// written to. Run from the repository root, since the twin check looks
+// for `stdlib/<path>.kod` there.
+import "fs"
+import "process"
+import "kod/build"
+import "kod/test_support"
+
+func expect_prefix(anon path: str, want: str) -> none {
+    let got: str = build.path_to_prefix(path)
+    if got != want {
+        fail(f"path_to_prefix({path}) is {got}, want {want}")
+    }
+}
+
+func expect_obj(anon root: str, source: str, want: str) -> none {
+    let got: str = build.obj_path(:root, :source)
+    if got != want {
+        fail(f"obj_path({root}, {source}) is {got}, want {want}")
+    }
+}
+
+test "an ordinary path keeps the symbols it always had" {
+    expect_prefix("tests/hello.kod", want: "tests$hello")
+    expect_prefix("stdlib/io.kod", want: "io")
+    expect_prefix("stdlib/kod/ast.kod", want: "kod$ast")
+    expect_prefix("stdlib/primitives/int64.kod", want: "primitives$int64")
+    expect_prefix("kodc.kod", want: "kodc")
+    expect_prefix("tools/kod.kod", want: "tools$kod")
+    expect_prefix("a/b_2.kod", want: "a$b_2")
+    expect_prefix("tests/foo.bar.kod", want: "tests$foo.bar")
+    expect_prefix("/tmp/foo.kod", want: "tmp$foo")
+}
+
+test "a byte that is no symbol character is escaped to $$ and two hex digits" {
+    expect_prefix("my-app.kod", want: "my$$2dapp")
+    expect_prefix("tests/with space.kod", want: "tests$with$$20space")
+    expect_prefix("a/p$q.kod", want: "a$p$$24q")
+    expect_prefix("a/b+c@d.kod", want: "a$b$$2bc$$40d")
+    expect_prefix("café.kod", want: "caf$$c3$$a9")
+}
+
+test "a leading dot is escaped, and the prefix then gets a dot in front" {
+    expect_prefix("-x.kod", want: ".$$2dx")
+    expect_prefix(".-x.kod", want: ".$$2e$$2dx")
+    expect_prefix(".hidden.kod", want: ".$$2ehidden")
+    expect_prefix("a/.b.kod", want: "a$.b")
+    expect_prefix(".kod", want: ".")
+}
+
+test "a prefix that would start with a digit gets a dot in front" {
+    expect_prefix("01_hello.kod", want: ".01_hello")
+    expect_prefix("2024/report.kod", want: ".2024$report")
+    expect_prefix("3d.kod", want: ".3d")
+    expect_prefix("tests/3d.kod", want: "tests$3d")
+    expect_prefix("a/2024/report.kod", want: "a$2024$report")
+}
+
+test "an e or E after the leading digits of a prefix is escaped, which the assembler would read as a number" {
+    expect_prefix("1e5.kod", want: ".1$$655")
+    expect_prefix("0example.kod", want: ".0$$65xample")
+    expect_prefix("2East/lib.kod", want: ".2$$45ast$lib")
+    expect_prefix("12E.kod", want: ".12$$45")
+    expect_prefix("1e5_test.kod", want: ".1$$655_test")
+    // Not a number to the assembler, so nothing more is escaped.
+    expect_prefix("1x5e.kod", want: ".1x5e")
+    expect_prefix("1.5e3.kod", want: ".1.5e3")
+    expect_prefix("a/1e5.kod", want: "a$1e5")
+    expect_prefix("e5.kod", want: "e5")
+    expect_prefix("-1e5.kod", want: ".$$2d1e5")
+}
+
+test "mangle_path is the whole rule without the twin marker" {
+    if build.mangle_path("3d") != ".3d" {
+        fail("mangle_path(3d) is " + build.mangle_path("3d"))
+    }
+    if build.mangle_path("1e5") != ".1$$655" {
+        fail("mangle_path(1e5) is " + build.mangle_path("1e5"))
+    }
+    if build.mangle_path("-x/y") != ".$$2dx$y" {
+        fail("mangle_path(-x/y) is " + build.mangle_path("-x/y"))
+    }
+    if build.mangle_path("") != "." {
+        fail("mangle_path() is " + build.mangle_path(""))
+    }
+    if build.mangle_path("a/b") != "a$b" {
+        fail("mangle_path(a/b) is " + build.mangle_path("a/b"))
+    }
+}
+
+test "a project module named like a stdlib module is in the .user$ namespace" {
+    expect_prefix("io.kod", want: ".user$io")
+    expect_prefix("kod/ast.kod", want: ".user$kod$ast")
+    expect_prefix("json.kod", want: ".user$json")
+    expect_prefix("tests/io.kod", want: "tests$io")
+    expect_prefix("stdlib/io.kod", want: "io")
+    expect_prefix("lib/json.kod", want: "lib$json")
+}
+
+test "an import resolves to the prefix of the module it names" {
+    let local: build.Resolved = build.resolve_import(target_path: "main.kod", module_name: "./io")
+    assert local.file == "io.kod"
+    expect_prefix(local.file, want: ".user$io")
+    assert local.prefix == ".user$io"
+    let std: build.Resolved = build.resolve_import(target_path: "main.kod", module_name: "io")
+    assert std.file == "stdlib/io.kod"
+    assert std.prefix == "io"
+    let nested: build.Resolved = build.resolve_import(target_path: "tests/main.kod", module_name: "./io")
+    assert nested.file == "tests/io.kod"
+    assert nested.prefix == "tests$io"
+    let spelled: build.Resolved = build.resolve_import(target_path: "main.kod", module_name: "./lib/../io")
+    assert spelled.prefix == ".user$io"
+}
+
+test "paths that differ in a byte the symbol would lose get different prefixes" {
+    let pairs: [str] = ["-x", ".-x", "p$q", "p/q", "a-b", "a/-b", "01_x", ".01_x", "io", "stdlib/io", ".user/io", "x/stdlib/io", "a b", "a$$20b", "a.b", "a/.b", ".user", "user"]
+    for x in pairs {
+        for y in pairs {
+            // `io` and `stdlib/io` are the same module on purpose.
+            let same_module: bool = (x == "io" and y == "stdlib/io") or (x == "stdlib/io" and y == "io")
+            let a: str = build.path_to_prefix(x + ".kod")
+            if x != y and same_module == false and a == build.path_to_prefix(y + ".kod") {
+                fail(f"{x} and {y} share the prefix {a}")
+            }
+        }
+    }
+}
+
+// Every string of up to `max_len` bytes over `alphabet`.
+func strings_over(alphabet: [str], max_len: int64) -> [str] {
+    mut all: [str] = []
+    mut level: [str] = [""]
+    mut n: int64 = 0
+    for n < max_len {
+        mut next: [str] = []
+        for s in level {
+            for c in alphabet {
+                next += [s + c]
+            }
+        }
+        for s in next {
+            all += [s]
+        }
+        level = next
+        n = n + 1
+    }
+    return all
+}
+
+func is_symbol_char(anon c: int64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.' or c == '$'
+}
+
+// Does the prefix start with `.`, digits and an `e` or `E`, which the
+// assembler takes for a number?
+func starts_like_a_number(anon prefix: str) -> bool {
+    if len(prefix) == 0 or prefix[0] != '.' {
+        return false
+    }
+    mut k: int64 = 1
+    for k < len(prefix) and prefix[k] >= '0' and prefix[k] <= '9' {
+        k = k + 1
+    }
+    return k > 1 and k < len(prefix) and (prefix[k] == 'e' or prefix[k] == 'E')
+}
+
+test "every short path gets a prefix the assembler takes, and no two share one" {
+    let alphabet: [str] = ["a", "2", "e", "E", "-", ".", "/", "$", " "]
+    let seen: Map[str, str] = Map[str, str]()
+    mut checked: int64 = 0
+    for s in strings_over(:alphabet, max_len: 4) {
+        // An absolute path and the relative one share a prefix (documented),
+        // and `//` is not a normalized path.
+        if s[0] == '/' or s.contains("//") {
+            continue
+        }
+        let path: str = s + ".kod"
+        let prefix: str = build.path_to_prefix(path)
+        if len(prefix) == 0 {
+            fail(f"{path} has an empty prefix")
+        }
+        if prefix[0] == '$' or (prefix[0] >= '0' and prefix[0] <= '9') {
+            fail(f"{path} has the prefix {prefix}, which starts with $ or a digit")
+        }
+        if starts_like_a_number(prefix) {
+            fail(f"{path} has the prefix {prefix}, which the assembler reads as a number")
+        }
+        mut k: int64 = 0
+        for k < len(prefix) {
+            if is_symbol_char(prefix[k]) == false {
+                fail(f"{path} has the prefix {prefix}, which holds a byte the assembler rejects")
+            }
+            k = k + 1
+        }
+        if seen.contains(prefix) {
+            let other: str = seen[prefix]? or ""
+            fail(f"{path} and {other} share the prefix {prefix}")
+        }
+        seen.set(prefix, path)
+        checked = checked + 1
+    }
+    assert checked > 2000
+}
+
+test "an object is named after its source path in a tree" {
+    let root: str = "build/apps/hello/hello.obj"
+    expect_obj(root, source: "tests/hello.kod", want: "build/apps/hello/hello.obj/tests/hello.kod.o")
+    expect_obj(root, source: "stdlib/json.kod", want: "build/apps/hello/hello.obj/stdlib/json.kod.o")
+    expect_obj(root, source: "lib/json.kod", want: "build/apps/hello/hello.obj/lib/json.kod.o")
+    expect_obj(root, source: "json.kod", want: "build/apps/hello/hello.obj/json.kod.o")
+}
+
+test "the .. of a path, the root of an absolute path and a % are written %xx" {
+    let root: str = "build/apps/hello/hello.obj"
+    expect_obj(root, source: "../d/x.kod", want: "build/apps/hello/hello.obj/%2e%2e/d/x.kod.o")
+    expect_obj(root, source: "/tmp/x.kod", want: "build/apps/hello/hello.obj/%2f/tmp/x.kod.o")
+    expect_obj(root, source: "a/50%.kod", want: "build/apps/hello/hello.obj/a/50%25.kod.o")
+    expect_obj(root, source: "a/%2e%2e/x.kod", want: "build/apps/hello/hello.obj/a/%252e%252e/x.kod.o")
+}
+
+test "a stem of obj gets a tree that is not its executable" {
+    expect_obj("build/apps/obj/obj.obj", source: "obj.kod", want: "build/apps/obj/obj.obj/obj.kod.o")
+}
+
+test "objects of equally named modules are different files" {
+    let root: str = "build/apps/util/util.obj"
+    assert build.obj_path(:root, source: "x/util.kod") != build.obj_path(:root, source: "y/util.kod")
+    assert build.obj_path(:root, source: "json.kod") != build.obj_path(:root, source: "stdlib/json.kod")
+    assert build.obj_path(:root, source: "a.kod") != build.obj_path(:root, source: "/a.kod")
+}
+
+// The file name of `path` without `.kod`: the name of the program built
+// from it.
+func stem_of(anon path: str) -> str {
+    mut start: int64 = 0
+    mut i: int64 = 0
+    for i < len(path) {
+        if path[i] == '/' {
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return path[start..len(path)-4]
+}
+
+// Build the files as a program with the native driver and check what it
+// prints. The program's directory under `build/apps` is removed again
+// unless it was there before.
+func expect_program_prints(anon files: fs.MemFs, entry: str, want: str) -> none {
+    let app_dir: str = f"build/apps/{stem_of(entry)}"
+    let existed: process.ProcessResult = process.run(["test", "-e", app_dir])
+    let r: process.ProcessResult = test_support.build_and_run_files(:files, :entry)
+    if existed.status != 0 {
+        process.run(["rm", "-rf", app_dir])
+    }
+    if r.status != 0 {
+        fail(f"{entry} exited {r.status}: {r.stderr}")
+    }
+    if r.stdout != want {
+        fail(f"{entry} printed {r.stdout}, want {want}")
+    }
+}
+
+test "a project json.kod and the stdlib json link into one program" {
+    let files: fs.MemFs = fs.mem_fs()
+    files.add("main.kod", """
+import "./json"
+import "./reports"
+
+func main() -> int64 {
+    print(json.name())
+    print(reports.render())
+    return 0
+}
+""")
+    files.add("json.kod", """
+func name() -> str {
+    return "local json"
+}
+""")
+    files.add("reports.kod", """
+import "json"
+
+func render() -> str {
+    return json.emit(json.parse("[1, 2]"))
+}
+""")
+    expect_program_prints(files, entry: "main.kod", want: "local json\n[1,2]\n")
+}
+
+test "equally named modules in different directories link" {
+    let files: fs.MemFs = fs.mem_fs()
+    files.add("main.kod", """
+import "./a"
+import "./b"
+
+func main() -> int64 {
+    print(a.name())
+    print(b.name())
+    return 0
+}
+""")
+    files.add("a.kod", """
+import "./x/util"
+
+func name() -> str {
+    return util.name()
+}
+""")
+    files.add("b.kod", """
+import "./y/util"
+
+func name() -> str {
+    return util.name()
+}
+""")
+    files.add("x/util.kod", """
+func name() -> str {
+    return "x util"
+}
+""")
+    files.add("y/util.kod", """
+func name() -> str {
+    return "y util"
+}
+""")
+    expect_program_prints(files, entry: "main.kod", want: "x util\ny util\n")
+}
+
+test "an entry whose path has a dash and a space builds and runs" {
+    let files: fs.MemFs = fs.mem_fs()
+    files.add("my-app/with space.kod", """
+func main() -> int64 {
+    print("spaced")
+    return 0
+}
+""")
+    expect_program_prints(files, entry: "my-app/with space.kod", want: "spaced\n")
+}
