@@ -392,7 +392,7 @@ def test_kod_test_takes_a_directory_whose_name_starts_with_a_dash(dash_dir: Path
 
 
 def test_kod_test_of_a_directory_with_a_very_long_absolute_name(scratch: Path):
-    deep = scratch / ("d" * 120) / ("e" * 120)
+    deep = scratch / ("d" * 200) / ("e" * 200)
     deep.mkdir(parents=True)
     (deep / "ok_test.kod").write_text(PASSING)
     assert len(str(deep)) > 300
