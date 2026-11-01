@@ -6724,16 +6724,12 @@ type Codegen = struct {
                 self.report_error(self.generic_downcast_msg(struct_idx, shown: type_name), span: self.p.expr_spans[rhs])
                 return .VImm(value: 0)
             }
-            let vt_lbl = self.register_vtable(struct_idx, iface_idx)
+            self.register_vtable(struct_idx, iface_idx)
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
             self.emit(f"ldr {reg}, [{reg}, #8]")
-            let exp = self.pool.alloc_reg()
-            self.emit(f"adrp {exp}, {vt_lbl}@PAGE")
-            self.emit(f"add {exp}, {exp}, {vt_lbl}@PAGEOFF")
-            self.emit(f"cmp {reg}, {exp}")
+            self.emit_type_id_cmp(reg, :struct_idx, :iface_idx)
             self.emit(f"cset {reg}, {cond_match}")
-            self.pool.free_reg(exp)
             return .VReg(name: reg)
         }
         // `T or Error` result: test the discriminant against Ok's disc.
@@ -7231,18 +7227,14 @@ type Codegen = struct {
         if self.infer_kind(subject_id) is .KInterface(ii) {
             iface_idx = ii
         }
-        let vt_lbl = self.register_vtable(struct_idx, iface_idx)
+        self.register_vtable(struct_idx, iface_idx)
         let ptr_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: ptr_r)
         let vt_r = self.pool.alloc_reg()
         self.emit(f"ldr {vt_r}, [{ptr_r}, #8]")
-        let exp_r = self.pool.alloc_reg()
-        self.emit(f"adrp {exp_r}, {vt_lbl}@PAGE")
-        self.emit(f"add {exp_r}, {exp_r}, {vt_lbl}@PAGEOFF")
-        self.emit(f"cmp {vt_r}, {exp_r}")
+        self.emit_type_id_cmp(vt_r, :struct_idx, :iface_idx)
         self.emit(f"bne {skip_lbl}")
         self.pool.free_reg(vt_r)
-        self.pool.free_reg(exp_r)
         if len(binding) > 0 {
             let boff = self.find_var_offset(binding)
             let dv_r = self.pool.alloc_reg()
@@ -9294,6 +9286,12 @@ type Codegen = struct {
     // and return the new register. Otherwise returns the input register.
     func maybe_box_for_iface(self, anon arg_reg: str, actual: TypeKind, expected: TypeKind, span: ast.Span) -> str {
         let .KInterface(iface_idx) = expected else { return arg_reg }
+        if actual is .KInterface(have_idx) {
+            if self.same_iface(have_idx, iface_idx) or self.iface_covers(have_idx, iface_idx) == false {
+                return arg_reg
+            }
+            return self.emit_iface_convert(arg_reg, from_idx: have_idx, to_idx: iface_idx)
+        }
         let gap = self.iface_gap(actual, :iface_idx)
         if len(gap) > 0 {
             mut what = f"`{self.kind_display(actual)}`"
@@ -9309,6 +9307,83 @@ type Codegen = struct {
             .KBool -> return self.emit_prim_iface_box(arg_reg, kind: .KBool, :iface_idx)
             else return arg_reg
         }
+    }
+
+    // Whether interface `have` declares every method of `want`, with the same types.
+    func iface_covers(self, anon have: int64, anon want: int64) -> bool {
+        for m in self.interfaces[want].methods {
+            let at = self.iface_method_pos(have, name: m.name)
+            if at < 0 {
+                return false
+            }
+            if self.same_kind(self.method_kind(m.sig), self.method_kind(self.interfaces[have].methods[at].sig)) == false {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Where a method sits in the interface's vtable, or -1.
+    func iface_method_pos(self, anon iface_idx: int64, name: str) -> int64 {
+        mut at = 0
+        for m in self.interfaces[iface_idx].methods {
+            if m.name == name {
+                return at
+            }
+            at += 1
+        }
+        return -1
+    }
+
+    // Turn an interface value into one of an interface with some of its methods.
+    // Builds the new vtable on the spot: the wanted entries of the old one, then
+    // its trailing type-identity word, so `is` still sees the same type.
+    func emit_iface_convert(self, anon arg_reg: str, from_idx: int64, to_idx: int64) -> str {
+        let have_count = len(self.interfaces[from_idx].methods)
+        let want = self.interfaces[to_idx].methods
+        let vt_off = 16
+        let spilled = self.preserve_begin(arg_reg)
+        self.emit(f"mov x0, #{vt_off + 8 * (len(want) + 1)}")
+        self.emit("bl _arena_alloc")
+        let cell_r = self.preserve_end(arg_reg, :spilled)
+        let tmp = self.pool.alloc_reg()
+        let old_vt = self.pool.alloc_reg()
+        self.emit(f"ldr {tmp}, [{cell_r}]")
+        self.emit(f"str {tmp}, [x0]")
+        self.emit(f"ldr {old_vt}, [{cell_r}, #8]")
+        mut j = 0
+        for m in want {
+            let at = self.iface_method_pos(from_idx, name: m.name)
+            self.emit(f"ldr {tmp}, [{old_vt}, #{8 * at}]")
+            self.emit(f"str {tmp}, [x0, #{vt_off + 8 * j}]")
+            j += 1
+        }
+        self.emit(f"ldr {tmp}, [{old_vt}, #{8 * have_count}]")
+        self.emit(f"str {tmp}, [x0, #{vt_off + 8 * len(want)}]")
+        self.emit(f"add {tmp}, x0, #{vt_off}")
+        self.emit(f"str {tmp}, [x0, #8]")
+        self.pool.free_reg(tmp)
+        self.pool.free_reg(old_vt)
+        self.pool.free_reg(cell_r)
+        let out_r = self.pool.alloc_reg()
+        self.emit(f"mov {out_r}, x0")
+        return out_r
+    }
+
+    // The identity word that ends every vtable of a struct: the same for all of its interfaces.
+    func type_id_label(self, anon struct_idx: int64) -> str {
+        return f"${self.decl_label(.KStruct(idx: struct_idx, type_args: []))}$typeid"
+    }
+
+    // Leave in `vt_r` whether the vtable it holds is the struct's, as `cond` for a following `cset`/branch.
+    func emit_type_id_cmp(self, anon vt_r: str, struct_idx: int64, iface_idx: int64) -> none {
+        self.emit(f"ldr {vt_r}, [{vt_r}, #{8 * len(self.interfaces[iface_idx].methods)}]")
+        let exp_r = self.pool.alloc_reg()
+        let id_lbl = self.type_id_label(struct_idx)
+        self.emit(f"adrp {exp_r}, {id_lbl}@PAGE")
+        self.emit(f"add {exp_r}, {exp_r}, {id_lbl}@PAGEOFF")
+        self.emit(f"cmp {vt_r}, {exp_r}")
+        self.pool.free_reg(exp_r)
     }
 
     // Why a struct or primitive can't be a value of the interface; "" when it can.
@@ -10103,7 +10178,7 @@ type Codegen = struct {
                     .KInt64 -> return true
                     .KBool -> return true
                     .KStr -> return true
-                    .KInterface(a_idx) -> return self.same_iface(idx, a_idx)
+                    .KInterface(a_idx) -> return self.same_iface(idx, a_idx) or self.iface_covers(a_idx, idx)
                     else return false
                 }
             }
@@ -12983,7 +13058,28 @@ type Codegen = struct {
                     none -> self.println(f"\t.quad 0")
                 }
             }
+            self.println(f"\t.quad {self.type_id_label(struct_idx)}")
             i = i + 1
+        }
+        // The identity words themselves, one per struct however many interfaces it has.
+        mut ids: [str] = []
+        for struct_idx in self.vtable_struct_idx {
+            let id_lbl = self.type_id_label(struct_idx)
+            mut seen = false
+            for done in ids {
+                if done == id_lbl {
+                    seen = true
+                }
+            }
+            if seen == false {
+                ids += [id_lbl]
+                self.println("\t.p2align 3")
+                self.println(f"\t.globl {id_lbl}")
+                self.println(f"\t.private_extern {id_lbl}")
+                self.println(f"\t.weak_definition {id_lbl}")
+                self.println(f"{id_lbl}:")
+                self.println("\t.quad 0")
+            }
         }
         // Primitive vtables: same layout, but methods come from the
         // primitive method table populated by register_primitive_module.
@@ -13002,6 +13098,7 @@ type Codegen = struct {
                     self.println(f"\t.quad 0")
                 }
             }
+            self.println("\t.quad 0")
             pi = pi + 1
         }
     }
