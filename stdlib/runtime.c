@@ -6,6 +6,7 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -418,6 +419,85 @@ void kod_sb_clear(int64_t handle) {
 KodStr *kod_sb_to_str(int64_t handle) {
     KodStrBuilder *sb = (KodStrBuilder *)handle;
     return kod_str_from_bytes(sb->buf, sb->len);
+}
+
+// File descriptor I/O for stdlib/fd.kod. The calls return their result and
+// leave the reason for a failure in `kod_io_errno()` (0 after a success),
+// which Kod reads straight after. Interrupted calls are retried here.
+static int64_t g_io_errno;
+
+int64_t kod_io_errno(void) { return g_io_errno; }
+
+// mode: 0 read, 1 create or truncate for writing, 2 create or append.
+int64_t kod_fd_open(KodStr *path, int64_t mode) {
+    int flags = O_RDONLY;
+    if (mode == 1) flags = O_WRONLY | O_CREAT | O_TRUNC;
+    if (mode == 2) flags = O_WRONLY | O_CREAT | O_APPEND;
+    int fd;
+    do {
+        fd = open(path->buf, flags | O_CLOEXEC, 0644);
+    } while (fd < 0 && errno == EINTR);
+    g_io_errno = fd < 0 ? errno : 0;
+    return fd;
+}
+
+// At most `max` bytes (and never more than 64 KiB) from `fd`; empty at the
+// end of the stream, and on failure, which sets the errno.
+KodStr *kod_fd_read(int64_t fd, int64_t max) {
+    char chunk[65536];
+    if (max > (int64_t)sizeof chunk) max = (int64_t)sizeof chunk;
+    g_io_errno = 0;
+    if (max <= 0) return kod_str_new(0);
+    ssize_t n;
+    do {
+        n = read((int)fd, chunk, (size_t)max);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        g_io_errno = errno;
+        return kod_str_new(0);
+    }
+    return kod_str_from_bytes(chunk, n);
+}
+
+// Bytes written, or -1 with the errno set.
+int64_t kod_fd_write(int64_t fd, KodStr *data) {
+    g_io_errno = 0;
+    if (data->len == 0) return 0;
+    ssize_t n;
+    do {
+        n = write((int)fd, data->buf, (size_t)data->len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        g_io_errno = errno;
+        return -1;
+    }
+    return n;
+}
+
+int64_t kod_fd_close(int64_t fd) {
+    int rc = close((int)fd);
+    g_io_errno = rc < 0 ? errno : 0;
+    return rc;
+}
+
+KodStr *kod_errno_message(int64_t err) {
+    return kod_str_from_cstr(strerror((int)err));
+}
+
+// The position in stdlib/stream.kod's IoKind that an OS error number maps to.
+int64_t kod_errno_kind(int64_t err) {
+    switch (err) {
+    case ENOENT: return 0;
+    case EACCES: case EPERM: return 1;
+    case EEXIST: return 2;
+    case EINVAL: case EBADF: case EISDIR: case ENOTDIR: return 3;
+    case EAGAIN: return 4;
+    case ETIMEDOUT: return 5;
+    case ECONNREFUSED: return 6;
+    case ECONNRESET: return 7;
+    case EPIPE: return 8;
+    default: return 10;
+    }
 }
 
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`

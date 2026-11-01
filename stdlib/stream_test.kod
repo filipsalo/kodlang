@@ -1,0 +1,240 @@
+import "stream" { IoKind, IoError, Reader, Writer, MemReader, MemWriter, BufReader, read_all, read_exact, write_all, write_str, kind_of_errno }
+import "strbuilder" { StrBuilder }
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func s(anon x: bytes) -> str {
+    return kod_bytes_to_str(x)
+}
+
+func mem(anon text: str) -> MemReader {
+    return MemReader(data: b(text), pos: 0)
+}
+
+// Hands out one byte per read, like a slow socket.
+type Dribble = struct {
+    data: bytes
+    pos: int64
+    func read(self, anon max: int64) -> bytes or Error {
+        if max <= 0 or self.pos >= len(self.data) {
+            return b("")
+        }
+        self.pos = self.pos + 1
+        return self.data[self.pos - 1..self.pos]
+    }
+}
+
+// Fails on the nth read.
+type Flaky = struct {
+    left: int64
+    func read(self, anon max: int64) -> bytes or Error {
+        if self.left == 0 {
+            throw IoError(kind: .ConnectionReset, op: "read", errno: 54, detail: "reset")
+        }
+        self.left = self.left - 1
+        return b("xy")
+    }
+}
+
+// Accepts at most `cap` bytes per write.
+type Stingy = struct {
+    cap: int64
+    out: StrBuilder
+    func write(self, anon data: bytes) -> int64 or Error {
+        mut n = len(data)
+        if n > self.cap {
+            n = self.cap
+        }
+        self.out.append_bytes(data[0..n])
+        return n
+    }
+}
+
+type Stuck = struct {
+    nothing: int64
+    func write(self, anon data: bytes) -> int64 or Error {
+        return 0
+    }
+}
+
+func kind_of(anon r: bytes or Error) -> IoKind? {
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind
+        }
+        return .Other
+    }
+    return none
+}
+
+func fails_with(anon r: bytes or Error, anon want: IoKind) -> bool {
+    let k = kind_of(r)
+    if k is none {
+        return false
+    }
+    return (k? or .Other) == want
+}
+
+test "IoError.to_str names the operation and the reason" {
+    let e = IoError(kind: .NotFound, op: "open x.txt", errno: 2, detail: "No such file or directory")
+    assert e.to_str() == "open x.txt: No such file or directory"
+}
+
+test "kind_of_errno maps what it knows and falls back to Other" {
+    assert kind_of_errno(2) == .NotFound
+    assert kind_of_errno(13) == .PermissionDenied
+    assert kind_of_errno(17) == .AlreadyExists
+    assert kind_of_errno(22) == .InvalidInput
+    assert kind_of_errno(32) == .BrokenPipe
+    assert kind_of_errno(54) == .ConnectionReset
+    assert kind_of_errno(60) == .TimedOut
+    assert kind_of_errno(61) == .ConnectionRefused
+    assert kind_of_errno(35) == .WouldBlock
+    assert kind_of_errno(0) == .Other
+    assert kind_of_errno(9999) == .Other
+    assert kind_of_errno(-1) == .Other
+}
+
+test "MemReader hands out the data in pieces, then empty" {
+    let r = mem("hello")
+    assert s(must r.read(2)) == "he"
+    assert s(must r.read(100)) == "llo"
+    assert len(must r.read(5)) == 0
+    assert len(must r.read(5)) == 0
+}
+
+test "read with a non-positive max returns nothing and keeps the data" {
+    let r = mem("abc")
+    assert len(must r.read(0)) == 0
+    assert len(must r.read(-3)) == 0
+    assert s(must r.read(10)) == "abc"
+}
+
+test "read_all drains any reader, however small the pieces" {
+    let d = Dribble(data: b("a longer text"), pos: 0)
+    assert s(must read_all(d)) == "a longer text"
+    assert s(must read_all(mem(""))) == ""
+}
+
+test "read_all passes the reader's error on" {
+    let f = Flaky(left: 2)
+    assert fails_with(read_all(f), .ConnectionReset)
+}
+
+test "read_exact collects across short reads and stops at n" {
+    let d = Dribble(data: b("abcdef"), pos: 0)
+    assert s(must read_exact(d, 4)) == "abcd"
+    assert s(must read_exact(d, 0)) == ""
+    assert s(must read_exact(d, 2)) == "ef"
+}
+
+test "read_exact fails with UnexpectedEof when the stream ends early" {
+    let r = mem("abc")
+    assert fails_with(read_exact(r, 4), .UnexpectedEof)
+}
+
+test "MemWriter collects writes" {
+    let w = MemWriter(buf: StrBuilder())
+    assert (must w.write(b("ab"))) == 2
+    assert (must w.write(b(""))) == 0
+    must write_str(w, "cd")
+    assert w.to_str() == "abcd"
+    assert s(w.to_bytes()) == "abcd"
+}
+
+test "write_all repeats short writes" {
+    let w = Stingy(cap: 3, out: StrBuilder())
+    must write_all(w, b("0123456789"))
+    assert w.out.to_str() == "0123456789"
+}
+
+test "write_all of nothing writes nothing" {
+    let w = Stuck(nothing: 0)
+    must write_all(w, b(""))
+}
+
+test "write_all fails when a write accepts nothing" {
+    let w = Stuck(nothing: 0)
+    let r = write_all(w, b("x"))
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e.to_str() == "write: write returned 0"
+    }
+}
+
+test "read_line splits on LF and drops a CR before it" {
+    let br = BufReader(inner: mem("one\r\ntwo\nthree\n\nfour"))
+    assert ((must br.read_line())? or "!") == "one"
+    assert ((must br.read_line())? or "!") == "two"
+    assert ((must br.read_line())? or "!") == "three"
+    assert ((must br.read_line())? or "!") == ""
+    assert ((must br.read_line())? or "!") == "four"
+    assert (must br.read_line()) is none
+    assert (must br.read_line()) is none
+}
+
+test "read_line works when the stream arrives a byte at a time" {
+    let br = BufReader(inner: Dribble(data: b("ab\r\ncd\n"), pos: 0))
+    assert ((must br.read_line())? or "!") == "ab"
+    assert ((must br.read_line())? or "!") == "cd"
+    assert (must br.read_line()) is none
+}
+
+test "a lone CR in the middle of a line stays" {
+    let br = BufReader(inner: mem("a\rb\r\n"))
+    assert ((must br.read_line())? or "!") == "a\rb"
+}
+
+test "read_until with another delimiter" {
+    let br = BufReader(inner: mem("k=v;k2=v2"))
+    assert s((must br.read_until(59))? or b("!")) == "k=v"
+    assert s((must br.read_until(59))? or b("!")) == "k2=v2"
+    assert (must br.read_until(59)) is none
+}
+
+test "read_exact after read_line takes what is buffered first" {
+    let br = BufReader(inner: mem("HEAD\r\n\r\nbody-bytes-here"), chunk: 4)
+    assert ((must br.read_line())? or "!") == "HEAD"
+    assert ((must br.read_line())? or "!") == ""
+    assert s(must br.read_exact(4)) == "body"
+    assert s(must read_all(br)) == "-bytes-here"
+}
+
+test "BufReader.read serves the buffer, then the inner stream" {
+    let br = BufReader(inner: mem("ab\ncdefgh"), chunk: 100)
+    assert ((must br.read_line())? or "!") == "ab"
+    assert s(must br.read(3)) == "cde"
+    assert s(must br.read(10)) == "fgh"
+    assert len(must br.read(10)) == 0
+}
+
+test "read_exact on a BufReader fails with UnexpectedEof" {
+    let br = BufReader(inner: mem("abc"))
+    assert fails_with(br.read_exact(5), .UnexpectedEof)
+}
+
+test "a line over the limit is an InvalidInput error, not unbounded growth" {
+    let br = BufReader(inner: mem("x".repeat(500)), limit: 100)
+    let r = br.read_line()
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e is IoError(_)
+        if e is IoError(io) {
+            assert io.kind == .InvalidInput
+            assert io.detail == "line too long"
+        }
+    }
+}
+
+test "a line exactly at the limit is accepted" {
+    let br = BufReader(inner: mem("x".repeat(100) + "\nrest"), limit: 100)
+    assert len((must br.read_line())? or "") == 100
+}
+
+test "an inner error surfaces from read_line" {
+    let br = BufReader(inner: Flaky(left: 1))
+    let r = br.read_line()
+    assert r is Err(_)
+}
