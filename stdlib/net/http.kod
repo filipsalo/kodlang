@@ -1,0 +1,633 @@
+// HTTP/1.1 without the network: URLs, headers, writing a request and reading
+// a response. See docs/http.md.
+import "stream" { IoError, BufReader, Writer, write_all, read_exact }
+import "strbuilder" { StrBuilder }
+
+type Header = struct {
+    name: str
+    value: str
+}
+
+type Headers = struct {
+    items: [Header] = []
+
+    func get(self, anon name: str) -> str? {
+        let want = name.lower()
+        for h in self.items {
+            if h.name.lower() == want {
+                return h.value
+            }
+        }
+        return none
+    }
+
+    func all(self, anon name: str) -> [str] {
+        let want = name.lower()
+        mut out: [str] = []
+        for h in self.items {
+            if h.name.lower() == want {
+                out += [h.value]
+            }
+        }
+        return out
+    }
+
+    func has(self, anon name: str) -> bool {
+        return self.get(name) is none == false
+    }
+
+    func add(self, anon name: str, anon value: str) -> none {
+        self.items += [Header(name: name, value: value)]
+    }
+
+    // Replaces the first header of that name in place and drops the others.
+    func set(self, anon name: str, anon value: str) -> none {
+        let want = name.lower()
+        mut out: [Header] = []
+        mut placed = false
+        for h in self.items {
+            if h.name.lower() != want {
+                out += [h]
+            } else if placed == false {
+                out += [Header(name: name, value: value)]
+                placed = true
+            }
+        }
+        if placed == false {
+            out += [Header(name: name, value: value)]
+        }
+        self.items = out
+    }
+}
+
+type Url = struct {
+    scheme: str
+    host: str
+    port: int64
+    target: str
+
+    func host_header(self) -> str {
+        mut h = self.host
+        if h.contains(":") {
+            h = "[" + h + "]"
+        }
+        mut default_port: int64 = 80
+        if self.scheme == "https" {
+            default_port = 443
+        }
+        if self.port != default_port {
+            h += ":" + self.port.to_str()
+        }
+        return h
+    }
+}
+
+type Request = struct {
+    method: str
+    url: Url
+    headers: Headers
+    body: bytes
+}
+
+type Response = struct {
+    status: int64
+    reason: str
+    headers: Headers
+    body: bytes
+
+    func text(self) -> str {
+        return kod_bytes_to_str(self.body)
+    }
+
+    func ok(self) -> bool {
+        return self.status >= 200 and self.status < 300
+    }
+
+    func header(self, anon name: str) -> str? {
+        return self.headers.get(name)
+    }
+}
+
+type Limits = struct {
+    max_body: int64 = 16777216
+    max_header_bytes: int64 = 65536
+    max_headers: int64 = 100
+}
+
+func protocol(anon detail: str) -> IoError {
+    return IoError(kind: .Protocol, op: "http", errno: 0, detail: detail)
+}
+
+func invalid(anon op: str, anon detail: str) -> IoError {
+    return IoError(kind: .InvalidInput, op: op, errno: 0, detail: detail)
+}
+
+// ---- character classes ----
+
+func is_digit(anon c: int64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+func is_alpha(anon c: int64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+// A token character, as RFC 9110 defines it: names of methods and headers.
+func is_token_char(anon c: int64) -> bool {
+    if is_digit(c) or is_alpha(c) {
+        return true
+    }
+    return "!#$%&'*+-.^_`|~".find(kod_bytes_to_str(kod_bytes_from_array([c]))) is none == false
+}
+
+func is_token(anon s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    let n = len(s)
+    mut i: int64 = 0
+    for i < n {
+        if is_token_char(s[i]) == false {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// No control characters (a tab is allowed) and no DEL.
+func is_clean(anon s: str, tab_ok: bool) -> bool {
+    let n = len(s)
+    mut i: int64 = 0
+    for i < n {
+        let c = s[i]
+        if c == 127 or (c < 32 and (c != 9 or tab_ok == false)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func all_digits(anon s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    let n = len(s)
+    mut i: int64 = 0
+    for i < n {
+        if is_digit(s[i]) == false {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ---- URLs ----
+
+func parse_port(anon text: str, op: str) -> int64 or Error {
+    if all_digits(text) == false or len(text) > 5 {
+        throw invalid(op, f"bad port {text}")
+    }
+    let p = text.parse_int()? or 0
+    if p < 1 or p > 65535 {
+        throw invalid(op, f"port {text} out of range")
+    }
+    return p
+}
+
+func parse_url(anon s: str) -> Url or Error {
+    let op = "parse url"
+    if is_clean(s, tab_ok: false) == false or s.contains(" ") {
+        throw invalid(op, "URL has a space or control character")
+    }
+    let sep = s.find("://")
+    if sep is none {
+        throw invalid(op, "URL needs http:// or https://")
+    }
+    let at = sep? or 0
+    let scheme = s[0..at].lower()
+    if scheme != "http" and scheme != "https" {
+        throw invalid(op, f"unsupported scheme {scheme}")
+    }
+    mut rest = s[at + 3..len(s)]
+    let hash = rest.find("#")
+    if hash is none == false {
+        rest = rest[0..hash? or 0]
+    }
+    mut end = len(rest)
+    for mark in ["/", "?"] {
+        let m = rest.find(mark)
+        if m is none == false and (m? or 0) < end {
+            end = m? or 0
+        }
+    }
+    let authority = rest[0..end]
+    mut target = rest[end..len(rest)]
+    if len(target) == 0 {
+        target = "/"
+    } else if target[0] == 63 {
+        target = "/" + target
+    }
+    if authority.contains("@") {
+        throw invalid(op, "credentials in a URL are not supported")
+    }
+    mut host = authority
+    mut port: int64 = 80
+    if scheme == "https" {
+        port = 443
+    }
+    if authority.starts_with("[") {
+        let close = authority.find("]")
+        if close is none {
+            throw invalid(op, "unterminated [ in host")
+        }
+        let c = close? or 0
+        host = authority[1..c]
+        let after = authority[c + 1..len(authority)]
+        if len(after) > 0 {
+            if after[0] != 58 {
+                throw invalid(op, "text after ] in host")
+            }
+            port = try parse_port(after[1..len(after)], op: op)
+        }
+    } else {
+        let colon = authority.find(":")
+        if colon is none == false {
+            let c = colon? or 0
+            host = authority[0..c]
+            port = try parse_port(authority[c + 1..len(authority)], op: op)
+        }
+    }
+    if len(host) == 0 {
+        throw invalid(op, "URL has no host")
+    }
+    return Url(scheme: scheme, host: host.lower(), port: port, target: target)
+}
+
+// Remove "." and ".." segments from the path part of `target`; a query stays.
+func normalize_target(anon target: str) -> str {
+    mut path = target
+    mut query = ""
+    let q = target.find("?")
+    if q is none == false {
+        path = target[0..q? or 0]
+        query = target[q? or 0..len(target)]
+    }
+    let segments = path.split("/")
+    mut out: [str] = []
+    mut dir_end = false
+    mut first = true
+    for seg in segments {
+        if first {
+            first = false
+        } else if seg == "." {
+            dir_end = true
+        } else if seg == ".." {
+            if len(out) > 0 {
+                out = out[0..len(out) - 1]
+            }
+            dir_end = true
+        } else {
+            out += [seg]
+            dir_end = false
+        }
+    }
+    mut joined = "/" + "/".join(out)
+    if dir_end and joined.ends_with("/") == false {
+        joined += "/"
+    }
+    return joined + query
+}
+
+// Where a `Location` header sent from a response to `base` points.
+func resolve(anon base: Url, anon location: str) -> Url or Error {
+    let op = "resolve redirect"
+    mut loc = location
+    let hash = loc.find("#")
+    if hash is none == false {
+        loc = loc[0..hash? or 0]
+    }
+    if len(loc) == 0 {
+        throw invalid(op, "empty Location")
+    }
+    let lower = loc.lower()
+    if lower.starts_with("http://") or lower.starts_with("https://") {
+        return try parse_url(loc)
+    }
+    if loc.starts_with("//") {
+        return try parse_url(base.scheme + ":" + loc)
+    }
+    let colon = loc.find(":")
+    let slash = loc.find("/")
+    if colon is none == false {
+        let c = colon? or 0
+        if slash is none or c < (slash? or 0) {
+            if loc.starts_with("?") == false {
+                throw invalid(op, f"unsupported Location {loc}")
+            }
+        }
+    }
+    mut target = loc
+    if loc.starts_with("/") {
+        target = normalize_target(loc)
+    } else if loc.starts_with("?") {
+        let q = base.target.find("?")
+        mut path = base.target
+        if q is none == false {
+            path = base.target[0..q? or 0]
+        }
+        target = path + loc
+    } else {
+        let q = base.target.find("?")
+        mut path = base.target
+        if q is none == false {
+            path = base.target[0..q? or 0]
+        }
+        mut dir = "/"
+        let last = path.split("/")
+        if len(last) > 1 {
+            dir = path[0..len(path) - len(last[len(last) - 1])]
+        }
+        target = normalize_target(dir + loc)
+    }
+    return try parse_url(base.scheme + "://" + base.host_header() + target)
+}
+
+// ---- writing a request ----
+
+func is_post_like(anon method: str) -> bool {
+    return method == "POST" or method == "PUT" or method == "PATCH"
+}
+
+func own_header(anon name: str) -> bool {
+    let n = name.lower()
+    return n == "host" or n == "connection" or n == "content-length" or n == "transfer-encoding"
+}
+
+func write_request(anon w: Writer, anon req: Request) -> none or Error {
+    let op = "write request"
+    if is_token(req.method) == false {
+        throw invalid(op, "bad method")
+    }
+    if is_clean(req.url.target, tab_ok: false) == false or req.url.target.contains(" ") or req.url.target.starts_with("/") == false {
+        throw invalid(op, "bad request target")
+    }
+    for h in req.headers.items {
+        if is_token(h.name) == false {
+            throw invalid(op, f"bad header name {h.name}")
+        }
+        if is_clean(h.value, tab_ok: true) == false {
+            throw invalid(op, f"bad value for header {h.name}")
+        }
+    }
+    let out = StrBuilder()
+    out.append(req.method + " " + req.url.target + " HTTP/1.1\r\n")
+    out.append("Host: " + req.url.host_header() + "\r\n")
+    for h in req.headers.items {
+        if own_header(h.name) == false {
+            out.append(h.name + ": " + h.value + "\r\n")
+        }
+    }
+    if req.headers.has("User-Agent") == false {
+        out.append("User-Agent: kod\r\n")
+    }
+    if req.headers.has("Accept") == false {
+        out.append("Accept: */*\r\n")
+    }
+    if len(req.body) > 0 or is_post_like(req.method) {
+        out.append("Content-Length: " + len(req.body).to_str() + "\r\n")
+    }
+    out.append("Connection: close\r\n\r\n")
+    out.append_bytes(req.body)
+    try write_all(w, out.to_bytes())
+}
+
+// ---- reading a response ----
+
+// What a response may still use up for its status line, headers and trailers.
+type Budget = struct {
+    left: int64
+    headers: int64
+}
+
+func truncated(anon detail: str) -> IoError {
+    return IoError(kind: .UnexpectedEof, op: "http", errno: 0, detail: detail)
+}
+
+// The next line without its line end. The stream ending first, or in the
+// middle of the line, is a truncation; the budget running out is an error.
+func next_line(anon br: BufReader, anon budget: Budget) -> str or Error {
+    let got = br.read_line()
+    if got is Err(e) {
+        if e is IoError(io) {
+            if io.kind == .InvalidInput and io.detail == "line too long" {
+                throw protocol("headers too large")
+            }
+        }
+        throw e
+    }
+    let line = try got
+    if line is none {
+        throw truncated("connection closed before the end of the message")
+    }
+    if br.ended {
+        throw truncated("connection closed in the middle of a line")
+    }
+    let text = line? or ""
+    budget.left = budget.left - len(text) - 2
+    if budget.left < 0 {
+        throw protocol("headers too large")
+    }
+    return text
+}
+
+type StatusLine = struct {
+    code: int64
+    reason: str
+}
+
+func parse_status(anon line: str) -> StatusLine or Error {
+    if line.starts_with("HTTP/1.") == false or len(line) < 12 {
+        throw protocol("bad status line")
+    }
+    if is_digit(line[7]) == false or line[8] != 32 {
+        throw protocol("bad status line")
+    }
+    let digits = line[9..12]
+    if all_digits(digits) == false or (len(line) > 12 and line[12] != 32) {
+        throw protocol("bad status line")
+    }
+    let code = digits.parse_int()? or 0
+    if code < 100 or code > 599 {
+        throw protocol("bad status line")
+    }
+    mut reason = ""
+    if len(line) > 13 {
+        reason = line[13..len(line)]
+    }
+    return StatusLine(code: code, reason: reason)
+}
+
+// Header lines up to the empty line that ends them, added to `into`.
+func read_headers(anon br: BufReader, anon budget: Budget, anon into: Headers, max_headers: int64) -> none or Error {
+    for true {
+        let line = try next_line(br, budget)
+        if len(line) == 0 {
+            return
+        }
+        if line[0] == 32 or line[0] == 9 {
+            throw protocol("header continuation lines are not supported")
+        }
+        let colon = line.find(":")
+        if colon is none {
+            throw protocol("malformed header line")
+        }
+        let c = colon? or 0
+        let name = line[0..c]
+        if is_token(name) == false {
+            throw protocol("bad header name")
+        }
+        let value = line[c + 1..len(line)].trim()
+        if is_clean(value, tab_ok: true) == false {
+            throw protocol("bad header value")
+        }
+        budget.headers = budget.headers + 1
+        if budget.headers > max_headers {
+            throw protocol("too many headers")
+        }
+        into.add(name, value)
+    }
+}
+
+func parse_hex(anon text: str) -> int64 or Error {
+    if len(text) == 0 or len(text) > 15 {
+        throw protocol("bad chunk size")
+    }
+    mut n: int64 = 0
+    let len_text = len(text)
+    mut i: int64 = 0
+    for i < len_text {
+        let c = text[i]
+        mut d: int64 = -1
+        if is_digit(c) {
+            d = c - 48
+        } else if c >= 97 and c <= 102 {
+            d = c - 87
+        } else if c >= 65 and c <= 70 {
+            d = c - 55
+        }
+        if d < 0 {
+            throw protocol("bad chunk size")
+        }
+        n = n * 16 + d
+        i = i + 1
+    }
+    return n
+}
+
+func read_chunked(anon br: BufReader, anon budget: Budget, limits: Limits) -> bytes or Error {
+    let out = StrBuilder()
+    for true {
+        let size_line = try next_line(br, Budget(left: 4096, headers: 0))
+        mut size_text = size_line
+        let semi = size_line.find(";")
+        if semi is none == false {
+            size_text = size_line[0..semi? or 0]
+        }
+        let size = try parse_hex(size_text.trim())
+        if size == 0 {
+            break
+        }
+        if out.len() + size > limits.max_body {
+            throw protocol("body too large")
+        }
+        out.append_bytes(try read_exact(br, size))
+        let end = try read_exact(br, 2)
+        if kod_bytes_to_str(end) != "\r\n" {
+            throw protocol("chunk is missing its closing line break")
+        }
+    }
+    try read_headers(br, budget, Headers(), max_headers: limits.max_headers)
+    return out.to_bytes()
+}
+
+func read_length(anon headers: Headers, anon limits: Limits) -> int64 or Error {
+    mut n: int64 = -1
+    for v in headers.all("content-length") {
+        let t = v.trim()
+        if all_digits(t) == false or len(t) > 18 {
+            throw protocol("bad Content-Length")
+        }
+        let x = t.parse_int()? or -1
+        if n >= 0 and x != n {
+            throw protocol("conflicting Content-Length headers")
+        }
+        n = x
+    }
+    if n > limits.max_body {
+        throw protocol("body too large")
+    }
+    return n
+}
+
+func read_body(anon br: BufReader, anon method: str, status: int64, headers: Headers, budget: Budget, limits: Limits) -> bytes or Error {
+    if method == "HEAD" or status < 200 or status == 204 or status == 304 {
+        return kod_str_to_bytes("")
+    }
+    let codings = headers.all("transfer-encoding")
+    if len(codings) > 0 {
+        for v in codings {
+            if v.trim().lower() != "chunked" {
+                throw protocol(f"unsupported Transfer-Encoding {v}")
+            }
+        }
+        return try read_chunked(br, budget, limits: limits)
+    }
+    let n = try read_length(headers, limits)
+    if n >= 0 {
+        return try read_exact(br, n)
+    }
+    let out = StrBuilder()
+    for true {
+        let piece = try br.read(65536)
+        if len(piece) == 0 {
+            break
+        }
+        out.append_bytes(piece)
+        if out.len() > limits.max_body {
+            throw protocol("body too large")
+        }
+    }
+    return out.to_bytes()
+}
+
+func read_one(anon br: BufReader, anon method: str, limits: Limits) -> Response or Error {
+    mut interim: int64 = 0
+    for true {
+        let budget = Budget(left: limits.max_header_bytes, headers: 0)
+        let status = try parse_status(try next_line(br, budget))
+        let headers = Headers()
+        try read_headers(br, budget, headers, max_headers: limits.max_headers)
+        if status.code >= 200 {
+            let body = try read_body(br, method, status: status.code, headers: headers, budget: budget, limits: limits)
+            return Response(status: status.code, reason: status.reason, headers: headers, body: body)
+        }
+        interim = interim + 1
+        if interim > 16 {
+            throw protocol("too many interim responses")
+        }
+    }
+    throw protocol("unreachable")
+}
+
+// One response from `br`. `method` is the request's, which decides whether a
+// body follows. Lines longer than the header limit fail.
+func read_response(anon br: BufReader, anon method: str, limits: Limits = Limits()) -> Response or Error {
+    let old = br.limit
+    br.limit = limits.max_header_bytes
+    let r = read_one(br, method, limits: limits)
+    br.limit = old
+    return r
+}

@@ -27,8 +27,10 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
    connection with the system's SecureTransport (no extra install; TLS 1.2 at most), named
    in its leading `// kod:` lines so only programs that import it link the Security
    framework. A `TlsStream` is a `Reader` and a `Writer`, like a plain connection.
-3. **HTTP/1.1 client** — request building, status line and header parsing,
-   `Content-Length` and chunked bodies, over either stream type.
+3. **HTTP/1.1 client** — done: `stdlib/net/http.kod` (URLs, headers, request writing and
+   response parsing with `Content-Length`, chunked and read-to-close bodies and size limits;
+   no network code) and `stdlib/net/client.kod` (`get`, `post`, `fetch` over TCP or TLS, with
+   redirects). See `docs/http.md`.
 4. **Robust JSON** — parse errors returned as values instead of panics, `\uXXXX` escapes,
    non-integer numbers, and pretty-printing.
 

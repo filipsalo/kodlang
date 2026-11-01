@@ -1,0 +1,110 @@
+// HTTP requests over TCP or TLS, with redirects. See docs/http.md.
+import "net/http" { Headers, Request, Response, Limits, Url, parse_url, resolve, write_request, read_response, invalid }
+import "net/tcp"
+import "net/tls"
+import "stream" { BufReader, Reader, Writer }
+
+type Options = struct {
+    headers: Headers = Headers()
+    body: bytes = kod_str_to_bytes("")
+    trust_file: str = ""
+    timeout_ms: int64 = 30000
+    max_redirects: int64 = 5
+    limits: Limits = Limits()
+}
+
+// Write `req` to `w` and read the response from `r`, which may be the same
+// connection.
+func talk(anon r: Reader, anon w: Writer, anon req: Request, options: Options) -> Response or Error {
+    try write_request(w, req)
+    let br = BufReader(inner: r, limit: options.limits.max_header_bytes)
+    return read_response(br, req.method, limits: options.limits)
+}
+
+// One request on its own connection, closed afterwards.
+func exchange(anon req: Request, options: Options) -> Response or Error {
+    let url = req.url
+    if url.scheme == "https" {
+        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: options.timeout_ms)
+        try conn.set_timeout(ms: options.timeout_ms)
+        let result = talk(conn, conn, req, options: options)
+        if conn.close() is Err(_) {
+            return result
+        }
+        return result
+    }
+    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: options.timeout_ms)
+    try tcp.set_timeout(conn, ms: options.timeout_ms)
+    let result = talk(conn, conn, req, options: options)
+    if conn.close() is Err(_) {
+        return result
+    }
+    return result
+}
+
+func is_redirect(anon status: int64) -> bool {
+    return status == 301 or status == 302 or status == 303 or status == 307 or status == 308
+}
+
+// `headers` without the named ones.
+func without(anon headers: Headers, anon names: [str]) -> Headers {
+    let out = Headers()
+    for h in headers.items {
+        mut drop = false
+        for n in names {
+            if h.name.lower() == n {
+                drop = true
+            }
+        }
+        if drop == false {
+            out.add(h.name, h.value)
+        }
+    }
+    return out
+}
+
+func fetch(anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+    mut current = try parse_url(url)
+    mut verb = method
+    mut payload = options.body
+    mut headers = without(options.headers, [])
+    mut hops: int64 = 0
+    for true {
+        let req = Request(method: verb, url: current, headers: headers, body: payload)
+        let resp = try exchange(req, options: options)
+        let location = resp.header("location")
+        if is_redirect(resp.status) == false or location is none or options.max_redirects <= 0 {
+            return resp
+        }
+        hops = hops + 1
+        if hops > options.max_redirects {
+            throw invalid("redirect", f"more than {options.max_redirects} redirects")
+        }
+        let next = try resolve(current, location? or "")
+        if current.scheme == "https" and next.scheme == "http" {
+            throw invalid("redirect", "refusing a redirect from https to http")
+        }
+        if resp.status != 307 and resp.status != 308 {
+            if verb != "HEAD" {
+                verb = "GET"
+            }
+            payload = kod_str_to_bytes("")
+            headers = without(headers, ["content-type"])
+        }
+        if next.host != current.host or next.port != current.port {
+            headers = without(headers, ["authorization", "cookie", "proxy-authorization"])
+        }
+        current = next
+    }
+    throw invalid("redirect", "unreachable")
+}
+
+func get(anon url: str) -> Response or Error {
+    return try fetch("GET", url)
+}
+
+func post(anon url: str, anon body: bytes, content_type: str) -> Response or Error {
+    let options = Options(body: body)
+    options.headers.add("Content-Type", content_type)
+    return try fetch("POST", url, options: options)
+}

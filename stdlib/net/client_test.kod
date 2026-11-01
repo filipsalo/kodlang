@@ -1,0 +1,313 @@
+import "net/client" { Options, fetch, get, post }
+import "net/http" { Headers, Response, Limits }
+import "net/tcp"
+import "stream" { IoError, IoKind }
+import "process"
+import "io"
+
+// These tests talk to tests/support/http_fixture.py, a scripted local server,
+// and (for https) to `openssl s_server`.
+
+type Server = struct {
+    pid: str
+    port: int64
+}
+
+func start_fixture() -> Server {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    let r = process.run(["sh", "-c", f"python3 tests/support/http_fixture.py {port} >/dev/null 2>&1 </dev/null & echo $!"])
+    assert r.status == 0
+    let pid = r.stdout.trim()
+    mut tries: int64 = 0
+    for tries < 100 {
+        let c = tcp.connect("127.0.0.1", port: port)
+        if c is Ok(conn) {
+            must conn.close()
+            return Server(pid: pid, port: port)
+        }
+        process.run(["sleep", "0.05"])
+        tries = tries + 1
+    }
+    assert false
+    return Server(pid: pid, port: port)
+}
+
+func stop(anon sv: Server) -> none {
+    process.run(["kill", sv.pid])
+}
+
+func url(anon sv: Server, anon path: str) -> str {
+    return f"http://127.0.0.1:{sv.port}{path}"
+}
+
+type Failure = struct {
+    kind: IoKind
+    detail: str
+}
+
+func why(anon r: Response or Error) -> Failure? {
+    if r is Err(e) {
+        if e is IoError(io) {
+            return Failure(kind: io.kind, detail: io.detail)
+        }
+        return Failure(kind: .Other, detail: e.to_str())
+    }
+    return none
+}
+
+func fails(anon r: Response or Error, anon kind: IoKind, anon part: str) -> bool {
+    let f = why(r)
+    if f is none {
+        return false
+    }
+    let w = f? or Failure(kind: .Other, detail: "")
+    return w.kind == kind and w.detail.contains(part)
+}
+
+func b(anon text: str) -> bytes {
+    return kod_str_to_bytes(text)
+}
+
+test "get: status, headers and body" {
+    let sv = start_fixture()
+    let r = must get(url(sv, "/hello"))
+    assert r.status == 200 and r.reason == "OK" and r.ok()
+    assert r.text() == "hello"
+    assert (r.header("content-type")? or "!") == "text/plain"
+    assert len(r.headers.all("x-a")) == 2
+    stop(sv)
+}
+
+test "the request line, Host and default headers reach the server" {
+    let sv = start_fixture()
+    let r = must get(url(sv, "/echo?a=1&b=2"))
+    let text = r.text()
+    assert text.starts_with("GET /echo?a=1&b=2\n")
+    assert text.contains(f"Host: 127.0.0.1:{sv.port}\n")
+    assert text.contains("User-Agent: kod\n")
+    assert text.contains("Accept: */*\n")
+    assert text.contains("Connection: close\n")
+    stop(sv)
+}
+
+test "post sends a body with its length and type" {
+    let sv = start_fixture()
+    let r = must post(url(sv, "/echo"), b("{\"k\": 1}"), content_type: "application/json")
+    let text = r.text()
+    assert text.starts_with("POST /echo\n")
+    assert text.contains("Content-Type: application/json\n")
+    assert text.contains("Content-Length: 8\n")
+    assert text.ends_with("\n\n{\"k\": 1}")
+    stop(sv)
+}
+
+test "fetch: any method, extra headers" {
+    let sv = start_fixture()
+    let options = Options()
+    options.headers.add("X-Token", "abc")
+    options.headers.add("User-Agent", "mine")
+    let r = must fetch("DELETE", url(sv, "/echo"), options: options)
+    let text = r.text()
+    assert text.starts_with("DELETE /echo\n")
+    assert text.contains("X-Token: abc\n")
+    assert text.contains("User-Agent: mine\n")
+    assert text.contains("User-Agent: kod") == false
+    stop(sv)
+}
+
+test "statuses other than 200 come back as responses, not errors" {
+    let sv = start_fixture()
+    let a = must get(url(sv, "/missing"))
+    assert a.status == 404 and a.ok() == false and a.text() == "nope"
+    let c = must get(url(sv, "/created"))
+    assert c.status == 201 and c.ok()
+    stop(sv)
+}
+
+test "chunked, close-delimited, HEAD, 204 and interim responses" {
+    let sv = start_fixture()
+    assert (must get(url(sv, "/chunked"))).text() == "Wikipedia in\r\n\r\nchunks."
+    assert (must get(url(sv, "/close"))).text() == "until close"
+    let h = must fetch("HEAD", url(sv, "/head"))
+    assert len(h.body) == 0 and (h.header("content-length")? or "!") == "10"
+    assert len((must get(url(sv, "/nocontent"))).body) == 0
+    assert (must get(url(sv, "/interim"))).text() == "after interim"
+    stop(sv)
+}
+
+test "302 and 303 turn a POST into a GET without a body" {
+    let sv = start_fixture()
+    let a = must post(url(sv, "/302"), b("data"), content_type: "text/plain")
+    assert a.text().starts_with("GET /echo\n")
+    assert a.text().contains("Content-Type") == false
+    assert a.text().ends_with("\n\n")
+    let c = must post(url(sv, "/303"), b("data"), content_type: "text/plain")
+    assert c.text().starts_with("GET /echo\n")
+    let m = must post(url(sv, "/301"), b("data"), content_type: "text/plain")
+    assert m.text().starts_with("GET /echo\n")
+    stop(sv)
+}
+
+test "307 and 308 keep the method and the body" {
+    let sv = start_fixture()
+    let a = must post(url(sv, "/307"), b("data"), content_type: "text/plain")
+    assert a.text().starts_with("POST /echo\n")
+    assert a.text().contains("Content-Type: text/plain\n")
+    assert a.text().ends_with("\n\ndata")
+    let c = must post(url(sv, "/308"), b("data"), content_type: "text/plain")
+    assert c.text().ends_with("\n\ndata")
+    stop(sv)
+}
+
+test "HEAD stays HEAD across a 302" {
+    let sv = start_fixture()
+    let r = must fetch("HEAD", url(sv, "/302"))
+    assert r.status == 200 and len(r.body) == 0
+    stop(sv)
+}
+
+test "relative, dotted and absolute Locations are followed" {
+    let sv = start_fixture()
+    assert (must get(url(sv, "/relative"))).text() == "hello"
+    assert (must get(url(sv, "/dir/relative"))).text() == "hello"
+    assert (must get(url(sv, "/absolute"))).text() == "hello"
+    assert (must get(url(sv, "/chain"))).text().starts_with("GET /echo\n")
+    stop(sv)
+}
+
+test "credentials do not follow a redirect to another host" {
+    let sv = start_fixture()
+    let options = Options()
+    options.headers.add("Authorization", "Bearer secret")
+    options.headers.add("Cookie", "a=b")
+    options.headers.add("X-Keep", "yes")
+    let same = must fetch("GET", url(sv, "/302"), options: options)
+    assert same.text().contains("Authorization: Bearer secret\n")
+    assert same.text().contains("Cookie: a=b\n")
+    let other = must fetch("GET", url(sv, "/cross-host"), options: options)
+    assert other.status == 200
+    assert other.text().contains("Authorization") == false
+    assert other.text().contains("Cookie") == false
+    assert other.text().contains("X-Keep: yes\n")
+    assert other.text().contains(f"Host: localhost:{sv.port}\n")
+    stop(sv)
+}
+
+test "max_redirects 0 returns the redirect itself" {
+    let sv = start_fixture()
+    let options = Options(max_redirects: 0)
+    let r = must fetch("GET", url(sv, "/302"), options: options)
+    assert r.status == 302 and (r.header("location")? or "!") == "/echo"
+    stop(sv)
+}
+
+test "a redirect loop or a long chain stops with an error" {
+    let sv = start_fixture()
+    assert fails(get(url(sv, "/loop")), .InvalidInput, "redirects")
+    let short = Options(max_redirects: 1)
+    assert fails(fetch("GET", url(sv, "/chain"), options: short), .InvalidInput, "redirects")
+    let enough = Options(max_redirects: 2)
+    assert (fetch("GET", url(sv, "/chain"), options: enough)) is Ok(_)
+    stop(sv)
+}
+
+test "a redirect without Location, or to another scheme, is not followed blindly" {
+    let sv = start_fixture()
+    let r = must get(url(sv, "/no-location"))
+    assert r.status == 302 and r.text() == "nowhere"
+    assert fails(get(url(sv, "/to-ftp")), .InvalidInput, "Location")
+    stop(sv)
+}
+
+test "bad URLs are InvalidInput errors" {
+    assert fails(get("not a url"), .InvalidInput, "URL")
+    assert fails(get("ftp://example.com/"), .InvalidInput, "scheme")
+    assert fails(get("http://user:pw@example.com/"), .InvalidInput, "credentials")
+}
+
+test "a server that is not there" {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    assert fails(get(f"http://127.0.0.1:{port}/"), .ConnectionRefused, "")
+    assert fails(get("http://no-such-host.invalid/"), .HostNotFound, "")
+}
+
+test "a slow server hits the timeout" {
+    let sv = start_fixture()
+    let options = Options(timeout_ms: 200)
+    assert fails(fetch("GET", url(sv, "/slow"), options: options), .TimedOut, "")
+    let patient = Options(timeout_ms: 5000)
+    assert (must fetch("GET", url(sv, "/slow"), options: patient)).text() == "late"
+    stop(sv)
+}
+
+test "broken responses are errors with a kind" {
+    let sv = start_fixture()
+    assert fails(get(url(sv, "/truncated")), .UnexpectedEof, "")
+    assert fails(get(url(sv, "/garbage")), .Protocol, "status line")
+    assert fails(get(url(sv, "/bomb")), .Protocol, "too many headers")
+    stop(sv)
+}
+
+test "limits cap the body a server can send" {
+    let sv = start_fixture()
+    assert (must get(url(sv, "/big"))).status == 200
+    let small = Options(limits: Limits(max_body: 1000000, max_header_bytes: 65536, max_headers: 100))
+    assert fails(fetch("GET", url(sv, "/big"), options: small), .Protocol, "body too large")
+    let few = Options(limits: Limits(max_body: 1000, max_header_bytes: 65536, max_headers: 10))
+    assert fails(fetch("GET", url(sv, "/bomb"), options: few), .Protocol, "too many headers")
+    stop(sv)
+}
+
+// ---- https ----
+
+func cert_path() -> str {
+    return "build/client_test_cert.pem"
+}
+
+func key_path() -> str {
+    return "build/client_test_key.pem"
+}
+
+func start_tls_server() -> Server {
+    if io.is_file(cert_path()) == false or io.is_file(key_path()) == false {
+        let made = process.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key_path(), "-out", cert_path(), "-subj", "/CN=localhost", "-days", "30", "-addext", "subjectAltName=DNS:localhost", "-addext", "extendedKeyUsage=serverAuth"])
+        assert made.status == 0
+    }
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    let script = f"perl -e 'alarm 120; exec @ARGV' /usr/bin/openssl s_server -accept {port} -cert {cert_path()} -key {key_path()} -www -quiet -tls1_2 >/dev/null 2>&1 </dev/null & echo $!"
+    let r = process.run(["sh", "-c", script])
+    let pid = r.stdout.trim()
+    mut tries: int64 = 0
+    for tries < 100 {
+        let c = tcp.connect("127.0.0.1", port: port)
+        if c is Ok(conn) {
+            must conn.close()
+            return Server(pid: pid, port: port)
+        }
+        process.run(["sleep", "0.05"])
+        tries = tries + 1
+    }
+    assert false
+    return Server(pid: pid, port: port)
+}
+
+test "https with a trusted certificate" {
+    let sv = start_tls_server()
+    let options = Options(trust_file: cert_path())
+    let r = must fetch("GET", f"https://localhost:{sv.port}/", options: options)
+    assert r.status == 200
+    assert r.text().contains("</HTML>")
+    stop(sv)
+}
+
+test "https with an untrusted certificate is an error" {
+    let sv = start_tls_server()
+    assert fails(get(f"https://localhost:{sv.port}/"), .Tls, "")
+    stop(sv)
+}
