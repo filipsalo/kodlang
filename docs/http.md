@@ -25,8 +25,7 @@ func main() -> int64 or Error {
 `get`, `post` and `fetch` open a connection for each request and close it
 afterwards (`Connection: close`). To make several requests over the same
 connection, use a [`Client`](#connection-reuse). There is no pipelining, no
-cookies, no proxy support and no automatic decompression (no `Accept-Encoding`
-is sent).
+cookies and no proxy support.
 
 ## Requests
 
@@ -44,6 +43,7 @@ is sent).
 | `body` | empty | the request body (`bytes`) |
 | `trust_file` | `""` | PEM roots for `https`, as for [`net/tls`](io.md#tls) |
 | `timeout_ms` | 30000 | limit for the connect, the TLS handshake, and each single read or write; a server that keeps sending slowly never trips it (see `deadline_ms`) |
+| `accept_gzip` | true | send `Accept-Encoding: gzip`, and decode a gzip response (see [Compression](#compression)) |
 | `deadline_ms` | 0 | limit for the whole `fetch` (connect, handshake, every redirect and reading the whole body); 0 means none, a negative value is an `InvalidInput` error |
 | `max_redirects` | 5 | redirects to follow; 0 returns the redirect response as it is |
 | `limits` | see below | caps on what a response may send |
@@ -118,6 +118,23 @@ is `deadline exceeded`, however the wait ended, and the connection is closed.
 Two things can overrun it: resolving a host name is not interruptible, and a TLS
 connection spends up to the time left on the TCP connect and then up to the
 same on the handshake. Neither is by more than one `timeout_ms`.
+
+## Compression
+
+With `accept_gzip` on, requests carry `Accept-Encoding: gzip` (unless you set an
+`Accept-Encoding` yourself), and a response whose `Content-Encoding` is `gzip` or
+`x-gzip` is decoded before you see it: `Response.body` holds the decoded bytes,
+the `Content-Encoding` header is removed, and `Content-Length` is the decoded
+length. This happens whenever the response says it is gzip, even from a server that
+was not asked to compress, and with `accept_gzip` off.
+
+The decoded body is held to `limits.max_body` like any other, so a response that
+inflates past it fails with a `Protocol` error `body too large` instead of filling
+memory. A body that is not valid gzip is a `Protocol` error `bad gzip body` with
+the reason, and `Content-Length` of the compressed data was already checked as
+usual. Any other `Content-Encoding` (`br`, `deflate`, `zstd`, or a list of codings)
+is left alone: the body comes back as received, with its header, for you to handle.
+A response with no body, such as one to `HEAD`, is not decoded.
 
 ## Redirects
 
@@ -220,7 +237,7 @@ options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))
 |----------|---------|
 | `parse_url(s)` | `Url or Error` with `scheme`, `host`, `port`, `target` (path and query) |
 | `resolve(base, location)` | the `Url` a `Location` points to |
-| `write_request(w, req, keep_alive = false)` | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
+| `write_request(w, req, keep_alive = false, accept_gzip = false)` (labels `keep_alive:` and `accept_gzip:`, in that order) | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`, and `Accept-Encoding: gzip` when `accept_gzip` and there is no `Accept-Encoding` header already; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
 | `read_response(br, method, limits = Limits())` | read one response from a `BufReader`; `method` decides whether there is a body; `Response.keep_alive` says whether the connection can carry another request |
 
 `write_request` and `read_response` work on `MemWriter` and `MemReader`, which

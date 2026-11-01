@@ -2,6 +2,7 @@
 import "net/http" { Headers, Request, Response, Limits, Url, parse_url, resolve, write_request, read_response, invalid }
 import "net/tcp"
 import "net/tls"
+import "compress/inflate"
 import "fd" { Fd }
 import "net/tls" { TlsStream }
 import "stream" { IoError, BufReader, Reader, Writer }
@@ -15,6 +16,7 @@ type Options = struct {
     max_redirects: int64 = 5
     limits: Limits = Limits()
     deadline_ms: int64 = 0
+    accept_gzip: bool = true
 }
 
 func deadline_error() -> IoError {
@@ -205,9 +207,36 @@ type Acquired = struct {
     reused: bool
 }
 
+// A gzip-encoded body decoded, with the headers saying so removed; any other
+// response as it is.
+func decode_content(anon resp: Response, anon limits: Limits) -> Response or Error {
+    let coding = resp.headers.get("content-encoding")
+    if coding is none or len(resp.body) == 0 {
+        return resp
+    }
+    let name = (coding? or "").trim().lower()
+    if name != "gzip" and name != "x-gzip" {
+        return resp
+    }
+    let decoded = inflate.gunzip(resp.body, max_output: limits.max_body)
+    if decoded is Err(e) {
+        if e is IoError(io) {
+            if io.detail == "output too large" {
+                throw IoError(kind: .Protocol, op: "http", errno: 0, detail: "body too large")
+            }
+            throw IoError(kind: .Protocol, op: "http", errno: 0, detail: "bad gzip body: " + io.detail)
+        }
+        throw e
+    }
+    let body = try decoded
+    let headers = without(resp.headers, ["content-encoding", "content-length"])
+    headers.add("Content-Length", len(body).to_str())
+    return Response(status: resp.status, reason: resp.reason, headers: headers, body: body, keep_alive: resp.keep_alive)
+}
+
 // Write `req` and read its response.
 func attempt(anon io: LinkIO, anon br: BufReader, anon req: Request, options: Options, keep_alive: bool) -> Response or Error {
-    try write_request(io, req, keep_alive: keep_alive)
+    try write_request(io, req, keep_alive: keep_alive, accept_gzip: options.accept_gzip)
     return read_response(br, req.method, limits: options.limits)
 }
 
@@ -308,7 +337,7 @@ type Client = struct {
             } else {
                 discard(link)
             }
-            return response
+            return try decode_content(response, options.limits)
         }
         throw invalid("fetch", "unreachable")
     }
