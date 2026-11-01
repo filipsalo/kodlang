@@ -234,9 +234,9 @@ def test_selfhost_matches_interpreter(target: str, sh_kodc):
     assert py_out.returncode == 0, f"interpreter failed: {py_out.stderr}"
     # Guard against comparing two empty modules.
     assert ".globl" in sh_out.stdout, f"sh_kodc emitted no symbols for {target}"
-    assert (
-        sh_out.stdout == py_out.stdout
-    ), f"sh_kodc and interpreter diverge on {target}"
+    assert sh_out.stdout == py_out.stdout, (
+        f"sh_kodc and interpreter diverge on {target}"
+    )
 
 
 def test_selfhost_fixed_point(sh_kodc):

@@ -103,7 +103,7 @@ class KodError(Exception):
 
     def __str__(self) -> str:
         excerpt = self.excerpt()
-        s = f"\033[1;37m{self.span.filename}:{self.line+1}:{self.col+1}{RESET}: "
+        s = f"\033[1;37m{self.span.filename}:{self.line + 1}:{self.col + 1}{RESET}: "
         s += f"{ERR}error: \033[1;37m{self.msg}{RESET}\n"
         line_no_width = 5  # max(len(str(line.line_no)) for line in excerpt.lines)
         for line in excerpt.lines:
