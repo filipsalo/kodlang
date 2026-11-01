@@ -436,6 +436,36 @@ using it as the interface is an error at that spot, such as
 or ``method `area` is `func(int64) -> int64`, not `func() -> int64` ``.
 `throw` counts too, since it makes its value an `Error`.
 
+An interface value converts to another interface that declares only methods
+the first one has, with the same parameter and return types, in any order. It
+goes wherever a struct would (an argument, an annotated `let`, a field, a
+return value), and a downcast still works on the result:
+
+```kod
+interface Reader {
+    func read(self) -> int64
+}
+interface ReadCloser {
+    func close(self) -> none
+    func read(self) -> int64
+}
+
+func drain(anon r: Reader) -> int64 {
+    return r.read()
+}
+
+let rc: ReadCloser = File(n: 7)
+drain(rc)                      // 7
+let r: Reader = rc
+if r is File(f) {              // still the File
+    print_int(f.n)
+}
+```
+
+Converting builds the new interface's method table when it runs, so it costs a
+small allocation. Arrays and optionals of interface values don't convert
+element by element: a `[ReadCloser]` is not a `[Reader]`.
+
 ## Type aliases
 
 `type Name = T` gives an existing type a second name. An alias is
