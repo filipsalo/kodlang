@@ -265,7 +265,7 @@ options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))
 |----------|---------|
 | `parse_url(s)` | `Url or Error` with `scheme`, `host`, `port`, `target` (path and query) |
 | `resolve(base, location)` | the `Url` a `Location` points to |
-| `write_request(w, req, keep_alive = false, accept_gzip = false)` (labels `keep_alive:` and `accept_gzip:`, in that order) | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`, and `Accept-Encoding: gzip` when `accept_gzip` and there is no `Accept-Encoding` header already; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
+| `write_request(w, req, keep_alive = false, accept_gzip = false)` | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`, and `Accept-Encoding: gzip` when `accept_gzip` and there is no `Accept-Encoding` header already; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
 | `read_response(br, method, limits = Limits())` | read one response from a `BufReader`; `method` decides whether there is a body; `Response.keep_alive` says whether the connection can carry another request |
 
 `write_request` and `read_response` work on `MemWriter` and `MemReader`, which
