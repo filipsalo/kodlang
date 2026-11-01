@@ -32,6 +32,10 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
 4. **Robust JSON** — parse errors returned as values instead of panics, `\uXXXX` escapes,
    non-integer numbers, and pretty-printing.
 
+Done on the way: `str` has `starts_with`, `ends_with`, `find`, `split`, `trim`, `join`, `replace`,
+`lower`, `upper`, `parse_int` and friends, and `StrBuilder` (`stdlib/strbuilder.kod`) appends in
+amortised constant time (see `docs/strings.md`).
+
 Language work along the way, as these modules need it: `\x` / `\u` string escapes,
 module-level constants (top-level `let` is currently an error), and the
 open codegen bugs that this kind of code is most likely to hit.
