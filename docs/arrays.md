@@ -120,10 +120,24 @@ amortized O(1) per element. `+` always copies both operands, so
 `+=` appends to the array itself, not to a copy, so everything that holds
 the same array sees the new elements: after `let a = xs` and `xs += [3]`,
 `a` ends in 3 too. That holds for an array kept in a field or in another
-array (`rows[0] += [4]`) as well. A `for x in xs` loop also reaches the
-elements appended to `xs` while it runs. To keep the old contents, copy
-the array first with `xs + []` or `xs[..]`. Both copies are shallow: the
-inner arrays of a `[[T]]` are still shared.
+array (`rows[0] += [4]`) as well, and for an array passed to a function that
+appends to its parameter. A `for x in xs` loop also reaches the elements
+appended to `xs` while it runs.
+
+The one exception is a `mut` binding that starts from an existing array, a
+variable, a field or an element: it gets a copy of its own, so appending to
+it leaves the original alone.
+
+```kod
+mut ys = xs            // a copy of xs
+ys += [4]              // xs is unchanged
+```
+
+A `mut` binding that starts from a call, a literal or an expression such as
+`xs + []` already holds an array nobody else has, so nothing is copied.
+To keep the old contents in any other case, copy the array first with
+`xs + []` or `xs[..]`. All of these copies are shallow: the inner arrays of a
+`[[T]]` are still shared.
 
 ## Iterating
 
