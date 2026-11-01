@@ -44,6 +44,7 @@ type IoKind = enum {
     UnexpectedEof
     Other
     HostNotFound
+    Tls
 }
 
 type IoError = struct {
@@ -72,7 +73,9 @@ match open_read(path) {
 `kind_of_errno(errno)` maps an OS error number to an `IoKind`; anything it
 doesn't know is `Other`. `EAGAIN` is `TimedOut`, because a descriptor here is
 only ever non-blocking through a timeout (see [TCP](#tcp)). `HostNotFound` is
-for a name that doesn't resolve and has no OS error number (`errno` is 0). An interrupted system call is retried inside the
+for a name that doesn't resolve and has no OS error number (`errno` is 0).
+`Tls` is for a TLS failure that isn't a plain I/O error, such as a certificate
+that doesn't verify (see [TLS](#tls)). An interrupted system call is retried inside the
 runtime, so `EINTR` never reaches a caller.
 
 ## Reader and Writer
@@ -188,3 +191,49 @@ connection is `ConnectionRefused`, a timeout `TimedOut`, a name that doesn't
 resolve `HostNotFound`, and a `port` outside 0..65535 or an empty `host`
 `InvalidInput`. Writing to a peer that has closed is a `BrokenPipe` error and
 doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
+
+## TLS
+
+`stdlib/net/tls.kod` runs TLS over a TCP connection, using the system's
+SecureTransport (the Security framework), so it needs nothing installed and
+checks certificates against the macOS keychain. A program that imports it
+links `-framework Security -framework CoreFoundation`; no other program does.
+
+```kod
+import "net/tls" { connect }
+import "stream" { BufReader, write_str }
+
+func main() -> int64 or Error {
+    let conn = try connect("example.com", port: 443)
+    try write_str(conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+    let br = BufReader(inner: conn)
+    print((try br.read_line())? or "")
+    try conn.close()
+    return 0
+}
+```
+
+A `TlsStream` is a `Reader` and a `Writer`, so everything above works on it
+as on a plain connection.
+
+| Function | Meaning |
+|----------|---------|
+| `connect(host, port, trust_file = "", timeout_ms = 10000)` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
+| `s.read(max)`, `s.write(data)` | as for any stream |
+| `s.set_timeout(ms)` | as `net/tcp.set_timeout`: a read or write fails with `TimedOut` after `ms` milliseconds without progress |
+| `s.close()` | send a close notice, then close the connection; `none or Error` |
+
+The server's certificate must be valid for `host`, chain to a trusted root and
+be in date; otherwise `connect` throws an `IoError` of kind `Tls` whose
+`detail` says why, and the connection is closed. `timeout_ms` limits the TCP
+connect and, separately, the handshake. A server that can't speak TLS 1.2 is a
+`Tls` error: SecureTransport has no TLS 1.3, and the minimum version is 1.2.
+
+`trust_file` is the path of a PEM file of certificates. When it isn't empty,
+those certificates are the only trusted roots, in place of the keychain: use it
+for a private CA or a self-signed server. The host name is still checked.
+
+A server that closes the connection without a close notice reads as an
+ordinary end of stream, since plain HTTP/1.0 servers do that; a response that
+carries its own length (`Content-Length` or chunked) shows a truncation
+anyway.

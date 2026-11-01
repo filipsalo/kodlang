@@ -1,0 +1,83 @@
+// TLS over a TCP connection, with the system's SecureTransport. See docs/io.md.
+// kod:cc tls.c -fno-objc-arc
+// kod:link -framework Security -framework CoreFoundation
+
+import "stream" { IoError, os_error }
+import "fd" { Fd, kod_io_errno }
+import "net/tcp"
+
+extern func kod_tls_open(anon fd: int64, anon host: str, anon trust_file: str) -> int64
+extern func kod_tls_read(anon session: int64, anon max: int64) -> bytes
+extern func kod_tls_write(anon session: int64, anon data: bytes) -> int64
+extern func kod_tls_close(anon session: int64) -> none
+extern func kod_tls_status() -> int64
+extern func kod_tls_message() -> str
+extern func kod_fd_close(anon fd: int64) -> int64
+
+// The error for the call that just failed: an OS error, or a TLS failure.
+func failure(anon op: str) -> IoError {
+    if kod_tls_status() == 2 {
+        return IoError(kind: .Tls, op: op, errno: 0, detail: kod_tls_message())
+    }
+    return os_error(op, errno: kod_io_errno())
+}
+
+func closed(anon op: str) -> IoError {
+    return IoError(kind: .InvalidInput, op: op, errno: 0, detail: "connection is closed")
+}
+
+type TlsStream = struct {
+    fd: int64
+    session: int64
+    open: bool = true
+
+    func read(self, anon max: int64) -> bytes or Error {
+        if self.open == false {
+            throw closed("read")
+        }
+        let data = kod_tls_read(self.session, max)
+        if kod_tls_status() != 0 {
+            throw failure("read")
+        }
+        return data
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        if self.open == false {
+            throw closed("write")
+        }
+        let n = kod_tls_write(self.session, data)
+        if n < 0 {
+            throw failure("write")
+        }
+        return n
+    }
+
+    func set_timeout(self, ms: int64) -> none or Error {
+        try tcp.set_timeout(Fd(fd: self.fd), ms: ms)
+    }
+
+    func close(self) -> none or Error {
+        if self.open == false {
+            throw closed("close")
+        }
+        self.open = false
+        kod_tls_close(self.session)
+        if kod_fd_close(self.fd) < 0 {
+            throw os_error("close", errno: kod_io_errno())
+        }
+    }
+}
+
+func connect(anon host: str, port: int64, trust_file: str = "", timeout_ms: int64 = 10000) -> TlsStream or Error {
+    let conn = try tcp.connect(host, port: port, timeout_ms: timeout_ms)
+    try tcp.set_timeout(conn, ms: timeout_ms)
+    let session = kod_tls_open(conn.fd, host, trust_file)
+    if session < 0 {
+        let err = failure(f"tls {host}:{port}")
+        kod_fd_close(conn.fd)
+        throw err
+    }
+    try tcp.set_timeout(conn, ms: 0)
+    return TlsStream(fd: conn.fd, session: session)
+}
