@@ -28,6 +28,9 @@ typedef struct {
 // Memory that is never freed: everything Kod allocates comes from here.
 void *arena_alloc(int64_t size);
 
+// Records the OS error number that stdlib/fd.kod reports for a failed call.
+void kod_io_set_errno(int64_t err);
+
 // Prints `panic: ` and the message to stderr, with a backtrace, and exits 1.
 __attribute__((noreturn)) void kod_panic(KodStr *msg);
 

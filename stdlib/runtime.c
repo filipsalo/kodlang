@@ -428,6 +428,8 @@ static int64_t g_io_errno;
 
 int64_t kod_io_errno(void) { return g_io_errno; }
 
+void kod_io_set_errno(int64_t err) { g_io_errno = err; }
+
 // mode: 0 read, 1 create or truncate for writing, 2 create or append.
 int64_t kod_fd_open(KodStr *path, int64_t mode) {
     int flags = O_RDONLY;
@@ -489,10 +491,9 @@ int64_t kod_errno_kind(int64_t err) {
     switch (err) {
     case ENOENT: return 0;
     case EACCES: case EPERM: return 1;
-    case EEXIST: return 2;
+    case EEXIST: case EADDRINUSE: return 2;
     case EINVAL: case EBADF: case EISDIR: case ENOTDIR: return 3;
-    case EAGAIN: return 4;
-    case ETIMEDOUT: return 5;
+    case EAGAIN: case ETIMEDOUT: return 5;
     case ECONNREFUSED: return 6;
     case ECONNRESET: return 7;
     case EPIPE: return 8;

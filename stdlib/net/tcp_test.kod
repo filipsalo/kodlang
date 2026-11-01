@@ -1,0 +1,189 @@
+import "net/tcp" { connect, listen, set_timeout, Listener }
+import "stream" { IoError, IoKind, BufReader, read_all, write_str, write_all }
+import "fd" { Fd }
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func s(anon x: bytes) -> str {
+    return kod_bytes_to_str(x)
+}
+
+func kind_of(anon r: Fd or Error) -> IoKind? {
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind
+        }
+        return .Other
+    }
+    return none
+}
+
+func is_kind(anon r: Fd or Error, anon want: IoKind) -> bool {
+    let k = kind_of(r)
+    if k is none {
+        return false
+    }
+    return (k? or .Other) == want
+}
+
+// A listener on a free local port, a client connected to it, and the
+// server's end of that connection.
+type Pair = struct {
+    listener: Listener
+    client: Fd
+    server: Fd
+}
+
+func pair() -> Pair {
+    let l = must listen("127.0.0.1", port: 0)
+    let c = must connect("127.0.0.1", port: l.port())
+    let sv = must l.accept()
+    return Pair(listener: l, client: c, server: sv)
+}
+
+test "listen on port 0 picks a free port" {
+    let l = must listen("127.0.0.1", port: 0)
+    assert l.port() > 0 and l.port() < 65536
+    must l.close()
+}
+
+test "two listeners get different ports" {
+    let a = must listen("127.0.0.1", port: 0)
+    let c = must listen("127.0.0.1", port: 0)
+    assert a.port() != c.port()
+    must a.close()
+    must c.close()
+}
+
+test "bytes go both ways" {
+    let p = pair()
+    must write_str(p.client, "ping")
+    assert s(must p.server.read(100)) == "ping"
+    must write_str(p.server, "pong")
+    assert s(must p.client.read(100)) == "pong"
+    must p.client.close()
+    must p.server.close()
+    must p.listener.close()
+}
+
+test "the end of the stream is an empty read after the peer closes" {
+    let p = pair()
+    must write_str(p.server, "bye")
+    must p.server.close()
+    assert s(must read_all(p.client)) == "bye"
+    assert len(must p.client.read(10)) == 0
+    must p.client.close()
+    must p.listener.close()
+}
+
+test "a large write arrives whole" {
+    let p = pair()
+    let big = "0123456789".repeat(20000)
+    must write_str(p.server, big)
+    must p.server.close()
+    let got = must read_all(p.client)
+    assert len(got) == 200000
+    assert s(got) == big
+    must p.client.close()
+    must p.listener.close()
+}
+
+test "a BufReader reads lines off a socket" {
+    let p = pair()
+    must write_str(p.server, "HTTP/1.1 200 OK\r\nA: b\r\n\r\nbody")
+    must p.server.close()
+    let br = BufReader(inner: p.client)
+    assert ((must br.read_line())? or "!") == "HTTP/1.1 200 OK"
+    assert ((must br.read_line())? or "!") == "A: b"
+    assert ((must br.read_line())? or "!") == ""
+    assert s(must br.read_exact(4)) == "body"
+    must p.client.close()
+    must p.listener.close()
+}
+
+test "connecting to a port nobody listens on is ConnectionRefused" {
+    let l = must listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    assert is_kind(connect("127.0.0.1", port: port), .ConnectionRefused)
+}
+
+test "a name that does not resolve is HostNotFound" {
+    let r = connect("no-such-host.invalid", port: 80)
+    assert is_kind(r, .HostNotFound)
+    if r is Err(e) {
+        assert e.to_str().starts_with("resolve no-such-host.invalid: ")
+    }
+}
+
+test "a bad port or an empty host is InvalidInput" {
+    assert is_kind(connect("127.0.0.1", port: -1), .InvalidInput)
+    assert is_kind(connect("127.0.0.1", port: 65536), .InvalidInput)
+    assert is_kind(connect("", port: 80), .InvalidInput)
+    assert listen("127.0.0.1", port: 70000) is Err(_)
+}
+
+test "listening on a port that is taken fails with AlreadyExists" {
+    let l = must listen("127.0.0.1", port: 0)
+    let again = listen("127.0.0.1", port: l.port())
+    assert again is Err(_)
+    if again is Err(e) {
+        if e is IoError(io) {
+            assert io.kind == .AlreadyExists
+        }
+    }
+    must l.close()
+}
+
+test "a read times out after set_timeout" {
+    let p = pair()
+    must set_timeout(p.client, ms: 50)
+    let r = p.client.read(10)
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e is IoError(_)
+        if e is IoError(io) {
+            assert io.kind == .TimedOut
+        }
+    }
+    must set_timeout(p.client, ms: 0)
+    must write_str(p.server, "late")
+    assert s(must p.client.read(10)) == "late"
+    must p.client.close()
+    must p.server.close()
+    must p.listener.close()
+}
+
+test "writing to a closed peer is a BrokenPipe error, not a signal" {
+    let p = pair()
+    must p.server.close()
+    let chunk = b("x".repeat(1000))
+    mut failed = false
+    mut i: int64 = 0
+    for i < 200 and failed == false {
+        let r = write_all(p.client, chunk)
+        if r is Err(e) {
+            failed = true
+            if e is IoError(io) {
+                assert io.kind == .BrokenPipe or io.kind == .ConnectionReset
+            }
+        }
+        i = i + 1
+    }
+    assert failed
+    must p.client.close()
+    must p.listener.close()
+}
+
+test "an empty host listens on every interface" {
+    let l = must listen("", port: 0)
+    let c = must connect("127.0.0.1", port: l.port())
+    let sv = must l.accept()
+    must write_str(c, "hi")
+    assert s(must sv.read(10)) == "hi"
+    must c.close()
+    must sv.close()
+    must l.close()
+}
