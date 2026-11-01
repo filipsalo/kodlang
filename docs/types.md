@@ -242,6 +242,10 @@ let x: int64? = none
 let y: int64? = 42
 ```
 
+The `?` goes after the whole type, so `[str]?` is an optional array and
+`Box[int64]?` an optional generic struct. `names? or []` is the array, or an
+empty one when there is none.
+
 Test with `is` and destructure with `Some(binding)`:
 
 ```kod
