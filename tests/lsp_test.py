@@ -613,9 +613,9 @@ def test_parse_error_emits_diagnostic(lsp_binary):
     ]
     assert len(diag_msgs) == 1
     diags = diag_msgs[0]["params"]["diagnostics"]
-    assert any(
-        "expected `)`" in d["message"] for d in diags
-    ), f"no `expected )` in diags: {diags}"
+    assert any("expected `)`" in d["message"] for d in diags), (
+        f"no `expected )` in diags: {diags}"
+    )
 
 
 def test_cross_module_import_resolves(lsp_binary):
@@ -655,9 +655,9 @@ def test_cross_module_import_resolves(lsp_binary):
         r for r in responses if r.get("method") == "textDocument/publishDiagnostics"
     ]
     assert len(diag_msgs) == 1
-    assert (
-        diag_msgs[0]["params"]["diagnostics"] == []
-    ), f"unexpected diagnostics: {diag_msgs[0]['params']['diagnostics']}"
+    assert diag_msgs[0]["params"]["diagnostics"] == [], (
+        f"unexpected diagnostics: {diag_msgs[0]['params']['diagnostics']}"
+    )
 
 
 def test_debounce_coalesces_typing_burst(lsp_binary):
@@ -831,9 +831,9 @@ def test_completion_offers_globals_at_bare_identifier(lsp_binary):
     )
     init = next(r for r in responses if r.get("id") == 1)
     cap = init["result"]["capabilities"]
-    assert (
-        cap.get("completionProvider") is not None
-    ), "completionProvider not advertised"
+    assert cap.get("completionProvider") is not None, (
+        "completionProvider not advertised"
+    )
 
     labels = _completion_labels(responses, 2)
     assert "helper" in labels  # free function
