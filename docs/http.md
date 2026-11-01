@@ -42,7 +42,8 @@ sent).
 | `headers` | none | extra request headers (`Headers`) |
 | `body` | empty | the request body (`bytes`) |
 | `trust_file` | `""` | PEM roots for `https`, as for [`net/tls`](io.md#tls) |
-| `timeout_ms` | 30000 | limit for the connect, the TLS handshake, and each single read or write; not for the request as a whole |
+| `timeout_ms` | 30000 | limit for the connect, the TLS handshake, and each single read or write; a server that keeps sending slowly never trips it (see `deadline_ms`) |
+| `deadline_ms` | 0 | limit for the whole `fetch` (connect, handshake, every redirect and reading the whole body); 0 means none, a negative value is an `InvalidInput` error |
 | `max_redirects` | 5 | redirects to follow; 0 returns the redirect response as it is |
 | `limits` | see below | caps on what a response may send |
 
@@ -56,6 +57,19 @@ address in brackets), an optional port, and an optional path and query. The
 scheme is case-insensitive, the default ports are 80 and 443, and a missing
 path is `/`. A fragment is dropped. Credentials in the URL (`user@host`),
 other schemes, spaces and control characters are errors.
+
+## Deadlines
+
+`timeout_ms` bounds each wait, so a server that sends one byte every few
+seconds can keep a request open for as long as it likes. `deadline_ms` bounds
+the request as a whole: the time is counted from the start of `fetch` and shared
+by every redirect, and every read and write is given only what is left of it.
+When it runs out the call throws an `IoError` of kind `TimedOut` whose `detail`
+is `deadline exceeded`, however the wait ended, and the connection is closed.
+
+Two things can overrun it: resolving a host name is not interruptible, and a TLS
+connection spends up to the time left on the TCP connect and then up to the
+same on the handshake. Neither is by more than one `timeout_ms`.
 
 ## Redirects
 

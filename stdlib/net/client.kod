@@ -2,7 +2,10 @@
 import "net/http" { Headers, Request, Response, Limits, Url, parse_url, resolve, write_request, read_response, invalid }
 import "net/tcp"
 import "net/tls"
-import "stream" { BufReader, Reader, Writer }
+import "fd" { Fd }
+import "net/tls" { TlsStream }
+import "stream" { IoError, BufReader, Reader, Writer }
+import "time"
 
 type Options = struct {
     headers: Headers = Headers()
@@ -11,6 +14,93 @@ type Options = struct {
     timeout_ms: int64 = 30000
     max_redirects: int64 = 5
     limits: Limits = Limits()
+    deadline_ms: int64 = 0
+}
+
+func deadline_error() -> IoError {
+    return IoError(kind: .TimedOut, op: "http", errno: 0, detail: "deadline exceeded")
+}
+
+// How long the next wait may last: `timeout_ms`, or less when the deadline
+// (a monotonic time in ns, 0 for none) is nearer. Fails when it has passed.
+func wait_ms(timeout_ms: int64, deadline_ns: int64) -> int64 or Error {
+    if deadline_ns == 0 {
+        return timeout_ms
+    }
+    let left_ns = deadline_ns - time.monotonic_ns()
+    if left_ns <= 0 {
+        throw deadline_error()
+    }
+    let left_ms = (left_ns + 999999) / 1000000
+    if left_ms < timeout_ms {
+        return left_ms
+    }
+    return timeout_ms
+}
+
+// A wait that ended in `TimedOut` after the deadline is a deadline error.
+func after_wait(anon e: Error, deadline_ns: int64) -> Error {
+    if deadline_ns != 0 and time.monotonic_ns() >= deadline_ns {
+        if e is IoError(io) {
+            if io.kind == .TimedOut {
+                return deadline_error()
+            }
+        }
+    }
+    return e
+}
+
+// A plain connection whose every read and write is limited by the deadline.
+type TcpLink = struct {
+    conn: Fd
+    timeout_ms: int64
+    deadline_ns: int64
+
+    func read(self, anon max: int64) -> bytes or Error {
+        let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
+        try tcp.set_timeout(self.conn, ms: ms)
+        let got = self.conn.read(max)
+        if got is Err(e) {
+            throw after_wait(e, deadline_ns: self.deadline_ns)
+        }
+        return try got
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
+        try tcp.set_timeout(self.conn, ms: ms)
+        let put = self.conn.write(data)
+        if put is Err(e) {
+            throw after_wait(e, deadline_ns: self.deadline_ns)
+        }
+        return try put
+    }
+}
+
+type TlsLink = struct {
+    conn: TlsStream
+    timeout_ms: int64
+    deadline_ns: int64
+
+    func read(self, anon max: int64) -> bytes or Error {
+        let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
+        try self.conn.set_timeout(ms: ms)
+        let got = self.conn.read(max)
+        if got is Err(e) {
+            throw after_wait(e, deadline_ns: self.deadline_ns)
+        }
+        return try got
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
+        try self.conn.set_timeout(ms: ms)
+        let put = self.conn.write(data)
+        if put is Err(e) {
+            throw after_wait(e, deadline_ns: self.deadline_ns)
+        }
+        return try put
+    }
 }
 
 // Write `req` to `w` and read the response from `r`, which may be the same
@@ -22,20 +112,21 @@ func talk(anon r: Reader, anon w: Writer, anon req: Request, options: Options) -
 }
 
 // One request on its own connection, closed afterwards.
-func exchange(anon req: Request, options: Options) -> Response or Error {
+func exchange(anon req: Request, options: Options, deadline_ns: int64) -> Response or Error {
     let url = req.url
+    let connect_ms = try wait_ms(timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
     if url.scheme == "https" {
-        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: options.timeout_ms)
-        try conn.set_timeout(ms: options.timeout_ms)
-        let result = talk(conn, conn, req, options: options)
+        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: connect_ms)
+        let link = TlsLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
+        let result = talk(link, link, req, options: options)
         if conn.close() is Err(_) {
             return result
         }
         return result
     }
-    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: options.timeout_ms)
-    try tcp.set_timeout(conn, ms: options.timeout_ms)
-    let result = talk(conn, conn, req, options: options)
+    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: connect_ms)
+    let link = TcpLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
+    let result = talk(link, link, req, options: options)
     if conn.close() is Err(_) {
         return result
     }
@@ -64,6 +155,13 @@ func without(anon headers: Headers, anon names: [str]) -> Headers {
 }
 
 func fetch(anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+    if options.deadline_ms < 0 {
+        throw invalid("fetch", "deadline_ms cannot be negative")
+    }
+    mut deadline_ns: int64 = 0
+    if options.deadline_ms > 0 {
+        deadline_ns = time.monotonic_ns() + options.deadline_ms * 1000000
+    }
     mut current = try parse_url(url)
     mut verb = method
     mut payload = options.body
@@ -71,7 +169,7 @@ func fetch(anon method: str, anon url: str, options: Options = Options()) -> Res
     mut hops: int64 = 0
     for true {
         let req = Request(method: verb, url: current, headers: headers, body: payload)
-        let resp = try exchange(req, options: options)
+        let resp = try exchange(req, options: options, deadline_ns: deadline_ns)
         let location = resp.header("location")
         if is_redirect(resp.status) == false or location is none or options.max_redirects <= 0 {
             return resp

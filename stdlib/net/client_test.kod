@@ -4,6 +4,7 @@ import "net/tcp"
 import "stream" { IoError, IoKind }
 import "process"
 import "io"
+import "time"
 
 // These tests talk to tests/support/http_fixture.py, a scripted local server,
 // and (for https) to `openssl s_server`.
@@ -260,6 +261,74 @@ test "limits cap the body a server can send" {
     let few = Options(limits: Limits(max_body: 1000, max_header_bytes: 65536, max_headers: 10))
     assert fails(fetch("GET", url(sv, "/bomb"), options: few), .Protocol, "too many headers")
     stop(sv)
+}
+
+// ---- deadlines ----
+
+test "deadline_ms: a request that finishes in time is untouched" {
+    let sv = start_fixture()
+    let options = Options(deadline_ms: 5000)
+    assert (must fetch("GET", url(sv, "/hello"), options: options)).text() == "hello"
+    stop(sv)
+}
+
+test "deadline_ms: a slow answer is cut off, though no single wait is long" {
+    let sv = start_fixture()
+    let options = Options(deadline_ms: 300)
+    let r = fetch("GET", url(sv, "/slow"), options: options)
+    assert fails(r, .TimedOut, "deadline exceeded")
+    stop(sv)
+}
+
+test "deadline_ms: a body that dribbles in is cut off while every read progresses" {
+    let sv = start_fixture()
+    let slow = Options(deadline_ms: 300)
+    assert fails(fetch("GET", url(sv, "/dribble"), options: slow), .TimedOut, "deadline exceeded")
+    let whole = Options()
+    assert len((must fetch("GET", url(sv, "/dribble"), options: whole)).body) == 20
+    let patient = Options(deadline_ms: 5000)
+    assert len((must fetch("GET", url(sv, "/dribble"), options: patient)).body) == 20
+    stop(sv)
+}
+
+test "deadline_ms: redirects share one deadline" {
+    let sv = start_fixture()
+    let tight = Options(deadline_ms: 600)
+    assert fails(fetch("GET", url(sv, "/hop1"), options: tight), .TimedOut, "deadline exceeded")
+    let roomy = Options(deadline_ms: 5000)
+    assert (must fetch("GET", url(sv, "/hop1"), options: roomy)).text() == "hello"
+    stop(sv)
+}
+
+test "deadline_ms: the elapsed time is near the deadline, not the server's delay" {
+    let sv = start_fixture()
+    let t0 = time.monotonic_ns()
+    let r = fetch("GET", url(sv, "/slow"), options: Options(deadline_ms: 250))
+    let ms = (time.monotonic_ns() - t0) / 1000000
+    assert r is Err(_)
+    assert ms >= 200 and ms < 1000
+    stop(sv)
+}
+
+test "deadline_ms: a deadline shorter than timeout_ms wins, a longer one loses" {
+    let sv = start_fixture()
+    let by_timeout = Options(timeout_ms: 200, deadline_ms: 5000)
+    assert fails(fetch("GET", url(sv, "/slow"), options: by_timeout), .TimedOut, "")
+    stop(sv)
+}
+
+test "deadline_ms: 0 means none, a negative value is refused" {
+    let sv = start_fixture()
+    assert (must fetch("GET", url(sv, "/hello"), options: Options(deadline_ms: 0))).status == 200
+    assert fails(fetch("GET", url(sv, "/hello"), options: Options(deadline_ms: -1)), .InvalidInput, "deadline")
+    stop(sv)
+}
+
+test "deadline_ms: a connection refused is still ConnectionRefused" {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    assert fails(fetch("GET", f"http://127.0.0.1:{port}/", options: Options(deadline_ms: 5000)), .ConnectionRefused, "")
 }
 
 // ---- https ----

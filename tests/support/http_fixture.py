@@ -66,6 +66,17 @@ class Handler(socketserver.StreamRequestHandler):
     def github(self, target: str, path: str, headers: list[tuple[str, str]]) -> bytes:
         return github(target, path, headers)
 
+    def dribble(self) -> bytes:
+        """A 20-byte body sent a byte at a time, 50 ms apart: every read makes
+        progress, the whole takes a second."""
+        self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n")
+        self.wfile.flush()
+        for _ in range(20):
+            time.sleep(0.05)
+            self.wfile.write(b"x")
+            self.wfile.flush()
+        return b""
+
     def route(
         self,
         method: str,
@@ -121,6 +132,14 @@ class Handler(socketserver.StreamRequestHandler):
         if path == "/slow":
             time.sleep(1.5)
             return reply("200 OK", b"late")
+        if path == "/dribble":
+            return self.dribble()
+        if path == "/hop1":
+            time.sleep(0.4)
+            return redirect("302 Found", "/hop2")
+        if path == "/hop2":
+            time.sleep(0.4)
+            return redirect("302 Found", "/hello")
         if path == "/big":
             return reply("200 OK", b"x" * 3_000_000)
         if path == "/truncated":
