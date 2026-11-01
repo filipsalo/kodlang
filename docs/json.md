@@ -4,19 +4,65 @@ icon: lucide/braces
 
 # JSON
 
-`stdlib/json.kod` parses and emits JSON.
+`stdlib/json.kod` parses and emits JSON, strictly as RFC 8259 defines it.
 
 ## Quick example
 
 ```kod
 import "json"
 
-let v: json.Value = json.parse("[1, 2, 3]")
-// v is Array([Number(1), Number(2), Number(3)])
-
-let s: str = json.emit(v)
-// s is "[1,2,3]"
+func main() -> int64 or Error {
+    let v = try json.parse("{\"name\": \"kod\", \"tags\": [1, 2.5, \"\\u00e9\"]}")
+    let name = json.as_str(json.get(v, key: "name"))
+    print(name? or "?")                       // kod
+    print(json.emit(v))                       // {"name":"kod","tags":[1,2.5,"é"]}
+    print(json.emit_pretty(v))
+    return 0
+}
 ```
+
+## Parsing
+
+```kod
+func parse(anon src: str, max_depth: int64 = 512) -> Value or Error
+```
+
+Malformed input is an error you can handle, never a panic. The error is a
+`JsonError`, which carries where it went wrong:
+
+```kod
+type JsonError = struct {
+    message: str     // "unexpected character", "unterminated string", ...
+    offset: int64    // byte offset in the input
+    line: int64      // 1-based
+    column: int64    // 1-based, in bytes
+}
+```
+
+Its `to_str` reads `json: unexpected character at line 2, column 7`. Recover
+it with a downcast (`e is JsonError(je)`, see
+[Types](types.md#recovering-the-concrete-error-type)).
+
+What the parser accepts is exactly JSON text: one value, with optional
+whitespace (space, tab, newline, carriage return) around it. It rejects, with an
+error saying what and where:
+
+- an empty input, text after the value, and a missing or doubled comma,
+  colon or bracket;
+- trailing commas, comments, single quotes, unquoted keys, `NaN`,
+  `Infinity` and a leading `+`;
+- numbers like `01`, `-`, `1.`, `.5`, `1e` and `0x10`;
+- a raw control character (below U+0020) inside a string;
+- an escape other than `\" \\ \/ \b \f \n \r \t \uXXXX`;
+- a `\u` escape that isn't four hex digits, and an unpaired surrogate
+  (`\ud800` not followed by `\udc00`..`\udfff`, or a lone low surrogate);
+- nesting deeper than `max_depth`, which stops `[[[[...` from exhausting the
+  stack. Depth counts the arrays and objects around a value, so `max_depth: 1`
+  allows `[1]` and not `[[1]]`.
+
+A UTF-8 byte order mark at the start is skipped. Bytes of 0x80 and up inside
+strings are taken as they are: the parser doesn't check that they are valid
+UTF-8.
 
 ## The `Value` type
 
@@ -24,37 +70,58 @@ let s: str = json.emit(v)
 type Value = enum {
     Null
     Bool(value: bool)
-    Number(value: int64)        // int64 only — floats not supported
+    Number(value: int64)
     Str(value: str)
     Array(items: [Value])
     Object(keys: [str], values: [Value])
+    Decimal(text: str)
 }
 ```
 
-Object entries are stored as parallel arrays (`keys[i]` ↔ `values[i]`)
-rather than a separate `Entry` struct, so the type stays
-single-recursive.
+An integer that fits in `int64` is a `Number` (`-0` is `Number(0)`). Any other
+number is a `Decimal`: one with a fraction or an exponent (`2.5`, `1e3`,
+`-0.0`), or an integer too large for `int64`. A `Decimal` keeps the number's
+text exactly as it was written, so nothing is rounded and it is written back
+unchanged; Kod has no floating-point type to hold it. `\uXXXX` escapes are
+decoded into UTF-8, with a surrogate pair giving one four-byte character, and
+`\u0000` gives a NUL byte inside the `str`.
+
+Object entries are stored as parallel arrays (`keys[i]` is the key of
+`values[i]`), in the order they were written. A repeated key is kept, and
+`get` finds the first.
 
 ## Accessors
 
-Free functions (Kod doesn't yet support methods on enums) that return
-`T?` so callers can chain via `let .Some(v) = ... else`:
+Free functions (Kod has no methods on enums). None of them can fail: they
+return `Null` or `none` when the value isn't what you asked for, so
+`get(get(v, key: "a"), key: "b")` is safe on any input.
 
 | Function | Returns |
 |---|---|
-| `get(v: Value, key: str) -> Value` | Object lookup. Returns `Null` if the key is missing or `v` isn't an Object. |
-| `as_str(v: Value) -> str?` | Unwrap to a string, `none` if not `Str`. |
-| `as_int(v: Value) -> int64?` | Unwrap to an integer, `none` if not `Number`. |
-| `as_bool(v: Value) -> bool?` | Unwrap to a bool, `none` if not `Bool`. |
+| `get(v, key)` | the first value of that key in an object; `Null` if the key is missing or `v` isn't an object |
+| `at(v, index)` | the element of an array; `Null` if out of range or `v` isn't an array |
+| `as_str(v)` | `str?`, for a `Str` |
+| `as_int(v)` | `int64?`, for a `Number` (a `Decimal` is `none`, even `3.0`) |
+| `as_bool(v)` | `bool?`, for a `Bool` |
+| `as_array(v)` | `[Value]?`, for an `Array` |
+| `as_number_text(v)` | `str?`, the text of a `Number` or a `Decimal` |
+| `is_null(v)` | `bool` |
+
+## Emitting
 
 ```kod
-let .Some(method) = json.as_str(json.get(req, key: "method")) else { return }
-let .Some(id) = json.as_int(json.get(req, key: "id")) else { return }
+func emit(anon v: Value) -> str
+func emit_pretty(anon v: Value, indent: int64 = 2) -> str
 ```
 
-## Limitations
+`emit` writes compact JSON with no spaces. `emit_pretty` puts each array
+element and object entry on its own line, indented by `indent` spaces per
+level, with `": "` after a key; an empty array or object is `[]` or `{}`, and
+there is no newline at the end. Both write strings with `\"`, `\\`, `\b`,
+`\f`, `\n`, `\r`, `\t` and `\u00XX` for any other control character, and leave
+everything else, UTF-8 included, as it is. The text of a `Decimal` is written
+verbatim; a `Decimal` built by hand whose text isn't a JSON number is written
+as `null`, so the output is always valid JSON.
 
-- Numbers are int64 only.
-- String escapes: `\n \t \r \" \\ \/`. No `\uXXXX`.
-- Strict JSON: no trailing commas, no comments.
-- Parse failure currently panics rather than returning an error type.
+`emit(parse(s))` and `s` mean the same JSON, with these exceptions: the
+whitespace, the choice of escapes in strings, and `-0` written as `0`.

@@ -15,7 +15,7 @@ exhaustiveness checks), generics (monomorphised), interfaces, `T?`, `T or Error`
 and `test` blocks. The stdlib covers file and process I/O, `Map` / `Set`, sorting, time,
 CRC-32, deflate / gzip, a minimal JSON, and LSP-style JSON-RPC framing.
 
-## Next milestone: networking → HTTP → JSON
+## Last milestone (done): networking → HTTP → JSON
 
 Grow the stdlib far enough to talk to HTTP services and handle real JSON. In order:
 
@@ -31,8 +31,10 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
    response parsing with `Content-Length`, chunked and read-to-close bodies and size limits;
    no network code) and `stdlib/net/client.kod` (`get`, `post`, `fetch` over TCP or TLS, with
    redirects). See `docs/http.md`.
-4. **Robust JSON** — parse errors returned as values instead of panics, `\uXXXX` escapes,
-   non-integer numbers, and pretty-printing.
+4. **Robust JSON** — done: `json.parse` returns `Value or Error` with the position of a
+   syntax error, follows RFC 8259 strictly (including `\uXXXX` and surrogate pairs), keeps
+   numbers it can't hold as `Decimal` text, bounds nesting depth, and `emit_pretty` indents.
+   See `docs/json.md`.
 
 Done on the way: `str` has `starts_with`, `ends_with`, `find`, `split`, `trim`, `join`, `replace`,
 `lower`, `upper`, `parse_int` and friends, and `StrBuilder` (`stdlib/strbuilder.kod`) appends in

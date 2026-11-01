@@ -86,6 +86,25 @@ def test_initialize_then_shutdown(lsp_binary):
     assert shutdown["result"] is None
 
 
+def test_a_message_that_is_not_json_is_skipped(lsp_binary):
+    """Bad JSON used to panic the server; now it is dropped and the session
+    goes on."""
+    good = frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    junk = b'Content-Length: 9\r\n\r\n{"a": 1,]'
+    truncated = b"Content-Length: 5\r\n\r\n[1, 2"
+    tail = frame({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None})
+    exit_ = frame({"jsonrpc": "2.0", "method": "exit", "params": None})
+    result = subprocess.run(
+        [str(lsp_binary)],
+        input=good + junk + truncated + tail + exit_,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    responses = parse_frames(result.stdout)
+    assert [r["id"] for r in responses] == [1, 2]
+
+
 def test_did_open_with_error_emits_diagnostic(lsp_binary):
     bad_source = "func main() -> int64 {\n  does_not_exist()\n  return 0\n}\n"
     responses = drive(
@@ -824,7 +843,7 @@ def test_completion_offers_globals_at_bare_identifier(lsp_binary):
 
 def test_completion_module_qualified_returns_imports_exports(lsp_binary):
     # After `io.`, completions should be io's exported functions.
-    source = 'import "io"\n' "func main() -> int64 {\n" "  io.\n" "  return 0\n" "}\n"
+    source = 'import "io"\nfunc main() -> int64 {\n  io.\n  return 0\n}\n'
     responses = drive(
         lsp_binary,
         [
@@ -868,13 +887,7 @@ def test_completion_str_methods_on_typed_variable(lsp_binary):
     # After `s.`, where `s: str` was declared above, completions should
     # include the methods registered on str (to_str, hash, code_points,
     # char_at, contains, …).
-    source = (
-        "func main() -> int64 {\n"
-        '  let s: str = "hello"\n'
-        "  s.\n"
-        "  return 0\n"
-        "}\n"
-    )
+    source = 'func main() -> int64 {\n  let s: str = "hello"\n  s.\n  return 0\n}\n'
     responses = drive(
         lsp_binary,
         [
