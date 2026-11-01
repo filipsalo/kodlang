@@ -1190,12 +1190,51 @@ type Parser = struct {
 				break
 			}
 			let pat: int64 = self.parse_match_arm_pattern()
-			mut body: int64 = self.parse_expr()
-			arms += [self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body))]
+			mut body: int64 = 0
+			mut pre: [int64] = []
+			if self.at(.OpenCurly) {
+				// A block arm: its last statement is the arm's value.
+				let open_tok: lexing.Token = self.peek()
+				pre = self.parse_block()
+				mut valued = false
+				if len(pre) > 0 {
+					let last_id: int64 = pre[len(pre) - 1]
+					if self.stmts[last_id] is ast.Stmt.ExprStmt(last) {
+						body = last
+						pre = pre[0..len(pre) - 1]
+						valued = true
+					}
+					if self.stmts[last_id] is ast.Stmt.Return(_value) {
+						body = self.unreachable_value()
+						valued = true
+					}
+					if self.stmts[last_id] is ast.Stmt.Throw(_thrown) {
+						body = self.unreachable_value()
+						valued = true
+					}
+				}
+				if valued == false {
+					self.record_error("error: a match arm's block must end with an expression, the arm's value", got: open_tok)
+					body = self.alloc_expr(ast.Expr.IntLit(value: 0), span: self.here())
+				}
+			} else {
+				body = self.parse_expr()
+			}
+			arms += [self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre))]
 			self.skip_newlines()
 		}
 		self.expect(.CloseCurly)
 		return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
+	}
+
+	// The value of a block arm that ends in `return` or `throw`: a call that
+	// never returns, which the arm never gets to.
+	func unreachable_value(self) -> int64 {
+		let span: ast.Span = self.here()
+		let callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "kod_panic"), :span)
+		let message: int64 = self.alloc_expr(ast.Expr.StrLit(value: "unreachable"), :span)
+		let args: [ast.CallArg] = [ast.CallArg(label: "", label_span: span, value: message)]
+		return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
 	}
 
 	// Parse a match-arm's pattern and the connecting token. `else { ... }`,
@@ -2593,6 +2632,9 @@ type Renamer = struct {
 					let mark = self.top
 					self.depth += 1
 					self.bind_pattern(match_arm.pattern)
+					for stmt_id in match_arm.pre {
+						self.stmt(stmt_id)
+					}
 					self.expr(match_arm.body)
 					self.depth -= 1
 					self.end_scope(mark)

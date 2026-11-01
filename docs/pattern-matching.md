@@ -156,7 +156,7 @@ if x is not none {
 
 ## Match as expression
 
-A `match` produces a value when every arm body is a single expression:
+A `match` produces a value when every arm has a value, in the simplest case a single expression:
 
 ```kod
 let label: str = match direction {
@@ -208,8 +208,28 @@ doesn't use the value, so its arms may return `none`. Without an annotation, a m
 all `none` is an error too, as `let x = none` is, since its type can't be
 inferred.
 
-For multi-statement arm bodies, use a match statement and assign or
-return from inside.
+## Arms with several statements
+
+An arm of a match expression may be a block. Its last statement must be an
+expression, and that expression is the arm's value; the statements before it
+run first, and what they bind is gone after the arm:
+
+```kod
+let size: int64 = match shape {
+    Shape.Circle(r) -> {
+        let d = 2 * r
+        d * 3
+    }
+    Shape.Rect(w, h) -> w * h
+}
+```
+
+The block is an ordinary block, so it may `return`, `throw` or `try` (they leave
+the function, not just the arm), and an arm without braces is still one
+expression. `else { ... }` takes a block too. A block that is empty, or whose
+last statement is not an expression (`let`, `if`, an assignment), is an error:
+the arm would have no value. A match *statement* needs none of this, since its
+arms are blocks already.
 
 ## `if X is .Variant(bindings) { ... }`
 

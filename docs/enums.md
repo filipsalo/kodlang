@@ -213,7 +213,8 @@ other side's enum doesn't declare.
 
 ## `match` as an expression
 
-A match can produce a value when every arm body is an expression:
+A match can produce a value when every arm has a value: an expression, or a
+[block ending in one](pattern-matching.md#arms-with-several-statements):
 
 ```kod
 let label: str = match d {
