@@ -455,6 +455,22 @@ can appear anywhere a value can, as in `out += [try parse(s)]` or
 explicit `Result[T, E]` with an `E` other than `Error` doesn't count, since
 its error isn't an `Error` to report or pass on; match it instead.
 
+A call whose result is a `T or Error` can't be used as a statement on its own, because
+that would drop an error without a word:
+
+```kod
+file.close()               // error: the `none or Error` result of this call is dropped
+try file.close()           // propagate it
+must file.close()          // panic on it
+let _ = file.close()       // ignore it, on purpose
+```
+
+`let _ = expr` evaluates `expr`, whatever its type, and keeps nothing: it binds no
+name, so it can be written any number of times in a block, and `_` can't be read
+afterwards. It is for fallible calls whose failure doesn't matter, like closing a
+connection that already failed. Any other value can be dropped by calling it as a
+statement, as before.
+
 A `none or Error` function that ends without a `return`, or with a bare
 `return`, returns `Ok(none)`, as `return none` does.
 
