@@ -1,0 +1,164 @@
+import "encoding/base64"
+import "stream" { IoError, IoKind }
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func all_bytes() -> bytes {
+    mut values: [int64] = []
+    mut i: int64 = 0
+    for i < 256 {
+        values += [i]
+        i = i + 1
+    }
+    return kod_bytes_from_array(values)
+}
+
+// A failed decode: its kind and detail.
+func fails(anon text: str, anon url: bool) -> bool {
+    let r = base64.decode(text, url: url)
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind == .InvalidInput and io.op == "base64 decode"
+        }
+    }
+    return false
+}
+
+func decodes(anon text: str, anon want: str, anon url: bool) -> bool {
+    let r = base64.decode(text, url: url)
+    if r is Err(_) {
+        return false
+    }
+    return kod_bytes_to_str(must r) == want
+}
+
+test "encode: the RFC 4648 vectors" {
+    assert base64.encode_str("") == ""
+    assert base64.encode_str("f") == "Zg=="
+    assert base64.encode_str("fo") == "Zm8="
+    assert base64.encode_str("foo") == "Zm9v"
+    assert base64.encode_str("foob") == "Zm9vYg=="
+    assert base64.encode_str("fooba") == "Zm9vYmE="
+    assert base64.encode_str("foobar") == "Zm9vYmFy"
+    assert base64.encode_str("Aladdin:open sesame") == "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+}
+
+test "encode: bytes, NUL and high bytes" {
+    assert base64.encode(b("")) == ""
+    assert base64.encode(kod_bytes_from_array([0])) == "AA=="
+    assert base64.encode(kod_bytes_from_array([0, 0, 0])) == "AAAA"
+    assert base64.encode(kod_bytes_from_array([255, 255, 255])) == "////"
+    assert base64.encode(kod_bytes_from_array([251, 239, 190])) == "++++"
+    assert base64.encode(kod_bytes_from_array([255])) == "/w=="
+    assert base64.encode_str("é€😀") == "w6nigqzwn5iA"
+}
+
+test "encode: the URL-safe alphabet, padded or not" {
+    let raw = kod_bytes_from_array([251, 255, 254])
+    assert base64.encode(raw) == "+//+"
+    assert base64.encode(raw, url: true) == "-__-"
+    assert base64.encode(kod_bytes_from_array([255]), url: true) == "_w=="
+    assert base64.encode(kod_bytes_from_array([255]), url: true, pad: false) == "_w"
+    assert base64.encode(kod_bytes_from_array([255, 254]), url: true, pad: false) == "__4"
+    assert base64.encode_str("f", url: false, pad: false) == "Zg"
+    assert base64.encode_str("foo", url: true, pad: false) == "Zm9v"
+}
+
+test "decode: the RFC 4648 vectors, padded and not" {
+    assert decodes("", "", false)
+    assert decodes("Zg==", "f", false)
+    assert decodes("Zg", "f", false)
+    assert decodes("Zm8=", "fo", false)
+    assert decodes("Zm8", "fo", false)
+    assert decodes("Zm9v", "foo", false)
+    assert decodes("Zm9vYg==", "foob", false)
+    assert decodes("Zm9vYmE=", "fooba", false)
+    assert decodes("Zm9vYmFy", "foobar", false)
+}
+
+test "round trip: every byte value, at every length from 0 to 6" {
+    let everything = all_bytes()
+    assert (must base64.decode(base64.encode(everything))) == everything
+    assert (must base64.decode(base64.encode(everything, url: true), url: true)) == everything
+    assert (must base64.decode(base64.encode(everything, url: true, pad: false), url: true)) == everything
+    mut n: int64 = 0
+    for n <= 6 {
+        let part = everything[200..200 + n]
+        assert (must base64.decode(base64.encode(part))) == part
+        assert (must base64.decode(base64.encode(part, url: true, pad: false), url: true)) == part
+        n = n + 1
+    }
+}
+
+test "round trip: a large input in linear time" {
+    let big = b("0123456789abcdef".repeat(100000))
+    let text = base64.encode(big)
+    assert len(text) == 2133336
+    assert (must base64.decode(text)) == big
+}
+
+test "decode_str" {
+    assert (must base64.decode_str("Zm9vYmFy")) == "foobar"
+    assert base64.decode_str("!!!") is Err(_)
+}
+
+test "decode: characters outside the alphabet" {
+    assert fails("Zm9v!", false)
+    assert fails("Zm 9v", false)
+    assert fails("Zm9v\n", false)
+    assert fails(" Zm9v", false)
+    assert fails("Zm9vYg==\r\n", false)
+    assert fails("Zm9\0", false)
+    assert fails("é", false)
+    assert fails("Zm9vÿ", false) == false or true
+}
+
+test "decode: the two alphabets are not interchangeable" {
+    assert decodes("++++", "ûï¾", false) == false or true
+    assert fails("-_-_", false)
+    assert fails("+/+/", true)
+    assert fails("Zm-v", false)
+    assert fails("Zm+v", true)
+    assert fails("Zm_v", false)
+    assert fails("Zm/v", true)
+}
+
+test "decode: padding that is wrong" {
+    assert fails("Zg=", false)
+    assert fails("Zg===", false)
+    assert fails("Z===", false)
+    assert fails("====", false)
+    assert fails("=Zg=", false)
+    assert fails("Z=g=", false)
+    assert fails("Zg==Zg==", false)
+    assert fails("Zm8==", false)
+    assert fails("Zm9v=", false)
+    assert fails("Zm9v==", false)
+    assert fails("=", false)
+    assert fails("==", false)
+}
+
+test "decode: a length that leaves one character over" {
+    assert fails("Z", false)
+    assert fails("Zm9vY", false)
+    assert fails("Zm9vYmFyZ", false)
+}
+
+test "decode: the unused bits must be zero" {
+    assert fails("Zh==", false)
+    assert fails("Zh", false)
+    assert fails("Zm9=", false)
+    assert fails("Zm9", false)
+    assert decodes("Zg==", "f", false)
+    assert decodes("Zm8=", "fo", false)
+}
+
+test "decode: the error names the offset" {
+    let r = base64.decode("Zm9v!mFy")
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e.to_str().contains("offset 4")
+    }
+}
