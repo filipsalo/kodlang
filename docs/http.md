@@ -136,6 +136,20 @@ let url = with_query("https://api.example.com/search", q)
 | `Query` | `add(name, value)` appends a pair, `to_str()` joins them as `name=value&name=value`, with names and values encoded; no pairs give `""` |
 | `with_query(url, q)` | `url` plus `?` and the query, or `&` if `url` already has a `?`; an empty query returns `url` as it is; a `#fragment` stays at the end |
 
+## Basic authentication
+
+`basic_auth(user, password)` returns the value for an `Authorization` header,
+`Basic ` and the base64 of `user:password` (RFC 7617). The text is taken as
+bytes, so UTF-8 passes through unchanged. A `user` containing `:` is an
+`InvalidInput` error, because the colon is what separates the two.
+
+```kod
+import "net/http" { basic_auth }
+
+let options = Options()
+options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))
+```
+
 ## Building and reading by hand
 
 `net/http` has what `client` is made of:

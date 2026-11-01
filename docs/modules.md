@@ -119,6 +119,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `strbuilder`, `stream`, `fd` | `StrBuilder`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
 | `net/tcp`, `net/tls`, `net/http`, `net/client` | TCP, TLS, HTTP/1.1 messages and an HTTP client. See [Streams](io.md) and [HTTP client](http.md). |
 | `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
+| `encoding/base64` | Base64, standard and URL-safe, strict decoding. See [Encodings](encoding.md). |
 | `hash/crc32` | CRC-32 (gzip polynomial), streaming or one-shot. |
 | `compress/deflate`, `compress/gzip` | Deflate encoder (fixed Huffman, optional LZ77) and a gzip writer. |
 | `kod/ast` | AST node types (for the self-hosted compiler). |

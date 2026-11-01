@@ -43,7 +43,7 @@ amortised constant time (see `docs/strings.md`). `stdlib/stream.kod` and `stdlib
 
 `examples/github_repo.kod` ties it together as a worked API client (walked through in
 `docs/api-client.md`), with `env` for tokens, `json.ObjectBuilder` for bodies and `Query` /
-`percent_encode` for URLs.
+`percent_encode` for URLs, and `encoding/base64` with `basic_auth` for credentials.
 
 Language work along the way, as these modules need it: `\x` / `\u` string escapes,
 module-level constants (top-level `let` is currently an error), and the
