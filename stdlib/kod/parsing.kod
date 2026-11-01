@@ -110,6 +110,104 @@ func parse_hex_after_prefix(anon s: str) -> int64 {
 	return result
 }
 
+// The value of a hex digit, or -1 if `c` isn't one.
+func hex_digit_value(anon c: int64) -> int64 {
+	if c >= '0' and c <= '9' {
+		return c - '0'
+	}
+	if c >= 'a' and c <= 'f' {
+		return c - 'a' + 10
+	}
+	if c >= 'A' and c <= 'F' {
+		return c - 'A' + 10
+	}
+	return -1
+}
+
+// The UTF-8 encoding of code point `cp`, which must be a Unicode scalar value.
+func utf8_of(anon cp: int64) -> str {
+	if cp < 128 {
+		return kod_bytes_to_str(kod_bytes_from_array([cp]))
+	}
+	if cp < 2048 {
+		return kod_bytes_to_str(kod_bytes_from_array([192 + cp / 64, 128 + cp % 64]))
+	}
+	if cp < 65536 {
+		return kod_bytes_to_str(kod_bytes_from_array([224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]))
+	}
+	return kod_bytes_to_str(kod_bytes_from_array([240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64]))
+}
+
+// Index of the `}` that closes the `\u{...}` escape whose `u` is at `u_at`, or -1 if there
+// is no `{` after the `u` or the text between the braces isn't 1 to 6 hex digits.
+func read_unicode_escape(anon raw: str, u_at: int64) -> int64 {
+	let end: int64 = len(raw)
+	if u_at + 1 >= end or raw[u_at + 1] != '{' {
+		return -1
+	}
+	mut j: int64 = u_at + 2
+	mut digits: int64 = 0
+	for j < end and raw[j] != '}' {
+		if hex_digit_value(raw[j]) < 0 {
+			return -1
+		}
+		digits = digits + 1
+		j = j + 1
+	}
+	if j >= end or digits == 0 or digits > 6 {
+		return -1
+	}
+	return j
+}
+
+// The code point written between the braces of a `\u{...}` whose `u` is at `u_at`
+// and whose closing brace is at `close`.
+func unicode_escape_value(anon raw: str, u_at: int64, close: int64) -> int64 {
+	mut value: int64 = 0
+	mut j: int64 = u_at + 2
+	for j < close {
+		value = value * 16 + hex_digit_value(raw[j])
+		j = j + 1
+	}
+	return value
+}
+
+func is_scalar_value(anon cp: int64) -> bool {
+	return cp <= 1114111 and (cp < 55296 or cp > 57343)
+}
+
+// What is wrong with the first malformed `\x` or `\u` escape in a raw string body,
+// or "" if there is none. Other backslash sequences are never an error.
+func escape_problem(anon raw: str) -> str {
+	let end: int64 = len(raw)
+	mut i: int64 = 0
+	for i < end {
+		if raw[i] == '\\' and i + 1 < end {
+			i = i + 1
+			if raw[i] == 'x' {
+				if i + 2 >= end or hex_digit_value(raw[i + 1]) < 0 or hex_digit_value(raw[i + 2]) < 0 {
+					return "error: invalid escape `\\x`: it needs two hex digits"
+				}
+				i = i + 2
+			} else if raw[i] == 'u' {
+				if i + 1 >= end or raw[i + 1] != '{' {
+					return "error: invalid escape `\\u`: write the character as `\\u{...}`, for instance `\\u{1F600}`"
+				}
+				let close: int64 = read_unicode_escape(raw, u_at: i)
+				if close < 0 {
+					return "error: invalid escape `\\u{...}`: it needs 1 to 6 hex digits between the braces"
+				}
+				if is_scalar_value(unicode_escape_value(raw, u_at: i, close: close)) == false {
+					return "error: invalid escape `\\u{...}`: not a Unicode scalar value (above 10FFFF, or a surrogate)"
+				}
+				i = close
+			}
+		}
+		i = i + 1
+	}
+	return ""
+}
+
 // Process backslash escape sequences in a raw string body.
 func unescape_str(anon raw: str) -> str {
 	mut result: str = ""
@@ -120,27 +218,37 @@ func unescape_str(anon raw: str) -> str {
 			i = i + 1
 			if raw[i] == 'n' {
 				result = result + "\n"
-			}
-			if raw[i] == 't' {
+			} else if raw[i] == 't' {
 				result = result + "\t"
-			}
-			if raw[i] == 'r' {
+			} else if raw[i] == 'r' {
 				result = result + "\r"
-			}
-			if raw[i] == '\\' {
+			} else if raw[i] == '\\' {
 				result = result + "\\"
-			}
-			if raw[i] == '\'' {
+			} else if raw[i] == '\'' {
 				result = result + "'"
-			}
-			if raw[i] == '0' {
+			} else if raw[i] == '0' {
 				result = result + "\0"
-			}
-			if raw[i] == '"' {
+			} else if raw[i] == '"' {
 				// Append a literal " — written via slice because the
 				// `\"` escape can't appear in the source until lexer
 				// + this fn are both built with `\"` support.
 				result = result + raw[i..i+1]
+			} else if raw[i] == 'x' {
+				// `\xHH`: one byte. A malformed one is reported by escape_problem.
+				if i + 2 < end and hex_digit_value(raw[i + 1]) >= 0 and hex_digit_value(raw[i + 2]) >= 0 {
+					result = result + kod_bytes_to_str(kod_bytes_from_array([hex_digit_value(raw[i + 1]) * 16 + hex_digit_value(raw[i + 2])]))
+					i = i + 2
+				}
+			} else if raw[i] == 'u' {
+				// `\u{H...}`: a character, as UTF-8.
+				let close: int64 = read_unicode_escape(raw, u_at: i)
+				if close >= 0 {
+					let cp: int64 = unicode_escape_value(raw, u_at: i, close: close)
+					if is_scalar_value(cp) {
+						result = result + utf8_of(cp)
+						i = close
+					}
+				}
 			}
 		} else {
 			result = result + raw[i..i+1]
@@ -216,10 +324,16 @@ func is_triple_quoted(anon s: str) -> bool {
 // processing escape sequences. Handles both regular "..." and triple
 // """...""" forms.
 func parse_string_value(anon raw: str) -> str {
+	return unescape_str(string_body(raw))
+}
+
+// The text between the quotes of a string token, dedented if triple-quoted, with its
+// escape sequences still in it.
+func string_body(anon raw: str) -> str {
 	if is_triple_quoted(raw) {
-		return unescape_str(dedent_triple_body(raw[3..len(raw)-3]))
+		return dedent_triple_body(raw[3..len(raw)-3])
 	}
-	return unescape_str(raw[1..len(raw)-1])
+	return raw[1..len(raw)-1]
 }
 
 // ParseError is the structured diagnostic the parser produces when
@@ -411,6 +525,14 @@ type Parser = struct {
 		}
 		let end_col: int64 = col + width
 		self.errors += [ParseError(path: self.path, :line, :col, :end_col, :message, source_line: line_text, :caret)]
+	}
+
+	// Report a malformed `\x` or `\u` escape in the string body `body` of `tok`.
+	func check_escapes(self, anon body: str, tok: lexing.Token) -> none {
+		let problem: str = escape_problem(body)
+		if len(problem) > 0 {
+			self.record_error(problem, got: tok)
+		}
 	}
 
 	func check_literal_range(self, anon tok: lexing.Token) -> bool {
@@ -877,9 +999,16 @@ type Parser = struct {
 		for i < len(inner) {
 			mut j: int64 = i
 			for j < len(inner) and inner[j] != '{' {
-				j = j + 1
+				if inner[j] == '\\' and j + 1 < len(inner) and inner[j + 1] == '\\' {
+					j = j + 2
+				} else if inner[j] == '\\' and lexing.unicode_escape_end(inner, start: j) >= 0 {
+					j = lexing.unicode_escape_end(inner, start: j)
+				} else {
+					j = j + 1
+				}
 			}
 			if j > i {
+				self.check_escapes(inner[i..j], tok: lexing.Token(kind: .FStringLit, value: raw, start: span.start, end: span.start + 1))
 				let lit: str = unescape_str(inner[i..j])
 				parts += [self.alloc_expr(ast.Expr.StrLit(value: lit), :span)]
 			}
@@ -967,6 +1096,7 @@ type Parser = struct {
 		// String literal
 		if self.at(.StringLit) {
 			let tok: lexing.Token = self.advance()
+			self.check_escapes(string_body(tok.value), :tok)
 			return self.alloc_expr(ast.Expr.StrLit(value: parse_string_value(tok.value)), :span)
 		}
 		// Bytes literal: `b"..."`. The lexer emits the leading `b`
@@ -977,6 +1107,7 @@ type Parser = struct {
 			let tok: lexing.Token = self.advance()
 			let raw: str = tok.value
 			let body: str = raw[1..len(raw)]
+			self.check_escapes(string_body(body), :tok)
 			return self.alloc_expr(ast.Expr.BytesLit(value: parse_string_value(body)), :span)
 		}
 		// Boolean
