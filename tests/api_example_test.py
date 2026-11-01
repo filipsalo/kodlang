@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -147,3 +148,18 @@ def test_an_unreachable_api(example):
     assert r.stdout == ""
     assert r.stderr.startswith("error: ")
     assert "connect" in r.stderr
+
+
+def connections_so_far(api_url: str) -> int:
+    """How many connections the fixture has served, counting this request's."""
+    with urllib.request.urlopen(f"{api_url}/stats", timeout=10) as response:
+        return int(response.read())
+
+
+def test_both_requests_share_one_connection(example, api):
+    before = connections_so_far(api)
+    r = run(example, ["octo/hello"], api)
+    assert r.returncode == 0, r.stderr
+    after = connections_so_far(api)
+    # `before` and `after` each count the connection that asked for them.
+    assert after - before - 1 == 1
