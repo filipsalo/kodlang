@@ -107,9 +107,12 @@ let response = try post("https://api.example.com/issues", payload, content_type:
 
 ## What to know before relying on it
 
-- One request opens one connection and closes it; there is no keep-alive.
+- `get`, `post` and `fetch` open a connection for each request and close it. A program
+  that makes many requests to one host should create a `Client` and call its
+  `get`, `post` and `fetch` instead, which keep connections for reuse
+  ([Connection reuse](http.md#connection-reuse)).
 - `timeout_ms` applies to the connect, the TLS handshake and each read or write.
-  It does not bound a request as a whole.
+  Set `deadline_ms` to bound a request as a whole ([Deadlines](http.md#deadlines)).
 - TLS goes through the system's SecureTransport, which speaks TLS 1.2 at most. A
   server that insists on TLS 1.3 fails with a `Tls` error.
 - Numbers with a fraction or an exponent come back as `Decimal` text, because

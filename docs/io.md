@@ -187,6 +187,7 @@ func fetch_status_line(host: str) -> str or Error {
 | `set_timeout(f, ms)` | make a read or a write on `f` fail with `TimedOut` after `ms` milliseconds without progress; 0 means wait forever; `none or Error` |
 | `listen(host, port, backlog = 128)` | a `Listener` bound to `host:port`; an empty `host` means every IPv4 interface and port 0 picks a free port; `Listener or Error` |
 | `l.accept()` | the next connection, waiting for one; `Fd or Error` |
+| `is_idle(f)` | true if nothing is waiting to be read from `f`; false if it has data, an end of stream (the peer closed it) or an error pending |
 | `l.port()` | the port it is bound to |
 | `l.close()` | stop listening; `none or Error` |
 

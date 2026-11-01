@@ -1,16 +1,22 @@
 """A scripted HTTP server for stdlib/net/client_test.kod.
 
-Usage: http_fixture.py PORT. It answers on 127.0.0.1:PORT, one raw response per
-path (see ROUTES), and exits by itself after two minutes.
+Usage: http_fixture.py PORT [CERT KEY]. It answers on 127.0.0.1:PORT, one raw
+response per path (see Handler.route), over TLS 1.2 when a certificate and key
+are given, and exits by itself after two minutes. A connection stays open for
+the next request unless the request or the route says otherwise.
 """
 
 import os
 import socketserver
+import ssl
 import sys
 import threading
 import time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+TLS_FILES = sys.argv[2:4]
+LOCK = threading.Lock()
+STATE = {"connections": 0, "drops": 0, "flaky": 0}
 
 
 def reply(
@@ -42,10 +48,22 @@ def echo(
 
 
 class Handler(socketserver.StreamRequestHandler):
-    def handle(self) -> None:
+    def setup(self) -> None:
+        if TLS_FILES:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(TLS_FILES[0], TLS_FILES[1])
+            self.request = context.wrap_socket(self.request, server_side=True)
+        super().setup()
+        self.conn_id = 0
+        self.requests = 0
+        self.close_after = False
+        self.keep_open = False
+
+    def read_request(self) -> tuple[str, str, list[tuple[str, str]], bytes] | None:
         request_line = self.rfile.readline().decode("latin-1").rstrip("\r\n")
         if not request_line:
-            return
+            return None
         method, target, _ = request_line.split(" ", 2)
         headers: list[tuple[str, str]] = []
         while True:
@@ -59,9 +77,43 @@ class Handler(socketserver.StreamRequestHandler):
             if name.lower() == "content-length":
                 length = int(value)
         body = self.rfile.read(length) if length else b""
-        path = target.split("?", 1)[0]
-        self.wfile.write(self.route(method, target, path, headers, body))
-        self.wfile.flush()
+        return method, target, headers, body
+
+    def handle(self) -> None:
+        while True:
+            request = self.read_request()
+            if request is None:
+                return
+            method, target, headers, body = request
+            if self.requests == 0:
+                with LOCK:
+                    STATE["connections"] += 1
+                    self.conn_id = STATE["connections"]
+            self.requests += 1
+            self.close_after = False
+            self.keep_open = False
+            path = target.split("?", 1)[0]
+            response = self.route(method, target, path, headers, body)
+            if response is None:
+                return
+            self.wfile.write(response)
+            self.wfile.flush()
+            asked_close = any(
+                n.lower() == "connection" and "close" in v.lower() for n, v in headers
+            )
+            head = response.split(b"\r\n\r\n", 1)[0].lower()
+            status = head.split(b" ", 2)[1] if head.count(b" ") >= 2 else b""
+            bodyless = method == "HEAD" or status in (b"204", b"304")
+            framed = (
+                bodyless or b"content-length:" in head or b"transfer-encoding:" in head
+            )
+            if (
+                asked_close
+                or self.close_after
+                or not framed
+                or b"connection: close" in head
+            ):
+                return
 
     def github(self, target: str, path: str, headers: list[tuple[str, str]]) -> bytes:
         return github(target, path, headers)
@@ -84,9 +136,43 @@ class Handler(socketserver.StreamRequestHandler):
         path: str,
         headers: list[tuple[str, str]],
         body: bytes,
-    ) -> bytes:
+    ) -> bytes | None:
         if path.startswith("/repos/"):
             return self.github(target, path, headers)
+        if path == "/conn-id":
+            return reply("200 OK", f"conn {self.conn_id} req {self.requests}".encode())
+        if path == "/redir-id":
+            return redirect("302 Found", "/conn-id")
+        if path == "/lies":
+            # Says close but leaves the socket open: only the header can tell.
+            self.keep_open = True
+            return reply("200 OK", b"lies", "Connection: close\r\n")
+        if path == "/lies10":
+            self.keep_open = True
+            return b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nlies"
+        if path == "/close-after":
+            return reply("200 OK", b"bye", "Connection: close\r\n")
+        if path == "/http10":
+            self.close_after = True
+            return b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        if path == "/http10-keep":
+            return b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok"
+        if path == "/silent-close":
+            self.close_after = True
+            return reply("200 OK", b"closing")
+        if path == "/drop":
+            with LOCK:
+                STATE["drops"] += 1
+            return None
+        if path == "/drops":
+            return reply("200 OK", str(STATE["drops"]).encode())
+        if path == "/flaky":
+            with LOCK:
+                STATE["flaky"] += 1
+                first = STATE["flaky"] % 2 == 1
+            return None if first else reply("200 OK", b"recovered")
+        if path == "/flaky-count":
+            return reply("200 OK", str(STATE["flaky"]).encode())
         if path == "/hello":
             return reply(
                 "200 OK", b"hello", "Content-Type: text/plain\r\nX-A: 1\r\nX-A: 2\r\n"
@@ -143,6 +229,7 @@ class Handler(socketserver.StreamRequestHandler):
         if path == "/big":
             return reply("200 OK", b"x" * 3_000_000)
         if path == "/truncated":
+            self.close_after = True
             return b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort"
         if path == "/garbage":
             return b"NOT HTTP AT ALL\r\n\r\n"
