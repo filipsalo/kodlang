@@ -497,6 +497,8 @@ type Codegen = struct {
     body_instance: int64 = -1
     // A default checked at its declaration isn't compiled, so only its type is.
     checking_default: bool = false
+    // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
+    cur_owner: int64 = -1
 
     scopes: [ModuleScope] = []
     scope_idx: FuncIdx = FuncIdx()
@@ -8313,6 +8315,9 @@ type Codegen = struct {
                             self.check_sig_types(fd.params, return_typ: fd.return_typ)
                             self.check_param_count(fd.params, what: f"`{struct_name}.{fd.name}`", span: fd.name_span)
                             self.check_param_names(fd.params)
+                            if fd.name == "init" and (len(fd.params) == 0 or fd.params[0].name != "self") {
+                                self.report_error(f"error: generic struct `{struct_name}` can't declare `init` yet", span: fd.name_span)
+                            }
                         }
                     }
                     self.subst_names = saved_names
@@ -9471,11 +9476,14 @@ type Codegen = struct {
         let saved_p = self.p
         let saved_vars = self.vars
         let saved_log = self.bound_log
+        let saved_owner = self.cur_owner
         self.p = src_p
         self.vars = []
         self.bound_log = []
+        self.cur_owner = -1
         self.collect_expr_vars(default_id)
         let reg = self.compile_into(default_id, :expected)
+        self.cur_owner = saved_owner
         self.p = saved_p
         self.vars = saved_vars
         self.bound_log = saved_log
@@ -9491,8 +9499,11 @@ type Codegen = struct {
         self.bound_log = []
         self.stmt_error_mark = self.report_attempts
         self.checking_default = true
+        let saved_owner = self.cur_owner
+        self.cur_owner = -1
         self.collect_expr_vars(default_id)
         self.check_value_kind(default_id, :expected)
+        self.cur_owner = saved_owner
         self.checking_default = false
         self.vars = saved_vars
         self.frame_slots = saved_slots
@@ -9721,6 +9732,10 @@ type Codegen = struct {
             if self.is_import_alias(maybe_mod) {
                 let struct_idx = self.qualified_idx(maybe_mod, name: method_name, what: 0)
                 if struct_idx >= 0 {
+                    let init_idx = self.custom_init(struct_idx)
+                    if init_idx >= 0 {
+                        return self.structs[struct_idx].methods[init_idx].sig.return_kind
+                    }
                     return .KStruct(idx: struct_idx, type_args: [])
                 }
                 let fn_idx = self.lookup_import_fn(maybe_mod, method_name)
@@ -9880,6 +9895,10 @@ type Codegen = struct {
                         if struct_idx >= 0 {
                             if len(self.structs[struct_idx].type_param_names) > 0 {
                                 return .KUnknown
+                            }
+                            let init_idx = self.custom_init(struct_idx)
+                            if init_idx >= 0 {
+                                return self.structs[struct_idx].methods[init_idx].sig.return_kind
                             }
                             return .KStruct(idx: struct_idx, type_args: [])
                         }
@@ -10770,7 +10789,86 @@ type Codegen = struct {
 
     // Allocate a struct value on the arena and return its pointer in x0.
     // field_args supplies the labelled field values.
+    // Where `init` sits in the struct's methods when `Name(...)` calls it, or -1.
+    func custom_init(self, anon struct_idx: int64) -> int64 {
+        if len(self.structs[struct_idx].type_param_names) > 0 {
+            return -1
+        }
+        if self.cur_owner >= 0 and self.same_struct(self.cur_owner, struct_idx) {
+            return -1
+        }
+        if self.structs[struct_idx].method_idx.get("init") is Some(mi) {
+            let sig = self.structs[struct_idx].methods[mi].sig
+            if len(sig.param_names) > 0 and sig.param_names[0] == "self" {
+                return -1
+            }
+            return mi
+        }
+        return -1
+    }
+
+    // `Name(...)` for a struct that declares `init`: an ordinary call of it.
+    func compile_init_call(self, anon args: [ast.CallArg], struct_idx: int64, init_idx: int64, span: ast.Span) -> Val {
+        let info = self.structs[struct_idx]
+        let sig = info.methods[init_idx].sig
+        let before = self.report_attempts
+        self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: info.name, call_span: span)
+        if self.report_attempts > before {
+            mut by_field = false
+            for arg in args {
+                if len(arg.label) > 0 and self.has_field(arg.label, :struct_idx) and self.label_declared(sig.param_labels, arg.label) == false {
+                    by_field = true
+                }
+            }
+            if by_field {
+                self.report_error(f"error: `{info.name}` declares `init`, so it is built with that and not from its fields", :span)
+            }
+        }
+        let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: info.name).slots
+        self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
+        self.emit(f"bl ${info.module_prefix}${info.name}$init")
+        return .VReg(name: "x0")
+    }
+
+    func label_declared(self, anon labels: [str], anon label: str) -> bool {
+        for l in labels {
+            if l == label {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Reports an `init` that can't be one; `owner` is the struct it is declared in.
+    func check_init_decl(self, anon func_decl: ast.FuncDecl, owner: int64) -> none {
+        if func_decl.name != "init" {
+            return
+        }
+        if len(func_decl.params) > 0 and func_decl.params[0].name == "self" {
+            return
+        }
+        let name = self.structs[owner].name
+        let self_kind: TypeKind = .KStruct(idx: owner, type_args: [])
+        mut ok = false
+        let rk = self.resolve_type(func_decl.return_typ)
+        if self.same_kind(rk, self_kind) {
+            ok = true
+        }
+        if self.is_result_kind(rk) {
+            if self.same_kind(self.result_inner_kind(rk), self_kind) {
+                ok = true
+            }
+        }
+        if ok == false {
+            self.report_error(f"error: `{name}.init` must return `{name}` or `{name} or Error`", span: func_decl.name_span)
+        }
+    }
+
     func compile_struct_construct(self, anon field_args: [ast.CallArg], struct_idx: int64, span: ast.Span) -> Val {
+        let init_idx = self.custom_init(struct_idx)
+        if init_idx >= 0 {
+            return self.compile_init_call(field_args, :struct_idx, :init_idx, :span)
+        }
         let params = self.structs[struct_idx].type_param_names
         if len(params) > 0 {
             let name = self.structs[struct_idx].name
@@ -12651,6 +12749,10 @@ type Codegen = struct {
     // `owner` is the struct whose method this is, or -1.
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
+        self.cur_owner = owner
+        if owner >= 0 and self.body_instance < 0 {
+            self.check_init_decl(func_decl, :owner)
+        }
         self.check_param_order(func_decl, func_decl.name)
         // A generic template's methods are checked once, in check_module_types.
         if self.body_instance < 0 {

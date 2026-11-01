@@ -107,6 +107,46 @@ all three of its fields default to `[]`:
 let m: Map[str, int64] = Map[str, int64]()
 ```
 
+## Custom constructors
+
+A struct may declare its own constructor, a function named `init` inside the
+body with no `self`:
+
+```kod
+type Port = struct {
+    number: int64
+
+    func init(number: int64) -> Port or Error {
+        if number < 1 or number > 65535 {
+            throw BadPort(number: number)
+        }
+        return Port(number: number)
+    }
+}
+
+let p = try Port(number: 8080)     // calls init
+```
+
+From then on `Port(...)` anywhere outside the struct's own functions calls
+`init`, with the usual rules for a function call: labels, defaults and
+[skipped labels](functions.md). The field constructor is not available there,
+so a label `init` doesn't declare is an error. `init` is the only way to make a
+`Port`, and whatever it checks holds for every `Port` at the moment it is made.
+
+Inside the struct's own functions, `init` and the other methods, `Port(...)`
+is the field constructor as before. That is how `init` builds the value, and
+how methods such as `op_add` make a new one without going through the checks
+again. A method can't call `init` itself.
+
+`init` must return the struct (`-> Port`) or a result of it (`-> Port or Error`),
+which makes `try Port(...)` and `must Port(...)` work as for any fallible
+call. It may not be a generic struct's: `init` on a `Box[T]` is an error for
+now. A struct without `init` is built from its fields as described above.
+
+Fields stay assignable, so `p.number = 0` is still possible after a checked
+construction. Custom constructors guard how a value starts, not what happens
+to it later.
+
 ## Field access
 
 ```kod
