@@ -501,6 +501,25 @@ int64_t kod_errno_kind(int64_t err) {
     }
 }
 
+// Environment variables for stdlib/env.kod. The Kod side has already refused
+// names that are empty or hold `=` or a NUL byte, and values with a NUL byte.
+int64_t kod_env_has(KodStr *name) {
+    return getenv(name->buf) != NULL;
+}
+
+KodStr *kod_env_get(KodStr *name) {
+    const char *value = getenv(name->buf);
+    return kod_str_from_cstr(value ? value : "");
+}
+
+int64_t kod_env_set(KodStr *name, KodStr *value) {
+    return setenv(name->buf, value->buf, 1) == 0 ? 0 : -1;
+}
+
+void kod_env_unset(KodStr *name) {
+    unsetenv(name->buf);
+}
+
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`
 // struct's field order (each slot 8 bytes). The two `*` slots hold
 // Kod `str` values (i.e. pointers to KodStr structs).
