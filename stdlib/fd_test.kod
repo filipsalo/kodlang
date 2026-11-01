@@ -1,0 +1,147 @@
+import "stream" { IoError, IoKind, read_all, write_str, write_all, BufReader }
+import "fd" { Fd, open_read, create, append, stdin, stdout, stderr }
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func path(anon name: str) -> str {
+    return f"build/fd_test_{name}.tmp"
+}
+
+func kind_of_open(anon p: str) -> IoKind {
+    let r = open_read(p)
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind
+        }
+    }
+    return .Other
+}
+
+test "create, write, close, then read the file back" {
+    let p = path("roundtrip")
+    let w = must create(p)
+    must write_str(w, "hello\nworld\n")
+    must w.close()
+    let r = must open_read(p)
+    assert kod_bytes_to_str(must read_all(r)) == "hello\nworld\n"
+    must r.close()
+}
+
+test "create truncates and append extends" {
+    let p = path("trunc")
+    let w = must create(p)
+    must write_str(w, "long old content")
+    must w.close()
+    let w2 = must create(p)
+    must write_str(w2, "new")
+    must w2.close()
+    let a = must append(p)
+    must write_str(a, "+more")
+    must a.close()
+    let r = must open_read(p)
+    assert kod_bytes_to_str(must read_all(r)) == "new+more"
+    must r.close()
+}
+
+test "append creates a missing file" {
+    let p = path("appendnew")
+    let w = must create(p)
+    must w.close()
+    let a = must append(p)
+    must write_str(a, "x")
+    must a.close()
+    assert ((must open_read(p)).read(10)) is Ok(_)
+}
+
+test "a file larger than any single read" {
+    let p = path("big")
+    let w = must create(p)
+    must write_all(w, kod_str_to_bytes("0123456789".repeat(30000)))
+    must w.close()
+    let r = must open_read(p)
+    let data = must read_all(r)
+    assert len(data) == 300000
+    assert kod_bytes_to_str(data[299990..300000]) == "0123456789"
+    must r.close()
+}
+
+test "bytes with NULs and high bits survive a round trip" {
+    let p = path("binary")
+    let raw = kod_bytes_from_array([0, 255, 10, 13, 0, 128])
+    let w = must create(p)
+    must write_all(w, raw)
+    must w.close()
+    let r = must open_read(p)
+    assert (must read_all(r)) == raw
+    must r.close()
+}
+
+test "an empty file reads as the end of the stream" {
+    let p = path("empty")
+    must (must create(p)).close()
+    let r = must open_read(p)
+    assert len(must r.read(10)) == 0
+    must r.close()
+}
+
+test "opening a missing file is NotFound and names the path" {
+    let p = path("does_not_exist")
+    assert kind_of_open(p) == .NotFound
+    let r = open_read(p)
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e.to_str().starts_with(f"open {p}: ")
+    }
+}
+
+test "opening a directory for reading succeeds but reading it fails" {
+    let d = open_read("build")
+    if d is Ok(dir) {
+        assert dir.read(10) is Err(_)
+    }
+}
+
+test "creating in a missing directory is NotFound" {
+    let r = create("build/no_such_dir_here/x.tmp")
+    assert r is Err(_)
+    if r is Err(e) {
+        assert e is IoError(_)
+        if e is IoError(io) {
+            assert io.kind == .NotFound
+            assert io.errno == 2
+        }
+    }
+}
+
+test "creating where there is a directory fails" {
+    assert create("build") is Err(_)
+}
+
+test "reading from a write-only descriptor and closing twice are errors" {
+    let p = path("modes")
+    let w = must create(p)
+    assert w.read(4) is Err(_)
+    must w.close()
+    assert w.close() is Err(_)
+    assert w.write(b("x")) is Err(_)
+}
+
+test "stdin, stdout and stderr wrap descriptors 0, 1 and 2" {
+    assert stdin().fd == 0
+    assert stdout().fd == 1
+    assert stderr().fd == 2
+}
+
+test "a BufReader reads lines from a file" {
+    let p = path("lines")
+    let w = must create(p)
+    must write_str(w, "a\r\nb\nc")
+    must w.close()
+    let br = BufReader(inner: must open_read(p))
+    assert ((must br.read_line())? or "!") == "a"
+    assert ((must br.read_line())? or "!") == "b"
+    assert ((must br.read_line())? or "!") == "c"
+    assert (must br.read_line()) is none
+}

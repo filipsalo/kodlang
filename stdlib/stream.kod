@@ -1,0 +1,213 @@
+// Byte streams and the I/O error type. See docs/io.md.
+import "strbuilder" { StrBuilder }
+
+extern func kod_errno_kind(anon err: int64) -> int64
+extern func kod_errno_message(anon err: int64) -> str
+
+type IoKind = enum {
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    InvalidInput
+    WouldBlock
+    TimedOut
+    ConnectionRefused
+    ConnectionReset
+    BrokenPipe
+    UnexpectedEof
+    Other
+}
+
+type IoError = struct {
+    kind: IoKind
+    op: str
+    errno: int64
+    detail: str
+
+    func to_str(self) -> str {
+        return f"{self.op}: {self.detail}"
+    }
+}
+
+// The kinds in the order the runtime's `kod_errno_kind` numbers them.
+func kind_at(anon i: int64) -> IoKind {
+    if i == 0 { return .NotFound }
+    if i == 1 { return .PermissionDenied }
+    if i == 2 { return .AlreadyExists }
+    if i == 3 { return .InvalidInput }
+    if i == 4 { return .WouldBlock }
+    if i == 5 { return .TimedOut }
+    if i == 6 { return .ConnectionRefused }
+    if i == 7 { return .ConnectionReset }
+    if i == 8 { return .BrokenPipe }
+    return .Other
+}
+
+func kind_of_errno(anon err: int64) -> IoKind {
+    if err <= 0 {
+        return .Other
+    }
+    return kind_at(kod_errno_kind(err))
+}
+
+// The error for OS error number `err` raised by `op`.
+func os_error(anon op: str, errno: int64) -> IoError {
+    return IoError(kind: kind_of_errno(errno), op: op, errno: errno, detail: kod_errno_message(errno))
+}
+
+func empty_bytes() -> bytes {
+    return kod_str_to_bytes("")
+}
+
+interface Reader {
+    func read(self, anon max: int64) -> bytes or Error
+}
+
+interface Writer {
+    func write(self, anon data: bytes) -> int64 or Error
+}
+
+func read_all(anon r: Reader) -> bytes or Error {
+    let out = StrBuilder()
+    for true {
+        let piece = try r.read(65536)
+        if len(piece) == 0 {
+            return out.to_bytes()
+        }
+        out.append_bytes(piece)
+    }
+    return out.to_bytes()
+}
+
+func read_exact(anon r: Reader, anon n: int64) -> bytes or Error {
+    let out = StrBuilder()
+    for out.len() < n {
+        let piece = try r.read(n - out.len())
+        if len(piece) == 0 {
+            throw IoError(kind: .UnexpectedEof, op: "read", errno: 0, detail: f"stream ended after {out.len()} of {n} bytes")
+        }
+        out.append_bytes(piece)
+    }
+    return out.to_bytes()
+}
+
+func write_all(anon w: Writer, anon data: bytes) -> none or Error {
+    let total = len(data)
+    mut done: int64 = 0
+    for done < total {
+        let n = try w.write(data[done..total])
+        if n <= 0 {
+            throw IoError(kind: .Other, op: "write", errno: 0, detail: "write returned 0")
+        }
+        done = done + n
+    }
+}
+
+func write_str(anon w: Writer, anon text: str) -> none or Error {
+    try write_all(w, kod_str_to_bytes(text))
+}
+
+type MemReader = struct {
+    data: bytes
+    pos: int64
+
+    func read(self, anon max: int64) -> bytes or Error {
+        let end = self.pos + max
+        if max <= 0 or self.pos >= len(self.data) {
+            return empty_bytes()
+        }
+        let piece = self.data[self.pos..end]
+        self.pos = self.pos + len(piece)
+        return piece
+    }
+}
+
+type MemWriter = struct {
+    buf: StrBuilder
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        self.buf.append_bytes(data)
+        return len(data)
+    }
+
+    func to_bytes(self) -> bytes {
+        return self.buf.to_bytes()
+    }
+
+    func to_str(self) -> str {
+        return self.buf.to_str()
+    }
+}
+
+type BufReader = struct {
+    inner: Reader
+    limit: int64 = 1048576
+    chunk: int64 = 8192
+    buf: bytes = kod_str_to_bytes("")
+    pos: int64 = 0
+
+    func read(self, anon max: int64) -> bytes or Error {
+        if max <= 0 {
+            return empty_bytes()
+        }
+        if self.pos < len(self.buf) {
+            mut end = self.pos + max
+            if end > len(self.buf) {
+                end = len(self.buf)
+            }
+            let piece = self.buf[self.pos..end]
+            self.pos = end
+            return piece
+        }
+        return try self.inner.read(max)
+    }
+
+    func read_exact(self, anon n: int64) -> bytes or Error {
+        return try read_exact(self, n)
+    }
+
+    func read_until(self, anon delim: int64) -> bytes? or Error {
+        let out = StrBuilder()
+        for true {
+            if self.pos >= len(self.buf) {
+                let more = try self.inner.read(self.chunk)
+                if len(more) == 0 {
+                    if out.len() == 0 {
+                        return none
+                    }
+                    return out.to_bytes()
+                }
+                self.buf = more
+                self.pos = 0
+            }
+            let n = len(self.buf)
+            mut i = self.pos
+            for i < n and self.buf[i] != delim {
+                i = i + 1
+            }
+            out.append_bytes(self.buf[self.pos..i])
+            if out.len() > self.limit {
+                throw IoError(kind: .InvalidInput, op: "read", errno: 0, detail: "line too long")
+            }
+            if i < n {
+                self.pos = i + 1
+                return out.to_bytes()
+            }
+            self.pos = n
+        }
+        return none
+    }
+
+    func read_line(self) -> str? or Error {
+        let raw = try self.read_until(10)
+        if raw is none {
+            return none
+        }
+        let text = kod_bytes_to_str(raw? or empty_bytes())
+        let n = len(text)
+        if n > 0 and text[n - 1] == 13 {
+            return text[0..n - 1]
+        }
+        return text
+    }
+}
