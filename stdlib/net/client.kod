@@ -50,20 +50,36 @@ func after_wait(anon e: Error, deadline_ns: int64) -> Error {
     return e
 }
 
+// What the client needs of a connection, plain or TLS.
+interface Link {
+    func read(self, anon max: int64) -> bytes or Error
+    func write(self, anon data: bytes) -> int64 or Error
+    func close(self) -> none or Error
+    // Nothing is waiting to be read: the peer has not closed it or sent more.
+    func idle(self) -> bool
+    // Set the limits for the next request and forget what was received.
+    func arm(self, anon timeout_ms: int64, anon deadline_ns: int64) -> none
+    // Bytes read since `arm`.
+    func received(self) -> int64
+}
+
 // A plain connection whose every read and write is limited by the deadline.
 type TcpLink = struct {
     conn: Fd
     timeout_ms: int64
     deadline_ns: int64
+    got: int64 = 0
 
     func read(self, anon max: int64) -> bytes or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
         try tcp.set_timeout(self.conn, ms: ms)
-        let got = self.conn.read(max)
-        if got is Err(e) {
+        let data = self.conn.read(max)
+        if data is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
         }
-        return try got
+        let bytes_read = try data
+        self.got = self.got + len(bytes_read)
+        return bytes_read
     }
 
     func write(self, anon data: bytes) -> int64 or Error {
@@ -74,6 +90,24 @@ type TcpLink = struct {
             throw after_wait(e, deadline_ns: self.deadline_ns)
         }
         return try put
+    }
+
+    func close(self) -> none or Error {
+        return try self.conn.close()
+    }
+
+    func idle(self) -> bool {
+        return tcp.is_idle(self.conn)
+    }
+
+    func arm(self, anon timeout_ms: int64, anon deadline_ns: int64) -> none {
+        self.timeout_ms = timeout_ms
+        self.deadline_ns = deadline_ns
+        self.got = 0
+    }
+
+    func received(self) -> int64 {
+        return self.got
     }
 }
 
@@ -81,15 +115,18 @@ type TlsLink = struct {
     conn: TlsStream
     timeout_ms: int64
     deadline_ns: int64
+    got: int64 = 0
 
     func read(self, anon max: int64) -> bytes or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
         try self.conn.set_timeout(ms: ms)
-        let got = self.conn.read(max)
-        if got is Err(e) {
+        let data = self.conn.read(max)
+        if data is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
         }
-        return try got
+        let bytes_read = try data
+        self.got = self.got + len(bytes_read)
+        return bytes_read
     }
 
     func write(self, anon data: bytes) -> int64 or Error {
@@ -101,36 +138,233 @@ type TlsLink = struct {
         }
         return try put
     }
+
+    func close(self) -> none or Error {
+        return try self.conn.close()
+    }
+
+    func idle(self) -> bool {
+        return tcp.is_idle(Fd(fd: self.conn.fd))
+    }
+
+    func arm(self, anon timeout_ms: int64, anon deadline_ns: int64) -> none {
+        self.timeout_ms = timeout_ms
+        self.deadline_ns = deadline_ns
+        self.got = 0
+    }
+
+    func received(self) -> int64 {
+        return self.got
+    }
 }
 
-// Write `req` to `w` and read the response from `r`, which may be the same
-// connection.
-func talk(anon r: Reader, anon w: Writer, anon req: Request, options: Options) -> Response or Error {
-    try write_request(w, req)
-    let br = BufReader(inner: r, limit: options.limits.max_header_bytes)
+// A new connection to where `url` points, within `connect_ms`.
+func open_link(anon url: Url, options: Options, connect_ms: int64) -> Link or Error {
+    if url.scheme == "https" {
+        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: connect_ms)
+        return TlsLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: 0)
+    }
+    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: connect_ms)
+    return TcpLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: 0)
+}
+
+// Methods that are safe to send again when a reused connection turns out to
+// be dead.
+func repeatable(anon method: str) -> bool {
+    return method == "GET" or method == "HEAD" or method == "OPTIONS" or method == "PUT" or method == "DELETE" or method == "TRACE"
+}
+
+type Idle = struct {
+    key: str
+    link: Link
+    since_ns: int64
+}
+
+// Close a connection that nothing more is wanted from.
+func discard(anon link: Link) -> none {
+    if link.close() is Err(_) {
+        return
+    }
+}
+
+// A Link as a Reader and a Writer, which is what the HTTP code takes.
+type LinkIO = struct {
+    link: Link
+
+    func read(self, anon max: int64) -> bytes or Error {
+        return try self.link.read(max)
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        return try self.link.write(data)
+    }
+}
+
+type Acquired = struct {
+    link: Link
+    reused: bool
+}
+
+// Write `req` and read its response.
+func attempt(anon io: LinkIO, anon br: BufReader, anon req: Request, options: Options, keep_alive: bool) -> Response or Error {
+    try write_request(io, req, keep_alive: keep_alive)
     return read_response(br, req.method, limits: options.limits)
 }
 
-// One request on its own connection, closed afterwards.
-func exchange(anon req: Request, options: Options, deadline_ns: int64) -> Response or Error {
-    let url = req.url
-    let connect_ms = try wait_ms(timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
-    if url.scheme == "https" {
-        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: connect_ms)
-        let link = TlsLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
-        let result = talk(link, link, req, options: options)
-        if conn.close() is Err(_) {
-            return result
+// Connections kept between requests. See docs/http.md.
+type Client = struct {
+    max_idle_per_host: int64 = 2
+    idle_ms: int64 = 30000
+    pool: [Idle] = []
+
+    // An idle connection for `key`, or none. Ones that are too old or that the
+    // server has closed are closed on the way.
+    func take(self, anon key: str) -> Idle? {
+        let now = time.monotonic_ns()
+        mut kept: [Idle] = []
+        mut found: Idle? = none
+        for entry in self.pool {
+            if now - entry.since_ns > self.idle_ms * 1000000 or entry.link.idle() == false {
+                discard(entry.link)
+            } else if entry.key == key and found is none {
+                found = entry
+            } else {
+                kept += [entry]
+            }
         }
-        return result
+        self.pool = kept
+        return found
     }
-    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: connect_ms)
-    let link = TcpLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
-    let result = talk(link, link, req, options: options)
-    if conn.close() is Err(_) {
-        return result
+
+    // Keep `link` for `key`, closing the oldest of that host's if there are too many.
+    func keep(self, anon key: str, anon link: Link) -> none {
+        if self.max_idle_per_host <= 0 {
+            discard(link)
+            return
+        }
+        mut count: int64 = 0
+        for entry in self.pool {
+            if entry.key == key {
+                count = count + 1
+            }
+        }
+        mut kept: [Idle] = []
+        mut drop = count - self.max_idle_per_host + 1
+        for entry in self.pool {
+            if entry.key == key and drop > 0 {
+                drop = drop - 1
+                discard(entry.link)
+            } else {
+                kept += [entry]
+            }
+        }
+        kept += [Idle(key: key, link: link, since_ns: time.monotonic_ns())]
+        self.pool = kept
     }
-    return result
+
+    // Close every idle connection.
+    func close(self) -> none {
+        for entry in self.pool {
+            discard(entry.link)
+        }
+        let empty: [Idle] = []
+        self.pool = empty
+    }
+
+    func acquire(self, anon key: str, anon url: Url, options: Options, deadline_ns: int64) -> Acquired or Error {
+        let kept = self.take(key)
+        if kept is Some(entry) {
+            return Acquired(link: entry.link, reused: true)
+        }
+        let connect_ms = try wait_ms(timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
+        let link = try open_link(url, options: options, connect_ms: connect_ms)
+        return Acquired(link: link, reused: false)
+    }
+
+    // One request, on a kept connection if there is one, else on a new one.
+    func exchange(self, anon req: Request, options: Options, deadline_ns: int64) -> Response or Error {
+        let url = req.url
+        let key = f"{url.scheme}://{url.host}:{url.port}"
+        let reuse = self.max_idle_per_host > 0
+        mut repeated = false
+        for true {
+            let got = try self.acquire(key, url, options: options, deadline_ns: deadline_ns)
+            let link = got.link
+            link.arm(options.timeout_ms, deadline_ns)
+            let io = LinkIO(link: link)
+            let br = BufReader(inner: io, limit: options.limits.max_header_bytes)
+            let outcome = attempt(io, br, req, options: options, keep_alive: reuse)
+            if outcome is Err(e) {
+                discard(link)
+                if got.reused and repeated == false and link.received() == 0 and repeatable(req.method) {
+                    repeated = true
+                    continue
+                }
+                throw e
+            }
+            let response = try outcome
+            if reuse and response.keep_alive and br.pos >= len(br.buf) {
+                self.keep(key, link)
+            } else {
+                discard(link)
+            }
+            return response
+        }
+        throw invalid("fetch", "unreachable")
+    }
+
+    func fetch(self, anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+        if options.deadline_ms < 0 {
+            throw invalid("fetch", "deadline_ms cannot be negative")
+        }
+        mut deadline_ns: int64 = 0
+        if options.deadline_ms > 0 {
+            deadline_ns = time.monotonic_ns() + options.deadline_ms * 1000000
+        }
+        mut current = try parse_url(url)
+        mut verb = method
+        mut payload = options.body
+        mut headers = without(options.headers, [])
+        mut hops: int64 = 0
+        for true {
+            let req = Request(method: verb, url: current, headers: headers, body: payload)
+            let resp = try self.exchange(req, options: options, deadline_ns: deadline_ns)
+            let location = resp.header("location")
+            if is_redirect(resp.status) == false or location is none or options.max_redirects <= 0 {
+                return resp
+            }
+            hops = hops + 1
+            if hops > options.max_redirects {
+                throw invalid("redirect", f"more than {options.max_redirects} redirects")
+            }
+            let next = try resolve(current, location? or "")
+            if current.scheme == "https" and next.scheme == "http" {
+                throw invalid("redirect", "refusing a redirect from https to http")
+            }
+            if resp.status != 307 and resp.status != 308 {
+                if verb != "HEAD" {
+                    verb = "GET"
+                }
+                payload = kod_str_to_bytes("")
+                headers = without(headers, ["content-type"])
+            }
+            if next.host != current.host or next.port != current.port {
+                headers = without(headers, ["authorization", "cookie", "proxy-authorization"])
+            }
+            current = next
+        }
+        throw invalid("redirect", "unreachable")
+    }
+
+    func get(self, anon url: str) -> Response or Error {
+        return try self.fetch("GET", url)
+    }
+
+    func post(self, anon url: str, anon body: bytes, content_type: str) -> Response or Error {
+        let options = Options(body: body)
+        options.headers.add("Content-Type", content_type)
+        return try self.fetch("POST", url, options: options)
+    }
 }
 
 func is_redirect(anon status: int64) -> bool {
@@ -154,47 +388,10 @@ func without(anon headers: Headers, anon names: [str]) -> Headers {
     return out
 }
 
+// One request on its own connection, closed afterwards.
 func fetch(anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
-    if options.deadline_ms < 0 {
-        throw invalid("fetch", "deadline_ms cannot be negative")
-    }
-    mut deadline_ns: int64 = 0
-    if options.deadline_ms > 0 {
-        deadline_ns = time.monotonic_ns() + options.deadline_ms * 1000000
-    }
-    mut current = try parse_url(url)
-    mut verb = method
-    mut payload = options.body
-    mut headers = without(options.headers, [])
-    mut hops: int64 = 0
-    for true {
-        let req = Request(method: verb, url: current, headers: headers, body: payload)
-        let resp = try exchange(req, options: options, deadline_ns: deadline_ns)
-        let location = resp.header("location")
-        if is_redirect(resp.status) == false or location is none or options.max_redirects <= 0 {
-            return resp
-        }
-        hops = hops + 1
-        if hops > options.max_redirects {
-            throw invalid("redirect", f"more than {options.max_redirects} redirects")
-        }
-        let next = try resolve(current, location? or "")
-        if current.scheme == "https" and next.scheme == "http" {
-            throw invalid("redirect", "refusing a redirect from https to http")
-        }
-        if resp.status != 307 and resp.status != 308 {
-            if verb != "HEAD" {
-                verb = "GET"
-            }
-            payload = kod_str_to_bytes("")
-            headers = without(headers, ["content-type"])
-        }
-        if next.host != current.host or next.port != current.port {
-            headers = without(headers, ["authorization", "cookie", "proxy-authorization"])
-        }
-        current = next
-    }
-    throw invalid("redirect", "unreachable")
+    let client = Client(max_idle_per_host: 0)
+    return try client.fetch(method, url, options: options)
 }
 
 func get(anon url: str) -> Response or Error {

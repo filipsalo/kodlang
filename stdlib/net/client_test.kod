@@ -1,4 +1,4 @@
-import "net/client" { Options, fetch, get, post }
+import "net/client" { Client, Options, fetch, get, post }
 import "net/http" { Headers, Response, Limits }
 import "net/tcp"
 import "stream" { IoError, IoKind }
@@ -15,10 +15,15 @@ type Server = struct {
 }
 
 func start_fixture() -> Server {
+    return start_fixture_with("")
+}
+
+// `extra` is more arguments for the fixture: a certificate and key for TLS.
+func start_fixture_with(anon extra: str) -> Server {
     let l = must tcp.listen("127.0.0.1", port: 0)
     let port = l.port()
     must l.close()
-    let r = process.run(["sh", "-c", f"python3 tests/support/http_fixture.py {port} >/dev/null 2>&1 </dev/null & echo $!"])
+    let r = process.run(["sh", "-c", f"python3 tests/support/http_fixture.py {port} {extra} >/dev/null 2>&1 </dev/null & echo $!"])
     assert r.status == 0
     let pid = r.stdout.trim()
     mut tries: int64 = 0
@@ -331,6 +336,207 @@ test "deadline_ms: a connection refused is still ConnectionRefused" {
     assert fails(fetch("GET", f"http://127.0.0.1:{port}/", options: Options(deadline_ms: 5000)), .ConnectionRefused, "")
 }
 
+// ---- connection reuse ----
+
+func body(anon r: Response or Error) -> str {
+    if r is Err(e) {
+        return "error: " + e.to_str()
+    }
+    return (must r).text()
+}
+
+func pause(anon seconds: str) -> none {
+    process.run(["sleep", seconds])
+}
+
+test "Client: requests share one connection" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 2"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 3"
+    client.close()
+    stop(sv)
+}
+
+test "the free functions open a connection for each request" {
+    let sv = start_fixture()
+    assert body(get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    assert body(get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "max_idle_per_host 0 turns reuse off" {
+    let sv = start_fixture()
+    let client = Client(max_idle_per_host: 0)
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "each host and port has its own connection" {
+    let a = start_fixture()
+    let b = start_fixture()
+    let client = Client()
+    assert body(client.get(url(a, "/conn-id"))) == "conn 1 req 1"
+    assert body(client.get(url(b, "/conn-id"))) == "conn 1 req 1"
+    assert body(client.get(url(a, "/conn-id"))) == "conn 1 req 2"
+    assert body(client.get(url(b, "/conn-id"))) == "conn 1 req 2"
+    client.close()
+    stop(a)
+    stop(b)
+}
+
+test "a redirect within a host stays on the connection" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/redir-id"))) == "conn 1 req 2"
+    stop(sv)
+}
+
+test "Connection: close ends the connection's life" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/close-after"))) == "bye"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "HTTP/1.0 is reused only with keep-alive" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/http10"))) == "ok"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    let keep = Client()
+    assert body(keep.get(url(sv, "/http10-keep"))) == "ok"
+    assert body(keep.get(url(sv, "/conn-id"))) == "conn 3 req 2"
+    stop(sv)
+}
+
+test "the headers decide, not whether the socket happens to be open" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/lies"))) == "lies"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    assert body(client.get(url(sv, "/lies10"))) == "lies"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 3 req 1"
+    stop(sv)
+}
+
+test "a response that ends with the connection is not reused" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/close"))) == "until close"
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "chunked, HEAD and 204 responses leave the connection reusable" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/chunked"))) == "Wikipedia in\r\n\r\nchunks."
+    assert (must client.fetch("HEAD", url(sv, "/head"))).status == 200
+    assert (must client.get(url(sv, "/nocontent"))).status == 204
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 4"
+    stop(sv)
+}
+
+test "a connection the server closed meanwhile is replaced, whatever the method" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/silent-close"))) == "closing"
+    pause("0.2")
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    assert body(client.get(url(sv, "/silent-close"))) == "closing"
+    pause("0.2")
+    let posted = client.post(url(sv, "/echo"), b("data"), content_type: "text/plain")
+    assert body(posted).starts_with("POST /echo")
+    stop(sv)
+}
+
+test "idle_ms: an old idle connection is not used" {
+    let sv = start_fixture()
+    let client = Client(idle_ms: 100)
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    pause("0.3")
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "the Client works after close" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    client.close()
+    client.close()
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "a connection that dropped the request is retried for a GET" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/hello"))) == "hello"
+    assert body(client.get(url(sv, "/flaky"))) == "recovered"
+    assert body(get(url(sv, "/flaky-count"))) == "2"
+    stop(sv)
+}
+
+test "the retry happens once, so a request dropped twice fails" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/hello"))) == "hello"
+    assert fails(client.get(url(sv, "/drop")), .UnexpectedEof, "")
+    assert body(get(url(sv, "/drops"))) == "2"
+    stop(sv)
+}
+
+test "a POST is not repeated" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/hello"))) == "hello"
+    assert fails(client.post(url(sv, "/drop"), b("x"), content_type: "text/plain"), .UnexpectedEof, "")
+    assert body(get(url(sv, "/drops"))) == "1"
+    stop(sv)
+}
+
+test "a request on a new connection is not repeated either" {
+    let sv = start_fixture()
+    let client = Client()
+    assert fails(client.get(url(sv, "/drop")), .UnexpectedEof, "")
+    assert body(get(url(sv, "/drops"))) == "1"
+    stop(sv)
+}
+
+test "after an error the connection is not reused" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 1"
+    assert fails(client.get(url(sv, "/truncated")), .UnexpectedEof, "")
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 2 req 1"
+    stop(sv)
+}
+
+test "deadlines and timeouts apply to a reused connection" {
+    let sv = start_fixture()
+    let client = Client()
+    assert body(client.get(url(sv, "/hello"))) == "hello"
+    let r = client.fetch("GET", url(sv, "/slow"), options: Options(deadline_ms: 300))
+    assert fails(r, .TimedOut, "deadline exceeded")
+    assert body(client.get(url(sv, "/hello"))) == "hello"
+    let t = client.fetch("GET", url(sv, "/slow"), options: Options(timeout_ms: 200))
+    assert fails(t, .TimedOut, "")
+    stop(sv)
+}
+
+test "a big body followed by another request" {
+    let sv = start_fixture()
+    let client = Client()
+    assert len((must client.get(url(sv, "/big"))).body) == 3000000
+    assert body(client.get(url(sv, "/conn-id"))) == "conn 1 req 2"
+    stop(sv)
+}
+
 // ---- https ----
 
 func cert_path() -> str {
@@ -341,11 +547,21 @@ func key_path() -> str {
     return "build/client_test_key.pem"
 }
 
-func start_tls_server() -> Server {
+func make_certificate() -> none {
     if io.is_file(cert_path()) == false or io.is_file(key_path()) == false {
         let made = process.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key_path(), "-out", cert_path(), "-subj", "/CN=localhost", "-days", "30", "-addext", "subjectAltName=DNS:localhost", "-addext", "extendedKeyUsage=serverAuth"])
         assert made.status == 0
     }
+}
+
+// The fixture server speaking TLS 1.2 with the test certificate.
+func start_tls_fixture() -> Server {
+    make_certificate()
+    return start_fixture_with(cert_path() + " " + key_path())
+}
+
+func start_tls_server() -> Server {
+    make_certificate()
     let l = must tcp.listen("127.0.0.1", port: 0)
     let port = l.port()
     must l.close()
@@ -378,5 +594,30 @@ test "https with a trusted certificate" {
 test "https with an untrusted certificate is an error" {
     let sv = start_tls_server()
     assert fails(get(f"https://localhost:{sv.port}/"), .Tls, "")
+    stop(sv)
+}
+
+test "https connections are kept too" {
+    let sv = start_tls_fixture()
+    let options = Options(trust_file: cert_path())
+    let client = Client()
+    let a = must client.fetch("GET", f"https://localhost:{sv.port}/conn-id", options: options)
+    let b2 = must client.fetch("GET", f"https://localhost:{sv.port}/conn-id", options: options)
+    assert a.text() == "conn 1 req 1"
+    assert b2.text() == "conn 1 req 2"
+    let c = must client.fetch("GET", f"https://localhost:{sv.port}/chunked", options: options)
+    assert c.text() == "Wikipedia in\r\n\r\nchunks."
+    client.close()
+    stop(sv)
+}
+
+test "https: a connection that dropped the request is retried" {
+    let sv = start_tls_fixture()
+    let options = Options(trust_file: cert_path())
+    let client = Client()
+    let first = must client.fetch("GET", f"https://localhost:{sv.port}/hello", options: options)
+    assert first.status == 200
+    let second = must client.fetch("GET", f"https://localhost:{sv.port}/flaky", options: options)
+    assert second.text() == "recovered"
     stop(sv)
 }

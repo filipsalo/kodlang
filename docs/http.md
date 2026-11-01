@@ -22,10 +22,11 @@ func main() -> int64 or Error {
 }
 ```
 
-One request uses one connection, which is closed afterwards
-(`Connection: close`). There is no keep-alive, no pipelining, no cookies,
-no proxy support and no automatic decompression (no `Accept-Encoding` is
-sent).
+`get`, `post` and `fetch` open a connection for each request and close it
+afterwards (`Connection: close`). To make several requests over the same
+connection, use a [`Client`](#connection-reuse). There is no pipelining, no
+cookies, no proxy support and no automatic decompression (no `Accept-Encoding`
+is sent).
 
 ## Requests
 
@@ -57,6 +58,53 @@ address in brackets), an optional port, and an optional path and query. The
 scheme is case-insensitive, the default ports are 80 and 443, and a missing
 path is `/`. A fragment is dropped. Credentials in the URL (`user@host`),
 other schemes, spaces and control characters are errors.
+
+## Connection reuse
+
+A `Client` keeps the connections it has finished with and uses them again for
+the next request to the same scheme, host and port, which saves the TCP connect
+and the TLS handshake each time:
+
+```kod
+import "net/client" { Client }
+
+func main() -> int64 or Error {
+    let client = Client()
+    let a = try client.get("https://api.example.com/users/1")
+    let b = try client.get("https://api.example.com/users/2")   // same connection
+    client.close()
+    return 0
+}
+```
+
+`Client` has `fetch(method, url, options = Options())`, `get(url)` and
+`post(url, body, content_type)`, which behave as the functions of the same
+names, and `close()`, which closes every idle connection. Its fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_idle_per_host` | 2 | idle connections kept for each scheme, host and port; 0 turns reuse off, so every request opens and closes its own |
+| `idle_ms` | 30000 | an idle connection older than this is closed instead of reused |
+
+A connection goes back to the `Client` after a response only when nothing about
+the exchange makes it unsafe: the response is `HTTP/1.1` (or `HTTP/1.0` with
+`Connection: keep-alive`), has no `Connection: close`, has a length (a
+`Content-Length`, chunked encoding, or no body at all, as for `HEAD`, `204` and
+`304`), and left nothing unread. A response that ends where the connection ends is
+never reused. After any error the connection is closed.
+
+Before an idle connection is used, the `Client` checks that the server has not
+closed it, and discards it if it has. A server can still close one in the instant
+between that check and the request. When a request on a reused connection then
+fails before any of the response arrives, and its method is `GET`, `HEAD`,
+`OPTIONS`, `PUT`, `DELETE` or `TRACE` (the ones that are safe to repeat), the
+`Client` makes it once more on a new connection. A `POST` or `PATCH` is not
+repeated, and the error is returned as it is.
+
+Redirects use the `Client` too, so a redirect within one host goes over the same
+connection. `timeout_ms` and `deadline_ms` apply to a reused connection exactly as
+to a new one. A `Client` is not meant to be shared by two requests at the same
+time, and there is only one thread.
 
 ## Deadlines
 
@@ -172,8 +220,8 @@ options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))
 |----------|---------|
 | `parse_url(s)` | `Url or Error` with `scheme`, `host`, `port`, `target` (path and query) |
 | `resolve(base, location)` | the `Url` a `Location` points to |
-| `write_request(w, req)` | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
-| `read_response(br, method, limits = Limits())` | read one response from a `BufReader`; `method` decides whether there is a body |
+| `write_request(w, req, keep_alive = false)` | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
+| `read_response(br, method, limits = Limits())` | read one response from a `BufReader`; `method` decides whether there is a body; `Response.keep_alive` says whether the connection can carry another request |
 
 `write_request` and `read_response` work on `MemWriter` and `MemReader`, which
 is how they are tested without a network.

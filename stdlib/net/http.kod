@@ -95,6 +95,8 @@ type Response = struct {
     reason: str
     headers: Headers
     body: bytes
+    // The connection can carry another request: see docs/http.md.
+    keep_alive: bool = false
 
     func text(self) -> str {
         return kod_bytes_to_str(self.body)
@@ -494,7 +496,7 @@ func own_header(anon name: str) -> bool {
     return n == "host" or n == "connection" or n == "content-length" or n == "transfer-encoding"
 }
 
-func write_request(anon w: Writer, anon req: Request) -> none or Error {
+func write_request(anon w: Writer, anon req: Request, keep_alive: bool = false) -> none or Error {
     let op = "write request"
     if is_token(req.method) == false {
         throw invalid(op, "bad method")
@@ -527,7 +529,10 @@ func write_request(anon w: Writer, anon req: Request) -> none or Error {
     if len(req.body) > 0 or is_post_like(req.method) {
         out.append("Content-Length: " + len(req.body).to_str() + "\r\n")
     }
-    out.append("Connection: close\r\n\r\n")
+    if keep_alive == false {
+        out.append("Connection: close\r\n")
+    }
+    out.append("\r\n")
     out.append_bytes(req.body)
     try write_all(w, out.to_bytes())
 }
@@ -574,6 +579,7 @@ func next_line(anon br: BufReader, anon budget: Budget) -> str or Error {
 type StatusLine = struct {
     code: int64
     reason: str
+    minor: int64
 }
 
 func parse_status(anon line: str) -> StatusLine or Error {
@@ -595,7 +601,7 @@ func parse_status(anon line: str) -> StatusLine or Error {
     if len(line) > 13 {
         reason = line[13..len(line)]
     }
-    return StatusLine(code: code, reason: reason)
+    return StatusLine(code: code, reason: reason, minor: line[7] - 48)
 }
 
 // Header lines up to the empty line that ends them, added to `into`.
@@ -731,6 +737,40 @@ func read_body(anon br: BufReader, anon method: str, status: int64, headers: Hea
     return out.to_bytes()
 }
 
+// Does a `Connection`-style header list `token` (case-insensitively)?
+func has_token(anon headers: Headers, anon name: str, anon token: str) -> bool {
+    for v in headers.all(name) {
+        for part in v.split(",") {
+            if part.trim().lower() == token {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// Does the response say where its body ends, so that the connection can be
+// used again after it?
+func framed(anon method: str, status: int64, headers: Headers) -> bool {
+    if method == "HEAD" or status < 200 or status == 204 or status == 304 {
+        return true
+    }
+    return len(headers.all("transfer-encoding")) > 0 or len(headers.all("content-length")) > 0
+}
+
+func may_reuse(anon method: str, status: StatusLine, headers: Headers) -> bool {
+    if framed(method, status: status.code, headers: headers) == false {
+        return false
+    }
+    if has_token(headers, "connection", "close") {
+        return false
+    }
+    if status.minor >= 1 {
+        return true
+    }
+    return has_token(headers, "connection", "keep-alive")
+}
+
 func read_one(anon br: BufReader, anon method: str, limits: Limits) -> Response or Error {
     mut interim: int64 = 0
     for true {
@@ -740,7 +780,7 @@ func read_one(anon br: BufReader, anon method: str, limits: Limits) -> Response 
         try read_headers(br, budget, headers, max_headers: limits.max_headers)
         if status.code >= 200 {
             let body = try read_body(br, method, status: status.code, headers: headers, budget: budget, limits: limits)
-            return Response(status: status.code, reason: status.reason, headers: headers, body: body)
+            return Response(status: status.code, reason: status.reason, headers: headers, body: body, keep_alive: may_reuse(method, status: status, headers: headers))
         }
         interim = interim + 1
         if interim > 16 {

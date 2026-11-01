@@ -165,3 +165,14 @@ int64_t kod_tcp_set_timeout(int64_t fd, int64_t ms) {
     kod_io_set_errno(0);
     return 0;
 }
+
+// 1 if nothing is waiting to be read from `fd`, 0 if there is data, an end of
+// stream or an error (so an idle connection the peer has closed is not idle).
+int64_t kod_tcp_idle(int64_t fd) {
+    struct pollfd p = {.fd = (int)fd, .events = POLLIN};
+    int ready;
+    do {
+        ready = poll(&p, 1, 0);
+    } while (ready < 0 && errno == EINTR);
+    return ready == 0;
+}
