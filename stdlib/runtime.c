@@ -1020,6 +1020,18 @@ int64_t kod_unix_ns(void) {
     return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
 }
 
+// Sleep for `ms` milliseconds; a signal doesn't end it early. Negative is zero.
+void kod_sleep_ms(int64_t ms) {
+    if (ms <= 0) {
+        return;
+    }
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
 // ── Sampling profiler ─────────────────────────────────────────────────
 //
 // SIGPROF-driven sampler: every `interval_us` of CPU time the kernel
