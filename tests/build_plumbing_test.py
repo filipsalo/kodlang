@@ -138,7 +138,7 @@ def test_objects_are_named_after_their_source_in_a_tree(scratch: Path):
     entry.write_text(
         'import "json"\nimport "./lib/helper"\n\n'
         "func main() -> int64 {\n"
-        '    let rendered: str = json.emit(json.parse("[]"))\n'
+        '    let rendered: str = json.emit(must json.parse("[]"))\n'
         '    print(f"{helper.name()} {rendered}")\n'
         "    return 0\n}\n"
     )
