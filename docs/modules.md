@@ -140,13 +140,7 @@ recovers a struct from an interface value whichever side boxed it.
 
 Top-level functions and types are visible to importing modules. There is no explicit `pub`/`private` distinction yet.
 
-A module's top level holds only declarations (`func`, `type`, `interface`, `import`, `extern` and `test`). Top-level `let` and `mut` bindings aren't supported, and they and any other statement there are an error. For a module-wide constant, use a function with no arguments:
-
-```kod
-func max_block() -> int64 {
-    return 65535
-}
-```
+A module's top level holds declarations (`func`, `type`, `interface`, `import`, `extern` and `test`) and constants (`let NAME: T = value`, see [Module-level constants](types.md#module-level-constants)). A top-level `mut` and any statement there are an error. A constant is visible to importing modules like a function.
 
 ## Symbol and object names
 

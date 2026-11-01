@@ -47,9 +47,10 @@ amortised constant time (see `docs/strings.md`). `stdlib/stream.kod` and `stdlib
 connections, a whole-request `deadline_ms`, and gzip responses (decoded with the system zlib
 through `compress/inflate`).
 
-Language work along the way, as these modules need it: `\x` / `\u` string escapes,
-module-level constants (top-level `let` is currently an error), and the
-open codegen bugs that this kind of code is most likely to hit.
+Language work along the way, as these modules need it: calls over several lines, default
+labels that can be skipped, `\x` / `\u` string escapes, module-level constants and a
+statement that drops a `T or Error` being an error (all done); what remains is the open
+codegen bugs that this kind of code is most likely to hit.
 
 ## Later
 

@@ -91,6 +91,34 @@ values (see [Memory layout](memory-layout.md)), mutating a struct's *fields*
 through a parameter or `self` (`p.field = v`) is still allowed regardless of
 whether the binding is `mut` — `mut` governs only reassigning the name.
 
+
+## Module-level constants
+
+A `let` at the top level of a module names a constant. It needs a type, and `mut`
+isn't allowed there:
+
+```kod
+let MAX_BLOCK: int64 = 65535
+let SECONDS_PER_DAY: int64 = 24 * 60 * 60
+let GREETING: str = "hello, " + "world"
+let PRIMES: [int64] = [2, 3, 5, 7]
+let DEFAULT_MODE: Mode = Mode.Fast
+```
+
+The value is built only from literals, operators, array literals, enum variants
+without a payload, and other constants. A call, a constructor, an f-string, a `match` or
+anything else is an error (``this can't be part of a module-level constant``), so a
+constant never has a side effect, and a constant that refers to itself, directly or through
+others, is an error (``constant `A` refers to itself``).
+
+A constant is used by its name. Another module's is `import "limits" { MAX_BLOCK }` or
+`limits.MAX_BLOCK`, like a function's. A local variable or parameter of the same name hides
+it, as it does a function, and a constant and a function can't share a name in one
+module. A constant can't be assigned.
+
+The value is worked out at each use, like a [default](functions.md#default-values), so an
+array constant is a new array every time, and nothing is shared between uses.
+
 ## Primitive types
 
 | Type | Description | Example |

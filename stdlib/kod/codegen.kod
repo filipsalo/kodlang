@@ -1260,6 +1260,55 @@ type Codegen = struct {
         }
     }
 
+    // Whether a signature is a module-level constant's.
+    func sig_is_const(self, anon sig: SigInfo) -> bool {
+        if sig.decl_id <= 0 {
+            return false
+        }
+        return sig.src_p.func_decls[sig.decl_id].is_const
+    }
+
+    // Whether `expr_id` is a use of a module-level constant, by name (`NAME`) or through an
+    // import (`module.NAME`). A local of the same name in force hides it.
+    func const_signature(self, anon expr_id: int64) -> SigInfo? {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> {
+                let i = self.var_index(name)
+                if i >= 0 and (self.reads_scoped == false or self.vars[i].bound) {
+                    return none
+                }
+                let slot = self.lookup_func(name)
+                if slot == -1 {
+                    return none
+                }
+                let sig: SigInfo = self.fn_sig(slot)
+                if self.sig_is_const(sig) {
+                    return sig
+                }
+                return none
+            }
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    let .Ident(mod_name) = self.p.exprs[lhs] else { return none }
+                    let .Ident(member) = self.p.exprs[rhs] else { return none }
+                    if self.var_index(mod_name) >= 0 or self.is_import_alias(mod_name) == false {
+                        return none
+                    }
+                    let fn_idx = self.lookup_import_fn(mod_name, member)
+                    if fn_idx == -1 {
+                        return none
+                    }
+                    let sig: SigInfo = self.import_fn_at(fn_idx).sig
+                    if self.sig_is_const(sig) {
+                        return sig
+                    }
+                }
+                return none
+            }
+            else return none
+        }
+    }
+
     func fn_address(self, anon slot: int64) -> Val {
         let lbl: str = self.fn_label(slot)
         let reg: str = self.pool.alloc_reg()
@@ -6060,6 +6109,10 @@ type Codegen = struct {
                 return .VStrLbl(page: lbl)
             }
             .Ident(name) -> {
+                if self.const_signature(expr_id) is Some(_const_sig) {
+                    let no_args: [ast.CallArg] = []
+                    return self.compile_call(no_args, callee_id: expr_id)
+                }
                 let i = self.var_index(name)
                 if i < 0 {
                     // Not a variable — see if it's a function name in
@@ -6123,7 +6176,13 @@ type Codegen = struct {
                 let empty: [ast.CallArg] = []
                 return self.compile_enum_construct(empty, :enum_idx, :variant_idx, span: self.p.expr_spans[expr_id])
             }
-            .Binary(lhs, op, rhs) -> return self.compile_binary(:lhs, :op, :rhs)
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot and self.const_signature(expr_id) is Some(_const_sig) {
+                    let no_args: [ast.CallArg] = []
+                    return self.compile_call(no_args, callee_id: expr_id)
+                }
+                return self.compile_binary(:lhs, :op, :rhs)
+            }
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
             .Call(callee, args) -> return self.compile_call(args, callee_id: callee)
             .ArrayLit(elements) -> return self.compile_array_lit(elements)
@@ -9670,6 +9729,9 @@ type Codegen = struct {
                 if i >= 0 and (self.reads_scoped == false or self.vars[i].bound) {
                     return self.slot_kind(i)
                 }
+                if self.const_signature(expr_id) is Some(const_sig) {
+                    return const_sig.return_kind
+                }
                 // Function-as-value reference: synthesise a KFunc
                 // from the function's pre-resolved signature so
                 // `let f = foo` infers `f: func(...) -> R`.
@@ -9787,6 +9849,9 @@ type Codegen = struct {
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Dot -> {
+                        if self.const_signature(expr_id) is Some(const_sig) {
+                            return const_sig.return_kind
+                        }
                         // `mod.Enum.Variant` or `Enum.Variant` — unit-variant ref.
                         if self.three_part_enum_kind(dot_lhs: lhs) is Some(k) {
                             return k
