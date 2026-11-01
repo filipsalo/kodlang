@@ -1,0 +1,129 @@
+import "compress/inflate"
+import "compress/gzip"
+import "encoding/base64"
+import "stream" { IoError, IoKind }
+
+func data(anon b64: str) -> bytes {
+    return must base64.decode(b64)
+}
+
+func text(anon r: bytes or Error) -> str {
+    if r is Err(e) {
+        return "error: " + e.to_str()
+    }
+    return kod_bytes_to_str(must r)
+}
+
+func fails_with(anon r: bytes or Error, anon part: str) -> bool {
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind == .InvalidInput and io.detail.contains(part)
+        }
+    }
+    return false
+}
+
+test "gunzip: a plain member" {
+    assert text(inflate.gunzip(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA=="))) == "hello world"
+}
+
+test "gunzip: an empty member" {
+    assert text(inflate.gunzip(data("H4sIAAAAAAAC/wMAAAAAAAAAAAA="))) == ""
+}
+
+test "gunzip: members one after the other are joined" {
+    assert text(inflate.gunzip(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAB+LCAAAAAAAAv9TSExPzMwDAHQI7eMGAAAA"))) == "hello world again"
+}
+
+test "gunzip: a file name, and every optional header field" {
+    assert text(inflate.gunzip(data("H4sICAAAAAAC/25hbWUudHh0ACvPLMlQSFRIy8xJVchLzE0FANCDOdEQAAAA"))) == "with a file name"
+    assert text(inflate.gunzip(data("H4sIHgAAAAAAAwUAWFlaMTJuLnR4dABhIGNvbW1lbnQA6ChLzMlRKMlIVchITUxJLVJIy0zNSSkGAA1/uSMVAAAA"))) == "all the header fields"
+}
+
+test "inflate_zlib and inflate_raw" {
+    assert text(inflate.inflate_zlib(data("eJyryslMUkhJLElUqIKxAEZjBvc="))) == "zlib data zlib data"
+    assert text(inflate.inflate_raw(data("K0osVyhCYAA="))) == "raw raw raw raw"
+}
+
+test "the three formats are not interchangeable" {
+    assert inflate.gunzip(data("eJyryslMUkhJLElUqIKxAEZjBvc=")) is Err(_)
+    assert inflate.inflate_zlib(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==")) is Err(_)
+    assert inflate.inflate_raw(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==")) is Err(_)
+}
+
+test "gunzip: what our own gzip writer produces, in all its three forms" {
+    let input = kod_str_to_bytes("The quick brown fox jumps over the lazy dog. ".repeat(500))
+    assert (must inflate.gunzip(gzip.compress_fixed(input))) == input
+    assert (must inflate.gunzip(gzip.compress_lz77(input))) == input
+    assert (must inflate.gunzip(gzip.compress(input))) == input
+    let nothing = kod_str_to_bytes("")
+    assert (must inflate.gunzip(gzip.compress(nothing))) == nothing
+}
+
+test "gunzip: binary data with every byte value, a few blocks long" {
+    mut values: [int64] = []
+    mut i: int64 = 0
+    for i < 70000 {
+        values += [(i * 7 + i / 256) % 256]
+        i = i + 1
+    }
+    let input = kod_bytes_from_array(values)
+    assert (must inflate.gunzip(gzip.compress(input))) == input
+}
+
+test "gunzip: corrupt input is an InvalidInput error" {
+    assert fails_with(inflate.gunzip(kod_str_to_bytes("not gzip at all")), "header")
+    assert fails_with(inflate.gunzip(kod_str_to_bytes("")), "truncated")
+    assert fails_with(inflate.gunzip(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCEEUoNCwAAAA==")), "check")
+}
+
+test "gunzip: truncated input, at every length" {
+    let whole = data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==")
+    mut n: int64 = 0
+    for n < len(whole) {
+        assert inflate.gunzip(whole[0..n]) is Err(_)
+        n = n + 1
+    }
+    assert inflate.gunzip(whole) is Ok(_)
+}
+
+test "gunzip: bytes after the last member are an error" {
+    let whole = data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==")
+    assert inflate.gunzip(whole + kod_str_to_bytes("x")) is Err(_)
+    assert inflate.gunzip(whole + kod_bytes_from_array([0, 0, 0, 0])) is Err(_)
+}
+
+test "gunzip: max_output stops decompression instead of filling memory" {
+    let input = kod_str_to_bytes("x".repeat(3000000))
+    let packed = gzip.compress(input)
+    assert fails_with(inflate.gunzip(packed, max_output: 1000000), "output too large")
+    assert len(must inflate.gunzip(packed, max_output: 3000000)) == 3000000
+    assert fails_with(inflate.gunzip(packed, max_output: 2999999), "output too large")
+}
+
+test "gunzip: a small input that expands a thousandfold cannot get past max_output" {
+    let member = data("H4sIAAAAAAAC/+3BMQEAAADCoNqLbw0PoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIBXA3ERB/6ghgEA")
+    assert len(member) < 200
+    mut bomb = member
+    mut i: int64 = 0
+    for i < 99 {
+        bomb = bomb + member
+        i = i + 1
+    }
+    assert len(bomb) < 20000
+    assert len(must inflate.gunzip(bomb, max_output: 10000000)) == 10000000
+    assert fails_with(inflate.gunzip(bomb, max_output: 1000000), "output too large")
+    assert fails_with(inflate.gunzip(bomb, max_output: 9999999), "output too large")
+    assert fails_with(inflate.gunzip(bomb, max_output: 100000), "output too large")
+}
+
+test "gunzip: max_output counts every member together" {
+    let two = data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAB+LCAAAAAAAAv9TSExPzMwDAHQI7eMGAAAA")
+    assert fails_with(inflate.gunzip(two, max_output: 16), "output too large")
+    assert len(must inflate.gunzip(two, max_output: 17)) == 17
+}
+
+test "gunzip: max_output 0 allows only empty output" {
+    assert fails_with(inflate.gunzip(data("H4sIAAAAAAAC/8tIzcnJVyjPL8pJAQCFEUoNCwAAAA=="), max_output: 0), "output too large")
+    assert (must inflate.gunzip(data("H4sIAAAAAAAC/wMAAAAAAAAAAAA="), max_output: 0)) == kod_str_to_bytes("")
+}

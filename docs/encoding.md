@@ -43,6 +43,34 @@ and a mangled input is noticed:
 Errors are `IoError`s of kind `InvalidInput`, with `op` `base64 decode` and a
 `detail` that names the byte offset of the problem where there is one.
 
+## Decompression
+
+`stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data with the
+system's zlib. A program that imports it compiles `inflate.c` and links `-lz`;
+no other program does. (Compressing is done by `compress/gzip` and
+`compress/deflate`, written in Kod.)
+
+```kod
+import "compress/inflate"
+
+let text = kod_bytes_to_str(must inflate.gunzip(data))
+```
+
+| Function | Meaning |
+|---|---|
+| `gunzip(data: bytes, max_output: int64 = 16777216) -> bytes or Error` | a gzip file (RFC 1952); several members one after the other give their output joined, like `gunzip` does |
+| `inflate_zlib(data: bytes, max_output: int64 = 16777216) -> bytes or Error` | a zlib stream (RFC 1950) |
+| `inflate_raw(data: bytes, max_output: int64 = 16777216) -> bytes or Error` | a raw deflate stream (RFC 1951) |
+
+`max_output` is the most bytes the result may have. Decompression stops as soon as
+it would be exceeded, so a few kilobytes of input cannot make the program allocate
+gigabytes; the buffer grows only as output is produced. Errors are `IoError`s of
+kind `InvalidInput`, with `op` the function's name and a `detail` that says what was
+wrong: `output too large`, `truncated`, or zlib's own wording for corrupt data
+(`incorrect header check`, `invalid block type`, `incorrect data check` for a CRC
+that does not match, `incorrect length check`). Bytes after the last gzip member
+are an error, and so is a stream that ends before its final block.
+
 ## Percent-encoding
 
 For URLs and query strings, see [HTTP client](http.md#query-strings-and-percent-encoding).

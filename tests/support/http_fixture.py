@@ -6,6 +6,7 @@ are given, and exits by itself after two minutes. A connection stays open for
 the next request unless the request or the route says otherwise.
 """
 
+import gzip
 import os
 import socketserver
 import ssl
@@ -129,6 +130,39 @@ class Handler(socketserver.StreamRequestHandler):
             self.wfile.flush()
         return b""
 
+    def encoded(self, method: str, path: str) -> bytes:
+        """Responses with a Content-Encoding."""
+        plain = b"hello gzip"
+        coding = "gzip"
+        if path == "/gzip-empty":
+            plain = b""
+        elif path == "/gzip-bomb":
+            plain = b"x" * 20_000_000
+        elif path == "/gzip-big":
+            plain = b"0123456789abcdef" * 300_000
+        elif path == "/gzip-utf8":
+            plain = "Café ☕".encode()
+        body = gzip.compress(plain, mtime=0)
+        if path == "/gzip-bad":
+            body = b"this is not gzip data"
+        elif path == "/br":
+            coding, body = "br", b"\x8b\x02\x80binary"
+        elif path == "/gzip-list":
+            coding = "gzip, br"
+        elif path == "/x-gzip":
+            coding = "x-gzip"
+        headers = f"Content-Encoding: {coding}\r\n"
+        if path == "/gzip-chunked":
+            half = len(body) // 2
+            parts = [body[:half], body[half:]]
+            framed = b"".join(f"{len(p):x}\r\n".encode() + p + b"\r\n" for p in parts)
+            head = f"HTTP/1.1 200 OK\r\n{headers}Transfer-Encoding: chunked\r\n\r\n"
+            return head.encode() + framed + b"0\r\n\r\n"
+        if method == "HEAD":
+            head = f"HTTP/1.1 200 OK\r\n{headers}Content-Length: {len(body)}\r\n\r\n"
+            return head.encode()
+        return reply("200 OK", body, headers)
+
     def route(
         self,
         method: str,
@@ -143,6 +177,8 @@ class Handler(socketserver.StreamRequestHandler):
             return reply("200 OK", f"conn {self.conn_id} req {self.requests}".encode())
         if path == "/redir-id":
             return redirect("302 Found", "/conn-id")
+        if path.startswith("/gzip") or path in ("/x-gzip", "/br"):
+            return self.encoded(method, path)
         if path == "/lies":
             # Says close but leaves the socket open: only the header can tell.
             self.keep_open = True
