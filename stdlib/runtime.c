@@ -713,6 +713,19 @@ void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
     return out;
 }
 
+// A shallow copy with room to grow, for a `mut` binding that starts from an existing array.
+void *kod_array_copy(void *src_raw) {
+    KodArray *src = (KodArray *)src_raw;
+    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
+    out->ptr = arena_alloc(src->len > 0 ? src->len * 8 : 8);
+    out->len = src->len;
+    out->cap = src->len;
+    if (src->len > 0) {
+        memcpy(out->ptr, src->ptr, src->len * 8);
+    }
+    return out;
+}
+
 void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
