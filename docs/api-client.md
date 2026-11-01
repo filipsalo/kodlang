@@ -111,7 +111,11 @@ body.put_str("body", "Steps to reproduce: ...")
 body.put("labels", json.array_of([json.str_value("bug")]))
 
 let payload = kod_str_to_bytes(json.emit(body.build()))
-let response = try post("https://api.example.com/issues", payload, content_type: "application/json")
+let response = try post(
+    "https://api.example.com/issues",
+    payload,
+    content_type: "application/json",
+)
 ```
 
 ## What to know before relying on it

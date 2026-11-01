@@ -69,6 +69,34 @@ let name: str = "Alice"
 greet(:name)          // shorthand for greet(name: name)
 ```
 
+## Long calls and parameter lists
+
+A call may be split across lines wherever the arguments are separated, and so may a
+parameter list. Put each argument on its own line, with or without a trailing comma,
+and comments between them:
+
+```kod
+let conn = connect(
+    "example.com",
+    port: 8443,        // not the default
+    timeout_ms: 200,
+    tls: true,
+)
+
+func request(
+    anon method: str,
+    anon url: str,
+    timeout_ms: int64 = 5000,
+) -> none { ... }
+```
+
+This holds for every call: functions, methods, `x?.method(...)`, struct and enum
+constructors (`Point(x: 1, y: 2)`), and the argument lists of enum variants in a type
+declaration. A line break after the callee and before the `(` still ends the statement,
+so `f` and `(1)` on two lines are two expressions, not a call. A call that never closes
+is reported at the first token that cannot continue it, for instance
+`` expected `)`, got `let` `` on the line of the next statement.
+
 ## Label / binding split
 
 A parameter can have two names — an external *label* used at call sites and
