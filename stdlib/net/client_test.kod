@@ -1,4 +1,4 @@
-import "net/client" { Client, Options, fetch, get, post }
+import "net/client" { Client, Options, fetch, get, post, put, patch, delete }
 import "net/http" { Headers, Response, Limits }
 import "net/tcp"
 import "stream" { IoError, IoKind }
@@ -334,6 +334,136 @@ test "deadline_ms: a connection refused is still ConnectionRefused" {
     let port = l.port()
     must l.close()
     assert fails(fetch("GET", f"http://127.0.0.1:{port}/", options: Options(deadline_ms: 5000)), .ConnectionRefused, "")
+}
+
+// ---- client-level settings ----
+
+func echo_of(anon r: Response or Error) -> str {
+    return body(r)
+}
+
+test "Client.headers are sent with every request" {
+    let sv = start_fixture()
+    let client = Client()
+    client.headers.add("X-Api-Key", "k1")
+    client.headers.add("Accept", "application/json")
+    let a = echo_of(client.get(url(sv, "/echo")))
+    assert a.contains("X-Api-Key: k1\n") and a.contains("Accept: application/json\n")
+    assert a.contains("Accept: */*") == false
+    let c = echo_of(client.post(url(sv, "/echo"), b("x"), content_type: "text/plain"))
+    assert c.contains("X-Api-Key: k1\n") and c.contains("Content-Type: text/plain\n")
+    stop(sv)
+}
+
+test "request headers are added, and win over the client's of the same name" {
+    let sv = start_fixture()
+    let client = Client()
+    client.headers.add("X-Api-Key", "client")
+    client.headers.add("X-Keep", "yes")
+    let options = Options()
+    options.headers.add("x-api-key", "request")
+    options.headers.add("X-Extra", "1")
+    let text = echo_of(client.get(url(sv, "/echo"), options: options))
+    assert text.contains("x-api-key: request\n")
+    assert text.contains("X-Api-Key: client") == false
+    assert text.contains("X-Keep: yes\n") and text.contains("X-Extra: 1\n")
+    assert echo_of(client.get(url(sv, "/echo"))).contains("X-Api-Key: client\n")
+    stop(sv)
+}
+
+test "the client's headers are not changed by a request's" {
+    let sv = start_fixture()
+    let client = Client()
+    client.headers.add("A", "1")
+    let options = Options()
+    options.headers.add("B", "2")
+    options.headers.add("A", "other")
+    must client.get(url(sv, "/echo"), options: options)
+    assert len(client.headers.items) == 1
+    assert (client.headers.get("A")? or "!") == "1"
+    stop(sv)
+}
+
+test "client-level Authorization does not follow a redirect to another host" {
+    let sv = start_fixture()
+    let client = Client()
+    client.headers.add("Authorization", "Bearer secret")
+    assert echo_of(client.get(url(sv, "/302"))).contains("Authorization: Bearer secret\n")
+    let other = echo_of(client.get(url(sv, "/cross-host")))
+    assert other.contains("Authorization") == false
+    stop(sv)
+}
+
+test "Client.deadline_ms applies to every request, and a request can change it" {
+    let sv = start_fixture()
+    let client = Client(deadline_ms: 300)
+    assert fails(client.get(url(sv, "/slow")), .TimedOut, "deadline exceeded")
+    assert echo_of(client.get(url(sv, "/hello"))) == "hello"
+    assert fails(client.get(url(sv, "/slow"), options: Options(deadline_ms: 200)), .TimedOut, "deadline exceeded")
+    assert echo_of(client.get(url(sv, "/slow"), options: Options(deadline_ms: 0))) == "late"
+    assert echo_of(client.get(url(sv, "/slow"), options: Options(deadline_ms: 5000))) == "late"
+    stop(sv)
+}
+
+test "Client.timeout_ms and a request's timeout_ms" {
+    let sv = start_fixture()
+    let client = Client(timeout_ms: 200)
+    assert fails(client.get(url(sv, "/slow")), .TimedOut, "")
+    assert echo_of(client.get(url(sv, "/slow"), options: Options(timeout_ms: 5000))) == "late"
+    stop(sv)
+}
+
+test "Client.accept_gzip, max_redirects and limits, and their overrides" {
+    let sv = start_fixture()
+    let plain = Client(accept_gzip: false)
+    assert echo_of(plain.get(url(sv, "/echo"))).contains("Accept-Encoding") == false
+    assert echo_of(plain.get(url(sv, "/echo"), options: Options(accept_gzip: true))).contains("Accept-Encoding: gzip")
+    let stay = Client(max_redirects: 0)
+    assert (must stay.get(url(sv, "/302"))).status == 302
+    assert (must stay.get(url(sv, "/302"), options: Options(max_redirects: 5))).status == 200
+    let small = Client(limits: Limits(max_body: 1000000, max_header_bytes: 65536, max_headers: 100))
+    assert fails(small.get(url(sv, "/big")), .Protocol, "body too large")
+    let roomy = Options(limits: Limits(max_body: 4000000, max_header_bytes: 65536, max_headers: 100))
+    assert len((must small.get(url(sv, "/big"), options: roomy)).body) == 3000000
+    stop(sv)
+}
+
+test "get, delete, put, patch and post take options" {
+    let sv = start_fixture()
+    let client = Client()
+    let options = Options()
+    options.headers.add("X-Mark", "m")
+    let g = echo_of(client.get(url(sv, "/echo"), options: options))
+    assert g.starts_with("GET /echo\n") and g.contains("X-Mark: m\n")
+    assert echo_of(client.delete(url(sv, "/echo"), options: options)).starts_with("DELETE /echo\n")
+    let u = echo_of(client.put(url(sv, "/echo"), b("body"), content_type: "text/plain", options: options))
+    assert u.starts_with("PUT /echo\n") and u.ends_with("\n\nbody") and u.contains("X-Mark: m\n")
+    let pa = echo_of(client.patch(url(sv, "/echo"), b("p"), content_type: "application/merge-patch+json"))
+    assert pa.starts_with("PATCH /echo\n") and pa.contains("Content-Type: application/merge-patch+json\n")
+    let po = echo_of(client.post(url(sv, "/echo"), b("q"), content_type: "text/plain", options: options))
+    assert po.starts_with("POST /echo\n") and po.contains("X-Mark: m\n")
+    stop(sv)
+}
+
+test "the module's functions take options and a body method too" {
+    let sv = start_fixture()
+    let options = Options()
+    options.headers.add("X-Mark", "m")
+    assert echo_of(get(url(sv, "/echo"), options: options)).contains("X-Mark: m\n")
+    assert echo_of(delete(url(sv, "/echo"))).starts_with("DELETE /echo\n")
+    assert echo_of(put(url(sv, "/echo"), b("z"), content_type: "text/plain")).ends_with("\n\nz")
+    assert echo_of(patch(url(sv, "/echo"), b("z"), content_type: "text/plain")).starts_with("PATCH /echo\n")
+    assert echo_of(post(url(sv, "/echo"), b("z"), content_type: "text/plain", options: options)).contains("X-Mark: m\n")
+    stop(sv)
+}
+
+test "a request's own body option is used by fetch, post's body argument wins" {
+    let sv = start_fixture()
+    let client = Client()
+    let options = Options(body: b("from options"))
+    assert echo_of(client.fetch("POST", url(sv, "/echo"), options: options)).ends_with("\n\nfrom options")
+    assert echo_of(client.post(url(sv, "/echo"), b("argument"), content_type: "text/plain", options: options)).ends_with("\n\nargument")
+    stop(sv)
 }
 
 // ---- connection reuse ----
@@ -703,5 +833,17 @@ test "https: a connection that dropped the request is retried" {
     assert first.status == 200
     let second = must client.fetch("GET", f"https://localhost:{sv.port}/flaky", options: options)
     assert second.text() == "recovered"
+    stop(sv)
+}
+
+test "https: the client's trust_file and a request's" {
+    let sv = start_tls_fixture()
+    let client = Client(trust_file: cert_path())
+    let r = must client.get(f"https://localhost:{sv.port}/hello")
+    assert r.text() == "hello"
+    let stranger = Client()
+    assert fails(stranger.get(f"https://localhost:{sv.port}/hello"), .Tls, "")
+    let ok = must stranger.get(f"https://localhost:{sv.port}/hello", options: Options(trust_file: cert_path()))
+    assert ok.status == 200
     stop(sv)
 }

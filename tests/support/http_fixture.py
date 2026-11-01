@@ -173,6 +173,8 @@ class Handler(socketserver.StreamRequestHandler):
     ) -> bytes | None:
         if path.startswith("/repos/"):
             return self.github(target, path, headers)
+        if path == "/stats":
+            return reply("200 OK", str(STATE["connections"]).encode())
         if path == "/conn-id":
             return reply("200 OK", f"conn {self.conn_id} req {self.requests}".encode())
         if path == "/redir-id":

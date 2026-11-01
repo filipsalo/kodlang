@@ -29,24 +29,57 @@ cookies and no proxy support.
 
 ## Requests
 
-| Function | Meaning |
-|----------|---------|
-| `get(url)` | `GET` with the default options |
-| `post(url, body, content_type)` | `POST` of a `bytes` body |
-| `fetch(method, url, options = Options())` | any method; the body is `options.body`; `Response or Error` |
+A `Client` carries the settings that describe the service you talk to (its
+headers, its certificate roots, its deadline) and makes the requests:
 
-`Options`:
+```kod
+import "net/client" { Client }
+
+let client = Client(deadline_ms: 15000)
+client.headers.add("Accept", "application/json")
+client.headers.add("Authorization", "Bearer " + token)
+
+let user = try client.get("https://api.example.com/users/1")
+let made = try client.post("https://api.example.com/users", payload, content_type: "application/json")
+```
+
+| Method of `Client` | Meaning |
+|---|---|
+| `get(url, options = Options())`, `delete(url, options = Options())` | `GET`, `DELETE` |
+| `post(url, body, content_type, options = Options())`, `put(...)`, `patch(...)` | the method with a `bytes` body and a `Content-Type` |
+| `fetch(method, url, options = Options())` | any method; the body is `options.body` |
+| `close()` | close the idle connections (see [Connection reuse](#connection-reuse)) |
+
+All return `Response or Error`. The functions `get`, `post`, `put`, `patch`,
+`delete` and `fetch` of the module do the same with a new `Client` for each
+call, which is closed again afterwards: one request, one connection.
+
+A `Client` has these fields, each with the default shown:
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `headers` | none | extra request headers (`Headers`) |
-| `body` | empty | the request body (`bytes`) |
+| `headers` | none | headers sent with every request (`Headers`) |
 | `trust_file` | `""` | PEM roots for `https`, as for [`net/tls`](io.md#tls) |
 | `timeout_ms` | 30000 | limit for the connect, the TLS handshake, and each single read or write; a server that keeps sending slowly never trips it (see `deadline_ms`) |
-| `accept_gzip` | true | send `Accept-Encoding: gzip`, and decode a gzip response (see [Compression](#compression)) |
-| `deadline_ms` | 0 | limit for the whole `fetch` (connect, handshake, every redirect and reading the whole body); 0 means none, a negative value is an `InvalidInput` error |
+| `deadline_ms` | 0 | limit for the whole request (connect, handshake, every redirect and reading the whole body); 0 means none, a negative value is an `InvalidInput` error |
 | `max_redirects` | 5 | redirects to follow; 0 returns the redirect response as it is |
+| `accept_gzip` | true | send `Accept-Encoding: gzip`, and decode a gzip response (see [Compression](#compression)) |
 | `limits` | see below | caps on what a response may send |
+| `max_idle_per_host`, `idle_ms` | 2, 30000 | connection reuse (see [Connection reuse](#connection-reuse)) |
+
+`Options` is for one request. Its fields are the same, plus the body, and each
+one that you leave out means the `Client`'s value:
+
+| Field | Meaning |
+|-------|---------|
+| `headers` | added to the client's; where both have a header of the same name, the request's wins |
+| `body` | the request body (`bytes`); empty by default |
+| `trust_file`, `timeout_ms`, `deadline_ms`, `max_redirects`, `accept_gzip`, `limits` | replace the client's for this request, including with `0` or `false` |
+
+```kod
+let r = try client.get(url, options: Options(deadline_ms: 2000))   // this one is quicker
+let q = try client.get(url, options: Options(deadline_ms: 0))      // and this one has none
+```
 
 A `Host` header, `Connection: close` and a `Content-Length` (for any body,
 and for an empty `POST`, `PUT` or `PATCH`) are always set by the library and
@@ -77,14 +110,10 @@ func main() -> int64 or Error {
 }
 ```
 
-`Client` has `fetch(method, url, options = Options())`, `get(url)` and
-`post(url, body, content_type)`, which behave as the functions of the same
-names, and `close()`, which closes every idle connection. Its fields:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `max_idle_per_host` | 2 | idle connections kept for each scheme, host and port; 0 turns reuse off, so every request opens and closes its own |
-| `idle_ms` | 30000 | an idle connection older than this is closed instead of reused |
+`max_idle_per_host` (2) is how many idle connections are kept for each scheme,
+host and port; 0 turns reuse off, so every request opens and closes its own.
+`idle_ms` (30000) is how old an idle connection may be before it is closed instead
+of reused.
 
 A connection goes back to the `Client` after a response only when nothing about
 the exchange makes it unsafe: the response is `HTTP/1.1` (or `HTTP/1.0` with
@@ -102,8 +131,7 @@ fails before any of the response arrives, and its method is `GET`, `HEAD`,
 repeated, and the error is returned as it is.
 
 Redirects use the `Client` too, so a redirect within one host goes over the same
-connection. `timeout_ms` and `deadline_ms` apply to a reused connection exactly as
-to a new one. A `Client` is not meant to be shared by two requests at the same
+connection. The timeouts and the deadline apply to a reused connection exactly as to a new one. A `Client` is not meant to be shared by two requests at the same
 time, and there is only one thread.
 
 ## Deadlines

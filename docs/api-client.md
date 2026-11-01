@@ -35,15 +35,24 @@ use that to run the example against a local stand-in server
 with the program's name first. `env.get("GITHUB_TOKEN")` returns a `str?`, and
 `x? or default` handles a missing variable ([Built-ins](builtins.md#environment-variables)).
 
-**The request.** Headers go in `Options`, and `fetch` does the rest: it picks TCP
-or TLS from the URL, follows redirects, and enforces the size limits
+**The client.** What every request to the service needs goes on a `Client` once: its
+headers, its deadline. The example wraps it in a small `GitHub` type, so `main` reads
+as `github.repo(name)` and `github.open_issues(name, limit: 3)`. One `Client` serves
+both requests, which keeps the connection from the first and uses it for the second
 ([HTTP client](http.md)).
 
 ```kod
-let options = Options()
-options.headers.add("Accept", "application/vnd.github+json")
-let response = try fetch("GET", url, options: options)
+let client = Client(deadline_ms: 15000)
+client.headers.add("Accept", "application/vnd.github+json")
+client.headers.add("Authorization", "Bearer " + token)
+
+let response = try client.get(url)
 ```
+
+A single request can override any of that with `Options`, for instance
+`client.get(url, options: Options(deadline_ms: 2000))`. `Client.get` follows
+redirects, enforces the size limits and the deadline, and picks TCP or TLS from the
+URL.
 
 **Query strings.** Build them with `Query`, which encodes names and values, rather
 than by joining strings:
@@ -52,7 +61,7 @@ than by joining strings:
 let query = Query()
 query.add("state", "open")
 query.add("per_page", "3")
-let url = with_query(repo_url + "/issues", query)
+let url = with_query("/repos/" + name + "/issues", query)
 ```
 
 **Reading JSON.** `json.parse` returns `Value or Error`. The accessors never fail,

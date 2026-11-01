@@ -11,7 +11,7 @@
 import "env"
 import "io"
 import "json"
-import "net/client" { Options, fetch }
+import "net/client" { Client }
 import "net/http" { Query, with_query }
 
 func fail(anon message: str) -> none {
@@ -36,19 +36,42 @@ func api_message(anon body: str) -> str {
     return ""
 }
 
-func call(anon url: str) -> json.Value or Error {
-    let options = Options()
-    options.headers.add("Accept", "application/vnd.github+json")
+// The GitHub API: one Client for all requests, so that they share a connection,
+// set up with what every request needs.
+type GitHub = struct {
+    client: Client
+    root: str
+
+    // GET `path` and parse the JSON answer; any status outside 2xx is an ApiError.
+    func get(self, anon path: str) -> json.Value or Error {
+        let response = try self.client.get(self.root + path)
+        if response.ok() == false {
+            throw ApiError(status: response.status, reason: response.reason, detail: api_message(response.text()))
+        }
+        return try json.parse(response.text())
+    }
+
+    func repo(self, anon name: str) -> json.Value or Error {
+        return try self.get("/repos/" + name)
+    }
+
+    func open_issues(self, anon name: str, limit: int64) -> json.Value or Error {
+        let query = Query()
+        query.add("state", "open")
+        query.add("per_page", limit.to_str())
+        return try self.get(with_query("/repos/" + name + "/issues", query))
+    }
+}
+
+func connect(anon root: str) -> GitHub {
+    // 15 seconds for each request as a whole, however slowly the server sends it.
+    let client = Client(deadline_ms: 15000)
+    client.headers.add("Accept", "application/vnd.github+json")
     let token = env.get("GITHUB_TOKEN")
     if token is none == false {
-        options.headers.add("Authorization", "Bearer " + (token? or ""))
+        client.headers.add("Authorization", "Bearer " + (token? or ""))
     }
-    let response = try fetch("GET", url, options: options)
-    if response.ok() == false {
-        let detail = api_message(response.text())
-        throw ApiError(status: response.status, reason: response.reason, detail: detail)
-    }
-    return try json.parse(response.text())
+    return GitHub(client: client, root: root)
 }
 
 type ApiError = struct {
@@ -94,24 +117,21 @@ func main(argv: [str]) -> int64 {
         io.write_stderr("usage: github_repo OWNER/REPO\n")
         return 2
     }
-    let api = env.get("GITHUB_API")? or "https://api.github.com"
-    let repo_url = api + "/repos/" + argv[1]
+    let github = connect(env.get("GITHUB_API")? or "https://api.github.com")
 
-    let repo = call(repo_url)
+    let repo = github.repo(argv[1])
     if repo is Err(e) {
         fail(e.to_str())
         return 1
     }
     print_repo(must repo)
 
-    let query = Query()
-    query.add("state", "open")
-    query.add("per_page", "3")
-    let issues = call(with_query(repo_url + "/issues", query))
+    let issues = github.open_issues(argv[1], limit: 3)
     if issues is Err(e) {
         fail(e.to_str())
         return 1
     }
     print_issues(must issues)
+    github.client.close()
     return 0
 }

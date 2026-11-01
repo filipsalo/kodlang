@@ -8,15 +8,43 @@ import "net/tls" { TlsStream }
 import "stream" { IoError, BufReader, Reader, Writer }
 import "time"
 
+// What one request may change about the Client it is sent through. A field left
+// out means the Client's value.
 type Options = struct {
     headers: Headers = Headers()
     body: bytes = kod_str_to_bytes("")
-    trust_file: str = ""
-    timeout_ms: int64 = 30000
-    max_redirects: int64 = 5
-    limits: Limits = Limits()
-    deadline_ms: int64 = 0
-    accept_gzip: bool = true
+    trust_file: str? = none
+    timeout_ms: int64? = none
+    max_redirects: int64? = none
+    limits: Limits? = none
+    deadline_ms: int64? = none
+    accept_gzip: bool? = none
+}
+
+// The values a request runs with: the Client's, with the Options laid over them.
+type Settings = struct {
+    headers: Headers
+    body: bytes
+    trust_file: str
+    timeout_ms: int64
+    max_redirects: int64
+    limits: Limits
+    deadline_ms: int64
+    accept_gzip: bool
+}
+
+// `base` and `extra` together; a header of `extra` replaces those of `base` with its name.
+func merged(anon base: Headers, anon extra: Headers) -> Headers {
+    let out = Headers()
+    for h in base.items {
+        if extra.has(h.name) == false {
+            out.add(h.name, h.value)
+        }
+    }
+    for h in extra.items {
+        out.add(h.name, h.value)
+    }
+    return out
 }
 
 func deadline_error() -> IoError {
@@ -161,13 +189,13 @@ type TlsLink = struct {
 }
 
 // A new connection to where `url` points, within `connect_ms`.
-func open_link(anon url: Url, options: Options, connect_ms: int64) -> Link or Error {
+func open_link(anon url: Url, cfg: Settings, connect_ms: int64) -> Link or Error {
     if url.scheme == "https" {
-        let conn = try tls.connect(url.host, port: url.port, trust_file: options.trust_file, timeout_ms: connect_ms)
-        return TlsLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: 0)
+        let conn = try tls.connect(url.host, port: url.port, trust_file: cfg.trust_file, timeout_ms: connect_ms)
+        return TlsLink(conn: conn, timeout_ms: cfg.timeout_ms, deadline_ns: 0)
     }
     let conn = try tcp.connect(url.host, port: url.port, timeout_ms: connect_ms)
-    return TcpLink(conn: conn, timeout_ms: options.timeout_ms, deadline_ns: 0)
+    return TcpLink(conn: conn, timeout_ms: cfg.timeout_ms, deadline_ns: 0)
 }
 
 // Methods that are safe to send again when a reused connection turns out to
@@ -235,16 +263,28 @@ func decode_content(anon resp: Response, anon limits: Limits) -> Response or Err
 }
 
 // Write `req` and read its response.
-func attempt(anon io: LinkIO, anon br: BufReader, anon req: Request, options: Options, keep_alive: bool) -> Response or Error {
-    try write_request(io, req, keep_alive: keep_alive, accept_gzip: options.accept_gzip)
-    return read_response(br, req.method, limits: options.limits)
+func attempt(anon io: LinkIO, anon br: BufReader, anon req: Request, cfg: Settings, keep_alive: bool) -> Response or Error {
+    try write_request(io, req, keep_alive: keep_alive, accept_gzip: cfg.accept_gzip)
+    return read_response(br, req.method, limits: cfg.limits)
 }
 
 // Connections kept between requests. See docs/http.md.
 type Client = struct {
+    headers: Headers = Headers()
+    trust_file: str = ""
+    timeout_ms: int64 = 30000
+    deadline_ms: int64 = 0
+    max_redirects: int64 = 5
+    accept_gzip: bool = true
+    limits: Limits = Limits()
     max_idle_per_host: int64 = 2
     idle_ms: int64 = 30000
     pool: [Idle] = []
+
+    // The settings for a request with `options`.
+    func settings(self, anon options: Options) -> Settings {
+        return Settings(headers: merged(self.headers, options.headers), body: options.body, trust_file: options.trust_file? or self.trust_file, timeout_ms: options.timeout_ms? or self.timeout_ms, max_redirects: options.max_redirects? or self.max_redirects, limits: options.limits? or self.limits, deadline_ms: options.deadline_ms? or self.deadline_ms, accept_gzip: options.accept_gzip? or self.accept_gzip)
+    }
 
     // An idle connection for `key`, or none. Ones that are too old or that the
     // server has closed are closed on the way.
@@ -300,29 +340,29 @@ type Client = struct {
         self.pool = empty
     }
 
-    func acquire(self, anon key: str, anon url: Url, options: Options, deadline_ns: int64) -> Acquired or Error {
+    func acquire(self, anon key: str, anon url: Url, cfg: Settings, deadline_ns: int64) -> Acquired or Error {
         let kept = self.take(key)
         if kept is Some(entry) {
             return Acquired(link: entry.link, reused: true)
         }
-        let connect_ms = try wait_ms(timeout_ms: options.timeout_ms, deadline_ns: deadline_ns)
-        let link = try open_link(url, options: options, connect_ms: connect_ms)
+        let connect_ms = try wait_ms(timeout_ms: cfg.timeout_ms, deadline_ns: deadline_ns)
+        let link = try open_link(url, cfg: cfg, connect_ms: connect_ms)
         return Acquired(link: link, reused: false)
     }
 
     // One request, on a kept connection if there is one, else on a new one.
-    func exchange(self, anon req: Request, options: Options, deadline_ns: int64) -> Response or Error {
+    func exchange(self, anon req: Request, cfg: Settings, deadline_ns: int64) -> Response or Error {
         let url = req.url
         let key = f"{url.scheme}://{url.host}:{url.port}"
         let reuse = self.max_idle_per_host > 0
         mut repeated = false
         for true {
-            let got = try self.acquire(key, url, options: options, deadline_ns: deadline_ns)
+            let got = try self.acquire(key, url, cfg: cfg, deadline_ns: deadline_ns)
             let link = got.link
-            link.arm(options.timeout_ms, deadline_ns)
+            link.arm(cfg.timeout_ms, deadline_ns)
             let io = LinkIO(link: link)
-            let br = BufReader(inner: io, limit: options.limits.max_header_bytes)
-            let outcome = attempt(io, br, req, options: options, keep_alive: reuse)
+            let br = BufReader(inner: io, limit: cfg.limits.max_header_bytes)
+            let outcome = attempt(io, br, req, cfg: cfg, keep_alive: reuse)
             if outcome is Err(e) {
                 discard(link)
                 if got.reused and repeated == false and link.received() == 0 and repeatable(req.method) {
@@ -337,34 +377,35 @@ type Client = struct {
             } else {
                 discard(link)
             }
-            return try decode_content(response, options.limits)
+            return try decode_content(response, cfg.limits)
         }
         throw invalid("fetch", "unreachable")
     }
 
     func fetch(self, anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
-        if options.deadline_ms < 0 {
+        let cfg = self.settings(options)
+        if cfg.deadline_ms < 0 {
             throw invalid("fetch", "deadline_ms cannot be negative")
         }
         mut deadline_ns: int64 = 0
-        if options.deadline_ms > 0 {
-            deadline_ns = time.monotonic_ns() + options.deadline_ms * 1000000
+        if cfg.deadline_ms > 0 {
+            deadline_ns = time.monotonic_ns() + cfg.deadline_ms * 1000000
         }
         mut current = try parse_url(url)
         mut verb = method
-        mut payload = options.body
-        mut headers = without(options.headers, [])
+        mut payload = cfg.body
+        mut headers = cfg.headers
         mut hops: int64 = 0
         for true {
             let req = Request(method: verb, url: current, headers: headers, body: payload)
-            let resp = try self.exchange(req, options: options, deadline_ns: deadline_ns)
+            let resp = try self.exchange(req, cfg: cfg, deadline_ns: deadline_ns)
             let location = resp.header("location")
-            if is_redirect(resp.status) == false or location is none or options.max_redirects <= 0 {
+            if is_redirect(resp.status) == false or location is none or cfg.max_redirects <= 0 {
                 return resp
             }
             hops = hops + 1
-            if hops > options.max_redirects {
-                throw invalid("redirect", f"more than {options.max_redirects} redirects")
+            if hops > cfg.max_redirects {
+                throw invalid("redirect", f"more than {cfg.max_redirects} redirects")
             }
             let next = try resolve(current, location? or "")
             if current.scheme == "https" and next.scheme == "http" {
@@ -385,15 +426,32 @@ type Client = struct {
         throw invalid("redirect", "unreachable")
     }
 
-    func get(self, anon url: str) -> Response or Error {
-        return try self.fetch("GET", url)
+    func get(self, anon url: str, options: Options = Options()) -> Response or Error {
+        return try self.fetch("GET", url, options: options)
     }
 
-    func post(self, anon url: str, anon body: bytes, content_type: str) -> Response or Error {
-        let options = Options(body: body)
-        options.headers.add("Content-Type", content_type)
-        return try self.fetch("POST", url, options: options)
+    func delete(self, anon url: str, options: Options = Options()) -> Response or Error {
+        return try self.fetch("DELETE", url, options: options)
     }
+
+    func post(self, anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+        return try self.fetch("POST", url, options: with_body(options, body, content_type))
+    }
+
+    func put(self, anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+        return try self.fetch("PUT", url, options: with_body(options, body, content_type))
+    }
+
+    func patch(self, anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+        return try self.fetch("PATCH", url, options: with_body(options, body, content_type))
+    }
+}
+
+// `options` with a body, and a `Content-Type` that replaces one of the same name.
+func with_body(anon options: Options, anon body: bytes, anon content_type: str) -> Options {
+    let headers = merged(options.headers, Headers())
+    headers.set("Content-Type", content_type)
+    return Options(headers: headers, body: body, trust_file: options.trust_file, timeout_ms: options.timeout_ms, max_redirects: options.max_redirects, limits: options.limits, deadline_ms: options.deadline_ms, accept_gzip: options.accept_gzip)
 }
 
 func is_redirect(anon status: int64) -> bool {
@@ -423,12 +481,22 @@ func fetch(anon method: str, anon url: str, options: Options = Options()) -> Res
     return try client.fetch(method, url, options: options)
 }
 
-func get(anon url: str) -> Response or Error {
-    return try fetch("GET", url)
+func get(anon url: str, options: Options = Options()) -> Response or Error {
+    return try fetch("GET", url, options: options)
 }
 
-func post(anon url: str, anon body: bytes, content_type: str) -> Response or Error {
-    let options = Options(body: body)
-    options.headers.add("Content-Type", content_type)
-    return try fetch("POST", url, options: options)
+func delete(anon url: str, options: Options = Options()) -> Response or Error {
+    return try fetch("DELETE", url, options: options)
+}
+
+func post(anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+    return try fetch("POST", url, options: with_body(options, body, content_type))
+}
+
+func put(anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+    return try fetch("PUT", url, options: with_body(options, body, content_type))
+}
+
+func patch(anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
+    return try fetch("PATCH", url, options: with_body(options, body, content_type))
 }
