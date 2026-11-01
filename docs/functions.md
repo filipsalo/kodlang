@@ -44,7 +44,8 @@ greet(name: "Alice")
 
 Labeled arguments go in parameter order: with `func move(x: int64, y: int64)`,
 `move(y: 2, x: 1)` is an error
-(`` parameter 0 of `move` expected label `x`, got `y` ``).
+(`` parameter 0 of `move` expected label `x`, got `y` ``). A label may jump over
+parameters that have [defaults](#default-values), which are then left out of the call.
 
 `anon` removes the label requirement for that parameter:
 
@@ -114,6 +115,29 @@ is declared, so `func f(x: int64 = "a")` is an error even if no call leaves
 a wrong field in a constructor, is reported where a call leaves it out, and
 an interface method's default is checked only at each call that leaves it
 out.
+
+A label can jump over parameters that have defaults, so that a later one can be
+set without writing out the ones in between:
+
+```kod
+func connect(anon host: str, port: int64 = 80, timeout_ms: int64 = 5000, tls: bool = false) -> none { ... }
+
+connect("example.com")                          // all defaults
+connect("example.com", timeout_ms: 200)         // port and tls by default
+connect("example.com", port: 8443, tls: true)   // timeout_ms by default
+```
+
+The labels still go in parameter order, and a parameter that is jumped over must
+have a default; `connect(port: 1)` is an error because `host` has none
+(`` parameter 0 of `connect` is anon; remove label `port` ``). An `anon`
+parameter with a default can be jumped over the same way, by labeling a later
+argument. Unlabeled arguments fill the parameters strictly in order, so only a
+label can skip.
+
+Each default is evaluated afresh at the call, in the order of the parameters,
+along with the arguments you did give: in `f(a: x(), c: z())` for `func f(a: int64, b: int64 = y(), c: int64 = 0)`,
+the calls run `x`, then the default `y`, then `z`. It works the same for
+methods, [interface methods](types.md#interfaces) and functions of other modules.
 
 ## Argument types
 
