@@ -23,10 +23,23 @@ Supported escape sequences:
 | `\\` | backslash |
 | `\"` | double quote |
 | `\'` | single quote |
+| `\xHH` | the byte `HH`, two hex digits (`00` to `FF`) |
+| `\u{H...}` | a Unicode character, 1 to 6 hex digits, written as UTF-8 |
 
-There are no `\x..` or `\u{...}` escapes yet. For any other escape the
-backslash and the character after it are both dropped, so `"\x41"` is
-`"41"`. Non-ASCII UTF-8 can be written directly in the source.
+`\x` gives a single byte, so `"\xC3\xA9"` and `"\u{e9}"` are both `é` (two bytes), while
+`"\xE9"` is one byte that isn't valid UTF-8 by itself. A string may hold any bytes. A
+`\u{...}` must be a Unicode scalar value: at most `10FFFF`, and not a surrogate
+(`D800` to `DFFF`).
+
+A malformed `\x` or `\u` is an error: a `\x` without two hex digits, a `\u` without
+braces, an empty or unterminated `\u{}`, more than six digits, or a value that isn't a
+scalar value. For any other escape the backslash and the character after it are both
+dropped, so `"\q"` is `""`. Non-ASCII UTF-8 can also be written directly in the source.
+Character literals (`'a'`) take the simple escapes only.
+
+Byte literals (`b"..."`) and f-strings take the same escapes. In an f-string, the braces of
+`\u{...}` are part of the escape, not an interpolation: `f"\u{e9}{n}"` is `é` followed by
+the value of `n`.
 
 ## F-strings
 
