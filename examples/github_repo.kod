@@ -1,0 +1,117 @@
+// Summarise a GitHub repository over its JSON API.
+//
+//   kod run examples/github_repo.kod anthropics/anthropic-sdk-python
+//
+// Environment:
+//   GITHUB_TOKEN  sent as a bearer token when set (needed for private repos)
+//   GITHUB_API    the API root, https://api.github.com by default
+//
+// Exit status: 0 on success, 1 when the request fails or the repository is
+// not found, 2 on a bad command line.
+import "env"
+import "io"
+import "json"
+import "net/client" { Options, fetch }
+import "net/http" { Query, with_query }
+
+func fail(anon message: str) -> none {
+    io.write_stderr("error: " + message + "\n")
+}
+
+// A string field, or `fallback` when it is missing, null or not a string.
+func text_of(anon v: json.Value, key: str, fallback: str) -> str {
+    return json.as_str(json.get(v, key: key))? or fallback
+}
+
+func number_of(anon v: json.Value, key: str) -> int64 {
+    return json.as_int(json.get(v, key: key))? or 0
+}
+
+// The `message` the API puts in an error body, if the body is JSON.
+func api_message(anon body: str) -> str {
+    let parsed = json.parse(body)
+    if parsed is Ok(v) {
+        return text_of(v, key: "message", fallback: "")
+    }
+    return ""
+}
+
+func call(anon url: str) -> json.Value or Error {
+    let options = Options()
+    options.headers.add("Accept", "application/vnd.github+json")
+    let token = env.get("GITHUB_TOKEN")
+    if token is none == false {
+        options.headers.add("Authorization", "Bearer " + (token? or ""))
+    }
+    let response = try fetch("GET", url, options: options)
+    if response.ok() == false {
+        let detail = api_message(response.text())
+        throw ApiError(status: response.status, reason: response.reason, detail: detail)
+    }
+    return try json.parse(response.text())
+}
+
+type ApiError = struct {
+    status: int64
+    reason: str
+    detail: str
+
+    func to_str(self) -> str {
+        if len(self.detail) > 0 {
+            return f"{self.status} {self.reason}: {self.detail}"
+        }
+        return f"{self.status} {self.reason}"
+    }
+}
+
+func print_repo(anon repo: json.Value) -> none {
+    print(text_of(repo, key: "full_name", fallback: "?"))
+    print("  " + text_of(repo, key: "description", fallback: "(no description)"))
+    print(f"  language: {text_of(repo, key: "language", fallback: "unknown")}")
+    print(f"  stars: {number_of(repo, key: "stargazers_count")}, forks: {number_of(repo, key: "forks_count")}")
+    let license = json.get(repo, key: "license")
+    print(f"  license: {text_of(license, key: "spdx_id", fallback: "none")}")
+}
+
+func print_issues(anon issues: json.Value) -> none {
+    let items = json.as_array(issues)
+    if items is none {
+        return
+    }
+    print("open issues:")
+    mut shown: int64 = 0
+    for issue in items? or [] {
+        print(f"  #{number_of(issue, key: "number")} {text_of(issue, key: "title", fallback: "?")}")
+        shown = shown + 1
+    }
+    if shown == 0 {
+        print("  none")
+    }
+}
+
+func main(argv: [str]) -> int64 {
+    if len(argv) != 2 or argv[1].contains("/") == false {
+        io.write_stderr("usage: github_repo OWNER/REPO\n")
+        return 2
+    }
+    let api = env.get("GITHUB_API")? or "https://api.github.com"
+    let repo_url = api + "/repos/" + argv[1]
+
+    let repo = call(repo_url)
+    if repo is Err(e) {
+        fail(e.to_str())
+        return 1
+    }
+    print_repo(must repo)
+
+    let query = Query()
+    query.add("state", "open")
+    query.add("per_page", "3")
+    let issues = call(with_query(repo_url + "/issues", query))
+    if issues is Err(e) {
+        fail(e.to_str())
+        return 1
+    }
+    print_issues(must issues)
+    return 0
+}

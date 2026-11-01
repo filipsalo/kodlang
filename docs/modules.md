@@ -111,10 +111,13 @@ The stdlib lives under `stdlib/` in the repository.
 | `io` | `read_file`, `write_file`, and stdin/stdout/stderr helpers. |
 | `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
+| `env` | `get`, `set` and `unset` for environment variables. See [Built-ins](builtins.md#environment-variables). |
 | `time` | `monotonic_ns()` and `unix_ns()`. |
 | `set` | `Set[T]`, a hash set built on `Map`. |
 | `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |
-| `json` | Minimal JSON parse/emit, int64 numbers only. See [JSON](json.md). |
+| `json` | Strict JSON parse/emit, with builders. See [JSON](json.md). |
+| `strbuilder`, `stream`, `fd` | `StrBuilder`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
+| `net/tcp`, `net/tls`, `net/http`, `net/client` | TCP, TLS, HTTP/1.1 messages and an HTTP client. See [Streams](io.md) and [HTTP client](http.md). |
 | `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
 | `hash/crc32` | CRC-32 (gzip polynomial), streaming or one-shot. |
 | `compress/deflate`, `compress/gzip` | Deflate encoder (fixed Huffman, optional LZ77) and a gzip writer. |

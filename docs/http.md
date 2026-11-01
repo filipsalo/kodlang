@@ -115,6 +115,27 @@ broken server can't use up memory:
 
 A `Content-Length` over `max_body` fails before any of the body is read.
 
+## Query strings and percent-encoding
+
+Put user input into a URL through `Query`, never by concatenating it:
+
+```kod
+import "net/http" { Query, with_query }
+
+let q = Query()
+q.add("q", "kod language")
+q.add("page", "2")
+let url = with_query("https://api.example.com/search", q)
+// https://api.example.com/search?q=kod%20language&page=2
+```
+
+| Function | Meaning |
+|---|---|
+| `percent_encode(s)` | every byte except `A-Z a-z 0-9 - . _ ~` becomes `%XX` (uppercase hex); UTF-8 text is encoded byte by byte |
+| `percent_decode(s)` | the reverse; `%XX` is a byte, and `+` stays a `+`; a `%` not followed by two hex digits is an `InvalidInput` error; `str or Error` |
+| `Query` | `add(name, value)` appends a pair, `to_str()` joins them as `name=value&name=value`, with names and values encoded; no pairs give `""` |
+| `with_query(url, q)` | `url` plus `?` and the query, or `&` if `url` already has a `?`; an empty query returns `url` as it is; a `#fragment` stays at the end |
+
 ## Building and reading by hand
 
 `net/http` has what `client` is made of:

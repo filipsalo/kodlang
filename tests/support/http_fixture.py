@@ -63,6 +63,9 @@ class Handler(socketserver.StreamRequestHandler):
         self.wfile.write(self.route(method, target, path, headers, body))
         self.wfile.flush()
 
+    def github(self, target: str, path: str, headers: list[tuple[str, str]]) -> bytes:
+        return github(target, path, headers)
+
     def route(
         self,
         method: str,
@@ -71,6 +74,8 @@ class Handler(socketserver.StreamRequestHandler):
         headers: list[tuple[str, str]],
         body: bytes,
     ) -> bytes:
+        if path.startswith("/repos/"):
+            return self.github(target, path, headers)
         if path == "/hello":
             return reply(
                 "200 OK", b"hello", "Content-Type: text/plain\r\nX-A: 1\r\nX-A: 2\r\n"
@@ -130,6 +135,46 @@ class Handler(socketserver.StreamRequestHandler):
         if path == "/missing":
             return reply("404 Not Found", b"nope")
         return reply("404 Not Found", b"no such route")
+
+
+def github(target: str, path: str, headers: list[tuple[str, str]]) -> bytes:
+    """Enough of GitHub's repo API for examples/github_repo.kod."""
+    sent = {name.lower(): value for name, value in headers}
+    json_type = "Content-Type: application/json\r\n"
+    if "user-agent" not in sent:
+        body = b'{"message": "Request forbidden: send a User-Agent header"}'
+        return reply("403 Forbidden", body, json_type)
+    if sent.get("accept") != "application/vnd.github+json":
+        return reply(
+            "415 Unsupported Media Type", b'{"message": "bad Accept"}', json_type
+        )
+    parts = path.split("/")
+    if parts[2:] == ["octo", "hello"]:
+        body = (
+            b'{"full_name": "octo/hello", "description": "Caf\\u00e9 \\u2615 tools",'
+            b' "language": "Kod", "stargazers_count": 1234, "forks_count": 56,'
+            b' "license": {"spdx_id": "MIT"}, "score": 9.5}'
+        )
+        return reply("200 OK", body, json_type)
+    if parts[2:] == ["octo", "secret"]:
+        if sent.get("authorization") != "Bearer s3cret":
+            return reply("404 Not Found", b'{"message": "Not Found"}', json_type)
+        body = b'{"full_name": "octo/secret", "description": null, "license": null}'
+        return reply("200 OK", body, json_type)
+    if parts[2:] == ["octo", "hello", "issues"]:
+        if target.split("?", 1)[-1] != "state=open&per_page=3":
+            return reply("400 Bad Request", b'{"message": "bad query"}', json_type)
+        body = b'[{"number": 7, "title": "It crashes"}, {"number": 3, "title": "Add \\"docs\\""}]'
+        return reply("200 OK", body, json_type)
+    if parts[2:] == ["octo", "secret", "issues"]:
+        return reply("200 OK", b"[]", json_type)
+    if parts[2:] == ["octo", "quiet", "issues"]:
+        return reply("200 OK", b"[]", json_type)
+    if parts[2:] == ["octo", "quiet"]:
+        return reply("200 OK", b'{"full_name": "octo/quiet"}', json_type)
+    if parts[2:] == ["octo", "html"]:
+        return reply("502 Bad Gateway", b"<html>upstream down</html>")
+    return reply("404 Not Found", b'{"message": "Not Found"}', json_type)
 
 
 class Server(socketserver.ThreadingTCPServer):

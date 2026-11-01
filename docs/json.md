@@ -107,6 +107,31 @@ return `Null` or `none` when the value isn't what you asked for, so
 | `as_number_text(v)` | `str?`, the text of a `Number` or a `Decimal` |
 | `is_null(v)` | `bool` |
 
+## Building values
+
+Constructing a `Value` by hand means `.Object(keys: [...], values: [...])` with
+two arrays that must stay in step. Two builders do the bookkeeping:
+
+```kod
+let body = json.ObjectBuilder()
+body.put_str("title", "a bug")
+body.put_int("priority", 2)
+body.put_bool("urgent", false)
+body.put("labels", json.array_of([.Str(value: "bug"), .Str(value: "ui")]))
+let text = json.emit(body.build())
+// {"title":"a bug","priority":2,"urgent":false,"labels":["bug","ui"]}
+```
+
+| Method | Meaning |
+|---|---|
+| `put(key, value)` | add an entry with any `Value`; entries keep the order they were added in, and a repeated key is added again |
+| `put_str(key, s)`, `put_int(key, n)`, `put_bool(key, b)`, `put_null(key)` | the same for the common cases |
+| `build() -> Value` | the `Object`; the builder can go on being used |
+
+`array_of(items: Items) -> Value` makes an `Array` from a `[Value]`; `str_value(s)`,
+`int_value(n)` and `bool_value(b)` make the scalar `Value`s, for building those
+arrays.
+
 ## Emitting
 
 ```kod

@@ -198,6 +198,31 @@ func main() -> int64 {
 }
 ```
 
+## Environment variables
+
+`stdlib/env.kod` reads and changes the process's environment. A program's
+arguments come from `main(argv: [str])` (see [Functions](functions.md#main)).
+
+```kod
+import "env"
+
+func main() -> int64 {
+    let token = env.get("API_TOKEN")
+    print(token? or "no token")
+    env.set("MODE", "test")
+    env.unset("API_TOKEN")
+    return 0
+}
+```
+
+| Function | Meaning |
+|---|---|
+| `get(name) -> str?` | the value, or `none` if the variable isn't set; a variable set to the empty string is `""`, not `none` |
+| `set(name, value) -> none or Error` | set or replace it; the change is seen by programs started afterwards with `process.run` and `process.exec`; an empty `name`, one containing `=` or a NUL byte, and a `value` with a NUL byte are `InvalidInput` errors |
+| `unset(name) -> none` | remove it; unsetting a variable that isn't set does nothing |
+
+Compiled programs only: the interpreter does not mirror these externs.
+
 ## Extern (C runtime)
 
 Available for re-declaration in any module if needed:
