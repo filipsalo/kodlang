@@ -362,6 +362,64 @@ int64_t kod_str_cmp(KodStr *a, KodStr *b) {
     return a->len - b->len;
 }
 
+// A growable byte buffer behind the stdlib `StrBuilder` and the str methods
+// that build strings. Kod holds it as an int64 handle. The buffer doubles
+// when full, in the arena like everything else, so n appended bytes cost
+// O(n) and leave under 2n bytes of abandoned buffers behind.
+typedef struct {
+    char *buf;
+    int64_t len;
+    int64_t cap;
+} KodStrBuilder;
+
+int64_t kod_sb_new(void) {
+    KodStrBuilder *sb = (KodStrBuilder *)arena_alloc(sizeof(KodStrBuilder));
+    sb->cap = 32;
+    sb->len = 0;
+    sb->buf = (char *)arena_alloc(sb->cap);
+    return (int64_t)sb;
+}
+
+static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
+    if (extra > INT64_MAX / 4 - sb->len) {
+        kod_panic(kod_str_from_cstr("string builder is too large"));
+    }
+    int64_t need = sb->len + extra;
+    if (need <= sb->cap) return;
+    int64_t new_cap = sb->cap;
+    while (new_cap < need) new_cap *= 2;
+    char *new_buf = (char *)arena_alloc(new_cap);
+    memcpy(new_buf, sb->buf, (size_t)sb->len);
+    sb->buf = new_buf;
+    sb->cap = new_cap;
+}
+
+void kod_sb_append(int64_t handle, KodStr *s) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    kod_sb_reserve(sb, s->len);
+    memcpy(sb->buf + sb->len, s->buf, (size_t)s->len);
+    sb->len += s->len;
+}
+
+void kod_sb_append_byte(int64_t handle, int64_t b) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    kod_sb_reserve(sb, 1);
+    sb->buf[sb->len++] = (char)(b & 0xff);
+}
+
+int64_t kod_sb_len(int64_t handle) {
+    return ((KodStrBuilder *)handle)->len;
+}
+
+void kod_sb_clear(int64_t handle) {
+    ((KodStrBuilder *)handle)->len = 0;
+}
+
+KodStr *kod_sb_to_str(int64_t handle) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    return kod_str_from_bytes(sb->buf, sb->len);
+}
+
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`
 // struct's field order (each slot 8 bytes). The two `*` slots hold
 // Kod `str` values (i.e. pointers to KodStr structs).
