@@ -45,6 +45,7 @@ type IoKind = enum {
     Other
     HostNotFound
     Tls
+    Protocol
 }
 
 type IoError = struct {
@@ -75,7 +76,8 @@ doesn't know is `Other`. `EAGAIN` is `TimedOut`, because a descriptor here is
 only ever non-blocking through a timeout (see [TCP](#tcp)). `HostNotFound` is
 for a name that doesn't resolve and has no OS error number (`errno` is 0).
 `Tls` is for a TLS failure that isn't a plain I/O error, such as a certificate
-that doesn't verify (see [TLS](#tls)). An interrupted system call is retried inside the
+that doesn't verify (see [TLS](#tls)). `Protocol` is for a peer that breaks the rules of the
+protocol being spoken, such as a malformed HTTP response (see [HTTP](http.md)). An interrupted system call is retried inside the
 runtime, so `EINTR` never reaches a caller.
 
 ## Reader and Writer
@@ -131,6 +133,9 @@ let body = try br.read_exact(length)     // takes what is buffered first
 Fields: `inner`, `limit: int64 = 1048576` (a `read_until` or `read_line` longer
 than this fails with an `InvalidInput` error `line too long` instead of
 growing without bound), `chunk: int64 = 8192` (the size of each inner read).
+`ended` is set when a `read_until` or `read_line` returned a last piece that the
+stream's end cut short, with no delimiter after it; a protocol that needs
+every line terminated can tell a truncation from a complete line by it.
 A `BufReader` doesn't close its inner stream.
 
 ## Files and descriptors

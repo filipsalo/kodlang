@@ -1,0 +1,453 @@
+import "net/http" { Url, Header, Headers, Request, Response, Limits, parse_url, resolve, write_request, read_response }
+import "stream" { IoError, IoKind, BufReader, MemReader, MemWriter }
+import "strbuilder" { StrBuilder }
+
+func b(anon text: str) -> bytes {
+    return kod_str_to_bytes(text)
+}
+
+func reader(anon text: str) -> BufReader {
+    return BufReader(inner: MemReader(data: b(text), pos: 0))
+}
+
+func get(anon text: str) -> Response or Error {
+    return read_response(reader(text), "GET")
+}
+
+func with_limits(anon text: str, anon limits: Limits) -> Response or Error {
+    return read_response(reader(text), "GET", limits: limits)
+}
+
+// What went wrong in a failed result: its kind and detail.
+type Failure = struct {
+    kind: IoKind
+    detail: str
+}
+
+func why(anon r: Response or Error) -> Failure? {
+    if r is Err(e) {
+        if e is IoError(io) {
+            return Failure(kind: io.kind, detail: io.detail)
+        }
+        return Failure(kind: .Other, detail: e.to_str())
+    }
+    return none
+}
+
+func rejects(anon r: Response or Error, anon part: str) -> bool {
+    let f = why(r)
+    if f is none {
+        return false
+    }
+    let w = f? or Failure(kind: .Other, detail: "")
+    return w.kind == .Protocol and w.detail.contains(part)
+}
+
+func eof_kind(anon r: Response or Error) -> bool {
+    let f = why(r)
+    if f is none {
+        return false
+    }
+    let w = f? or Failure(kind: .Other, detail: "")
+    return w.kind == .UnexpectedEof
+}
+
+func url_error(anon s: str) -> bool {
+    return parse_url(s) is Err(_)
+}
+
+func port_of(anon s: str) -> int64 {
+    let u = must parse_url(s)
+    return u.port
+}
+
+func target_of(anon s: str) -> str {
+    let u = must parse_url(s)
+    return u.target
+}
+
+func host_of(anon s: str) -> str {
+    let u = must parse_url(s)
+    return u.host
+}
+
+func resolved(anon base: str, anon location: str) -> str {
+    let r = must resolve(must parse_url(base), location)
+    return f"{r.scheme}://{r.host}:{r.port}{r.target}"
+}
+
+// ---- URLs ----
+
+test "parse_url: scheme, host, default ports, path" {
+    let u = must parse_url("http://example.com/a/b?q=1")
+    assert u.scheme == "http" and u.host == "example.com" and u.port == 80
+    assert u.target == "/a/b?q=1"
+    assert port_of("https://example.com") == 443
+    assert port_of("HTTPS://example.com") == 443
+    assert port_of("http://example.com:8080/x") == 8080
+    assert target_of("http://example.com") == "/"
+    assert target_of("http://example.com?x=1") == "/?x=1"
+    assert target_of("http://example.com/p#frag") == "/p"
+    assert target_of("http://example.com/p?q#frag") == "/p?q"
+    assert host_of("http://EXAMPLE.com/") == "example.com"
+}
+
+test "parse_url: IPv6 and IPv4 literals" {
+    assert host_of("http://[::1]:9000/") == "::1"
+    assert port_of("http://[::1]:9000/") == 9000
+    assert port_of("http://[::1]/") == 80
+    assert host_of("http://127.0.0.1:81/") == "127.0.0.1"
+}
+
+test "parse_url: rejects what it should" {
+    assert url_error("")
+    assert url_error("example.com/x")
+    assert url_error("ftp://example.com/")
+    assert url_error("http://")
+    assert url_error("http:///x")
+    assert url_error("http://user@example.com/")
+    assert url_error("http://user:pw@example.com/")
+    assert url_error("http://example.com:/")
+    assert url_error("http://example.com:0/")
+    assert url_error("http://example.com:65536/")
+    assert url_error("http://example.com:80x/")
+    assert url_error("http://exa mple.com/")
+    assert url_error("http://example.com/a b")
+    assert url_error("http://example.com/a\r\nHost: evil")
+    assert url_error("http://example.com/\0")
+    assert url_error("http://[::1/")
+    assert url_error("http://[]/")
+}
+
+test "Url.host_header leaves out default ports and brackets IPv6" {
+    assert (must parse_url("http://example.com/")).host_header() == "example.com"
+    assert (must parse_url("http://example.com:80/")).host_header() == "example.com"
+    assert (must parse_url("https://example.com:443/")).host_header() == "example.com"
+    assert (must parse_url("http://example.com:8080/")).host_header() == "example.com:8080"
+    assert (must parse_url("https://example.com:80/")).host_header() == "example.com:80"
+    assert (must parse_url("http://[::1]:9000/")).host_header() == "[::1]:9000"
+    assert (must parse_url("http://[::1]/")).host_header() == "[::1]"
+}
+
+test "resolve: absolute, scheme-relative, absolute-path, query and relative" {
+    let base = "http://a.test:8080/dir/page?x=1"
+    assert resolved(base, "https://b.test/z") == "https://b.test:443/z"
+    assert resolved(base, "//c.test/p") == "http://c.test:80/p"
+    assert resolved(base, "/top") == "http://a.test:8080/top"
+    assert resolved(base, "?y=2") == "http://a.test:8080/dir/page?y=2"
+    assert resolved(base, "other") == "http://a.test:8080/dir/other"
+    assert resolved(base, "sub/x?q") == "http://a.test:8080/dir/sub/x?q"
+    assert resolved(base, "../up") == "http://a.test:8080/up"
+    assert resolved(base, "./same") == "http://a.test:8080/dir/same"
+    assert resolved(base, "../../../way/up") == "http://a.test:8080/way/up"
+    assert resolved(base, "/a/./b/../c") == "http://a.test:8080/a/c"
+    assert resolved(base, "x#frag") == "http://a.test:8080/dir/x"
+    assert resolved("http://a.test/", "x") == "http://a.test:80/x"
+}
+
+test "resolve: rejects an empty or unusable Location" {
+    let base = must parse_url("http://a.test/")
+    assert resolve(base, "") is Err(_)
+    assert resolve(base, "ftp://x/") is Err(_)
+    assert resolve(base, "http://") is Err(_)
+    assert resolve(base, "/a b") is Err(_)
+}
+
+// ---- headers ----
+
+test "Headers: case-insensitive lookup, order, repeats" {
+    let h = Headers()
+    h.add("Content-Type", "text/plain")
+    h.add("X-A", "1")
+    h.add("x-a", "2")
+    assert (h.get("content-type")? or "!") == "text/plain"
+    assert (h.get("CONTENT-TYPE")? or "!") == "text/plain"
+    assert (h.get("X-A")? or "!") == "1"
+    assert h.get("missing") is none
+    assert h.has("x-A") and h.has("missing") == false
+    let all = h.all("X-a")
+    assert len(all) == 2 and all[0] == "1" and all[1] == "2"
+    assert len(h.all("missing")) == 0
+    assert len(h.items) == 3
+    assert h.items[1].name == "X-A"
+}
+
+test "Headers.set replaces every value of the name" {
+    let h = Headers()
+    h.add("A", "1")
+    h.add("B", "x")
+    h.add("a", "2")
+    h.set("A", "3")
+    assert len(h.all("a")) == 1 and (h.get("a")? or "!") == "3"
+    assert (h.get("b")? or "!") == "x"
+    h.set("New", "n")
+    assert (h.get("new")? or "!") == "n"
+}
+
+// ---- writing requests ----
+
+func written(anon req: Request) -> str {
+    let w = MemWriter(buf: StrBuilder())
+    must write_request(w, req)
+    return w.to_str()
+}
+
+func request(anon method: str, anon url: str) -> Request {
+    return Request(method: method, url: must parse_url(url), headers: Headers(), body: b(""))
+}
+
+test "write_request: a GET with the defaults" {
+    let text = written(request("GET", "http://example.com/a?b=1"))
+    assert text == "GET /a?b=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: kod\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+}
+
+test "write_request: the Host header carries a non-default port" {
+    let text = written(request("GET", "http://example.com:8080/"))
+    assert text.contains("\r\nHost: example.com:8080\r\n")
+}
+
+test "write_request: user headers are kept, defaults yield to them" {
+    let req = request("GET", "http://example.com/")
+    req.headers.add("Accept", "application/json")
+    req.headers.add("User-Agent", "mine")
+    req.headers.add("X-Token", "abc")
+    let text = written(req)
+    assert text.contains("\r\nAccept: application/json\r\n")
+    assert text.contains("\r\nUser-Agent: mine\r\n")
+    assert text.contains("\r\nX-Token: abc\r\n")
+    assert text.contains("Accept: */*") == false
+    assert text.contains("User-Agent: kod") == false
+}
+
+test "write_request: Host, Connection and Content-Length are the library's" {
+    let req = request("POST", "http://example.com/")
+    req.headers.add("host", "evil.test")
+    req.headers.add("Connection", "keep-alive")
+    req.headers.add("content-length", "999")
+    let text = written(Request(method: "POST", url: req.url, headers: req.headers, body: b("hello")))
+    assert text.contains("evil.test") == false
+    assert text.contains("keep-alive") == false
+    assert text.contains("999") == false
+    assert text.contains("\r\nHost: example.com\r\n")
+    assert text.contains("\r\nConnection: close\r\n")
+    assert text.contains("\r\nContent-Length: 5\r\n")
+    assert text.ends_with("\r\n\r\nhello")
+}
+
+test "write_request: Content-Length for empty POST, PUT and PATCH only" {
+    assert written(request("POST", "http://e.test/")).contains("Content-Length: 0\r\n")
+    assert written(request("PUT", "http://e.test/")).contains("Content-Length: 0\r\n")
+    assert written(request("PATCH", "http://e.test/")).contains("Content-Length: 0\r\n")
+    assert written(request("GET", "http://e.test/")).contains("Content-Length") == false
+    assert written(request("DELETE", "http://e.test/")).contains("Content-Length") == false
+}
+
+test "write_request: binary bodies go out untouched" {
+    let raw = kod_bytes_from_array([0, 255, 13, 10, 13, 10, 65])
+    let w = MemWriter(buf: StrBuilder())
+    must write_request(w, Request(method: "POST", url: must parse_url("http://e.test/"), headers: Headers(), body: raw))
+    let out = w.to_bytes()
+    assert len(out) > 7
+    assert out[len(out) - 7..len(out)] == raw
+}
+
+func refused(anon req: Request) -> bool {
+    let w = MemWriter(buf: StrBuilder())
+    let r = write_request(w, req)
+    if r is Err(e) {
+        if e is IoError(io) {
+            return io.kind == .InvalidInput and w.buf.len() == 0
+        }
+    }
+    return false
+}
+
+test "write_request: refuses header injection and bad methods, writing nothing" {
+    let a = request("GET", "http://e.test/")
+    a.headers.add("X", "v\r\nInjected: yes")
+    assert refused(a)
+    let n = request("GET", "http://e.test/")
+    n.headers.add("X\r\nInjected", "v")
+    assert refused(n)
+    let c = request("GET", "http://e.test/")
+    c.headers.add("Bad:Name", "v")
+    assert refused(c)
+    let e = request("GET", "http://e.test/")
+    e.headers.add("", "v")
+    assert refused(e)
+    let z = request("GET", "http://e.test/")
+    z.headers.add("X", "a\0b")
+    assert refused(z)
+    assert refused(request("GE T", "http://e.test/"))
+    assert refused(request("", "http://e.test/"))
+    assert refused(request("GET\r\nX: y", "http://e.test/"))
+}
+
+// ---- reading responses ----
+
+test "read_response: status line, headers, Content-Length body" {
+    let r = must get("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: 1\r\nx-a: 2\r\n\r\nhelloEXTRA")
+    assert r.status == 200 and r.reason == "OK"
+    assert r.text() == "hello"
+    assert r.ok()
+    assert (r.header("content-length")? or "!") == "5"
+    assert len(r.headers.all("x-a")) == 2
+}
+
+test "read_response: HTTP/1.0, a missing reason, LF-only line ends" {
+    let a = must get("HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    assert a.status == 404 and a.reason == "Not Found" and a.ok() == false
+    let b2 = must get("HTTP/1.1 204\r\n\r\n")
+    assert b2.status == 204 and b2.reason == ""
+    let c = must get("HTTP/1.1 200 OK\nContent-Length: 2\n\nhi")
+    assert c.text() == "hi"
+}
+
+test "read_response: header values are trimmed, colons in values stay" {
+    let r = must get("HTTP/1.1 200 OK\r\nLocation:   http://x.test:80/p  \r\nContent-Length: 0\r\nEmpty:\r\n\r\n")
+    assert (r.header("location")? or "!") == "http://x.test:80/p"
+    assert (r.header("empty")? or "!") == ""
+}
+
+test "read_response: no length means read to the end of the connection" {
+    let r = must get("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close")
+    assert r.text() == "body until close"
+}
+
+test "read_response: a binary body is exact" {
+    let raw = kod_bytes_from_array([0, 1, 255, 13, 10, 0])
+    let text = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n" + kod_bytes_to_str(raw)
+    let r = must get(text)
+    assert r.body == raw
+}
+
+test "read_response: HEAD, 204, 304 and 1xx have no body even with a length" {
+    let h = must read_response(reader("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"), "HEAD")
+    assert len(h.body) == 0 and (h.header("content-length")? or "!") == "10"
+    let n = must get("HTTP/1.1 204 No Content\r\nContent-Length: 4\r\n\r\nabcd")
+    assert len(n.body) == 0
+}
+
+test "read_response: 1xx responses are skipped" {
+    let r = must get("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\nX: y\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    assert r.status == 200 and r.text() == "ok"
+}
+
+test "read_response: chunked bodies, extensions and trailers" {
+    let r = must get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\nA\r\n0123456789\r\n0\r\nX-Trailer: t\r\n\r\n")
+    assert r.text() == "hello world0123456789"
+    assert r.headers.has("x-trailer") == false
+}
+
+test "read_response: chunk sizes in either case, and no trailer" {
+    let r = must get("HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\nb\r\n01234567890\r\nB\r\nabcdefghijk\r\n0\r\n\r\n")
+    assert r.text() == "01234567890abcdefghijk"
+}
+
+test "read_response: chunked beats Content-Length" {
+    let r = must get("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    assert r.text() == "hello"
+}
+
+test "read_response: only plain chunked is a Transfer-Encoding we understand" {
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nx"), "Transfer-Encoding")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nx"), "Transfer-Encoding")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"), "Transfer-Encoding")
+    let r = must get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n")
+    assert r.text() == "hi"
+}
+
+test "read_response: bad status lines" {
+    assert rejects(get("HTTP/2 200 OK\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1 20 OK\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1 2000 OK\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1 abc OK\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1 099 Low\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1 600 High\r\n\r\n"), "status line")
+    assert rejects(get("garbage\r\n\r\n"), "status line")
+    assert rejects(get("HTTP/1.1\r\n\r\n"), "status line")
+    assert rejects(get("\r\n\r\n"), "status line")
+}
+
+test "read_response: an empty connection is UnexpectedEof" {
+    assert eof_kind(get(""))
+}
+
+test "read_response: bad headers" {
+    assert rejects(get("HTTP/1.1 200 OK\r\nno colon here\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\nName : v\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\n: v\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\nA: 1\r\n\tfolded\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\nA: b\0c\r\n\r\n"), "header")
+    assert rejects(get("HTTP/1.1 200 OK\r\nBad Name: v\r\n\r\n"), "header")
+}
+
+test "read_response: bad Content-Length values" {
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nx"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: 1x\r\n\r\nx"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: 1, 1\r\n\r\nx"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n"), "Content-Length")
+    assert rejects(get("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx"), "Content-Length")
+}
+
+test "read_response: a repeated Content-Length that agrees is fine" {
+    let r = must get("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nhi")
+    assert r.text() == "hi"
+}
+
+test "read_response: bad chunks" {
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nx\r\n0\r\n\r\n"), "chunk")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\r\n0\r\n\r\n"), "chunk")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\n0\r\n\r\n"), "chunk")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffff\r\n"), "chunk")
+    assert rejects(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiXX0\r\n\r\n"), "chunk")
+}
+
+test "read_response: truncated bodies are UnexpectedEof" {
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"))
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"))
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"))
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: y"))
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nContent-Len"))
+    assert eof_kind(get("HTTP/1.1 200 OK\r\nA: b\r\n"))
+}
+
+test "limits: body size, announced and actual" {
+    let small = Limits(max_body: 10, max_header_bytes: 65536, max_headers: 100)
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n", small), "body too large")
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\n\r\n" + "x".repeat(11), small), "body too large")
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n6\r\nabcdef\r\n0\r\n\r\n", small), "body too large")
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n", small), "body too large")
+    let ok = must with_limits("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789", small)
+    assert len(ok.body) == 10
+}
+
+test "limits: header count and bytes" {
+    let few = Limits(max_body: 1000, max_header_bytes: 65536, max_headers: 3)
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n", few), "too many headers")
+    assert (with_limits("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nContent-Length: 0\r\n\r\n", few)) is Ok(_)
+    let tight = Limits(max_body: 1000, max_header_bytes: 40, max_headers: 100)
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nX: " + "y".repeat(100) + "\r\n\r\n", tight), "headers too large")
+    assert rejects(with_limits("HTTP/1.1 200 OK\r\nA: 1234567890\r\nB: 1234567890\r\nC: 1234567890\r\n\r\n", tight), "headers too large")
+}
+
+test "limits: trailers count toward the header limits" {
+    let tight = Limits(max_body: 1000, max_header_bytes: 60, max_headers: 100)
+    let text = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: " + "y".repeat(100) + "\r\n\r\n"
+    assert rejects(with_limits(text, tight), "headers too large")
+}
+
+test "limits: an endless header line cannot grow without bound" {
+    let r = with_limits("HTTP/1.1 200 OK\r\nX: " + "y".repeat(200000), Limits(max_body: 1000, max_header_bytes: 1000, max_headers: 100))
+    assert r is Err(_)
+}
+
+test "read_response: two responses on one stream are read in turn" {
+    let br = reader("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhiHTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\nx")
+    let a = must read_response(br, "GET")
+    let c = must read_response(br, "GET")
+    assert a.text() == "hi" and c.status == 404 and c.text() == "x"
+}
