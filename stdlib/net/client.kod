@@ -7,6 +7,7 @@ import "fd" { Fd }
 import "net/tls" { TlsStream }
 import "stream" { IoError, BufReader, Reader, Writer }
 import "time"
+import "time" { Duration }
 
 // What one request may change about the Client it is sent through. A field left
 // out means the Client's value.
@@ -14,10 +15,10 @@ type Options = struct {
     headers: Headers = Headers()
     body: bytes = kod_str_to_bytes("")
     trust_file: str? = none
-    timeout_ms: int64? = none
+    timeout: Duration? = none
     max_redirects: int64? = none
     limits: Limits? = none
-    deadline_ms: int64? = none
+    deadline: Duration? = none
     accept_gzip: bool? = none
 }
 
@@ -26,10 +27,10 @@ type Settings = struct {
     headers: Headers
     body: bytes
     trust_file: str
-    timeout_ms: int64
+    timeout: Duration
     max_redirects: int64
     limits: Limits
-    deadline_ms: int64
+    deadline: Duration
     accept_gzip: bool
 }
 
@@ -102,7 +103,7 @@ type TcpLink = struct {
 
     func read(self, anon max: int64) -> bytes or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
-        try tcp.set_timeout(self.conn, ms: ms)
+        try tcp.set_timeout(self.conn, timeout: Duration(ms: ms))
         let data = self.conn.read(max)
         if data is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
@@ -114,7 +115,7 @@ type TcpLink = struct {
 
     func write(self, anon data: bytes) -> int64 or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
-        try tcp.set_timeout(self.conn, ms: ms)
+        try tcp.set_timeout(self.conn, timeout: Duration(ms: ms))
         let put = self.conn.write(data)
         if put is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
@@ -149,7 +150,7 @@ type TlsLink = struct {
 
     func read(self, anon max: int64) -> bytes or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
-        try self.conn.set_timeout(ms: ms)
+        try self.conn.set_timeout(timeout: Duration(ms: ms))
         let data = self.conn.read(max)
         if data is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
@@ -161,7 +162,7 @@ type TlsLink = struct {
 
     func write(self, anon data: bytes) -> int64 or Error {
         let ms = try wait_ms(timeout_ms: self.timeout_ms, deadline_ns: self.deadline_ns)
-        try self.conn.set_timeout(ms: ms)
+        try self.conn.set_timeout(timeout: Duration(ms: ms))
         let put = self.conn.write(data)
         if put is Err(e) {
             throw after_wait(e, deadline_ns: self.deadline_ns)
@@ -191,11 +192,11 @@ type TlsLink = struct {
 // A new connection to where `url` points, within `connect_ms`.
 func open_link(anon url: Url, cfg: Settings, connect_ms: int64) -> Link or Error {
     if url.scheme == "https" {
-        let conn = try tls.connect(url.host, port: url.port, trust_file: cfg.trust_file, timeout_ms: connect_ms)
-        return TlsLink(conn: conn, timeout_ms: cfg.timeout_ms, deadline_ns: 0)
+        let conn = try tls.connect(url.host, port: url.port, trust_file: cfg.trust_file, timeout: Duration(ms: connect_ms))
+        return TlsLink(conn: conn, timeout_ms: cfg.timeout.ceil_ms(), deadline_ns: 0)
     }
-    let conn = try tcp.connect(url.host, port: url.port, timeout_ms: connect_ms)
-    return TcpLink(conn: conn, timeout_ms: cfg.timeout_ms, deadline_ns: 0)
+    let conn = try tcp.connect(url.host, port: url.port, timeout: Duration(ms: connect_ms))
+    return TcpLink(conn: conn, timeout_ms: cfg.timeout.ceil_ms(), deadline_ns: 0)
 }
 
 // Methods that are safe to send again when a reused connection turns out to
@@ -259,13 +260,13 @@ func attempt(anon link: Link, anon br: BufReader, anon req: Request, cfg: Settin
 type Client = struct {
     headers: Headers = Headers()
     trust_file: str = ""
-    timeout_ms: int64 = 30000
-    deadline_ms: int64 = 0
+    timeout: Duration = Duration(seconds: 30)
+    deadline: Duration = Duration()
     max_redirects: int64 = 5
     accept_gzip: bool = true
     limits: Limits = Limits()
     max_idle_per_host: int64 = 2
-    idle_ms: int64 = 30000
+    idle: Duration = Duration(seconds: 30)
     pool: [Idle] = []
 
     // The settings for a request with `options`.
@@ -274,10 +275,10 @@ type Client = struct {
             headers: merged(self.headers, options.headers),
             body: options.body,
             trust_file: options.trust_file? or self.trust_file,
-            timeout_ms: options.timeout_ms? or self.timeout_ms,
+            timeout: options.timeout? or self.timeout,
             max_redirects: options.max_redirects? or self.max_redirects,
             limits: options.limits? or self.limits,
-            deadline_ms: options.deadline_ms? or self.deadline_ms,
+            deadline: options.deadline? or self.deadline,
             accept_gzip: options.accept_gzip? or self.accept_gzip,
         )
     }
@@ -289,7 +290,7 @@ type Client = struct {
         mut kept: [Idle] = []
         mut found: Idle? = none
         for entry in self.pool {
-            if now - entry.since_ns > self.idle_ms * 1000000 or entry.link.idle() == false {
+            if now - entry.since_ns > self.idle.ns or entry.link.idle() == false {
                 discard(entry.link)
             } else if entry.key == key and found is none {
                 found = entry
@@ -341,7 +342,7 @@ type Client = struct {
         if kept is Some(entry) {
             return Acquired(link: entry.link, reused: true)
         }
-        let connect_ms = try wait_ms(timeout_ms: cfg.timeout_ms, deadline_ns: deadline_ns)
+        let connect_ms = try wait_ms(timeout_ms: cfg.timeout.ceil_ms(), deadline_ns: deadline_ns)
         let link = try open_link(url, cfg: cfg, connect_ms: connect_ms)
         return Acquired(link: link, reused: false)
     }
@@ -355,7 +356,7 @@ type Client = struct {
         for true {
             let got = try self.acquire(key, url, cfg: cfg, deadline_ns: deadline_ns)
             let link = got.link
-            link.arm(cfg.timeout_ms, deadline_ns)
+            link.arm(cfg.timeout.ceil_ms(), deadline_ns)
             let br = BufReader(inner: link, limit: cfg.limits.max_header_bytes)
             let outcome = attempt(link, br, req, cfg: cfg, keep_alive: reuse)
             if outcome is Err(e) {
@@ -379,12 +380,12 @@ type Client = struct {
 
     func fetch(self, anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
         let cfg = self.settings(options)
-        if cfg.deadline_ms < 0 {
-            throw invalid("fetch", "deadline_ms cannot be negative")
+        if cfg.deadline < Duration() {
+            throw invalid("fetch", "deadline cannot be negative")
         }
         mut deadline_ns: int64 = 0
-        if cfg.deadline_ms > 0 {
-            deadline_ns = time.monotonic_ns() + cfg.deadline_ms * 1000000
+        if cfg.deadline > Duration() {
+            deadline_ns = time.monotonic_ns() + cfg.deadline.ns
         }
         mut current = try parse_url(url)
         mut verb = method
@@ -450,10 +451,10 @@ func with_body(anon options: Options, anon body: bytes, anon content_type: str) 
         headers: headers,
         body: body,
         trust_file: options.trust_file,
-        timeout_ms: options.timeout_ms,
+        timeout: options.timeout,
         max_redirects: options.max_redirects,
         limits: options.limits,
-        deadline_ms: options.deadline_ms,
+        deadline: options.deadline,
         accept_gzip: options.accept_gzip,
     )
 }

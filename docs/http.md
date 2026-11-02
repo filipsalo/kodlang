@@ -34,8 +34,9 @@ headers, its certificate roots, its deadline) and makes the requests:
 
 ```kod
 import "net/client" { Client }
+import "time" { Duration }
 
-let client = Client(deadline_ms: 15000)
+let client = Client(deadline: Duration(seconds: 15))
 client.headers.add("Accept", "application/json")
 client.headers.add("Authorization", "Bearer " + token)
 
@@ -60,12 +61,12 @@ A `Client` has these fields, each with the default shown:
 |-------|---------|---------|
 | `headers` | none | headers sent with every request (`Headers`) |
 | `trust_file` | `""` | PEM roots for `https`, as for [`net/tls`](io.md#tls) |
-| `timeout_ms` | 30000 | limit for the connect, the TLS handshake, and each single read or write; a server that keeps sending slowly never trips it (see `deadline_ms`) |
-| `deadline_ms` | 0 | limit for the whole request (connect, handshake, every redirect and reading the whole body); 0 means none, a negative value is an `InvalidInput` error |
+| `timeout` | `Duration(seconds: 30)` | limit for the connect, the TLS handshake, and each single read or write; a server that keeps sending slowly never trips it (see `deadline`) |
+| `deadline` | `Duration()` | limit for the whole request (connect, handshake, every redirect and reading the whole body); zero means none, a negative one is an `InvalidInput` error |
 | `max_redirects` | 5 | redirects to follow; 0 returns the redirect response as it is |
 | `accept_gzip` | true | send `Accept-Encoding: gzip`, and decode a gzip response (see [Compression](#compression)) |
 | `limits` | see below | caps on what a response may send |
-| `max_idle_per_host`, `idle_ms` | 2, 30000 | connection reuse (see [Connection reuse](#connection-reuse)) |
+| `max_idle_per_host`, `idle` | 2, `Duration(seconds: 30)` | connection reuse (see [Connection reuse](#connection-reuse)) |
 
 `Options` is for one request. Its fields are the same, plus the body, and each
 one that you leave out means the `Client`'s value:
@@ -74,11 +75,11 @@ one that you leave out means the `Client`'s value:
 |-------|---------|
 | `headers` | added to the client's; where both have a header of the same name, the request's wins |
 | `body` | the request body (`bytes`); empty by default |
-| `trust_file`, `timeout_ms`, `deadline_ms`, `max_redirects`, `accept_gzip`, `limits` | replace the client's for this request, including with `0` or `false` |
+| `trust_file`, `timeout`, `deadline`, `max_redirects`, `accept_gzip`, `limits` | replace the client's for this request, including with `0` or `false` |
 
 ```kod
-let r = try client.get(url, options: Options(deadline_ms: 2000))   // this one is quicker
-let q = try client.get(url, options: Options(deadline_ms: 0))      // and this one has none
+let r = try client.get(url, options: Options(deadline: Duration(seconds: 2)))   // this one is quicker
+let q = try client.get(url, options: Options(deadline: Duration()))              // and this one has none
 ```
 
 A `Host` header, `Connection: close` and a `Content-Length` (for any body,
@@ -112,7 +113,7 @@ func main() -> int64 or Error {
 
 `max_idle_per_host` (2) is how many idle connections are kept for each scheme,
 host and port; 0 turns reuse off, so every request opens and closes its own.
-`idle_ms` (30000) is how old an idle connection may be before it is closed instead
+`idle` (30 seconds) is how old an idle connection may be before it is closed instead
 of reused.
 
 A connection goes back to the `Client` after a response only when nothing about
@@ -136,8 +137,8 @@ time, and there is only one thread.
 
 ## Deadlines
 
-`timeout_ms` bounds each wait, so a server that sends one byte every few
-seconds can keep a request open for as long as it likes. `deadline_ms` bounds
+`timeout` bounds each wait, so a server that sends one byte every few
+seconds can keep a request open for as long as it likes. `deadline` bounds
 the request as a whole: the time is counted from the start of `fetch` and shared
 by every redirect, and every read and write is given only what is left of it.
 When it runs out the call throws an `IoError` of kind `TimedOut` whose `detail`
@@ -145,7 +146,7 @@ is `deadline exceeded`, however the wait ended, and the connection is closed.
 
 Two things can overrun it: resolving a host name is not interruptible, and a TLS
 connection spends up to the time left on the TCP connect and then up to the
-same on the handshake. Neither is by more than one `timeout_ms`.
+same on the handshake. Neither is by more than one `timeout`.
 
 ## Compression
 

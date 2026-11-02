@@ -42,7 +42,7 @@ both requests, which keeps the connection from the first and uses it for the sec
 ([HTTP client](http.md)).
 
 ```kod
-let client = Client(deadline_ms: 15000)
+let client = Client(deadline: Duration(seconds: 15))
 client.headers.add("Accept", "application/vnd.github+json")
 client.headers.add("Authorization", "Bearer " + token)
 
@@ -50,7 +50,7 @@ let response = try client.get(url)
 ```
 
 A single request can override any of that with `Options`, for instance
-`client.get(url, options: Options(deadline_ms: 2000))`. `Client.get` follows
+`client.get(url, options: Options(deadline: Duration(seconds: 2)))`. `Client.get` follows
 redirects, enforces the size limits and the deadline, and picks TCP or TLS from the
 URL.
 
@@ -124,8 +124,8 @@ let response = try post(
   that makes many requests to one host should create a `Client` and call its
   `get`, `post` and `fetch` instead, which keep connections for reuse
   ([Connection reuse](http.md#connection-reuse)).
-- `timeout_ms` applies to the connect, the TLS handshake and each read or write.
-  Set `deadline_ms` to bound a request as a whole ([Deadlines](http.md#deadlines)).
+- `timeout` applies to the connect, the TLS handshake and each read or write.
+  Set `deadline` to bound a request as a whole ([Deadlines](http.md#deadlines)).
 - TLS goes through the system's SecureTransport, which speaks TLS 1.2 at most. A
   server that insists on TLS 1.3 fails with a `Tls` error.
 - Numbers with a fraction or an exponent come back as `Decimal` text, because
