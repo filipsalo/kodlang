@@ -14,6 +14,7 @@ passed by value in registers.
 | Type    | Width | Representation                                         |
 | ------- | ----- | ------------------------------------------------------ |
 | `int64` | 8     | Two's-complement 64-bit int                            |
+| `float64` | 8   | IEEE 754 binary64 bit pattern, in an integer slot      |
 | `str`   | 8     | Pointer to null-terminated C string in `.data` section |
 | `bool`  | 1     | 0 (false) or 1 (true)                                  |
 | `none`  | 8     | Always 0 (null sentinel)                               |

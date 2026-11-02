@@ -124,6 +124,7 @@ array constant is a new array every time, and nothing is shared between uses.
 | Type | Description | Example |
 |------|-------------|---------|
 | `int64` | 64-bit signed integer | `42`, `-7` |
+| `float64` | 64-bit IEEE 754 float, see [Floating point](floats.md) | `1.5`, `2e9` |
 | `str` | UTF-8 string | `"hello"` |
 | `bool` | Boolean | `true`, `false` |
 | `none` | No value (unit type) | — |
@@ -201,11 +202,12 @@ and of the same type:
 
 | Operator | Operands | Result |
 |----------|----------|--------|
-| `+` | two `int64`, two `str`, two `bytes` or two arrays of one type | the operands' type |
-| `-` `*` `/` `%` | two `int64` | `int64` |
+| `+` | two `int64`, two `float64`, two `str`, two `bytes` or two arrays of one type | the operands' type |
+| `-` `*` `/` | two `int64` or two `float64` | the operands' type |
+| `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
-| `<` `<=` `>` `>=` | two `int64`, two `str` or two `bytes` | `bool` |
-| `==` `!=` | two `int64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, or an optional and `none` | `bool` |
+| `<` `<=` `>` `>=` | two `int64`, two `float64`, two `str` or two `bytes` | `bool` |
+| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, or an optional and `none` | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write

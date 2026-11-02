@@ -128,6 +128,6 @@ let response = try post(
   Set `deadline` to bound a request as a whole ([Deadlines](http.md#deadlines)).
 - TLS goes through the system's SecureTransport, which speaks TLS 1.2 at most. A
   server that insists on TLS 1.3 fails with a `Tls` error.
-- Numbers with a fraction or an exponent come back as `Decimal` text, because
-  Kod has no floating-point type: `json.as_int` is `none` for them, and
-  `json.as_number_text` gives the digits.
+- Numbers with a fraction or an exponent come back as `Decimal` text:
+  `json.as_int` is `none` for them, `json.as_number_text` gives the digits, and
+  `.parse_float()` on those turns them into a [`float64`](floats.md).
