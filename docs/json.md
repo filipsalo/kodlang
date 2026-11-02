@@ -82,7 +82,8 @@ An integer that fits in `int64` is a `Number` (`-0` is `Number(0)`). Any other
 number is a `Decimal`: one with a fraction or an exponent (`2.5`, `1e3`,
 `-0.0`), or an integer too large for `int64`. A `Decimal` keeps the number's
 text exactly as it was written, so nothing is rounded and it is written back
-unchanged; Kod has no floating-point type to hold it. `\uXXXX` escapes are
+unchanged. Read it as a [`float64`](floats.md) with `parse_float` on
+`as_number_text`, and build one with `to_str`. `\uXXXX` escapes are
 decoded into UTF-8, with a surrogate pair giving one four-byte character, and
 `\u0000` gives a NUL byte inside the `str`.
 

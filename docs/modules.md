@@ -107,7 +107,7 @@ The stdlib lives under `stdlib/` in the repository.
 | Module | Contents |
 |--------|----------|
 | `builtins` | Always imported. `print`, `print_int`, `len`, `fail`, `Map[K, V]`, `Option[T]`, the `Error` / `Stringable` / `ExitCode` interfaces. |
-| `primitives/int64`, `primitives/str`, `primitives/bool` | Methods on the primitive types (`to_str`, `hash`). Auto-loaded; not imported directly. |
+| `primitives/int64`, `primitives/float64`, `primitives/str`, `primitives/bool` (and `int64_float`, `str_float`, whose methods `to_float64` and `parse_float` are kept apart because the Python interpreter reads `int64` and `str`) | Methods on the primitive types (`to_str`, `hash`, `parse_float`). Auto-loaded; not imported directly. |
 | `io` | `read_file`, `write_file`, and stdin/stdout/stderr helpers. |
 | `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
