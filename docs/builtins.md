@@ -187,7 +187,7 @@ assert r.status == 0
 assert r.stdout == "hello\n"
 ```
 
-`process.run(argv)` captures stdout and stderr. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run. Compiled programs only: the interpreter does not mirror its extern.
+`process.run(argv)` captures stdout and stderr. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run. Compiled programs only: the interpreter does not mirror its extern.
 
 ```kod
 import "process"
