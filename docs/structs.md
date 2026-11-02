@@ -187,6 +187,36 @@ Privacy covers the field, not what it points to. A method that returns a
 private array returns the array itself, which the caller can then change by
 indexing it; return a copy when that matters.
 
+## Private methods
+
+A method whose name starts with `_` is private in the same way: only the
+struct's own functions can call it, as `self._name(...)` or on another value
+of the struct.
+
+```kod
+type Duration = struct {
+    _ns: int64
+
+    func _whole(self, unit: int64) -> int64 {
+        return self._ns / unit
+    }
+
+    func as_ms(self) -> int64 {
+        return self._whole(unit: 1 000 000)
+    }
+}
+
+d.as_ms()               // fine
+d._whole(unit: 1)       // error: method `_whole` is private to `Duration`
+```
+
+That keeps helpers that assume the struct's invariants, or that would break
+them, out of the struct's interface. A method of a primitive type such as
+`str` or `int64` is private to the module that declares it.
+
+An interface can't declare a private method: calling it through the
+interface would reach the struct's method from outside.
+
 ## Field access
 
 ```kod
