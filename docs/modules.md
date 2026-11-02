@@ -112,7 +112,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
 | `env` | `get`, `set` and `unset` for environment variables. See [Built-ins](builtins.md#environment-variables). |
-| `time` | `monotonic_ns()`, `unix_ns()` and `sleep_ms(ms)`. |
+| `time` | `monotonic_ns()`, `unix_ns()`, `Duration` and `sleep(d)`. See [Time](time.md). |
 | `set` | `Set[T]`, a hash set built on `Map`. |
 | `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |
 | `json` | Strict JSON parse/emit, with builders. See [JSON](json.md). |

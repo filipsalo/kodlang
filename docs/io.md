@@ -168,11 +168,12 @@ program does.
 
 ```kod
 import "net/tcp" { connect, set_timeout }
+import "time" { Duration }
 import "stream" { BufReader, write_str }
 
 func fetch_status_line(host: str) -> str or Error {
     let conn = try connect(host, port: 80)
-    try set_timeout(conn, ms: 5000)
+    try set_timeout(conn, timeout: Duration(seconds: 5))
     try write_str(conn, "HEAD / HTTP/1.0\r\n\r\n")
     let br = BufReader(inner: conn)
     let line = try br.read_line()
@@ -183,15 +184,15 @@ func fetch_status_line(host: str) -> str or Error {
 
 | Function | Meaning |
 |----------|---------|
-| `connect(host, port, timeout_ms = 10000)` | resolve `host` (a name or an IP literal, IPv4 or IPv6) and connect to the first address that answers; `Fd or Error` |
-| `set_timeout(f, ms)` | make a read or a write on `f` fail with `TimedOut` after `ms` milliseconds without progress; 0 means wait forever; `none or Error` |
+| `connect(host, port, timeout = Duration(seconds: 10))` | resolve `host` (a name or an IP literal, IPv4 or IPv6) and connect to the first address that answers; `Fd or Error` |
+| `set_timeout(f, timeout)` | make a read or a write on `f` fail with `TimedOut` after a [`Duration`](time.md) without progress; zero means wait forever; `none or Error` |
 | `listen(host, port, backlog = 128)` | a `Listener` bound to `host:port`; an empty `host` means every IPv4 interface and port 0 picks a free port; `Listener or Error` |
 | `l.accept()` | the next connection, waiting for one; `Fd or Error` |
 | `is_idle(f)` | true if nothing is waiting to be read from `f`; false if it has data, an end of stream (the peer closed it) or an error pending |
 | `l.port()` | the port it is bound to |
 | `l.close()` | stop listening; `none or Error` |
 
-`connect` gives up on each address after `timeout_ms` milliseconds, so a host
+`connect` gives up on each address after `timeout`, so a host
 with several unreachable addresses can take longer in all. A refused
 connection is `ConnectionRefused`, a timeout `TimedOut`, a name that doesn't
 resolve `HostNotFound`, and a `port` outside 0..65535 or an empty `host`
@@ -224,14 +225,14 @@ as on a plain connection.
 
 | Function | Meaning |
 |----------|---------|
-| `connect(host, port, trust_file = "", timeout_ms = 10000)` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
+| `connect(host, port, trust_file = "", timeout = Duration(seconds: 10))` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
 | `s.read(max)`, `s.write(data)` | as for any stream |
-| `s.set_timeout(ms)` | as `net/tcp.set_timeout`: a read or write fails with `TimedOut` after `ms` milliseconds without progress |
+| `s.set_timeout(timeout)` | as `net/tcp.set_timeout`: a read or write fails with `TimedOut` after a `Duration` without progress |
 | `s.close()` | send a close notice, then close the connection; `none or Error` |
 
 The server's certificate must be valid for `host`, chain to a trusted root and
 be in date; otherwise `connect` throws an `IoError` of kind `Tls` whose
-`detail` says why, and the connection is closed. `timeout_ms` limits the TCP
+`detail` says why, and the connection is closed. `timeout` limits the TCP
 connect and, separately, the handshake. A server that can't speak TLS 1.2 is a
 `Tls` error: SecureTransport has no TLS 1.3, and the minimum version is 1.2.
 
