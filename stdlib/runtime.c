@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
@@ -678,6 +679,122 @@ int64_t kod_kill(int64_t pid) {
     waitpid((pid_t)pid, &status, 0);
     return 1;
 }
+
+// float64: a Kod `float64` travels as the 8 bytes of its IEEE 754 pattern in an
+// ordinary integer register or slot; these move between the two forms.
+static double f64_of(int64_t bits) {
+    double d;
+    memcpy(&d, &bits, sizeof d);
+    return d;
+}
+
+static int64_t f64_bits(double d) {
+    int64_t bits;
+    memcpy(&bits, &d, sizeof bits);
+    return bits;
+}
+
+int64_t kod_i64_to_f64(int64_t n) { return f64_bits((double)n); }
+
+// Truncates toward zero; not-a-number is 0 and out-of-range saturates.
+int64_t kod_f64_to_i64(int64_t bits) {
+    double d = f64_of(bits);
+    if (d != d) return 0;
+    if (d >= 9223372036854775808.0) return INT64_MAX;
+    if (d <= -9223372036854775808.0) return INT64_MIN;
+    return (int64_t)d;
+}
+
+int64_t kod_f64_abs(int64_t bits) { return f64_bits(fabs(f64_of(bits))); }
+int64_t kod_f64_floor(int64_t bits) { return f64_bits(floor(f64_of(bits))); }
+int64_t kod_f64_ceil(int64_t bits) { return f64_bits(ceil(f64_of(bits))); }
+int64_t kod_f64_round(int64_t bits) { return f64_bits(round(f64_of(bits))); }
+int64_t kod_f64_sqrt(int64_t bits) { return f64_bits(sqrt(f64_of(bits))); }
+int64_t kod_f64_is_nan(int64_t bits) { return isnan(f64_of(bits)) ? 1 : 0; }
+int64_t kod_f64_is_inf(int64_t bits) { return isinf(f64_of(bits)) ? 1 : 0; }
+
+// The fewest digits that read back as exactly `bits`, in plain decimal for
+// magnitudes from 1e-6 up to (not including) 1e21 and as d.ddde+X outside it;
+// always with a point or an exponent, so a float never reads as an integer.
+KodStr *kod_f64_to_str(int64_t bits) {
+    double d = f64_of(bits);
+    if (isnan(d)) return kod_str_from_bytes("nan", 3);
+    if (isinf(d)) return d < 0 ? kod_str_from_bytes("-inf", 4) : kod_str_from_bytes("inf", 3);
+    if (d == 0) {
+        return signbit(d) ? kod_str_from_bytes("-0.0", 4) : kod_str_from_bytes("0.0", 3);
+    }
+    char sci[40];
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(sci, sizeof sci, "%.*e", prec - 1, d);
+        if (strtod(sci, NULL) == d) break;
+    }
+    // sci is [-]d[.ddd]e[+-]XX
+    char digits[24];
+    int nd = 0;
+    char *p = sci;
+    int negative = 0;
+    if (*p == '-') {
+        negative = 1;
+        p++;
+    }
+    for (; *p && *p != 'e'; p++) {
+        if (*p != '.') digits[nd++] = *p;
+    }
+    int exp10 = atoi(p + 1);
+    while (nd > 1 && digits[nd - 1] == '0') nd--;
+    char out[64];
+    int n = 0;
+    if (negative) out[n++] = '-';
+    if (exp10 >= -6 && exp10 < 21) {
+        if (exp10 >= 0) {
+            for (int i = 0; i <= exp10; i++) out[n++] = i < nd ? digits[i] : '0';
+            out[n++] = '.';
+            if (nd > exp10 + 1) {
+                for (int i = exp10 + 1; i < nd; i++) out[n++] = digits[i];
+            } else {
+                out[n++] = '0';
+            }
+        } else {
+            out[n++] = '0';
+            out[n++] = '.';
+            for (int i = 0; i < -exp10 - 1; i++) out[n++] = '0';
+            for (int i = 0; i < nd; i++) out[n++] = digits[i];
+        }
+    } else {
+        out[n++] = digits[0];
+        if (nd > 1) {
+            out[n++] = '.';
+            for (int i = 1; i < nd; i++) out[n++] = digits[i];
+        }
+        n += snprintf(out + n, sizeof out - (size_t)n, "e%c%d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+    }
+    return kod_str_from_bytes(out, n);
+}
+
+// Whether `s` is a decimal number: an optional sign, digits with an optional
+// point (one digit at least) and an optional exponent with digits.
+int64_t kod_f64_valid(KodStr *s) {
+    const char *p = s->buf;
+    int64_t n = s->len, i = 0, digits = 0;
+    if (i < n && (p[i] == '+' || p[i] == '-')) i++;
+    while (i < n && p[i] >= '0' && p[i] <= '9') { i++; digits++; }
+    if (i < n && p[i] == '.') {
+        i++;
+        while (i < n && p[i] >= '0' && p[i] <= '9') { i++; digits++; }
+    }
+    if (digits == 0) return 0;
+    if (i < n && (p[i] == 'e' || p[i] == 'E')) {
+        i++;
+        if (i < n && (p[i] == '+' || p[i] == '-')) i++;
+        int64_t exp_digits = 0;
+        while (i < n && p[i] >= '0' && p[i] <= '9') { i++; exp_digits++; }
+        if (exp_digits == 0) return 0;
+    }
+    return i == n ? 1 : 0;
+}
+
+// The value of a string that kod_f64_valid accepts.
+int64_t kod_f64_parse(KodStr *s) { return f64_bits(strtod(s->buf, NULL)); }
 
 // Replace this process with `argv[0]` (found via PATH) and `argv`. Buffered
 // output is flushed first: the new image would never see it. Returns -1,
