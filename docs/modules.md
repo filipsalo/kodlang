@@ -138,7 +138,40 @@ recovers a struct from an interface value whichever side boxed it.
 
 ## Visibility
 
-Top-level functions and types are visible to importing modules. There is no explicit `pub`/`private` distinction yet.
+Top-level functions, externs, constants and types are visible to importing modules, except those whose name starts with `_`. Those are private to the module that declares them, which uses them like any other name:
+
+```kod
+// lib.kod
+let _LIMIT: int64 = 3
+
+type _Slot = struct {
+    n: int64
+}
+
+func _clamp(anon n: int64) -> int64 {
+    if n > _LIMIT {
+        return _LIMIT
+    }
+    return n
+}
+
+func slots(anon n: int64) -> int64 {
+    return _Slot(n: _clamp(n)).n
+}
+
+// main.kod
+import "./lib"
+
+func main() -> int64 {
+    print_int(lib.slots(5))     // 3
+    lib._clamp(5)               // error: `_clamp` is private to module `lib`
+    return 0
+}
+```
+
+The same error is reported for `lib._LIMIT`, `lib._Slot(...)`, `lib._Slot` in a type, and `_clamp` in an import list (`import "./lib" { _clamp }`). Did-you-mean hints never suggest another module's private names.
+
+A private name keeps a helper out of the module's interface, so the module can change or remove it without breaking its importers. A public function may still take or return a private type: callers can use such a value, its fields and its methods, but can't write the type's name. Fields and methods whose names start with `_` are private to their struct; see [Structs](structs.md#private-fields).
 
 A module's top level holds declarations (`func`, `type`, `interface`, `import`, `extern` and `test`) and constants (`let NAME: T = value`, see [Module-level constants](types.md#module-level-constants)). A top-level `mut` and any statement there are an error. A constant is visible to importing modules like a function.
 
