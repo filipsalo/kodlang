@@ -77,6 +77,16 @@ type SigInfo = struct {
     decl_id: int64 = 0
 }
 
+// A binary operator that calls a struct's operator method: `negate` flips the
+// method's `bool`, and `swap` makes the right operand the receiver.
+type OpCall = struct {
+    struct_idx: int64
+    method_idx: int64
+    swap: bool
+    negate: bool
+    compare: bool
+}
+
 // How the arguments of a call line up with the declared parameters: for each
 // parameter (after the skipped `self`), the index of the argument that fills it,
 // or -1 when it takes its default. `messages` and `spans` are the mismatches
@@ -499,6 +509,8 @@ type Codegen = struct {
     checking_default: bool = false
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
     cur_owner: int64 = -1
+    // Some struct declares an operator method (`op_add`, …); until one does, none of the operator checks run.
+    has_ops: bool = false
 
     scopes: [ModuleScope] = []
     scope_idx: FuncIdx = FuncIdx()
@@ -828,7 +840,7 @@ type Codegen = struct {
                 return
             }
             if lhs_name == "" {
-                self.report_error(f"error: `{sym}` doesn't take `{lhs_shown}` operands", span: self.p.expr_spans[lhs_id])
+                self.report_error(f"error: `{sym}` doesn't take `{lhs_shown}` operands{self.op_declare_hint(lhs_kind, :op)}", span: self.p.expr_spans[lhs_id])
                 return
             }
             if lhs_name == rhs_name {
@@ -864,6 +876,9 @@ type Codegen = struct {
             mut hint = ""
             if bad == rhs_id and self.is_unary_minus(lhs_id) {
                 hint = self.negate_base_hint(rhs_id, minus: self.p.expr_spans[lhs_id].start)
+            }
+            if bad == lhs_id {
+                hint = self.op_declare_hint(lhs_kind, :op)
             }
             self.report_error(f"error: `{sym}` needs `int64` operands, got `{bad_shown}`{hint}", span: self.p.expr_spans[bad])
         }
@@ -1023,7 +1038,7 @@ type Codegen = struct {
             return "arrays; compare `len(...)` and the elements"
         }
         match kind {
-            .KStruct(_idx, _type_args) -> return "structs; compare their fields"
+            .KStruct(_idx, _type_args) -> return "structs; compare their fields, or declare `op_eq`"
             .KInterface(_idx) -> return "interface values"
             .KFunc(_params, _ret) -> return "function values"
             else return ""
@@ -4503,8 +4518,23 @@ type Codegen = struct {
         mut out: [MethodInfo] = []
         for m in methods {
             out += [MethodInfo(name: m.name, decl_id: m.decl_id, sig: self.resolve_sig(m.decl_id, :p))]
+            if self.is_operator_method(m.name) {
+                self.has_ops = true
+            }
         }
         return out
+    }
+
+    func is_operator_method(self, anon name: str) -> bool {
+        if name.starts_with("op_") == false {
+            return false
+        }
+        for known in ["op_add", "op_sub", "op_mul", "op_div", "op_mod", "op_eq", "op_lt", "op_radd", "op_rsub", "op_rmul", "op_rdiv", "op_rmod"] {
+            if known == name {
+                return true
+            }
+        }
+        return false
     }
 
     // Resolve the params and return type of `p.func_decls[decl_id]` into a
@@ -6818,6 +6848,11 @@ type Codegen = struct {
     func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
         mut lhs_kind = self.infer_kind(lhs_id)
         let rhs_kind0 = self.infer_kind(rhs_id)
+        if self.has_ops {
+            if self.op_call_for(lhs_kind, :op, rhs_kind: rhs_kind0) is Some(oc) {
+                return self.compile_op_call(:lhs_id, :rhs_id, :oc)
+            }
+        }
         let build_rhs = self.is_eq_ctor_operand(rhs_id, :op, other_kind: lhs_kind)
         mut build_lhs = false
         if build_rhs == false {
@@ -9977,8 +10012,19 @@ type Codegen = struct {
                             none -> return .KUnknown
                         }
                     }
-                    .Add -> return self.concat_kind(lhs, rhs_id: rhs)
+                    .Add -> {
+                        let sum_kind = self.concat_kind(lhs, rhs_id: rhs)
+                        if self.overload_kind(sum_kind, op: .Add, rhs_id: rhs) is Some(k) {
+                            return k
+                        }
+                        return sum_kind
+                    }
                     .Sub -> {
+                        if self.has_ops {
+                            if self.overload_kind(self.infer_kind(lhs), op: .Sub, rhs_id: rhs) is Some(k) {
+                                return k
+                            }
+                        }
                         if self.is_unary_minus(lhs) and (self.infer_kind(rhs) is .KInt64) == false {
                             return .KUnknown
                         }
@@ -10019,6 +10065,9 @@ type Codegen = struct {
                             else return .KUnknown
                         }
                     }
+                    .Mul -> return self.arith_kind(lhs, op: .Mul, rhs_id: rhs)
+                    .Div -> return self.arith_kind(lhs, op: .Div, rhs_id: rhs)
+                    .Mod -> return self.arith_kind(lhs, op: .Mod, rhs_id: rhs)
                     else return .KInt64
                 }
             }
@@ -10789,6 +10838,140 @@ type Codegen = struct {
 
     // Allocate a struct value on the arena and return its pointer in x0.
     // field_args supplies the labelled field values.
+    // For a struct operand: the method that would give the operator a meaning.
+    func op_declare_hint(self, anon kind: TypeKind, op: ast.Op) -> str {
+        let name = self.op_method_name(op)
+        if len(name) > 0 and kind is .KStruct(_idx, _args) {
+            return f"; declare `{name}` on `{self.kind_display(kind)}` to use it"
+        }
+        return ""
+    }
+
+    // The method an operator calls, or "" for an operator no struct can take.
+    func op_method_name(self, anon op: ast.Op) -> str {
+        match op {
+            .Add -> return "op_add"
+            .Sub -> return "op_sub"
+            .Mul -> return "op_mul"
+            .Div -> return "op_div"
+            .Mod -> return "op_mod"
+            .Eq -> return "op_eq"
+            .Ne -> return "op_eq"
+            .Lt -> return "op_lt"
+            .Le -> return "op_lt"
+            .Gt -> return "op_lt"
+            .Ge -> return "op_lt"
+            else return ""
+        }
+    }
+
+    // How `lhs op rhs` reaches a struct's method, or none when it is not an operator on a struct.
+    func op_call_for(self, anon lhs_kind: TypeKind, op: ast.Op, rhs_kind: TypeKind) -> OpCall? {
+        let name = self.op_method_name(op)
+        if len(name) == 0 {
+            return none
+        }
+        let compare = name == "op_eq" or name == "op_lt"
+        if lhs_kind is .KStruct(idx, _args) {
+            if compare {
+                let .KStruct(rhs_idx, _rhs_args) = rhs_kind else { return none }
+                if self.same_struct(idx, rhs_idx) == false {
+                    return none
+                }
+            }
+            if self.structs[idx].method_idx.get(name) is Some(mi) {
+                return OpCall(struct_idx: idx, method_idx: mi, swap: op is .Gt or op is .Le, negate: op is .Ne or op is .Le or op is .Ge, compare: compare)
+            }
+            return none
+        }
+        if compare == false and lhs_kind is .KInt64 {
+            if rhs_kind is .KStruct(idx, _args) {
+                if self.structs[idx].method_idx.get("op_r" + name[3..]) is Some(mi) {
+                    return OpCall(struct_idx: idx, method_idx: mi, swap: true, negate: false, compare: false)
+                }
+            }
+        }
+        return none
+    }
+
+    // `*`, `/` and `%`: int64, unless the left operand's struct (or the right one's, reflected) defines them.
+    func arith_kind(self, anon lhs_id: int64, op: ast.Op, rhs_id: int64) -> TypeKind {
+        if self.has_ops {
+            if self.overload_kind(self.infer_kind(lhs_id), :op, :rhs_id) is Some(k) {
+                return k
+            }
+        }
+        return .KInt64
+    }
+
+    // The type of `lhs op rhs` when `op` calls a struct's method, else none.
+    func overload_kind(self, anon lhs_kind: TypeKind, op: ast.Op, rhs_id: int64) -> TypeKind? {
+        if self.has_ops == false {
+            return none
+        }
+        mut rhs_kind: TypeKind = .KUnknown
+        mut can_overload = false
+        if lhs_kind is .KStruct(_idx, _args) {
+            can_overload = true
+        }
+        if lhs_kind is .KInt64 {
+            rhs_kind = self.infer_kind(rhs_id)
+            can_overload = true
+        }
+        if can_overload == false {
+            return none
+        }
+        if self.op_call_for(lhs_kind, :op, :rhs_kind) is Some(oc) {
+            return self.structs[oc.struct_idx].methods[oc.method_idx].sig.return_kind
+        }
+        return none
+    }
+
+    // `lhs op rhs` as a call of the operator method, operands evaluated left to right.
+    func compile_op_call(self, lhs_id: int64, rhs_id: int64, oc: OpCall) -> Val {
+        let method = self.structs[oc.struct_idx].methods[oc.method_idx]
+        let shown = self.struct_display_name(oc.struct_idx)
+        if self.takes_self_and(method.sig, count: 1) == false {
+            self.compile_discard(lhs_id)
+            self.compile_discard(rhs_id)
+            self.report_error(f"error: `{shown}.{method.name}` must take one operand", span: self.p.expr_spans[lhs_id])
+            return .VImm(value: 0)
+        }
+        if oc.compare and (method.sig.return_kind is .KBool) == false {
+            self.compile_discard(lhs_id)
+            self.compile_discard(rhs_id)
+            self.report_error(f"error: `{shown}.{method.name}` must return `bool`", span: self.p.expr_spans[lhs_id])
+            return .VImm(value: 0)
+        }
+        let arg_kind = method.sig.param_kinds[1]
+        let parked = self.park_value(self.compile_expr(lhs_id))
+        mut other_r = ""
+        if oc.swap {
+            other_r = self.pool.alloc_reg()
+            self.mov_to(self.compile_expr(rhs_id), dest: other_r)
+            self.check_value_kind(lhs_id, expected: arg_kind)
+        } else {
+            other_r = self.compile_key(rhs_id, kind: arg_kind)
+        }
+        let lhs_r = self.unpark_value(parked)
+        if oc.swap {
+            self.emit(f"mov x0, {other_r}")
+            self.emit(f"mov x1, {lhs_r}")
+        } else {
+            self.emit(f"mov x0, {lhs_r}")
+            self.emit(f"mov x1, {other_r}")
+        }
+        self.pool.free_reg(lhs_r)
+        self.pool.free_reg(other_r)
+        let info = self.structs[oc.struct_idx]
+        self.emit(f"bl ${info.module_prefix}${info.name}${method.name}")
+        if oc.negate {
+            self.emit("cmp x0, #0")
+            self.emit("cset x0, eq")
+        }
+        return .VReg(name: "x0")
+    }
+
     // Where `init` sits in the struct's methods when `Name(...)` calls it, or -1.
     func custom_init(self, anon struct_idx: int64) -> int64 {
         if len(self.structs[struct_idx].type_param_names) > 0 {

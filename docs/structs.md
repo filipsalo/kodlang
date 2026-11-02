@@ -236,11 +236,65 @@ parse these yet.
 
 The built-in `Map[K, V]` is the canonical example.
 
-## Equality
+## Operators
 
-Structs have no `==` or `!=`: comparing two struct values is an error, even
-two of the same type. Compare the fields you care about instead, as in
-`a.x == b.x and a.y == b.y`.
+A struct gives the arithmetic and comparison operators a meaning by declaring
+methods with reserved names. The operator on the left operand's struct calls
+the method with the right operand as its one argument:
+
+| Operator | Method | Returns |
+|---|---|---|
+| `a + b` | `op_add(self, other)` | any type |
+| `a - b` | `op_sub(self, other)` | any type |
+| `a * b` | `op_mul(self, other)` | any type |
+| `a / b` | `op_div(self, other)` | any type |
+| `a % b` | `op_mod(self, other)` | any type |
+| `a == b`, `a != b` | `op_eq(self, other)` | `bool` |
+| `a < b`, `a > b`, `a <= b`, `a >= b` | `op_lt(self, other)` | `bool` |
+
+```kod
+type Money = struct {
+    cents: int64
+
+    func op_add(self, other: Money) -> Money {
+        return Money(cents: self.cents + other.cents)
+    }
+
+    func op_mul(self, times: int64) -> Money {
+        return Money(cents: self.cents * times)
+    }
+
+    func op_eq(self, other: Money) -> bool {
+        return self.cents == other.cents
+    }
+
+    func op_lt(self, other: Money) -> bool {
+        return self.cents < other.cents
+    }
+}
+
+let total = Money(cents: 250) + Money(cents: 100) * 3     // 550
+if total > Money(cents: 500) { ... }
+```
+
+`!=` is `not op_eq`. The four orderings come from `op_lt` alone: `a > b` is
+`b < a`, `a <= b` is `not (b < a)` and `a >= b` is `not (a < b)`. `a += b` and
+`a -= b` are `a = a + b` and `a = a - b`, and `a < b < c` chains as it does for
+numbers. The operators keep their usual precedence, and the operands are
+evaluated left to right whichever one the method belongs to.
+
+A struct is the right operand when the left is an `int64`: `3 * price` calls
+`op_rmul` on `price` with `3` as its argument. The reflected methods are
+`op_radd`, `op_rsub`, `op_rmul`, `op_rdiv` and `op_rmod`; each is tried only
+when the left operand isn't a struct, and there is no reflected comparison.
+
+A method that implements an operator takes `self` and one more parameter, and
+the comparison methods return `bool`; otherwise it is an error where the
+operator is used. A struct that doesn't declare the method still can't use the
+operator, so `a + b` on a plain struct is the same error as before, and
+`a == b` still tells you to compare the fields. A prefix minus is `0 - x`,
+so `-price` calls `op_rsub` with `0`. `not`, `and`, `or` and `is` are never
+overloaded.
 
 ## Memory layout (compiler)
 
