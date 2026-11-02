@@ -654,6 +654,31 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
     return result;
 }
 
+// Start `argv[0]` (found via PATH) with stdin, stdout and stderr on
+// /dev/null and return its pid without waiting, or -1 when it could not be
+// started.
+int64_t kod_spawn(KodArray *argv_arr) {
+    if (argv_arr->len == 0) return -1;
+    char **argv = c_argv(argv_arr);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return rc == 0 ? (int64_t)pid : -1;
+}
+
+// SIGTERM a child and reap it. False when the signal could not be sent.
+int64_t kod_kill(int64_t pid) {
+    if (pid <= 0 || kill((pid_t)pid, SIGTERM) != 0) return 0;
+    int status;
+    waitpid((pid_t)pid, &status, 0);
+    return 1;
+}
+
 // Replace this process with `argv[0]` (found via PATH) and `argv`. Buffered
 // output is flushed first: the new image would never see it. Returns -1,
 // and only then, when the exec failed (nothing to run, or an empty argv).
