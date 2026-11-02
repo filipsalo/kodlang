@@ -50,6 +50,9 @@ type TypeKind = enum {
     KArrayBool
     // `[[T]]`: `inner` is the kind of the element arrays.
     KArrayArray(inner: TypeKind)
+    // A 64-bit IEEE float, held as its bit pattern in an ordinary 8-byte slot.
+    KFloat64
+    KArrayFloat64
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -414,6 +417,9 @@ type Codegen = struct {
 
     str_labels: [str] = []
     str_values: [str] = []
+    // The `.double` constants of float literals, by label.
+    float_labels: [str] = []
+    float_values: [str] = []
     // Map from string value to its already-emitted label, mirroring the
     // parallel str_values / str_labels arrays for O(1) intern lookups.
     interned: StrMap = StrMap()
@@ -864,6 +870,13 @@ type Codegen = struct {
             self.report_error(f"error: cannot add `{lhs_shown}` and `{rhs_shown}`{hint}", span: self.p.expr_spans[bad])
             return
         }
+        if lhs_name == "float64" and (op is .Sub or op is .Mul or op is .Div) {
+            if rhs_name == "float64" {
+                return
+            }
+            self.report_error(f"error: `{sym}` needs `float64` operands, got `{rhs_shown}`", span: self.p.expr_spans[rhs_id])
+            return
+        }
         mut bad = 0
         mut bad_shown = lhs_shown
         if lhs_name != "int64" {
@@ -1224,6 +1237,7 @@ type Codegen = struct {
     func operand_scalar(self, anon kind: TypeKind) -> str {
         match kind {
             .KInt64 -> return "int64"
+            .KFloat64 -> return "float64"
             .KStr -> return "str"
             .KBytes -> return "bytes"
             else return ""
@@ -1233,6 +1247,7 @@ type Codegen = struct {
     func prints_as_str(self, anon kind: TypeKind) -> bool {
         match kind {
             .KInt64 -> return true
+            .KFloat64 -> return true
             .KBool -> return true
             else return false
         }
@@ -1367,6 +1382,7 @@ type Codegen = struct {
             .KArrayOptional(_inner) -> return true
             .KArrayFunc(_pk, _rk) -> return true
             .KArrayBool -> return true
+            .KArrayFloat64 -> return true
             .KArrayArray(_inner) -> return true
             else return false
         }
@@ -3172,6 +3188,7 @@ type Codegen = struct {
             .KInt64 -> return "primitives$int64"
             .KStr -> return "primitives$str"
             .KBool -> return "primitives$bool"
+            .KFloat64 -> return "primitives$float64"
             else return ""
         }
     }
@@ -3195,6 +3212,7 @@ type Codegen = struct {
                     .KInt64 -> if stored is .KInt64 { matches = true }
                     .KStr -> if stored is .KStr { matches = true }
                     .KBool -> if stored is .KBool { matches = true }
+                    .KFloat64 -> if stored is .KFloat64 { matches = true }
                     else none
                 }
                 if matches {
@@ -3991,6 +4009,7 @@ type Codegen = struct {
             .KVoid -> return "none"
             .KInt64 -> return "int64"
             .KBool -> return "bool"
+            .KFloat64 -> return "float64"
             .KStr -> return "str"
             .KBytes -> return "bytes"
             .KArray -> return "[int64]"
@@ -4036,6 +4055,7 @@ type Codegen = struct {
             }
             .KUnknown -> return "<unknown>"
             .KArrayBool -> return "[bool]"
+            .KArrayFloat64 -> return "[float64]"
             .KArrayArray(inner) -> return f"[{self.kind_display(inner)}]"
         }
     }
@@ -4182,6 +4202,7 @@ type Codegen = struct {
             .KVoid -> return "void"
             .KInt64 -> return "int64"
             .KBool -> return "bool"
+            .KFloat64 -> return "float64"
             .KStr -> return "str"
             .KBytes -> return "bytes"
             .KArray -> return "arr"
@@ -4213,6 +4234,7 @@ type Codegen = struct {
             }
             .KUnknown -> return "unknown"
             .KArrayBool -> return "arrbool"
+            .KArrayFloat64 -> return "arrfloat64"
             .KArrayArray(inner) -> return f"arrarr${self.canonical_kind_name(inner)}"
         }
     }
@@ -4328,6 +4350,9 @@ type Codegen = struct {
         if name == "bool" {
             return .KBool
         }
+        if name == "float64" {
+            return .KFloat64
+        }
         if name == "str" {
             return .KStr
         }
@@ -4351,6 +4376,7 @@ type Codegen = struct {
         }
         match elem {
             .KBool -> return .KArrayBool
+            .KFloat64 -> return .KArrayFloat64
             .KStruct(struct_idx, _struct_type_args) -> return .KArrayStruct(elem_idx: struct_idx)
             .KEnum(enum_idx) -> return .KArrayEnum(elem_idx: enum_idx)
             .KStr -> return .KArrayStr
@@ -5136,7 +5162,7 @@ type Codegen = struct {
                 return true
             }
         }
-        if name == "int64" or name == "bool" or name == "str" or name == "bytes" or name == "none" {
+        if name == "int64" or name == "float64" or name == "bool" or name == "str" or name == "bytes" or name == "none" {
             return true
         }
         return self.module_type_ref(name) >= 0
@@ -6137,6 +6163,15 @@ type Codegen = struct {
     func compile_expr(self, anon expr_id: int64) -> Val {
         match self.p.exprs[expr_id] {
             .IntLit(value) -> return .VImm(:value)
+            .FloatLit(text) -> {
+                let lbl = self.fresh("Lfloat")
+                self.float_labels += [lbl]
+                self.float_values += [text]
+                let reg: str = self.pool.alloc_reg()
+                self.emit(f"adrp {reg}, {lbl}@PAGE")
+                self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
+                return .VReg(name: reg)
+            }
             .BoolLit(value) -> {
                 if value {
                     return .VImm(value: 1)
@@ -6853,6 +6888,9 @@ type Codegen = struct {
                 return self.compile_op_call(:lhs_id, :rhs_id, :oc)
             }
         }
+        if op is .Sub and rhs_kind0 is .KFloat64 and self.is_unary_minus(lhs_id) {
+            return self.compile_float_neg(rhs_id)
+        }
         let build_rhs = self.is_eq_ctor_operand(rhs_id, :op, other_kind: lhs_kind)
         mut build_lhs = false
         if build_rhs == false {
@@ -7003,6 +7041,12 @@ type Codegen = struct {
         }
         let lhs_reg = self.unpark_value(parked)
         mut result = self.pool.alloc_reg()
+        if lhs_kind is .KFloat64 {
+            self.emit_float_op(op, :result, :lhs_reg, :rhs_reg)
+            self.pool.free_reg(lhs_reg)
+            self.pool.free_reg(rhs_reg)
+            return .VReg(name: result)
+        }
         match op {
             .Eq -> {
                 self.emit(f"cmp {lhs_reg}, {rhs_reg}")
@@ -7074,6 +7118,46 @@ type Codegen = struct {
         self.pool.free_reg(lhs_reg)
         self.pool.free_reg(rhs_reg)
         return .VReg(name: result)
+    }
+
+    // `result = lhs op rhs` on float bit patterns: through d0 and d1, which nothing else holds.
+    // An ordered comparison is false when either side is not a number.
+    func emit_float_op(self, anon op: ast.Op, result: str, lhs_reg: str, rhs_reg: str) -> none {
+        self.emit(f"fmov d0, {lhs_reg}")
+        self.emit(f"fmov d1, {rhs_reg}")
+        mut cond = ""
+        match op {
+            .Eq -> cond = "eq"
+            .Ne -> cond = "ne"
+            .Lt -> cond = "mi"
+            .Le -> cond = "ls"
+            .Gt -> cond = "gt"
+            .Ge -> cond = "ge"
+            else none
+        }
+        if len(cond) > 0 {
+            self.emit("fcmp d0, d1")
+            self.emit(f"cset {result}, {cond}")
+            return
+        }
+        match op {
+            .Add -> self.emit("fadd d0, d0, d1")
+            .Sub -> self.emit("fsub d0, d0, d1")
+            .Mul -> self.emit("fmul d0, d0, d1")
+            .Div -> self.emit("fdiv d0, d0, d1")
+            else none
+        }
+        self.emit(f"fmov {result}, d0")
+    }
+
+    // `-x` on a float flips the sign bit, also of zero and not-a-number.
+    func compile_float_neg(self, anon operand_id: int64) -> Val {
+        let val = self.compile_expr(operand_id)
+        let reg = self.load(val)
+        self.emit(f"fmov d0, {reg}")
+        self.emit("fneg d0, d0")
+        self.emit(f"fmov {reg}, d0")
+        return .VReg(name: reg)
     }
 
     // So `e == .V` with a `.V` missing from `e`'s enum names `e`'s enum.
@@ -7333,6 +7417,12 @@ type Codegen = struct {
                 let val = self.compile_expr(expr_id)
                 self.mov_to(val, dest: "x0")
                 self.emit("bl $primitives$bool$to_str")
+                return .VReg(name: "x0")
+            }
+            .KFloat64 -> {
+                let val = self.compile_expr(expr_id)
+                self.mov_to(val, dest: "x0")
+                self.emit("bl $primitives$float64$to_str")
                 return .VReg(name: "x0")
             }
             .KBytes -> return self.compile_expr(expr_id)
@@ -8018,7 +8108,7 @@ type Codegen = struct {
         if len(hint) > 0 {
             return f"error: unknown type `{name}`; {hint}"
         }
-        mut names: [str] = ["int64", "bool", "str", "bytes", "none"]
+        mut names: [str] = ["int64", "float64", "bool", "str", "bytes", "none"]
         for n in self.subst_names {
             names += [n]
         }
@@ -9140,6 +9230,7 @@ type Codegen = struct {
                     .KInt64 -> if pm.kind is .KInt64 { matches = true }
                     .KStr -> if pm.kind is .KStr { matches = true }
                     .KBool -> if pm.kind is .KBool { matches = true }
+                    .KFloat64 -> if pm.kind is .KFloat64 { matches = true }
                     else none
                 }
                 if matches {
@@ -9222,6 +9313,7 @@ type Codegen = struct {
                     .KInt64 -> if pm.kind is .KInt64 { same = true }
                     .KStr -> if pm.kind is .KStr { same = true }
                     .KBool -> if pm.kind is .KBool { same = true }
+                    .KFloat64 -> if pm.kind is .KFloat64 { same = true }
                     else none
                 }
                 if same {
@@ -9862,6 +9954,7 @@ type Codegen = struct {
                 return .KInt64
             }
             .BoolLit(value) -> return .KBool
+            .FloatLit(_text) -> return .KFloat64
             .StrLit(value) -> return .KStr
             .BytesLit(value) -> return .KBytes
             .NoneLit -> return .KOptional(inner: .KVoid)
@@ -10025,8 +10118,16 @@ type Codegen = struct {
                                 return k
                             }
                         }
-                        if self.is_unary_minus(lhs) and (self.infer_kind(rhs) is .KInt64) == false {
-                            return .KUnknown
+                        if self.is_unary_minus(lhs) {
+                            let operand_kind = self.infer_kind(rhs)
+                            if operand_kind is .KFloat64 {
+                                return .KFloat64
+                            }
+                            if (operand_kind is .KInt64) == false {
+                                return .KUnknown
+                            }
+                        } else if self.infer_kind(lhs) is .KFloat64 {
+                            return .KFloat64
                         }
                         return .KInt64
                     }
@@ -10050,6 +10151,7 @@ type Codegen = struct {
                             .KArrayOptional(inner_kind) -> return .KOptional(inner: inner_kind)
                             .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
                             .KArrayBool -> return .KBool
+                            .KArrayFloat64 -> return .KFloat64
                             .KArrayArray(inner) -> return inner
                             .KStruct(sidx, _struct_type_args) -> {
                                 // Struct with op_index — return its return kind.
@@ -10434,6 +10536,7 @@ type Codegen = struct {
             .KArrayOptional(inner) -> return .KOptional(:inner)
             .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
             .KArrayBool -> return .KBool
+            .KArrayFloat64 -> return .KFloat64
             .KArrayArray(inner) -> return inner
             else return .KUnknown
         }
@@ -10900,6 +11003,9 @@ type Codegen = struct {
             if self.overload_kind(self.infer_kind(lhs_id), :op, :rhs_id) is Some(k) {
                 return k
             }
+        }
+        if self.infer_kind(lhs_id) is .KFloat64 {
+            return .KFloat64
         }
         return .KInt64
     }
@@ -12474,6 +12580,7 @@ type Codegen = struct {
             .KArrayOptional(inner_kind) -> elem_kind = .KOptional(inner: inner_kind)
             .KArrayFunc(param_kinds, return_kind) -> elem_kind = .KFunc(:param_kinds, :return_kind)
             .KArrayBool -> elem_kind = .KBool
+            .KArrayFloat64 -> elem_kind = .KFloat64
             .KArrayArray(inner) -> elem_kind = inner
             else none
         }
@@ -13306,8 +13413,15 @@ type Codegen = struct {
         }
         self.body_instance = saved_instance
 
-        if len(self.str_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 {
+        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 {
             self.println(".data")
+            mut fi = 0
+            for fi < len(self.float_labels) {
+                self.println("\t.p2align 3")
+                self.println(f"{self.float_labels[fi]}:")
+                self.println(f"\t.double {self.float_values[fi]}")
+                fi = fi + 1
+            }
             // Each `str` literal is a KodStr struct (`{ buf, len }`) plus
             // a byte buffer. The 8-aligned struct header is what the
             // label points at — adrp / add returns the struct pointer.
