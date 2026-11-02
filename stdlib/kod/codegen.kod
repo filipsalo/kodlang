@@ -2859,6 +2859,7 @@ type Codegen = struct {
     // `alias.name` where it is written: the type the module imported as `alias`
     // declares, its own aliases included. idx * 4 + what (see TypeScope.own),
     // -1 when that module declares none, -2 when no import is named `alias`.
+    // Another module's `_` types are private, so -1.
     func qualified_type_ref(self, anon alias: str, name: str) -> int64 {
         let ti = self.cur_type_scope()
         if ti < 0 {
@@ -2868,6 +2869,9 @@ type Codegen = struct {
         mut i = 0
         for a in ts.alias_names {
             if a == alias {
+                if name.starts_with("_") {
+                    return -1
+                }
                 if self.type_scope_idx.get(ts.alias_paths[i]) is Some(mi) {
                     if self.type_scopes[mi].own.get(name) is Some(r) {
                         return r
@@ -2887,6 +2891,29 @@ type Codegen = struct {
             return r / 4
         }
         return -1
+    }
+
+    // Whether the module imported as `alias` declares a function, constant or type `name`, private or not.
+    func module_declares(self, anon alias: str, name: str) -> bool {
+        if self.lookup_any_import_fn(alias, name) != -1 {
+            return true
+        }
+        let ti = self.cur_type_scope()
+        if ti < 0 {
+            return false
+        }
+        let ts = self.type_scopes[ti]
+        mut i = 0
+        for a in ts.alias_names {
+            if a == alias {
+                if self.type_scope_idx.get(ts.alias_paths[i]) is Some(mi) {
+                    return self.type_scopes[mi].own.contains(name)
+                }
+                return false
+            }
+            i += 1
+        }
+        return false
     }
 
     // Why `alias.name` names no type here; `call` for `alias.name(...)`.
@@ -2909,10 +2936,15 @@ type Codegen = struct {
         if target == -1 {
             return f"error: unknown type `{alias}.{name}`"
         }
+        if name.starts_with("_") and self.module_declares(alias, :name) {
+            return private_to_module(name, :alias)
+        }
         mut candidates: [str] = []
         if target >= 0 {
             for n in self.type_scopes[target].own.keys {
-                candidates += [n]
+                if n.starts_with("_") == false {
+                    candidates += [n]
+                }
             }
         }
         mut what = "type"
@@ -3550,8 +3582,16 @@ type Codegen = struct {
         return names
     }
 
-    // In the current module: an import_fns index, scope_fns[k] as -2 - k, or -1.
+    // `local_mod.name` as written here; another module's `_` names are private, so -1.
     func lookup_import_fn(self, anon local_mod: str, anon name: str) -> int64 {
+        if name.starts_with("_") {
+            return -1
+        }
+        return self.lookup_any_import_fn(local_mod, name)
+    }
+
+    // In the current module: an import_fns index, scope_fns[k] as -2 - k, or -1. Private names included.
+    func lookup_any_import_fn(self, anon local_mod: str, anon name: str) -> int64 {
         let si = self.cur_scope()
         if si < 0 {
             return self.find_import_fn_idx(local_mod, name)
@@ -3580,7 +3620,7 @@ type Codegen = struct {
         let si = self.cur_scope()
         if si < 0 {
             for f in self.import_fns {
-                if f.module == local_mod {
+                if f.module == local_mod and f.name.starts_with("_") == false {
                     names += [f.name]
                 }
             }
@@ -3589,7 +3629,9 @@ type Codegen = struct {
         let ti = self.scope_alias_target(si, local_mod)
         if ti >= 0 {
             for n in self.scopes[ti].names {
-                names += [n]
+                if n.starts_with("_") == false {
+                    names += [n]
+                }
             }
         }
         return names
@@ -6296,6 +6338,16 @@ type Codegen = struct {
                     let no_args: [ast.CallArg] = []
                     return self.compile_call(no_args, callee_id: expr_id)
                 }
+                if op is .Dot {
+                    if self.p.exprs[lhs] is .Ident(alias) {
+                        if self.p.exprs[rhs] is .Ident(member) {
+                            if member.starts_with("_") and self.var_index(alias) < 0 and self.is_import_alias(alias) and self.module_declares(alias, name: member) {
+                                self.report_error(private_to_module(member, :alias), span: self.p.expr_spans[rhs])
+                                return .VImm(value: 0)
+                            }
+                        }
+                    }
+                }
                 return self.compile_binary(:lhs, :op, :rhs)
             }
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
@@ -8543,6 +8595,9 @@ type Codegen = struct {
                         }
                         item_i += 1
                         let span = ast.Span(start: item_at)
+                        if item.starts_with("_") {
+                            self.report_error(private_to_module(item, alias: local_name), :span)
+                        }
                         if seen.contains(item) {
                             self.check_first_name(seen, :listed, name: item, :span)
                         } else {
@@ -8767,6 +8822,10 @@ type Codegen = struct {
                 // A capitalized name reads as a constructor.
                 if method_name[0] >= 'A' and method_name[0] <= 'Z' and self.qualified_type_ref(mod_or_obj, name: method_name) < 0 {
                     self.report_error(self.qualified_type_error(mod_or_obj, name: method_name, call: true), span: self.p.expr_spans[callee_rhs])
+                    return .VImm(value: 0)
+                }
+                if method_name.starts_with("_") and self.module_declares(mod_or_obj, name: method_name) {
+                    self.report_error(private_to_module(method_name, alias: mod_or_obj), span: self.p.expr_spans[callee_rhs])
                     return .VImm(value: 0)
                 }
                 self.report_error(self.with_suggestion(f"error: module `{mod_or_obj}` has no function `{method_name}`", typo: method_name, candidates: self.import_fn_names(mod_or_obj)), span: self.p.expr_spans[callee_rhs])
@@ -13696,6 +13755,10 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+func private_to_module(anon name: str, alias: str) -> str {
+    return f"error: `{name}` is private to module `{alias}`"
 }
 
 // Where a pattern's `m.T` splits, or -1 for a bare name.
