@@ -143,9 +143,49 @@ which makes `try Port(...)` and `must Port(...)` work as for any fallible
 call. It may not be a generic struct's: `init` on a `Box[T]` is an error for
 now. A struct without `init` is built from its fields as described above.
 
-Fields stay assignable, so `p.number = 0` is still possible after a checked
-construction. Custom constructors guard how a value starts, not what happens
-to it later.
+Public fields stay assignable, so `p.number = 0` is still possible after a
+checked construction. To keep what `init` checks true for the value's whole
+life, make the field [private](#private-fields).
+
+## Private fields
+
+A field whose name starts with `_` is private: only the struct's own
+functions (`init`, its methods and its operator methods) can read or assign
+it, or name it in the field constructor.
+
+```kod
+type Duration = struct {
+    _ns: int64
+
+    func init(seconds: int64 = 0, ms: int64 = 0) -> Duration {
+        return Duration(_ns: seconds * 1 000 000 000 + ms * 1 000 000)
+    }
+
+    func as_ms(self) -> int64 {
+        return self._ns / 1 000 000
+    }
+}
+
+let d = Duration(seconds: 5)
+print_int(d.as_ms())    // 5000
+d._ns                   // error: field `_ns` is private to `Duration`
+d._ns = 0               // error: field `_ns` is private to `Duration`
+```
+
+Only `Duration`'s own functions can set `_ns`, so whatever `init` checks
+about it holds for as long as the value lives.
+Callers depend only on the methods, so the representation can change
+without breaking them: `Duration` could store microseconds instead and no
+caller would notice.
+
+Outside the struct, a private field can't be named in the field constructor
+either. A private field with a [default](#field-defaults) is filled in from
+it; a private field without one means the struct can only be built through
+`init` or its own functions. Public and private fields mix freely.
+
+Privacy covers the field, not what it points to. A method that returns a
+private array returns the array itself, which the caller can then change by
+indexing it; return a copy when that matters.
 
 ## Field access
 
