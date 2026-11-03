@@ -25,7 +25,7 @@ The condition must be a `bool`. There's no truthiness, so `if n` on an
 `for` with a condition loops until the condition is false:
 
 ```kod
-let i: int64 = 0
+mut i: int64 = 0
 for i < 10 {
     print_int(i)
     i = i + 1
@@ -34,6 +34,16 @@ for i < 10 {
 
 This is Kod's general looping construct. There is no `while` keyword.
 As with `if`, the condition must be a `bool`.
+
+The condition can bind names as an `if` condition does, alone or joined by
+`and`. The loop ends when a pattern fails, and the names are new each time
+round:
+
+```kod
+for reader.next_line() is Some(line) and len(line) > 0 {
+    print(line)
+}
+```
 
 ## `for` / `in` (foreach)
 
@@ -48,7 +58,28 @@ for name in names {
 
 The loop variable is declared implicitly — no `let` needed.
 
-Only arrays can be iterated. `for c in s` over a `str` and `for k in m`
+`for i, x in xs` also numbers the elements from 0:
+
+```kod
+for i, name in names {
+    print(f"{i}: {name}")
+}
+```
+
+`for i in a..b` counts from `a` up to but not including `b`, like the slice
+`xs[a..b]`. Both bounds must be `int64` and are evaluated once, before the
+first iteration, so changing `n` in the body of `for i in 0..n` doesn't change
+how many times it runs. `a..b` works only here: it isn't a value of its own.
+
+```kod
+for i in 0..3 {
+    print_int(i)    // 0, 1, 2
+}
+```
+
+Either form can take `_` for a name it doesn't use.
+
+Only arrays and `a..b` can be iterated. `for c in s` over a `str` and `for k in m`
 over a `Map` are errors for now: iterate over `s.code_points()` or
 `m.keys` instead. Iterating over any other kind of value is an error too.
 

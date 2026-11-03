@@ -284,8 +284,9 @@ if a is .Some(x) and b is .Some(y) and x == y {
 ```
 
 The `else` block runs when any operand fails, and sees none of the
-bindings. Elsewhere a pattern can't bind: not under `or` or `not`, not
-with `is not` inside an `and` chain, not in a `for` condition or a `let`
+bindings. A `for` condition can bind the same way (see
+[`for`](control-flow.md#for-while-style)). Elsewhere a pattern can't bind: not
+under `or` or `not`, not with `is not` inside an `and` chain, not in a `let`
 value. There the `is` is only a test, and `.Circle(r)` is an error.
 
 ```kod
