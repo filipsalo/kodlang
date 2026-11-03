@@ -361,6 +361,11 @@ and `f` as a value is that function; with none of those it is an error:
 declaration (see [Blocks and bindings](control-flow.md#blocks-and-bindings)
 and [Built-ins](builtins.md)).
 
+A function of an imported module is a value written through its module,
+`let f = vec.dot`, unless a local named `vec` is in force. A name the
+module doesn't declare is an error with a did-you-mean hint
+(`` module `vec` has no function or constant `dott` ``).
+
 An indirect call has the function type's return type wherever the
 function value comes from: a local, an array element (`fs[i](x)`), a
 struct field (`h.fn(x)`) or another call (`get_fn()(x)`). It must pass
