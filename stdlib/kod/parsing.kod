@@ -885,6 +885,78 @@ type Parser = struct {
 		return false
 	}
 
+	// The pattern of each operand that binds, or -1. The patterns go in before
+	// the body is parsed, as a whole-condition one does, so their spans end here.
+	func chain_patterns(self, anon ops: [int64]) -> [int64] {
+		mut pats: [int64] = []
+		for op in ops {
+			mut pat: int64 = -1
+			if self.binds_names(op) and self.exprs[op] is .Binary(_lhs, _op, rhs) {
+				pat = self.pattern_of_expr(rhs)
+			}
+			pats += [pat]
+		}
+		return pats
+	}
+
+	func any_pattern(self, anon pats: [int64]) -> bool {
+		for pat in pats {
+			if pat >= 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	// `let name = counter` and `counter += 1`, ahead of a loop's body, so that
+	// `continue` has already moved on.
+	func take_counter(self, anon name: str, counter: str, span: ast.Span) -> [int64] {
+		let value: int64 = self.alloc_expr(ast.Expr.Ident(name: counter), :span)
+		let lhs: int64 = self.alloc_expr(ast.Expr.Ident(name: counter), :span)
+		let rhs: int64 = self.alloc_expr(ast.Expr.IntLit(value: 1), :span)
+		return [
+			self.alloc_stmt(ast.Stmt.Let(:name, typ: 0, :value, mutable: false)),
+			self.alloc_stmt(ast.Stmt.PlusAssign(:lhs, :rhs)),
+		]
+	}
+
+	// `if true` holds a rewritten loop's hidden locals, as a block would.
+	func hidden_block(self, anon stmts: [int64], span: ast.Span) -> int64 {
+		let always: int64 = self.alloc_expr(ast.Expr.BoolLit(value: true), :span)
+		return self.alloc_stmt(ast.Stmt.If(cond: always, then_body: stmts, else_body: []))
+	}
+
+	// `for i in a..b`, with the bounds evaluated once and typed `int64`.
+	func for_range(self, anon name: str, start: int64, stop: int64, body: [int64]) -> int64 {
+		let span: ast.Span = self.expr_spans[start]
+		let next_name: str = f"__for_next_{start}"
+		let stop_name: str = f"__for_stop_{start}"
+		let typ: int64 = self.alloc_type(ast.TypeExpr.Named(name: "int64"), :span)
+		let next: int64 = self.alloc_expr(ast.Expr.Ident(name: next_name), :span)
+		let last: int64 = self.alloc_expr(ast.Expr.Ident(name: stop_name), :span)
+		let cond: int64 = self.alloc_expr(ast.Expr.Binary(lhs: next, op: .Lt, rhs: last), :span)
+		mut inner: [int64] = self.take_counter(name, counter: next_name, :span)
+		inner += body
+		return self.hidden_block([
+			self.alloc_stmt(ast.Stmt.Let(name: next_name, :typ, value: start, mutable: true)),
+			self.alloc_stmt(ast.Stmt.Let(name: stop_name, :typ, value: stop, mutable: false)),
+			self.alloc_stmt(ast.Stmt.For(:cond, body: inner)),
+		], :span)
+	}
+
+	// `for i, x in xs`.
+	func for_numbered(self, anon index: str, name: str, iter: int64, body: [int64]) -> int64 {
+		let span: ast.Span = self.expr_spans[iter]
+		let counter: str = f"__for_index_{iter}"
+		let zero: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0), :span)
+		mut inner: [int64] = self.take_counter(index, :counter, :span)
+		inner += body
+		return self.hidden_block([
+			self.alloc_stmt(ast.Stmt.Let(name: counter, typ: 0, value: zero, mutable: true)),
+			self.alloc_stmt(ast.Stmt.ForEach(:name, :iter, body: inner)),
+		], :span)
+	}
+
 	// An `if` whose `and` chain binds: each operand with a pattern is a one-arm
 	// match around the operands after it, the others plain `if`s; `elses[i]`
 	// runs when operand i fails.
@@ -1838,16 +1910,7 @@ type Parser = struct {
 				}
 			}
 			if chained {
-				mut pats: [int64] = []
-				for op in ops {
-					mut op_pat: int64 = -1
-					if self.binds_names(op) {
-						if self.exprs[op] is .Binary(_op_lhs, _op_op, op_rhs) {
-							op_pat = self.pattern_of_expr(op_rhs)
-						}
-					}
-					pats += [op_pat]
-				}
+				let pats: [int64] = self.chain_patterns(ops)
 				let body: [int64] = self.parse_block()
 				// Any operand can fail, so each gets its own parse of the else
 				// block: one statement per path, which the flow checks follow.
@@ -1912,15 +1975,46 @@ type Parser = struct {
 		// for (with foreach detection)
 		if self.try_consume(.KwFor) {
 			self.skip_newlines()
+			if self.at(.Identifier) and self.peek_kind_at(1) == .Comma and self.peek_kind_at(2) == .Identifier and self.peek_kind_at(3) == .KwIn {
+				let index: str = self.binding_identifier()
+				self.expect(.Comma)
+				let name: str = self.binding_identifier()
+				self.expect(.KwIn)
+				let iter: int64 = self.parse_expr()
+				if self.at(.DotDot) {
+					self.record_error("error: `for i, x in` numbers an array; a range is already numbers, so write `for x in a..b`", got: self.peek())
+					self.advance()
+					self.parse_expr()
+				}
+				let body: [int64] = self.parse_block()
+				return self.for_numbered(index, :name, :iter, :body)
+			}
 			if self.at(.Identifier) and self.peek_kind_at(1) == .KwIn {
 				mut name: str = self.binding_identifier()
 				self.expect(.KwIn)
 				let iter: int64 = self.parse_expr()
+				if self.try_consume(.DotDot) {
+					let stop: int64 = self.parse_expr()
+					let body: [int64] = self.parse_block()
+					return self.for_range(name, start: iter, :stop, :body)
+				}
 				mut body: [int64] = self.parse_block()
 				return self.alloc_stmt(ast.Stmt.ForEach(:name, :iter, :body))
 			}
 			let cond: int64 = self.parse_expr()
+			let ops: [int64] = self.and_operands(cond)
+			let pats: [int64] = self.chain_patterns(ops)
 			mut body: [int64] = self.parse_block()
+			if self.any_pattern(pats) {
+				// `for true { if cond { body } else { break } }`: `continue`
+				// tests the condition again, and `break` is the loop's own.
+				mut elses: [[int64]] = []
+				for _op in ops {
+					elses += [[self.alloc_stmt(ast.Stmt.Break)]]
+				}
+				let always: int64 = self.alloc_expr(ast.Expr.BoolLit(value: true), span: self.expr_spans[cond])
+				return self.alloc_stmt(ast.Stmt.For(cond: always, body: [self.chain_stmt(ops, :pats, from: 0, :body, :elses)]))
+			}
 			return self.alloc_stmt(ast.Stmt.For(:cond, :body))
 		}
 

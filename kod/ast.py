@@ -1395,6 +1395,58 @@ class IfStatement(ASTNode):
         return cls(condition, true_branch, false_branch, span)
 
 
+def _take_counter(name, counter, span):
+    """`let name = counter` and `counter += 1`, ahead of a loop's body, so that
+    `continue` has already moved on."""
+    plus = tokens.Plus("+", span)
+    one = IntegerLiteral(types.Int64(1), span=span)
+    step = BinaryOperator(Name(counter, span), plus, one, span)
+    return [
+        VariableDeclaration(Variable(name, None, span), Name(counter, span), span),
+        Assignment(Name(counter, span), step, span),
+    ]
+
+
+def _hidden_block(stmts, span):
+    """`if true` holds a rewritten loop's hidden locals, as a block would."""
+    return IfStatement(BooleanLiteral(types.Bool(True), span=span), stmts, [], span)
+
+
+def _for_range(name, start, stop, body, span, parser):
+    """`for i in a..b`, with the bounds evaluated once."""
+    next_name = f"__for_next_{parser.pos}"
+    stop_name = f"__for_stop_{parser.pos}"
+    less = tokens.LessThan("<", span)
+    cond = BinaryOperator(Name(next_name, span), less, Name(stop_name, span), span)
+    inner = _take_counter(name, next_name, span) + body
+    return _hidden_block(
+        [
+            VariableDeclaration(
+                Variable(next_name, None, span), start, span, mutable=True
+            ),
+            VariableDeclaration(Variable(stop_name, None, span), stop, span),
+            ForStatement(cond, inner, span),
+        ],
+        span,
+    )
+
+
+def _for_numbered(index, name, iterable, body, span, parser):
+    """`for i, x in xs`."""
+    counter = f"__for_index_{parser.pos}"
+    zero = IntegerLiteral(types.Int64(0), span=span)
+    inner = _take_counter(index, counter, span) + body
+    return _hidden_block(
+        [
+            VariableDeclaration(
+                Variable(counter, None, span), zero, span, mutable=True
+            ),
+            ForEachStatement(name, iterable, inner, span),
+        ],
+        span,
+    )
+
+
 def _parse_block(parser):
     parser.consume(tokens.OpenCurly)
     stmts = []
@@ -1544,15 +1596,38 @@ class ForStatement(ASTNode):
             if parser.peeking_at(tokens.Identifier):
                 saved_pos = parser.pos
                 binding = parser.consume(tokens.Identifier).value
+                index = None
+                if parser.try_consume(tokens.Comma):
+                    index = binding
+                    binding = parser.consume(tokens.Identifier).value
                 if parser.try_consume(tokens.In):
                     iterable = Expression.parse(parser)
+                    if parser.try_consume(tokens.DotDot):
+                        stop = Expression.parse(parser)
+                        body = _parse_block(parser)
+                        return _for_range(binding, iterable, stop, body, span, parser)
                     parser.consume(tokens.OpenCurly)
                     while not parser.try_consume(tokens.CloseCurly):
                         if statement := parser.parse_statement():
                             body.append(statement)
+                    if index is not None:
+                        return _for_numbered(
+                            index, binding, iterable, body, span, parser
+                        )
                     return ForEachStatement(binding, iterable, body, span)
                 parser.pos = saved_pos
             condition = Expression.parse(parser)
+            ops = _and_operands(condition)
+            if any(_binds_names(op) for op in ops):
+                # `for true { if cond { body } else { break } }`: `continue`
+                # tests the condition again, and `break` is the loop's own.
+                pats = [
+                    _pattern_from_is_rhs(op, parser) if _binds_names(op) else None
+                    for op in ops
+                ]
+                body = _parse_block(parser)
+                test = _if_chain(ops, pats, body, [BreakStatement(span)], span)
+                return cls(BooleanLiteral(types.Bool(True), span=span), [test], span)
             parser.consume(tokens.OpenCurly)
             while not parser.try_consume(tokens.CloseCurly):
                 if statement := parser.parse_statement():
