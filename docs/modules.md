@@ -32,31 +32,36 @@ func origin() -> vec.Vec2 {
 Qualified constructors have the imported type, so `let v = vec.Vec2(x: 1, y: 2)`
 needs no annotation before `v.x`. Calling a function the module doesn't
 declare, such as `vec.lenght(v)`, is an error with a did-you-mean hint.
-A local or parameter named like an import alias hides the module where
-it is in force. After `let vec = Thing()`, `vec.len()` calls `Thing`'s
-method until the block that declared it ends. Before that `let`, in its
-own initializer (`let vec = vec.make(1)`) and after its block, `vec.` is
-the module again, or an outer binding of that name. In a type or a type
-argument, `vec.Vec2` always means the module, and so does the enum in a
-pattern or an `is`, such as `vec.Shape.Circle`, wherever the `is` is
-written: a condition, a `let`, an operand of `and`, an f-string. In an
-expression, where the local is in force, `vec.Vec2(...)` calls a method
-of the local and `vec.Shape.Circle` reads a field of it, also where an
-enum `Shape` is in scope, and `x is vec.Vec2` and a pattern `vec.Vec2(b)`
-are errors: `` `vec` is a local here, so `vec.Vec2` doesn't name a type
-of its module; give the local another name ``.
+No local can be named like an import alias: a `let`, `mut`, parameter,
+`for` variable or pattern binding named `vec` is an error,
+`` `vec` is the name of an import; give the local another name ``, so
+`vec.` always means the module.
 A function named like an import alias doesn't hide it: with `func vec()`
 declared too, `vec()` calls the function and `vec.make(1)` the module's.
 
-To also use some names unqualified, list them after the path. The qualified form keeps working:
+To use some names unqualified instead, list them after the path:
 
 ```kod
 import "./math/vec" { Vec2, dot }
 
 func norm2(anon v: Vec2) -> int64 {
-    return dot(v, v)        // same as vec.dot(v, v)
+    return dot(v, v)
 }
 ```
+
+An import that lists names binds only those names, not its alias, so
+`vec.dot` is an error there and a local may be named `vec`. That keeps the
+usual way of naming a value after its module working:
+
+```kod
+import "net/client" { Client }
+
+let client = Client()      // `client` is a local; `net/client` is reached through `Client`
+```
+
+To have both, import the module twice: `import "./math/vec"` binds `vec`
+and `import "./math/vec" { Vec2 }` adds `Vec2`, and then no local can be
+named `vec`.
 
 Each listed name must be a function, extern, constant or type the module declares; otherwise it's an error with a did-you-mean hint: `` module `vec` has no function, constant or type `dto`; did you mean `dot`? ``.
 
@@ -92,7 +97,7 @@ The same holds for a function literal or a function value used as a default (`cb
 
 A bare type name `T` means, in this order: a type parameter of the generic declaration around it, a primitive (`int64`, `bool`, `str`, `bytes`, `none`), a type the module declares (its own aliases included), a type it lists in an import (`import "./pa" { Pt }`), then a builtin type. A type of a module imported without listing it, or loaded only because another module imports it, is written through the module: `pa.Pt`. Otherwise it's an error with a hint naming the file that declares it: `` unknown type `Pt`; lib/pa.kod declares `Pt`: write `pa.Pt` or list it in the import (`{ Pt }`) ``, or `` unknown type `Pt`; lib/pa.kod declares `Pt`: import it to use it here `` when the module doesn't import that file.
 
-`m.T` means a type that the module imported as `m` declares, its own aliases included. This holds in a type, a constructor `m.T(...)`, a type argument, `m.E.V`, `is m.T` and a pattern `m.T(b)`, except where a local named `m` is in force (see above). Types that `m` only imports aren't reachable through it. Otherwise it's an error: `` module `m` has no type `T` ``, with a did-you-mean over m's types (`` module `m` has no function or type `T` `` for a call `m.T(...)`). When `m` isn't a module this one imports, the error spells what was written: `` unknown type `m.T` ``.
+`m.T` means a type that the module imported as `m` declares, its own aliases included. This holds in a type, a constructor `m.T(...)`, a type argument, `m.E.V`, `is m.T` and a pattern `m.T(b)`. Types that `m` only imports aren't reachable through it. Otherwise it's an error: `` module `m` has no type `T` ``, with a did-you-mean over m's types (`` module `m` has no function or type `T` `` for a call `m.T(...)`). When `m` isn't a module this one imports, the error spells what was written: `` unknown type `m.T` ``.
 
 A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method, field or variant with the name of an earlier one of the same struct, interface or enum (`` `Kind.A` is already declared on line 2 ``). A method can't take the name of a field of its struct either; the error is at the method (`` `Bag.len` is already declared on line 3 ``).
 

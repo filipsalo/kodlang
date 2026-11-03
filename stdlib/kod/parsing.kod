@@ -424,6 +424,10 @@ type Parser = struct {
 	const_names: [str] = []
 	const_exprs: [int64] = []
 	const_spans: [ast.Span] = []
+	// Each local a function binds (parameter, `let`, `mut`, `for` variable,
+	// pattern binding) and where its name starts, for codegen's checks.
+	binding_names: [str] = []
+	binding_starts: [int64] = []
 
 	func peek(self) -> lexing.Token {
 		if self.pos >= len(self.tokens) {
@@ -477,6 +481,14 @@ type Parser = struct {
 			self.record_unexpected(expected: lexing.kind_name(kind), got: self.peek())
 		}
 		return self.advance()
+	}
+
+	// expect_identifier for a name a local binds, noted in binding_names.
+	func binding_identifier(self) -> str {
+		self.binding_starts += [self.peek().start]
+		let name = self.expect_identifier()
+		self.binding_names += [name]
+		return name
 	}
 
 	func expect_identifier(self) -> str {
@@ -749,6 +761,7 @@ type Parser = struct {
 		// `mut` (after optional `anon`) makes the parameter binding
 		// reassignable inside the body. Irrelevant to the call site.
 		let mutable: bool = self.try_consume(.KwMut)
+		let first_start = self.peek().start
 		let first: str = self.expect_identifier()
 		// Optional second identifier (Swift-style label/binding split):
 		// `func greet(who person: str)` — `who` is the label and `person`
@@ -756,7 +769,10 @@ type Parser = struct {
 		// are the same name.
 		mut name: str = first
 		if self.at(.Identifier) {
-			name = self.expect_identifier()
+			name = self.binding_identifier()
+		} else if first != "self" {
+			self.binding_names += [first]
+			self.binding_starts += [first_start]
 		}
 		mut label: str = first
 		if anonymous {
@@ -817,6 +833,11 @@ type Parser = struct {
 					let .Ident(binding) = self.exprs[arg.value] else { return -1 }
 					bindings += [binding]
 				}
+				// The binding names of an `is` pattern, which parses as a call first.
+				for arg in args {
+					self.binding_starts += [self.expr_spans[arg.value].start]
+				}
+				self.binding_names += bindings
 				match self.exprs[callee] {
 					.Ident(name) -> {
 						if len(bindings) > 1 {
@@ -912,7 +933,7 @@ type Parser = struct {
 			self.advance()
 			mut binding: str = ""
 			if self.try_consume(.OpenParen) {
-				binding = self.expect_identifier()
+				binding = self.binding_identifier()
 				self.expect(.CloseParen)
 			}
 			return self.alloc_pattern(ast.Pattern.SomePat(:binding))
@@ -922,7 +943,7 @@ type Parser = struct {
 			self.advance()
 			mut binding: str = ""
 			if self.try_consume(.OpenParen) {
-				binding = self.expect_identifier()
+				binding = self.binding_identifier()
 				self.expect(.CloseParen)
 			}
 			return self.alloc_pattern(ast.Pattern.OkPat(:binding))
@@ -931,7 +952,7 @@ type Parser = struct {
 			self.advance()
 			mut binding: str = ""
 			if self.try_consume(.OpenParen) {
-				binding = self.expect_identifier()
+				binding = self.binding_identifier()
 				self.expect(.CloseParen)
 			}
 			return self.alloc_pattern(ast.Pattern.ErrPat(:binding))
@@ -942,7 +963,7 @@ type Parser = struct {
 			mut bindings: [str] = []
 			if self.try_consume(.OpenParen) {
 				for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
-					bindings += [self.expect_identifier()]
+					bindings += [self.binding_identifier()]
 					if self.try_consume(.Comma) == false {
 						break
 					}
@@ -958,7 +979,7 @@ type Parser = struct {
 			let type_name: str = self.expect_identifier()
 			mut binding: str = ""
 			if self.try_consume(.OpenParen) {
-				binding = self.expect_identifier()
+				binding = self.binding_identifier()
 				self.expect(.CloseParen)
 			}
 			return self.alloc_pattern(ast.Pattern.TypePat(:type_name, :binding))
@@ -979,7 +1000,7 @@ type Parser = struct {
 		mut bindings: [str] = []
 		if self.try_consume(.OpenParen) {
 			for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
-				bindings += [self.expect_identifier()]
+				bindings += [self.binding_identifier()]
 				if self.try_consume(.Comma) == false {
 					break
 				}
@@ -1665,7 +1686,7 @@ type Parser = struct {
 				mut else_body: [int64] = self.parse_block()
 				return self.alloc_stmt(ast.Stmt.LetElse(pattern: pat, :value, :else_body))
 			}
-			mut name: str = self.expect_identifier()
+			mut name: str = self.binding_identifier()
 			mut typ: int64 = 0
 			if self.try_consume(.Colon) {
 				typ = self.parse_type_expr()
@@ -1679,7 +1700,7 @@ type Parser = struct {
 		// mut declaration — a mutable local binding. Irrefutable only
 		// (`mut .Pat` is rejected: expect_identifier errors on the `.`).
 		if self.try_consume(.KwMut) {
-			mut name: str = self.expect_identifier()
+			mut name: str = self.binding_identifier()
 			mut typ: int64 = 0
 			if self.try_consume(.Colon) {
 				typ = self.parse_type_expr()
@@ -1785,7 +1806,7 @@ type Parser = struct {
 		if self.try_consume(.KwFor) {
 			self.skip_newlines()
 			if self.at(.Identifier) and self.peek_kind_at(1) == .KwIn {
-				mut name: str = self.expect_identifier()
+				mut name: str = self.binding_identifier()
 				self.expect(.KwIn)
 				let iter: int64 = self.parse_expr()
 				mut body: [int64] = self.parse_block()
@@ -1966,6 +1987,10 @@ type Parser = struct {
 					}
 				}
 				self.expect(.CloseCurly)
+			}
+			// An import that lists names binds no alias; `#` keeps source from naming it.
+			if len(items) > 0 {
+				local_name = "#" + local_name
 			}
 			self.skip_newlines()
 			return ast.Decl.Import(:module_name, :local_name, :items)
