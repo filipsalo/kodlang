@@ -55,6 +55,5 @@ codegen bugs that this kind of code is most likely to hit.
 
 - Pattern matching: nested patterns and guard clauses.
 - Closures that capture enclosing locals.
-- `pub` / private visibility for module members.
 - Dead-code elimination: skip compiling functions nothing reaches.
 - Retire the Python interpreter and bootstrap (see `TODO.md`).
