@@ -154,6 +154,27 @@ if x is not none {
 }
 ```
 
+### Alternatives (`|`)
+
+Patterns joined with `|` share an arm, in a `match` statement or expression:
+
+```kod
+match token {
+    .Plus | .Minus -> print("additive")
+    .Star | .Slash -> print("multiplicative")
+    else print("other")
+}
+match n {
+    1 | 2 | 3 -> print("small")
+    else print("big")
+}
+```
+
+The arm counts as one arm for each alternative when the compiler checks that
+a `match` is exhaustive. Alternatives can't bind names, because each would
+have to bind the same ones; `_` is fine, as in `.Circle(_) | .Dot`. Give an
+arm that binds a line of its own.
+
 ## Match as expression
 
 A `match` produces a value when every arm has a value, in the simplest case a single expression:

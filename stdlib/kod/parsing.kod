@@ -1379,42 +1379,68 @@ type Parser = struct {
 			if self.peek_kind() == .CloseCurly {
 				break
 			}
-			let pat: int64 = self.parse_match_arm_pattern()
-			mut body: int64 = 0
-			mut pre: [int64] = []
-			if self.at(.OpenCurly) {
-				// A block arm: its last statement is the arm's value.
-				let open_tok: lexing.Token = self.peek()
-				pre = self.parse_block()
-				mut valued = false
-				if len(pre) > 0 {
-					let last_id: int64 = pre[len(pre) - 1]
-					if self.stmts[last_id] is ast.Stmt.ExprStmt(last) {
-						body = last
-						pre = pre[0..len(pre) - 1]
-						valued = true
-					}
-					if self.stmts[last_id] is ast.Stmt.Return(_value) {
-						body = self.unreachable_value()
-						valued = true
-					}
-					if self.stmts[last_id] is ast.Stmt.Throw(_thrown) {
-						body = self.unreachable_value()
-						valued = true
-					}
+			let pats: [int64] = self.parse_match_arm_patterns()
+			let body_pos = self.pos
+			let errors_before = len(self.errors)
+			for pat in pats {
+				self.pos = body_pos
+				arms += [self.parse_match_expr_arm(pat)]
+				if len(self.errors) > errors_before {
+					break
 				}
-				if valued == false {
-					self.record_error("error: a match arm's block must end with an expression, the arm's value", got: open_tok)
-					body = self.alloc_expr(ast.Expr.IntLit(value: 0), span: self.here())
-				}
-			} else {
-				body = self.parse_expr()
 			}
-			arms += [self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre))]
 			self.skip_newlines()
 		}
 		self.expect(.CloseCurly)
 		return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
+	}
+
+	func parse_match_expr_arm(self, anon pat: int64) -> int64 {
+		mut body: int64 = 0
+		mut pre: [int64] = []
+		if self.at(.OpenCurly) {
+			// A block arm: its last statement is the arm's value.
+			let open_tok: lexing.Token = self.peek()
+			pre = self.parse_block()
+			mut valued = false
+			if len(pre) > 0 {
+				let last_id: int64 = pre[len(pre) - 1]
+				if self.stmts[last_id] is ast.Stmt.ExprStmt(last) {
+					body = last
+					pre = pre[0..len(pre) - 1]
+					valued = true
+				}
+				if self.stmts[last_id] is ast.Stmt.Return(_value) {
+					body = self.unreachable_value()
+					valued = true
+				}
+				if self.stmts[last_id] is ast.Stmt.Throw(_thrown) {
+					body = self.unreachable_value()
+					valued = true
+				}
+			}
+			if valued == false {
+				self.record_error("error: a match arm's block must end with an expression, the arm's value", got: open_tok)
+				body = self.alloc_expr(ast.Expr.IntLit(value: 0), span: self.here())
+			}
+		} else {
+			body = self.parse_expr()
+		}
+		return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre))
+	}
+
+	func parse_match_stmt_arm(self, anon pat: int64) -> int64 {
+		mut body: [int64] = []
+		if self.try_consume(.KwNone) {
+			// `else none` — empty no-op body sugar.
+		} else {
+			if self.at(.OpenCurly) {
+				body = self.parse_block()
+			} else {
+				body += [self.parse_stmt()]
+			}
+		}
+		return self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))
 	}
 
 	// The value of a block arm that ends in `return` or `throw`: a call that
@@ -1427,17 +1453,53 @@ type Parser = struct {
 		return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
 	}
 
-	// Parse a match-arm's pattern and the connecting token. `else { ... }`,
+	// Parse a match-arm's patterns and the connecting token. `else { ... }`,
 	// `else expr`, and `else -> expr` are accepted as catch-all arms in
 	// place of `else ...`. For non-else patterns, the `->` is required.
-	func parse_match_arm_pattern(self) -> int64 {
+	// `.A | .B -> body` is one arm per pattern; the caller parses the body
+	// once for each, so each is its own statements, as with an `else` body.
+	func parse_match_arm_patterns(self) -> [int64] {
 		if self.try_consume(.KwElse) {
 			self.try_consume(.Arrow)
-			return self.alloc_pattern(ast.Pattern.Wildcard)
+			return [self.alloc_pattern(ast.Pattern.Wildcard)]
 		}
-		let pat: int64 = self.parse_pattern()
+		mut pats: [int64] = [self.parse_pattern()]
+		let bar_tok: lexing.Token = self.peek()
+		for self.try_consume(.Pipe) {
+			self.skip_newlines()
+			pats += [self.parse_pattern()]
+		}
+		if len(pats) > 1 {
+			for pat in pats {
+				if self.pattern_binds(pat) {
+					self.record_error("error: alternatives joined by `|` can't bind names; give the arm that binds a line of its own", got: bar_tok)
+					break
+				}
+			}
+		}
 		self.expect(.Arrow)
-		return pat
+		return pats
+	}
+
+	func pattern_binds(self, anon pat: int64) -> bool {
+		match self.patterns[pat] {
+			.EnumPat(_enum_name, _variant_name, bindings) -> return self.any_named(bindings)
+			.ImplicitEnumPat(_variant_name, bindings) -> return self.any_named(bindings)
+			.SomePat(binding) -> return self.any_named([binding])
+			.OkPat(binding) -> return self.any_named([binding])
+			.ErrPat(binding) -> return self.any_named([binding])
+			.TypePat(_type_name, binding) -> return self.any_named([binding])
+			else return false
+		}
+	}
+
+	func any_named(self, anon bindings: [str]) -> bool {
+		for name in bindings {
+			if len(name) > 0 and name != "_" {
+				return true
+			}
+		}
+		return false
 	}
 
 	func parse_postfix(self, anon base: int64) -> int64 {
@@ -2039,18 +2101,16 @@ type Parser = struct {
 				if self.peek_kind() == .CloseCurly {
 					break
 				}
-				let pat: int64 = self.parse_match_arm_pattern()
-				mut body: [int64] = []
-				if self.try_consume(.KwNone) {
-					// `else none` — empty no-op body sugar.
-				} else {
-					if self.at(.OpenCurly) {
-						body = self.parse_block()
-					} else {
-						body += [self.parse_stmt()]
+				let pats: [int64] = self.parse_match_arm_patterns()
+				let body_pos = self.pos
+				let errors_before = len(self.errors)
+				for pat in pats {
+					self.pos = body_pos
+					arms += [self.parse_match_stmt_arm(pat)]
+					if len(self.errors) > errors_before {
+						break
 					}
 				}
-				arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))]
 				self.skip_newlines()
 			}
 			self.expect(.CloseCurly)

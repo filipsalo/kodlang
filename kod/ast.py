@@ -1803,6 +1803,91 @@ class TypePattern:
     span: Span
 
 
+def _parse_arm_pattern(parser, span):
+    """One pattern of a match arm."""
+    if parser.peeking_at(tokens.IntegerLiteral):
+        tok = parser.consume(tokens.IntegerLiteral)
+        pattern = IntegerPattern(_literal_value(parser, tok), span)
+    elif parser.peeking_at(tokens.StringLiteral):
+        tok = StringLiteral.parse(parser)
+        pattern = StringPattern(tok.value.to_py_str(), span)
+    elif parser.peeking_at(tokens.NoneLiteral):
+        parser.consume(tokens.NoneLiteral)
+        pattern = OptionalNonePattern(span)
+    elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
+        parser.consume(tokens.Identifier)
+        binding = ""
+        if parser.try_consume(tokens.OpenParen):
+            binding = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.CloseParen)
+        pattern = OptionalSomePattern(binding, span)
+    elif parser.peeking_at(tokens.Identifier) and parser.peek().value in (
+        "Ok",
+        "Err",
+    ):
+        kind = parser.consume(tokens.Identifier).value
+        binding = ""
+        if parser.try_consume(tokens.OpenParen):
+            binding = parser.consume(tokens.Identifier).value
+            parser.consume(tokens.CloseParen)
+        pattern = (ResultOkPattern if kind == "Ok" else ResultErrPattern)(binding, span)
+    elif parser.peeking_at(tokens.Dot):
+        parser.consume(tokens.Dot)
+        variant_name = parser.consume(tokens.Identifier).value
+        bindings = []
+        if parser.try_consume(tokens.OpenParen):
+            while not parser.try_consume(tokens.CloseParen):
+                bindings.append(parser.consume(tokens.Identifier).value)
+                if not parser.try_consume(tokens.Comma):
+                    parser.consume(tokens.CloseParen)
+                    break
+        pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
+    else:
+        first = parser.consume(tokens.Identifier).value
+        if not parser.peeking_at(tokens.Dot):
+            # Bare type name → interface downcast.
+            binding = ""
+            if parser.try_consume(tokens.OpenParen):
+                binding = parser.consume(tokens.Identifier).value
+                parser.consume(tokens.CloseParen)
+            pattern = TypePattern(first, binding, span)
+        else:
+            parser.consume(tokens.Dot)
+            second = parser.consume(tokens.Identifier).value
+            module_name = None
+            if parser.peeking_at(tokens.Dot):
+                parser.consume(tokens.Dot)
+                variant_name = parser.consume(tokens.Identifier).value
+                enum_name = second
+                module_name = first
+                parser.check_enum_qualifier(first, second, span)
+            else:
+                enum_name = first
+                variant_name = second
+            bindings = []
+            if parser.try_consume(tokens.OpenParen):
+                while not parser.try_consume(tokens.CloseParen):
+                    bindings.append(parser.consume(tokens.Identifier).value)
+                    if not parser.try_consume(tokens.Comma):
+                        parser.consume(tokens.CloseParen)
+                        break
+            pattern = EnumVariantPattern(enum_name, variant_name, bindings, span)
+            if module_name is not None:
+                pattern.__dict__["_kod_module"] = module_name
+    return pattern
+
+
+def _parse_arm_patterns(parser, span):
+    """A match arm's patterns: `.A | .B` is one arm per pattern, each with its
+    own copy of the body."""
+    patterns = [_parse_arm_pattern(parser, span)]
+    while parser.try_consume(tokens.Pipe):
+        while parser.try_consume(tokens.EOL):
+            pass
+        patterns.append(_parse_arm_pattern(parser, span))
+    return patterns
+
+
 @dataclasses.dataclass
 class MatchExpressionArm:
     pattern: Any  # same patterns as MatchArm
@@ -1810,7 +1895,7 @@ class MatchExpressionArm:
     span: Span
 
     @classmethod
-    def parse(cls, parser: "Parser") -> "MatchExpressionArm":
+    def parse(cls, parser: "Parser") -> "list[MatchExpressionArm]":
         with parser.span() as span:
             # `else` is the wildcard/catch-all arm; the arrow after it is
             # optional since `else` is already unambiguous.
@@ -1819,83 +1904,13 @@ class MatchExpressionArm:
                 pattern = WildcardPattern(span)
                 parser.try_consume(tokens.Arrow)
                 body = Expression.parse(parser)
-                return cls(pattern, body, span)
-            if parser.peeking_at(tokens.IntegerLiteral):
-                tok = parser.consume(tokens.IntegerLiteral)
-                pattern = IntegerPattern(_literal_value(parser, tok), span)
-            elif parser.peeking_at(tokens.StringLiteral):
-                tok = StringLiteral.parse(parser)
-                pattern = StringPattern(tok.value.to_py_str(), span)
-            elif parser.peeking_at(tokens.NoneLiteral):
-                parser.consume(tokens.NoneLiteral)
-                pattern = OptionalNonePattern(span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
-                parser.consume(tokens.Identifier)
-                binding = ""
-                if parser.try_consume(tokens.OpenParen):
-                    binding = parser.consume(tokens.Identifier).value
-                    parser.consume(tokens.CloseParen)
-                pattern = OptionalSomePattern(binding, span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value in (
-                "Ok",
-                "Err",
-            ):
-                kind = parser.consume(tokens.Identifier).value
-                binding = ""
-                if parser.try_consume(tokens.OpenParen):
-                    binding = parser.consume(tokens.Identifier).value
-                    parser.consume(tokens.CloseParen)
-                pattern = (ResultOkPattern if kind == "Ok" else ResultErrPattern)(
-                    binding, span
-                )
-            elif parser.peeking_at(tokens.Dot):
-                parser.consume(tokens.Dot)
-                variant_name = parser.consume(tokens.Identifier).value
-                bindings = []
-                if parser.try_consume(tokens.OpenParen):
-                    while not parser.try_consume(tokens.CloseParen):
-                        bindings.append(parser.consume(tokens.Identifier).value)
-                        if not parser.try_consume(tokens.Comma):
-                            parser.consume(tokens.CloseParen)
-                            break
-                pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
-            else:
-                first = parser.consume(tokens.Identifier).value
-                if not parser.peeking_at(tokens.Dot):
-                    # Bare type name → interface downcast.
-                    binding = ""
-                    if parser.try_consume(tokens.OpenParen):
-                        binding = parser.consume(tokens.Identifier).value
-                        parser.consume(tokens.CloseParen)
-                    pattern = TypePattern(first, binding, span)
-                else:
-                    parser.consume(tokens.Dot)
-                    second = parser.consume(tokens.Identifier).value
-                    module_name = None
-                    if parser.peeking_at(tokens.Dot):
-                        parser.consume(tokens.Dot)
-                        variant_name = parser.consume(tokens.Identifier).value
-                        enum_name = second
-                        module_name = first
-                        parser.check_enum_qualifier(first, second, span)
-                    else:
-                        enum_name = first
-                        variant_name = second
-                    bindings = []
-                    if parser.try_consume(tokens.OpenParen):
-                        while not parser.try_consume(tokens.CloseParen):
-                            bindings.append(parser.consume(tokens.Identifier).value)
-                            if not parser.try_consume(tokens.Comma):
-                                parser.consume(tokens.CloseParen)
-                                break
-                    pattern = EnumVariantPattern(
-                        enum_name, variant_name, bindings, span
-                    )
-                    if module_name is not None:
-                        pattern.__dict__["_kod_module"] = module_name
+                return [cls(pattern, body, span)]
+            patterns = _parse_arm_patterns(parser, span)
             parser.consume(tokens.Arrow)
             body = Expression.parse(parser)
-        return cls(pattern, body, span)
+        return [cls(patterns[0], body, span)] + [
+            cls(pattern, copy.deepcopy(body), span) for pattern in patterns[1:]
+        ]
 
 
 @dataclasses.dataclass
@@ -1917,7 +1932,7 @@ class MatchExpression(ASTNode):
             while not parser.try_consume(tokens.CloseCurly):
                 if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
                     continue
-                arms.append(MatchExpressionArm.parse(parser))
+                arms.extend(MatchExpressionArm.parse(parser))
         return cls(expression, arms, span)
 
 
@@ -1928,7 +1943,7 @@ class MatchArm:
     span: Span
 
     @classmethod
-    def parse(cls, parser: "Parser") -> "MatchArm":
+    def parse(cls, parser: "Parser") -> "list[MatchArm]":
         with parser.span() as span:
             # `else` is the wildcard/catch-all arm; arrow is optional after it.
             # `else none` is sugar for an empty body (no-op catch-all).
@@ -1938,7 +1953,7 @@ class MatchArm:
                 parser.try_consume(tokens.Arrow)
                 if parser.peeking_at(tokens.NoneLiteral):
                     parser.consume(tokens.NoneLiteral)
-                    return cls(pattern, [], span)
+                    return [cls(pattern, [], span)]
                 if parser.peeking_at(tokens.OpenCurly):
                     parser.consume(tokens.OpenCurly)
                     body = []
@@ -1951,82 +1966,8 @@ class MatchArm:
                     body = []
                     if stmt := parser.parse_statement(check_end=False):
                         body.append(stmt)
-                return cls(pattern, body, span)
-            # Parse pattern
-            if parser.peeking_at(tokens.IntegerLiteral):
-                tok = parser.consume(tokens.IntegerLiteral)
-                pattern = IntegerPattern(_literal_value(parser, tok), span)
-            elif parser.peeking_at(tokens.StringLiteral):
-                tok = StringLiteral.parse(parser)
-                pattern = StringPattern(tok.value.to_py_str(), span)
-            elif parser.peeking_at(tokens.NoneLiteral):
-                parser.consume(tokens.NoneLiteral)
-                pattern = OptionalNonePattern(span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value == "Some":
-                parser.consume(tokens.Identifier)
-                binding = ""
-                if parser.try_consume(tokens.OpenParen):
-                    binding = parser.consume(tokens.Identifier).value
-                    parser.consume(tokens.CloseParen)
-                pattern = OptionalSomePattern(binding, span)
-            elif parser.peeking_at(tokens.Identifier) and parser.peek().value in (
-                "Ok",
-                "Err",
-            ):
-                kind = parser.consume(tokens.Identifier).value
-                binding = ""
-                if parser.try_consume(tokens.OpenParen):
-                    binding = parser.consume(tokens.Identifier).value
-                    parser.consume(tokens.CloseParen)
-                pattern = (ResultOkPattern if kind == "Ok" else ResultErrPattern)(
-                    binding, span
-                )
-            elif parser.peeking_at(tokens.Dot):
-                parser.consume(tokens.Dot)
-                variant_name = parser.consume(tokens.Identifier).value
-                bindings = []
-                if parser.try_consume(tokens.OpenParen):
-                    while not parser.try_consume(tokens.CloseParen):
-                        bindings.append(parser.consume(tokens.Identifier).value)
-                        if not parser.try_consume(tokens.Comma):
-                            parser.consume(tokens.CloseParen)
-                            break
-                pattern = ImplicitEnumVariantPattern(variant_name, bindings, span)
-            else:
-                first = parser.consume(tokens.Identifier).value
-                if not parser.peeking_at(tokens.Dot):
-                    # Bare type name → interface downcast.
-                    binding = ""
-                    if parser.try_consume(tokens.OpenParen):
-                        binding = parser.consume(tokens.Identifier).value
-                        parser.consume(tokens.CloseParen)
-                    pattern = TypePattern(first, binding, span)
-                else:
-                    parser.consume(tokens.Dot)
-                    second = parser.consume(tokens.Identifier).value
-                    # Three-part: module.Enum.Variant, whose module must declare the enum.
-                    module_name = None
-                    if parser.peeking_at(tokens.Dot):
-                        parser.consume(tokens.Dot)
-                        variant_name = parser.consume(tokens.Identifier).value
-                        enum_name = second
-                        module_name = first
-                        parser.check_enum_qualifier(first, second, span)
-                    else:
-                        enum_name = first
-                        variant_name = second
-                    bindings = []
-                    if parser.try_consume(tokens.OpenParen):
-                        while not parser.try_consume(tokens.CloseParen):
-                            bindings.append(parser.consume(tokens.Identifier).value)
-                            if not parser.try_consume(tokens.Comma):
-                                parser.consume(tokens.CloseParen)
-                                break
-                    pattern = EnumVariantPattern(
-                        enum_name, variant_name, bindings, span
-                    )
-                    if module_name is not None:
-                        pattern.__dict__["_kod_module"] = module_name
+                return [cls(pattern, body, span)]
+            patterns = _parse_arm_patterns(parser, span)
             # Parse ->
             parser.consume(tokens.Arrow)
             # Parse body: block or single statement
@@ -2042,7 +1983,9 @@ class MatchArm:
                 body = []
                 if stmt := parser.parse_statement(check_end=False):
                     body.append(stmt)
-        return cls(pattern, body, span)
+        return [cls(patterns[0], body, span)] + [
+            cls(pattern, copy.deepcopy(body), span) for pattern in patterns[1:]
+        ]
 
 
 @dataclasses.dataclass
@@ -2062,5 +2005,5 @@ class MatchStatement(ASTNode):
             while not parser.try_consume(tokens.CloseCurly):
                 if parser.try_consume(tokens.EOL) or parser.try_consume(tokens.Comment):
                     continue
-                arms.append(MatchArm.parse(parser))
+                arms.extend(MatchArm.parse(parser))
         return cls(expression, arms, span)
