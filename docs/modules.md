@@ -58,6 +58,8 @@ func norm2(anon v: Vec2) -> int64 {
 }
 ```
 
+Each listed name must be a function, extern, constant or type the module declares; otherwise it's an error with a did-you-mean hint: `` module `vec` has no function, constant or type `dto`; did you mean `dot`? ``.
+
 ## Where names resolve
 
 Parameter defaults, struct field defaults and the method bodies of a generic type resolve function names, type names and import aliases in the module that wrote them, even though they run as part of the caller's code. A default in `util.kod` that calls `helper()` calls util's own `helper`, a function util imports with `{ helper }`, or the builtin of that name, never one that belongs to the caller. Likewise `rng.seed()` in that default means util's own `import "./rng"`, whether or not the caller imports a module named `rng`:
