@@ -242,7 +242,9 @@ if module.decls[i] is .Func(decl_id) {
 }
 ```
 
-An optional `else { ... }` runs when the pattern doesn't match.
+An optional `else { ... }` runs when the pattern doesn't match, and
+`else if` chains on as it does after any `if`; that `if` can bind names of
+its own: `if r is Ok(v) { … } else if r is Err(e) and e.code > 0 { … }`.
 Pattern bindings stay scoped to the matching arm — they aren't
 in scope in the `else` block. There and after the `if`, a name the
 pattern binds means what it meant before the `if`, such as an outer

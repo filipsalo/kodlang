@@ -1337,7 +1337,7 @@ class IfStatement(ASTNode):
                 body = _parse_block(parser)
                 else_body = []
                 if parser.try_consume(tokens.Else):
-                    else_body = _parse_block(parser)
+                    else_body = _parse_else(parser)
                 return _if_chain(ops, pats, body, else_body, span)
             if pat is not None:
                 lhs = condition.lhs
@@ -1352,12 +1352,7 @@ class IfStatement(ASTNode):
                 # Pattern bindings stay scoped to the matching arm.
                 else_body: list[Statement] = []
                 if parser.try_consume(tokens.Else):
-                    parser.consume(tokens.OpenCurly)
-                    while not parser.try_consume(tokens.CloseCurly):
-                        if parser.try_consume(tokens.EOL):
-                            continue
-                        if stmt := parser.parse_statement():
-                            else_body.append(stmt)
+                    else_body = _parse_else(parser)
                 # `is not` swaps arms: body runs when the pattern does
                 # NOT match; pattern bindings only see else_body.
                 if isinstance(condition.op, tokens.IsNot):
@@ -1399,6 +1394,13 @@ def _parse_block(parser):
         if stmt := parser.parse_statement():
             stmts.append(stmt)
     return stmts
+
+
+def _parse_else(parser):
+    """What follows an `else`: a block, or an `if` that chains on."""
+    if parser.peeking_at(tokens.If):
+        return [IfStatement.parse(parser)]
+    return _parse_block(parser)
 
 
 def _and_operands(cond):
