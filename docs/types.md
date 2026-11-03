@@ -179,10 +179,14 @@ let flag: bool = true
 let other: bool = false
 ```
 
-Logical operators: `and`, `or`. There's no prefix `not`; negate a `bool`
-with `b == false`. Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`.
-Comparisons, `and`/`or` and `is` always produce a `bool`, so `let ok = a < b`
-is a `bool` binding and `f"{a < b}"` prints `true` or `false`.
+Logical operators: `and`, `or`, `not`. Comparison: `==`, `!=`, `<`, `<=`, `>`,
+`>=`. Comparisons, `and`/`or`/`not` and `is` always produce a `bool`, so
+`let ok = a < b` is a `bool` binding and `f"{a < b}"` prints `true` or `false`.
+
+`not` binds looser than comparisons and `is`, and tighter than `and` and `or`:
+`not a == b` is `not (a == b)`, `not x is .Red` is `not (x is .Red)`, and
+`not a and b` is `(not a) and b`. Its operand must be a `bool`; test an optional
+with `x is none`.
 
 `bool` and `int64` don't mix, and nothing else stands in for a `bool`. Both
 operands of `and` and `or` must be `bool`, and so must the condition of an
