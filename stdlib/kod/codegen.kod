@@ -1323,7 +1323,7 @@ type Codegen = struct {
                 if op is .Dot {
                     let .Ident(mod_name) = self.p.exprs[lhs] else { return none }
                     let .Ident(member) = self.p.exprs[rhs] else { return none }
-                    if self.var_index(mod_name) >= 0 or self.is_import_alias(mod_name) == false {
+                    if self.is_import_alias(mod_name) == false {
                         return none
                     }
                     let fn_idx = self.lookup_import_fn(mod_name, member)
@@ -1347,7 +1347,7 @@ type Codegen = struct {
         let .Ident(alias) = self.p.exprs[lhs] else { return -1 }
         let .Ident(member) = self.p.exprs[rhs] else { return -1 }
         if op is .Dot {
-            if self.var_index(alias) >= 0 or self.is_import_alias(alias) == false {
+            if self.is_import_alias(alias) == false {
                 return -1
             }
             let slot = self.lookup_import_fn(alias, member)
@@ -1789,8 +1789,8 @@ type Codegen = struct {
                 target = f"`{enum_name}.{variant_name}`"
                 variant = variant_name
                 if kind is .KInterface(_iface) {
-                    mut msg = self.hidden_alias_msg(enum_name, type_name: variant_name)
-                    if len(msg) == 0 and len(bindings) > 1 and self.is_import_alias(enum_name) {
+                    mut msg = ""
+                    if len(bindings) > 1 and self.is_import_alias(enum_name) {
                         msg = f"error: a downcast to {target} binds one name, got {len(bindings)}; bind the value and read its fields"
                     }
                     // `x.T(b)` or `x.E.V(b)` where `x` names no module and `x` / `x.E` no type.
@@ -4519,7 +4519,6 @@ type Codegen = struct {
         }
         match self.p.type_exprs[type_id] {
             .Named(name) -> {
-                // A local never hides the module of `m.T` here.
                 if type_id < len(self.p.type_quals) {
                     let qual = self.p.type_quals[type_id]
                     if len(qual) > 0 {
@@ -6391,7 +6390,7 @@ type Codegen = struct {
                     }
                     if self.p.exprs[lhs] is .Ident(alias) {
                         if self.p.exprs[rhs] is .Ident(member) {
-                            if self.var_index(alias) < 0 and self.is_import_alias(alias) and self.qualified_type_ref(alias, name: member) < 0 {
+                            if self.is_import_alias(alias) and self.qualified_type_ref(alias, name: member) < 0 {
                                 if member.starts_with("_") and self.module_declares(alias, name: member) {
                                     self.report_error(private_to_module(member, :alias), span: self.p.expr_spans[rhs])
                                 } else {
@@ -6792,9 +6791,8 @@ type Codegen = struct {
     }
 
     // Why an `is` right-hand side `m.T`, `m.T(b)`, `m.E.V` or `m.E.V(b)` names
-    // no type: `m` is hidden by a local, imports no such type, or isn't an
-    // import and names no type the module sees. "" when it names one. In
-    // `m.E.V` the `m` is the module even where a local is named like it.
+    // no type: `m` imports no such type, or isn't an import and names no type
+    // the module sees. "" when it names one.
     func is_rhs_qual_error(self, anon rhs: int64) -> str {
         mut callee = rhs
         if self.p.exprs[rhs] is .Call(call_callee, _args) {
@@ -6815,15 +6813,14 @@ type Codegen = struct {
         let .Ident(written) = self.p.exprs[qual_id] else { return "" }
         let .Ident(name) = self.p.exprs[type_id] else { return "" }
         let qualifier = self.source_name(written)
-        let module_hidden = enum_form and self.var_bound(written) and self.declares_alias(qualifier)
-        if self.var_bound(written) and module_hidden == false {
-            return self.hidden_alias_msg(written, type_name: name)
-        }
-        if module_hidden or self.is_import_alias(written) {
+        if self.is_import_alias(qualifier) {
             if self.qualified_type_ref(qualifier, :name) >= 0 {
                 return ""
             }
             return self.qualified_type_error(qualifier, :name, call: false)
+        }
+        if self.var_bound(written) {
+            return ""
         }
         if self.type_name_known(qualifier) {
             return ""
@@ -6856,14 +6853,6 @@ type Codegen = struct {
         let .Ident(qualifier) = self.p.exprs[lhs] else { return no_parts }
         let .Ident(name) = self.p.exprs[rhs] else { return no_parts }
         return [qualifier, name]
-    }
-
-    // `X.T` names no type of the module `X` where a local `X` is bound.
-    func hidden_alias_msg(self, anon qualifier: str, type_name: str) -> str {
-        if self.var_bound(qualifier) == false or self.declares_alias(qualifier) == false {
-            return ""
-        }
-        return f"error: `{qualifier}` is a local here, so `{qualifier}.{type_name}` doesn't name a type of its module; give the local another name"
     }
 
     // `Option.Some` and `Result.Ok` name the variants `T?` and `T or Error` test.
@@ -8052,8 +8041,9 @@ type Codegen = struct {
         return enum_idx
     }
 
+    // No local can take an import's name, so an alias always means the module.
     func is_import_alias(self, anon name: str) -> bool {
-        return self.var_bound(name) == false and self.declares_alias(name)
+        return self.declares_alias(name)
     }
 
     func declares_alias(self, anon name: str) -> bool {
@@ -11535,33 +11525,9 @@ type Codegen = struct {
         return -1
     }
 
-    // The variant of `enum_idx` an `is` right-hand side names. In `m.E.V` the `m`
-    // is the module even where a local is named like it, as in a pattern.
+    // The variant of `enum_idx` an `is` right-hand side names.
     func is_variant_idx(self, anon rhs: int64, enum_idx: int64) -> int64 {
-        let named_in_scope = self.ctor_variant_idx(rhs, :enum_idx)
-        if named_in_scope >= 0 {
-            return named_in_scope
-        }
-        mut callee = rhs
-        if self.p.exprs[rhs] is .Call(call_callee, _args) {
-            callee = call_callee
-        }
-        let .Binary(lhs, op, name_id) = self.p.exprs[callee] else { return -1 }
-        let .Dot = op else { return -1 }
-        let .Ident(variant_name) = self.p.exprs[name_id] else { return -1 }
-        let .Binary(mod_id, inner_op, enum_id) = self.p.exprs[lhs] else { return -1 }
-        let .Dot = inner_op else { return -1 }
-        let .Ident(written) = self.p.exprs[mod_id] else { return -1 }
-        let .Ident(enum_name) = self.p.exprs[enum_id] else { return -1 }
-        let alias = self.source_name(written)
-        if self.var_bound(written) == false or self.declares_alias(alias) == false {
-            return -1
-        }
-        let module_enum = self.qualified_idx(alias, name: enum_name, what: 1)
-        if module_enum < 0 or self.enums_compatible(enum_idx, a_idx: module_enum) == false {
-            return -1
-        }
-        return self.find_variant_idx(variant_name, :enum_idx)
+        return self.ctor_variant_idx(rhs, :enum_idx)
     }
 
     // `.Ok` in a `Status or Error` slot is Status's own `Ok` when only its payload fits.
