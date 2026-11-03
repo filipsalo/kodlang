@@ -1040,6 +1040,16 @@ class Expression(ASTNode):
                     operand = Expression.parse(parser, 17)
                 zero = IntegerLiteral(types.Int64(0), span=op_token.span)
                 value = BinaryOperator(zero, op_token, operand, op_token.span)
+            case tokens.Not():
+                # `not x` is `x == false`, x taken at comparison precedence.
+                op_token = parser.consume(tokens.Not)
+                operand = Expression.parse(parser, tokens.EqualEqual.precedence)
+                value = BinaryOperator(
+                    operand,
+                    tokens.EqualEqual("==", op_token.span),
+                    BooleanLiteral(types.Bool(False), span=op_token.span),
+                    op_token.span,
+                )
             case tokens.Try():
                 value = TryExpression.parse(parser)
             case tokens.Must():
