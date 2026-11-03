@@ -4,15 +4,13 @@ icon: lucide/globe
 
 # HTTP client
 
-`stdlib/net/client.kod` makes HTTP/1.1 requests over TCP or TLS, and
-`stdlib/net/http.kod` is the part that doesn't touch the network: URLs,
-headers, writing a request to a `Writer` and reading a response from a
-`BufReader`. A program that only parses or builds HTTP imports `net/http`
-and links no socket or TLS code; one that imports `net/client` links both
-(see [TCP](io.md#tcp) and [TLS](io.md#tls)).
+`stdlib/net/http.kod` makes HTTP/1.1 requests over TCP or TLS (see
+[TCP](io.md#tcp) and [TLS](io.md#tls)). Its parts that don't touch the
+network, URLs, headers, writing a request to a `Writer` and reading a
+response from a `BufReader`, work on their own too.
 
 ```kod
-import "net/client" { get }
+import "net/http" { get }
 
 func main() -> int64 or Error {
     let r = try get("https://example.com/")
@@ -33,7 +31,7 @@ A `Client` carries the settings that describe the service you talk to (its
 headers, its certificate roots, its deadline) and makes the requests:
 
 ```kod
-import "net/client" { Client }
+import "net/http" { Client }
 import "time" { Duration }
 
 let client = Client(deadline: Duration(seconds: 15))
@@ -100,7 +98,7 @@ the next request to the same scheme, host and port, which saves the TCP connect
 and the TLS handshake each time:
 
 ```kod
-import "net/client" { Client }
+import "net/http" { Client }
 
 func main() -> int64 or Error {
     let client = Client()

@@ -28,9 +28,8 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
    in its leading `// kod:` lines so only programs that import it link the Security
    framework. A `TlsStream` is a `Reader` and a `Writer`, like a plain connection.
 3. **HTTP/1.1 client** — done: `stdlib/net/http.kod` (URLs, headers, request writing and
-   response parsing with `Content-Length`, chunked and read-to-close bodies and size limits;
-   no network code) and `stdlib/net/client.kod` (`get`, `post`, `fetch` over TCP or TLS, with
-   redirects). See `docs/http.md`.
+   response parsing with `Content-Length`, chunked and read-to-close bodies and size limits,
+   and `get`, `post`, `fetch` over TCP or TLS, with redirects). See `docs/http.md`.
 4. **Robust JSON** — done: `json.parse` returns `Value or Error` with the position of a
    syntax error, follows RFC 8259 strictly (including `\uXXXX` and surrogate pairs), keeps
    numbers it can't hold as `Decimal` text, bounds nesting depth, and `emit_pretty` indents.
@@ -43,7 +42,7 @@ amortised constant time (see `docs/strings.md`). `stdlib/stream.kod` and `stdlib
 
 `examples/github_repo.kod` ties it together as a worked API client (walked through in
 `docs/api-client.md`), with `env` for tokens, `json.ObjectBuilder` for bodies and `Query` /
-`percent_encode` for URLs, and `encoding/base64` with `basic_auth` for credentials. `net/client` has a `Client` that keeps
+`percent_encode` for URLs, and `encoding/base64` with `basic_auth` for credentials. `net/http` has a `Client` that keeps
 connections, a whole-request `deadline_ms`, and gzip responses (decoded with the system zlib
 through `compress/inflate`).
 

@@ -103,7 +103,7 @@ values in step, and `post` sets the length and the content type:
 
 ```kod
 import "json"
-import "net/client" { post }
+import "net/http" { post }
 
 let body = json.ObjectBuilder()
 body.put_str("title", "It crashes")
