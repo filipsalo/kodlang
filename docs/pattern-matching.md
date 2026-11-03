@@ -264,8 +264,27 @@ match `.Some(c)`. Likewise `.Some` and `.None` need an optional, and
 `.Ok` and `.Err` a `T or Error`.
 
 A bare `is` also tests an enum value's variant without binding its
-payload: `if c is .Red and ready { ... }`, `s is .Circle(_)`. Bindings need
-the `is` to be the whole `if` condition.
+payload: `if c is .Red and ready { ... }`, `s is .Circle(_)`.
+
+A pattern with bindings can also be one of the operands an `if` condition
+joins with `and`. Its names are in scope in the operands after it and in
+the body, as if each `is` were its own `if` nested inside the one before:
+
+```kod
+if decl is .Import(_path, alias, _items) and alias.starts_with("#") == false {
+    aliases += [alias]
+}
+if a is .Some(x) and b is .Some(y) and x == y {
+    print_int(x)
+} else {
+    print("no match")
+}
+```
+
+The `else` block runs when any operand fails, and sees none of the
+bindings. Elsewhere a pattern can't bind: not under `or` or `not`, not
+with `is not` inside an `and` chain, not in a `for` condition or a `let`
+value. There the `is` is only a test, and `.Circle(r)` is an error.
 
 ```kod
 if v is .Some(x) {
