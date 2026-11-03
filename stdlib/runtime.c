@@ -422,7 +422,7 @@ KodStr *kod_sb_to_str(int64_t handle) {
     return kod_str_from_bytes(sb->buf, sb->len);
 }
 
-// File descriptor I/O for stdlib/fd.kod. The calls return their result and
+// File descriptor I/O for stdlib/posix.kod. The calls return their result and
 // leave the reason for a failure in `kod_io_errno()` (0 after a success),
 // which Kod reads straight after. Interrupted calls are retried here.
 static int64_t g_io_errno;
