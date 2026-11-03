@@ -1,5 +1,6 @@
 """Abstract syntax tree."""
 
+import copy
 import dataclasses
 import os
 from functools import cached_property
@@ -1327,6 +1328,17 @@ class IfStatement(ASTNode):
             # pattern -> desugar to a one-arm match. Bare `<lhs> is none` /
             # unit-variant checks keep their bool semantics.
             pat = _pattern_from_is_rhs(condition, parser)
+            ops = _and_operands(condition)
+            if pat is None and len(ops) > 1 and any(_binds_names(op) for op in ops):
+                pats = [
+                    _pattern_from_is_rhs(op, parser) if _binds_names(op) else None
+                    for op in ops
+                ]
+                body = _parse_block(parser)
+                else_body = []
+                if parser.try_consume(tokens.Else):
+                    else_body = _parse_block(parser)
+                return _if_chain(ops, pats, body, else_body, span)
             if pat is not None:
                 lhs = condition.lhs
                 parser.consume(tokens.OpenCurly)
@@ -1376,6 +1388,58 @@ class IfStatement(ASTNode):
                         if statement := parser.parse_statement():
                             false_branch.append(statement)
         return cls(condition, true_branch, false_branch, span)
+
+
+def _parse_block(parser):
+    parser.consume(tokens.OpenCurly)
+    stmts = []
+    while not parser.try_consume(tokens.CloseCurly):
+        if parser.try_consume(tokens.EOL):
+            continue
+        if stmt := parser.parse_statement():
+            stmts.append(stmt)
+    return stmts
+
+
+def _and_operands(cond):
+    """`a and b and c` as its operands, left to right."""
+    if isinstance(cond, BinaryOperator) and isinstance(cond.op, tokens.And):
+        return _and_operands(cond.lhs) + _and_operands(cond.rhs)
+    return [cond]
+
+
+def _binds_names(cond):
+    """Whether `x is P` binds a name, so an `if` has to match it rather than test it."""
+    if not isinstance(cond, BinaryOperator) or not isinstance(cond.op, tokens.Is):
+        return False
+    rhs = cond.rhs
+    if not isinstance(rhs, FunctionCall):
+        return False
+    args = rhs.args.params if isinstance(rhs.args, FunctionCallParamList) else rhs.args
+    return any(
+        isinstance(a, FunctionCallParam)
+        and isinstance(a.expression, (Variable, Name))
+        and a.expression.id != "_"
+        for a in args
+    )
+
+
+def _if_chain(ops, pats, body, else_body, span):
+    """An `if` whose `and` chain binds: each operand with a pattern is a one-arm
+    match around the operands after it, the others plain `if`s. Any of them
+    can fail, so each gets its own copy of the else body."""
+    inner = body
+    for op, pat in reversed(list(zip(ops, pats))):
+        otherwise = copy.deepcopy(else_body)
+        if pat is not None:
+            arms = [
+                MatchArm(pat, inner, span),
+                MatchArm(WildcardPattern(span), otherwise, span),
+            ]
+            inner = [MatchStatement(op.lhs, arms, span)]
+        else:
+            inner = [IfStatement(op, inner, otherwise, span)]
+    return inner[0]
 
 
 def _pattern_from_is_rhs(cond, parser):
