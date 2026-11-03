@@ -50,7 +50,9 @@ func norm2(anon v: Vec2) -> int64 {
 ```
 
 An import that lists names binds only those names, not its alias, so
-`vec.dot` is an error there and a local may be named `vec`. That keeps the
+`vec.dot` is an error there (`` unknown name `vec`; an import that lists
+names binds no `vec`, so add a plain import of it to write `vec.` ``) and a
+local may be named `vec`. That keeps the
 usual way of naming a value after its module working:
 
 ```kod
@@ -98,6 +100,8 @@ The same holds for a function literal or a function value used as a default (`cb
 A bare type name `T` means, in this order: a type parameter of the generic declaration around it, a primitive (`int64`, `bool`, `str`, `bytes`, `none`), a type the module declares (its own aliases included), a type it lists in an import (`import "./pa" { Pt }`), then a builtin type. A type of a module imported without listing it, or loaded only because another module imports it, is written through the module: `pa.Pt`. Otherwise it's an error with a hint naming the file that declares it: `` unknown type `Pt`; lib/pa.kod declares `Pt`: write `pa.Pt` or list it in the import (`{ Pt }`) ``, or `` unknown type `Pt`; lib/pa.kod declares `Pt`: import it to use it here `` when the module doesn't import that file.
 
 `m.T` means a type that the module imported as `m` declares, its own aliases included. This holds in a type, a constructor `m.T(...)`, a type argument, `m.E.V`, `is m.T` and a pattern `m.T(b)`. Types that `m` only imports aren't reachable through it. Otherwise it's an error: `` module `m` has no type `T` ``, with a did-you-mean over m's types (`` module `m` has no function or type `T` `` for a call `m.T(...)`). When `m` isn't a module this one imports, the error spells what was written: `` unknown type `m.T` ``.
+
+A module exports only what it declares, never what it imports. When `m` lists `T` in one of its own imports, `m.T`, `m.f()`, `m.f` and `import "./m" { T }` say where `T` comes from: `` `T` is imported by `m`, not declared there; import it from lib/b.kod ``. A value of such a type can still be used without naming it, as in `let t = m.make()`. To pass a type on deliberately, `m` declares an alias of it, `type T = b.T` (which needs a plain `import "./b"`), and for a function a wrapper.
 
 A module declares each of its names once. A function, extern, struct, enum, interface or type alias with the name of an earlier one in the same module is an error at the second declaration (`` `f` is already declared on line 1 ``), and so is a method, field or variant with the name of an earlier one of the same struct, interface or enum (`` `Kind.A` is already declared on line 2 ``). A method can't take the name of a field of its struct either; the error is at the method (`` `Bag.len` is already declared on line 3 ``).
 
