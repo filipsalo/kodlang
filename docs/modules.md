@@ -54,9 +54,9 @@ An import that lists names binds only those names, not its alias, so
 usual way of naming a value after its module working:
 
 ```kod
-import "net/client" { Client }
+import "net/http" { Client }
 
-let client = Client()      // `client` is a local; `net/client` is reached through `Client`
+let client = Client()      // `client` is a local, and `http` names nothing
 ```
 
 To have both, import the module twice: `import "./math/vec"` binds `vec`
@@ -124,7 +124,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |
 | `json` | Strict JSON parse/emit, with builders. See [JSON](json.md). |
 | `strbuilder`, `stream`, `fd` | `StrBuilder`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
-| `net/tcp`, `net/tls`, `net/http`, `net/client` | TCP, TLS, HTTP/1.1 messages and an HTTP client. See [Streams](io.md) and [HTTP client](http.md). |
+| `net/tcp`, `net/tls`, `net/http` | TCP, TLS, and HTTP/1.1 messages with a client. See [Streams](io.md) and [HTTP client](http.md). |
 | `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
 | `encoding/base64` | Base64, standard and URL-safe, strict decoding. See [Encodings](encoding.md). |
 | `hash/crc32` | CRC-32 (gzip polynomial), streaming or one-shot. |

@@ -1,4 +1,4 @@
-"""A scripted HTTP server for stdlib/net/client_test.kod.
+"""A scripted HTTP server for stdlib/net/http_client_test.kod.
 
 Usage: http_fixture.py PORT [CERT KEY]. It answers on 127.0.0.1:PORT, one raw
 response per path (see Handler.route), over TLS 1.2 when a certificate and key
