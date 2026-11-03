@@ -125,7 +125,7 @@ a generic type's method names the instance whose `T` is the bad key
 method, such as a `Map[Pt, int64]` written out in `Box[Pt]`, ends with the
 instance it's compiled for, as other errors there do
 (`` (in `Box[Pt]`) ``). The same holds for the element type of a
-`Set[T]` from the `set` module.
+`Set[T]` from the `sets` module.
 
 ## Indexing a struct
 
@@ -233,7 +233,7 @@ Available for re-declaration in any module if needed:
 | `_arena_alloc` | Bump allocator for everything heap-shaped. |
 | `_kod_str_concat`, `_kod_str_slice` | String operations the runtime exposes to codegen. |
 | `_kod_sb_new`, `_kod_sb_append`, `_kod_sb_append_byte`, `_kod_sb_len`, `_kod_sb_clear`, `_kod_sb_to_str` | The growable buffer behind `StrBuilder` and the `str` methods `join`, `repeat`, `replace`, `lower` and `upper`; a handle is an `int64`. |
-| `_kod_fd_open`, `_kod_fd_read`, `_kod_fd_write`, `_kod_fd_close`, `_kod_io_errno`, `_kod_errno_kind`, `_kod_errno_message` | Descriptor I/O and OS error numbers behind `stdlib/fd.kod` and `stdlib/stream.kod`; see [Streams](io.md). |
+| `_kod_fd_open`, `_kod_fd_read`, `_kod_fd_write`, `_kod_fd_close`, `_kod_io_errno`, `_kod_errno_kind`, `_kod_errno_message` | Descriptor I/O and OS error numbers behind `stdlib/posix.kod` and `stdlib/stream.kod`; see [Streams](io.md). |
 | `_kod_array_concat`, `_kod_array_concat_new` | Array append in place (`+=`) and concatenation into a new array (`+`). |
 | `_kod_test_fail`, `_kod_test_summary` | Test runner internals. |
 | `read_file`, `write_file` | File I/O. |

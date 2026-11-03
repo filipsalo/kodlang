@@ -37,7 +37,7 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
 
 Done on the way: `str` has `starts_with`, `ends_with`, `find`, `split`, `trim`, `join`, `replace`,
 `lower`, `upper`, `parse_int` and friends, and `StrBuilder` (`stdlib/strbuilder.kod`) appends in
-amortised constant time (see `docs/strings.md`). `stdlib/stream.kod` and `stdlib/fd.kod` give
+amortised constant time (see `docs/strings.md`). `stdlib/stream.kod` and `stdlib/posix.kod` give
 `Reader` / `Writer`, `IoError` with kinds, `BufReader` and file descriptors (see `docs/io.md`). `stdlib/net/tcp.kod` connects, listens and accepts, and a connection is an `Fd`.
 
 `examples/github_repo.kod` ties it together as a worked API client (walked through in

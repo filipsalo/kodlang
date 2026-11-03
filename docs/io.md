@@ -5,13 +5,13 @@ icon: lucide/arrow-left-right
 # Streams and I/O errors
 
 `stdlib/stream.kod` defines the error type and the two interfaces that byte
-streams share, and `stdlib/fd.kod` implements them over file descriptors:
+streams share, and `stdlib/posix.kod` implements them over file descriptors:
 files, standard input and output and, later, sockets. Code that reads or
 writes takes a `Reader` or a `Writer` and doesn't care what is behind it.
 
 ```kod
 import "stream" { Reader, read_all }
-import "fd" { open_read }
+import "posix" { open_read }
 
 func count_bytes(anon r: Reader) -> int64 or Error {
     let data = try read_all(r)
