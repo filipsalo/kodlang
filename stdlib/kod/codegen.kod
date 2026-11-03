@@ -8302,14 +8302,21 @@ type Codegen = struct {
         let ti = self.cur_type_scope()
         if ti >= 0 {
             let ts = self.type_scopes[ti]
+            mut listed_in = ""
             mut i = 0
             for path in ts.alias_paths {
                 if self.type_scope_idx.get(path) is Some(mi) {
                     if self.type_scopes[mi].own.contains(name) {
-                        return f"{path} declares `{name}`: write `{ts.alias_names[i]}.{name}" + listing
+                        if ts.alias_names[i].starts_with("#") == false {
+                            return f"{path} declares `{name}`: write `{ts.alias_names[i]}.{name}" + listing
+                        }
+                        listed_in = path
                     }
                 }
                 i += 1
+            }
+            if len(listed_in) > 0 {
+                return listed_in + " declares `" + name + "`: list it in the import (`{ " + name + " }`)"
             }
         }
         for ts in self.type_scopes {
@@ -8616,7 +8623,30 @@ type Codegen = struct {
     }
 
     // A second declaration would replace the first or only fail in the assembler.
+    // No local may take the name of an import alias, so `vec.` always means the module.
+    func check_alias_locals(self, anon module: ast.Module) -> none {
+        mut aliases: [str] = []
+        for decl in module.decls {
+            if decl is .Import(_module_name, local_name, _items) {
+                if len(local_name) > 0 and local_name.starts_with("#") == false {
+                    aliases += [local_name]
+                }
+            }
+        }
+        if len(aliases) == 0 {
+            return
+        }
+        mut i = 0
+        for name in self.p.binding_names {
+            if regalloc.str_in(aliases, p: name) {
+                self.report_error(f"error: `{name}` is the name of an import; give the local another name", span: ast.Span(start: self.p.binding_starts[i]))
+            }
+            i += 1
+        }
+    }
+
     func check_duplicate_decls(self, anon module: ast.Module) -> none {
+        self.check_alias_locals(module)
         let seen = FuncIdx()
         // The names an import lists before any declaration of them.
         let listed = FuncIdx()
@@ -8637,7 +8667,7 @@ type Codegen = struct {
                     // Two imports can't share a name unless they load one file.
                     if aliases.get(local_name) is Some(first) {
                         if self.alias_target_count(local_name) > 1 {
-                            self.report_error(f"error: `{local_name}` is already imported on line {self.line_of_offset(first)}", span: ast.Span(start: path_at))
+                            self.report_error(f"error: `{alias_shown(local_name)}` is already imported on line {self.line_of_offset(first)}", span: ast.Span(start: path_at))
                         }
                     } else {
                         aliases.set(local_name, path_at)
@@ -8650,9 +8680,9 @@ type Codegen = struct {
                         item_i += 1
                         let span = ast.Span(start: item_at)
                         if item.starts_with("_") {
-                            self.report_error(private_to_module(item, alias: local_name), :span)
+                            self.report_error(private_to_module(item, alias: alias_shown(local_name)), :span)
                         } else if self.module_declares(local_name, name: item) == false {
-                            self.report_error(self.with_suggestion(f"error: module `{local_name}` has no function, constant or type `{item}`", typo: item, candidates: self.module_public_names(local_name)), :span)
+                            self.report_error(self.with_suggestion(f"error: module `{alias_shown(local_name)}` has no function, constant or type `{item}`", typo: item, candidates: self.module_public_names(local_name)), :span)
                         }
                         if seen.contains(item) {
                             self.check_first_name(seen, :listed, name: item, :span)
@@ -13816,6 +13846,14 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+// An import alias as source writes it: a listed import's internal `#vec` is `vec`.
+func alias_shown(anon alias: str) -> str {
+    if alias.starts_with("#") {
+        return alias[1..]
+    }
+    return alias
 }
 
 func private_to_module(anon name: str, alias: str) -> str {

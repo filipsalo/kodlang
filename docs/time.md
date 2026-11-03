@@ -7,6 +7,7 @@ icon: lucide/timer
 `stdlib/time.kod` has two clocks, a `Duration` type, and `sleep`.
 
 ```kod
+import "time"
 import "time" { Duration }
 
 let started = time.monotonic_ns()
