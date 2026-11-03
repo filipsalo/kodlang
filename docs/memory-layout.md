@@ -69,7 +69,7 @@ Enums are **arena-allocated**, like structs. A stack slot holds an 8-byte
 pointer; the cell at the pointer is:
 
 ```
-[offset 0]  discriminant : int64  (variant index starting from 0)
+[offset 0]  discriminant : int64  (variant index starting from 1)
 [offset 8]  payload      : max(variant payload sizes) bytes
 ```
 

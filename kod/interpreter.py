@@ -2672,6 +2672,8 @@ class Interpreter:
             return types.String(str(value.value).encode("utf8"))
         if isinstance(value, types.Bool):
             return types.String(b"true" if value.value else b"false")
+        if isinstance(value, types.EnumValue):
+            return types.String(value.variant_name.encode("utf8"))
         methods = getattr(type(value), "methods", None) or {}
         if "to_str" in methods:
             return self.call_function(module, methods["to_str"], (value,))
@@ -2772,7 +2774,7 @@ class Interpreter:
                 # this still shares the libc stdout buffer that
                 # putchar / printf write into — Python's sys.stdout
                 # has its own buffer and would interleave wrong.
-                libc.puts(args[0].value)
+                libc.puts(self._coerce_to_str(func.module, args[0]).value)
                 return types.Int64(0)
             if func.name == "putchar":
                 # The builtin extern: libc's putchar, so it writes into the
