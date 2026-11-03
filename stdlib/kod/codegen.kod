@@ -7583,6 +7583,11 @@ type Codegen = struct {
                     }
                 }
             }
+            .KEnum(enum_idx) -> {
+                if self.is_result_enum_idx(enum_idx) == false {
+                    return self.compile_variant_name(expr_id, :enum_idx)
+                }
+            }
             .KUnknown -> {
                 let val = self.compile_expr(expr_id)
                 self.report_cannot_infer(expr_id, what: "this expression")
@@ -7611,6 +7616,28 @@ type Codegen = struct {
         }
         self.report_error(f"error: cannot convert a value of type `{shown}` to `str`{note}", span: self.p.expr_spans[expr_id])
         return .VImm(value: 0)
+    }
+
+    // An enum in an f-string: the name of its variant, without its payload.
+    func compile_variant_name(self, anon expr_id: int64, enum_idx: int64) -> Val {
+        let val = self.compile_expr(expr_id)
+        self.mov_to(val, dest: "x0")
+        let tag = self.pool.alloc_reg()
+        self.emit(f"ldr {tag}, [x0]")
+        let end_lbl = self.fresh("Lvariant_name")
+        for variant in self.enums[enum_idx].variants {
+            let next_lbl = self.fresh("Lvariant_next")
+            let name_lbl = self.intern_str(variant.name)
+            self.emit(f"cmp {tag}, #{variant.discriminant}")
+            self.emit(f"bne {next_lbl}")
+            self.emit(f"adrp x0, {name_lbl}@PAGE")
+            self.emit(f"add x0, x0, {name_lbl}@PAGEOFF")
+            self.emit(f"b {end_lbl}")
+            self.emit_label(next_lbl)
+        }
+        self.emit_label(end_lbl)
+        self.pool.free_reg(tag)
+        return .VReg(name: "x0")
     }
 
     func compile_str_concat(self, lhs_id: int64, rhs_id: int64) -> Val {
@@ -9058,6 +9085,14 @@ type Codegen = struct {
                 let builtin = self.is_builtin_call(key)
                 if name == "len" and len(args) == 1 and builtin {
                     return self.compile_len(args[0].value)
+                }
+                // `print(x)` takes what `{x}` does.
+                if name == "print" and len(args) == 1 and builtin and len(args[0].label) == 0 and (self.infer_kind(args[0].value) is .KStr) == false {
+                    let arg = args[0]
+                    let span = self.p.expr_spans[arg.value]
+                    let str_callee = self.p.alloc_expr(ast.Expr.Ident(name: "$str"), :span)
+                    let wrapped = self.p.alloc_expr(ast.Expr.Call(callee: str_callee, args: [arg]), :span)
+                    return self.compile_call([ast.CallArg(label: "", label_span: arg.label_span, value: wrapped)], :callee_id)
                 }
                 // `str(x)` — explicit conversion intrinsic. Dispatches by
                 // kind to the appropriate to_str (int_to_str, bool_to_str,

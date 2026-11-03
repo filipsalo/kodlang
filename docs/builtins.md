@@ -42,7 +42,7 @@ else doesn't hide the builtin, so `kod_panic(msg)` after
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `print` | `(str) -> none` | Print a string followed by a newline. |
+| `print` | `(x) -> none` | Print `x`, followed by a newline. Takes whatever `f"{x}"` does (see [Strings](strings.md)). |
 | `print_int` | `(int64) -> none` | Print an integer followed by a newline. Equivalent to `print(n.to_str())`. |
 | `kod_puts` | `(str) -> int64` | Write a string and a newline to stdout. What `print` calls; embedded NULs are written as-is. |
 | `putchar` | `(int64) -> int64` | C `putchar`: write a single byte to stdout. Also runs in the interpreter, which shares libc's stdout buffer with `kod_puts`. |

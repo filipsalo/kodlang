@@ -75,12 +75,19 @@ What can be interpolated:
 - a struct that declares `func to_str(self) -> str`
 - a value of an interface that declares the same `to_str`, such as
   `Stringable` or `Error`; the call goes to the concrete type's `to_str`
+- an enum, as the name of its variant: `f"{c}"` is `Red`, and an `Op.Lit(n: 4)`
+  is `Lit`, without its payload. A `T or Error` isn't one of these: test it first
 
-Anything else is a compile error for now: an optional (`T?`), an enum, an
+`print(x)` takes the same values as `{x}` does.
+
+Anything else is a compile error for now: an optional (`T?`), an
 array, a function value, and a struct or interface without a
 `func to_str(self) -> str`, including one whose `to_str` takes arguments
 or returns something else.
 Unwrap an optional first, e.g. `f"{n? or 0}"`.
+
+The braces hold one expression. There are no format specs, so `f"{n:03}"` is an
+error rather than a number that isn't padded.
 
 ## Concatenation
 
