@@ -45,6 +45,14 @@ type Insn = enum {
 // (the callee restores it), so the common shallow expressions never
 // need a spill. Only deeper expressions spill into the caller-saved
 // x8-x15 at the front, which still get stack-spilled around calls.
+type PoolState = struct {
+    free_regs: [str]
+    cs_in_use: int64
+    live: [str]
+    // The frame slot each of `live` is saved in.
+    slots: [int64] = []
+}
+
 type RegPool = struct {
     // Indexed by vreg id; entries accumulate across all functions
     // in a module so `subst_vregs` at flush-out time can resolve
@@ -57,6 +65,10 @@ type RegPool = struct {
     free_regs: [str] = []
     cs_in_use: int64 = 0
     cs_high_water: int64 = 0
+    // The vregs handed out and not yet freed, for `evict`.
+    live: [str] = []
+    // Whether `evict` ran in this function, so `run` must leave it alone.
+    evicted: bool = false
 
     // Reset per-function state. `vreg_phys` is intentionally left
     // alone — its ids stay valid across the whole module.
@@ -64,6 +76,27 @@ type RegPool = struct {
         self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
         self.cs_in_use = 0
         self.cs_high_water = 0
+        self.live = []
+        self.evicted = false
+    }
+
+    // Hand every register back, for code too deep to compile with what is
+    // left. The caller saves `live` to the frame around it, then calls
+    // `restore`. Vregs now share physicals with ones that stay in use
+    // after it, each pair apart only by that save, which `run` can't see.
+    func evict(self) -> PoolState {
+        let state = PoolState(free_regs: self.free_regs, cs_in_use: self.cs_in_use, live: self.live)
+        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+        self.cs_in_use = 0
+        self.live = []
+        self.evicted = true
+        return state
+    }
+
+    func restore(self, anon state: PoolState) -> none {
+        self.free_regs = state.free_regs
+        self.cs_in_use = state.cs_in_use
+        self.live = state.live
     }
 
     // Allocate a fresh virtual register backed by a physical from
@@ -75,6 +108,9 @@ type RegPool = struct {
     // is buffered.
     func alloc_reg(self) -> str {
         let n = len(self.free_regs)
+        if n == 0 {
+            kod_panic("compiler bug: out of registers; `compile_expr` evicts before this can happen, so a site is holding too many without compiling an expression")
+        }
         mut phys = self.free_regs[-1]
         mut new_regs: [str] = []
         for i in 0..n - 1 {
@@ -89,7 +125,9 @@ type RegPool = struct {
         }
         let id: int64 = len(self.vreg_phys)
         self.vreg_phys += [phys]
-        return f"v{id}"
+        let name = f"v{id}"
+        self.live += [name]
+        return name
     }
 
     // Return a register to the pool. Accepts either a vreg name
@@ -101,6 +139,13 @@ type RegPool = struct {
         mut phys: str = reg
         if self.is_vreg_name(reg) {
             phys = self.vreg_phys[self.parse_vreg_id(reg)]
+            mut still_live: [str] = []
+            for name in self.live {
+                if name != reg {
+                    still_live += [name]
+                }
+            }
+            self.live = still_live
         }
         if phys == "x0" or phys == "x1" or phys == "x2" or phys == "x3" or phys == "x4" or phys == "x5" or phys == "x6" or phys == "x7" {
             return
