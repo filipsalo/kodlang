@@ -10,7 +10,7 @@ interpreter is retired; the tag `python-bootstrap` keeps it (see
 [Self-hosting](docs/self-hosting.md#recovering-from-a-bad-snapshot)).
 
 The language has structs, enums with payloads, `match` (statement and expression, with
-exhaustiveness checks), generics (monomorphised), interfaces, `T?`, `T or Error` with
+exhaustiveness checks), generic types and functions (monomorphised), interfaces, `T?`, `T or Error` with
 `try` / `must`, function values and non-capturing lambdas, `str` / `bytes` / dynamic arrays,
 and `test` blocks. The stdlib covers file and process I/O, `Map` / `Set`, sorting, time,
 CRC-32, deflate / gzip, a minimal JSON, and LSP-style JSON-RPC framing.

@@ -78,6 +78,28 @@ type SigInfo = struct {
     src_p: parsing.Parser
     // The declaration in `src_p.func_decls`; 0 for an extern.
     decl_id: int64 = 0
+    // A generic function's parameters; `type_args` is empty for the template, whose
+    // kinds are unknown where they name a parameter, and set for an instance.
+    type_params: [str] = []
+    type_args: [TypeKind] = []
+}
+
+// One copy of a generic function for one list of type arguments. Its sig is
+// made when a call's kind is inferred; only a compiled call queues its body.
+type FuncInst = struct {
+    sig: SigInfo
+    label: str
+    display: str
+    queued: bool = false
+    // How many instances' bodies led here.
+    depth: int64 = 0
+}
+
+// The function a call's callee names, with its label and its name as written.
+type FnRef = struct {
+    sig: SigInfo
+    label: str
+    name: str
 }
 
 // A binary operator that calls a struct's operator method: `negate` flips the
@@ -517,6 +539,8 @@ type Codegen = struct {
     stmt_error_mark: int64 = 0
     // The generic instance whose method bodies are being compiled, or -1.
     body_instance: int64 = -1
+    // The generic function instance whose body is being compiled, or -1.
+    body_func_inst: int64 = -1
     // A default checked at its declaration isn't compiled, so only its type is.
     checking_default: bool = false
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
@@ -604,6 +628,10 @@ type Codegen = struct {
     // Generic instances by key (see EnumInfo.key).
     struct_insts: FuncIdx = FuncIdx()
     enum_insts: FuncIdx = FuncIdx()
+    func_insts: [FuncInst] = []
+    func_inst_idx: FuncIdx = FuncIdx()
+    // Indexes into func_insts of the bodies to compile, in the order they were called.
+    func_inst_queue: [int64] = []
 
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
@@ -1521,6 +1549,10 @@ type Codegen = struct {
             self.report_message(f"{text} (in `{self.struct_display_name(self.body_instance)}`)", :span)
             return
         }
+        if self.body_func_inst >= 0 {
+            self.report_message(f"{text} (in `{self.func_insts[self.body_func_inst].display}`)", :span)
+            return
+        }
         self.report_message(text, :span)
     }
 
@@ -1603,12 +1635,17 @@ type Codegen = struct {
             return true
         }
         seen.set(key, 1)
-        if self.body_instance >= 0 {
+        // Struct instances count up from 0, function instances down from -2.
+        mut instance = self.body_instance
+        if self.body_func_inst >= 0 {
+            instance = -2 - self.body_func_inst
+        }
+        if instance != -1 {
             let pos_key = f"{self.p.path}:{span.start}"
             if seen.get(pos_key) is Some(owner) {
-                return owner != self.body_instance
+                return owner != instance
             }
-            seen.set(pos_key, self.body_instance)
+            seen.set(pos_key, instance)
         }
         return false
     }
@@ -4663,9 +4700,13 @@ type Codegen = struct {
     // FuncDecl point into p.type_exprs). Type *names* are still looked up in
     // self's own registered tables — they must have been registered via
     // register_module_types beforehand.
-    func resolve_sig(self, anon decl_id: int64, p: parsing.Parser) -> SigInfo {
+    // A generic function's parameters resolve to `type_args`, or else to unknown kinds.
+    func resolve_sig(self, anon decl_id: int64, p: parsing.Parser, type_args: [TypeKind] = []) -> SigInfo {
         let func_decl = p.func_decls[decl_id]
         let saved_p = self.p
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        self.bind_func_type_params(func_decl.type_params, :type_args)
         self.p = p
         mut param_kinds: [TypeKind] = []
         mut param_labels: [str] = []
@@ -4683,7 +4724,263 @@ type Codegen = struct {
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
         self.p = saved_p
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :decl_id)
+        self.subst_names = saved_names
+        self.subst_args = saved_args
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :decl_id, type_params: func_decl.type_params, :type_args)
+    }
+
+    // Leaves the substitution alone for a function that isn't generic.
+    func bind_func_type_params(self, anon type_params: [str], type_args: [TypeKind]) -> none {
+        if len(type_params) == 0 {
+            return
+        }
+        if len(type_args) == 0 {
+            self.bind_type_params_unknown(type_params)
+            return
+        }
+        self.subst_names = type_params
+        self.subst_args = type_args
+    }
+
+    func is_generic_sig(self, anon sig: SigInfo) -> bool {
+        return len(sig.type_params) > 0 and len(sig.type_args) == 0
+    }
+
+    // `none`, `[]` and `.Red` have no type until they have somewhere to go.
+    func lacks_own_type(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .NoneLit -> return true
+            .ArrayLit(elements) -> return len(elements) == 0 or self.lacks_own_type(elements[0])
+            else return self.is_implicit_variant_value(expr_id)
+        }
+    }
+
+    func kind_has_void(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KVoid -> return true
+            .KOptional(inner) -> return self.kind_has_void(inner)
+            .KArrayOptional(inner) -> return self.kind_has_void(inner)
+            .KArrayArray(inner) -> return self.kind_has_void(inner)
+            else return false
+        }
+    }
+
+    // Matches parameter type `type_id` against an argument's kind. A parameter
+    // already settled stays as it is; the argument is checked against it later.
+    func settle_type_params(self, anon type_id: int64, kind: TypeKind, sig: SigInfo, bound: [TypeKind]) -> none {
+        if kind is .KUnknown or kind is .KVoid {
+            return
+        }
+        match sig.src_p.type_exprs[type_id] {
+            .Named(name) -> {
+                for i, type_param in sig.type_params {
+                    if type_param == name {
+                        if bound[i] is .KUnknown and not self.kind_has_unknown(kind) and not self.kind_has_void(kind) {
+                            bound[i] = kind
+                        }
+                        return
+                    }
+                }
+            }
+            .Array(inner) -> {
+                if self.is_array_kind(kind) {
+                    self.settle_type_params(inner, kind: self.array_elem_kind(kind), :sig, :bound)
+                }
+            }
+            .Optional(inner) -> {
+                if kind is .KOptional(held) {
+                    self.settle_type_params(inner, kind: held, :sig, :bound)
+                } else {
+                    self.settle_type_params(inner, :kind, :sig, :bound)
+                }
+            }
+            .Generic(name, args) -> {
+                let template_args = self.instance_args_of_template(type_id, :name, :kind, :sig)
+                if len(template_args) == len(args) {
+                    for i, arg in args {
+                        self.settle_type_params(arg, kind: template_args[i], :sig, :bound)
+                    }
+                }
+            }
+            .Func(params, return_typ) -> {
+                if kind is .KFunc(param_kinds, return_kind) and len(param_kinds) == len(params) {
+                    for i, param in params {
+                        self.settle_type_params(param, kind: param_kinds[i], :sig, :bound)
+                    }
+                    if return_typ != 0 {
+                        self.settle_type_params(return_typ, kind: return_kind, :sig, :bound)
+                    }
+                }
+            }
+        }
+    }
+
+    // The type arguments of `kind`, when it's an instance of the generic `name` that `type_id` writes.
+    func instance_args_of_template(self, anon type_id: int64, name: str, kind: TypeKind, sig: SigInfo) -> [TypeKind] {
+        let saved_p = self.p
+        self.p = sig.src_p
+        let struct_idx = self.type_expr_idx(type_id, :name, what: 0)
+        let enum_idx = self.type_expr_idx(type_id, :name, what: 1)
+        self.p = saved_p
+        if kind is .KStruct(idx, _type_args) and struct_idx >= 0 and self.structs[idx].template_idx == struct_idx {
+            return self.structs[idx].template_args
+        }
+        if kind is .KEnum(idx) and enum_idx >= 0 and self.enums[idx].template_idx == enum_idx {
+            return self.enums[idx].template_args
+        }
+        let no_args: [TypeKind] = []
+        return no_args
+    }
+
+    // The type arguments of a call, written in `chain` (0 if it has none) or inferred. Empty if
+    // they can't be had; only those written are reported, when `report` is set.
+    func call_type_args(self, anon fn_ref: FnRef, args: [ast.CallArg], chain: int64, report: bool) -> [TypeKind] {
+        let sig = fn_ref.sig
+        if chain != 0 {
+            return self.generic_type_args(chain, name: fn_ref.name, param_count: len(sig.type_params), :report)
+        }
+        let bound = self.settled_type_args(fn_ref, :args)
+        for kind in bound {
+            if kind is .KUnknown {
+                let no_args: [TypeKind] = []
+                return no_args
+            }
+        }
+        return bound
+    }
+
+    // One kind per type parameter, unknown for those no argument settles.
+    func settled_type_args(self, anon fn_ref: FnRef, args: [ast.CallArg]) -> [TypeKind] {
+        let sig = fn_ref.sig
+        let plan = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: fn_ref.name)
+        mut bound: [TypeKind] = []
+        for _type_param in sig.type_params {
+            bound += [.KUnknown]
+        }
+        for i, param in sig.src_p.func_decls[sig.decl_id].params {
+            let ai = plan.slots[i]
+            if ai >= 0 and not self.lacks_own_type(args[ai].value) {
+                self.settle_type_params(param.typ, kind: self.infer_kind(args[ai].value), :sig, :bound)
+            }
+        }
+        return bound
+    }
+
+    // The instance of the function for `type_args`, which may not be queued yet.
+    func func_instance(self, anon fn_ref: FnRef, type_args: [TypeKind]) -> int64 {
+        let sig = fn_ref.sig
+        let key = self.instance_key(f"{sig.src_p.path}:{sig.decl_id}", args: type_args)
+        if self.func_inst_idx.get(key) is Some(existing) {
+            return existing
+        }
+        mut shown: [str] = []
+        for arg in type_args {
+            shown += [self.kind_display(arg)]
+        }
+        let name = sig.src_p.func_decls[sig.decl_id].name
+        // Every module that calls it compiles a copy of its own, so the label names this module too.
+        let label = self.decl_instance_label(f"${self.path_prefix}$inst{fn_ref.label}", args: type_args)
+        self.func_insts += [FuncInst(sig: self.resolve_sig(sig.decl_id, p: sig.src_p, :type_args), :label, display: f"{name}[{", ".join(shown)}]")]
+        let idx = len(self.func_insts) - 1
+        let insts = self.func_inst_idx
+        insts.set(key, idx)
+        return idx
+    }
+
+    // Asks for the body to be compiled, unless the instances have gone too deep to end.
+    func queue_func_instance(self, anon idx: int64, span: ast.Span) -> none {
+        if self.func_insts[idx].queued {
+            return
+        }
+        mut depth = 0
+        if self.body_func_inst >= 0 {
+            depth = self.func_insts[self.body_func_inst].depth + 1
+        }
+        if depth >= 64 {
+            self.report_message(f"error: generic function `{self.func_insts[idx].sig.src_p.func_decls[self.func_insts[idx].sig.decl_id].name}` is 64 instances deep; each one calls another with a new type", :span)
+            return
+        }
+        self.func_insts[idx].queued = true
+        self.func_insts[idx].depth = depth
+        self.func_inst_queue += [idx]
+    }
+
+    func compile_generic_call(self, anon fn_ref: FnRef, args: [ast.CallArg], chain: int64, span: ast.Span) -> Val {
+        let sig = fn_ref.sig
+        let attempts = self.report_attempts
+        self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: fn_ref.name, call_span: span)
+        let type_args = self.call_type_args(fn_ref, :args, :chain, report: true)
+        if len(type_args) == 0 {
+            // Arguments that don't line up or don't compile are the error to fix first.
+            for arg in args {
+                if not self.lacks_own_type(arg.value) {
+                    self.compile_discard(arg.value)
+                }
+            }
+            if chain == 0 and self.report_attempts == attempts {
+                self.report_cannot_infer_type_args(fn_ref, :args, :span)
+            }
+            return .VImm(value: 0)
+        }
+        let idx = self.func_instance(fn_ref, :type_args)
+        self.queue_func_instance(idx, :span)
+        let inst_sig = self.func_insts[idx].sig
+        let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: fn_ref.name).slots
+        self.prepare_args_with_kinds(args, expected_kinds: inst_sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots, type_params: inst_sig.type_params, :type_args)
+        self.emit(f"bl {self.func_insts[idx].label}")
+        return .VReg(name: "x0")
+    }
+
+    // The first type parameter no argument settles.
+    func report_cannot_infer_type_args(self, anon fn_ref: FnRef, args: [ast.CallArg], span: ast.Span) -> none {
+        let type_params = fn_ref.sig.type_params
+        for i, kind in self.settled_type_args(fn_ref, :args) {
+            if kind is .KUnknown {
+                self.report_error(f"error: cannot infer `{type_params[i]}` in the call to `{fn_ref.name}`; write the type arguments: `{fn_ref.name}[{", ".join(type_params)}](...)`", :span)
+                return
+            }
+        }
+    }
+
+    func generic_call_kind(self, anon fn_ref: FnRef, args: [ast.CallArg], chain: int64) -> TypeKind {
+        let type_args = self.call_type_args(fn_ref, :args, :chain, report: false)
+        if len(type_args) == 0 {
+            return .KUnknown
+        }
+        return self.func_insts[self.func_instance(fn_ref, :type_args)].sig.return_kind
+    }
+
+    // The function at the root of `f[A]` or `m.f[A]`; a local or a constant there is indexed instead.
+    func index_chain_fn(self, anon chain: int64) -> FnRef? {
+        let root = self.index_chain_root(chain)
+        match self.p.exprs[root] {
+            .Ident(key) -> {
+                if self.var_bound(key) or self.calls_local(key) {
+                    return none
+                }
+                let name = self.source_name(key)
+                let slot = self.lookup_func(name)
+                if slot == -1 or self.sig_is_const(self.fn_sig(slot)) {
+                    return none
+                }
+                return FnRef(sig: self.fn_sig(slot), label: self.fn_label(slot), :name)
+            }
+            .Binary(lhs, _op, rhs) -> {
+                let slot = self.module_fn_value(root)
+                if slot == -1 {
+                    return none
+                }
+                let .Ident(alias) = self.p.exprs[lhs] else { return none }
+                let .Ident(member) = self.p.exprs[rhs] else { return none }
+                let ifn = self.import_fn_at(slot)
+                return FnRef(sig: ifn.sig, label: ifn.label, name: f"{alias}.{member}")
+            }
+            else return none
+        }
+    }
+
+    func report_generic_value(self, anon name: str, span: ast.Span) -> none {
+        self.report_error(f"error: generic function `{name}` can't be used as a value; wrap a call of it in a function literal", :span)
     }
 
     // Dead code after a `return` doesn't count.
@@ -5866,6 +6163,7 @@ type Codegen = struct {
             self.subst_names = self.structs[self.structs[owner].template_idx].type_param_names
             self.subst_args = self.structs[owner].template_args
         }
+        self.bind_func_type_params(sig.type_params, type_args: sig.type_args)
         self.naming_locals = true
         for stmt_id in fd.body {
             self.collect_stmt_vars(:stmt_id)
@@ -6263,6 +6561,10 @@ type Codegen = struct {
                     // `foo` as a callback.
                     let slot = self.lookup_func(name)
                     if slot != -1 {
+                        if self.is_generic_sig(self.fn_sig(slot)) {
+                            self.report_generic_value(name, span: self.p.expr_spans[expr_id])
+                            return .VImm(value: 0)
+                        }
                         return self.fn_address(slot)
                     }
                     // Candidates for the typo hint: in-scope variables
@@ -6320,6 +6622,10 @@ type Codegen = struct {
                 return self.compile_enum_construct(empty, :enum_idx, :variant_idx, span: self.p.expr_spans[expr_id])
             }
             .Binary(lhs, op, rhs) -> {
+                if op is .Index and self.index_chain_fn(expr_id) is Some(fn_ref) and self.is_generic_sig(fn_ref.sig) {
+                    self.report_generic_value(fn_ref.name, span: self.p.expr_spans[expr_id])
+                    return .VImm(value: 0)
+                }
                 if op is .Dot and self.const_signature(expr_id) is Some(_const_sig) {
                     let no_args: [ast.CallArg] = []
                     return self.compile_call(no_args, callee_id: expr_id)
@@ -6327,6 +6633,10 @@ type Codegen = struct {
                 if op is .Dot {
                     let slot = self.module_fn_value(expr_id)
                     if slot != -1 {
+                        if self.is_generic_sig(self.import_fn_at(slot).sig) {
+                            self.report_generic_value(self.import_fn_at(slot).name, span: self.p.expr_spans[expr_id])
+                            return .VImm(value: 0)
+                        }
                         let lbl = self.import_fn_at(slot).label
                         let reg: str = self.pool.alloc_reg()
                         self.emit(f"adrp {reg}, {lbl}@PAGE")
@@ -8461,7 +8771,9 @@ type Codegen = struct {
             match decl {
                 .Func(decl_id) -> {
                     let fd = self.p.func_decls[decl_id]
+                    self.subst_names = fd.type_params
                     self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                    self.subst_names = saved_names
                 }
                 .Extern(_name, _name_span, params, return_typ) -> self.check_sig_types(params, :return_typ)
                 .Struct(_name, _name_span, type_params, fields, methods) -> {
@@ -8493,6 +8805,9 @@ type Codegen = struct {
     func check_method_sigs(self, anon methods: [int64]) -> none {
         for method_id in methods {
             let fd = self.p.func_decls[method_id]
+            if len(fd.type_params) > 0 {
+                continue
+            }
             self.check_sig_types(fd.params, return_typ: fd.return_typ)
         }
     }
@@ -8511,6 +8826,21 @@ type Codegen = struct {
         let saved_names = self.subst_names
         for decl in module.decls {
             match decl {
+                .Func(decl_id) -> {
+                    // A generic function's body is compiled per instance, or not at all.
+                    let fd = self.p.func_decls[decl_id]
+                    if len(fd.type_params) > 0 {
+                        self.subst_names = fd.type_params
+                        self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                        self.check_param_order(fd, fd.name)
+                        self.check_param_count(fd.params, what: f"`{fd.name}`", span: fd.name_span)
+                        self.check_param_names(fd.params)
+                        if fd.name == "main" {
+                            self.report_error("error: `main` can't be generic", span: fd.name_span)
+                        }
+                        self.subst_names = saved_names
+                    }
+                }
                 .Struct(struct_name, _name_span, type_params, fields, methods) -> {
                     self.subst_names = type_params
                     for field in fields {
@@ -8858,6 +9188,9 @@ type Codegen = struct {
             }
             let ifn = self.import_fn_at(fn_idx)
             let sig = ifn.sig
+            if self.is_generic_sig(sig) {
+                return self.compile_generic_call(FnRef(:sig, label: ifn.label, name: f"{mod_or_obj}.{method_name}"), :args, chain: 0, span: self.p.expr_spans[callee_lhs])
+            }
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: method_name).slots
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
@@ -9079,6 +9412,9 @@ type Codegen = struct {
                 let slot = self.lookup_func(name)
                 if slot != -1 {
                     let sig = self.fn_sig(slot)
+                    if self.is_generic_sig(sig) {
+                        return self.compile_generic_call(FnRef(:sig, label: self.fn_label(slot), :name), :args, chain: 0, span: self.p.expr_spans[callee_id])
+                    }
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
@@ -9117,6 +9453,9 @@ type Codegen = struct {
                                 return .VImm(value: 0)
                             }
                             return self.compile_struct_construct(args, struct_idx: ctor_idx, span: self.p.expr_spans[callee_id])
+                        }
+                        if self.index_chain_fn(callee_id) is Some(fn_ref) {
+                            return self.compile_generic_call(fn_ref, :args, chain: callee_id, span: self.p.expr_spans[callee_id])
                         }
                         if self.p.exprs[self.index_chain_root(callee_id)] is .Ident(root) {
                             // A generic type only another module declares, unless a local of the name is in force.
@@ -9756,7 +10095,8 @@ type Codegen = struct {
         self.bound_log = saved_log
     }
 
-    func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser, slots: [int64]) -> none {
+    // `type_params` and `type_args` are a generic instance's, for its defaults.
+    func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser, slots: [int64], type_params: [str] = [], type_args: [TypeKind] = []) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         // When the call has fewer args than the function declares,
         // missing slots fill from `default_exprs` (compiled in the
@@ -9801,7 +10141,12 @@ type Codegen = struct {
                     arg_reg = self.load(arg_val)
                 }
             } else {
+                let saved_names = self.subst_names
+                let saved_args = self.subst_args
+                self.bind_func_type_params(type_params, :type_args)
                 arg_reg = self.compile_default(default_exprs[i], expected: expected_kinds[i], :src_p)
+                self.subst_names = saved_names
+                self.subst_args = saved_args
             }
             self.emit(f"str {arg_reg}, [sp, #{i * 8}]")
             self.pool.free_reg(arg_reg)
@@ -9960,7 +10305,7 @@ type Codegen = struct {
     // For `obj.method()` where obj is a known struct, return the method's
     // recorded return kind. Returns none if anything about the shape doesn't
     // match (callee not Ident.Ident, obj not a struct, method not found).
-    func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64) -> TypeKind? {
+    func method_call_return_kind(self, callee_lhs: int64, callee_rhs: int64, args: [ast.CallArg]) -> TypeKind? {
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
         let enum3 = self.three_part_ctor_enum(callee_lhs, variant_name: method_name)
         if enum3 >= 0 {
@@ -9983,7 +10328,11 @@ type Codegen = struct {
             if fn_idx == -1 {
                 return .KUnknown
             }
-            return self.import_fn_at(fn_idx).sig.return_kind
+            let ifn = self.import_fn_at(fn_idx)
+            if self.is_generic_sig(ifn.sig) {
+                return self.generic_call_kind(FnRef(sig: ifn.sig, label: ifn.label, name: f"{maybe_mod}.{method_name}"), :args, chain: 0)
+            }
+            return ifn.sig.return_kind
         }
         // Recurse via infer_kind so receivers like `0.to_str()` (IntLit
         // receiver) or `p.field.to_str()` (Binary.Dot receiver) get the
@@ -10152,13 +10501,17 @@ type Codegen = struct {
                         // Free function call: use the cached return kind.
                         let slot = self.lookup_func(name)
                         if slot != -1 {
-                            return self.fn_sig(slot).return_kind
+                            let sig = self.fn_sig(slot)
+                            if self.is_generic_sig(sig) {
+                                return self.generic_call_kind(FnRef(:sig, label: self.fn_label(slot), :name), :args, chain: 0)
+                            }
+                            return sig.return_kind
                         }
                     }
                     .Binary(call_lhs, call_op, call_rhs) -> {
                         match call_op {
                             .Dot -> {
-                                if self.method_call_return_kind(callee_lhs: call_lhs, callee_rhs: call_rhs) is Some(k) {
+                                if self.method_call_return_kind(callee_lhs: call_lhs, callee_rhs: call_rhs, :args) is Some(k) {
                                     return k
                                 }
                                 // Re-inferring the callee would double the work per chained call.
@@ -10171,6 +10524,9 @@ type Codegen = struct {
                                         return .KUnknown
                                     }
                                     return .KStruct(idx: ctor_idx, type_args: [])
+                                }
+                                if self.index_chain_fn(callee) is Some(fn_ref) {
+                                    return self.generic_call_kind(fn_ref, :args, chain: callee)
                                 }
                             }
                             else none
@@ -13095,15 +13451,38 @@ type Codegen = struct {
     // dense `x19..` prefix.
 
     // `owner` is the struct whose method this is, or -1.
+    func compile_func_instance(self, anon idx: int64) -> none {
+        let inst = self.func_insts[idx]
+        let saved_p = self.p
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        self.p = inst.sig.src_p
+        self.subst_names = inst.sig.type_params
+        self.subst_args = inst.sig.type_args
+        self.body_func_inst = idx
+        self.compile_func(fd_id: inst.sig.decl_id, struct_name: "", override_lbl: inst.label)
+        self.body_func_inst = -1
+        self.p = saved_p
+        self.subst_names = saved_names
+        self.subst_args = saved_args
+    }
+
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
+        // A method with type parameters of its own has been reported by the parser.
+        if owner >= 0 and len(func_decl.type_params) > 0 {
+            return
+        }
         self.cur_owner = owner
         if owner >= 0 and self.body_instance < 0 {
             self.check_init_decl(func_decl, :owner)
         }
-        self.check_param_order(func_decl, func_decl.name)
-        // A generic template's methods are checked once, in check_module_types.
-        if self.body_instance < 0 {
+        // A generic template's methods and functions are checked once, in check_module_types.
+        let once = self.body_instance < 0 and self.body_func_inst < 0
+        if self.body_func_inst < 0 {
+            self.check_param_order(func_decl, func_decl.name)
+        }
+        if once {
             mut what = f"`{func_decl.name}`"
             if len(struct_name) > 0 {
                 what = f"`{struct_name}.{func_decl.name}`"
@@ -13364,7 +13743,11 @@ type Codegen = struct {
 
         for decl in module.decls {
             match decl {
-                .Func(decl_id) -> self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
+                .Func(decl_id) -> {
+                    if len(self.p.func_decls[decl_id].type_params) == 0 {
+                        self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
+                    }
+                }
                 .Struct(name, _name_span, struct_type_params, fields, methods) -> {
                     // A generic template's methods only compile per instance.
                     if len(struct_type_params) == 0 {
@@ -13434,27 +13817,35 @@ type Codegen = struct {
         // (e.g. Map[str, int64]). We walk the structs list with a cursor
         // that re-checks the length each step so any further instantiations
         // discovered while compiling a specialised body get picked up too.
+        // Each kind of body can call for more of the other, so go round until both run out.
         mut cursor = 0
-        for cursor < len(self.structs) {
-            mut s = self.structs[cursor]
-            if s.template_idx >= 0 and not self.has_bad_key(s) {
-                let template = self.structs[s.template_idx]
-                let saved_p = self.p
-                let saved_names = self.subst_names
-                let saved_args = self.subst_args
-                self.p = s.src_p
-                self.subst_names = template.type_param_names
-                self.subst_args = s.template_args
-                self.body_instance = cursor
-                for m in s.methods {
-                    self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "", owner: cursor)
+        mut func_cursor = 0
+        for cursor < len(self.structs) or func_cursor < len(self.func_inst_queue) {
+            for cursor < len(self.structs) {
+                mut s = self.structs[cursor]
+                if s.template_idx >= 0 and not self.has_bad_key(s) {
+                    let template = self.structs[s.template_idx]
+                    let saved_p = self.p
+                    let saved_names = self.subst_names
+                    let saved_args = self.subst_args
+                    self.p = s.src_p
+                    self.subst_names = template.type_param_names
+                    self.subst_args = s.template_args
+                    self.body_instance = cursor
+                    for m in s.methods {
+                        self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "", owner: cursor)
+                    }
+                    self.body_instance = -1
+                    self.p = saved_p
+                    self.subst_names = saved_names
+                    self.subst_args = saved_args
                 }
-                self.body_instance = -1
-                self.p = saved_p
-                self.subst_names = saved_names
-                self.subst_args = saved_args
+                cursor = cursor + 1
             }
-            cursor = cursor + 1
+            for func_cursor < len(self.func_inst_queue) {
+                self.compile_func_instance(self.func_inst_queue[func_cursor])
+                func_cursor += 1
+            }
         }
         let saved_instance = self.body_instance
         mut ci = 0
