@@ -97,6 +97,20 @@ type FuncInst = struct {
 }
 
 // The function a call's callee names, with its label and its name as written.
+// How an arm's tests fail and on what, for compile_arm_value.
+type ArmTests = struct {
+    subject_kind: TypeKind
+    subject_id: int64
+    skip_lbl: str
+}
+
+// One way to build a value, for checking that patterns cover a type.
+type PatternCtor = struct {
+    name: str
+    shown: str
+    fields: [TypeKind]
+}
+
 type FnRef = struct {
     sig: SigInfo
     label: str
@@ -1787,6 +1801,7 @@ type Codegen = struct {
         mut needs_result: bool = false
         mut needs_interface: bool = false
         for pid in pattern_ids {
+            self.check_pattern_names(pid, :subject_id)
             let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: self.infer_kind(subject_id))
             match pat {
                 .NonePat -> needs_optional = true
@@ -1823,18 +1838,33 @@ type Codegen = struct {
         }
     }
 
+    // `_` and `_name` bind nothing, so they can repeat.
+    func check_pattern_names(self, anon pattern_id: int64, subject_id: int64) -> none {
+        let names = self.pattern_tree_names(pattern_id)
+        for i, name in names {
+            if name[0] != '_' and arrays.contains(names[i + 1..], name) {
+                self.report_error(f"error: a pattern binds `{self.source_name(name)}` twice; give one of them another name", span: self.p.expr_spans[subject_id])
+                return
+            }
+        }
+    }
+
     // False after reporting a pattern the subject's type can't match.
     func check_pattern_subject(self, anon pat: ast.Pattern, subject_id: int64) -> bool {
-        let kind = self.infer_kind(subject_id)
+        return self.check_pattern_kind(pat, kind: self.infer_kind(subject_id), :subject_id, nested: false)
+    }
+
+    // `nested` when `kind` is a payload's, not the subject's, so the subject can't be unwrapped.
+    func check_pattern_kind(self, anon pat: ast.Pattern, kind: TypeKind, subject_id: int64, nested: bool) -> bool {
         if self.kind_has_unknown(kind) {
             return true
         }
         mut target = ""
         mut variant = ""
         match pat {
-            .IntPat(_value) -> return self.check_literal_pattern(.KInt64, :subject_id)
-            .StrPat(_value) -> return self.check_literal_pattern(.KStr, :subject_id)
-            .BoolPat(_value) -> return self.check_literal_pattern(.KBool, :subject_id)
+            .IntPat(_value) -> return self.check_literal_pattern(.KInt64, :kind, :subject_id, :nested)
+            .StrPat(_value) -> return self.check_literal_pattern(.KStr, :kind, :subject_id, :nested)
+            .BoolPat(_value) -> return self.check_literal_pattern(.KBool, :kind, :subject_id, :nested)
             .EnumPat(enum_name, variant_name, bindings) -> {
                 target = f"`{enum_name}.{variant_name}`"
                 variant = variant_name
@@ -1873,7 +1903,11 @@ type Codegen = struct {
         let inner = self.optional_inner(kind)
         if inner is .KEnum(_inner_idx) {
             if kind is .KOptional(_k) {
-                self.report_error(f"error: {target} matches a `{self.kind_display(inner)}`, not a `{shown}`{self.unwrap_hint(subject_id)}, or match `.Some(v)`", :span)
+                mut hint = ""
+                if not nested {
+                    hint = self.unwrap_hint(subject_id)
+                }
+                self.report_error(f"error: {target} matches a `{self.kind_display(inner)}`, not a `{shown}`{hint}, or match `.Some(v)`", :span)
                 return false
             }
         }
@@ -1889,13 +1923,12 @@ type Codegen = struct {
         return false
     }
 
-    func check_literal_pattern(self, anon want: TypeKind, subject_id: int64) -> bool {
-        let kind = self.infer_kind(subject_id)
+    func check_literal_pattern(self, anon want: TypeKind, kind: TypeKind, subject_id: int64, nested: bool) -> bool {
         if self.same_kind(kind, want) {
             return true
         }
         mut hint = ""
-        if self.same_kind(self.optional_inner(kind), want) {
+        if not nested and self.same_kind(self.optional_inner(kind), want) {
             hint = self.unwrap_hint(subject_id)
         }
         self.report_error(f"error: cannot match a `{self.kind_display(kind)}` value against a `{self.kind_display(want)}` literal{hint}", span: self.p.expr_spans[subject_id])
@@ -1910,6 +1943,162 @@ type Codegen = struct {
     // surfaces every gap in a single pass. Matches on int64 and str
     // require an explicit `else` arm.
     func check_match_exhaustive(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
+        let attempts_before = self.report_attempts
+        self.check_match_variants(subject_id, :pattern_ids)
+        if self.report_attempts != attempts_before {
+            return
+        }
+        mut nests = false
+        for pid in pattern_ids {
+            if len(self.p.pattern_subs[pid]) > 0 {
+                nests = true
+            }
+        }
+        if not nests {
+            return
+        }
+        // Every variant has an arm; what nests in those arms can still leave gaps.
+        let kind = self.infer_kind(subject_id)
+        mut rows: [[int64]] = []
+        for pid in pattern_ids {
+            rows += [[pid]]
+        }
+        if self.missing_case(rows, kinds: [kind]) is Some(witness) {
+            self.report_error(f"error: match on `{self.kind_display(kind)}` doesn't cover `{witness[0]}`", span: self.p.expr_spans[subject_id])
+        }
+    }
+
+    // A case no row matches, shown a column at a time, or none. A row holds a
+    // pattern id per column, -1 for one that takes anything. Only a column
+    // some row tests is split by constructor, so a recursive type still ends.
+    func missing_case(self, anon rows: [[int64]], kinds: [TypeKind]) -> [str]? {
+        if len(kinds) == 0 {
+            if len(rows) == 0 {
+                let empty: [str] = []
+                return empty
+            }
+            return none
+        }
+        let kind = kinds[0]
+        let rest = kinds[1..]
+        let ctors = self.pattern_ctors(kind)
+        mut tested = false
+        for row in rows {
+            if len(self.pattern_ctor_name(row[0], subject_kind: kind)) > 0 {
+                tested = true
+            }
+        }
+        if tested and len(ctors) > 0 {
+            for ctor in ctors {
+                let arity = len(ctor.fields)
+                mut spec: [[int64]] = []
+                for row in rows {
+                    let name = self.pattern_ctor_name(row[0], subject_kind: kind)
+                    if name == ctor.name or len(name) == 0 {
+                        spec += [self.pattern_ctor_args(row[0], subject_kind: kind, :arity) + row[1..]]
+                    }
+                }
+                if self.missing_case(spec, kinds: ctor.fields + rest) is Some(witness) {
+                    mut shown = ctor.shown
+                    if arity > 0 {
+                        shown = f"{shown}({", ".join(witness[0..arity])})"
+                    }
+                    return [shown] + witness[arity..]
+                }
+            }
+            return none
+        }
+        mut others: [[int64]] = []
+        for row in rows {
+            if len(self.pattern_ctor_name(row[0], subject_kind: kind)) == 0 {
+                others += [row[1..]]
+            }
+        }
+        if self.missing_case(others, kinds: rest) is Some(witness) {
+            return ["_"] + witness
+        }
+        return none
+    }
+
+    // What values of a type can be built from, or [] for a type with too many values to list.
+    func pattern_ctors(self, anon kind: TypeKind) -> [PatternCtor] {
+        let no_fields: [TypeKind] = []
+        if self.is_result_kind(kind) {
+            return [
+                PatternCtor(name: "Ok", shown: "Ok", fields: [self.result_inner_kind(kind)]),
+                PatternCtor(name: "Err", shown: "Err", fields: [self.result_err_kind(kind)]),
+            ]
+        }
+        match kind {
+            .KOptional(inner) -> return [
+                PatternCtor(name: "Some", shown: "Some", fields: [inner]),
+                PatternCtor(name: "none", shown: "none", fields: no_fields),
+            ]
+            .KBool -> return [
+                PatternCtor(name: "true", shown: "true", fields: no_fields),
+                PatternCtor(name: "false", shown: "false", fields: no_fields),
+            ]
+            .KEnum(idx) -> {
+                mut ctors: [PatternCtor] = []
+                for variant in self.enums[idx].variants {
+                    ctors += [PatternCtor(name: variant.name, shown: f".{variant.name}", fields: variant.field_kinds)]
+                }
+                return ctors
+            }
+            else {
+                let no_ctors: [PatternCtor] = []
+                return no_ctors
+            }
+        }
+    }
+
+    // The constructor a column's pattern tests: "" when it takes anything, and
+    // a name no type lists for a literal or a downcast, which tests only part of one.
+    func pattern_ctor_name(self, anon pattern_id: int64, subject_kind: TypeKind) -> str {
+        if pattern_id < 0 {
+            return ""
+        }
+        match self.subject_pattern(self.p.patterns[pattern_id], :subject_kind) {
+            .Wildcard -> return ""
+            .SomePat(_binding) -> return "Some"
+            .NonePat -> return "none"
+            .OkPat(_binding) -> return "Ok"
+            .ErrPat(_binding) -> return "Err"
+            .BoolPat(value) -> {
+                if value {
+                    return "true"
+                }
+                return "false"
+            }
+            .EnumPat(_enum_name, variant_name, _bindings) -> return variant_name
+            .ImplicitEnumPat(variant_name, _bindings) -> return variant_name
+            else return "#partial"
+        }
+    }
+
+    // The patterns in a column's payload positions, -1 where it only binds.
+    func pattern_ctor_args(self, anon pattern_id: int64, subject_kind: TypeKind, arity: int64) -> [int64] {
+        mut args: [int64] = []
+        for _i in 0..arity {
+            args += [-1]
+        }
+        if pattern_id < 0 {
+            return args
+        }
+        let names = self.pattern_binding_names(self.subject_pattern(self.p.patterns[pattern_id], :subject_kind))
+        for i, name in names {
+            if i < arity {
+                for sub in self.p.pattern_subs[pattern_id] {
+                    if sub.binding == name {
+                        args[i] = sub.pattern
+                    }
+                }
+            }
+        }
+        return args
+    }
+
+    func check_match_variants(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
         mut has_wildcard: bool = false
         for pid in pattern_ids {
             if self.p.patterns[pid] is .Wildcard {
@@ -2757,8 +2946,8 @@ type Codegen = struct {
         }
     }
 
-    func bind_pattern(self, anon pattern: ast.Pattern) -> none {
-        for name in self.pattern_binding_names(pattern) {
+    func bind_pattern(self, anon pattern_id: int64) -> none {
+        for name in self.pattern_tree_names(pattern_id) {
             self.bind_var(name)
         }
     }
@@ -5086,8 +5275,8 @@ type Codegen = struct {
                 }
             }
             .LetElse(pattern, value, _else_body) -> {
-                self.retype_pattern_bindings(self.p.patterns[pattern], subject_kind: self.infer_kind(value))
-                self.bind_pattern(self.p.patterns[pattern])
+                self.retype_pattern_bindings(pattern, subject_kind: self.infer_kind(value))
+                self.bind_pattern(pattern)
             }
             else none
         }
@@ -5097,8 +5286,8 @@ type Codegen = struct {
         let arm = self.p.match_arms[arm_id]
         let mark = len(self.bound_log)
         let kinds_mark = len(self.walk_slots)
-        self.retype_pattern_bindings(self.p.patterns[arm.pattern], :subject_kind)
-        self.bind_pattern(self.p.patterns[arm.pattern])
+        self.retype_pattern_bindings(arm.pattern, :subject_kind)
+        self.bind_pattern(arm.pattern)
         let flow = self.block_flow(arm.body)
         self.unbind_to(mark)
         self.drop_walk_kinds(kinds_mark)
@@ -5864,10 +6053,43 @@ type Codegen = struct {
         return kinds
     }
 
-    // A first guess; compile time retypes them from the subject's final kind.
-    func alloc_pattern_bindings(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> none {
-        let names = self.pattern_binding_names(pattern)
+    // Every name a pattern binds, with those of the patterns nested in it.
+    func pattern_tree_names(self, anon pattern_id: int64) -> [str] {
+        // A new array: `+=` would grow the one the pattern itself holds.
+        mut names: [str] = []
+        names += self.pattern_binding_names(self.p.patterns[pattern_id])
+        for sub in self.p.pattern_subs[pattern_id] {
+            names += self.pattern_tree_names(sub.pattern)
+        }
+        return names
+    }
+
+    // What each of pattern_tree_names is bound to.
+    func pattern_tree_kinds(self, anon pattern_id: int64, subject_kind: TypeKind) -> [TypeKind] {
+        mut kinds: [TypeKind] = []
+        kinds += self.pattern_binding_kinds(self.p.patterns[pattern_id], :subject_kind)
+        for sub in self.p.pattern_subs[pattern_id] {
+            kinds += self.pattern_tree_kinds(sub.pattern, subject_kind: self.sub_pattern_kind(pattern_id, :sub, :subject_kind))
+        }
+        return kinds
+    }
+
+    // The type of the payload position a nested pattern tests.
+    func sub_pattern_kind(self, anon pattern_id: int64, sub: ast.SubPattern, subject_kind: TypeKind) -> TypeKind {
+        let pattern = self.p.patterns[pattern_id]
         let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
+        for i, name in self.pattern_binding_names(pattern) {
+            if name == sub.binding and i < len(kinds) {
+                return kinds[i]
+            }
+        }
+        return .KUnknown
+    }
+
+    // A first guess; compile time retypes them from the subject's final kind.
+    func alloc_pattern_bindings(self, anon pattern_id: int64, subject_kind: TypeKind) -> none {
+        let names = self.pattern_tree_names(pattern_id)
+        let kinds = self.pattern_tree_kinds(pattern_id, :subject_kind)
         for i in 0..len(names) {
             if not self.var_declared(names[i]) {
                 self.alloc_var(name: names[i], kind: kinds[i])
@@ -5876,9 +6098,9 @@ type Codegen = struct {
     }
 
     // Returns the previous kinds for restore_pattern_bindings.
-    func retype_pattern_bindings(self, anon pattern: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
-        let names = self.pattern_binding_names(pattern)
-        let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
+    func retype_pattern_bindings(self, anon pattern_id: int64, subject_kind: TypeKind) -> [TypeKind] {
+        let names = self.pattern_tree_names(pattern_id)
+        let kinds = self.pattern_tree_kinds(pattern_id, :subject_kind)
         mut saved: [TypeKind] = []
         for i in 0..len(names) {
             saved += [self.find_var_kind(names[i])]
@@ -5887,8 +6109,8 @@ type Codegen = struct {
         return saved
     }
 
-    func restore_pattern_bindings(self, anon pattern: ast.Pattern, kinds: [TypeKind]) -> none {
-        let names = self.pattern_binding_names(pattern)
+    func restore_pattern_bindings(self, anon pattern_id: int64, kinds: [TypeKind]) -> none {
+        let names = self.pattern_tree_names(pattern_id)
         mut i = len(names) - 1
         for i >= 0 {
             self.update_var_kind(name: names[i], kind: kinds[i])
@@ -5896,16 +6118,149 @@ type Codegen = struct {
         }
     }
 
+    // After an arm's own test has bound its pattern: the tests of the patterns
+    // nested in it, then its guard. Any of them failing moves on to `skip_lbl`.
+    func emit_arm_tests(self, anon pattern_id: int64, guard: int64, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
+        self.emit_sub_patterns(pattern_id, :subject_kind, :subject_id, :skip_lbl)
+        if guard == 0 {
+            return
+        }
+        let val = self.compile_expr(guard)
+        self.check_bool(guard, need: "a match guard must be a `bool`", optional_hint: "; test it with `is not none`")
+        let reg = self.load(val)
+        self.emit(f"cmp {reg}, #0")
+        self.pool.free_reg(reg)
+        self.emit(f"beq {skip_lbl}")
+    }
+
+    func emit_sub_patterns(self, anon pattern_id: int64, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
+        for sub in self.p.pattern_subs[pattern_id] {
+            let kind = self.sub_pattern_kind(pattern_id, :sub, :subject_kind)
+            if not self.kind_has_unknown(kind) {
+                self.emit_pattern_test(sub.pattern, subject_kind: kind, subj_slot: self.find_var_offset(sub.binding), :subject_id, :skip_lbl)
+            }
+        }
+    }
+
+    // Test the value in `subj_slot` against a nested pattern and bind what it
+    // names. Errors point at the match's subject, the only span a pattern has.
+    func emit_pattern_test(self, anon pattern_id: int64, subject_kind: TypeKind, subj_slot: int64, subject_id: int64, skip_lbl: str) -> none {
+        let raw = self.p.patterns[pattern_id]
+        let pattern = self.subject_pattern(raw, :subject_kind)
+        if not self.check_nested_pattern(pattern, kind: subject_kind, :subject_id) {
+            return
+        }
+        let span = self.p.expr_spans[subject_id]
+        let disc_r = self.pool.alloc_reg()
+        self.emit_ldr(subj_slot, reg: disc_r)
+        if subject_kind is .KEnum(_idx) {
+            self.emit(f"ldr {disc_r}, [{disc_r}]")
+        }
+        match pattern {
+            .Wildcard -> none
+            .IntPat(value) -> {
+                self.emit_cmp_imm(disc_r, :value)
+                self.emit(f"bne {skip_lbl}")
+            }
+            .BoolPat(value) -> {
+                mut lit = 0
+                if value {
+                    lit = 1
+                }
+                self.emit(f"cmp {disc_r}, #{lit}")
+                self.emit(f"bne {skip_lbl}")
+            }
+            .StrPat(value) -> {
+                let slbl = self.intern_str(value)
+                self.emit_ldr(subj_slot, reg: "x0")
+                self.emit(f"adrp x1, {slbl}@PAGE")
+                self.emit(f"add x1, x1, {slbl}@PAGEOFF")
+                self.emit("bl _kod_str_cmp")
+                self.emit("cmp x0, #0")
+                self.emit(f"bne {skip_lbl}")
+            }
+            .EnumPat(_enum_name, _variant_name, _bindings) -> {
+                self.emit_variant_test(raw, subj_enum_idx: self.enum_idx_of_kind(subject_kind), :disc_r, :subj_slot, :skip_lbl, :span)
+            }
+            .ImplicitEnumPat(_variant_name, _bindings) -> {
+                self.emit_variant_test(raw, subj_enum_idx: self.enum_idx_of_kind(subject_kind), :disc_r, :subj_slot, :skip_lbl, :span)
+            }
+            .NonePat -> {
+                self.emit(f"cmp {disc_r}, #0")
+                self.emit(f"bne {skip_lbl}")
+            }
+            .SomePat(binding) -> {
+                self.emit(f"cmp {disc_r}, #0")
+                self.emit(f"beq {skip_lbl}")
+                if len(binding) > 0 {
+                    let val_r = self.pool.alloc_reg()
+                    self.emit(f"ldr {val_r}, [{disc_r}]")
+                    self.emit_str(self.find_var_offset(binding), reg: val_r)
+                    self.pool.free_reg(val_r)
+                }
+            }
+            .OkPat(binding) -> {
+                self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
+                self.emit(f"bne {skip_lbl}")
+                self.bind_result_payload(binding, :subj_slot)
+            }
+            .ErrPat(binding) -> {
+                self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
+                self.emit(f"beq {skip_lbl}")
+                self.bind_result_payload(binding, :subj_slot)
+            }
+            .TypePat(type_name, binding) -> {
+                self.emit_typepat_test(:type_name, :binding, :subject_kind, :span, :subj_slot, :skip_lbl)
+            }
+        }
+        self.pool.free_reg(disc_r)
+        self.emit_sub_patterns(pattern_id, :subject_kind, :subject_id, :skip_lbl)
+    }
+
+    // False after reporting a nested pattern its position's type can't match.
+    func check_nested_pattern(self, anon pattern: ast.Pattern, kind: TypeKind, subject_id: int64) -> bool {
+        match pattern {
+            .NonePat -> return self.check_optional_pattern(kind, :subject_id)
+            .SomePat(_binding) -> return self.check_optional_pattern(kind, :subject_id)
+            .OkPat(_binding) -> return self.check_result_pattern(kind, :subject_id)
+            .ErrPat(_binding) -> return self.check_result_pattern(kind, :subject_id)
+            .TypePat(_type_name, _binding) -> {
+                if kind is .KInterface(_idx) {
+                    return true
+                }
+                self.report_error(f"error: a type pattern requires an interface value, got `{self.kind_display(kind)}`", span: self.p.expr_spans[subject_id])
+                return false
+            }
+            else return self.check_pattern_kind(pattern, :kind, :subject_id, nested: true)
+        }
+    }
+
+    func check_optional_pattern(self, anon kind: TypeKind, subject_id: int64) -> bool {
+        if kind is .KOptional(_inner) {
+            return true
+        }
+        self.report_error(f"error: `is` / `match` with none/Some requires an optional value, got `{self.kind_display(kind)}`", span: self.p.expr_spans[subject_id])
+        return false
+    }
+
+    func check_result_pattern(self, anon kind: TypeKind, subject_id: int64) -> bool {
+        if self.is_result_kind(kind) {
+            return true
+        }
+        self.report_error(f"error: `is` / `match` with Ok/Err requires a `T or Error` value, got `{self.kind_display(kind)}`", span: self.p.expr_spans[subject_id])
+        return false
+    }
+
     // The collect pass may have typed the bindings from a placeholder subject.
-    func compile_arm_stmts(self, anon body: [int64], pattern_id: int64, subject_kind: TypeKind) -> none {
-        let pattern = self.p.patterns[pattern_id]
-        let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+    func compile_arm_stmts(self, anon arm: ast.MatchArm, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
+        let saved = self.retype_pattern_bindings(arm.pattern, :subject_kind)
         let mark = len(self.bound_log)
-        self.bind_pattern(pattern)
-        self.allow_reassign(self.pattern_binding_names(pattern))
-        self.compile_block(body)
+        self.bind_pattern(arm.pattern)
+        self.allow_reassign(self.pattern_tree_names(arm.pattern))
+        self.emit_arm_tests(arm.pattern, guard: arm.guard, :subject_kind, :subject_id, :skip_lbl)
+        self.compile_block(arm.body)
         self.unbind_to(mark)
-        self.restore_pattern_bindings(pattern, kinds: saved)
+        self.restore_pattern_bindings(arm.pattern, kinds: saved)
     }
 
     // A none or optional arm makes the whole match optional.
@@ -5922,16 +6277,15 @@ type Codegen = struct {
         mut widen = false
         for arm_id in arms {
             let arm = self.p.match_expr_arms[arm_id]
-            let pattern = self.p.patterns[arm.pattern]
-            let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+            let saved = self.retype_pattern_bindings(arm.pattern, :subject_kind)
             let mark = len(self.bound_log)
-            self.bind_pattern(pattern)
+            self.bind_pattern(arm.pattern)
             let kinds_mark = len(self.walk_slots)
             self.bind_arm_pre(arm.pre)
             let k = self.infer_kind(arm.body)
             self.unbind_to(mark)
             self.drop_walk_kinds(kinds_mark)
-            self.restore_pattern_bindings(pattern, kinds: saved)
+            self.restore_pattern_bindings(arm.pattern, kinds: saved)
             if self.is_none_kind(k) or self.is_some_optional(k) {
                 widen = true
             }
@@ -5953,12 +6307,13 @@ type Codegen = struct {
     }
 
     // With `ok_wrap`, an arm that isn't already a result becomes its Ok.
-    func compile_arm_value(self, anon body: int64, pre: [int64], pattern_id: int64, subject_kind: TypeKind, expected: TypeKind, ok_wrap: bool, result_r: str) -> none {
-        let pattern = self.p.patterns[pattern_id]
-        let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+    func compile_arm_value(self, anon arm: ast.MatchExprArm, tests: ArmTests, expected: TypeKind, ok_wrap: bool, result_r: str) -> none {
+        let body = arm.body
+        let saved = self.retype_pattern_bindings(arm.pattern, subject_kind: tests.subject_kind)
         let mark = len(self.bound_log)
-        self.bind_pattern(pattern)
-        for stmt_id in pre {
+        self.bind_pattern(arm.pattern)
+        self.emit_arm_tests(arm.pattern, guard: arm.guard, subject_kind: tests.subject_kind, subject_id: tests.subject_id, skip_lbl: tests.skip_lbl)
+        for stmt_id in arm.pre {
             self.compile_stmt(stmt_id)
         }
         let body_kind = self.infer_kind(body)
@@ -5993,7 +6348,7 @@ type Codegen = struct {
             }
         }
         self.unbind_to(mark)
-        self.restore_pattern_bindings(pattern, kinds: saved)
+        self.restore_pattern_bindings(arm.pattern, kinds: saved)
     }
 
     // `kod_panic(...)`, or a call to a function that never returns.
@@ -6446,7 +6801,10 @@ type Codegen = struct {
                 let subj_kind = self.collected_kind(subject)
                 for arm_id in arms {
                     let arm = self.p.match_expr_arms[arm_id]
-                    self.alloc_pattern_bindings(self.p.patterns[arm.pattern], subject_kind: subj_kind)
+                    self.alloc_pattern_bindings(arm.pattern, subject_kind: subj_kind)
+                    if arm.guard != 0 {
+                        self.collect_expr_vars(arm.guard)
+                    }
                     for stmt_id in arm.pre {
                         self.collect_stmt_vars(:stmt_id)
                     }
@@ -6548,7 +6906,10 @@ type Codegen = struct {
                 let subj_kind = self.collected_kind(subject)
                 for arm_id in arms {
                     let arm = self.p.match_arms[arm_id]
-                    self.alloc_pattern_bindings(self.p.patterns[arm.pattern], subject_kind: subj_kind)
+                    self.alloc_pattern_bindings(arm.pattern, subject_kind: subj_kind)
+                    if arm.guard != 0 {
+                        self.collect_expr_vars(arm.guard)
+                    }
                     for arm_stmt in arm.body {
                         self.collect_stmt_vars(stmt_id: arm_stmt)
                     }
@@ -6559,7 +6920,7 @@ type Codegen = struct {
                 // a match arm) so the rest of the surrounding block can use
                 // them.
                 let subj_kind = self.collected_kind(value)
-                self.alloc_pattern_bindings(self.subject_pattern(self.p.patterns[pattern], subject_kind: subj_kind), subject_kind: subj_kind)
+                self.alloc_pattern_bindings(pattern, subject_kind: subj_kind)
                 self.collect_expr_vars(value)
                 for e in 0..len(else_body) {
                     self.collect_stmt_vars(stmt_id: else_body[e])
@@ -7204,6 +7565,11 @@ type Codegen = struct {
             self.report_error(f"error: `is` can't bind `{binding}` here; a pattern binds names only in an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs])
             return .VImm(value: 0)
         }
+        if self.is_rhs_nests(rhs) {
+            self.compile_discard(lhs)
+            self.report_error("error: a nested pattern works in a `match`, a let-else, or an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs])
+            return .VImm(value: 0)
+        }
         // Interface downcast: `e is StructType` — compare the value's vtable
         // (cell offset 8) against the (StructType, iface) vtable's address.
         if lhs_kind is .KInterface(iface_idx) {
@@ -7297,6 +7663,17 @@ type Codegen = struct {
             self.emit(f"cset {reg}, {cond_no_match}")
         }
         return .VReg(name: reg)
+    }
+
+    func is_rhs_nests(self, anon rhs: int64) -> bool {
+        if self.p.exprs[rhs] is .Call(_callee, args) {
+            for arg in args {
+                if not (self.p.exprs[arg.value] is .Ident(_name)) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     // `_` and `_name` bind nothing.
@@ -7755,7 +8132,7 @@ type Codegen = struct {
     // (cell offset 8) against the (type_name, iface) vtable; branch to
     // skip_lbl on mismatch. On match, bind the concrete pointer (offset 0)
     // — typed `KStruct` — into `binding`'s slot.
-    func emit_typepat_test(self, type_name: str, binding: str, subject_id: int64, subj_slot: int64, skip_lbl: str) -> none {
+    func emit_typepat_test(self, type_name: str, binding: str, subject_kind: TypeKind, span: ast.Span, subj_slot: int64, skip_lbl: str) -> none {
         let struct_idx = self.type_pat_struct(type_name)
         if struct_idx < 0 {
             mut msg = f"error: `{type_name}` is not a struct type"
@@ -7764,15 +8141,15 @@ type Codegen = struct {
             } else if len(self.type_elsewhere_hint(type_name)) > 0 {
                 msg = f"error: unknown type `{type_name}`; {self.type_elsewhere_hint(type_name)}"
             }
-            self.report_error(msg, span: self.p.expr_spans[subject_id])
+            self.report_error(msg, :span)
             return none
         }
         if len(self.structs[struct_idx].type_param_names) > 0 {
-            self.report_error(self.generic_downcast_msg(struct_idx, shown: type_name), span: self.p.expr_spans[subject_id])
+            self.report_error(self.generic_downcast_msg(struct_idx, shown: type_name), :span)
             return none
         }
         mut iface_idx = -1
-        if self.infer_kind(subject_id) is .KInterface(ii) {
+        if subject_kind is .KInterface(ii) {
             iface_idx = ii
         }
         self.register_vtable(struct_idx, iface_idx)
@@ -10236,13 +10613,18 @@ type Codegen = struct {
             return .VImm(value: 0)
         }
         mut expr_patterns: [int64] = []
+        mut unguarded: [int64] = []
         for arm_id in arms {
-            expr_patterns += [self.p.match_expr_arms[arm_id].pattern]
+            let arm = self.p.match_expr_arms[arm_id]
+            expr_patterns += [arm.pattern]
+            if arm.guard == 0 {
+                unguarded += [arm.pattern]
+            }
         }
         let attempts_before = self.report_attempts
         self.check_match_subject(subject_id, pattern_ids: expr_patterns)
         if self.report_attempts == attempts_before {
-            self.check_match_exhaustive(subject_id, pattern_ids: expr_patterns)
+            self.check_match_exhaustive(subject_id, pattern_ids: unguarded)
         }
         // Static enum kind for `.Foo` pattern disambiguation. See
         // compile_match_stmt for the analogous reasoning.
@@ -10262,13 +10644,13 @@ type Codegen = struct {
             let skip_lbl = self.fresh("Lmexpr_skip")
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                 }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10279,7 +10661,7 @@ type Codegen = struct {
                     }
                     self.emit(f"cmp {disc_r}, #{lit}")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10293,26 +10675,26 @@ type Codegen = struct {
                     self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .NonePat -> {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10329,7 +10711,7 @@ type Codegen = struct {
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10337,7 +10719,7 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -10345,18 +10727,18 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
-                    self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.emit_typepat_test(:type_name, :binding, subject_kind: subj_kind, span: self.p.expr_spans[subject_id], :subj_slot, :skip_lbl)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 else {
-                    self.compile_arm_value(arm.body, pre: arm.pre, pattern_id: arm.pattern, subject_kind: subj_kind, :expected, :ok_wrap, :result_r)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                 }
             }
@@ -10812,8 +11194,8 @@ type Codegen = struct {
             .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
             .LetElse(pattern, value, else_body) -> {
                 self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
-                self.bind_pattern(self.p.patterns[pattern])
-                self.allow_reassign(self.pattern_binding_names(self.p.patterns[pattern]))
+                self.bind_pattern(pattern)
+                self.allow_reassign(self.pattern_tree_names(pattern))
             }
             .Throw(value) -> self.compile_throw(value)
             .Assert(expr, source_text, span) -> self.compile_assert(expr, :source_text, :span)
@@ -11157,10 +11539,9 @@ type Codegen = struct {
             let subject_kind = self.infer_kind(subject)
             for arm_id in arms {
                 let arm = self.p.match_expr_arms[arm_id]
-                let pattern = self.p.patterns[arm.pattern]
-                let saved = self.retype_pattern_bindings(pattern, :subject_kind)
+                let saved = self.retype_pattern_bindings(arm.pattern, :subject_kind)
                 let mark = len(self.bound_log)
-                self.bind_pattern(pattern)
+                self.bind_pattern(arm.pattern)
                 let kinds_mark = len(self.walk_slots)
                 self.bind_arm_pre(arm.pre)
                 if not self.is_void_kind(self.infer_kind(arm.body)) {
@@ -11168,7 +11549,7 @@ type Codegen = struct {
                 }
                 self.unbind_to(mark)
                 self.drop_walk_kinds(kinds_mark)
-                self.restore_pattern_bindings(pattern, kinds: saved)
+                self.restore_pattern_bindings(arm.pattern, kinds: saved)
             }
             return
         }
@@ -13254,17 +13635,18 @@ type Codegen = struct {
         if self.walk_completes(else_body) {
             self.report_error("error: the else block of a let-else must leave the scope (return, throw, break, continue or panic)", span: self.p.expr_spans[value_id])
         }
+        self.check_pattern_names(pattern_id, subject_id: value_id)
         if self.infer_kind(value_id) is .KUnknown {
             self.compile_discard(value_id)
             self.report_cannot_infer(value_id, what: "this expression")
-            for name in self.pattern_binding_names(self.let_else_pattern(pattern_id, :value_id)) {
+            for name in self.pattern_tree_names(pattern_id) {
                 self.update_var_kind(:name, kind: .KUnknown)
             }
             return
         }
         if not self.check_pattern_subject(self.let_else_pattern(pattern_id, :value_id), subject_id: value_id) {
             self.compile_discard(value_id)
-            for name in self.pattern_binding_names(self.let_else_pattern(pattern_id, :value_id)) {
+            for name in self.pattern_tree_names(pattern_id) {
                 self.update_var_kind(:name, kind: .KUnknown)
             }
             return
@@ -13278,7 +13660,7 @@ type Codegen = struct {
         self.pool.free_reg(sptr_r)
         let pattern = self.let_else_pattern(pattern_id, :value_id)
         let value_kind = self.infer_kind(value_id)
-        let old_kinds = self.retype_pattern_bindings(pattern, subject_kind: value_kind)
+        let old_kinds = self.retype_pattern_bindings(pattern_id, subject_kind: value_kind)
         match pattern {
             .EnumPat(enum_name, variant_name, bindings) -> {
                 let enum_idx = self.pattern_enum_idx(:enum_name, :variant_name, subj_enum_idx: self.enum_idx_of_kind(value_kind), span: self.p.expr_spans[value_id])
@@ -13371,12 +13753,13 @@ type Codegen = struct {
                 return
             }
         }
+        self.emit_sub_patterns(pattern_id, subject_kind: value_kind, subject_id: value_id, skip_lbl: else_lbl)
         self.emit(f"b {done_lbl}")
         self.emit_label(else_lbl)
         // A name bound again in this block still holds its old value here.
-        self.restore_pattern_bindings(pattern, kinds: old_kinds)
+        self.restore_pattern_bindings(pattern_id, kinds: old_kinds)
         self.compile_block(else_body)
-        self.retype_pattern_bindings(pattern, subject_kind: value_kind)
+        self.retype_pattern_bindings(pattern_id, subject_kind: value_kind)
         self.emit_label(done_lbl)
     }
 
@@ -13387,13 +13770,18 @@ type Codegen = struct {
             return
         }
         mut stmt_patterns: [int64] = []
+        mut unguarded: [int64] = []
         for arm_id in arms {
-            stmt_patterns += [self.p.match_arms[arm_id].pattern]
+            let arm = self.p.match_arms[arm_id]
+            stmt_patterns += [arm.pattern]
+            if arm.guard == 0 {
+                unguarded += [arm.pattern]
+            }
         }
         let attempts_before = self.report_attempts
         self.check_match_subject(subject_id, pattern_ids: stmt_patterns)
         if self.report_attempts == attempts_before {
-            self.check_match_exhaustive(subject_id, pattern_ids: stmt_patterns)
+            self.check_match_exhaustive(subject_id, pattern_ids: unguarded)
         }
         // Static enum kind of the subject, used to disambiguate
         // implicit `.Foo` patterns when multiple enums declare a
@@ -13415,13 +13803,13 @@ type Codegen = struct {
             let skip_lbl = self.fresh("Lmatch_skip")
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
-                    self.compile_block(arm.body)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                 }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_block(arm.body)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -13432,7 +13820,7 @@ type Codegen = struct {
                     }
                     self.emit(f"cmp {disc_r}, #{lit}")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_block(arm.body)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -13446,26 +13834,26 @@ type Codegen = struct {
                     self.emit("bl _kod_str_cmp")
                     self.emit("cmp x0, #0")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_block(arm.body)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .NonePat -> {
                     self.emit(f"cmp {disc_r}, #0")
                     self.emit(f"bne {skip_lbl}")
-                    self.compile_block(arm.body)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -13482,7 +13870,7 @@ type Codegen = struct {
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -13493,7 +13881,7 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"bne {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
@@ -13501,13 +13889,13 @@ type Codegen = struct {
                     self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
                     self.emit(f"beq {skip_lbl}")
                     self.bind_result_payload(binding, :subj_slot)
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
-                    self.emit_typepat_test(:type_name, :binding, :subject_id, :subj_slot, :skip_lbl)
-                    self.compile_arm_stmts(arm.body, pattern_id: arm.pattern, subject_kind: subj_kind)
+                    self.emit_typepat_test(:type_name, :binding, subject_kind: subj_kind, span: self.p.expr_spans[subject_id], :subj_slot, :skip_lbl)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
