@@ -292,8 +292,7 @@ expected becomes its value, the way an `int64` becomes the value of an
 `int64?`, so a `none` `MaybeInt?` means there is no `int64?` at all. A
 `Map[str, int64?]`'s `get` returns such an optional: `none` for a missing
 key, and `Some(v)` for a stored value, where `v` is `none` if `none` was
-stored. The Python interpreter (`kod _interpret`) doesn't tell those two
-`none`s apart.
+stored.
 
 ### Postfix `?`
 

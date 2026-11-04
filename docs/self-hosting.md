@@ -4,7 +4,7 @@ icon: lucide/cpu
 
 # Self-hosting
 
-The primary goal of Kod is self-hosting — a compiler written in Kod that compiles itself. The Python side is frozen: it is the interpreter and the bootstrap, and gets no new build logic.
+Kod's compiler is written in Kod and compiles itself. A checked-in binary of it, the snapshot, is what builds it from source.
 
 ## Status
 
@@ -46,7 +46,7 @@ Driven by the `Makefile`:
 
 Two consequences: a codegen change reaches user programs right away, but the stage0 stdlib modules keep the snapshot's codegen until `make bootstrap-snapshot` refreshes it. And the compiler sources themselves may only use features the snapshot can compile.
 
-If the snapshot is missing, the Makefile falls back to running `kodc.kod` under the Python interpreter (`make bootstrap-snapshot` forces this path; it takes minutes).
+There is no other way in: without the snapshot, `make` stops and says how to restore it. See [Refreshing the snapshot](#refreshing-the-snapshot) and [Recovering from a bad snapshot](#recovering-from-a-bad-snapshot).
 
 ### The link configuration
 
@@ -69,15 +69,33 @@ A program links, in order: `LINK`, `-o <exe>`, the `RUNTIME_C` objects, the `STA
 
 Requirements: `clang` and `as` (Xcode Command Line Tools). `kod` is run from the repository root; from another directory `uv run kod` says that `build/apps/kod/kod` is not found, and that tool, called by its path, says `link.cfg not found`. Calling `build/apps/kod/kod` directly does not rebuild `build/stage0/`, so after a change to `runtime.c` or `link.cfg` run `make kod` (or `uv run kod`, which does); when the configuration names an always-linked object that is not there yet, `kod` says `build/stage0/_name.o not found; run make`.
 
+## Refreshing the snapshot
+
+```shell
+make bootstrap-snapshot
+```
+
+Runs `make selfhost-check`, checks that the stage2 and stage3 binaries are byte-identical, and only then copies the stage2 `sh_kodc` over `bootstrap/sh_kodc`. It takes seconds. Commit the new binary on its own.
+
+A feature takes two steps to reach the compiler's own sources: commit the feature, refresh the snapshot, and only then use it there. The compiler sources may use only what the snapshot can compile.
+
+Don't rewrite the history of `bootstrap/sh_kodc`: each old version can build the sources of its time, which makes them the way back.
+
+The snapshot is arm64-darwin only. Bringing the compiler to another platform means adding the target and cross-compiling from a Mac.
+
+## Recovering from a bad snapshot
+
+The fixed-point check shows that a compiler reproduces itself, not that it is right: a snapshot with a bug that reproduces itself passes. If `bootstrap/sh_kodc` is lost or bad:
+
+1. Restore a good version from git, the newest one before the problem: `git log -- bootstrap/sh_kodc`, then `git checkout <rev> -- bootstrap/sh_kodc`. If it can't compile the current sources, check out the sources of that commit as well and work forward one snapshot at a time.
+2. As a last resort, the tag `python-bootstrap` is the last commit with the Python interpreter, which builds the compiler with no binary at all: check it out and run `make bootstrap-snapshot` (about 11 minutes). From that compiler, work forward through later commits the same way.
+
 ## What's still Python
 
-- `kod/interpreter.py`, the Python lexer, parser and `kod/loader.py`: the independent second implementation of the language (the `both`-mode fixtures and the parity tests) and the bootstrap when `bootstrap/sh_kodc` is missing (`kod _interpret kodc.kod ...`).
-- `kod/bootstrap.py`: the one piece of build logic left, `kod _emit-runtime-main`, which the Makefile uses to write the `_main` shim of `kodc.kod` and `tools/kod.kod` when there is no snapshot. `tests/bootstrap_test.py` keeps it identical to `sh_kodc _emit-runtime-main`.
-- `kod/__main__.py`: `uv run kod build|run|test|check`, run from the repository root, refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`. If `make` fails, it prints make's errors and `kod: failed to rebuild the toolchain` and stops with make's status; from any other directory, or when `make` is not installed and the tool is not built, it says that the tool is missing. Plus `_interpret`.
+- `kod/__main__.py`: `uv run kod build|run|test|check`, run from the repository root, refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`. If `make` fails, it prints make's errors and `kod: failed to rebuild the toolchain` and stops with make's status; from any other directory, or when `make` is not installed and the tool is not built, it says that the tool is missing.
+- `tests/` and `tools/asm_diff.py`: the test harness and the assembly comparison.
 
-Rules: language features and build logic are added in Kod only. The interpreter is not extended for them: their fixtures say `// expected mode:` `run`. An `extern func` the interpreter does not mirror is compiled-only. It mirrors twelve: `read_file`, `kod_is_file`, `kod_panic`, `kod_puts`, `kod_bytes_from_array`, `kod_str_to_bytes`, `kod_bytes_to_str`, `kod_eprint`, `read_stdin_line`, `read_stdin_exact`, `write_stdout` and `putchar` (the builtin; it shares libc's stdout buffer with `kod_puts`). The compiler sources and the stage0 stdlib stay within what the snapshot and the Python parser accept (types declared before use). Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool install .` is not supported: the wheel contains no stdlib.
-
-See `TODO.md` for the running list of Python-deletion work.
+Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool install .` is not supported: the wheel contains no stdlib.
 
 ## Codegen design
 
@@ -98,8 +116,6 @@ make selfhost-check
 Fixed-point check. `build/stage1/sh_kodc` compiles the compiler into `build/selfhost/stage2/`, that compiler compiles it again into `build/selfhost/stage3/`, and the two sets of assembly must be byte-identical. A miscompile in the compiler that changes its own behavior shows up as a difference. Takes a few seconds; pytest runs it.
 
 It then compiles every `.kod` file in the repo (the `make asm-diff` corpus) with both `build/stage1/sh_kodc` and the stage2 compiler, and fails if any file's assembly, diagnostics or exit status differ, writing both outputs under `build/selfhost/corpus-diff/`. Stage1 is the current sources compiled by the snapshot and stage2 the same sources compiled by themselves, so a difference means the snapshot miscompiles some of the new compiler code, typically a construct it handles differently than the current compiler does. Compiler sources must then avoid that construct until the snapshot is refreshed.
-
-`tests/examples_test.py::test_selfhost_matches_interpreter` additionally checks that `sh_kodc` and `kodc.kod` running under the Python interpreter produce identical assembly for a small program, so the bootstrap path stays usable.
 
 ### Checking that a compiler refactor changes nothing
 

@@ -2,7 +2,6 @@
 tool, and when there is none it says so instead of building something else."""
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -52,59 +51,15 @@ def test_inside_a_checkout_it_hands_off_to_the_native_tool(sh_kodc):
 
 
 @pytest.mark.parametrize(
-    "command", ["_emit-asm", "_dump-ast", "_emit-test-runtime-main"]
+    "command",
+    ["_emit-asm", "_dump-ast", "_emit-test-runtime-main"]
+    + ["_interpret", "_emit-runtime-main"],
 )
 def test_the_debug_commands_that_built_things_are_gone(command):
     result = launch(command, "tests/hello.kod", cwd=ROOT)
     assert result.returncode == 2
     assert "invalid choice" in result.stderr
     assert result.stdout == ""
-
-
-def test_interpret_prints_a_runtime_error_without_a_traceback():
-    result = launch("_interpret", "tests/block_local_fn_gone_interpreted.kod", cwd=ROOT)
-    assert result.returncode == 1
-    stderr = re.sub("\033[^m]+?m", "", result.stderr)
-    assert "9:15: error: `f` is declared in a block that has ended" in stderr
-    assert "Traceback" not in stderr
-
-
-@pytest.mark.parametrize(
-    "entry,message",
-    [
-        ("stdlib/io.kod", "_emit-runtime-main: no `main` function in stdlib/io.kod"),
-        ("nonexistent.kod", "nonexistent.kod:1:1: error: no such file"),
-        (
-            "tests/dep_signature_error.kod",
-            "tests/no_such_dep_module.kod:1:1: error: no such file",
-        ),
-        ("tests/cyclic_import_enum.kod", "error: import cycle"),
-    ],
-)
-def test_emit_runtime_main_says_what_is_wrong_without_a_traceback(
-    entry, message, tmp_path
-):
-    out = tmp_path / "main.s"
-    result = launch("_emit-runtime-main", entry, str(out), cwd=ROOT)
-    assert result.returncode == 1
-    assert message in result.stderr
-    assert "Traceback" not in result.stderr
-    assert result.stdout == ""
-    assert not out.exists()
-
-
-@pytest.mark.parametrize(
-    "entry,message",
-    [
-        ("nonexistent.kod", "nonexistent.kod:1:1: error: no such file"),
-        ("tests/cyclic_import_struct.kod", "error: import cycle"),
-    ],
-)
-def test_interpret_says_what_is_wrong_without_a_traceback(entry, message):
-    result = launch("_interpret", entry, cwd=ROOT)
-    assert result.returncode == 1
-    assert message in result.stderr
-    assert "Traceback" not in result.stderr
 
 
 def test_the_test_command_it_lists_takes_a_path_as_the_native_tool_does(sh_kodc):

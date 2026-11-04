@@ -13,22 +13,9 @@ import _pytest
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-# The native tools every test but the interpreter's goes through (the
-# `sh_kodc` fixture builds them).
+# The native tools every test goes through (the `sh_kodc` fixture builds them).
 KOD = ROOT / "build" / "apps" / "kod" / "kod"
 SH_KODC = ROOT / "build" / "stage1" / "sh_kodc"
-
-
-def run_interpreted(path: str) -> subprocess.CompletedProcess:
-    """Run a program in the interpreter."""
-    result = subprocess.run(
-        [sys.executable, "-m", "kod", "_interpret", path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    return result
 
 
 def run_compiled(path: str) -> subprocess.CompletedProcess:
@@ -82,12 +69,7 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
         if "errors" in expects:
             yield pytest.param(compile_to_assembly, path, expects, id=f"{path} compile")
         else:
-            if mode != "interpret":
-                yield pytest.param(run_compiled, path, expects, id=f"{path} run")
-            if mode != "run":
-                yield pytest.param(
-                    run_interpreted, path, expects, id=f"{path} interpret"
-                )
+            yield pytest.param(run_compiled, path, expects, id=f"{path} run")
 
 
 @pytest.mark.parametrize("func,path,expects", generate_tests())
@@ -186,57 +168,16 @@ def test_read_file_pipe(sh_kodc):
         check=False,
     )
     assert build.returncode == 0, build.stderr.decode()
-    for cmd in (
+    result = subprocess.run(
         [str(ROOT / "build/apps/read_file_stdin/read_file_stdin")],
-        [sys.executable, "-m", "kod", "_interpret", path],
-    ):
-        result = subprocess.run(
-            cmd, cwd=ROOT, input=data, capture_output=True, timeout=30, check=False
-        )
-        assert result.returncode == 0, result.stderr.decode()
-        assert result.stdout == b"%d\n" % len(data) + data + b"\n"
-
-
-@pytest.mark.parametrize(
-    "target",
-    [
-        "tests/xmod_return_kind.kod",
-        "tests/interface_dispatch.kod",
-        "tests/selfhost_parity.kod",
-        "tests/block_scopes.kod",
-        "tests/type_names_per_module.kod",
-    ],
-)
-def test_selfhost_matches_interpreter(target: str, sh_kodc):
-    """Byte-identity check between the native sh_kodc binary and kodc.kod
-    driven through the Python interpreter. Keeps the bootstrap path (which
-    runs the compiler under the interpreter) honest. The targets cover
-    imports, structs, enums, interfaces, match, methods, block scopes, (via
-    selfhost_parity.kod) the statement lowering the compiler sources use, and
-    (via type_names_per_module.kod) modules that declare types of one name."""
-    sh_out = subprocess.run(
-        [str(sh_kodc), target],
         cwd=ROOT,
+        input=data,
         capture_output=True,
-        text=True,
-        timeout=10,
+        timeout=30,
         check=False,
     )
-    py_out = subprocess.run(
-        [sys.executable, "-m", "kod", "_interpret", "kodc.kod", target],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert sh_out.returncode == 0, f"sh_kodc failed: {sh_out.stderr}"
-    assert py_out.returncode == 0, f"interpreter failed: {py_out.stderr}"
-    # Guard against comparing two empty modules.
-    assert ".globl" in sh_out.stdout, f"sh_kodc emitted no symbols for {target}"
-    assert sh_out.stdout == py_out.stdout, (
-        f"sh_kodc and interpreter diverge on {target}"
-    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout == b"%d\n" % len(data) + data + b"\n"
 
 
 def test_selfhost_fixed_point(sh_kodc):
@@ -358,39 +299,3 @@ def test_many_errors_take_linear_time(sh_kodc, tmp_path):
     elapsed = time.monotonic() - start
     assert result.stderr.count("error: expected `int64`, got `none`") == n
     assert elapsed < 4, f"{elapsed:.1f} s"
-
-
-def test_interpreter_reads_a_plus_chain_once(monkeypatch):
-    """A long `+` chain, of ints or of `.Variant` literals, takes linear time."""
-    from kod import __main__ as cli
-    from kod import interpreter
-
-    calls = 0
-    slot_target = interpreter._slot_target
-
-    def counting(expr):
-        nonlocal calls
-        calls += 1
-        return slot_target(expr)
-
-    monkeypatch.setattr(interpreter, "_slot_target", counting)
-    terms = " + ".join(["i"] * 100)
-    lits = " + ".join(["[.A]"] * 100)
-    src = ROOT / "build" / f"plus_chain_{os.getpid()}.kod"
-    src.parent.mkdir(exist_ok=True)
-    src.write_text(
-        "type C = enum {\n    A\n}\n\n"
-        "func main() -> int64 {\n    mut t = 0\n    mut i = 0\n"
-        f"    for i < 20 {{\n        t = t + {terms}\n        let xs = {lits}\n"
-        "        t += len(xs)\n        i += 1\n    }\n"
-        "    return t\n}\n"
-    )
-    monkeypatch.chdir(ROOT)
-    monkeypatch.setattr(sys, "argv", ["kod", "_interpret", str(src.relative_to(ROOT))])
-    try:
-        with pytest.raises(SystemExit) as exited:
-            cli.main()
-    finally:
-        src.unlink()
-    assert exited.value.code == 21000
-    assert calls < 20 * 100 * 20
