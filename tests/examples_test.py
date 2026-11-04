@@ -180,6 +180,34 @@ def test_read_file_pipe(sh_kodc):
     assert result.stdout == b"%d\n" % len(data) + data + b"\n"
 
 
+def test_kod_check_finds_a_type_elsewhere_in_the_program(sh_kodc):
+    """`kod check` gives the hint `kod run` does, and sh_kodc on the one file
+    can't: it doesn't know the rest of the program."""
+    entry = "tests/type_bare_cross_module_late.kod"
+    hint = f"{entry} declares `Late`: import it to use it here"
+    result = subprocess.run(
+        [str(KOD), "check", entry],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert hint in result.stderr
+    alone = subprocess.run(
+        [str(SH_KODC), "tests/type_bare_cross_module_late_dep.kod"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert alone.returncode == 1
+    assert "error: unknown type `Late`" in alone.stderr
+    assert hint not in alone.stderr
+
+
 def test_selfhost_fixed_point(sh_kodc):
     """The current compiler, compiled by itself twice, emits identical
     assembly both times (see `make selfhost-check`)."""
