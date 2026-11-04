@@ -405,6 +405,9 @@ type argument.
 
 `Map[K, V]` (in `builtins`) is the canonical example.
 
+Functions can be generic too, with their type arguments usually inferred from
+the call: see [Generic functions](functions.md#generic-functions).
+
 ## Interfaces
 
 Method-based contracts that types can opt into by declaring the right methods. Primitives implement them implicitly via boxing.

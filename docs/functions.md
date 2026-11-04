@@ -371,6 +371,116 @@ struct field (`h.fn(x)`) or another call (`get_fn()(x)`). It must pass
 exactly as many arguments as the function type has parameters, since a
 function type carries no defaults.
 
+## Generic functions
+
+Type parameters in brackets after the name make a function generic. They can
+be used in its parameters, its return type and its body:
+
+```kod
+func first[T](anon xs: [T]) -> T? {
+    if len(xs) == 0 {
+        return none
+    }
+    return xs[0]
+}
+
+func map_all[T, U](anon xs: [T], f: func(T) -> U) -> [U] {
+    mut out: [U] = []
+    for x in xs {
+        out += [f(x)]
+    }
+    return out
+}
+
+let a = first([1, 2])                                      // a: int64?
+let b = map_all([1, 2], f: func(anon n: int64) -> str {    // b: [str]
+    return f"#{n}"
+})
+```
+
+Like a [generic struct](types.md#generics), a generic function is
+monomorphised: it's compiled once for each list of type arguments a module
+calls it with.
+
+### Inference
+
+A call usually leaves the type arguments out, and the compiler works them out
+from the arguments:
+
+- Arguments are read in parameter order. Each one is matched against its
+  parameter's declared type: `T` takes the argument's whole type, `[T]` an
+  array's element type, `Box[T]` an instance's type argument, and
+  `func(T) -> U` a function's parameter and return types. `T?` takes the
+  inner type of an optional or else the argument's own type, so `int64?` and
+  `int64` both make `T` an `int64`.
+- The first argument to settle a type parameter decides it. Later arguments
+  are then converted to the parameter's type as in any call, and one that
+  can't be is an error at that argument. With `func pick[T](a: T, b: T)`,
+  `pick(a: 1, b: "x")` reports `` expected `int64`, got `str` ``, and arguments
+  of two structs that share an interface need
+  [the type written out](#explicit-type-arguments), as in
+  `pick[Shape](a: sq, b: circle)`.
+- An argument with no type of its own (`none`, `[]`, `.Red`) settles nothing,
+  but takes its type from the parameter once the others have settled it:
+  with `func add[T](xs: [T], x: T)`, `add(xs: [], x: 1)` makes `T` an `int64`.
+- A parameter left to its default settles nothing either.
+- Only arguments count. Neither the return type nor where the result goes
+  matters, so a type parameter that no argument settles is an error, even in
+  `let xs: [int64] = empty()`:
+  `` cannot infer `T` in the call to `empty`; write the type arguments: `empty[T](...)` ``.
+
+### Explicit type arguments
+
+Type arguments can be written after the function's name, all of them or none:
+
+```kod
+let xs = empty[int64]()
+let c = util.first[str](names)
+```
+
+They are spelled as for a generic struct's constructor (`str`, `[str]`,
+`int64?`, `Box[int64]`). The wrong number is an error, and so is giving them to
+a function that isn't generic.
+
+### Checking
+
+There are no bounds on a type parameter: the body may do anything the type
+arguments allow, and is compiled for each instance. A signature is always
+checked. A body is checked only for the instances that are called, so the body
+of a generic function nothing calls isn't checked. An error in a body is
+reported once, for the first instance that hits it, and names that instance:
+
+```kod
+func largest[T](a: T, b: T) -> T {
+    if a < b {               // with Color: `<` doesn't take `Color` operands (in `largest[Color]`)
+        return b
+    }
+    return a
+}
+```
+
+A generic function may call itself and other generic functions. The chain of
+instances has to end: one that keeps making a bigger type, like `f[[T]]` inside
+`f[T]`, is an error once it is 64 instances deep.
+
+Parameter defaults and the body resolve names in the module that wrote them,
+as for a [generic struct's methods](modules.md), and `T` means the instance's
+type in both.
+
+### Limits
+
+- A generic function isn't a value until it has its type arguments, and can't
+  be a value yet with them. `let f = first` and `let f = first[int64]` are
+  errors. A function literal does the job:
+  `func(anon xs: [int64]) -> int64? { return first(xs) }`.
+- Only top-level functions can be generic. A method can use its struct's type
+  parameters but can't declare its own, and neither can an interface method, a
+  function literal, an extern or `main`. A module-level constant can't either.
+- A function literal in a generic body can't name `T`, as in a generic struct's
+  methods, because it's compiled once and not per instance.
+- A type parameter's name can't repeat in one list, and hides a type of the
+  same name for the length of the function.
+
 ## Extern functions
 
 Declare external C functions with `extern`:

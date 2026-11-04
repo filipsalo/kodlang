@@ -22,7 +22,7 @@ Hello, world!
 ## Features
 
 - Compiled to native ARM64 machine code (via `as` + `clang`)
-- Static types: `int64`, `str`, `bool`, arrays `[T]`, structs, enums, optionals `T?`, generics `T[U, V]`
+- Static types: `int64`, `str`, `bool`, arrays `[T]`, structs, enums, optionals `T?`, generic types `T[U, V]` and functions `f[T]`
 - Pattern matching via `match`, plus `if X is .Variant(bindings)` sugar
 - F-string interpolation (`f"hello {name}"`), auto-`to_str` for non-string interpolands
 - Interfaces with vtable dispatch; primitives implement them via implicit boxing
