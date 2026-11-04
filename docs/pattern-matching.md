@@ -45,9 +45,14 @@ match x {
 match n {
     0    -> print("zero")
     1    -> print("one")
+    -1   -> print("minus one")
     else -> print("other")
 }
 ```
+
+A `-` directly before the digits makes the literal negative. As in an
+expression, the smallest `int64` is written `-9223372036854775808`. Only a
+literal can be a pattern, so `-n` is not one.
 
 ### String literal
 
