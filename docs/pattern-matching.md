@@ -117,7 +117,8 @@ match shape {
 ```
 
 Bindings are by position — the names in the pattern don't have to match the field names.
-A pattern may bind fewer names than the variant has fields, but not more.
+A pattern may bind fewer names than the variant has fields, but not more, and
+it can't bind one name twice, though `_` and `_name` can repeat.
 Naming an enum or variant that doesn't exist is an error, as is an
 implicit `.Variant` that no enum declares.
 
@@ -158,6 +159,67 @@ if x is not none {
 }
 ```
 
+### Nested patterns
+
+A payload position can hold a pattern instead of a name. The arm matches only
+when every nested pattern does, and a failed test moves on to the next arm:
+
+```kod
+type Shape = enum {
+    Circle(radius: int64)
+    Rect(w: int64, h: int64)
+}
+
+match shape {
+    .Rect(w, 0)     -> print(f"flat {w}")   // h must be 0, w is bound
+    .Rect(_, _)     -> print("rect")
+    .Circle(radius) -> print_int(radius)
+}
+
+let best: Shape? = find_best()
+match best {
+    Some(.Circle(r))  -> print_int(r)
+    Some(.Rect(w, h)) -> print_int(w * h)
+    none              -> print("nothing")
+}
+```
+
+Patterns nest to any depth, and each kind above can appear inside another:
+literals, `none`, `Some(...)`, `Ok(...)`, `Err(...)`, enum variants, and a
+struct downcast such as `.Wrap(Sq(s))`. In a payload position a bare name
+always binds, so a downcast with no binding is not available there: write
+`Sq(_)`. A nested literal needs a field of its own type.
+
+Tests run left to right and from the outside in, and each nested pattern sees
+the field's type, so `.Pair(Some(0), "x")` needs an optional `int64` and a `str`.
+
+Nested patterns work wherever a pattern can bind: in a `match`, in an `if` or
+`for` condition (`if best is Some(.Circle(r)) { ... }`), and in a let-else
+(`let .Some(.Circle(r)) = best else { return }`). Elsewhere `is` is only a
+test, and a nested pattern is an error: use a `match`, or an `if` of its own.
+
+### Guards
+
+An arm's pattern can be followed by `if` and a condition. The arm runs only
+when the pattern matches and the condition is true; otherwise the next arm is
+tried. The pattern's bindings are in scope in the guard:
+
+```kod
+match shape {
+    .Circle(r) if r > 100 -> print("big circle")
+    .Circle(r)            -> print_int(r)
+    .Rect(w, h) if w == h -> print("square")
+    .Rect(_, _)           -> print("rect")
+}
+```
+
+The guard must be a `bool`. It runs at most once for each arm, after that arm's
+pattern has matched, and can call functions. On an arm with alternatives it
+applies to each of them: `.Plus | .Minus if ready -> ...`. Guards work in match
+statements and match expressions, but not on `else`, which has no pattern to
+guard. A guard can't bind names itself; put the pattern in the arm instead:
+`Some(.Circle(r)) -> ...` rather than `Some(s) if s is .Circle(r) -> ...`.
+
 ### Alternatives (`|`)
 
 Patterns joined with `|` share an arm, in a `match` statement or expression:
@@ -176,8 +238,9 @@ match n {
 
 The arm counts as one arm for each alternative when the compiler checks that
 a `match` is exhaustive. Alternatives can't bind names, because each would
-have to bind the same ones; `_` is fine, as in `.Circle(_) | .Dot`. Give an
-arm that binds a line of its own.
+have to bind the same ones; `_` and nested literals are fine, as in
+`.Circle(_) | .Dot` and `.Rect(0, _) | .Rect(_, 0)`. Give an arm that binds a
+line of its own.
 
 ## Match as expression
 
@@ -376,6 +439,25 @@ match c {
 }
 ```
 
+An arm with a guard doesn't cover anything, since its condition can be false:
+some other arm has to handle that variant too.
+
+Nested patterns are checked all the way down. These arms cover every `Shape?`,
+so no `else` is needed:
+
+```kod
+match best {
+    Some(.Circle(_))  -> print("circle")
+    Some(.Rect(_, _)) -> print("rect")
+    none              -> print("nothing")
+}
+```
+
+Drop the `.Rect` arm and the error names what is left:
+`match on `Shape?` doesn't cover `Some(.Rect(_, _))``. A nested literal never
+completes a field of type `int64` or `str`, so `.Rect(w, 0)` needs another arm
+for the same variant.
+
 Add the missing arm or an `else` catch-all:
 
 ```kod
@@ -394,8 +476,3 @@ A `match` on `int64` or `str` must include an `else` arm — the
 compiler reports an error otherwise. (`int64` and `str` have too many
 possible values to enumerate; the `else` makes the fall-through
 explicit.)
-
-## Other limitations
-
-- No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value)
-- No guard clauses (`if` conditions on arms)

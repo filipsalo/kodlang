@@ -343,6 +343,23 @@ func string_body(anon raw: str) -> str {
 // `expect()` finds a token kind that doesn't match. Same field shape
 // as codegen.Diagnostic so callers can fold parser errors into the codegen's
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
+// The name a payload position binds when it holds pattern `pattern_id`.
+func hidden_binding(anon pattern_id: int64) -> str {
+	return f"__pat{pattern_id}"
+}
+
+func is_hidden_binding(anon name: str) -> bool {
+	return name.starts_with("__pat")
+}
+
+func payload_bindings(anon items: [ast.SubPattern]) -> [str] {
+	mut bindings: [str] = []
+	for item in items {
+		bindings += [item.binding]
+	}
+	return bindings
+}
+
 type ParseError = struct {
 	path: str
 	line: int64
@@ -375,6 +392,8 @@ type Parser = struct {
 	stmts: [ast.Stmt]
 	type_exprs: [ast.TypeExpr]
 	patterns: [ast.Pattern]
+	// By pattern id: the positions of its payload that hold a pattern.
+	pattern_subs: [[ast.SubPattern]] = []
 	match_arms: [ast.MatchArm]
 	match_expr_arms: [ast.MatchExprArm]
 	func_decls: [ast.FuncDecl]
@@ -412,6 +431,8 @@ type Parser = struct {
 	const_spans: [ast.Span] = []
 	// Each local a function binds (parameter, `let`, `mut`, `for` variable,
 	// pattern binding) and where its name starts, for codegen's checks.
+	// Whether the arm's patterns just parsed have a guard after them.
+	arm_guarded: bool = false
 	binding_names: [str] = []
 	binding_starts: [int64] = []
 
@@ -610,6 +631,8 @@ type Parser = struct {
 	func alloc_pattern(self, anon p: ast.Pattern) -> int64 {
 		mut id: int64 = len(self.patterns)
 		self.patterns += [p]
+		let no_subs: [ast.SubPattern] = []
+		self.pattern_subs += [no_subs]
 		mut end: int64 = 0
 		if self.pos > 0 {
 			end = self.tokens[self.pos - 1].end
@@ -806,18 +829,31 @@ type Parser = struct {
 			.Binary(_lhs, _op, _rhs) -> return self.variant_pattern(expr_id, bindings: none_bindings)
 			.Call(callee, args) -> {
 				mut bindings: [str] = []
+				mut subs: [ast.SubPattern] = []
 				for arg in args {
 					if len(arg.label) > 0 {
 						return -1
 					}
-					let .Ident(binding) = self.exprs[arg.value] else { return -1 }
-					bindings += [binding]
+					if self.exprs[arg.value] is .Ident(binding) {
+						bindings += [binding]
+					} else {
+						let sub = self.pattern_of_expr(arg.value)
+						if sub < 0 {
+							return -1
+						}
+						let hidden = hidden_binding(sub)
+						bindings += [hidden]
+						subs += [ast.SubPattern(binding: hidden, pattern: sub)]
+					}
 				}
 				// The binding names of an `is` pattern, which parses as a call first.
 				for arg in args {
-					self.binding_starts += [self.expr_spans[arg.value].start]
+					if self.exprs[arg.value] is .Ident(binding) {
+						self.binding_starts += [self.expr_spans[arg.value].start]
+						self.binding_names += [binding]
+					}
 				}
-				self.binding_names += bindings
+				mut pat: int64 = -1
 				match self.exprs[callee] {
 					.Ident(name) -> {
 						if len(bindings) > 1 {
@@ -827,11 +863,15 @@ type Parser = struct {
 						if len(bindings) == 1 {
 							binding = bindings[0]
 						}
-						return self.named_pattern(name, :binding)
+						pat = self.named_pattern(name, :binding)
 					}
-					.ImplicitVariant(name) -> return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, :bindings))
-					else return self.variant_pattern(callee, :bindings)
+					.ImplicitVariant(name) -> pat = self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, :bindings))
+					else pat = self.variant_pattern(callee, :bindings)
 				}
+				if pat >= 0 {
+					self.pattern_subs[pat] = subs
+				}
+				return pat
 			}
 			else return -1
 		}
@@ -855,11 +895,15 @@ type Parser = struct {
 		return [expr_id]
 	}
 
-	// Whether `x is P` binds a name, so an `if` has to match it rather than test it.
+	// Whether `x is P` binds a name or nests a pattern, so an `if` has to match it rather than test it.
 	func binds_names(self, anon expr_id: int64) -> bool {
 		if self.exprs[expr_id] is .Binary(_lhs, op, rhs) and op is .Is and self.exprs[rhs] is .Call(_callee, args) {
 			for arg in args {
-				if self.exprs[arg.value] is .Ident(name) and name != "_" {
+				if self.exprs[arg.value] is .Ident(name) {
+					if name != "_" {
+						return true
+					}
+				} else {
 					return true
 				}
 			}
@@ -1038,58 +1082,34 @@ type Parser = struct {
 		// Some(binding)
 		if self.at(.Identifier) and self.peek().value == "Some" {
 			self.advance()
-			mut binding: str = ""
-			if self.try_consume(.OpenParen) {
-				binding = self.binding_identifier()
-				self.expect(.CloseParen)
-			}
-			return self.alloc_pattern(ast.Pattern.SomePat(:binding))
+			let item = self.parse_one_payload()
+			return self.with_subs(self.alloc_pattern(ast.Pattern.SomePat(binding: item.binding)), :item)
 		}
 		// Ok(binding) / Err(binding) — `T or Error` result patterns.
 		if self.at(.Identifier) and self.peek().value == "Ok" {
 			self.advance()
-			mut binding: str = ""
-			if self.try_consume(.OpenParen) {
-				binding = self.binding_identifier()
-				self.expect(.CloseParen)
-			}
-			return self.alloc_pattern(ast.Pattern.OkPat(:binding))
+			let item = self.parse_one_payload()
+			return self.with_subs(self.alloc_pattern(ast.Pattern.OkPat(binding: item.binding)), :item)
 		}
 		if self.at(.Identifier) and self.peek().value == "Err" {
 			self.advance()
-			mut binding: str = ""
-			if self.try_consume(.OpenParen) {
-				binding = self.binding_identifier()
-				self.expect(.CloseParen)
-			}
-			return self.alloc_pattern(ast.Pattern.ErrPat(:binding))
+			let item = self.parse_one_payload()
+			return self.with_subs(self.alloc_pattern(ast.Pattern.ErrPat(binding: item.binding)), :item)
 		}
 		// Implicit enum variant: .Variant or .Variant(bindings...)
 		if self.try_consume(.Dot) {
 			mut variant_name: str = self.expect_identifier()
-			mut bindings: [str] = []
-			if self.try_consume(.OpenParen) {
-				for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
-					bindings += [self.binding_identifier()]
-					if not self.try_consume(.Comma) {
-						break
-					}
-				}
-				self.expect(.CloseParen)
-			}
-			return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(:variant_name, :bindings))
+			let items = self.parse_payload()
+			let bindings = payload_bindings(items)
+			return self.with_all_subs(self.alloc_pattern(ast.Pattern.ImplicitEnumPat(:variant_name, :bindings)), :items)
 		}
 		// Interface downcast: `StructType` or `StructType(binding)`. A bare
 		// identifier NOT followed by `.` (which would make it `Enum.Variant`).
 		// codegen validates it names a struct and the subject is an interface.
 		if self.at(.Identifier) and self.peek_kind_at(1) != .Dot {
 			let type_name: str = self.expect_identifier()
-			mut binding: str = ""
-			if self.try_consume(.OpenParen) {
-				binding = self.binding_identifier()
-				self.expect(.CloseParen)
-			}
-			return self.alloc_pattern(ast.Pattern.TypePat(:type_name, :binding))
+			let item = self.parse_one_payload()
+			return self.with_subs(self.alloc_pattern(ast.Pattern.TypePat(:type_name, binding: item.binding)), :item)
 		}
 		// Explicit enum variant: Enum.Variant or Enum.Variant(bindings...).
 		// Also accept three-part 'module.Enum.Variant', whose enum is named
@@ -1104,17 +1124,58 @@ type Parser = struct {
 			enum_name = f"{first}.{second}"
 			variant_name = self.expect_identifier()
 		}
-		mut bindings: [str] = []
+		let items = self.parse_payload()
+		let bindings = payload_bindings(items)
+		return self.with_all_subs(self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings)), :items)
+	}
+
+	// A payload position: a name, which binds, or a pattern (pattern >= 0) under a hidden name.
+	func parse_payload_item(self) -> ast.SubPattern {
+		if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot {
+			return ast.SubPattern(binding: self.binding_identifier(), pattern: -1)
+		}
+		let pattern = self.parse_pattern()
+		return ast.SubPattern(binding: hidden_binding(pattern), :pattern)
+	}
+
+	// `(a, .B(c), 0)`, if the pattern has one.
+	func parse_payload(self) -> [ast.SubPattern] {
+		mut items: [ast.SubPattern] = []
 		if self.try_consume(.OpenParen) {
 			for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
-				bindings += [self.binding_identifier()]
+				items += [self.parse_payload_item()]
 				if not self.try_consume(.Comma) {
 					break
 				}
 			}
 			self.expect(.CloseParen)
 		}
-		return self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings))
+		return items
+	}
+
+	// The `(x)` of `Some(x)`, if it has one; without it, an empty binding.
+	func parse_one_payload(self) -> ast.SubPattern {
+		if self.try_consume(.OpenParen) {
+			let item = self.parse_payload_item()
+			self.expect(.CloseParen)
+			return item
+		}
+		return ast.SubPattern(binding: "", pattern: -1)
+	}
+
+	func with_subs(self, anon pat: int64, item: ast.SubPattern) -> int64 {
+		return self.with_all_subs(pat, items: [item])
+	}
+
+	func with_all_subs(self, anon pat: int64, items: [ast.SubPattern]) -> int64 {
+		mut subs: [ast.SubPattern] = []
+		for item in items {
+			if item.pattern >= 0 {
+				subs += [item]
+			}
+		}
+		self.pattern_subs[pat] = subs
+		return pat
 	}
 
 
@@ -1367,11 +1428,12 @@ type Parser = struct {
 				break
 			}
 			let pats: [int64] = self.parse_match_arm_patterns()
+			let guarded = self.arm_guarded
 			let body_pos = self.pos
 			let errors_before = len(self.errors)
 			for pat in pats {
 				self.pos = body_pos
-				arms += [self.parse_match_expr_arm(pat)]
+				arms += [self.parse_match_expr_arm(pat, :guarded)]
 				if len(self.errors) > errors_before {
 					break
 				}
@@ -1382,7 +1444,8 @@ type Parser = struct {
 		return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
 	}
 
-	func parse_match_expr_arm(self, anon pat: int64) -> int64 {
+	func parse_match_expr_arm(self, anon pat: int64, guarded: bool) -> int64 {
+		let guard = self.parse_arm_guard(guarded)
 		mut body: int64 = 0
 		mut pre: [int64] = []
 		if self.at(.OpenCurly) {
@@ -1413,10 +1476,11 @@ type Parser = struct {
 		} else {
 			body = self.parse_expr()
 		}
-		return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre))
+		return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre, :guard))
 	}
 
-	func parse_match_stmt_arm(self, anon pat: int64) -> int64 {
+	func parse_match_stmt_arm(self, anon pat: int64, guarded: bool) -> int64 {
+		let guard = self.parse_arm_guard(guarded)
 		mut body: [int64] = []
 		if self.try_consume(.KwNone) {
 			// `else none` — empty no-op body sugar.
@@ -1427,7 +1491,19 @@ type Parser = struct {
 				body += [self.parse_stmt()]
 			}
 		}
-		return self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))
+		return self.alloc_match_arm(ast.MatchArm(pattern: pat, :body, :guard))
+	}
+
+	// `if cond ->` after an arm's patterns, or 0. Each alternative of an arm
+	// parses it for itself, as it does the body.
+	func parse_arm_guard(self, anon guarded: bool) -> int64 {
+		if not guarded {
+			return 0
+		}
+		self.expect(.KwIf)
+		let guard = self.parse_expr()
+		self.expect(.Arrow)
+		return guard
 	}
 
 	// The value of a block arm that ends in `return` or `throw`: a call that
@@ -1442,10 +1518,12 @@ type Parser = struct {
 
 	// Parse a match-arm's patterns and the connecting token. `else { ... }`,
 	// `else expr`, and `else -> expr` are accepted as catch-all arms in
-	// place of `else ...`. For non-else patterns, the `->` is required.
+	// place of `else ...`. For non-else patterns, the `->` is required, unless
+	// a guard comes first (`arm_guarded`), whose parse then takes the `->`.
 	// `.A | .B -> body` is one arm per pattern; the caller parses the body
 	// once for each, so each is its own statements, as with an `else` body.
 	func parse_match_arm_patterns(self) -> [int64] {
+		self.arm_guarded = false
 		if self.try_consume(.KwElse) {
 			self.try_consume(.Arrow)
 			return [self.alloc_pattern(ast.Pattern.Wildcard)]
@@ -1464,11 +1542,20 @@ type Parser = struct {
 				}
 			}
 		}
+		if self.at(.KwIf) {
+			self.arm_guarded = true
+			return pats
+		}
 		self.expect(.Arrow)
 		return pats
 	}
 
 	func pattern_binds(self, anon pat: int64) -> bool {
+		for sub in self.pattern_subs[pat] {
+			if self.pattern_binds(sub.pattern) {
+				return true
+			}
+		}
 		match self.patterns[pat] {
 			.EnumPat(_enum_name, _variant_name, bindings) -> return self.any_named(bindings)
 			.ImplicitEnumPat(_variant_name, bindings) -> return self.any_named(bindings)
@@ -1482,7 +1569,7 @@ type Parser = struct {
 
 	func any_named(self, anon bindings: [str]) -> bool {
 		for name in bindings {
-			if len(name) > 0 and name != "_" {
+			if len(name) > 0 and name != "_" and not is_hidden_binding(name) {
 				return true
 			}
 		}
@@ -2089,11 +2176,12 @@ type Parser = struct {
 					break
 				}
 				let pats: [int64] = self.parse_match_arm_patterns()
+				let guarded = self.arm_guarded
 				let body_pos = self.pos
 				let errors_before = len(self.errors)
 				for pat in pats {
 					self.pos = body_pos
-					arms += [self.parse_match_stmt_arm(pat)]
+					arms += [self.parse_match_stmt_arm(pat, :guarded)]
 					if len(self.errors) > errors_before {
 						break
 					}
@@ -2832,13 +2920,17 @@ type Renamer = struct {
 			}
 			else none
 		}
+		for sub in self.p.pattern_subs[pattern_id] {
+			self.bind_pattern(sub.pattern)
+		}
 	}
 
 	// A match arm's pattern binds for its body, one level in.
-	func arm(self, anon pattern_id: int64, body: [int64]) -> none {
+	func arm(self, anon pattern_id: int64, guard: int64, body: [int64]) -> none {
 		let mark = self.top
 		self.depth += 1
 		self.bind_pattern(pattern_id)
+		self.expr(guard)
 		for stmt_id in body {
 			self.stmt(stmt_id)
 		}
@@ -2898,7 +2990,7 @@ type Renamer = struct {
 				self.expr(subject)
 				for arm_id in arms {
 					let match_arm = self.p.match_arms[arm_id]
-					self.arm(match_arm.pattern, body: match_arm.body)
+					self.arm(match_arm.pattern, guard: match_arm.guard, body: match_arm.body)
 				}
 			}
 			.LetElse(pattern, value, else_body) -> {
@@ -2959,6 +3051,7 @@ type Renamer = struct {
 					let mark = self.top
 					self.depth += 1
 					self.bind_pattern(match_arm.pattern)
+					self.expr(match_arm.guard)
 					for stmt_id in match_arm.pre {
 						self.stmt(stmt_id)
 					}
@@ -3007,5 +3100,7 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
 	let dummy_body: [int64] = []
 	let func_decls: [ast.FuncDecl] = [ast.FuncDecl(name: "", name_span: ast.Span(start: 0), params: dummy_params, return_typ: 0, body: dummy_body, doc: "")]
 	let errors: [ParseError] = []
-	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :match_arms, :match_expr_arms, :func_decls, :errors, :line_starts, :type_spans, :pattern_ends)
+	let no_subs: [ast.SubPattern] = []
+	let pattern_subs: [[ast.SubPattern]] = [no_subs]
+	return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :pattern_subs, :match_arms, :match_expr_arms, :func_decls, :errors, :line_starts, :type_spans, :pattern_ends)
 }

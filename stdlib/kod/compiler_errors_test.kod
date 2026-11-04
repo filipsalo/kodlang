@@ -6965,3 +6965,218 @@ test "generic instances: a chain through a struct and a function, or one that br
     assert len(nested_errs) == 1
     assert nested_errs[0].message == "error: generic function `both` makes a module's instances pass 4096; its calls keep making new types"
 }
+
+test "a nested pattern needs a field it can match" {
+    let types = """
+        type Shape = enum {
+            Circle(r: int64)
+            Named(n: str, o: int64?)
+            Dot
+        }
+        """
+    let lit_errs: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle("a") -> print("a")
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(lit_errs, needle: "cannot match a `int64` value against a `str` literal")
+    let opt_errs: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle(Some(x)) -> print_int(x)
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(opt_errs, needle: "requires an optional value")
+    let enum_errs: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle(.Dot) -> print("a")
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(enum_errs, needle: "`.Dot` needs an enum value, got `int64`")
+    let unknown_errs: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let o: Shape? = none
+            match o {
+                Some(.Square(x)) -> print_int(x)
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(unknown_errs, needle: "Square")
+    assert len(unknown_errs) == 1
+    let bound_errs: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let o: Shape? = none
+            match o {
+                Some(.Circle(a, b)) -> print_int(a + b)
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(bound_errs, needle: "has 1 payload field, pattern binds 2")
+}
+
+test "alternatives can't bind under a nested pattern, but can test" {
+    let errs: [codegen.Diagnostic] = test_support.try_compile("""
+        type Shape = enum {
+            Circle(r: int64?)
+            Dot
+        }
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle(Some(x)) | .Dot -> print("a")
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(errs, needle: "alternatives joined by `|` can't bind names")
+    let fine: [codegen.Diagnostic] = test_support.try_compile("""
+        type Shape = enum {
+            Circle(r: int64?)
+            Dot
+        }
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle(Some(0)) | .Dot -> print("a")
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert len(fine) == 0
+}
+
+test "`is` as a plain test takes no nested pattern" {
+    let errs: [codegen.Diagnostic] = test_support.try_compile("""
+        type Shape = enum {
+            Circle(r: int64)
+            Dot
+        }
+        func main() -> int64 {
+            let s: Shape = .Dot
+            let a = s is .Circle(0)
+            if s is .Dot or s is .Circle(1) {
+                print("b")
+            }
+            let _ = a
+            return 0
+        }
+        """)
+    assert len(errs) == 2
+    assert test_support.any_message_contains(errs, needle: "a nested pattern works in a `match`, a let-else, or an `if` or `for` condition")
+}
+
+test "a guard must be a bool and can't bind" {
+    let bool_errs: [codegen.Diagnostic] = test_support.try_compile("""
+        func main() -> int64 {
+            let n = 1
+            match n {
+                1 if n -> print("a")
+                else -> print("b")
+            }
+            let v = match n {
+                1 if "s" -> 1
+                else -> 2
+            }
+            print_int(v)
+            return 0
+        }
+        """)
+    assert len(bool_errs) == 2
+    assert test_support.any_message_contains(bool_errs, needle: "a match guard must be a `bool`, got `int64`")
+    assert test_support.any_message_contains(bool_errs, needle: "a match guard must be a `bool`, got `str`")
+    let bind_errs: [codegen.Diagnostic] = test_support.try_compile("""
+        func main() -> int64 {
+            let o: int64? = 1
+            match o {
+                Some(_) if o is Some(v) -> print_int(v)
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(bind_errs, needle: "`is` can't bind `v` here")
+    let scope_errs: [codegen.Diagnostic] = test_support.try_compile("""
+        type Shape = enum {
+            Circle(r: int64)
+            Dot
+        }
+        func main() -> int64 {
+            let s: Shape = .Dot
+            match s {
+                .Circle(r) if r > 0 -> print("a")
+                .Dot if r > 0 -> print("b")
+                else -> print("c")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(scope_errs, needle: "`r`")
+}
+
+test "a pattern can't bind a name twice" {
+    let types = """
+        type S = enum {
+            P(a: int64, b: str)
+            Q(s: S?, b: str)
+            D
+        }
+        """
+    let flat: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let s: S = .D
+            match s {
+                .P(x, x) -> print(x)
+                else -> print("b")
+            }
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(flat, needle: "a pattern binds `x` twice")
+    let nested: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let x = 1
+            let s: S = .D
+            let _ = x
+            if s is .Q(Some(.P(x, _)), x) {
+                print(x)
+            }
+            let .Q(Some(.Q(_, y)), y) = s else { return 1 }
+            print(y)
+            return 0
+        }
+        """)
+    assert test_support.any_message_contains(nested, needle: "a pattern binds `x` twice")
+    assert test_support.any_message_contains(nested, needle: "a pattern binds `y` twice")
+    let fine: [codegen.Diagnostic] = test_support.try_compile(types + """
+        func main() -> int64 {
+            let s: S = .D
+            match s {
+                .P(_, _) -> print("a")
+                .Q(Some(.P(_a, _b)), _b) -> print("b")
+                else -> print("c")
+            }
+            return 0
+        }
+        """)
+    assert len(fine) == 0
+}

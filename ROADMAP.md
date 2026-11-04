@@ -53,6 +53,5 @@ codegen bugs that this kind of code is most likely to hit.
 
 ## Later
 
-- Pattern matching: nested patterns and guard clauses.
 - Closures that capture enclosing locals.
 - Dead-code elimination: skip compiling functions nothing reaches.
