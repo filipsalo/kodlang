@@ -124,8 +124,9 @@ The stdlib lives under `stdlib/` in the repository.
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
 | `env` | `get`, `set` and `unset` for environment variables. See [Built-ins](builtins.md#environment-variables). |
 | `time` | `monotonic_ns()`, `unix_ns()`, `Duration` and `sleep(d)`. See [Time](time.md). |
-| `sets` | `Set[T]`, a hash set built on `Map`. |
-| `sort` | `sorted_int64`, `sorted_str` (insertion sort; returns a new array). |
+| `sets` | `Set[T]`, a hash set built on `Map`: `Set[str]()`. |
+| `sort` | `sorted(xs)` and `sorted_by(xs, less:)`, stable, returning a new array. See [Arrays](arrays.md#sorting). |
+| `arrays` | `contains(xs, x)` and `equal(a, b)`. See [Arrays](arrays.md#helpers). |
 | `json` | Strict JSON parse/emit, with builders. See [JSON](json.md). |
 | `strbuilder`, `stream`, `posix` | `StrBuilder`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
 | `net/tcp`, `net/tls`, `net/http` | TCP, TLS, and HTTP/1.1 messages with a client. See [Streams](io.md) and [HTTP client](http.md). |

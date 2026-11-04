@@ -471,10 +471,11 @@ type in both.
 
 ### Limits
 
-- A generic function isn't a value until it has its type arguments, and can't
-  be a value yet with them. `let f = first` and `let f = first[int64]` are
-  errors. A function literal does the job:
-  `func(anon xs: [int64]) -> int64? { return first(xs) }`.
+- A generic function is a value once it has its type arguments, as in
+  `let f = first[int64]` or `sorted_by(xs, less: before[T])`. Without them,
+  `let f = first` is an error, and they aren't inferred from where the value
+  goes. A value's type arguments must fit on one: `pair[A, B]` is only read as
+  a call, so wrap a call of it in a function literal.
 - Only top-level functions can be generic. A method can use its struct's type
   parameters but can't declare its own, and neither can an interface method, a
   function literal, an extern or `main`. A module-level constant can't either.

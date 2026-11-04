@@ -173,3 +173,40 @@ Appending (`+=`) goes through `_kod_array_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity
 only when `cap` runs out. `+` goes through `_kod_array_concat_new`, which
 allocates a fresh header and buffer.
+
+## Helpers
+
+The `arrays` module has what's the same for an array of any type:
+
+```kod
+import "arrays"
+
+arrays.contains(["a", "b"], "b")     // true
+arrays.equal([1, 2], [1, 2])         // true
+```
+
+Elements compare with `==`, so `str`s by content, and a type that `==` doesn't
+take is an error (see [Generic functions](functions.md#checking)).
+
+## Sorting
+
+The `sort` module's functions return a new array and leave the argument as it
+is. They take O(n log n) comparisons and are stable: elements that compare equal
+keep their order.
+
+```kod
+import "sort"
+
+sort.sorted([3, 1, 2])       // [1, 2, 3]
+sort.sorted(["b", "a"])      // ["a", "b"]
+```
+
+`sorted` orders by `<`, so it takes numbers, `str`s (by byte), and structs that
+declare [`op_lt`](structs.md#operators). `sorted_by` takes the order as a
+function that says whether its first argument goes before its second:
+
+```kod
+sort.sorted_by(people, less: func(a: Person, b: Person) -> bool {
+    return a.age < b.age
+})
+```
