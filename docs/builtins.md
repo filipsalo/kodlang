@@ -45,7 +45,7 @@ else doesn't hide the builtin, so `kod_panic(msg)` after
 | `print` | `(x) -> none` | Print `x`, followed by a newline. Takes whatever `f"{x}"` does (see [Strings](strings.md)). |
 | `print_int` | `(int64) -> none` | Print an integer followed by a newline. Equivalent to `print(n.to_str())`. |
 | `kod_puts` | `(str) -> int64` | Write a string and a newline to stdout. What `print` calls; embedded NULs are written as-is. |
-| `putchar` | `(int64) -> int64` | C `putchar`: write a single byte to stdout. Also runs in the interpreter, which shares libc's stdout buffer with `kod_puts`. |
+| `putchar` | `(int64) -> int64` | C `putchar`: write a single byte to stdout. Shares libc's stdout buffer with `print`. |
 
 ## Length
 
@@ -187,7 +187,7 @@ assert r.status == 0
 assert r.stdout == "hello\n"
 ```
 
-`process.run(argv)` captures stdout and stderr. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run. Compiled programs only: the interpreter does not mirror its extern.
+`process.run(argv)` captures stdout and stderr. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run.
 
 ```kod
 import "process"
@@ -220,8 +220,6 @@ func main() -> int64 {
 | `get(name) -> str?` | the value, or `none` if the variable isn't set; a variable set to the empty string is `""`, not `none` |
 | `set(name, value) -> none or Error` | set or replace it; the change is seen by programs started afterwards with `process.run` and `process.exec`; an empty `name`, one containing `=` or a NUL byte, and a `value` with a NUL byte are `InvalidInput` errors |
 | `unset(name) -> none` | remove it; unsetting a variable that isn't set does nothing |
-
-Compiled programs only: the interpreter does not mirror these externs.
 
 ## Extern (C runtime)
 

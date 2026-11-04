@@ -110,8 +110,8 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 
 `make test` rebuilds the toolchain and runs pytest, which covers three kinds of check:
 
-- **Example programs**: every `tests/**/*.kod`. Trailing `// expected output:`, `// expected errors:`, `// expected stderr:`, `// expected status:` and `// expected mode:` comments say what should happen. By default each one runs both compiled and under the Python interpreter (`mode: run` / `mode: interpret` pick one, `mode: skip` opts out).
+- **Example programs**: every `tests/**/*.kod`. Trailing `// expected output:`, `// expected errors:`, `// expected stderr:`, `// expected status:` and `// expected mode:` comments say what should happen. Each one is compiled and run; `mode: skip` opts out, for a module other fixtures import.
 - **Test blocks**: every `*_test.kod` in the repo that contains `test` blocks runs through `kod test <file>`, one pytest case per file.
-- **Self-hosting**: the fixed-point check and the interpreter parity check described in [Self-hosting](self-hosting.md#verifying-self-hosting).
+- **Self-hosting**: the fixed-point check described in [Self-hosting](self-hosting.md#verifying-self-hosting).
 
-The tests run programs through the native tools, `build/apps/kod/kod` and `build/stage1/sh_kodc`; Python only runs the interpreter. Python is frozen: language features and build logic are added in Kod, and a fixture for a feature the interpreter does not have says `// expected mode:` `run`. An `extern func` the interpreter does not mirror is compiled-only, so a fixture that calls one says `run` too.
+The tests run programs through the native tools, `build/apps/kod/kod` and `build/stage1/sh_kodc`; Python is only the test harness and the launcher.

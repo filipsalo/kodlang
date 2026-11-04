@@ -9,13 +9,6 @@ with `make` and hand off to the native tool, build/apps/kod/kod):
                          artifacts (exits non-zero if anything failed)
     kod test <path>      run `test` blocks in a file, or in every
                          `*_test.kod` under a directory
-
-Internal commands (subject to change; Python is the interpreter and the
-bootstrap, see docs/self-hosting.md):
-    kod _interpret <file>          run via the Python interpreter
-    kod _emit-runtime-main <file> <out.s>
-                                   write the `_main` shim (the no-snapshot
-                                   bootstrap's; sh_kodc has its own)
 """
 
 import argparse
@@ -25,14 +18,6 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-
-from kod.bootstrap import compose_runtime_main_asm
-from kod.exceptions import KodError
-from kod.filesys import FileSystem, FileWrapper
-from kod.interpreter import Interpreter
-from kod.loader import Loader, LoadError
-from kod.paths import find_stdlib_path
-from kod.program import Program
 
 _NATIVE_COMMANDS = {"build", "run", "test", "check"}
 
@@ -59,16 +44,6 @@ def _make_parser() -> argparse.ArgumentParser:
 
     p = subparsers.add_parser("test", help="run `test` blocks")
     p.add_argument("path", type=str)
-
-    # Internal commands. Underscore prefix signals "not part of the public
-    # surface; shape and existence may change."
-    p = subparsers.add_parser("_interpret")
-    p.add_argument("file", type=str)
-    p.add_argument("args", nargs="*")
-
-    p = subparsers.add_parser("_emit-runtime-main")
-    p.add_argument("file", type=str)
-    p.add_argument("out", type=str)
 
     return parser
 
@@ -132,72 +107,12 @@ def _hand_off_to_native() -> int:
     os.execv(str(native), [str(native), *sys.argv[1:]])
 
 
-def _load(file: str) -> tuple[Program, FileWrapper] | None:
-    """Parse the program whose entry is `file`. On failure, say why on stderr
-    and return None."""
-    project_fs = FileSystem(Path.cwd())
-    loader = Loader(project_fs=project_fs, stdlib_fs=FileSystem(find_stdlib_path()))
-    try:
-        entry_module = project_fs.open(Path(file).absolute())
-        return loader.parse_program(entry_module), entry_module
-    except KodError as err:
-        print(err, file=sys.stderr)
-    except FileNotFoundError as err:
-        # Same wording as sh_kodc, for the entry or for a module it imports.
-        name = Path(err.filename)
-        if name.is_relative_to(Path.cwd()):
-            name = name.relative_to(Path.cwd())
-        print(f"{name}:1:1: error: no such file", file=sys.stderr)
-    except LoadError as err:
-        print(err, file=sys.stderr)
-    return None
-
-
-def _interpret(file: str, args: list[str]) -> int:
-    """Run `file` in the interpreter. The program's own exit goes through
-    `sys.exit` in `Interpreter.run`."""
-    loaded = _load(file)
-    if loaded is None:
-        return 1
-    program, entry_module = loaded
-    try:
-        Interpreter(program).run(entry_module, [str(entry_module), *args])
-    except KodError as err:
-        print(err, file=sys.stderr)
-        return 1
-    return 0
-
-
-def _emit_runtime_main(file: str, out: str) -> int:
-    """Write the `_main` shim for the entry `file` to `out`: what the
-    Makefile uses for `kodc.kod` and `tools/kod.kod` when there is no
-    snapshot."""
-    loaded = _load(file)
-    if loaded is None:
-        return 1
-    program, entry_module = loaded
-    try:
-        asm = compose_runtime_main_asm(program, entry_module)
-    except ValueError as err:
-        print(f"kod: _emit-runtime-main: {err}", file=sys.stderr)
-        return 1
-    out_path = Path(out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(asm)
-    return 0
-
-
 def main():
     """Main entry point."""
     if len(sys.argv) > 1 and sys.argv[1] in _NATIVE_COMMANDS:
         return _hand_off_to_native()
 
-    args = _make_parser().parse_args()
-    match args.command:
-        case "_interpret":
-            return _interpret(args.file, args.args)
-        case "_emit-runtime-main":
-            return _emit_runtime_main(args.file, args.out)
+    _make_parser().parse_args()
     return 0
 
 

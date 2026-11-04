@@ -301,8 +301,7 @@ the template is reported for one instance only.
 
 A generic struct or enum may name itself, with any type arguments, in its
 fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
-`Pair[B, A]` above. The Python interpreter (`kod _interpret`) does not
-parse these yet.
+`Pair[B, A]` above.
 
 The built-in `Map[K, V]` is the canonical example.
 

@@ -6,10 +6,8 @@
 #   make stage1           build sh_kodc under build/stage1/
 #   make bootstrap        wipe build/ and rebuild stage0 + stage1 from scratch
 #   make bootstrap-snapshot
-#                         force the slow Python path end-to-end and copy the
-#                         resulting sh_kodc to bootstrap/sh_kodc. Run after
-#                         changes that the checked-in snapshot can no longer
-#                         handle (parser format, runtime ABI, …) and commit.
+#                         run selfhost-check, then copy the compiler it built
+#                         to bootstrap/sh_kodc. Commit the result on its own.
 #   make test             build sh_kodc + the kod driver, then run pytest
 #                         (example programs, every *_test.kod, self-hosting checks)
 #   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
@@ -32,24 +30,20 @@
 # C objects also when a header in stdlib/ changes.
 #
 # Layout:
-#   bootstrap/sh_kodc     arm64-darwin sh_kodc snapshot — checked in so a
-#                         fresh clone (or `make clean`) can rebuild stage1
-#                         in seconds instead of ~165 s in the Python interp.
+#   bootstrap/sh_kodc     arm64-darwin sh_kodc snapshot: what builds stage1,
+#                         on a fresh clone or after `make clean`. The only way
+#                         in (see docs/self-hosting.md for recovering one).
 #   build/stage0/         the objects every program links (link.cfg's RUNTIME_C
 #                         and STAGE0_KOD) and the compiler library
 #   build/stage1/         kodc.{s,o}, runtime_main.{s,o}, sh_kodc
 #   build/apps/<stem>/    the final executable, and its objects in <stem>.obj/
 
 PY := uv run python
-KOD := $(PY) -m kod
 
-# Compiler used to lower stage1 sources to .s. The checked-in snapshot
-# is ~30× faster than the Python interpreter on a cold stage1 build;
-# falls back to Python when the snapshot is missing (first build before
-# the binary lands, or `make bootstrap-snapshot`).
+# Compiler used to lower stage1 sources to .s.
 BOOTSTRAP_SH_KODC := bootstrap/sh_kodc
-KODC := $(if $(wildcard $(BOOTSTRAP_SH_KODC)),./$(BOOTSTRAP_SH_KODC),$(KOD) _interpret kodc.kod)
-KODC_EMIT_MAIN := $(if $(wildcard $(BOOTSTRAP_SH_KODC)),./$(BOOTSTRAP_SH_KODC) _emit-runtime-main,$(KOD) _emit-runtime-main)
+KODC := ./$(BOOTSTRAP_SH_KODC)
+KODC_EMIT_MAIN := ./$(BOOTSTRAP_SH_KODC) _emit-runtime-main
 
 STAGE0 := build/stage0
 STAGE1 := build/stage1
@@ -99,8 +93,8 @@ STAGE0_OBJS := \
 # Every module compile reads the stage0 sources (builtins generics are
 # monomorphised into each object; io/process/time layouts are imported),
 # so any edit to one recompiles everything — a few seconds. Also depend
-# on the compiler binary itself when KODC is one (not the Python form).
-KODC_DEP := $(wildcard $(patsubst ./%,%,$(firstword $(KODC))))
+# on the compiler binary itself.
+KODC_DEP := $(patsubst ./%,%,$(firstword $(KODC)))
 KOD_DEPS := $(KODC_DEP) $(STAGE0_KOD)
 
 # Compiler-library .o files shared by `make stage1` (sh_kodc itself)
@@ -139,14 +133,16 @@ AS := as -target arm64-apple-darwin
 
 all: stage1
 
+$(BOOTSTRAP_SH_KODC):
+	@echo "$@ not found; restore it with: git checkout -- $@ (see docs/self-hosting.md)" >&2
+	@exit 1
+
 $(LINK_STAMP):
 	mkdir -p $(dir $@)
 	echo '$(LINK_NOW)' > $@
 
-# Native `kod` driver — `kod build / run` orchestration written in
-# kod itself. Once built, the Python `kod` CLI (kod/__main__.py)
-# delegates straight to this binary for build / run / test / check
-# so users skip the Python startup tax.
+# Native `kod` driver: `kod build / run / test / check`, written in Kod.
+# The launcher (kod/__main__.py) hands off to this binary.
 KOD_APP := build/apps/kod
 kod: $(KOD_APP)/kod
 
@@ -155,7 +151,6 @@ $(KOD_APP)/kod: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)
 	$(LINK) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o
 
-# Two steps (not `_compile`) so the Python-interpreter fallback works.
 $(KOD_APP)/_kod.s: tools/kod.kod $(COMPILER_KOD)
 	mkdir -p $(KOD_APP)
 	$(KODC) $< > $@
@@ -187,10 +182,7 @@ endef
 $(foreach c,$(RUNTIME_C),$(eval $(call runtime_c_rule,$(c))))
 
 # Always-linked stdlib .kod modules (STAGE0_KOD) — each lowered to .s by
-# $(KODC) then assembled. Two steps (codegen to stdout + `as`) rather than
-# `$(KODC) _compile` so the bootstrap fallback works: when the snapshot is
-# missing $(KODC) is the Python interpreter, which can't drive `_compile`
-# (that needs the redirect_stdout / process.run externs, native only).
+# $(KODC) then assembled.
 define stage0_kod_rule
 $(STAGE0)/_$(basename $(notdir $(1))).s: $(1)
 	mkdir -p $(STAGE0)
@@ -262,21 +254,15 @@ bootstrap:
 	rm -rf build
 	$(MAKE) stage1
 
-# Rebuild the checked-in arm64-darwin snapshot from scratch via the
-# Python interpreter, then drop the result into bootstrap/. Run this
-# after a change that the current snapshot can't compile (parser
-# format, runtime ABI, codegen shape, …) and commit the new binary.
-# Hiding the snapshot first forces the slow Python path; the recursive
-# `make stage1` reruns the Makefile so KODC re-evaluates to the
-# Python form.
-bootstrap-snapshot:
-	@echo "==> Rebuilding bootstrap snapshot via Python interpreter (slow)..."
-	rm -f $(BOOTSTRAP_SH_KODC)
-	rm -rf build/stage0 build/stage1
-	$(MAKE) stage1
-	@mkdir -p $(dir $(BOOTSTRAP_SH_KODC))
-	cp build/stage1/sh_kodc $(BOOTSTRAP_SH_KODC)
-	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Verify, then commit it."
+# Replace the checked-in snapshot with the compiler selfhost-check built, once
+# that compiler has reproduced itself byte for byte. Nothing touches the old
+# snapshot before that. The mv is not a cp over the old file: macOS kills a
+# signed binary that was rewritten in place.
+bootstrap-snapshot: selfhost-check
+	cmp $(SELFHOST)/stage2/stage1/sh_kodc $(SELFHOST)/stage3/stage1/sh_kodc
+	cp $(SELFHOST)/stage2/stage1/sh_kodc $(BOOTSTRAP_SH_KODC).new
+	mv $(BOOTSTRAP_SH_KODC).new $(BOOTSTRAP_SH_KODC)
+	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Commit it on its own."
 
 test: stage1 kod
 	uv run pytest tests/

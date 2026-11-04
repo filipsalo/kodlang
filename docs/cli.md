@@ -75,9 +75,4 @@ uv run kod check src/foo.kod
 
 ## Internal / debug commands
 
-These exist to support the bootstrap and for debugging. Their shape may change. `sh_kodc` has its own internal subcommands (`_compile`, `_emit-runtime-main`, `_emit-test-runtime-main`).
-
-| Command | Purpose |
-|---------|---------|
-| `kod _interpret <file>` | Run via the Python interpreter (slow; used by sh_kodc's bootstrap). |
-| `kod _emit-runtime-main <entry.kod> <out.s>` | Write the `_main` shim for the given entry: the bootstrap's version, which the Makefile uses when there is no snapshot. `build/stage1/sh_kodc _emit-runtime-main` writes the same shim. Run from the repository root. |
+These exist for the build and for debugging. Their shape may change: `sh_kodc` has the internal subcommands `_compile`, `_emit-runtime-main` and `_emit-test-runtime-main`.

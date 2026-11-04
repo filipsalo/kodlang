@@ -80,8 +80,7 @@ def app_dir(stem: str) -> contextlib.AbstractContextManager[Path]:
 
 @pytest.fixture
 def scratch() -> Iterator[Path]:
-    """A fresh directory below build/, so that the entries in it are inside
-    the project, as the interpreter requires."""
+    """A fresh directory below build/."""
     (ROOT / "build").mkdir(exist_ok=True)
     path = Path(tempfile.mkdtemp(dir=ROOT / "build", prefix="names_"))
     try:

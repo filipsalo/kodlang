@@ -377,14 +377,14 @@ Declare external C functions with `extern`:
 
 ```kod
 extern func labs(anon n: int64) -> int64     // compiled programs only
-extern func putchar(anon c: int64) -> int64  // also runs in the interpreter
+extern func putchar(anon c: int64) -> int64
 ```
 
-An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`, so a libc function that takes a C string does not fit. The interpreter runs only the twelve externs it mirrors (`putchar` is one); calling any other stops with ``error: extern `NAME` is not available in the interpreter``.
+An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`, so a libc function that takes a C string does not fit.
 
 ## Recursion
 
-Recursion works in the interpreter. In the compiler, mutual recursion between functions is supported as long as all functions are declared in the same module.
+Mutual recursion between functions is supported as long as all functions are declared in the same module.
 
 ```kod
 func fib(n: int64) -> int64 {

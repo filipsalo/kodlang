@@ -118,7 +118,7 @@ The stdlib lives under `stdlib/` in the repository.
 | Module | Contents |
 |--------|----------|
 | `builtins` | Always imported. `print`, `print_int`, `len`, `fail`, `Map[K, V]`, `Option[T]`, the `Error` / `Stringable` / `ExitCode` interfaces. |
-| `primitives/int64`, `primitives/float64`, `primitives/str`, `primitives/bool` (and `int64_float`, `str_float`, whose methods `to_float64` and `parse_float` are kept apart because the Python interpreter reads `int64` and `str`) | Methods on the primitive types (`to_str`, `hash`, `parse_float`). Auto-loaded; not imported directly. |
+| `primitives/int64`, `primitives/float64`, `primitives/str`, `primitives/bool` (and `int64_float`, `str_float`, which hold `to_float64` and `parse_float`) | Methods on the primitive types (`to_str`, `hash`, `parse_float`). Auto-loaded; not imported directly. |
 | `io` | `read_file`, `write_file`, and stdin/stdout/stderr helpers. |
 | `fs` | `FileSystem` interface with `DiskFs` (real disk) and `MemFs` (in-memory, for tests). |
 | `process` | `process.run(argv)` — spawn a subprocess and capture stdout/stderr/exit code. `process.exec(argv)` — replace the calling process (compiled programs only). |
@@ -140,8 +140,7 @@ The stdlib lives under `stdlib/` in the repository.
 
 ## Circular imports
 
-Keep the dependency graph a DAG: the interpreter can't load circular
-imports. The compiler accepts them, and a struct, enum or interface
+Circular imports work: a struct, enum or interface
 declared in a module of the cycle is the same type on either side, so a
 value of it can be passed both ways, also inside an array, an optional, a
 `Map` or another generic type's instance such as `Box[Pt]`, and `is`
@@ -228,7 +227,7 @@ These are errors, `path:line:1: error: ...`, from `kod build`, `kod run`, `kod t
 
 Only a program that imports the module compiles its C file or passes its arguments, and that includes a module that only a test file imports: `kod test` reads the lines of every module of its program, and `kod test <dir>` builds all its files into one program, so one test file's missing `kod:require` file stops them all. A program that imports no such module compiles no C file. A C file's object is `<stem>.obj/<path>.c.o` in the tree of [Symbol and object names](#symbol-and-object-names), next to the module's own `<path>.kod.o`. If the C compiler fails, `kod` shows its output and `kod: compiling <file> failed`, exits 1 and links nothing.
 
-A module that declares link inputs cannot be one that the Makefile builds: it does not read their lines. That is a module listed in `STAGE0_KOD` of `link.cfg`, one of the compiler's own modules (`COMPILER_KOD` in the Makefile) and `kodc.kod` and `tools/kod.kod`. For a `STAGE0_KOD` module the driver says so (`path:line:1: error: ...`) and stops, rather than leave the lines unread; for the others a test of the repository checks that there are none. And the interpreter cannot call the module's `extern func`s (see [Extern functions](functions.md#extern-functions)).
+A module that declares link inputs cannot be one that the Makefile builds: it does not read their lines. That is a module listed in `STAGE0_KOD` of `link.cfg`, one of the compiler's own modules (`COMPILER_KOD` in the Makefile) and `kodc.kod` and `tools/kod.kod`. For a `STAGE0_KOD` module the driver says so (`path:line:1: error: ...`) and stops, rather than leave the lines unread; for the others a test of the repository checks that there are none.
 
 C files export bare symbols into one namespace shared with libc and `runtime.c`: name them `kod_<module>_...`. `#include "kod_rt.h"` (`CFLAGS` has `-I stdlib`) declares what they need of the runtime:
 

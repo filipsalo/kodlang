@@ -4,7 +4,7 @@ icon: lucide/house
 
 # Kod
 
-Kod is a toy language that compiles to AArch64 (Apple Silicon) machine code for macOS. A Python frontend bootstraps the self-hosted compiler (`sh_kodc`), which compiles Kod programs — including itself.
+Kod is a toy language that compiles to AArch64 (Apple Silicon) machine code for macOS. The self-hosted compiler (`sh_kodc`) compiles Kod programs, including itself.
 
 ```kod
 func main() -> int64 {
@@ -33,4 +33,4 @@ Hello, world!
 
 ## Status
 
-The self-hosted compiler (`sh_kodc`) is the production path. The Python interpreter (`kod _interpret`) remains as the bootstrap and as a second implementation of the language; it is frozen (see [Self-hosting](self-hosting.md#whats-still-python)).
+The self-hosted compiler (`sh_kodc`) is the only implementation. A checked-in snapshot of it builds the current sources (see [Self-hosting](self-hosting.md#build-chain)).
