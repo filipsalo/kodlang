@@ -294,7 +294,7 @@ joins with `and`. Its names are in scope in the operands after it and in
 the body, as if each `is` were its own `if` nested inside the one before:
 
 ```kod
-if decl is .Import(_path, alias, _items) and alias.starts_with("#") == false {
+if decl is .Import(_path, alias, _items) and not alias.starts_with("#") {
     aliases += [alias]
 }
 if a is .Some(x) and b is .Some(y) and x == y {
