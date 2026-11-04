@@ -213,6 +213,45 @@ func add(anon a: int64, anon b: int64) -> int64 {
     assert run(tmp_path, body, decls) == str(sum(range(1, 3000000, 2)))
 
 
+def test_jump_inside_call_arguments_inside_call_arguments(tmp_path):
+    # Not deep at all: the `continue` used to skip the inner call's stack
+    # cleanup, so the outer call read its first argument from the wrong slot.
+    decls = """
+func add(anon a: int64, anon b: int64) -> int64 {
+    return a + b
+}
+"""
+    body = """    let a = id(1)
+    let r = add(7, match a {
+        1 -> {
+            mut t = 0
+            for i in 0..3 {
+                t += add(1, match a {
+                    1 -> {
+                        if i == 1 {
+                            continue
+                        }
+                        i
+                    }
+                    else -> 0
+                })
+            }
+            t
+        }
+        else -> 0
+    })
+    print_int(r)"""
+    assert run(tmp_path, body, decls) == "11"
+
+
+def test_long_and_or_chains(tmp_path):
+    names = [f"n == {i}" for i in range(40)]
+    body = f"""    let n = id(39)
+    print({" or ".join(names)})
+    print({" and ".join(["n > 0"] * 40)})"""
+    assert run(tmp_path, body).split() == ["true", "true"]
+
+
 def test_nested_loops_each_keep_their_own_stack(tmp_path):
     decls = """
 func add(anon a: int64, anon b: int64) -> int64 {

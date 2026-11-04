@@ -103,7 +103,7 @@ Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool in
 
 - **Expression / statement / type-expr pools** on the parser: AST nodes are stored in flat arrays and referenced by `int64` ids.
 - **Struct / enum / interface tables** on the codegen: registration happens before compilation; field/method lookups index these tables. Each module also keeps a table of the type names it declares, so a type name resolves in the module that wrote it: through that module's own table, the tables of the modules its import lists name, then the builtins', and `m.T` through the table of the module imported as `m`.
-- **Register pool**: `x8`–`x15` used as expression temporaries; saved/restored across calls via stack spills as needed.
+- **Register pool**: `x8`–`x15` used as expression temporaries; saved/restored across calls via stack spills as needed. Code nested too deeply for the pool saves every live register to frame slots and compiles with all of them free, so nesting has no fixed limit.
 - **Generic monomorphisation**: each unique `Map[str, int64]` instantiation gets its own struct entry; methods compile once per instantiation.
 - **Interface dispatch**: `{data_ptr, vtable_ptr}` cells in the arena, one vtable per (struct, interface) pair; primitives box implicitly.
 
