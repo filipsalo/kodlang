@@ -301,7 +301,12 @@ the template is reported for one instance only.
 
 A generic struct or enum may name itself, with any type arguments, in its
 fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
-`Pair[B, A]` above.
+`Pair[B, A]` above. The instances have to end, though: one that keeps naming a
+bigger type, like `next: W[[T]]?` in `W[T]` or a method of `W[T]` that makes a
+`W[[T]]`, is an error once it is 64 instances deep
+(`` generic type `W` is 64 instances deep; each one names another with a new type ``).
+Methods that branch into new types are stopped earlier, when a module passes 4096
+instances.
 
 The built-in `Map[K, V]` is the canonical example.
 

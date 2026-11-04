@@ -461,7 +461,9 @@ func largest[T](a: T, b: T) -> T {
 
 A generic function may call itself and other generic functions. The chain of
 instances has to end: one that keeps making a bigger type, like `f[[T]]` inside
-`f[T]`, is an error once it is 64 instances deep.
+`f[T]`, is an error once it is 64 instances deep, also when the chain runs
+through a [generic struct's](structs.md#generic-structs) methods. A chain that
+branches into new types is stopped earlier, when a module passes 4096 instances.
 
 Parameter defaults and the body resolve names in the module that wrote them,
 as for a [generic struct's methods](modules.md), and `T` means the instance's
