@@ -75,7 +75,11 @@ against `3` is an error, and so is matching an optional: with
 ### Enum variant (explicit)
 
 ```kod
-type Color = enum { Red, Green, Blue }
+type Color = enum {
+    Red
+    Green
+    Blue
+}
 
 match c {
     Color.Red   -> print("red")
@@ -358,7 +362,11 @@ is reported instead, since it's usually a misspelling of the missing one,
 and its bindings don't cause further errors in the arm.
 
 ```kod
-type Color = enum { Red, Green, Blue }
+type Color = enum {
+    Red
+    Green
+    Blue
+}
 
 let c: Color = .Red
 // error: match on Color doesn't cover variant Blue

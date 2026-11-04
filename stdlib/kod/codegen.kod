@@ -200,6 +200,8 @@ type MethodInfo = struct {
 }
 
 type StructInfo = struct {
+    // How many instances' bodies led to this instance.
+    body_depth: int64 = 0
     name: str
     fields: [FieldInfo]
     methods: [MethodInfo]
@@ -556,6 +558,8 @@ type Codegen = struct {
     entry_import_paths: [str] = []
     bad_hash_keys: [str] = []
     inst_depth: int64 = 0
+    // Instances went 64 deep and that's reported: making more could only repeat it, at length.
+    inst_limit_hit: bool = false
     // Bad-key instances, reported at the outermost instantiation's site.
     pending_bad_keys: [int64] = []
     // 1 never, 0 may return, 2 deciding, -2 may while what it rests on does, -1 decide again.
@@ -1544,6 +1548,11 @@ type Codegen = struct {
     // enough for the handful of errors we'd ever report in a single
     // compile.
     func report_error(self, anon text: str, span: ast.Span) -> none {
+        // Past the instance limit, a generic body's errors are mostly what the refused instance leaves.
+        if self.inst_limit_hit and (self.body_instance >= 0 or self.body_func_inst >= 0) {
+            self.report_attempts += 1
+            return
+        }
         // A generic body is template code, so name the instance that has the error.
         if self.body_instance >= 0 {
             self.report_message(f"{text} (in `{self.struct_display_name(self.body_instance)}`)", :span)
@@ -4430,6 +4439,10 @@ type Codegen = struct {
         if self.struct_insts.get(key) is Some(existing) {
             return existing
         }
+        let body_depth = self.body_depth_here()
+        if self.type_instances_too_deep(template.name, :body_depth, span: whole) {
+            return template_idx
+        }
         mut canonical = template.name
         for ta in type_args {
             canonical = f"{canonical}${self.canonical_kind_name(ta)}"
@@ -4440,7 +4453,7 @@ type Codegen = struct {
         }
         let empty_params: [str] = []
         // Registered before its fields and sigs resolve, so a self-reference finds it.
-        self.structs += [StructInfo(name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key)]
+        self.structs += [StructInfo(:body_depth, name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key)]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
         let insts = self.struct_insts
@@ -4631,6 +4644,9 @@ type Codegen = struct {
         let key = self.instance_key(template.key, args: type_args)
         if self.enum_insts.get(key) is Some(existing) {
             return existing
+        }
+        if self.type_instances_too_deep(template.name, body_depth: self.body_depth_here(), span: whole) {
+            return template_idx
         }
         mut canonical = template.name
         for ta in type_args {
@@ -4889,20 +4905,58 @@ type Codegen = struct {
 
     // Asks for the body to be compiled, unless the instances have gone too deep to end.
     func queue_func_instance(self, anon idx: int64, span: ast.Span) -> none {
-        if self.func_insts[idx].queued {
+        if self.func_insts[idx].queued or self.inst_limit_hit {
             return
         }
-        mut depth = 0
-        if self.body_func_inst >= 0 {
-            depth = self.func_insts[self.body_func_inst].depth + 1
-        }
+        let depth = self.body_depth_here()
+        let name = self.func_insts[idx].sig.src_p.func_decls[self.func_insts[idx].sig.decl_id].name
         if depth >= 64 {
-            self.report_message(f"error: generic function `{self.func_insts[idx].sig.src_p.func_decls[self.func_insts[idx].sig.decl_id].name}` is 64 instances deep; each one calls another with a new type", :span)
+            self.inst_limit_hit = true
+            self.report_message(f"error: generic function `{name}` is 64 instances deep; each one calls another with a new type", :span)
+            return
+        }
+        if self.too_many_instances() {
+            self.inst_limit_hit = true
+            self.report_message(f"error: generic function `{name}` makes a module's instances pass 4096; its calls keep making new types", :span)
             return
         }
         self.func_insts[idx].queued = true
         self.func_insts[idx].depth = depth
         self.func_inst_queue += [idx]
+    }
+
+    // The depth of an instance the body being compiled asks for: 0 outside generic bodies.
+    func body_depth_here(self) -> int64 {
+        if self.body_func_inst >= 0 {
+            return self.func_insts[self.body_func_inst].depth + 1
+        }
+        if self.body_instance >= 0 {
+            return self.structs[self.body_instance].body_depth + 1
+        }
+        return 0
+    }
+
+    // Whether to refuse a new instance of a generic type, whose fields and bodies may ask for still bigger ones.
+    func type_instances_too_deep(self, anon name: str, body_depth: int64, span: ast.Span) -> bool {
+        if self.inst_limit_hit {
+            return true
+        }
+        if self.inst_depth < 64 and body_depth < 64 {
+            if not self.too_many_instances() {
+                return false
+            }
+            self.inst_limit_hit = true
+            self.report_message(f"error: generic type `{name}` makes a module's instances pass 4096; its methods keep making new types", :span)
+            return true
+        }
+        self.inst_limit_hit = true
+        self.report_message(f"error: generic type `{name}` is 64 instances deep; each one names another with a new type", :span)
+        return true
+    }
+
+    // A chain that branches doubles at each level, so it never gets deep in the time there is.
+    func too_many_instances(self) -> bool {
+        return len(self.func_inst_queue) + len(self.structs) >= 4096
     }
 
     func compile_generic_call(self, anon fn_ref: FnRef, args: [ast.CallArg], chain: int64, span: ast.Span) -> Val {
