@@ -342,7 +342,9 @@ print_int(apply(triple, 14)) // 42 — function passed as callback
 
 A function literal, `func(anon n: int64) -> int64 { return n + 1 }`, is
 a value of its function type too. It doesn't see the locals of the
-function it's written in, since there are no closures yet.
+function it's written in, since there are no closures yet, and a name it can't
+find says so: `` unknown name `limit`; a function literal can't see the locals
+of the function around it ``.
 
 A bare identifier in value position resolves to the function's address
 when no local of that name is in force there. A call `f(args)` goes to a

@@ -409,7 +409,9 @@ let .Some(v) = m.get(key) else { return -1 }
 The bindings start after the else block, so inside it a name the
 pattern binds still has the binding it had before the let-else, if any.
 
-The pattern always starts with a `.`. On a `T?` value (like
+The pattern always starts with a `.`, and leaving it out is an error that
+says so (`` a `let` pattern starts with a `.`: `let .Some(v) = ...` ``). On a
+`T?` value (like
 `m.get(key)` above), `.Some(v)` binds the unwrapped payload and
 `.None` matches `none`, the same spelling as for an `Option[T]`.
 On a `T or Error` value, `.Ok(v)` binds the value and `.Err(e)` the
