@@ -2262,3 +2262,95 @@ def test_a_signal_during_the_build_of_the_lsp_server_stops_what_it_started():
             if sleeper and not gone:
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(sleeper, signal.SIGKILL)
+
+
+def write_modules(root: Path, modules: dict[str, str]) -> None:
+    for name, source in modules.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+
+
+def run_from_root(entry: Path) -> list[str]:
+    done = subprocess.run(
+        [str(KOD), "run", str(entry.relative_to(ROOT))],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout.splitlines()
+
+
+WHO_S = """type S = struct {{
+    n: int64
+    func who(self) -> str {{
+        return "{name}"
+    }}
+}}
+"""
+WHO_INTERFACE = "interface {name} {{\n    func who(self) -> str\n}}\n"
+
+
+def test_two_vtables_whose_paths_spell_one_label_stay_apart():
+    # `$<dir>$a$I$for$<dir>$b$for$<dir>$c$S$vtable` used to be both of these.
+    (ROOT / "build").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ROOT / "build", prefix="vt") as tmp:
+        root = Path(tmp)
+        here = root.relative_to(ROOT)
+        write_modules(
+            root,
+            {
+                "a.kod": WHO_INTERFACE.format(name="I"),
+                f"a/I/for/{here}.kod": WHO_INTERFACE.format(name="b"),
+                f"b/for/{here}/c.kod": WHO_S.format(name="first S"),
+                "c.kod": WHO_S.format(name="second S"),
+                "m1.kod": f'import "./a"\nimport "./b/for/{here}/c"\n'
+                "func make() -> a.I {\n    return c.S(n: 1)\n}\n",
+                "m2.kod": f'import "./a/I/for/{here}" {{ b }}\nimport "./c"\n'
+                "func make() -> b {\n    return c.S(n: 2)\n}\n",
+                "main.kod": 'import "./m1"\nimport "./m2"\n'
+                "func main() -> int64 {\n"
+                "    print(m1.make().who())\n"
+                "    print(m2.make().who())\n"
+                "    return 0\n}\n",
+            },
+        )
+        assert run_from_root(root / "main.kod") == ["first S", "second S"]
+
+
+def test_an_instance_and_a_type_whose_paths_spell_one_label_stay_apart():
+    # `Box[x.S]` and the `S` of a directory path that spells it had one
+    # identity word, so `is` took one for the other.
+    (ROOT / "build").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ROOT / "build", prefix="vt") as tmp:
+        root = Path(tmp)
+        here = root.relative_to(ROOT)
+        write_modules(
+            root,
+            {
+                "i.kod": WHO_INTERFACE.format(name="I"),
+                "x.kod": WHO_S.format(name="plain S"),
+                "l.kod": "type Box[T] = struct {\n    v: T\n"
+                '    func who(self) -> str {\n        return "box"\n    }\n}\n',
+                f"l/Box/{here}/x.kod": WHO_S.format(name="deep S"),
+                "m1.kod": 'import "./i"\nimport "./l"\nimport "./x"\n'
+                "func make() -> i.I {\n"
+                "    return l.Box[x.S](v: x.S(n: 1))\n}\n",
+                "m2.kod": f'import "./i"\nimport "./l/Box/{here}/x"\n'
+                "func make() -> i.I {\n    return x.S(n: 2)\n}\n",
+                "main.kod": 'import "./m1"\nimport "./m2"\n'
+                f'import "./l/Box/{here}/x"\n'
+                "func main() -> int64 {\n"
+                "    let one = m1.make()\n"
+                "    let two = m2.make()\n"
+                "    print(one.who())\n"
+                "    print(two.who())\n"
+                "    print(one is x.S)\n"
+                "    print(two is x.S)\n"
+                "    return 0\n}\n",
+            },
+        )
+        assert run_from_root(root / "main.kod") == ["box", "deep S", "false", "true"]
