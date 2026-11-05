@@ -4,7 +4,8 @@ icon: lucide/timer
 
 # Time
 
-`stdlib/time.kod` has two clocks, a `Duration` type, and `sleep`.
+`stdlib/time.kod` has two clocks, a `Duration` type, `sleep`, and a `Time` type
+for timestamps.
 
 ```kod
 import "time"
@@ -71,6 +72,8 @@ ratio.
 |---|---|
 | `as_ms()` | the whole milliseconds in it, truncated toward zero |
 | `as_seconds()` | the whole seconds in it, truncated toward zero |
+| `as_hours()` | the whole hours in it, truncated toward zero |
+| `as_days()` | the whole 24-hour days in it, truncated toward zero |
 | `ceil_ms()` | milliseconds, rounded up for a positive duration, so that a short timeout never becomes 0 (which most timeouts treat as none) |
 | `to_str()` | a short reading, such as `1h2m3s`, `1.5s`, `250ms`, `12.5us`, `40ns` or `0s` |
 
@@ -87,6 +90,41 @@ func sleep(anon d: Duration) -> none
 
 waits at least `d`, to the resolution of the system clock, and a signal doesn't
 cut it short. A zero or negative duration returns at once.
+
+## Timestamps
+
+A `Time` is a moment: whole `seconds` since 1970-01-01 UTC, negative before it,
+and `nanos` from 0 to 999999999 on top. It has no time zone of its own, and
+reads as UTC.
+
+```kod
+import "time"
+
+let created = time.parse("2026-01-02T03:04:05+01:00")? or time.now()
+print(created.to_str())                       // 2026-01-02T02:04:05Z
+print(created.utc().year)                     // 2026
+print((time.now() - created).as_days())       // how many days ago
+```
+
+| Function | Returns |
+|---|---|
+| `now()` | the wall clock's time |
+| `parse(s)` | the `Time` of an RFC 3339 timestamp, or `none` if `s` isn't one |
+| `parse_date(s)` | midnight UTC of a `YYYY-MM-DD` date, or `none` if `s` isn't one |
+
+`parse` takes what APIs send: `2026-01-02T03:04:05Z`, with a fraction of a second
+as in `05.25Z`, and an offset as in `05+01:00`. A `t` and a `z` may be lowercase,
+as RFC 3339 allows. Digits past nanoseconds are dropped. It checks the calendar, so
+`2026-02-29` is `none`. A leap second, `:60`, is read as the first second after it,
+since a `Time` has no way to hold one.
+
+| Method | Meaning |
+|---|---|
+| `t + d` | the `Time` a `Duration` later |
+| `a - b` | the `Duration` from `b` to `a`, which wraps past about 292 years, as a `Duration` does |
+| `a == b`, `a < b` and the like | whether they're the same moment, or which comes first |
+| `utc()` | a `Utc` with `year`, `month` (1 to 12), `day`, `hour`, `minute` and `second` |
+| `to_str()` | RFC 3339 in UTC, with a fraction only if there is one, as in `2026-01-02T02:04:05.25Z` |
 
 ## Durations in other modules
 
