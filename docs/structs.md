@@ -293,17 +293,22 @@ let q = p.swap()    // Pair[int64, str]
 Construction always spells the type arguments; a bare `Pair(...)` is an
 error.
 
-Every method of an instance is compiled for its type arguments, whether
-it's called or not, so each must make sense for them. An error in one
-names the instance, as in
+A method of an instance is compiled for its type arguments when something
+uses it: a call, an operator or other syntax that calls it, or the instance
+becoming a value of an interface, which uses all of that interface's methods.
+So a `Box[T]` whose `contains` uses `==` can hold a struct that has no `==`, as
+long as nothing calls `contains` on that `Box`. Only a method's signature is
+checked otherwise, so a mistake in the body of a method nothing uses isn't
+reported, as with a generic function nothing calls. An error in a body names the
+instance, as in
 `` `<` doesn't take `Color` operands (in `Box[Color]`) ``, and a line of
 the template is reported for one instance only.
 
 A generic struct or enum may name itself, with any type arguments, in its
 fields, payloads and method signatures, as in `kids: [Tree[T]]` or the
 `Pair[B, A]` above. The instances have to end, though: one that keeps naming a
-bigger type, like `next: W[[T]]?` in `W[T]` or a method of `W[T]` that makes a
-`W[[T]]`, is an error once it is 64 instances deep
+bigger type, like `next: W[[T]]?` in `W[T]` or a called method of `W[T]` that
+makes a `W[[T]]`, is an error once it is 64 instances deep
 (`` generic type `W` is 64 instances deep; each one names another with a new type ``).
 Methods that branch into new types are stopped earlier, when a module passes 4096
 instances.

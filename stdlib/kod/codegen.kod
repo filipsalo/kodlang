@@ -85,6 +85,12 @@ type SigInfo = struct {
     type_args: [TypeKind] = []
 }
 
+// A method of a generic instance that something uses.
+type MethodInst = struct {
+    owner: int64
+    decl_id: int64
+}
+
 // One copy of a generic function for one list of type arguments. Its sig is
 // made when a call's kind is inferred; only a compiled call queues its body.
 type FuncInst = struct {
@@ -701,6 +707,9 @@ type Codegen = struct {
     enum_insts: FuncIdx = FuncIdx()
     func_insts: [FuncInst] = []
     func_inst_idx: FuncIdx = FuncIdx()
+    // Methods of generic instances that something uses, in the order they were asked for.
+    method_insts: [MethodInst] = []
+    method_inst_idx: FuncIdx = FuncIdx()
     // Indexes into func_insts of the bodies to compile, in the order they were called.
     func_inst_queue: [int64] = []
 
@@ -3564,6 +3573,40 @@ type Codegen = struct {
             args = f"{args}, int64"
         }
         return f"error: `{shown}` is generic; downcast to one of its instances through a type alias such as `type Int{s.name} = {shown}[{args}]`"
+    }
+
+    // The label to call a struct's method by. An instance's method gets compiled because of this.
+    func method_label(self, anon struct_idx: int64, name: str) -> str {
+        let s = self.structs[struct_idx]
+        if s.template_idx >= 0 and s.method_idx.get(name) is Some(mi) {
+            let key = f"{struct_idx}${name}"
+            if not self.method_inst_idx.contains(key) {
+                let seen = self.method_inst_idx
+                seen.set(key, len(self.method_insts))
+                self.method_insts += [MethodInst(owner: struct_idx, decl_id: s.methods[mi].decl_id)]
+            }
+        }
+        return f"${s.module_prefix}${s.name}${name}"
+    }
+
+    // Compile a generic instance's method for its type arguments.
+    func compile_method_inst(self, anon inst: MethodInst) -> none {
+        mut s = self.structs[inst.owner]
+        if self.has_bad_key(s) {
+            return
+        }
+        let saved_p = self.p
+        let saved_names = self.subst_names
+        let saved_args = self.subst_args
+        self.p = s.src_p
+        self.subst_names = self.structs[s.template_idx].type_param_names
+        self.subst_args = s.template_args
+        self.body_instance = inst.owner
+        self.compile_func(fd_id: inst.decl_id, struct_name: s.name, override_lbl: "", owner: inst.owner)
+        self.body_instance = -1
+        self.p = saved_p
+        self.subst_names = saved_names
+        self.subst_args = saved_args
     }
 
     // Register a (struct, interface) pair so its vtable is emitted at the
@@ -7476,7 +7519,7 @@ type Codegen = struct {
                         self.emit(f"mov x1, {key_r}")
                         self.pool.free_reg(key_r)
                     }
-                    mut method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}$op_index"
+                    mut method_lbl = self.method_label(idx, name: "op_index")
                     self.emit(f"bl {method_lbl}")
                     return .VReg(name: "x0")
                 }
@@ -8404,8 +8447,7 @@ type Codegen = struct {
                     if not bad_to_str {
                         let val = self.compile_expr(expr_id)
                         self.mov_to(val, dest: "x0")
-                        let struct_info = self.structs[struct_idx]
-                        self.emit(f"bl ${struct_info.module_prefix}${struct_info.name}$to_str")
+                        self.emit(f"bl {self.method_label(struct_idx, name: "to_str")}")
                         return .VReg(name: "x0")
                     }
                 }
@@ -10176,7 +10218,7 @@ type Codegen = struct {
                 let sig = s.methods[mi].sig
                 if self.takes_self_and(sig, count: 0) and self.same_kind(sig.return_kind, .KInt64) {
                     self.mov_to(arg_val, dest: "x0")
-                    self.emit(f"bl ${s.module_prefix}${s.name}$len")
+                    self.emit(f"bl {self.method_label(struct_idx, name: "len")}")
                     return .VReg(name: "x0")
                 }
                 let name = self.struct_display_name(struct_idx)
@@ -10333,7 +10375,7 @@ type Codegen = struct {
             .KStruct(idx, _struct_type_args) -> {
                 if self.structs[idx].method_idx.get(method_name) is Some(mi) {
                     self.check_private_method(method_name, struct_idx: idx, :span)
-                    method_lbl = f"${self.structs[idx].module_prefix}${self.structs[idx].name}${method_name}"
+                    method_lbl = self.method_label(idx, name: method_name)
                     sig_params = self.structs[idx].methods[mi].sig.param_kinds
                     sig_labels = self.structs[idx].methods[mi].sig.param_labels
                     sig_defaults = self.structs[idx].methods[mi].sig.param_default_exprs
@@ -12162,8 +12204,7 @@ type Codegen = struct {
         }
         self.pool.free_reg(lhs_r)
         self.pool.free_reg(other_r)
-        let info = self.structs[oc.struct_idx]
-        self.emit(f"bl ${info.module_prefix}${info.name}${method.name}")
+        self.emit(f"bl {self.method_label(oc.struct_idx, name: method.name)}")
         if oc.negate {
             self.emit("cmp x0, #0")
             self.emit("cset x0, eq")
@@ -12208,7 +12249,7 @@ type Codegen = struct {
         }
         let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: info.name).slots
         self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
-        self.emit(f"bl ${info.module_prefix}${info.name}$init")
+        self.emit(f"bl {self.method_label(struct_idx, name: "init")}")
         return .VReg(name: "x0")
     }
 
@@ -12672,7 +12713,7 @@ type Codegen = struct {
     // Look up `op_index_set` on a struct, returning its mangled label.
     func struct_index_setter_label(self, struct_idx: int64) -> str? {
         if self.structs[struct_idx].method_idx.get("op_index_set") is Some(_mi) {
-            return f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}$op_index_set"
+            return self.method_label(struct_idx, name: "op_index_set")
         }
         return none
     }
@@ -13490,7 +13531,7 @@ type Codegen = struct {
         mut sig_src_p: parsing.Parser = self.p
         if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
             self.check_private_method(method, :struct_idx, span: self.p.expr_spans[value_id])
-            method_lbl = f"${self.structs[struct_idx].module_prefix}${self.structs[struct_idx].name}${method}"
+            method_lbl = self.method_label(struct_idx, name: method)
             sig_params = self.structs[struct_idx].methods[mi].sig.param_kinds
             sig_labels = self.structs[struct_idx].methods[mi].sig.param_labels
             sig_defaults = self.structs[struct_idx].methods[mi].sig.param_default_exprs
@@ -14451,34 +14492,22 @@ type Codegen = struct {
             self.emit("ret")
         }
 
-        // Emit method bodies for every monomorphised struct instantiation
-        // (e.g. Map[str, int64]). We walk the structs list with a cursor
-        // that re-checks the length each step so any further instantiations
-        // discovered while compiling a specialised body get picked up too.
-        // Each kind of body can call for more of the other, so go round until both run out.
-        mut cursor = 0
+        // Emit the method bodies of generic instances that something uses, and the generic
+        // functions called. Each kind of body can ask for more of the other, and a vtable
+        // uses all of its interface's methods, so go round until all run out.
+        mut vtable_cursor = 0
+        mut method_cursor = 0
         mut func_cursor = 0
-        for cursor < len(self.structs) or func_cursor < len(self.func_inst_queue) {
-            for cursor < len(self.structs) {
-                mut s = self.structs[cursor]
-                if s.template_idx >= 0 and not self.has_bad_key(s) {
-                    let template = self.structs[s.template_idx]
-                    let saved_p = self.p
-                    let saved_names = self.subst_names
-                    let saved_args = self.subst_args
-                    self.p = s.src_p
-                    self.subst_names = template.type_param_names
-                    self.subst_args = s.template_args
-                    self.body_instance = cursor
-                    for m in s.methods {
-                        self.compile_func(fd_id: m.decl_id, struct_name: s.name, override_lbl: "", owner: cursor)
-                    }
-                    self.body_instance = -1
-                    self.p = saved_p
-                    self.subst_names = saved_names
-                    self.subst_args = saved_args
+        for vtable_cursor < len(self.vtable_struct_idx) or method_cursor < len(self.method_insts) or func_cursor < len(self.func_inst_queue) {
+            for vtable_cursor < len(self.vtable_struct_idx) {
+                for m in self.interfaces[self.vtable_iface_idx[vtable_cursor]].methods {
+                    let _ = self.method_label(self.vtable_struct_idx[vtable_cursor], name: m.name)
                 }
-                cursor = cursor + 1
+                vtable_cursor += 1
+            }
+            for method_cursor < len(self.method_insts) {
+                self.compile_method_inst(self.method_insts[method_cursor])
+                method_cursor += 1
             }
             for func_cursor < len(self.func_inst_queue) {
                 self.compile_func_instance(self.func_inst_queue[func_cursor])
