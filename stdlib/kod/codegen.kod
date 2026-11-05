@@ -85,6 +85,12 @@ type SigInfo = struct {
     type_args: [TypeKind] = []
 }
 
+// `m.T`, with `m` an import.
+type ModuleMember = struct {
+    alias: str
+    member: str
+}
+
 // A method of a generic instance that something uses.
 type MethodInst = struct {
     owner: int64
@@ -8986,11 +8992,40 @@ type Codegen = struct {
         return spans
     }
 
+    // `m` and `T` of `m.T`, when `m` is an import.
+    func module_type_parts(self, anon expr_id: int64) -> ModuleMember? {
+        let parts = self.qualified_parts(expr_id)
+        if len(parts) == 0 {
+            return none
+        }
+        let alias = self.source_name(parts[0])
+        if not self.is_import_alias(alias) {
+            return none
+        }
+        return ModuleMember(:alias, member: parts[1])
+    }
+
+    // A chain's root as written, for messages: `Box` or `m.Box`.
+    func chain_root_name(self, anon root: int64) -> str {
+        if self.p.exprs[root] is .Ident(key) {
+            return self.source_name(key)
+        }
+        if self.module_type_parts(root) is Some(parts) {
+            return f"{parts.alias}.{parts.member}"
+        }
+        return ""
+    }
+
     // Returns the template for bad type arguments, reporting them only when `report`.
     func generic_ctor_instance(self, anon callee_id: int64, report: bool) -> int64 {
-        let .Ident(key) = self.p.exprs[self.index_chain_root(callee_id)] else { return -1 }
-        let name = self.source_name(key)
-        let template_idx = self.find_struct_idx(name)
+        let root = self.index_chain_root(callee_id)
+        let name = self.chain_root_name(root)
+        mut template_idx = -1
+        if self.p.exprs[root] is .Ident(key) {
+            template_idx = self.find_struct_idx(self.source_name(key))
+        } else if self.module_type_parts(root) is Some(parts) {
+            template_idx = self.qualified_idx(parts.alias, name: parts.member, what: 0)
+        }
         if template_idx < 0 {
             return -1
         }
@@ -9050,9 +9085,24 @@ type Codegen = struct {
                         }
                     }
                     .Index -> {
-                        if self.p.exprs[self.index_chain_root(expr_id)] is .Ident(key) {
-                            let name = self.source_name(key)
-                            let struct_idx = self.find_struct_idx(name)
+                        let root = self.index_chain_root(expr_id)
+                        let name = self.chain_root_name(root)
+                        if len(name) > 0 {
+                            mut struct_idx = -1
+                            mut enum_idx = -1
+                            if self.p.exprs[root] is .Ident(_key) {
+                                struct_idx = self.find_struct_idx(name)
+                                enum_idx = self.find_enum_idx(name)
+                            } else if self.module_type_parts(root) is Some(parts) {
+                                struct_idx = self.qualified_idx(parts.alias, name: parts.member, what: 0)
+                                enum_idx = self.qualified_idx(parts.alias, name: parts.member, what: 1)
+                                if struct_idx < 0 and enum_idx < 0 {
+                                    if report {
+                                        self.report_error(self.qualified_type_error(parts.alias, name: parts.member, call: false), span: self.p.expr_spans[root])
+                                    }
+                                    return none
+                                }
+                            }
                             if struct_idx >= 0 {
                                 let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.structs[struct_idx].type_param_names), :report)
                                 if len(kinds) == 0 {
@@ -9060,7 +9110,6 @@ type Codegen = struct {
                                 }
                                 return .KStruct(idx: self.instantiate_struct(kinds, template_idx: struct_idx, arg_spans: self.expr_arg_spans(expr_id), whole: self.p.expr_spans[expr_id]), type_args: [])
                             }
-                            let enum_idx = self.find_enum_idx(name)
                             if enum_idx >= 0 {
                                 let kinds = self.generic_type_args(expr_id, :name, param_count: len(self.enums[enum_idx].type_param_names), :report)
                                 if len(kinds) == 0 {
@@ -10108,6 +10157,13 @@ type Codegen = struct {
                         }
                         if self.index_chain_fn(callee_id) is Some(fn_ref) {
                             return self.compile_generic_call(fn_ref, :args, chain: callee_id, span: self.p.expr_spans[callee_id])
+                        }
+                        if self.module_type_parts(self.index_chain_root(callee_id)) is Some(parts) {
+                            // Neither a type nor a function of that module.
+                            if self.qualified_type_ref(parts.alias, name: parts.member) < 0 and self.lookup_any_import_fn(parts.alias, parts.member) == -1 {
+                                self.report_error(self.qualified_type_error(parts.alias, name: parts.member, call: true), span: self.p.expr_spans[self.index_chain_root(callee_id)])
+                                return .VImm(value: 0)
+                            }
                         }
                         if self.p.exprs[self.index_chain_root(callee_id)] is .Ident(root) {
                             // A generic type only another module declares, unless a local of the name is in force.
