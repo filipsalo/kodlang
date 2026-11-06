@@ -185,7 +185,7 @@ for arg in args {
 A name is a local only where a binding of it is in force. Elsewhere it
 means a function of the module, an imported one or a builtin of that
 name, as it does in a call (see
-[Function-pointer types](functions.md#function-pointer-types)).
+[Function values](functions.md#function-values)).
 Elsewhere means before its `let`, or after the block, arm or loop that
 bound it when no outer binding is in force. With none of those
 functions, reading or assigning the name is an error:

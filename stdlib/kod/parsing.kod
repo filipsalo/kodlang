@@ -423,7 +423,7 @@ type Parser = struct {
 	// How many bindings got a name of their own (`x#1`) because they hide one in force.
 	renames: int64 = 0
 	// Match expressions parsed so far, so a FuncDecl can tell whether its body has one.
-	match_exprs: int64 = 0
+	binding_exprs: int64 = 0
 	// The module-level constants parsed so far: their names, and the expressions that
 	// give their values (for the check that none refers to itself).
 	const_names: [str] = []
@@ -1433,9 +1433,10 @@ type Parser = struct {
 			if self.try_consume(.Arrow) {
 				return_typ = self.parse_type_expr()
 			}
-			let match_mark = self.match_exprs
+			self.binding_exprs += 1
+			let binding_mark = self.binding_exprs
 			let body: [int64] = self.parse_block()
-			let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", has_match: self.match_exprs > match_mark)
+			let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark)
 			let decl_id: int64 = self.alloc_func_decl(fd)
 			return self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
 		}
@@ -1445,7 +1446,7 @@ type Parser = struct {
 	}
 
 	func parse_match_expr(self, anon span: ast.Span) -> int64 {
-		self.match_exprs += 1
+		self.binding_exprs += 1
 		let subject: int64 = self.parse_expr()
 		self.expect(.OpenCurly)
 		self.skip_newlines()
@@ -2267,9 +2268,9 @@ type Parser = struct {
 		if self.try_consume(.Arrow) {
 			return_typ = self.parse_type_expr()
 		}
-		let match_mark = self.match_exprs
+		let binding_mark = self.binding_exprs
 		mut body: [int64] = self.parse_block()
-		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc, has_match: self.match_exprs > match_mark, :type_params)
+		return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc, expr_binds: self.binding_exprs > binding_mark, :type_params)
 	}
 
 	func parse_func_type_params(self) -> [str] {
@@ -2444,10 +2445,10 @@ type Parser = struct {
 			let tok: lexing.Token = self.advance()
 			let raw: str = tok.value
 			let display: str = parse_string_value(raw)
-			let match_mark = self.match_exprs
+			let binding_mark = self.binding_exprs
 			mut body: [int64] = self.parse_block()
 			let empty_params: [ast.Param] = []
-			let func_decl: ast.FuncDecl = ast.FuncDecl(name: "test", name_span: ast.Span(start: tok.start), params: empty_params, return_typ: 0, :body, doc: "", has_match: self.match_exprs > match_mark)
+			let func_decl: ast.FuncDecl = ast.FuncDecl(name: "test", name_span: ast.Span(start: tok.start), params: empty_params, return_typ: 0, :body, doc: "", expr_binds: self.binding_exprs > binding_mark)
 			mut id: int64 = self.alloc_func_decl(func_decl)
 			self.skip_newlines()
 			return ast.Decl.Test(:display, decl: id)
@@ -2781,7 +2782,9 @@ func reads_operand_rhs(anon op: ast.Op) -> bool {
 //   match-expression arm      parent + 1
 //   let-else                  this depth, bound after its else block
 //   `let` / `mut`             this depth, bound after its value
-// A default sees no locals, and a function literal starts afresh.
+//   function literal          parent + 1 for its parameters and body
+// A default sees no locals. A read of a binding older than a function literal
+// is one it captures, which goes on the FuncDecl of every literal it's inside.
 type Renamer = struct {
 	p: Parser
 	// The bindings in force, innermost last; `top` of them are live.
@@ -2793,14 +2796,25 @@ type Renamer = struct {
 	depth: int64 = 0
 	// Live entries that hide another; a read needs a lookup only while one is.
 	renamed: int64 = 0
-	// Without a match expression an expression binds nothing.
-	has_match: bool = false
+	// Without a match expression or function literal an expression binds nothing.
+	expr_binds: bool = false
+	// The function literals being walked, outermost first, and `top` at each.
+	lit_ids: [int64] = []
+	lit_marks: [int64] = []
 
 	func run(self, anon decls: [ast.Decl]) -> none {
-		for fd in self.p.func_decls[1..] {
+		// Last first: a literal's id is below the function it's in, so it's walked in place.
+		mut id = len(self.p.func_decls) - 1
+		for id >= 1 {
+			let fd = self.p.func_decls[id]
+			id -= 1
+			if fd.walked {
+				continue
+			}
+			fd.walked = true
 			self.top = 0
 			self.renamed = 0
-			self.has_match = fd.has_match
+			self.expr_binds = fd.expr_binds
 			self.depth = 1
 			for param in fd.params {
 				self.bind(param.name)
@@ -2831,9 +2845,56 @@ type Renamer = struct {
 	func walk_default(self, anon expr_id: int64) -> none {
 		self.top = 0
 		self.renamed = 0
-		self.has_match = true
+		self.expr_binds = true
 		self.depth = 1
 		self.expr(expr_id)
+	}
+
+	func literal(self, anon decl_id: int64) -> none {
+		let fd = self.p.func_decls[decl_id]
+		if fd.walked {
+			return
+		}
+		fd.walked = true
+		let saved_binds = self.expr_binds
+		let mark = self.top
+		self.expr_binds = true
+		self.lit_ids += [decl_id]
+		self.lit_marks += [mark]
+		self.depth += 1
+		for param in fd.params {
+			param.name = self.bind(param.name)
+		}
+		self.depth -= 1
+		self.block(fd.body)
+		self.end_scope(mark)
+		self.lit_ids = self.lit_ids[0..len(self.lit_ids) - 1]
+		self.lit_marks = self.lit_marks[0..len(self.lit_marks) - 1]
+		self.expr_binds = saved_binds
+		for param in fd.params {
+			if param.default_expr != 0 {
+				let fresh = Renamer(p: self.p)
+				fresh.walk_default(param.default_expr)
+			}
+		}
+	}
+
+	// The binding at `i` is read: a capture of each literal younger than it.
+	func note_capture(self, anon i: int64, expr_id: int64) -> none {
+		for k, mark in self.lit_marks {
+			if i < mark {
+				let fd = self.p.func_decls[self.lit_ids[k]]
+				mut known = false
+				for c in fd.captures {
+					if c.key == self.keys[i] {
+						known = true
+					}
+				}
+				if not known {
+					fd.captures += [ast.Capture(key: self.keys[i], span: self.p.expr_spans[expr_id])]
+				}
+			}
+		}
 	}
 
 	func find(self, anon name: str) -> int64 {
@@ -2980,6 +3041,9 @@ type Renamer = struct {
 	func stmt(self, anon stmt_id: int64) -> none {
 		match self.p.stmts[stmt_id] {
 			.Let(name, typ, value, mutable) -> {
+				if self.p.exprs[value] is .FuncLit(decl_id) {
+					self.p.func_decls[decl_id].let_name = name
+				}
 				self.expr(value)
 				let key = self.bind(name)
 				if key != name {
@@ -3042,11 +3106,15 @@ type Renamer = struct {
 	}
 
 	func read(self, anon expr_id: int64, name: str) -> none {
-		if self.renamed == 0 {
+		if self.renamed == 0 and len(self.lit_marks) == 0 {
 			return
 		}
 		let i = self.find(name)
-		if i >= 0 and self.levels[i] > 0 {
+		if i < 0 {
+			return
+		}
+		self.note_capture(i, :expr_id)
+		if self.levels[i] > 0 {
 			self.p.exprs[expr_id] = ast.Expr.Ident(name: self.keys[i])
 		}
 	}
@@ -3058,7 +3126,7 @@ type Renamer = struct {
 	}
 
 	func expr(self, anon expr_id: int64) -> none {
-		if expr_id == 0 or (self.renamed == 0 and not self.has_match) {
+		if expr_id == 0 or (self.renamed == 0 and not self.expr_binds) {
 			return
 		}
 		match self.p.exprs[expr_id] {
@@ -3115,6 +3183,7 @@ type Renamer = struct {
 				self.expr(value)
 				self.args(args)
 			}
+			.FuncLit(decl_id) -> self.literal(decl_id)
 			else none
 		}
 	}

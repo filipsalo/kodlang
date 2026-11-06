@@ -100,6 +100,12 @@ let b = Node(name: "b", other: a)
 a.other = b  // a and b now live until the program exits
 ```
 
+A closure makes a cycle easy to write without seeing it: a closure stored in a
+struct it captures keeps that struct alive, as in
+`req.on_done = func() { req.count += 1 }`. That costs nothing for something that
+lives as long as the program, and leaks once per `req` for something made per
+request.
+
 For a long-running program, break the cycle when you are done with it
 (`a.other = none`), or keep the back reference as an index or a key instead of a
 struct. Most data, including all of the compiler's, has no cycles.
@@ -148,6 +154,23 @@ two after that.
 `_rc_release_stub`. They change only `x16`, `x17` and `lr`, and no flags, until an
 object is freed, and freeing saves the rest, so they can sit anywhere in an
 expression.
+
+### Function values
+
+A function value is a reference to a cell whose first word is the address of the
+code. A named function or a literal that captures nothing has one such cell in the
+data section, written only if the function is used as a value, and using it never
+allocates. A literal that captures allocates a counted cell each time it's
+evaluated, with the captured values after the code address:
+
+```
+closure cell:  [code, capture 0, capture 1, ...]
+```
+
+A call through a function value is `ldr x16, [f]; mov x17, f; blr x16`, so a
+function reached that way finds its cell in `x17`. One that captures copies the
+values into its frame on entry and borrows them, like parameters, since its caller
+keeps the cell alive for the call. Other functions ignore `x17`.
 
 ### Testing for mistakes
 

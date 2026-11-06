@@ -321,11 +321,11 @@ c.increment()
 print_int(c.get())
 ```
 
-## Function-pointer types
+## Function values
 
 Functions are values. Use `func(T1, T2) -> R` as a type to store,
-pass, or return them — the runtime representation is an 8-byte
-pointer to the function's code, same as a C function pointer.
+pass, or return them. A function value is an 8-byte reference, not a C function
+pointer (see [Function values](memory-layout.md#function-values)).
 
 ```kod
 func double(x: int64) -> int64 { return x * 2 }
@@ -341,10 +341,7 @@ print_int(apply(triple, 14)) // 42 — function passed as callback
 ```
 
 A function literal, `func(anon n: int64) -> int64 { return n + 1 }`, is
-a value of its function type too. It doesn't see the locals of the
-function it's written in, since there are no closures yet, and a name it can't
-find says so: `` unknown name `limit`; a function literal can't see the locals
-of the function around it ``.
+a value of its function type too.
 
 A bare identifier in value position resolves to the function's address
 when no local of that name is in force there. A call `f(args)` goes to a
@@ -372,6 +369,58 @@ function value comes from: a local, an array element (`fs[i](x)`), a
 struct field (`h.fn(x)`) or another call (`get_fn()(x)`). It must pass
 exactly as many arguments as the function type has parameters, since a
 function type carries no defaults.
+
+## Closures
+
+A function literal can read the locals and parameters in force where it's
+written, including `self`. It keeps their values, so it can outlive the function
+that made it:
+
+```kod
+func adder(anon n: int64) -> func(int64) -> int64 {
+    return func(anon x: int64) -> int64 {
+        return x + n
+    }
+}
+
+let add5 = adder(5)
+print_int(add5(1))           // 6
+```
+
+A literal captures the value a name has when the literal is evaluated. Each pass
+of a loop makes its own closure, with that pass's `for` variable and pattern
+bindings. Literals nest, and an inner one can capture what the outer one can see.
+
+A captured name can't be assigned in the literal: `` a function literal can't
+assign to `n`, which it captures ``. A variable declared `mut` can't be captured
+at all: `` a function literal can't capture `total`, which is `mut` ``. To share
+state, capture a struct and change its fields, since a captured struct is the same
+struct:
+
+```kod
+type Counter = struct { n: int64 = 0 }
+
+func make_counter() -> func() -> int64 {
+    let c = Counter()
+    return func() -> int64 {
+        c.n += 1
+        return c.n
+    }
+}
+```
+
+Other limits:
+
+- A literal can't see its own `let`, so it can't call itself through it. Use a
+  named function to recurse: `` unknown function `fact`; a function literal can't
+  see its own `let`, so use a named function to recurse ``.
+- A literal inside a generic function, or a method of a generic type, can't
+  capture: `` a function literal in a generic function or type can't capture
+  `x` ``. Passing a closure to a generic function works, as in
+  `sort.sorted_by(xs, less: ...)`.
+- A default value sees no locals, so a literal used as one captures nothing.
+- A closure kept in a struct that it captures is a cycle, and a cycle is never
+  freed (see [Reclaiming memory](memory-layout.md#reclaiming-memory)).
 
 ## Generic functions
 

@@ -336,6 +336,13 @@ type TypeScope = struct {
 
 // ── Per-variable stack slot ───────────────────────────────────────────────────
 
+// What a function literal captures, as its creation site sees it.
+type LitEnv = struct {
+    decl_id: int64
+    keys: [str] = []
+    kinds: [TypeKind] = []
+}
+
 type VarSlot = struct {
     name: str
     offset: int64
@@ -345,6 +352,8 @@ type VarSlot = struct {
     // an immutable `let` binding flips this to false (set in compile_let),
     // and a later pattern or loop binding of the slot back (allow_reassign).
     mutable: bool = true
+    // Written `mut`, unlike a loop or pattern binding that also may be reassigned.
+    declared_mut: bool = false
     // Whether the code being compiled is in the binding's scope.
     bound: bool = false
     // Bound at some point before, so a block that bound it may have ended.
@@ -486,6 +495,14 @@ type Codegen = struct {
     rc_param_offs: [int64] = []
     // Slot descriptors for objects too big for the mask in their header.
     rc_descs: [RcDesc] = []
+    // The functions used as values that have a cell in the data section so far.
+    fn_cells: [str] = []
+    // Literals that capture, in the order their creation sites were reached.
+    lit_envs: [LitEnv] = []
+    // What the literal being compiled captures, if it's one.
+    lit_env: LitEnv? = none
+    lit_let_name: str = ""
+    in_captures: [str] = []
     // Only `p` and `path_prefix` are required at construction; every
     // other field starts empty/zero via its default, so `make_codegen`
     // is just `Codegen(:p, :path_prefix)`.
@@ -1517,10 +1534,17 @@ type Codegen = struct {
     }
 
     func fn_address(self, anon slot: int64) -> Val {
-        let lbl: str = self.fn_label(slot)
+        return self.fn_value(self.fn_label(slot))
+    }
+
+    // The function value of what's at `lbl`: its cell in the data section.
+    func fn_value(self, anon lbl: str) -> Val {
+        if not arrays.contains(self.fn_cells, lbl) {
+            self.fn_cells += [lbl]
+        }
         let reg: str = self.pool.alloc_reg()
-        self.emit(f"adrp {reg}, {lbl}@PAGE")
-        self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
+        self.emit(f"adrp {reg}, Lfn{lbl}@PAGE")
+        self.emit(f"add {reg}, {reg}, Lfn{lbl}@PAGEOFF")
         return .VReg(name: reg)
     }
 
@@ -2333,23 +2357,34 @@ type Codegen = struct {
     }
 
     // Each parameter binds a name of its own.
+    func check_extern_no_func(self, anon params: [ast.Param], return_typ: int64) -> none {
+        for param in params {
+            if self.resolve_type(param.typ) is .KFunc(_p, _r) {
+                self.report_error("error: an `extern` can't take or return a function value", span: param.span)
+            }
+        }
+        if return_typ != 0 and self.resolve_type(return_typ) is .KFunc(_p, _r) {
+            self.report_error("error: an `extern` can't take or return a function value", span: self.p.type_spans[return_typ])
+        }
+    }
+
     func check_param_names(self, anon params: [ast.Param]) -> none {
         mut names: [str] = []
         for param in params {
             if arrays.contains(names, param.name) {
-                self.report_error(f"error: parameter `{param.name}` is declared twice; give one of them another name", span: param.span)
+                self.report_error(f"error: parameter `{self.source_name(param.name)}` is declared twice; give one of them another name", span: param.span)
             } else {
                 names += [param.name]
             }
         }
     }
 
-    // An unknown name inside a function literal is most often a local it would need to capture.
-    func literal_hint(self, anon msg: str) -> str {
-        if self.in_func_literal and not msg.contains("; ") {
-            return f"{msg}; a function literal can't see the locals of the function around it"
+    // An unknown name, which in a function literal may be the literal's own `let`.
+    func unknown_name_msg(self, anon msg: str, name: str, candidates: [str]) -> str {
+        if self.in_func_literal and name == self.lit_let_name {
+            return f"{msg}; a function literal can't see its own `let`, so use a named function to recurse"
         }
-        return msg
+        return self.with_suggestion(msg, typo: name, :candidates)
     }
 
     func is_lambda_name(self, anon name: str) -> bool {
@@ -3147,6 +3182,17 @@ type Codegen = struct {
     // Whether the most-recently-declared slot for `name` permits bare
     // reassignment. Returns true when not found so missing-variable
     // diagnostics stay the responsibility of the offset lookup.
+    func find_var_declared_mut(self, anon name: str) -> bool {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].declared_mut
+            }
+            i = i - 1
+        }
+        return false
+    }
+
     func find_var_mutable(self, anon name: str) -> bool {
         mut i = len(self.vars) - 1
         for i >= 0 {
@@ -5675,6 +5721,7 @@ type Codegen = struct {
             .KArrayInterface(_i) -> return true
             .KArrayOptional(_i) -> return true
             .KArrayArray(_i) -> return true
+            .KFunc(_a, _b) -> return true
             .KArrayFunc(_a, _b) -> return true
             .KInterface(_i) -> return true
             .KArrayBool -> return true
@@ -5886,6 +5933,15 @@ type Codegen = struct {
     }
 
     func emit_rc_descs(self) -> none {
+        if len(self.fn_cells) > 0 {
+            self.println(".data")
+            self.println("\t.p2align 3")
+            for lbl in self.fn_cells {
+                self.println(f"Lfn{lbl}:")
+                self.println(f"\t.quad {lbl}")
+            }
+            self.fn_cells = []
+        }
         if len(self.rc_descs) == 0 {
             return
         }
@@ -7550,7 +7606,7 @@ type Codegen = struct {
                     for n in self.visible_func_names() {
                         cands += [n]
                     }
-                    mut msg: str = self.literal_hint(self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands))
+                    mut msg: str = self.unknown_name_msg(f"error: unknown name `{name}`", :name, candidates: cands)
                     let hint = self.type_elsewhere_hint(name)
                     if len(hint) > 0 {
                         msg = f"error: unknown type `{name}`; {hint}"
@@ -7602,11 +7658,7 @@ type Codegen = struct {
                     }
                     let idx = self.func_instance(fn_ref, :type_args)
                     self.queue_func_instance(idx, span: self.p.expr_spans[expr_id])
-                    let lbl = self.func_insts[idx].label
-                    let reg: str = self.pool.alloc_reg()
-                    self.emit(f"adrp {reg}, {lbl}@PAGE")
-                    self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
-                    return .VReg(name: reg)
+                    return self.fn_value(self.func_insts[idx].label)
                 }
                 if op is .Dot and self.const_signature(expr_id) is Some(_const_sig) {
                     let no_args: [ast.CallArg] = []
@@ -7619,11 +7671,7 @@ type Codegen = struct {
                             self.report_generic_value(self.import_fn_at(slot).name, span: self.p.expr_spans[expr_id])
                             return .VImm(value: 0)
                         }
-                        let lbl = self.import_fn_at(slot).label
-                        let reg: str = self.pool.alloc_reg()
-                        self.emit(f"adrp {reg}, {lbl}@PAGE")
-                        self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
-                        return .VReg(name: reg)
+                        return self.fn_value(self.import_fn_at(slot).label)
                     }
                     if self.p.exprs[lhs] is .Ident(alias) and self.p.exprs[rhs] is .Ident(member) and self.is_import_alias(alias) and self.qualified_type_ref(alias, name: member) < 0 {
                         if member.starts_with("_") and self.module_declares(alias, name: member) {
@@ -7650,16 +7698,13 @@ type Codegen = struct {
             .OptionalMethodCall(value, method, args) -> return self.compile_optional_method_call(value_id: value, :method, :args)
             .FuncLit(decl_id) -> {
                 // The lambda was registered with a synthesised name
-                // and label during compile_module; emit its address
-                // as a function-pointer value, same shape as a bare
-                // named-function reference.
+                // and label during compile_module.
                 let slot = self.lookup_lambda(decl_id)
                 if slot != -1 {
-                    let lbl: str = self.fn_label(slot)
-                    let reg: str = self.pool.alloc_reg()
-                    self.emit(f"adrp {reg}, {lbl}@PAGE")
-                    self.emit(f"add {reg}, {reg}, {lbl}@PAGEOFF")
-                    return .VReg(name: reg)
+                    if len(self.p.func_decls[decl_id].captures) > 0 {
+                        return self.compile_closure(decl_id, lbl: self.fn_label(slot))
+                    }
+                    return self.fn_address(slot)
                 }
                 self.report_error("internal error: function literal was never registered", span: self.p.expr_spans[expr_id])
                 return .VImm(value: 0)
@@ -9955,6 +10000,7 @@ type Codegen = struct {
                 }
                 .Extern(name, name_span, params, return_typ) -> {
                     self.check_sig_types(params, :return_typ)
+                    self.check_extern_no_func(params, :return_typ)
                     self.check_param_count(params, what: f"`{name}`", span: name_span)
                     self.check_param_names(params)
                 }
@@ -10350,6 +10396,60 @@ type Codegen = struct {
         return "this function value"
     }
 
+    // A cell holds the code address, then the captured values, each retained.
+    func compile_closure(self, anon decl_id: int64, lbl: str) -> Val {
+        let fd = self.p.func_decls[decl_id]
+        mut env = LitEnv(:decl_id)
+        mut refs: [int64] = []
+        mut ok = true
+        for i, c in fd.captures {
+            let name = self.source_name(c.key)
+            if self.body_instance >= 0 or self.body_func_inst >= 0 {
+                self.report_error(f"error: a function literal in a generic function or type can't capture `{name}`", span: c.span)
+                ok = false
+            } else if self.find_var_declared_mut(c.key) {
+                self.report_error(f"error: a function literal can't capture `{name}`, which is `mut`", span: c.span)
+                ok = false
+            }
+            let kind = self.find_var_kind(c.key)
+            env.keys += [c.key]
+            env.kinds += [kind]
+            if self.rc_heap_kind(kind) {
+                refs += [i + 1]
+            }
+        }
+        if not ok {
+            return .VImm(value: 0)
+        }
+        mut known = false
+        for e in self.lit_envs {
+            if e.decl_id == decl_id {
+                known = true
+            }
+        }
+        if not known {
+            self.lit_envs += [env]
+        }
+        self.emit_load_imm("x0", value: (len(env.keys) + 1) * 8)
+        let rc_cell = self.rc_alloc_slots(refs)
+        let ptr_r = self.pool.alloc_reg()
+        self.emit(f"mov {ptr_r}, x0")
+        let tmp_r = self.pool.alloc_reg()
+        self.emit(f"adrp {tmp_r}, {lbl}@PAGE")
+        self.emit(f"add {tmp_r}, {tmp_r}, {lbl}@PAGEOFF")
+        self.emit(f"str {tmp_r}, [{ptr_r}]")
+        for i, key in env.keys {
+            self.emit_ldr(self.find_var_offset(key), reg: tmp_r)
+            self.rc_retain_kind(tmp_r, kind: env.kinds[i])
+            self.emit(f"str {tmp_r}, [{ptr_r}, #{(i + 1) * 8}]")
+        }
+        self.pool.free_reg(tmp_r)
+        self.emit(f"mov x0, {ptr_r}")
+        self.pool.free_reg(ptr_r)
+        self.rc_mark_owned("x0", slot: rc_cell)
+        return .VReg(name: "x0")
+    }
+
     func compile_indirect_call(self, callee_id: int64, args: [ast.CallArg]) -> Val {
         let callee_kind: TypeKind = self.infer_kind(callee_id)
         if callee_kind is .KFunc(param_kinds, _return_kind) {
@@ -10392,6 +10492,7 @@ type Codegen = struct {
             // with the arg registers x0-x7).
             let callee_reg: str = self.pool.alloc_reg()
             self.mov_to(callee_val, dest: callee_reg)
+            self.rc_hold(callee_id, reg: callee_reg)
             let spilled: bool = self.spill_across(callee_reg)
             // Function-pointer types don't carry defaults — the
             // sig isn't accessible at the indirect-call site, only
@@ -10401,7 +10502,9 @@ type Codegen = struct {
             let no_slots: [int64] = []
             self.prepare_args_with_kinds(args, expected_kinds: param_kinds, default_exprs: no_defaults, src_p: self.p, slots: no_slots)
             self.restore_across(callee_reg, :spilled)
-            self.emit(f"blr {callee_reg}")
+            self.emit(f"ldr x16, [{callee_reg}]")
+            self.emit(f"mov x17, {callee_reg}")
+            self.emit("blr x16")
             self.pool.free_reg(callee_reg)
             return .VReg(name: "x0")
         }
@@ -10509,7 +10612,7 @@ type Codegen = struct {
                         return .VImm(value: 0)
                     }
                 }
-                mut msg: str = self.literal_hint(self.with_suggestion(f"error: unknown function `{name}`", typo: name, candidates: self.visible_func_names()))
+                mut msg: str = self.unknown_name_msg(f"error: unknown function `{name}`", :name, candidates: self.visible_func_names())
                 if len(hint) > 0 {
                     msg = f"error: unknown type `{name}`; {hint}"
                 }
@@ -11931,6 +12034,7 @@ type Codegen = struct {
             if self.vars[i].name == name {
                 self.vars[i].kind = kind
                 self.vars[i].mutable = mutable
+                self.vars[i].declared_mut = mutable
                 i = len(self.vars)
             } else {
                 i = i + 1
@@ -13468,13 +13572,17 @@ type Codegen = struct {
                     }
                     mut msg: str = self.with_suggestion(f"error: unknown name `{name}`; declare it with `mut {name} = ...`", typo: name, candidates: cands)
                     if self.in_func_literal {
-                        msg = self.literal_hint(self.with_suggestion(f"error: unknown name `{name}`", typo: name, candidates: cands))
+                        msg = self.unknown_name_msg(f"error: unknown name `{name}`", :name, candidates: cands)
                     }
                     self.report_error(msg, span: self.p.expr_spans[lhs_id])
                     return none
                 }
                 if not self.var_bound(name) {
                     self.report_error(self.unbound_msg(name, verb: "assigned"), span: self.p.expr_spans[lhs_id])
+                    return none
+                }
+                if arrays.contains(self.in_captures, name) {
+                    self.report_error(f"error: a function literal can't assign to `{self.source_name(name)}`, which it captures", span: self.p.expr_spans[lhs_id])
                     return none
                 }
                 if self.enforce_immutability() and not self.find_var_mutable(name) {
@@ -14696,6 +14804,13 @@ type Codegen = struct {
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.in_func_literal = self.is_lambda_name(func_decl.name)
+        self.lit_let_name = self.source_name(func_decl.let_name)
+        let lit_env = self.lit_env
+        self.lit_env = none
+        self.in_captures = []
+        if lit_env is Some(env) {
+            self.in_captures = env.keys
+        }
         // A method with type parameters of its own has been reported by the parser.
         if owner >= 0 and len(func_decl.type_params) > 0 {
             return
@@ -14760,11 +14875,22 @@ type Codegen = struct {
             // opts the binding into reassignment. The slot otherwise defaults
             // mutable, so only params need this explicit set.
             self.vars[-1].mutable = param.mutable
+            self.vars[-1].declared_mut = param.mutable
             self.vars[-1].bound = true
         }
         mut param_kinds: [TypeKind] = []
         for v in self.vars {
             param_kinds += [v.kind]
+        }
+        // Captures are locals the prologue fills in, and borrowed like parameters.
+        mut capture_offs: [int64] = []
+        if lit_env is Some(env) {
+            for i, key in env.keys {
+                capture_offs += [self.alloc_var(name: key, kind: env.kinds[i])]
+                self.vars[-1].mutable = false
+                self.vars[-1].bound = true
+                self.rc_param_offs += [capture_offs[-1]]
+            }
         }
 
         for stmt_id in func_decl.body {
@@ -14875,6 +15001,11 @@ type Codegen = struct {
         self.emit(f"sub sp, sp, #{aligned}")
         for slot in self.rc_slots {
             self.emit_str_raw(slot, reg: "xzr")
+        }
+        // Before anything that counts: those use x17.
+        for i, off in capture_offs {
+            self.emit(f"ldr x9, [x17, #{(i + 1) * 8}]")
+            self.emit_str_raw(off, reg: "x9")
         }
         // A parameter the body stores to owns its value after all.
         mut rc_k = 0
@@ -15025,7 +15156,9 @@ type Codegen = struct {
             }
         }
         for ld_id in lambda_decl_ids {
-            self.compile_func(fd_id: ld_id, struct_name: "", override_lbl: "")
+            if len(self.p.func_decls[ld_id].captures) == 0 {
+                self.compile_func(fd_id: ld_id, struct_name: "", override_lbl: "")
+            }
         }
 
         // Compile any `test "..." { ... }` blocks. Each becomes a normal
@@ -15076,6 +15209,17 @@ type Codegen = struct {
             self.emit("ret")
         }
 
+        // A literal that captures can be compiled once what it captures has kinds, which
+        // is when its creation site has been. Its body may hold more such sites.
+        mut env_cursor = 0
+        for env_cursor < len(self.lit_envs) {
+            let env = self.lit_envs[env_cursor]
+            self.lit_env = env
+            self.compile_func(fd_id: env.decl_id, struct_name: "", override_lbl: "")
+            env_cursor += 1
+        }
+        self.lit_envs = []
+
         // Emit the method bodies of generic instances that something uses, and the generic
         // functions called. Each kind of body can ask for more of the other, and a vtable
         // uses all of its interface's methods, so go round until all run out.
@@ -15109,7 +15253,7 @@ type Codegen = struct {
         }
         self.body_instance = saved_instance
 
-        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 {
+        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 or len(self.fn_cells) > 0 or len(self.rc_descs) > 0 {
             self.println(".data")
             for fi, float_label in self.float_labels {
                 self.println("\t.p2align 3")
