@@ -26,6 +26,9 @@ typedef struct { uint32_t count; uint32_t info; } RcHdr;
 
 static char *rc_cur, *rc_end;
 __attribute__((used)) void *rc_free_lists[128];
+#ifdef RC_POISON
+static int64_t rc_poisoned;
+#endif
 #ifdef RC_STATS
 static int64_t rc_n_alloc, rc_n_free, rc_live, rc_peak;
 #endif
@@ -197,6 +200,7 @@ void rc_free_object(void *p) {
 #ifdef RC_POISON
         /* Never reused, and any later read sees rubbish. */
         memset(h + 1, 0xDD, (size_t)rc_class_size(cls) - 8);
+        rc_poisoned += rc_class_size(cls);
 #else
         *(void **)(h + 1) = rc_free_lists[cls];
         rc_free_lists[cls] = h;
@@ -287,6 +291,9 @@ __attribute__((naked)) void rc_release_stub(void) {
 /* Bytes in use: what the heap took from the OS, less what the free lists hold. */
 int64_t rc_live_bytes(void) {
     int64_t bytes = rc_cur ? rc_cur - (char *)RC_BASE : 0;
+#ifdef RC_POISON
+    bytes -= rc_poisoned;
+#endif
     for (int cls = 0; cls < 128; cls++) {
         for (RcHdr *h = (RcHdr *)rc_free_lists[cls]; h; h = *(RcHdr **)(h + 1)) {
             bytes -= rc_class_size(cls);
