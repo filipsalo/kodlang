@@ -459,16 +459,12 @@ type ProgramType = struct {
     path: str
 }
 
-extern func kod_env_get(anon name: str) -> str
-
 type RcDesc = struct {
     lbl: str
     words: [int64]
 }
 
 type Codegen = struct {
-    // Reference counting.
-    rc_on: bool = true
     // Frame slots that own a reference: released when the function exits.
     rc_slots: [int64] = []
     // Slots holding the fresh results of the statement being compiled.
@@ -5689,7 +5685,7 @@ type Codegen = struct {
 
     // Only x16, x17 and lr change, and no flags. An address outside the counted heap is left alone.
     func rc_retain(self, anon reg: str) -> none {
-        if not self.rc_on or self.rc_take(reg) {
+        if self.rc_take(reg) {
             return
         }
         self.emit(f"mov x17, {reg}")
@@ -5697,7 +5693,7 @@ type Codegen = struct {
     }
 
     func rc_retain_kind(self, anon reg: str, kind: TypeKind) -> none {
-        if self.rc_on and self.rc_heap_kind(kind) {
+        if self.rc_heap_kind(kind) {
             self.rc_retain(reg)
         }
     }
@@ -5721,9 +5717,6 @@ type Codegen = struct {
     // `reg` holds a fresh reference: the frame owns it until the statement ends,
     // unless the next thing to happen is a store that takes it over.
     func rc_temp(self, anon reg: str) -> none {
-        if not self.rc_on {
-            return
-        }
         self.rc_flush_pending()
         self.rc_pending = true
         self.rc_pending_reg = reg
@@ -5788,7 +5781,7 @@ type Codegen = struct {
 
     // `reg` holds the finished cell whose frame slot `slot` owns it.
     func rc_mark_owned(self, anon reg: str, slot: int64) -> none {
-        if self.rc_on and slot != 0 {
+        if slot != 0 {
             self.rc_flush_pending()
             self.rc_pending = true
             self.rc_pending_reg = reg
@@ -5797,16 +5790,13 @@ type Codegen = struct {
     }
 
     func rc_temp_val(self, anon val: Val, kind: TypeKind) -> Val {
-        if self.rc_on and self.rc_heap_kind(kind) and val is .VReg(name) {
+        if self.rc_heap_kind(kind) and val is .VReg(name) {
             self.rc_temp(name)
         }
         return val
     }
 
     func rc_call_result(self, anon expr_id: int64, callee: int64, val: Val) -> Val {
-        if not self.rc_on {
-            return val
-        }
         if self.rc_ctor_mark == len(self.out_buf) {
             return val
         }
@@ -5823,24 +5813,20 @@ type Codegen = struct {
     // Allocates a cell of the size in x0. The frame owns it until the statement ends;
     // its slot comes back for rc_mark_owned, once the cell is finished.
     func rc_alloc_cell(self, mask: int64) -> int64 {
-        if not self.rc_on {
-            self.emit("bl _arena_alloc")
-            return 0
-        }
         self.emit_load_imm("x1", value: mask)
         self.emit("bl _rc_alloc")
         return self.rc_store_temp("x0")
     }
 
     func rc_kind_mask(self, anon kind: TypeKind, slot: int64) -> int64 {
-        if self.rc_on and self.rc_heap_kind(kind) {
+        if self.rc_heap_kind(kind) {
             return 1 << slot
         }
         return 0
     }
 
     func rc_hold(self, anon expr_id: int64, reg: str) -> none {
-        if not self.rc_on or (self.rc_pending and self.rc_pending_reg == reg) {
+        if (self.rc_pending and self.rc_pending_reg == reg) {
             return
         }
         match self.p.exprs[expr_id] {
@@ -5881,7 +5867,7 @@ type Codegen = struct {
                 mask = mask | (1 << slot)
             }
         }
-        if top < 21 or not self.rc_on {
+        if top < 21 {
             return self.rc_alloc_cell(:mask)
         }
         mut words: [int64] = []
@@ -5916,49 +5902,47 @@ type Codegen = struct {
     }
 
     func emit_str(self, anon offset: int64, reg: str) -> none {
-        if self.rc_on {
-            mut i = len(self.vars) - 1
-            for i >= 0 {
-                if self.vars[i].offset == offset {
-                    mut rc_kind = self.vars[i].kind
-                    if offset == self.rc_let_off {
-                        rc_kind = self.rc_let_kind
-                    }
-                    if self.rc_heap_kind(rc_kind) or rc_kind is .KUnknown {
-                        mut known = false
-                        for slot in self.rc_slots {
-                            if slot == offset {
-                                known = true
-                                break
-                            }
-                        }
-                        self.rc_retain(reg)
-                        if not known {
-                            self.rc_slots += [offset]
-                            // The first store in the text, outside any loop: the slot is still empty.
-                            if len(self.loop_stack) == 0 {
-                                mut is_param = false
-                                for po in self.rc_param_offs {
-                                    if po == offset {
-                                        is_param = true
-                                        break
-                                    }
-                                }
-                                if not is_param {
-                                    self.emit_str_raw(offset, :reg)
-                                    return
-                                }
-                            }
-                        }
-                        self.emit_ldr(offset, reg: "x17")
-                        self.emit_str_raw(offset, :reg)
-                        self.rc_release_x17()
-                        return
-                    }
-                    break
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].offset == offset {
+                mut rc_kind = self.vars[i].kind
+                if offset == self.rc_let_off {
+                    rc_kind = self.rc_let_kind
                 }
-                i = i - 1
+                if self.rc_heap_kind(rc_kind) or rc_kind is .KUnknown {
+                    mut known = false
+                    for slot in self.rc_slots {
+                        if slot == offset {
+                            known = true
+                            break
+                        }
+                    }
+                    self.rc_retain(reg)
+                    if not known {
+                        self.rc_slots += [offset]
+                        // The first store in the text, outside any loop: the slot is still empty.
+                        if len(self.loop_stack) == 0 {
+                            mut is_param = false
+                            for po in self.rc_param_offs {
+                                if po == offset {
+                                    is_param = true
+                                    break
+                                }
+                            }
+                            if not is_param {
+                                self.emit_str_raw(offset, :reg)
+                                return
+                            }
+                        }
+                    }
+                    self.emit_ldr(offset, reg: "x17")
+                    self.emit_str_raw(offset, :reg)
+                    self.rc_release_x17()
+                    return
+                }
+                break
             }
+            i = i - 1
         }
         self.emit_str_raw(offset, :reg)
     }
@@ -7373,11 +7357,7 @@ type Codegen = struct {
                 // clobber a register-resident copy).
                 let hdr_name = f"__fh_{name}"
                 if not self.var_declared(hdr_name) {
-                    mut hdr_kind: TypeKind = .KInt64
-                    if self.rc_on {
-                        hdr_kind = .KArray
-                    }
-                    self.alloc_var(name: hdr_name, kind: hdr_kind)
+                    self.alloc_var(name: hdr_name, kind: .KArray)
                 }
                 self.collect_expr_vars(iter)
                 for i in 0..len(body) {
@@ -9180,14 +9160,12 @@ type Codegen = struct {
         self.emit("sub sp, sp, #16")
         self.emit("mov x0, #24")
         mut rc_mask = 1 << 22
-        if self.rc_on {
-            mut rc_elem = expected_elem
-            if self.is_void_kind(rc_elem) and n > 0 {
-                rc_elem = self.infer_kind(elements[0])
-            }
-            if self.rc_heap_kind(rc_elem) {
-                rc_mask = rc_mask | (1 << 21)
-            }
+        mut rc_elem = expected_elem
+        if self.is_void_kind(rc_elem) and n > 0 {
+            rc_elem = self.infer_kind(elements[0])
+        }
+        if self.rc_heap_kind(rc_elem) {
+            rc_mask = rc_mask | (1 << 21)
         }
         let rc_cell = self.rc_alloc_cell(mask: rc_mask)
         self.emit("str x0, [sp]")
@@ -9196,12 +9174,8 @@ type Codegen = struct {
             buf_sz = 8
         }
         self.emit_load_imm("x0", value: buf_sz)
-        if self.rc_on {
-            self.emit("mov x1, #0")
-            self.emit("bl _rc_alloc")
-        } else {
-            self.emit("bl _arena_alloc")
-        }
+        self.emit("mov x1, #0")
+        self.emit("bl _rc_alloc")
         self.emit("str x0, [sp, #8]")
         let typed = self.elem_needs_conversion(expected_elem)
         // With no type to go to, the literal takes its first element's.
@@ -9229,13 +9203,11 @@ type Codegen = struct {
             // have clobbered a pool-register copy.
             let buf_r = self.pool.alloc_reg()
             self.emit(f"ldr {buf_r}, [sp, #8]")
-            if self.rc_on {
-                mut rc_elem = expected_elem
-                if self.is_void_kind(rc_elem) {
-                    rc_elem = self.infer_kind(elements[0])
-                }
-                self.rc_retain_kind(elem_reg, kind: rc_elem)
+            mut rc_elem = expected_elem
+            if self.is_void_kind(rc_elem) {
+                rc_elem = self.infer_kind(elements[0])
             }
+            self.rc_retain_kind(elem_reg, kind: rc_elem)
             self.emit(f"str {elem_reg}, [{buf_r}, #{i * item_sz}]")
             self.pool.free_reg(buf_r)
             self.pool.free_reg(elem_reg)
@@ -11854,7 +11826,7 @@ type Codegen = struct {
             self.rc_release_x17()
         }
         self.rc_flush_pending()
-        if self.rc_on and len(self.rc_stmt_temps) > rc_mark {
+        if len(self.rc_stmt_temps) > rc_mark {
             for slot in self.rc_stmt_temps[rc_mark..] {
                 self.emit_ldr(slot, reg: "x17")
                 self.emit_str_raw(slot, reg: "xzr")
@@ -11920,7 +11892,7 @@ type Codegen = struct {
         }
         // From a reference to a number: the old value stays in its slot until the
         // function returns, since that slot is released as a reference then.
-        if self.rc_on and not self.rc_heap_kind(kind) and not (kind is .KUnknown) {
+        if not self.rc_heap_kind(kind) and not (kind is .KUnknown) {
             for slot in self.rc_slots {
                 if slot == off {
                     self.frame_slots = self.frame_slots + 1
@@ -12835,7 +12807,7 @@ type Codegen = struct {
             mut foff = self.find_field_offset(arg.label, :struct_idx)
             mut field_kind = self.find_field_kind(arg.label, :struct_idx)
             // Stash ptr_r across the call so it survives any bl in the
-            // field expression (constructor calls, arena_alloc for
+            // field expression (constructor calls, rc_alloc for
             // wrapping an optional, etc).
             let ptr_spilled = self.spill_across(ptr_r)
             let field_reg = self.compile_into(arg.value, expected: field_kind)
@@ -12912,12 +12884,10 @@ type Codegen = struct {
         mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
         self.emit_load_imm("x0", value: data_width)
         mut rc_refs: [int64] = []
-        if self.rc_on {
-            let rc_info = self.enums[enum_idx].variants[variant_idx]
-            for ri, rk in rc_info.field_kinds {
-                if ri < len(rc_info.field_offsets) and self.rc_heap_kind(rk) {
-                    rc_refs += [rc_info.field_offsets[ri] / 8 + 1]
-                }
+        let rc_info = self.enums[enum_idx].variants[variant_idx]
+        for ri, rk in rc_info.field_kinds {
+            if ri < len(rc_info.field_offsets) and self.rc_heap_kind(rk) {
+                rc_refs += [rc_info.field_offsets[ri] / 8 + 1]
             }
         }
         let rc_cell = self.rc_alloc_slots(rc_refs)
@@ -13127,7 +13097,7 @@ type Codegen = struct {
         if recv_first {
             ptr_reg = self.preserve_end(ptr_reg, spilled: ptr_spilled)
         }
-        if self.rc_on and self.rc_heap_kind(field_kind) {
+        if self.rc_heap_kind(field_kind) {
             self.rc_retain(tmp_reg)
             self.emit(f"ldr x17, [{ptr_reg}, #{foff}]")
             self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
@@ -13345,7 +13315,7 @@ type Codegen = struct {
                 let idx_r = self.load(idx_v)
                 // Preserve the index across the RHS *and* the lhs pointer
                 // computation. If either includes a `bl` (e.g. a struct
-                // constructor calling _arena_alloc) it would clobber a
+                // constructor calling _rc_alloc) it would clobber a
                 // caller-saved idx_r; preserve_begin stashes it then (and
                 // keeps it in a callee-saved register for free otherwise).
                 let idx_spilled = self.preserve_begin(idx_r)
@@ -13396,7 +13366,7 @@ type Codegen = struct {
                 self.emit_label(ok_lbl)
                 self.pool.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
-                if self.rc_on and self.rc_heap_kind(self.array_elem_kind(lhs_kind)) {
+                if self.rc_heap_kind(self.array_elem_kind(lhs_kind)) {
                     self.rc_retain(reloaded_rhs_r)
                     self.emit(f"ldr x17, [{buf_r}, {reloaded_idx_r}]")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
@@ -13569,7 +13539,7 @@ type Codegen = struct {
     // Leaves the function with the value in x0. A reference the frame would give up
     // anyway becomes the caller's as it is, with no counting.
     func emit_ret_jump(self) -> none {
-        if self.rc_on and self.rc_heap_kind(self.return_kind) and self.rc_take("x0") {
+        if self.rc_heap_kind(self.return_kind) and self.rc_take("x0") {
             self.emit(f"b {self.ret_lbl}_own")
             return
         }
@@ -13578,7 +13548,7 @@ type Codegen = struct {
 
     // `return x` for a local that owns its value: the local gives it up.
     func rc_return_local(self, anon val: Val) -> bool {
-        if not self.rc_on or not self.rc_heap_kind(self.return_kind) {
+        if not self.rc_heap_kind(self.return_kind) {
             return false
         }
         let .VStack(off) = val else { return false }
@@ -13798,9 +13768,7 @@ type Codegen = struct {
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
         self.emit(f"str {disc_r}, [x0]")
         self.pool.free_reg(disc_r)
-        if self.rc_on {
-            self.rc_retain_kind(payload, kind: self.result_inner_kind(self.return_kind))
-        }
+        self.rc_retain_kind(payload, kind: self.result_inner_kind(self.return_kind))
         self.emit(f"str {payload}, [x0, #8]")   // payload
         self.pool.free_reg(payload)
         self.rc_mark_owned("x0", slot: rc_cell)
@@ -14068,7 +14036,7 @@ type Codegen = struct {
         // load the field at its known offset.
         self.emit(f"ldr {reg}, [{reg}]")
         self.emit(f"ldr {reg}, [{reg}, #{foff}]")
-        // Wrap the field value into a fresh Some cell: arena_alloc 8 +
+        // Wrap the field value into a fresh Some cell: rc_alloc 8 +
         // store the value. Preserves the field value across `bl`.
         let val_spilled = self.preserve_begin(reg)
         self.emit("mov x0, #8")
@@ -14860,15 +14828,13 @@ type Codegen = struct {
         self.emit_no_value_return()
 
         self.emit_label(self.ret_lbl)
-        if self.rc_on {
-            self.rc_retain_kind("x0", kind: self.return_kind)
-            if self.rc_heap_kind(self.return_kind) {
-                self.emit_label(f"{self.ret_lbl}_own")
-            }
-            for slot in self.rc_slots {
-                self.emit_ldr(slot, reg: "x17")
-                self.rc_release_x17()
-            }
+        self.rc_retain_kind("x0", kind: self.return_kind)
+        if self.rc_heap_kind(self.return_kind) {
+            self.emit_label(f"{self.ret_lbl}_own")
+        }
+        for slot in self.rc_slots {
+            self.emit_ldr(slot, reg: "x17")
+            self.rc_release_x17()
         }
         // From fp: a `try` inside a pushed region branches here with sp still lowered.
         self.emit("mov sp, fp")
@@ -14910,21 +14876,19 @@ type Codegen = struct {
         for slot in self.rc_slots {
             self.emit_str_raw(slot, reg: "xzr")
         }
-        if self.rc_on {
-            // A parameter the body stores to owns its value after all.
-            mut rc_k = 0
-            for param in func_decl.params {
-                if rc_k < len(arg_regs) {
-                    let off = self.find_var_offset(param.name)
-                    for slot in self.rc_slots {
-                        if slot == off {
-                            self.rc_retain(arg_regs[rc_k])
-                            break
-                        }
+        // A parameter the body stores to owns its value after all.
+        mut rc_k = 0
+        for param in func_decl.params {
+            if rc_k < len(arg_regs) {
+                let off = self.find_var_offset(param.name)
+                for slot in self.rc_slots {
+                    if slot == off {
+                        self.rc_retain(arg_regs[rc_k])
+                        break
                     }
                 }
-                rc_k = rc_k + 1
             }
+            rc_k = rc_k + 1
         }
         for line in body_buf {
             self.out_buf += [line]
