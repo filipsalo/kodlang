@@ -260,8 +260,7 @@ for a value outside the `int64` range.
 ## Building strings
 
 `+=` copies the whole string every time, so a loop that appends thousands of
-pieces does quadratic work and leaves every intermediate copy in memory (the
-arena never frees). Use a `StrBuilder` for that:
+pieces does quadratic work. Use a `StrBuilder` for that:
 
 ```kod
 import "strbuilder" { StrBuilder }

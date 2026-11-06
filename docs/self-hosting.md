@@ -40,7 +40,7 @@ link.cfg            how everything is linked, read by the Makefile and by kod
 
 Driven by the `Makefile`:
 
-1. **stage0**: the checked-in snapshot `bootstrap/sh_kodc` compiles the always-linked stdlib modules and the compiler library to assembly; `as` assembles them and `clang` builds `arena.c` / `runtime.c`.
+1. **stage0**: the checked-in snapshot `bootstrap/sh_kodc` compiles the always-linked stdlib modules and the compiler library to assembly; `as` assembles them and `clang` builds `arena.c`, `rc.c` and `runtime.c`.
 2. **stage1**: the snapshot compiles `kodc.kod` and writes the `_main` shim; `clang` links everything into `build/stage1/sh_kodc`. So `sh_kodc` is the *current* compiler sources, compiled by the *snapshot*.
 3. **apps**: `kod build foo.kod` compiles each of the program's modules with `build/stage1/sh_kodc` to `build/apps/foo/foo.obj/<path>.o` and links them against `build/stage0/`.
 
@@ -105,7 +105,7 @@ Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool in
 - **Struct / enum / interface tables** on the codegen: registration happens before compilation; field/method lookups index these tables. Each module also keeps a table of the type names it declares, so a type name resolves in the module that wrote it: through that module's own table, the tables of the modules its import lists name, then the builtins', and `m.T` through the table of the module imported as `m`.
 - **Register pool**: `x8`–`x15` used as expression temporaries; saved/restored across calls via stack spills as needed. Code nested too deeply for the pool saves every live register to frame slots and compiles with all of them free, so nesting has no fixed limit.
 - **Generic monomorphisation**: each unique `Map[str, int64]` instantiation gets its own struct entry; methods compile once per instantiation.
-- **Interface dispatch**: `{data_ptr, vtable_ptr}` cells in the arena, one vtable per (struct, interface) pair; primitives box implicitly.
+- **Interface dispatch**: `{data_ptr, vtable_ptr}` cells on the heap, one vtable per (struct, interface) pair; primitives box implicitly.
 
 ## Verifying self-hosting
 

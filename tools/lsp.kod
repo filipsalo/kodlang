@@ -19,16 +19,10 @@ import "kod/ast"
 import "kod/codegen"
 import "kod/build"
 
-// LSP-state externs in stdlib/runtime.c. The LSP holds documents and a
-// compile cache here (in C-owned malloc'd memory) so they survive an
-// `arena_reset` — the parse trees / codegen state we drop between
-// recompiles otherwise leak gigabytes after a long editing session.
-//
-// `arena_reset` frees every arena block; `lsp_cache_invalidate` must
-// be called immediately before to null the dangling cached `cg`
-// pointer. Doc texts / active URI / publish-pending flag live in C
-// memory and are unaffected by either call.
-extern func arena_reset() -> none
+// LSP-state externs in stdlib/runtime.c: the documents, the active URI, the
+// publish-pending flag and a compile cache, which holds a reference to the last
+// `cg`. `lsp_cache_invalidate` drops that reference, and with it the parse trees
+// and codegen state of that compile.
 extern func lsp_cache_invalidate() -> none
 extern func lsp_docs_set(anon uri: str, anon text: str) -> none
 extern func lsp_docs_get(anon uri: str) -> str
@@ -131,13 +125,9 @@ func main() -> int64 {
     return 0
 }
 
-// The three document-lifecycle handlers all end with `lsp_cache_invalidate`
-// + `arena_reset`: at this point everything the user cares about (doc
-// text, active URI, publish-pending flag) lives in C-owned memory, and
-// the cached cg is being thrown out anyway (didOpen/didChange replace
-// the buffer; didClose drops it). Resetting here keeps memory bounded
-// — without it, every keystroke leaks the previous compile's parse
-// tree + codegen state.
+// The three document-lifecycle handlers all end with `lsp_cache_invalidate`:
+// didOpen and didChange replace the buffer the cached cg was compiled from, and
+// didClose drops it.
 func handle_did_open(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
@@ -146,7 +136,6 @@ func handle_did_open(params: json.Value) -> none {
     lsp_set_active_uri(uri)
     lsp_set_publish_pending(true)
     lsp_cache_invalidate()
-    arena_reset()
 }
 
 // `textDocument/didChange` with full sync mode: each notification carries
@@ -170,7 +159,6 @@ func handle_did_change(params: json.Value) -> none {
     lsp_set_active_uri(uri)
     lsp_set_publish_pending(true)
     lsp_cache_invalidate()
-    arena_reset()
 }
 
 func handle_did_close(params: json.Value) -> none {
@@ -185,7 +173,6 @@ func handle_did_close(params: json.Value) -> none {
         lsp_set_publish_pending(false)
     }
     lsp_cache_invalidate()
-    arena_reset()
 }
 
 // Compile `text` against the full stdlib + its transitive imports
@@ -384,14 +371,7 @@ func number_or_zero(anon v: json.Value) -> int64 {
 }
 
 // Cache hit when the request is for the same (uri, text) we last
-// compiled and the cached cg pointer is still valid (no arena_reset
-// since). Miss → recompile and repopulate the cache. We deliberately
-// don't reset the arena here — the caller's frame holds arena refs
-// (id_val, params, etc.) that have to stay live until the response
-// is written. The reset happens at the end of didOpen/didChange/
-// didClose, which is the next natural point where every kod-side
-// arena reference has gone out of scope and the cache is invalidated
-// in the same step.
+// compiled. Miss → recompile and repopulate the cache.
 func compile_or_cached(uri: str) -> codegen.Codegen {
     mut text: str = lsp_docs_get(uri)
     if lsp_cache_lookup(uri, text) {

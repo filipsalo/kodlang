@@ -377,7 +377,7 @@ overloaded.
 
 ## Memory layout (compiler)
 
-Struct fields are laid out sequentially, each taking 8 bytes, allocated on an arena:
+Struct fields are laid out sequentially, each taking 8 bytes, allocated on the [heap](memory-layout.md#the-heap):
 
 ```
 [ offset 0  ] field_0 : 8 bytes
@@ -385,4 +385,4 @@ Struct fields are laid out sequentially, each taking 8 bytes, allocated on an ar
 ...
 ```
 
-Struct variables hold a pointer to the arena allocation.
+Struct variables hold a pointer to the allocation.

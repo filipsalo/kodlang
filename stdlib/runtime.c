@@ -37,7 +37,7 @@ extern void kod_inspect_print_backtrace_from(int64_t fp)
 // which C files that Kod modules name include too.
 
 // Allocate a fresh KodStr plus a `len`-byte NUL-terminated buffer in
-// a single arena allocation. Caller fills `buf` before returning.
+// a single allocation. Caller fills `buf` before returning.
 static KodStr *kod_str_alloc(int64_t len) {
     return kod_str_new(len);
 }
@@ -366,7 +366,7 @@ int64_t kod_str_cmp(KodStr *a, KodStr *b) {
 
 // A growable byte buffer behind the stdlib `StrBuilder` and the str methods
 // that build strings. Kod holds it as an int64 handle. The buffer doubles
-// when full, in the arena like everything else, so n appended bytes cost
+// when full, so n appended bytes cost
 // O(n) and leave under 2n bytes of abandoned buffers behind.
 typedef struct {
     char *buf;
@@ -374,7 +374,6 @@ typedef struct {
     int64_t cap;
 } KodStrBuilder;
 
-#ifdef KOD_RC
 int64_t kod_sb_new(void) {
     KodStrBuilder *sb = (KodStrBuilder *)rc_alloc(sizeof(KodStrBuilder), 1);
     sb->cap = 32;
@@ -382,15 +381,6 @@ int64_t kod_sb_new(void) {
     sb->buf = (char *)rc_alloc_raw(sb->cap, 0);
     return (int64_t)sb;
 }
-#else
-int64_t kod_sb_new(void) {
-    KodStrBuilder *sb = (KodStrBuilder *)arena_alloc(sizeof(KodStrBuilder));
-    sb->cap = 32;
-    sb->len = 0;
-    sb->buf = (char *)arena_alloc(sb->cap);
-    return (int64_t)sb;
-}
-#endif
 
 static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
     if (extra > INT64_MAX / 4 - sb->len) {
@@ -400,14 +390,9 @@ static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
     if (need <= sb->cap) return;
     int64_t new_cap = sb->cap;
     while (new_cap < need) new_cap *= 2;
-#ifdef KOD_RC
     char *new_buf = (char *)rc_alloc_raw(new_cap, 0);
     memcpy(new_buf, sb->buf, (size_t)sb->len);
     rc_release_c(sb->buf);
-#else
-    char *new_buf = (char *)arena_alloc(new_cap);
-    memcpy(new_buf, sb->buf, (size_t)sb->len);
-#endif
     sb->buf = new_buf;
     sb->cap = new_cap;
 }
@@ -546,16 +531,17 @@ typedef struct {
     KodStr *stderr_buf;
 } KodProcessResult;
 
-// Append `n` bytes from `src` onto a growable arena-backed buffer.
-// Updates *buf, *len, *cap; arena-allocates fresh storage when the
+// Append `n` bytes from `src` onto a growable buffer.
+// Updates *buf, *len, *cap; allocates fresh storage when the
 // current capacity isn't enough. Returns the (possibly-new) buffer ptr.
 static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
                            const char *src, int64_t n) {
     if (*len + n > *cap) {
         int64_t new_cap = *cap;
         while (new_cap < *len + n) new_cap *= 2;
-        char *new_buf = (char *)arena_alloc(new_cap + 1);
+        char *new_buf = (char *)rc_alloc_raw(new_cap + 1, 0);
         memcpy(new_buf, buf, *len);
+        rc_release_c(buf);
         buf = new_buf;
         *cap = new_cap;
     }
@@ -564,12 +550,12 @@ static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
     return buf;
 }
 
-// The NULL-terminated C `argv` for a Kod `[str]`, in the arena. What
+// The NULL-terminated C `argv` for a Kod `[str]`, for the caller to release. What
 // posix_spawnp and execvp want is NUL-terminated C strings, not KodStr —
 // pull the underlying `buf` field out of each entry.
 static char **c_argv(KodArray *argv_arr) {
     int64_t argc = argv_arr->len;
-    char **argv = (char **)arena_alloc((argc + 1) * sizeof(char *));
+    char **argv = (char **)rc_alloc_raw((argc + 1) * sizeof(char *), 0);
     KodStr **kod_argv = (KodStr **)argv_arr->ptr;
     for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i]->buf;
     argv[argc] = NULL;
@@ -580,13 +566,12 @@ static char **c_argv(KodArray *argv_arr) {
 // `[str]`), capture stdout and stderr concurrently (via poll to avoid
 // the obvious deadlock where one pipe fills while we're blocked on the
 // other), wait, and return {status, stdout, stderr}. On spawn failure
-// status is -1 and the buffers are empty. Allocates the result and
-// both buffers in the arena.
+// status is -1 and the buffers are empty.
 KodProcessResult *kod_run_process(KodArray *argv_arr) {
     char **argv = c_argv(argv_arr);
 
     KodProcessResult *result =
-        (KodProcessResult *)arena_alloc(sizeof(KodProcessResult));
+        (KodProcessResult *)rc_alloc(sizeof(KodProcessResult), 6); // the two strs
 
     int out_pipe[2], err_pipe[2];
     if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
@@ -628,8 +613,8 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
 
     int64_t out_cap = 256, out_len = 0;
     int64_t err_cap = 256, err_len = 0;
-    char *out_buf = (char *)arena_alloc(out_cap + 1);
-    char *err_buf = (char *)arena_alloc(err_cap + 1);
+    char *out_buf = (char *)rc_alloc_raw(out_cap + 1, 0);
+    char *err_buf = (char *)rc_alloc_raw(err_cap + 1, 0);
 
     int open_count = 2;
     while (open_count > 0) {
@@ -660,6 +645,9 @@ KodProcessResult *kod_run_process(KodArray *argv_arr) {
     memcpy(out_str->buf, out_buf, out_len);
     KodStr *err_str = kod_str_alloc(err_len);
     memcpy(err_str->buf, err_buf, err_len);
+    rc_release_c(out_buf);
+    rc_release_c(err_buf);
+    rc_release_c(argv);
 
     int status;
     waitpid(pid, &status, 0);
@@ -685,6 +673,7 @@ int64_t kod_spawn(KodArray *argv_arr) {
     pid_t pid;
     int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
+    rc_release_c(argv);
     return rc == 0 ? (int64_t)pid : -1;
 }
 
@@ -855,15 +844,9 @@ KodStr *kod_bytes_from_array(void *arr_raw) {
 // `str` and `bytes` share the same runtime representation (a `KodStr *`);
 // these casts are zero-copy. The type system uses them to mark the
 // boundary between text and raw-byte handling.
-#ifdef KOD_RC
 KodStr *kod_str_to_bytes(void *s) { rc_retain_c(s); return (KodStr *)s; }
 KodStr *kod_bytes_to_str(void *b) { rc_retain_c(b); return (KodStr *)b; }
-#else
-KodStr *kod_str_to_bytes(void *s) { return (KodStr *)s; }
-KodStr *kod_bytes_to_str(void *b) { return (KodStr *)b; }
-#endif
 
-#ifdef KOD_RC
 #define RC_ARRAY_BIT (1ULL << 22)
 #define RC_REFS_BIT (1ULL << 21)
 static inline int rc_arr_counted(const void *p) { return ((uint64_t)p >> 36) == 0x300; }
@@ -936,67 +919,6 @@ void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
     if (refs) rc_arr_retain_all((void **)out->ptr, total);
     return out;
 }
-#else
-void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
-    KodArray *src = (KodArray *)src_raw;
-    int64_t len = clamp_slice(src->len, &start, end);
-    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
-    out->ptr = arena_alloc(len > 0 ? len * 8 : 8);
-    out->len = len;
-    out->cap = len;
-    if (len > 0) {
-        memcpy(out->ptr, (char *)src->ptr + start * 8, len * 8);
-    }
-    return out;
-}
-
-// A shallow copy with room to grow, for a `mut` binding that starts from an existing array.
-void *kod_array_copy(void *src_raw) {
-    KodArray *src = (KodArray *)src_raw;
-    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
-    out->ptr = arena_alloc(src->len > 0 ? src->len * 8 : 8);
-    out->len = src->len;
-    out->cap = src->len;
-    if (src->len > 0) {
-        memcpy(out->ptr, src->ptr, src->len * 8);
-    }
-    return out;
-}
-
-void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
-    KodArray *lhs = (KodArray *)lhs_raw;
-    KodArray *rhs = (KodArray *)rhs_raw;
-    int64_t total = lhs->len + rhs->len;
-    if (lhs->cap < total) {
-        int64_t new_cap = lhs->cap > 0 ? lhs->cap : 4;
-        while (new_cap < total) new_cap *= 2;
-        int64_t *buf = (int64_t *)arena_alloc(new_cap * 8);
-        int64_t *sl = (int64_t *)lhs->ptr;
-        for (int64_t i = 0; i < lhs->len; i++) buf[i] = sl[i];
-        lhs->ptr = buf;
-        lhs->cap = new_cap;
-    }
-    int64_t *dst = (int64_t *)lhs->ptr;
-    int64_t *sr = (int64_t *)rhs->ptr;
-    for (int64_t i = 0; i < rhs->len; i++) dst[lhs->len + i] = sr[i];
-    lhs->len = total;
-    return lhs;
-}
-
-// Binary `+` on arrays: a fresh array; `+=` appends via kod_array_concat.
-void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
-    KodArray *lhs = (KodArray *)lhs_raw;
-    KodArray *rhs = (KodArray *)rhs_raw;
-    int64_t total = lhs->len + rhs->len;
-    KodArray *out = (KodArray *)arena_alloc(sizeof(KodArray));
-    out->ptr = arena_alloc(total > 0 ? total * 8 : 8);
-    out->len = total;
-    out->cap = total;
-    if (lhs->len > 0) memcpy(out->ptr, lhs->ptr, lhs->len * 8);
-    if (rhs->len > 0) memcpy((char *)out->ptr + lhs->len * 8, rhs->ptr, rhs->len * 8);
-    return out;
-}
-#endif
 
 // Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
 // timeout, -1 on error. Used by the LSP loop to detect typing pauses:
@@ -1022,7 +944,7 @@ KodStr *read_stdin_line(void) {
     // copy into a properly-headed KodStr at the end.
     int64_t cap = 64;
     int64_t len = 0;
-    char *scratch = (char *)arena_alloc(cap);
+    char *scratch = (char *)rc_alloc_raw(cap, 0);
     while (1) {
         int ch = getchar();
         if (ch == EOF) {
@@ -1033,8 +955,9 @@ KodStr *read_stdin_line(void) {
         }
         if (len + 1 >= cap) {
             int64_t new_cap = cap * 2;
-            char *new_buf = (char *)arena_alloc(new_cap);
+            char *new_buf = (char *)rc_alloc_raw(new_cap, 0);
             for (int64_t i = 0; i < len; i++) new_buf[i] = scratch[i];
+            rc_release_c(scratch);
             scratch = new_buf;
             cap = new_cap;
         }
@@ -1045,6 +968,7 @@ KodStr *read_stdin_line(void) {
     }
     KodStr *s = kod_str_alloc(len);
     memcpy(s->buf, scratch, len);
+    rc_release_c(scratch);
     return s;
 }
 
@@ -1082,15 +1006,10 @@ KodStr *read_stdin_exact(int64_t n) {
     return s;
 }
 
-/* ── LSP state surviving arena_reset ──────────────────────────────────
+/* ── LSP state ────────────────────────────────────────────────────────
  *
- * The LSP recompiles between debounced didChange bursts and would
- * otherwise leak the previous compile's tokens / AST / codegen state
- * into the arena forever — every edit adds tens of MB. To keep memory
- * bounded the LSP calls `arena_reset` before each compile, but its
- * own per-document state (open document texts, the active URI, the
- * cached compile pointer) lives here in C-owned memory so it survives
- * the reset. Getters copy bytes back into a fresh arena KodStr.
+ * Open document texts, the active URI and the cached compile, in memory
+ * C owns. Getters copy bytes back into a fresh KodStr.
  */
 
 typedef struct LspDoc {
@@ -1105,9 +1024,7 @@ static LspDoc *g_lsp_docs = NULL;
 static char *g_lsp_active_uri = NULL;
 static int64_t g_lsp_active_uri_len = 0;
 static int g_lsp_publish_pending = 0;
-/* Cached compile result. The pointer lives in the arena, so we null
- * it out at the start of `arena_reset` — anything that wants it must
- * grab it before triggering a reset. */
+/* Cached compile result: this holds a reference to it. */
 static void *g_lsp_cached_cg = NULL;
 static char *g_lsp_cached_uri = NULL;
 static int64_t g_lsp_cached_uri_len = 0;
@@ -1193,14 +1110,10 @@ int64_t lsp_get_publish_pending(void) { return g_lsp_publish_pending; }
 void lsp_set_publish_pending(int64_t v) { g_lsp_publish_pending = v ? 1 : 0; }
 
 /* Cache lookup, two-step. `lsp_cache_lookup` returns 1 when (uri, text)
- * match the last successful compile *and* the cached cg pointer is
- * still valid (no `arena_reset` since); `lsp_cache_get_cg` then returns
+ * match the last successful compile; `lsp_cache_get_cg` then returns
  * the cg. The split keeps the Kod-side simple — calling a Codegen
  * field through an extern that might return null is awkward, so the
- * caller is expected to check `lsp_cache_lookup` first.
- *
- * The cg pointer is into the arena, so it's only valid until the
- * next `arena_reset` — which nulls it via `lsp_cache_invalidate`. */
+ * caller is expected to check `lsp_cache_lookup` first. */
 int64_t lsp_cache_lookup(KodStr *uri, KodStr *text) {
     if (!g_lsp_cached_cg) return 0;
     if (!lsp_bytes_eq(g_lsp_cached_uri, g_lsp_cached_uri_len, uri->buf, uri->len)) return 0;
@@ -1209,6 +1122,7 @@ int64_t lsp_cache_lookup(KodStr *uri, KodStr *text) {
 }
 
 void *lsp_cache_get_cg(void) {
+    rc_retain_c(g_lsp_cached_cg);
     return g_lsp_cached_cg;
 }
 
@@ -1221,13 +1135,14 @@ void lsp_cache_store(KodStr *uri, KodStr *text, void *cg) {
     g_lsp_cached_text = (char *)malloc((size_t)text->len);
     if (text->len > 0) memcpy(g_lsp_cached_text, text->buf, (size_t)text->len);
     g_lsp_cached_text_len = text->len;
+    rc_retain_c(cg);
+    rc_release_c(g_lsp_cached_cg);
     g_lsp_cached_cg = cg;
 }
 
-/* Called by the LSP just before `arena_reset` to clear the dangling
- * arena pointer in the cache. The uri/text byte buffers are malloc'd
- * and stay valid — only the cg pointer is invalidated. */
+/* Drops the cached compile. The uri/text byte buffers stay. */
 void lsp_cache_invalidate(void) {
+    rc_release_c(g_lsp_cached_cg);
     g_lsp_cached_cg = NULL;
 }
 

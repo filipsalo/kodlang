@@ -45,6 +45,9 @@ BOOTSTRAP_SH_KODC := bootstrap/sh_kodc
 KODC := ./$(BOOTSTRAP_SH_KODC)
 KODC_EMIT_MAIN := ./$(BOOTSTRAP_SH_KODC) _emit-runtime-main
 
+# The snapshot emits counted code only when asked, until the next refresh.
+export KOD_RC := 1
+
 STAGE0 := build/stage0
 STAGE1 := build/stage1
 

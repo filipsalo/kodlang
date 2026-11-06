@@ -22,10 +22,10 @@ passed by value in registers.
 ## Struct values
 
 Struct variables are **reference types**: the variable holds an 8-byte pointer
-to the struct's data, which lives in the global arena.
+to the struct's data, which lives on the [heap](#the-heap).
 
 ```
-stack slot (8 bytes)          arena memory
+stack slot (8 bytes)          heap memory
 ┌──────────────┐              ┌──────────────┐
 │   pointer ───┼─────────────▶│   field 0    │  offset 0
 └──────────────┘              │   field 1    │  offset 8
@@ -46,7 +46,7 @@ type Point = struct {
 }
 ```
 
-- `data_width` = 16 (allocated in arena)
+- `data_width` = 16 (allocated on the heap)
 - `width` = 8 (size of the pointer stored in a stack slot)
 
 ### Reference semantics
@@ -65,7 +65,7 @@ pointer the expression produced.
 
 ## Enum values
 
-Enums are **arena-allocated**, like structs. A stack slot holds an 8-byte
+Enums are **heap-allocated**, like structs. A stack slot holds an 8-byte
 pointer; the cell at the pointer is:
 
 ```
@@ -78,30 +78,89 @@ through the ARM64 calling convention without any multi-word ABI gymnastics.
 
 See `docs/enums.md` for details.
 
-## The global arena
+## Reclaiming memory
 
-All struct allocations go into a single implicit arena, backed by a
-linked-list bump allocator in `stdlib/arena.c`. The user never interacts
-with the arena directly — struct constructors allocate into it automatically.
+Kod counts references. Every struct, enum value, optional cell, interface cell,
+array and computed string has a count, and it is freed when the count reaches 0,
+as are the references it held. A program does nothing to make this happen: there
+is no `free`, no scope to declare and no collector that pauses it, and a server
+that handles requests for days stays the size its live data needs.
 
-### Allocator design
+**A cycle is never freed.** Two values that refer to each other keep each other
+alive after the last outside reference is gone:
 
-- Initial block: 4 MB (allocated via `malloc`)
-- When a block is full, a new block of at least 4 MB is linked in
-- Allocations are aligned to 8 bytes
-- Memory is never freed during a program run (the OS reclaims it on exit)
+```kod
+type Node = struct {
+    name: str
+    other: Node?
+}
 
-This is appropriate for compiler workloads, where all data is allocated
-upfront and the process exits when done.
-
-### Entry point
-
-```c
-void *arena_alloc(int64_t size);
+let a = Node(name: "a", other: none)
+let b = Node(name: "b", other: a)
+a.other = b  // a and b now live until the program exits
 ```
 
-Called internally by the compiler whenever a struct is constructed. Not
-exposed to Kod programs directly.
+For a long-running program, break the cycle when you are done with it
+(`a.other = none`), or keep the back reference as an index or a key instead of a
+struct. Most data, including all of the compiler's, has no cycles.
+
+Memory that has been freed is used again for new values but isn't returned to the
+OS, so a program stays as big as it has ever been. There are no threads, so counts
+aren't atomic.
+
+### The heap
+
+Counted objects live in one reserved address range of 64 GB (`stdlib/rc.c`), so
+whether a pointer is counted is a check on its address, and string literals and
+vtables need no count. A program that fills the range stops with
+`rc: the counted heap is full`.
+
+The 8 bytes before an object hold its header:
+
+```
+[offset -8]  count      : 32 bits
+[offset -4]  size class :  8 bits
+[offset -3]  slot mask  : 24 bits
+[offset  0]  the object
+```
+
+Bits 0 to 20 of the mask say which 8-byte slots of the object hold references,
+which is what freeing follows. Bit 21 marks an array whose elements are references,
+bit 22 an array, and bit 23 an object with references past slot 20, whose block
+ends in a pointer to a descriptor of them in the data section.
+
+A block comes from the free list of its size class, or else from the end of the
+used part of the range. Classes go up in steps of 16 bytes to 1 KB and in powers of
+two after that.
+
+### What generated code does
+
+- A call returns a reference its caller owns. A value a statement computes and
+  doesn't keep is released when the statement ends.
+- A store into a variable, field or element retains the new value and releases the
+  old one. When the value is fresh the store takes the reference over instead.
+- A function borrows its parameters: a parameter costs nothing unless the body
+  assigns to it. So that what it borrows can't go away, a caller holds a value it
+  read from a field or element for the length of the statement.
+- A function releases its variables when it returns.
+
+`retain` and `release` are calls with the object in `x17`, to `_rc_retain_stub` and
+`_rc_release_stub`. They change only `x16`, `x17` and `lr`, and no flags, until an
+object is freed, and freeing saves the rest, so they can sit anywhere in an
+expression.
+
+### Testing for mistakes
+
+To test the rules themselves, build the runtime so that freed memory is overwritten
+and never used again, by putting this in `link.local.cfg` and running the tests:
+
+```
+CFLAGS := -target arm64-apple-darwin -I stdlib -O2 -DRC_POISON
+```
+
+A use after free then shows as wrong output or a crash. `-DRC_STATS` adds counts of
+allocations and frees, printed at exit when `KOD_RC_STATS` is set. A program can
+declare `extern func rc_live_bytes() -> int64` to ask how much of the heap is in use.
 
 ## Calling convention (ARM64, macOS)
 

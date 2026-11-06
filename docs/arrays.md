@@ -167,7 +167,7 @@ Arrays are represented as a header struct on the heap:
 { void* ptr, int64 len, int64 cap }
 ```
 
-The `ptr` field points to an arena-allocated block of elements, each 8 bytes wide. `len` is the number of live elements; `cap` is the allocated capacity.
+The `ptr` field points to a block of elements, each 8 bytes wide. `len` is the number of live elements; `cap` is the allocated capacity.
 
 Appending (`+=`) goes through `_kod_array_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity

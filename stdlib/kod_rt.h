@@ -25,7 +25,7 @@ typedef struct {
     int64_t cap;
 } KodArray;
 
-// Memory that is never freed: everything Kod allocates comes from here.
+// Memory that is never freed, for what a C module keeps for good.
 void *arena_alloc(int64_t size);
 
 // The counted heap (stdlib/rc.c): `mask` says which 8-byte slots hold references.
@@ -42,17 +42,13 @@ void kod_io_set_errno(int64_t err);
 __attribute__((noreturn)) void kod_panic(KodStr *msg);
 
 // Allocate a fresh KodStr plus a `len`-byte NUL-terminated buffer in
-// a single arena allocation. Caller fills `buf` before returning.
+// a single allocation. Caller fills `buf` before returning.
 static inline KodStr *kod_str_new(int64_t len) {
     int64_t header = (int64_t)sizeof(KodStr);
     // Keep the byte buffer 8-aligned for the simple memcpy-into-it
     // paths even though no field needs that alignment.
     int64_t total = header + len + 1;
-#ifdef KOD_RC
     char *block = (char *)rc_alloc_raw(total, 0);
-#else
-    char *block = (char *)arena_alloc(total);
-#endif
     KodStr *s = (KodStr *)block;
     s->buf = block + header;
     s->len = len;

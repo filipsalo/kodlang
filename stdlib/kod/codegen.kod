@@ -461,9 +461,14 @@ type ProgramType = struct {
 
 extern func kod_env_get(anon name: str) -> str
 
+type RcDesc = struct {
+    lbl: str
+    words: [int64]
+}
+
 type Codegen = struct {
-    // Reference counting: on when KOD_RC is set while compiling.
-    rc_on: bool = len(kod_env_get("KOD_RC")) > 0
+    // Reference counting.
+    rc_on: bool = true
     // Frame slots that own a reference: released when the function exits.
     rc_slots: [int64] = []
     // Slots holding the fresh results of the statement being compiled.
@@ -483,6 +488,8 @@ type Codegen = struct {
     rc_pending_slot: int64 = 0
     // The frame offsets of this function's parameters: they hold a value on entry.
     rc_param_offs: [int64] = []
+    // Slot descriptors for objects too big for the mask in their header.
+    rc_descs: [RcDesc] = []
     // Only `p` and `path_prefix` are required at construction; every
     // other field starts empty/zero via its default, so `make_codegen`
     // is just `Codegen(:p, :path_prefix)`.
@@ -5849,15 +5856,63 @@ type Codegen = struct {
         }
     }
 
-    func rc_struct_mask(self, anon struct_idx: int64) -> int64 {
-        mut mask = 0
+    // The 8-byte slots of a struct that hold references.
+    func rc_struct_slots(self, anon struct_idx: int64) -> [int64] {
+        mut slots: [int64] = []
         for f in self.structs[struct_idx].fields {
-            let kind = self.find_field_kind(f.name, :struct_idx)
-            if self.rc_heap_kind(kind) and f.offset % 8 == 0 and f.offset / 8 < 21 {
-                mask = mask | (1 << (f.offset / 8))
+            if self.rc_heap_kind(self.find_field_kind(f.name, :struct_idx)) {
+                slots += [f.offset / 8]
             }
         }
-        return mask
+        return slots
+    }
+
+    // rc_alloc_cell for an object with references in `slots`. Slots past the 21 the
+    // header has room for go in a descriptor in the data section, one word of bits
+    // per 64 slots after a word that counts them.
+    func rc_alloc_slots(self, anon slots: [int64]) -> int64 {
+        mut top = 0
+        mut mask = 0
+        for slot in slots {
+            if slot > top {
+                top = slot
+            }
+            if slot < 21 {
+                mask = mask | (1 << slot)
+            }
+        }
+        if top < 21 or not self.rc_on {
+            return self.rc_alloc_cell(:mask)
+        }
+        mut words: [int64] = []
+        for _ in 0..top / 64 + 1 {
+            words += [0]
+        }
+        for slot in slots {
+            words[slot / 64] = words[slot / 64] | (1 << (slot % 64))
+        }
+        let lbl = f"Lrcslots{len(self.rc_descs)}"
+        self.rc_descs += [RcDesc(:lbl, :words)]
+        self.emit(f"adrp x1, {lbl}@PAGE")
+        self.emit(f"add x1, x1, {lbl}@PAGEOFF")
+        self.emit("bl _rc_alloc_big")
+        return self.rc_store_temp("x0")
+    }
+
+    func emit_rc_descs(self) -> none {
+        if len(self.rc_descs) == 0 {
+            return
+        }
+        self.println(".data")
+        self.println("\t.p2align 3")
+        for d in self.rc_descs {
+            self.println(f"{d.lbl}:")
+            self.println(f"\t.quad {len(d.words)}")
+            for w in d.words {
+                self.println(f"\t.quad {w}")
+            }
+        }
+        self.rc_descs = []
     }
 
     func emit_str(self, anon offset: int64, reg: str) -> none {
@@ -11855,12 +11910,23 @@ type Codegen = struct {
     func compile_let(self, name: str, typ: int64, value: int64, mutable: bool) -> none {
         self.check_type_expr(typ)
         self.note_wide_fn_local(name, :value)
-        let off = self.find_var_offset(name)
+        mut off = self.find_var_offset(name)
         mut kind = self.resolve_type(typ)
         if typ == 0 {
             kind = self.infer_kind(value)
             if self.is_untyped_literal(value) or self.is_none_kind(kind) {
                 kind = .KUnknown
+            }
+        }
+        // From a reference to a number: the old value stays in its slot until the
+        // function returns, since that slot is released as a reference then.
+        if self.rc_on and not self.rc_heap_kind(kind) and not (kind is .KUnknown) {
+            for slot in self.rc_slots {
+                if slot == off {
+                    self.frame_slots = self.frame_slots + 1
+                    off = 0 - self.frame_slots * 8
+                    break
+                }
             }
         }
         let mark = self.report_attempts
@@ -11887,6 +11953,7 @@ type Codegen = struct {
             self.check_value_kind(value, expected: kind)
         }
         // Only now: the value reads a binding of the same name with its old type.
+        self.vars[self.var_index(name)].offset = off
         mut i = 0
         for i < len(self.vars) {
             if self.vars[i].name == name {
@@ -12745,7 +12812,7 @@ type Codegen = struct {
         }
         let data_width = self.structs[struct_idx].data_width
         self.emit_load_imm("x0", value: data_width)
-        let rc_cell = self.rc_alloc_cell(mask: self.rc_struct_mask(struct_idx))
+        let rc_cell = self.rc_alloc_slots(self.rc_struct_slots(struct_idx))
         let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
         mut provided: [str] = []
@@ -12844,16 +12911,16 @@ type Codegen = struct {
         let data_width = self.enums[enum_idx].data_width
         mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
         self.emit_load_imm("x0", value: data_width)
-        mut rc_mask = 0
+        mut rc_refs: [int64] = []
         if self.rc_on {
             let rc_info = self.enums[enum_idx].variants[variant_idx]
             for ri, rk in rc_info.field_kinds {
-                if ri < len(rc_info.field_offsets) and rc_info.field_offsets[ri] / 8 + 1 < 21 {
-                    rc_mask = rc_mask | self.rc_kind_mask(rk, slot: rc_info.field_offsets[ri] / 8 + 1)
+                if ri < len(rc_info.field_offsets) and self.rc_heap_kind(rk) {
+                    rc_refs += [rc_info.field_offsets[ri] / 8 + 1]
                 }
             }
         }
-        let rc_cell = self.rc_alloc_cell(mask: rc_mask)
+        let rc_cell = self.rc_alloc_slots(rc_refs)
         let ptr_r = self.pool.alloc_reg()
         self.emit(f"mov {ptr_r}, x0")
         let disc_r = self.pool.alloc_reg()
@@ -15112,6 +15179,7 @@ type Codegen = struct {
     // each, look up the matching method on the struct and emit a .quad
     // pointing at its mangled label.
     func emit_vtables(self) -> none {
+        self.emit_rc_descs()
         for i, struct_idx in self.vtable_struct_idx {
             let iface_idx = self.vtable_iface_idx[i]
             let struct_info = self.structs[struct_idx]

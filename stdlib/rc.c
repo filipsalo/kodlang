@@ -5,8 +5,9 @@
  * check on the address, and string literals, vtables and arena memory need no
  * header. The 8 bytes before an object hold a 32-bit count, then a size class
  * and a 24-bit mask of the 8-byte slots that hold references. Bit 22 of the mask
- * marks an array and bit 21 an array whose elements are references, so a struct's
- * references past slot 20 aren't seen and what they hold is never freed.
+ * marks an array and bit 21 an array whose elements are references. Bit 23 marks an
+ * object with references past slot 20: the last word of its block points at a
+ * descriptor of them.
  *
  * Build with -DRC_POISON to overwrite freed memory and never reuse it, and to
  * fill memory the caller said it would fill, so a use after free shows up as
@@ -114,6 +115,17 @@ void *rc_alloc(int64_t size, int64_t mask) {
     return w;
 }
 
+#define RC_BIG_BIT (1u << 23)
+
+/* An object with references past slot 20. `desc` is a count of words, then that many
+ * words of bits, one bit per 8-byte slot. */
+void *rc_alloc_big(int64_t size, const int64_t *desc) {
+    void *p = rc_alloc(size + 8, RC_BIG_BIT);
+    RcHdr *h = (RcHdr *)p - 1;
+    *(const int64_t **)((char *)h + rc_class_size((int)(h->info & 0xff)) - 8) = desc;
+    return p;
+}
+
 /* Frees p, whose count reached 0, and whatever only it kept alive. Iterative:
  * a long list must not take the C stack with it. The pending list links
  * through the count word, as an offset (0 ends it: the first header in the
@@ -126,7 +138,24 @@ void rc_free_object(void *p) {
         pending = h->count ? (RcHdr *)((char *)RC_BASE + ((uint64_t)h->count << 4)) : NULL;
         void **slots = (void **)(h + 1);
         uint32_t mask = h->info >> 8;
-        if (mask & (1u << 22)) {
+        if (mask & RC_BIG_BIT) {
+            const int64_t *desc =
+                *(const int64_t **)((char *)h + rc_class_size((int)(h->info & 0xff)) - 8);
+            for (int64_t w = 0; w < desc[0]; w++) {
+                uint64_t bits = (uint64_t)desc[w + 1];
+                for (int i = 0; bits; i++, bits >>= 1) {
+                    if (!(bits & 1)) continue;
+                    void *c = slots[w * 64 + i];
+                    if (!rc_is_counted(c)) continue;
+                    RcHdr *ch = (RcHdr *)c - 1;
+                    if (--ch->count == 0) {
+                        ch->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
+                        pending = ch;
+                    }
+                }
+            }
+            mask = 0;
+        } else if (mask & (1u << 22)) {
             /* An array: { ptr, len, cap }. Its buffer has one owner. */
             void **buf = (void **)slots[0];
             if ((mask & (1u << 21)) && buf) {

@@ -236,6 +236,9 @@ C files export bare symbols into one namespace shared with libc and `runtime.c`:
 
 - `KodStr`: what a Kod `str` is when it crosses into C. `buf` points at `len` bytes followed by a NUL byte, and a `str` parameter or result is a `KodStr *`.
 - `KodArray`: a Kod `[T]`: `ptr` points at `len` 8-byte slots, with room for `cap`.
-- `arena_alloc(size)`: memory that is never freed, as for everything Kod allocates.
+- `arena_alloc(size)`: memory that is never freed.
+- `rc_alloc(size, mask)`: a counted object, zeroed, with a count of 1 that the caller owns. `mask` says which of its 8-byte slots hold references, bit 0 for the first; it must not use bits past 20. `rc_alloc_raw` is the same but leaves filling it to the caller. `rc_retain_c(p)` and `rc_release_c(p)` count a reference up and down, and do nothing for memory outside the counted heap.
 - `kod_str_new(len)`: a new `str` of `len` bytes for the caller to fill in. `kod_str_from_bytes(p, n)`: a `str` that is a copy of `n` bytes at `p`, which may contain NUL bytes.
 - `kod_panic(msg)`: print `panic: ` and the message with a backtrace, and exit 1.
+
+Kod values are [reference counted](memory-layout.md#reclaiming-memory), and C code follows the same rules as generated code. A parameter is borrowed: it stays alive during the call, and C code that keeps it after returning calls `rc_retain_c`. A result is owned by the caller, which releases it, so returning anything other than a new object, such as a parameter or something kept in a static, takes an `rc_retain_c` first. The same goes for references written into an object: each one needs its own count.
