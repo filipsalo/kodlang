@@ -61,7 +61,7 @@ There is no other way in: without the snapshot, `make` stops and says how to res
 | Name | Meaning |
 |---|---|
 | `LINK` | command that links an executable: `clang -target arm64-apple-darwin -Wl,-dead_strip`. `clang` finds the SDK and the macOS version. |
-| `CC`, `CFLAGS` | compile a C file: `clang`, `-target arm64-apple-darwin -I stdlib`. The target is pinned as in `LINK` (and `as`), so a `clang` that follows the architecture of the shell it runs in (one under Rosetta) does not produce x86_64 objects that the arm64 link rejects. |
+| `CC`, `CFLAGS` | compile a C file: `clang`, `-target arm64-apple-darwin -I stdlib -O2`. The target is pinned as in `LINK` (and `as`), so a `clang` that follows the architecture of the shell it runs in (one under Rosetta) does not produce x86_64 objects that the arm64 link rejects. |
 | `RUNTIME_C` | C files linked into every program; built to `build/stage0/<name>.o` |
 | `STAGE0_KOD` | Kod modules linked into every program, in link order; prebuilt by the snapshot compiler to `build/stage0/_<basename>.o`, so their basenames must be unique |
 
