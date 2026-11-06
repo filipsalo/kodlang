@@ -374,6 +374,15 @@ typedef struct {
     int64_t cap;
 } KodStrBuilder;
 
+#ifdef KOD_RC
+int64_t kod_sb_new(void) {
+    KodStrBuilder *sb = (KodStrBuilder *)rc_alloc(sizeof(KodStrBuilder), 1);
+    sb->cap = 32;
+    sb->len = 0;
+    sb->buf = (char *)rc_alloc_raw(sb->cap, 0);
+    return (int64_t)sb;
+}
+#else
 int64_t kod_sb_new(void) {
     KodStrBuilder *sb = (KodStrBuilder *)arena_alloc(sizeof(KodStrBuilder));
     sb->cap = 32;
@@ -381,6 +390,7 @@ int64_t kod_sb_new(void) {
     sb->buf = (char *)arena_alloc(sb->cap);
     return (int64_t)sb;
 }
+#endif
 
 static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
     if (extra > INT64_MAX / 4 - sb->len) {
@@ -390,8 +400,14 @@ static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
     if (need <= sb->cap) return;
     int64_t new_cap = sb->cap;
     while (new_cap < need) new_cap *= 2;
+#ifdef KOD_RC
+    char *new_buf = (char *)rc_alloc_raw(new_cap, 0);
+    memcpy(new_buf, sb->buf, (size_t)sb->len);
+    rc_release_c(sb->buf);
+#else
     char *new_buf = (char *)arena_alloc(new_cap);
     memcpy(new_buf, sb->buf, (size_t)sb->len);
+#endif
     sb->buf = new_buf;
     sb->cap = new_cap;
 }
@@ -839,9 +855,88 @@ KodStr *kod_bytes_from_array(void *arr_raw) {
 // `str` and `bytes` share the same runtime representation (a `KodStr *`);
 // these casts are zero-copy. The type system uses them to mark the
 // boundary between text and raw-byte handling.
+#ifdef KOD_RC
+KodStr *kod_str_to_bytes(void *s) { rc_retain_c(s); return (KodStr *)s; }
+KodStr *kod_bytes_to_str(void *b) { rc_retain_c(b); return (KodStr *)b; }
+#else
 KodStr *kod_str_to_bytes(void *s) { return (KodStr *)s; }
 KodStr *kod_bytes_to_str(void *b) { return (KodStr *)b; }
+#endif
 
+#ifdef KOD_RC
+#define RC_ARRAY_BIT (1ULL << 22)
+#define RC_REFS_BIT (1ULL << 21)
+static inline int rc_arr_counted(const void *p) { return ((uint64_t)p >> 36) == 0x300; }
+static inline int rc_arr_refs(const void *a) {
+    return rc_arr_counted(a) && ((((uint32_t *)a)[-1] >> 8) & RC_REFS_BIT);
+}
+static inline void rc_arr_set_refs(void *a) {
+    if (rc_arr_counted(a)) ((uint32_t *)a)[-1] |= (uint32_t)(RC_REFS_BIT << 8);
+}
+static KodArray *rc_arr_new(int64_t cap, int refs) {
+    KodArray *out = (KodArray *)rc_alloc(sizeof(KodArray), (int64_t)(RC_ARRAY_BIT | (refs ? RC_REFS_BIT : 0)));
+    out->ptr = rc_alloc_raw(cap > 0 ? cap * 8 : 8, 0);
+    out->cap = cap;
+    return out;
+}
+static void rc_arr_retain_all(void **p, int64_t n) {
+    for (int64_t i = 0; i < n; i++) rc_retain_c(p[i]);
+}
+
+void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
+    KodArray *src = (KodArray *)src_raw;
+    int64_t len = clamp_slice(src->len, &start, end);
+    int refs = rc_arr_refs(src);
+    KodArray *out = rc_arr_new(len, refs);
+    out->len = len;
+    if (len > 0) {
+        memcpy(out->ptr, (char *)src->ptr + start * 8, len * 8);
+        if (refs) rc_arr_retain_all((void **)out->ptr, len);
+    }
+    return out;
+}
+
+void *kod_array_copy(void *src_raw) {
+    return kod_array_slice(src_raw, 0, ((KodArray *)src_raw)->len);
+}
+
+void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
+    KodArray *lhs = (KodArray *)lhs_raw;
+    KodArray *rhs = (KodArray *)rhs_raw;
+    int64_t total = lhs->len + rhs->len;
+    int refs = rc_arr_refs(rhs) || rc_arr_refs(lhs);
+    if (lhs->cap < total) {
+        int64_t new_cap = lhs->cap > 0 ? lhs->cap : 4;
+        while (new_cap < total) new_cap *= 2;
+        int64_t *buf = (int64_t *)rc_alloc_raw(new_cap * 8, 0);
+        if (lhs->len > 0) memcpy(buf, lhs->ptr, lhs->len * 8);
+        rc_release_c(lhs->ptr);
+        lhs->ptr = buf;
+        lhs->cap = new_cap;
+    }
+    int64_t rhs_len = rhs->len;
+    if (rhs_len > 0) memmove((int64_t *)lhs->ptr + lhs->len, rhs->ptr, rhs_len * 8);
+    if (refs) {
+        rc_arr_retain_all((void **)lhs->ptr + lhs->len, rhs_len);
+        if (lhs->len == 0) rc_arr_set_refs(lhs);
+    }
+    lhs->len = total;
+    return lhs;
+}
+
+void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
+    KodArray *lhs = (KodArray *)lhs_raw;
+    KodArray *rhs = (KodArray *)rhs_raw;
+    int64_t total = lhs->len + rhs->len;
+    int refs = rc_arr_refs(lhs) || rc_arr_refs(rhs);
+    KodArray *out = rc_arr_new(total, refs);
+    out->len = total;
+    if (lhs->len > 0) memcpy(out->ptr, lhs->ptr, lhs->len * 8);
+    if (rhs->len > 0) memcpy((int64_t *)out->ptr + lhs->len, rhs->ptr, rhs->len * 8);
+    if (refs) rc_arr_retain_all((void **)out->ptr, total);
+    return out;
+}
+#else
 void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
     KodArray *src = (KodArray *)src_raw;
     int64_t len = clamp_slice(src->len, &start, end);
@@ -901,6 +996,7 @@ void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
     if (rhs->len > 0) memcpy((char *)out->ptr + lhs->len * 8, rhs->ptr, rhs->len * 8);
     return out;
 }
+#endif
 
 // Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
 // timeout, -1 on error. Used by the LSP loop to detect typing pauses:

@@ -28,6 +28,13 @@ typedef struct {
 // Memory that is never freed: everything Kod allocates comes from here.
 void *arena_alloc(int64_t size);
 
+// The counted heap (stdlib/rc.c): `mask` says which 8-byte slots hold references.
+// rc_alloc zeroes the object and rc_alloc_raw leaves that to the caller.
+void *rc_alloc(int64_t size, int64_t mask);
+void *rc_alloc_raw(int64_t size, int64_t mask);
+void rc_retain_c(void *p);
+void rc_release_c(void *p);
+
 // Records the OS error number that stdlib/posix.kod reports for a failed call.
 void kod_io_set_errno(int64_t err);
 
@@ -41,7 +48,11 @@ static inline KodStr *kod_str_new(int64_t len) {
     // Keep the byte buffer 8-aligned for the simple memcpy-into-it
     // paths even though no field needs that alignment.
     int64_t total = header + len + 1;
+#ifdef KOD_RC
+    char *block = (char *)rc_alloc_raw(total, 0);
+#else
     char *block = (char *)arena_alloc(total);
+#endif
     KodStr *s = (KodStr *)block;
     s->buf = block + header;
     s->len = len;

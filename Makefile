@@ -219,7 +219,7 @@ $(STAGE0)/_build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 	$(KODC) $< > $@
 
 # Assemble any stage0 .s (stdlib + compiler-lib) to its .o. The C
-# objects (arena.o, runtime.o) have explicit rules above and
+# objects (arena.o, rc.o, runtime.o) have explicit rules above and
 # don't match this (no corresponding .s).
 $(STAGE0)/%.o: $(STAGE0)/%.s
 	$(AS) -o $@ $<
