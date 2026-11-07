@@ -255,6 +255,41 @@ if x is not none {
 }
 ```
 
+### Narrowing
+
+After an `if` tests a name, the name has the type the test proves inside the
+block that runs, with no new name to bind:
+
+```kod
+func describe(anon shape: Shape, anon id: int64 | str | none) -> none {
+    if shape is Circle {
+        print_int(shape.r)          // a Circle here
+    }
+    if id is not none {
+        print(f"{id is str}")       // an int64 | str here
+    }
+    if id is none {
+        print("no id")
+    } else if id is int64 {
+        print_int(id + 1)           // an int64 here
+    }
+}
+```
+
+`x is T`, `x is Some`, `x is Ok`, `x is Err` and `x is not none` narrow the
+block, and the later operands of an `and` chain, as in
+`if x is not none and x > 3`. `x is none` and `x is not T` narrow the `else`
+block. Narrowing is a binding of the same name, as `x is T(x)` would make, so
+it applies only when:
+
+- `x` is a plain name, such as a local or a parameter, not a field or a call;
+- the type is written by its own name, not through a module: `m.T` doesn't
+  narrow, so bind it, as in `if e is errs.NotFound(nf)`;
+- the block doesn't assign to `x`, which then keeps its declared type there.
+
+After the block, `x` has its declared type again. A `for` condition doesn't
+narrow.
+
 ### Nested patterns
 
 A payload position can hold a pattern instead of a name. The arm matches only

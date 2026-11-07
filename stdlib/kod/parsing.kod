@@ -999,16 +999,119 @@ type Parser = struct {
 
 	// The pattern of each operand that binds, or -1. The patterns go in before
 	// the body is parsed, as a whole-condition one does, so their spans end here.
-	func chain_patterns(self, anon ops: [int64]) -> [int64] {
+	// With `narrow`, an operand that narrows its name gets a pattern too (see narrow_chain).
+	func chain_patterns(self, anon ops: [int64], narrow: bool = false) -> [int64] {
 		mut pats: [int64] = []
 		for op in ops {
 			mut pat: int64 = -1
 			if self.binds_names(op) and self.exprs[op] is .Binary(_lhs, _op, rhs) {
 				pat = self.pattern_of_expr(rhs)
+			} else if narrow {
+				pat = self.narrowing_pattern(op)
 			}
 			pats += [pat]
 		}
 		return pats
+	}
+
+	// The pattern of an `and` operand that narrows a plain name, binding nothing
+	// yet: `x is T`, `x is Some`, `x is Ok`, `x is Err`, or `x is not none` as `Some`.
+	func narrowing_pattern(self, anon op: int64) -> int64 {
+		let .Binary(lhs, is_op, rhs) = self.exprs[op] else { return -1 }
+		if len(self.narrow_name(lhs)) == 0 {
+			return -1
+		}
+		if is_op is .IsNot and self.exprs[rhs] is .NoneLit {
+			return self.alloc_pattern(ast.Pattern.SomePat(binding: ""))
+		}
+		if not (is_op is .Is) {
+			return -1
+		}
+		let pat = self.pattern_of_expr(rhs)
+		if pat >= 0 and self.narrows(pat) {
+			return pat
+		}
+		return -1
+	}
+
+	func narrows_op(self, anon op: int64) -> bool {
+		if self.exprs[op] is .Binary(lhs, is_op, rhs) and len(self.narrow_name(lhs)) > 0 {
+			if is_op is .IsNot {
+				return self.exprs[rhs] is .NoneLit
+			}
+			if is_op is .Is and not self.binds_names(op) {
+				match self.exprs[rhs] {
+					.Ident(name) -> return name != "None"
+					.Call(callee, _args) -> return self.exprs[callee] is .Ident(_name)
+					else return false
+				}
+			}
+		}
+		return false
+	}
+
+	// The name an `is` tests, when narrowing can rebind it: a plain name.
+	func narrow_name(self, anon subject: int64) -> str {
+		if self.exprs[subject] is .Ident(name) and name != "self" and name != "_" {
+			return name
+		}
+		return ""
+	}
+
+	// A test that binds nothing and that narrowing can make bind its name: a type
+	// pattern written by its own name, `Some`, `Ok` or `Err`.
+	func narrows(self, anon pat: int64) -> bool {
+		if len(self.pattern_subs[pat]) > 0 {
+			return false
+		}
+		match self.patterns[pat] {
+			.ImplicitEnumPat(v, b) -> return v.starts_with("$t") and len(b) == 1 and b[0] == "_"
+			.SomePat(b) -> return len(b) == 0 or b == "_"
+			.OkPat(b) -> return len(b) == 0 or b == "_"
+			.ErrPat(b) -> return len(b) == 0 or b == "_"
+			else return false
+		}
+	}
+
+	// `pat`, which `narrows`, binding `name`.
+	func narrow_to(self, anon pat: int64, name: str) -> none {
+		match self.patterns[pat] {
+			.ImplicitEnumPat(v, _b) -> self.patterns[pat] = ast.Pattern.ImplicitEnumPat(variant_name: v, bindings: [name])
+			.SomePat(_b) -> self.patterns[pat] = ast.Pattern.SomePat(binding: name)
+			.OkPat(_b) -> self.patterns[pat] = ast.Pattern.OkPat(binding: name)
+			.ErrPat(_b) -> self.patterns[pat] = ast.Pattern.ErrPat(binding: name)
+			else none
+		}
+	}
+
+	// Whether the tokens from `from` up to `to` assign to `name`: `name =`,
+	// `name +=` or `name -=`, not after a `.`. A block that does isn't narrowed.
+	func assigns(self, anon name: str, from: int64, to: int64) -> bool {
+		mut i = from
+		for i + 1 < to {
+			let tok = self.tokens[i]
+			if tok.kind == .Identifier and tok.value == name and (i == 0 or self.tokens[i - 1].kind != .Dot) {
+				let next = self.tokens[i + 1].kind
+				if next == .Equal or next == .PlusEqual or next == .MinusEqual {
+					return true
+				}
+			}
+			i += 1
+		}
+		return false
+	}
+
+	// Each narrowing operand of an `and` chain binds its name in the body, which
+	// spans tokens `from` to `to`.
+	func narrow_chain(self, anon ops: [int64], pats: [int64], from: int64, to: int64) -> none {
+		for i, op in ops {
+			if pats[i] >= 0 and self.narrows(pats[i]) and self.exprs[op] is .Binary(lhs, _op, _rhs) {
+				let name = self.narrow_name(lhs)
+				if len(name) > 0 and not self.assigns(name, :from, :to) {
+					self.narrow_to(pats[i], :name)
+				}
+			}
+		}
 	}
 
 	func any_pattern(self, anon pats: [int64]) -> bool {
@@ -2173,13 +2276,15 @@ type Parser = struct {
 			let ops: [int64] = self.and_operands(cond)
 			mut chained = false
 			for op in ops {
-				if len(ops) > 1 and self.binds_names(op) {
+				if len(ops) > 1 and (self.binds_names(op) or self.narrows_op(op)) {
 					chained = true
 				}
 			}
 			if chained {
-				let pats: [int64] = self.chain_patterns(ops)
+				let pats: [int64] = self.chain_patterns(ops, narrow: true)
+				let body_from = self.pos
 				let body: [int64] = self.parse_block()
+				self.narrow_chain(ops, :pats, from: body_from, to: self.pos)
 				// Any operand can fail, so each gets its own parse of the else
 				// block: one statement per path, which the flow checks follow.
 				mut elses: [[int64]] = []
@@ -2205,8 +2310,10 @@ type Parser = struct {
 				// `if x is not Pat { body } else { else_body }` swaps
 				// roles: the body runs when the pattern does NOT match;
 				// any bindings in Pat are scoped to else_body.
+				let body_from = self.pos
 				mut body: [int64] = self.parse_block()
-				let wild: int64 = self.alloc_pattern(ast.Pattern.Wildcard)
+				let body_to = self.pos
+				mut other: int64 = self.alloc_pattern(ast.Pattern.Wildcard)
 				// An optional `else { ... }` after the `is`-form populates
 				// the wildcard arm's body — pattern bindings stay scoped
 				// to the matching arm. Only consume the `else` when it's
@@ -2214,16 +2321,35 @@ type Parser = struct {
 				// swallow a separator that surrounding constructs (match
 				// arms, function bodies) need.
 				mut else_body: [int64] = []
+				let else_from = self.pos
 				if self.try_consume(.KwElse) {
 					else_body = self.else_block()
+				}
+				let else_to = self.pos
+				// Narrowing: the block the test proves something in binds the name.
+				let name = self.narrow_name(subject)
+				if len(name) > 0 {
+					let tests_none = self.patterns[pat] is .NonePat
+					// `x is T` narrows the body, and `x is not T` the else block.
+					if self.narrows(pat) {
+						if (not negated and not self.assigns(name, from: body_from, to: body_to)) or (negated and not self.assigns(name, from: else_from, to: else_to)) {
+							self.narrow_to(pat, :name)
+						}
+					}
+					// `x is none` narrows the else block, and `x is not none` the body.
+					if tests_none {
+						if (not negated and not self.assigns(name, from: else_from, to: else_to)) or (negated and not self.assigns(name, from: body_from, to: body_to)) {
+							other = self.alloc_pattern(ast.Pattern.SomePat(binding: name))
+						}
+					}
 				}
 				mut arms: [int64] = []
 				if negated {
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, body: else_body))]
-					arms += [self.alloc_match_arm(ast.MatchArm(pattern: wild, :body))]
+					arms += [self.alloc_match_arm(ast.MatchArm(pattern: other, :body))]
 				} else {
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))]
-					arms += [self.alloc_match_arm(ast.MatchArm(pattern: wild, body: else_body))]
+					arms += [self.alloc_match_arm(ast.MatchArm(pattern: other, body: else_body))]
 				}
 				return self.alloc_stmt(ast.Stmt.MatchStmt(:subject, :arms))
 			}
