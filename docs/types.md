@@ -506,7 +506,8 @@ member.
 
 `none` in a union makes it optional: `T | none` is exactly `T?`, and
 `A | B | none` is the optional of `A | B`. An optional member counts the same
-way, so `A? | B` is that type too.
+way, so `A? | B` is that type too. Its arms sit side by side, with no `Some`:
+`n: A`, `s: B` and `none`.
 
 In a type, `|` binds tighter than `or`, so `int64 | str or Error` is a fallible
 `int64 | str`. A function type's return type takes every member after the `->`,
@@ -651,15 +652,15 @@ if r is Err(e) { print(e.to_str()) }
 ### Recovering the concrete error type
 
 `Err(e)` binds `e` as the `Error` interface. To get back the concrete error
-struct, downcast with `is StructType` / `is StructType(binding)` — a general
-interface downcast that tests the boxed type and, on a match, binds the
-typed value:
+struct, downcast with `is binding: StructType` — a general interface downcast
+that tests the boxed type and, on a match, binds the typed value. The older
+`is StructType(binding)` means the same:
 
 ```kod
 match read_size(path) {
     Ok(n)  -> use(n)
     Err(e) ->
-        if e is NotFound(nf) {
+        if e is nf: NotFound {
             print(f"missing: {nf.path}")
         } else {
             print(e.to_str())
@@ -669,15 +670,15 @@ match read_size(path) {
 
 It works in `match`, `if … is`, and the bare `is` operator (a `match` on an
 interface needs an `else`, since its set of implementors isn't enumerable).
-`x is T` and a `T(b)` pattern hold only for a value of exactly that
+`x is _: T` and a `b: T` pattern hold only for a value of exactly that
 declaration, or that generic instance, whichever module boxed it, so an error
 struct that an imported function throws matches its type in the caller. `T`
 may be an alias of a struct or of a generic instance
 (`type IntBox = Box[int64]`), written `dep.T` through another module. Naming
 a generic type itself (`is Box`) is an error:
 `` `Box` is generic; downcast to one of its instances through a type alias such as `type IntBox = Box[int64]` ``.
-The pattern names such a struct through its module (`e is errs.NotFound(nf)`,
+The pattern names such a struct through its module (`e is nf: errs.NotFound`,
 which needs `errs` to declare `NotFound`) or, when it is imported as an item,
-by its own name (`e is NotFound(nf)`). Either way it binds one name, the
+by its own name (`e is nf: NotFound`). Either way it binds one name, the
 struct, whose fields are read from it. A local or parameter named like the
-module hides it, so `errs.NotFound(nf)` after `let errs = 3` is an error.
+module hides it, so `nf: errs.NotFound` after `let errs = 3` is an error.

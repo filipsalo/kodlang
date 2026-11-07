@@ -153,8 +153,9 @@ match maybe_n {
 
 ### Union member
 
-On a [union](types.md#union-types), `name: T` matches when the value holds the
-member `T`, and binds it as a `T`. Use `_` when the value isn't needed:
+`name: T` matches when the value holds a `T`, and binds it as a `T`. It works on a
+[union](types.md#union-types), an [interface](types.md#interfaces) and an
+optional. Use `_` when the value isn't needed:
 
 ```kod
 let id: int64 | str = "abc"
@@ -170,11 +171,44 @@ if id is s: str {
 }
 ```
 
-`T` has to be a member of the union. On the optional of a union, the members are
-inside `Some`, as in `Some(s: str)`, with `none` as the other arm; that form works
-in a `match`, not after `is`. A let-else can't test a member, since
-`let s: str = id else { ... }` isn't a pattern, so use `if` or `match`. To match a
-member's own variants, bind the enum and match that.
+On a union, `T` has to be a member. On an interface, `T` is a struct, and the
+pattern is a downcast, so a `match` still needs an `else`. The older `Circle(c)` means
+the same on an interface, and doesn't work on a union:
+
+```kod
+func describe(anon s: Shape) -> str {
+    match s {
+        c: Circle if c.r > 10 -> return "big circle"
+        c: Circle -> return f"circle {c.r}"
+        _: Square -> return "a square"
+        else -> return "something else"
+    }
+}
+```
+
+An optional takes these patterns directly, next to `none`, whether it holds the
+type itself, a union or an interface. `n: int64` on an `int64?` is `Some(n)`, and on
+an `int64 | str | none` it is `Some(n: int64)`, which is also valid:
+
+```kod
+let maybe: int64 | str | none = "here"
+
+match maybe {
+    n: int64 -> print_int(n)
+    s: str -> print(s)
+    none -> print("nothing")
+}
+
+if maybe is s: str {
+    print(s)
+}
+```
+
+Inside another pattern, such as `.Full(s: str)`, an optional field still needs its
+`Some`. A let-else can't start with this pattern, since
+`let s: str = id else { ... }` isn't one, so use `if` or `match`, or
+`let .Some(s: str) = maybe else { ... }` on an optional. To match a member's own
+variants, bind the enum and match that.
 
 ### `is` test
 

@@ -207,6 +207,13 @@ type EnumInfo = struct {
     is_union: bool = false
 }
 
+// A match arm as it was written, while it's compiled as `Some(n: T)`.
+type FlatArm = struct {
+    id: int64
+    pattern: ast.Pattern
+    subs: [ast.SubPattern]
+}
+
 type FieldInfo = struct {
     name: str
     offset: int64
@@ -1948,7 +1955,7 @@ type Codegen = struct {
                 is_iface = true
             }
             if not is_iface {
-                self.report_error("error: `is` / `match` with a type pattern requires an interface value", span: self.p.expr_spans[subject_id])
+                self.report_error("error: `T(b)` requires an interface value; on a union, write `b: T`", span: self.p.expr_spans[subject_id])
             }
         }
         if needs_optional {
@@ -2020,7 +2027,7 @@ type Codegen = struct {
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
                 if variant_name.starts_with("$t") {
-                    return self.check_union_pattern(variant_name, :kind, :subject_id)
+                    return self.check_union_pattern(variant_name, :kind, :subject_id, :nested)
                 }
                 target = f"`.{variant_name}`"
                 variant = variant_name
@@ -5283,7 +5290,7 @@ type Codegen = struct {
         return self.resolve_type(parsing.str_to_int(name[2..]))
     }
 
-    func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
+    func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64, nested: bool) -> bool {
         let span = self.p.expr_spans[subject_id]
         let type_id = parsing.str_to_int(name[2..])
         let errors_before = self.report_attempts
@@ -5300,11 +5307,22 @@ type Codegen = struct {
             self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
             return false
         }
-        if self.is_union_kind(self.optional_inner(kind)) and kind is .KOptional(_inner) {
-            self.report_error(f"error: `{shown}` is optional, so its members are inside `Some`: `Some(_: {member})`", :span)
+        if kind is .KInterface(_iface) {
+            if self.p.type_exprs[type_id] is .Named(_type_name) {
+                return true
+            }
+            self.report_error(f"error: `_: {member}` can't test a `{shown}`; a downcast is to a struct", :span)
             return false
         }
-        self.report_error(f"error: `_: {member}` matches a member of a union, got `{shown}`", :span)
+        if kind is .KOptional(_inner) {
+            if nested {
+                self.report_error(f"error: an optional inside a pattern needs its `Some`: `Some(_: {member})`", :span)
+                return false
+            }
+            self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
+            return false
+        }
+        self.report_error(f"error: `_: {member}` tests a union, interface or optional, got `{shown}`", :span)
         return false
     }
 
@@ -6777,6 +6795,14 @@ type Codegen = struct {
 
     // A pattern that doesn't resolve reports it, so its bindings are KUnknown.
     func pattern_binding_kinds(self, anon subject_pat: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
+        // `n: T` says what it binds, whatever the subject turns out to be.
+        if subject_pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+            mut written: [TypeKind] = []
+            if len(b) > 0 {
+                written += [self.union_pattern_kind(v)]
+            }
+            return written
+        }
         let pattern = self.subject_pattern(subject_pat, :subject_kind)
         let count = len(self.pattern_binding_names(pattern))
         mut kinds: [TypeKind] = []
@@ -8465,6 +8491,9 @@ type Codegen = struct {
             self.report_error("error: a nested pattern works in a `match`, a let-else, or an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs])
             return .VImm(value: 0)
         }
+        if not self.is_union_kind(lhs_kind) and self.p.exprs[rhs] is .Call(type_callee, _type_args) and self.p.exprs[type_callee] is .ImplicitVariant(type_name) and type_name.starts_with("$t") {
+            return self.compile_is_type(lhs, :type_name, :negate)
+        }
         // Interface downcast: `e is StructType` — compare the value's vtable
         // (cell offset 8) against the (StructType, iface) vtable's address.
         if lhs_kind is .KInterface(iface_idx) {
@@ -8572,6 +8601,21 @@ type Codegen = struct {
     }
 
     // `_` and `_name` bind nothing.
+    // `x is _: T` on an interface or optional: the `match` that means.
+    func compile_is_type(self, anon lhs: int64, type_name: str, negate: bool) -> Val {
+        let span = self.p.expr_spans[lhs]
+        let no_bindings: [str] = []
+        let tested = self.p.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: type_name, bindings: no_bindings))
+        let other = self.p.alloc_pattern(ast.Pattern.Wildcard)
+        let on_match = self.p.alloc_expr(ast.Expr.BoolLit(value: not negate), :span)
+        let on_other = self.p.alloc_expr(ast.Expr.BoolLit(value: negate), :span)
+        let arms: [int64] = [
+            self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: tested, body: on_match)),
+            self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: other, body: on_other)),
+        ]
+        return self.compile_expr(self.p.alloc_expr(ast.Expr.MatchExpr(subject: lhs, :arms), :span))
+    }
+
     func is_rhs_binding(self, anon rhs: int64) -> str {
         if self.p.exprs[rhs] is .Call(_callee, args) {
             for arg in args {
@@ -11664,6 +11708,17 @@ type Codegen = struct {
     }
 
     func compile_match_expr_for(self, anon arms: [int64], subject_id: int64, expected: TypeKind, ok_wrap: bool) -> Val {
+        mut pattern_ids: [int64] = []
+        for arm_id in arms {
+            pattern_ids += [self.p.match_expr_arms[arm_id].pattern]
+        }
+        let flat = self.flatten_optional_arms(pattern_ids, :subject_id)
+        let val = self.compile_match_expr_now(arms, :subject_id, :expected, :ok_wrap)
+        self.restore_flat_arms(flat)
+        return val
+    }
+
+    func compile_match_expr_now(self, anon arms: [int64], subject_id: int64, expected: TypeKind, ok_wrap: bool) -> Val {
         if self.infer_kind(subject_id) is .KUnknown {
             self.compile_discard(subject_id)
             self.report_cannot_infer(subject_id, what: "this expression")
@@ -14799,6 +14854,9 @@ type Codegen = struct {
     // On a `T?` subject, `.Some(v)` and `.None` are its Some and none patterns.
     func subject_pattern(self, anon pat: ast.Pattern, subject_kind: TypeKind) -> ast.Pattern {
         if subject_kind is .KInterface(_idx) {
+            if pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+                return self.struct_type_pattern(pat, name: v, bindings: b)
+            }
             return self.downcast_pattern(pat)
         }
         if subject_kind is .KEnum(union_idx) and self.enums[union_idx].is_union and pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
@@ -14829,6 +14887,21 @@ type Codegen = struct {
             return ast.Pattern.SomePat(:binding)
         }
         return pat
+    }
+
+    // On an interface, `b: T` is the downcast to a struct `T`.
+    func struct_type_pattern(self, anon pat: ast.Pattern, name: str, bindings: [str]) -> ast.Pattern {
+        let type_id = parsing.str_to_int(name[2..])
+        let .Named(type_name) = self.p.type_exprs[type_id] else { return pat }
+        mut binding = ""
+        if len(bindings) == 1 {
+            binding = bindings[0]
+        }
+        let qual = self.type_qual(type_id)
+        if len(qual) > 0 {
+            return .TypePat(type_name: f"{qual}.{type_name}", :binding)
+        }
+        return .TypePat(:type_name, :binding)
     }
 
     // On an interface, `alias.T(b)` is the downcast to a struct `T` of an imported module.
@@ -14980,7 +15053,61 @@ type Codegen = struct {
         self.emit_label(done_lbl)
     }
 
+    // On an optional, `n: T` is `Some(n: T)`, or `Some(n)` when `T` is what the
+    // optional holds. Only while this match compiles: another instance of a
+    // generic function can give the same pattern a different subject.
+    func flatten_optional_arms(self, anon pattern_ids: [int64], subject_id: int64) -> [FlatArm] {
+        mut saved: [FlatArm] = []
+        let .KOptional(inner) = self.infer_kind(subject_id) else { return saved }
+        for pid in pattern_ids {
+            let raw = self.p.patterns[pid]
+            if raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+                let written = self.union_pattern_kind(v)
+                if self.kind_has_unknown(written) {
+                    continue
+                }
+                mut binding = ""
+                if len(b) == 1 {
+                    binding = b[0]
+                }
+                mut holds_member = inner is .KInterface(_iface)
+                if inner is .KEnum(idx) and self.enums[idx].is_union {
+                    holds_member = self.union_pattern_variant(v, enum_idx: idx) >= 0
+                }
+                if self.type_key(written) == self.type_key(inner) {
+                    saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+                    self.p.patterns[pid] = .SomePat(:binding)
+                } else if holds_member {
+                    saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+                    let member = self.p.alloc_pattern(raw)
+                    let hidden = parsing.hidden_binding(member)
+                    self.alloc_var(name: hidden, kind: inner)
+                    self.p.patterns[pid] = .SomePat(binding: hidden)
+                    self.p.pattern_subs[pid] = [ast.SubPattern(binding: hidden, pattern: member)]
+                }
+            }
+        }
+        return saved
+    }
+
+    func restore_flat_arms(self, anon saved: [FlatArm]) -> none {
+        for arm in saved {
+            self.p.patterns[arm.id] = arm.pattern
+            self.p.pattern_subs[arm.id] = arm.subs
+        }
+    }
+
     func compile_match_stmt(self, anon arms: [int64], subject_id: int64) -> none {
+        mut pattern_ids: [int64] = []
+        for arm_id in arms {
+            pattern_ids += [self.p.match_arms[arm_id].pattern]
+        }
+        let flat = self.flatten_optional_arms(pattern_ids, :subject_id)
+        self.compile_match_stmt_now(arms, :subject_id)
+        self.restore_flat_arms(flat)
+    }
+
+    func compile_match_stmt_now(self, anon arms: [int64], subject_id: int64) -> none {
         if self.infer_kind(subject_id) is .KUnknown {
             self.compile_discard(subject_id)
             self.report_cannot_infer(subject_id, what: "this expression")
