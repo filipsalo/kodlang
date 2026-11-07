@@ -117,6 +117,14 @@ void kod_index_oob(int64_t idx, int64_t len) {
     exit(1);
 }
 
+void kod_div_zero(void) {
+    fflush(stdout);
+    fprintf(stderr, "panic: integer division by zero\n");
+    kod_inspect_print_backtrace_from(
+        (int64_t)(uintptr_t)__builtin_frame_address(0));
+    exit(1);
+}
+
 // Print to stderr without exiting. Used by the codegen to surface
 // user-facing errors (unknown method, etc.) while continuing to
 // scan the rest of the module for additional errors.

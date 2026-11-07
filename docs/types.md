@@ -179,6 +179,13 @@ operator: `-xs[0]` is `-(xs[0])`, `-p.get()` is `-(p.get())`, and
 is `-(x? or 3)` and gives `-3` for a `none`. It also makes `-n.to_str()`
 the negation of a `str`, an error whose hint suggests `(-n).to_str()`.
 
+Integer `/` rounds toward zero and `%` takes the sign of its left operand, so
+`-7 / 2` is `-3` and `-7 % 2` is `-1`, and `(a / b) * b + a % b` is always `a`.
+Dividing by zero, with `/` or `%`, panics:
+`panic: integer division by zero`, with a backtrace. The one quotient that
+doesn't fit, the smallest `int64` divided by `-1`, wraps around to the smallest
+`int64`, and its remainder is `0`.
+
 ## Boolean literals
 
 ```kod
