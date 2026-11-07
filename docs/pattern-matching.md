@@ -152,8 +152,9 @@ match maybe_n {
 ```
 
 A pattern that can't match `none` (a literal, a variant or a type pattern) tests
-the value inside, so it needs no `Some`. A name or `_` matches the optional
-itself, `none` included, so `Some(n)` is how to bind what's inside:
+the value inside, so it needs no `Some`. `_`, and a name in a payload position,
+match the optional itself, `none` included, so `Some(n)` is how to bind what's
+inside:
 
 ```kod
 let color: Color? = .Red
