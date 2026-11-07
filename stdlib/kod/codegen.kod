@@ -2197,6 +2197,7 @@ type Codegen = struct {
         }
         match self.subject_pattern(self.p.patterns[pattern_id], :subject_kind) {
             .Wildcard -> return ""
+            .BindPat(_binding) -> return ""
             .SomePat(_binding) -> return "Some"
             .NonePat -> return "none"
             .OkPat(_binding) -> return "Ok"
@@ -2238,7 +2239,7 @@ type Codegen = struct {
     func check_match_variants(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
         mut has_wildcard: bool = false
         for pid in pattern_ids {
-            if self.p.patterns[pid] is .Wildcard {
+            if self.p.patterns[pid] is .Wildcard or self.p.patterns[pid] is .BindPat(_b) {
                 has_wildcard = true
             }
         }
@@ -6801,6 +6802,7 @@ type Codegen = struct {
             .OkPat(binding) -> names += [binding]
             .ErrPat(binding) -> names += [binding]
             .TypePat(_type_name, binding) -> names += [binding]
+            .BindPat(binding) -> names += [binding]
             .EnumPat(_enum_name, _variant_name, bindings) -> return bindings
             .ImplicitEnumPat(_variant_name, bindings) -> return bindings
             else none
@@ -6829,6 +6831,7 @@ type Codegen = struct {
         }
         mut kind: TypeKind = .KInt64
         match pattern {
+            .BindPat(_binding) -> kind = subject_kind
             .SomePat(_binding) -> {
                 if subject_kind is .KOptional(inner) {
                     kind = inner
@@ -7010,6 +7013,7 @@ type Codegen = struct {
         }
         match pattern {
             .Wildcard -> none
+            .BindPat(binding) -> self.bind_whole(binding, :subj_slot)
             .IntPat(value) -> {
                 self.emit_cmp_imm(disc_r, :value)
                 self.emit(f"bne {skip_lbl}")
@@ -8500,8 +8504,11 @@ type Codegen = struct {
             return .VImm(value: 0)
         }
         let rhs = self.is_rhs_type_pattern(rhs_written)
-        if not self.is_union_kind(lhs_kind) and self.p.exprs[rhs] is .Call(type_callee, _type_args) and self.p.exprs[type_callee] is .ImplicitVariant(type_name) and type_name.starts_with("$t") {
-            return self.compile_is_type(lhs, :type_name, :negate)
+        if self.p.exprs[rhs] is .Call(type_callee, _type_args) and self.p.exprs[type_callee] is .ImplicitVariant(type_name) and type_name.starts_with("$t") {
+            // On a union, only `x is A` where `x` is exactly an `A` takes the match.
+            if not self.is_union_kind(lhs_kind) or self.type_key(self.union_pattern_kind(type_name)) == self.type_key(lhs_kind) {
+                return self.compile_is_type(lhs, :type_name, :negate)
+            }
         }
         // A downcast is `e is T`, which compile_is_type took above.
         if lhs_kind is .KInterface(_iface_idx) {
@@ -11901,6 +11908,12 @@ type Codegen = struct {
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                 }
+                .BindPat(binding) -> {
+                    self.bind_whole(binding, :subj_slot)
+                    self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
+                }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
                     self.emit(f"bne {skip_lbl}")
@@ -15193,6 +15206,7 @@ type Codegen = struct {
             .TypePat(type_name, binding) -> {
                 self.emit_typepat_test(:type_name, :binding, subject_kind: value_kind, span: self.p.expr_spans[value_id], :subj_slot, skip_lbl: else_lbl)
             }
+            .BindPat(binding) -> self.bind_whole(binding, :subj_slot)
             else {
                 self.report_error("error: pattern not supported in let-else", span: self.p.expr_spans[value_id])
                 return
@@ -15220,10 +15234,26 @@ type Codegen = struct {
         return saved
     }
 
-    // `T(n)` on an optional, here or in a payload at any depth, as its `Some(...)`.
+    // `T(n)` on an optional, here or in a payload at any depth, as its `Some(...)`,
+    // and on a value of exactly type `T` as what binds it.
     func flatten_pattern(self, anon pid: int64, kind: TypeKind) -> [FlatArm] {
         mut saved: [FlatArm] = []
         let raw = self.p.patterns[pid]
+        if raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") and not self.kind_has_unknown(kind) {
+            let written = self.union_pattern_kind(v)
+            if not self.kind_has_unknown(written) and self.type_key(written) == self.type_key(kind) {
+                mut binding = ""
+                if len(b) == 1 {
+                    binding = b[0]
+                }
+                saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+                self.p.patterns[pid] = .BindPat(:binding)
+                for sub in self.p.pattern_subs[pid] {
+                    saved += self.flatten_pattern(sub.pattern, kind: written)
+                }
+                return saved
+            }
+        }
         if kind is .KOptional(inner) and raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
             let written = self.union_pattern_kind(v)
             if not self.kind_has_unknown(written) {
@@ -15253,6 +15283,17 @@ type Codegen = struct {
             saved += self.flatten_pattern(sub.pattern, kind: self.sub_pattern_kind(pid, :sub, subject_kind: kind))
         }
         return saved
+    }
+
+    // A BindPat's binding takes the subject in `subj_slot` as it is.
+    func bind_whole(self, anon binding: str, subj_slot: int64) -> none {
+        if len(binding) == 0 or binding == "_" {
+            return
+        }
+        let val_r = self.pool.alloc_reg()
+        self.emit_ldr(subj_slot, reg: val_r)
+        self.emit_str(self.find_var_offset(binding), reg: val_r)
+        self.pool.free_reg(val_r)
     }
 
     func restore_flat_arms(self, anon saved: [FlatArm]) -> none {
@@ -15314,6 +15355,12 @@ type Codegen = struct {
                 .Wildcard -> {
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
+                }
+                .BindPat(binding) -> {
+                    self.bind_whole(binding, :subj_slot)
+                    self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
+                    self.emit(f"b {done_lbl}")
+                    self.emit_label(skip_lbl)
                 }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
