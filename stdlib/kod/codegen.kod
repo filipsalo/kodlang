@@ -5282,6 +5282,80 @@ type Codegen = struct {
         return true
     }
 
+    // The union `lhs == rhs` compares as: either side's, when the other is the
+    // same union, one that widens into it, or a value that goes into it.
+    func union_eq_kind(self, anon lhs_id: int64, rhs_id: int64, lhs_kind: TypeKind, rhs_kind: TypeKind) -> TypeKind {
+        let lhs_union = self.is_union_kind(lhs_kind)
+        let rhs_union = self.is_union_kind(rhs_kind)
+        if lhs_union and rhs_union {
+            if self.type_key(lhs_kind) == self.type_key(rhs_kind) or self.widens(rhs_kind, into: lhs_kind) {
+                return lhs_kind
+            }
+            if self.widens(lhs_kind, into: rhs_kind) {
+                return rhs_kind
+            }
+            return .KUnknown
+        }
+        if lhs_kind is .KEnum(idx) and lhs_union and self.union_variant_for(rhs_id, enum_idx: idx) >= 0 {
+            return lhs_kind
+        }
+        if rhs_kind is .KEnum(idx) and rhs_union and self.union_variant_for(lhs_id, enum_idx: idx) >= 0 {
+            return rhs_kind
+        }
+        return .KUnknown
+    }
+
+    // Equal when both hold the same member and those are `==`: a `match` on
+    // each side, with both computed first, left to right.
+    func compile_union_eq(self, lhs_id: int64, op: ast.Op, rhs_id: int64, kind: TypeKind) -> Val {
+        let .KEnum(idx) = kind else { return .VImm(value: 0) }
+        mut union_side = lhs_id
+        if not self.is_union_kind(self.infer_kind(lhs_id)) {
+            union_side = rhs_id
+        }
+        for v in self.enums[idx].variants {
+            let member = v.field_kinds[0]
+            if not self.member_has_eq(member) {
+                let shown = self.kind_display(member)
+                mut hint = ""
+                if member is .KStruct(_s, _args) {
+                    hint = f"; declare `op_eq` on `{shown}`"
+                }
+                self.report_error(f"error: cannot compare `{self.kind_display(kind)}` values, since its member `{shown}` has no `==`{hint}", span: self.p.expr_spans[union_side])
+                return .VImm(value: 0)
+            }
+        }
+        let span = self.p.expr_spans[lhs_id]
+        let l = self.stash_operand_as(lhs_id, :kind)
+        let r = self.stash_operand_as(rhs_id, :kind)
+        mut arms: [int64] = []
+        for v in self.enums[idx].variants {
+            let member = v.field_kinds[0]
+            let a = self.fresh("__eq_l")
+            self.alloc_var(name: a, kind: member)
+            let b = self.fresh("__eq_r")
+            self.alloc_var(name: b, kind: member)
+            let same = self.p.alloc_expr(.Binary(lhs: self.p.alloc_expr(.Ident(name: a), :span), :op, rhs: self.p.alloc_expr(.Ident(name: b), :span)), :span)
+            let lhs_bindings: [str] = [a]
+            let rhs_bindings: [str] = [b]
+            let inner_arms: [int64] = [
+                self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: rhs_bindings)), body: same)),
+                self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(ast.Pattern.Wildcard), body: self.p.alloc_expr(.BoolLit(value: op is .Ne), :span))),
+            ]
+            let inner = self.p.alloc_expr(.MatchExpr(subject: r, arms: inner_arms), :span)
+            arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: lhs_bindings)), body: inner))]
+        }
+        return self.compile_expr(self.p.alloc_expr(.MatchExpr(subject: l, :arms), :span))
+    }
+
+    func member_has_eq(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KStruct(idx, _args) -> return self.structs[idx].method_idx.contains("op_eq")
+            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx)
+            else return len(self.equality_scalar(kind)) > 0
+        }
+    }
+
     // `match v { A(a) -> body(a), ... }` over the members of the union `v` holds,
     // where `wrap` makes each arm's value: the member itself, or `$str` of it.
     func member_match(self, anon value_id: int64, wrap: str) -> int64 {
@@ -8729,6 +8803,12 @@ type Codegen = struct {
         }
         if op is .Sub and rhs_kind0 is .KFloat64 and self.is_unary_minus(lhs_id) {
             return self.compile_float_neg(rhs_id)
+        }
+        if op is .Eq or op is .Ne {
+            let union_kind = self.union_eq_kind(lhs_id, :rhs_id, :lhs_kind, rhs_kind: rhs_kind0)
+            if union_kind is .KEnum(_idx) {
+                return self.compile_union_eq(:lhs_id, :op, :rhs_id, kind: union_kind)
+            }
         }
         let build_rhs = self.is_eq_ctor_operand(rhs_id, :op, other_kind: lhs_kind)
         mut build_lhs = false

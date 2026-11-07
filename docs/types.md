@@ -225,7 +225,7 @@ and of the same type:
 | `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `float64`, two `str` or two `bytes` | `bool` |
-| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, or an optional and `none` | `bool` |
+| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, an optional and `none`, or a [union](#union-types) and a value that goes into it | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
@@ -541,9 +541,13 @@ itself widens. An `[A | B]` isn't an `[A | B | C]`, as an `[Sq]` isn't a
 member in instead. Nor is a union accepted where one of its members is declared.
 
 A union prints as the member it holds, with `print(x)`, `f"{x}"` or `str(x)`,
-when every member can be printed. Otherwise it has no fields, methods or
-operators of its own, so `==` needs a `match` first, and a union can't be a `Map`
-key. A union can't
+when every member can be printed. `==` and `!=` compare two unions, or a union
+and a value that goes into it (`x == 3`, `x == "a"`, `x == .Red`): they're equal
+when they hold the same member and those members are `==`. Every member needs a
+`==` of its own, so a union with a struct member that doesn't declare `op_eq`,
+or an array member, can't be compared. A union widens for `==` as it does
+elsewhere, so an `A | B` compares with an `A | B | C`. Otherwise a union has no
+fields, methods or operators of its own, and it can't be a `Map` key. A union can't
 mention a type parameter, except as `T | none`, since `T | str` would have only
 one member when `T` is `str`. A union alias can't refer to itself, so a recursive
 type such as a JSON value is still an [enum](enums.md).
