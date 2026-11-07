@@ -74,8 +74,8 @@ match b {
 ```
 
 A literal pattern needs a value of its own type, so matching a `str`
-against `3` is an error, and so is matching an optional: with
-`n: int64?`, unwrap it first, as in `match n? { 3 -> ... }`.
+against `3` is an error. On an optional it tests the value inside (see
+[Optional](#optional)): `3` on an `int64?` matches a `3` and not `none`.
 
 ### Enum variant (explicit)
 
@@ -151,6 +151,29 @@ match maybe_n {
 }
 ```
 
+A pattern that can't match `none` (a literal, a variant or a type pattern) tests
+the value inside, so it needs no `Some`. A name or `_` matches the optional
+itself, `none` included, so `Some(n)` is how to bind what's inside:
+
+```kod
+let color: Color? = .Red
+match color {
+    .Red    -> print("red")
+    .Rgb(v) -> print_int(v)
+    none    -> print("no color")
+}
+
+let count: int64? = 0
+match count {
+    0    -> print("zero")
+    none -> print("unknown")
+    else -> print("some")
+}
+```
+
+The same holds inside another pattern and after `is`: `color is .Red` is
+false for `none`.
+
 ### Type patterns
 
 A [union](types.md#union-types) is an enum whose variants are named by their
@@ -195,8 +218,9 @@ func describe(anon s: Shape) -> str {
 }
 ```
 
-An optional takes these patterns directly, next to `Some` and `none`, whether it
-holds the type itself, a union or an interface. `int64(n)` on an `int64?` is
+An optional takes these patterns directly, like any pattern that can't match
+`none` (see [Optional](#optional)), whether it holds the type itself, a union
+or an interface. `int64(n)` on an `int64?` is
 `Some(n)`, and on an `int64 | str | none` it is `Some(int64(n))`, which is also
 valid:
 
@@ -419,10 +443,10 @@ the enum works too, as in `Result.Ok(v)`. A generic
 enum is named without type arguments, and the bindings take the value's
 payload types: on a `Maybe[int64]`, `Maybe.Just(n)` binds an `int64`.
 
-Any other variant pattern needs an enum value. On a `Color?`, `.Red` is an
-error rather than a test that never matches: unwrap it first with `x?`, or
-match `.Some(c)`. Likewise `.Some` and `.None` need an optional, and
-`.Ok` and `.Err` a `T or Error`.
+Any other variant pattern needs an enum value, or an optional of one, where it
+tests the value inside: on a `Color?`, `.Red` matches a `.Red` and not `none`.
+Likewise `.Some` and `.None` need an optional, and `.Ok` and `.Err` a
+`T or Error`.
 
 A bare `is` also tests an enum value's variant without binding its
 payload: `if c is .Red and ready { ... }`, `s is .Circle(_)`.

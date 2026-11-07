@@ -293,13 +293,12 @@ let .Some(v) = y else { return -1 }
 // v is in scope and has type int64
 ```
 
-An optional can hold another optional, as `MaybeInt?` does with
-`type MaybeInt = int64?`. An `int64?` that goes where a `MaybeInt?` is
-expected becomes its value, the way an `int64` becomes the value of an
-`int64?`, so a `none` `MaybeInt?` means there is no `int64?` at all. A
-`Map[str, int64?]`'s `get` returns such an optional: `none` for a missing
-key, and `Some(v)` for a stored value, where `v` is `none` if `none` was
-stored.
+An optional of an optional is that optional, since `T?` is `T | none` and a
+union is a set: with `type MaybeInt = int64?`, `MaybeInt?` is `int64?`, and
+so is `T?` in a generic function where `T` is `int64?`. So `none` means one
+thing. A `Map[str, int64?]`'s `get` returns `none` both for a missing key and
+for a stored `none`; `contains` tells them apart. Where the difference
+matters, an enum that names both cases says it better.
 
 ### Postfix `?`
 

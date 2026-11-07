@@ -5024,7 +5024,7 @@ type Codegen = struct {
                 if inner_kind is .KUnknown {
                     return .KUnknown
                 }
-                return .KOptional(inner: inner_kind)
+                return optional_of(inner_kind)
             }
             .Union(members) -> {
                 mut kinds: [TypeKind] = []
@@ -8577,7 +8577,11 @@ type Codegen = struct {
             tests_none = true
         }
         if is_optional and not tests_none and opt_name != "Some" {
-            self.report_error("error: `is` on an optional takes `none`, `Some` or a type such as `T`", span: self.p.expr_spans[rhs])
+            let pat = self.p.pattern_of_expr(rhs)
+            if pat >= 0 {
+                return self.compile_is_pattern(lhs, pattern_id: pat, :negate)
+            }
+            self.report_error("error: `is` on an optional takes `none`, `Some`, a variant or a type such as `T`", span: self.p.expr_spans[rhs])
         }
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
@@ -8642,9 +8646,14 @@ type Codegen = struct {
     // `_` and `_name` bind nothing.
     // `x is T` on an interface or optional: the `match` that means.
     func compile_is_type(self, anon lhs: int64, type_name: str, negate: bool) -> Val {
-        let span = self.p.expr_spans[lhs]
         let no_bindings: [str] = []
         let tested = self.p.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: type_name, bindings: no_bindings))
+        return self.compile_is_pattern(lhs, pattern_id: tested, :negate)
+    }
+
+    // `x is P` as the `match` that means.
+    func compile_is_pattern(self, anon lhs: int64, pattern_id tested: int64, negate: bool) -> Val {
+        let span = self.p.expr_spans[lhs]
         let other = self.p.alloc_pattern(ast.Pattern.Wildcard)
         let on_match = self.p.alloc_expr(ast.Expr.BoolLit(value: not negate), :span)
         let on_other = self.p.alloc_expr(ast.Expr.BoolLit(value: negate), :span)
@@ -12396,7 +12405,7 @@ type Codegen = struct {
                     if field_kind is .KUnknown {
                         return .KUnknown
                     }
-                    return .KOptional(inner: field_kind)
+                    return optional_of(field_kind)
                 }
                 return .KUnknown
             }
@@ -12406,7 +12415,7 @@ type Codegen = struct {
                 let struct_idx = self.find_struct_idx_of_optional(value)
                 if struct_idx >= 0 {
                     if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
-                        return .KOptional(inner: self.structs[struct_idx].methods[mi].sig.return_kind)
+                        return optional_of(self.structs[struct_idx].methods[mi].sig.return_kind)
                     }
                 }
                 return .KUnknown
@@ -15279,6 +15288,17 @@ type Codegen = struct {
                 }
             }
         }
+        // A literal or variant can't be `none`, so it tests what the optional holds.
+        if kind is .KOptional(inner) and tests_inside_optional(raw) {
+            saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+            let member = self.p.alloc_pattern(raw)
+            self.p.pattern_subs[member] = self.p.pattern_subs[pid]
+            let hidden = parsing.hidden_binding(member)
+            self.alloc_var(name: hidden, kind: inner)
+            self.p.patterns[pid] = .SomePat(binding: hidden)
+            self.p.pattern_subs[pid] = [ast.SubPattern(binding: hidden, pattern: member)]
+            return saved + self.flatten_pattern(member, kind: inner)
+        }
         for sub in self.p.pattern_subs[pid] {
             saved += self.flatten_pattern(sub.pattern, kind: self.sub_pattern_kind(pid, :sub, subject_kind: kind))
         }
@@ -16173,6 +16193,27 @@ func ident_char(anon c: int64) -> bool {
     if c >= '0' and c <= '9' { return true }
     if c == '_' { return true }
     return false
+}
+
+// A pattern that never matches `none`, other than a type pattern (which
+// flatten_pattern handles first) and the optional's own `.Some` / `.None`.
+func tests_inside_optional(anon pat: ast.Pattern) -> bool {
+    match pat {
+        .IntPat(_v) -> return true
+        .StrPat(_v) -> return true
+        .BoolPat(_v) -> return true
+        .EnumPat(_e, _v, _b) -> return true
+        .ImplicitEnumPat(v, _b) -> return not v.starts_with("$t") and v != "Some" and v != "None"
+        else return false
+    }
+}
+
+// `T?`, which is `T` itself when `T` is already optional: `T | none` is a set.
+func optional_of(anon kind: TypeKind) -> TypeKind {
+    if kind is .KOptional(_inner) {
+        return kind
+    }
+    return .KOptional(inner: kind)
 }
 
 // An import alias as source writes it: a listed import's internal `#vec` is `vec`.
