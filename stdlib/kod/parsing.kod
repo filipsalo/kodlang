@@ -351,6 +351,8 @@ type Guard = struct {
 	arm: int64
 	pattern: int64
 	name: str
+	// The call the guard's block ends in, when only codegen can tell whether it returns.
+	call: int64 = 0
 }
 
 // The name a payload position binds when it holds pattern `pattern_id`.
@@ -450,6 +452,12 @@ type Parser = struct {
 	guard_arm: int64 = -1
 	guard_pat: int64 = -1
 	guard_name: str = ""
+	guard_call: int64 = 0
+	// Folds that hold only if the call their guard ends in never returns: the
+	// match statement, the call, and the arm the rest of the block went in.
+	fold_stmts: [int64] = []
+	fold_calls: [int64] = []
+	fold_arms: [int64] = []
 	// A name in a payload position, which binds unless it names a type.
 	payload_names: [str] = []
 	payload_starts: [int64] = []
@@ -2144,7 +2152,7 @@ type Parser = struct {
 			stmts += [stmt_id]
 			self.expect_stmt_end(:stmt_id, :errors_before)
 			if self.guard_arm >= 0 {
-				guards += [Guard(at: len(stmts), from: self.pos, arm: self.guard_arm, pattern: self.guard_pat, name: self.guard_name)]
+				guards += [Guard(at: len(stmts), from: self.pos, arm: self.guard_arm, pattern: self.guard_pat, name: self.guard_name, call: self.guard_call)]
 				self.guard_arm = -1
 			}
 			self.skip_newlines()
@@ -2168,13 +2176,18 @@ type Parser = struct {
 				continue
 			}
 			self.match_arms[g.arm] = ast.MatchArm(pattern: g.pattern, body: out[g.at..])
+			if g.call != 0 {
+				self.fold_stmts += [out[g.at - 1]]
+				self.fold_calls += [g.call]
+				self.fold_arms += [g.arm]
+			}
 			out = out[0..g.at]
 		}
 		return out
 	}
 
-	// Whether a block ends in a statement that can't fall through. Only a
-	// written `return`, `throw`, `break`, `continue` or `kod_panic(...)` counts.
+	// Whether a block ends in a statement that can't fall through: a written
+	// `return`, `throw`, `break`, `continue` or `kod_panic(...)`.
 	func ends_in_exit(self, anon stmts: [int64]) -> bool {
 		if len(stmts) == 0 {
 			return false
@@ -2192,6 +2205,17 @@ type Parser = struct {
 			}
 			else return false
 		}
+	}
+
+	// The call a block ends in, other than `kod_panic(...)`, or 0: codegen
+	// decides whether it returns.
+	func ends_in_call(self, anon stmts: [int64]) -> int64 {
+		if len(stmts) == 0 {
+			return 0
+		}
+		let .ExprStmt(expr) = self.stmts[stmts[len(stmts) - 1]] else { return 0 }
+		let .Call(_callee, _args) = self.exprs[expr] else { return 0 }
+		return expr
 	}
 
 	// A statement ends its line unless a block's `}` ended it.
@@ -2415,7 +2439,11 @@ type Parser = struct {
 				}
 				// A guard: with no else and a body that can't fall through, the rest of
 				// the block runs where the test failed, narrowed (see fold_guards).
-				if len(name) > 0 and else_to == else_from and self.ends_in_exit(body) {
+				self.guard_call = 0
+				if not self.ends_in_exit(body) {
+					self.guard_call = self.ends_in_call(body)
+				}
+				if len(name) > 0 and else_to == else_from and (self.ends_in_exit(body) or self.guard_call != 0) {
 					if not negated and self.patterns[pat] is .NonePat {
 						self.guard_arm = arms[1]
 						self.guard_pat = self.alloc_pattern(ast.Pattern.SomePat(binding: name))

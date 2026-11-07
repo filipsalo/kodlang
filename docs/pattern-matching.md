@@ -316,10 +316,30 @@ func total(anon xs: [int64?], limit: int64 or Error) -> int64 {
 ```
 
 `x is none`, `x is Err` and `x is not T` narrow this way, under the rules
-above, with the rest of the block in place of the `else` block. Only an exit
-written at the end of the block counts: a block that ends in a call to a
-helper that never returns, or in an `if` whose branches all return, doesn't
-narrow what follows.
+above, with the rest of the block in place of the `else` block. The block has
+to end in the exit: a `return`, `throw`, `break` or `continue`, or a call that
+never returns, which is `kod_panic(...)` or a function or method that can't
+finish by the rules in [`return`](control-flow.md#return) (a
+`-> none` function with no `return` that ends in such a call, or in a `for
+true` loop without a `break`):
+
+```kod
+func fail(anon msg: str) -> none {
+    kod_panic(f"config: {msg}")
+}
+
+func port(anon raw: str?) -> int64 {
+    if raw is none {
+        fail("no port")
+    }
+    return raw.parse_int()? or 80   // raw is a str from here on
+}
+```
+
+A call through a function value or an interface value is taken to return, so it
+doesn't narrow, and neither does a block that ends in an `if` whose branches
+all return. When the call can return, the rest of the block sees the name as
+it was.
 
 ### Nested patterns
 

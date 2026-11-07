@@ -748,6 +748,10 @@ type Codegen = struct {
     trust_sites: FuncIdx = FuncIdx()
     // Why the call being decided was trusted not to return, if it was.
     trust_why: str = ""
+    // The names a guard didn't narrow, since the call its block ends in can
+    // return, and those calls: innermost last, while the rest of the block compiles.
+    unnarrowed_names: [str] = []
+    unnarrowed_calls: [int64] = []
     // The function never_returns last answered for.
     last_nr_key: str = ""
     walking_fn: str = ""
@@ -1635,7 +1639,20 @@ type Codegen = struct {
 
     func unwrap_hint(self, anon expr_id: int64) -> str {
         let name = self.unwrap_name(expr_id)
-        return f"; unwrap it first with `{name}?` or `{name}? or default`"
+        return f"; unwrap it first with `{name}?` or `{name}? or default`{self.unnarrowed_note(expr_id)}"
+    }
+
+    // Why an `if x is none` guard above didn't narrow `x`.
+    func unnarrowed_note(self, anon expr_id: int64) -> str {
+        let .Ident(key) = self.p.exprs[expr_id] else { return "" }
+        mut i = len(self.unnarrowed_names) - 1
+        for i >= 0 {
+            if self.unnarrowed_names[i] == key {
+                return f"; the `if` above doesn't narrow `{self.source_name(key)}`, since `{call_text(self.p, self.unnarrowed_calls[i])}` can return"
+            }
+            i -= 1
+        }
+        return ""
     }
 
     // Unwrapping would panic on `none`, which the optional slot can hold.
@@ -5941,6 +5958,17 @@ type Codegen = struct {
             .MatchStmt(subject, arms) -> {
                 mut flow = Flow(completes: len(arms) == 0, breaks: false)
                 let subject_kind = self.infer_kind(subject)
+                // The guard's block runs on into the rest of the block, which decides.
+                let rest_arm = self.undone_fold(stmt_id)
+                if rest_arm >= 0 {
+                    for arm_id in arms {
+                        if arm_id != rest_arm and self.arm_flow(arm_id, :subject_kind).breaks {
+                            flow.breaks = true
+                        }
+                    }
+                    let rest = self.arm_flow(rest_arm, :subject_kind)
+                    return Flow(completes: rest.completes, breaks: flow.breaks or rest.breaks)
+                }
                 for arm_id in arms {
                     flow = either_flow(flow, self.arm_flow(arm_id, :subject_kind))
                 }
@@ -12613,7 +12641,14 @@ type Codegen = struct {
                 let val = self.compile_expr(expr)
                 self.free_val(val)
             }
-            .MatchStmt(subject, arms) -> self.compile_match_stmt(arms, subject_id: subject)
+            .MatchStmt(subject, arms) -> {
+                let rest_arm = self.undone_fold(stmt_id)
+                if rest_arm >= 0 {
+                    self.compile_undone_fold(arms, subject_id: subject, :rest_arm, call: self.fold_call(stmt_id))
+                } else {
+                    self.compile_match_stmt(arms, subject_id: subject)
+                }
+            }
             .LetElse(pattern, value, else_body) -> {
                 self.compile_let_else(else_body, pattern_id: pattern, value_id: value)
                 self.bind_pattern(pattern)
@@ -15453,6 +15488,58 @@ type Codegen = struct {
             self.p.patterns[arm.id] = arm.pattern
             self.p.pattern_subs[arm.id] = arm.subs
         }
+    }
+
+    // A guard's fold whose call can return: the arm the parser moved the rest of
+    // the block into, or -1 when there's no such fold or the call never returns.
+    func undone_fold(self, anon stmt_id: int64) -> int64 {
+        for i, folded in self.p.fold_stmts {
+            if folded == stmt_id {
+                if self.is_diverging_call(self.p.fold_calls[i]) {
+                    return -1
+                }
+                return self.p.fold_arms[i]
+            }
+        }
+        return -1
+    }
+
+    // `if x is none { f() }` and the rest, where `f` can return: the test, then
+    // the rest of the block with `x` as it was.
+    func fold_call(self, anon stmt_id: int64) -> int64 {
+        for i, folded in self.p.fold_stmts {
+            if folded == stmt_id {
+                return self.p.fold_calls[i]
+            }
+        }
+        return 0
+    }
+
+    func compile_undone_fold(self, anon arms: [int64], subject_id: int64, rest_arm: int64, call: int64) -> none {
+        let rest = self.p.match_arms[rest_arm]
+        let names = self.pattern_binding_names(self.p.patterns[rest.pattern])
+        let empty: [int64] = []
+        mut guard_arms: [int64] = []
+        for arm_id in arms {
+            if arm_id == rest_arm {
+                guard_arms += [self.p.alloc_match_arm(ast.MatchArm(pattern: rest.pattern, body: empty))]
+            } else {
+                guard_arms += [arm_id]
+            }
+        }
+        self.compile_match_stmt(guard_arms, :subject_id)
+        mut binding = "_"
+        if len(names) > 0 {
+            binding = names[0]
+        }
+        let whole = self.p.alloc_pattern(.BindPat(:binding))
+        let rest_arms: [int64] = [self.p.alloc_match_arm(ast.MatchArm(pattern: whole, body: rest.body))]
+        let mark = len(self.unnarrowed_names)
+        self.unnarrowed_names += [binding]
+        self.unnarrowed_calls += [call]
+        self.compile_match_stmt(rest_arms, :subject_id)
+        self.unnarrowed_names = self.unnarrowed_names[0..mark]
+        self.unnarrowed_calls = self.unnarrowed_calls[0..mark]
     }
 
     func compile_match_stmt(self, anon arms: [int64], subject_id: int64) -> none {
