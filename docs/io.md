@@ -63,7 +63,7 @@ with a downcast:
 match open_read(path) {
     Ok(f) -> use(f)
     Err(e) ->
-        if e is IoError(io) and io.kind == .NotFound {
+        if e is io: IoError and io.kind == .NotFound {
             print("no such file")
         } else {
             print(e.to_str())

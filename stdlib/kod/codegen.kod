@@ -1932,11 +1932,47 @@ type Codegen = struct {
     // subject must have an optional type — `none`/`Some` aren't
     // meaningful patterns on a non-optional value, and
     // `if x is none {...}` lowers to a MatchStmt.
+    // `T(b)` and `T`, the old spellings of the downcasts `b: T` and `_: T`.
+    func old_downcast_msg(self, anon pattern_id: int64, kind: TypeKind) -> str {
+        mut type_name = ""
+        mut binding = ""
+        match self.p.patterns[pattern_id] {
+            .TypePat(t, b) -> {
+                type_name = t
+                binding = b
+            }
+            .EnumPat(alias, t, bindings) -> {
+                if not kind is .KInterface(_idx) or len(bindings) > 1 or not self.is_import_alias(alias) {
+                    return ""
+                }
+                type_name = f"{alias}.{t}"
+                if len(bindings) == 1 {
+                    binding = bindings[0]
+                }
+            }
+            else return ""
+        }
+        return self.downcast_spelling_msg(type_name, :binding)
+    }
+
+    func downcast_spelling_msg(self, anon type_name: str, binding: str) -> str {
+        mut shown = "_"
+        if len(binding) > 0 and not parsing.is_hidden_binding(binding) {
+            shown = self.source_name(binding)
+        }
+        return f"error: a type pattern is written `{shown}: {type_name}`"
+    }
+
     func check_match_subject(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
         mut needs_optional: bool = false
         mut needs_result: bool = false
-        mut needs_interface: bool = false
+        let raw_kind = self.infer_kind(subject_id)
         for pid in pattern_ids {
+            let old_msg = self.old_downcast_msg(pid, kind: raw_kind)
+            if len(old_msg) > 0 {
+                self.report_error(old_msg, span: self.p.expr_spans[subject_id])
+                continue
+            }
             self.check_pattern_names(pid, :subject_id)
             let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: self.infer_kind(subject_id))
             match pat {
@@ -1944,20 +1980,11 @@ type Codegen = struct {
                 .SomePat(_binding) -> needs_optional = true
                 .OkPat(_b) -> needs_result = true
                 .ErrPat(_b) -> needs_result = true
-                .TypePat(_t, _b) -> needs_interface = true
+                .TypePat(_t, _b) -> {}
                 else self.check_pattern_subject(pat, :subject_id)
             }
         }
         let subj_kind = self.infer_kind(subject_id)
-        if needs_interface {
-            mut is_iface: bool = false
-            if subj_kind is .KInterface(_idx) {
-                is_iface = true
-            }
-            if not is_iface {
-                self.report_error("error: `T(b)` requires an interface value; on a union, write `b: T`", span: self.p.expr_spans[subject_id])
-            }
-        }
         if needs_optional {
             mut is_optional: bool = false
             if subj_kind is .KOptional(_inner) {
@@ -6980,6 +7007,11 @@ type Codegen = struct {
     // names. Errors point at the match's subject, the only span a pattern has.
     func emit_pattern_test(self, anon pattern_id: int64, subject_kind: TypeKind, subj_slot: int64, subject_id: int64, skip_lbl: str) -> none {
         let raw = self.p.patterns[pattern_id]
+        let old_msg = self.old_downcast_msg(pattern_id, kind: subject_kind)
+        if len(old_msg) > 0 {
+            self.report_error(old_msg, span: self.p.expr_spans[subject_id])
+            return
+        }
         let pattern = self.subject_pattern(raw, :subject_kind)
         if not self.check_nested_pattern(pattern, kind: subject_kind, :subject_id) {
             return
@@ -8376,7 +8408,7 @@ type Codegen = struct {
         return ""
     }
 
-    // `T`, `T(b)`, `alias.T` or `alias.T(b)`: the struct an interface downcast
+    // `T`, `T(b)`, `alias.T` or `alias.T(b)`, the old spellings of a downcast: the struct it
     // names, as `T` or `alias.T` (see type_pat_struct).
     func downcast_name(self, anon expr_id: int64) -> str {
         let parts = self.qualified_parts(expr_id)
@@ -8494,33 +8526,15 @@ type Codegen = struct {
         if not self.is_union_kind(lhs_kind) and self.p.exprs[rhs] is .Call(type_callee, _type_args) and self.p.exprs[type_callee] is .ImplicitVariant(type_name) and type_name.starts_with("$t") {
             return self.compile_is_type(lhs, :type_name, :negate)
         }
-        // Interface downcast: `e is StructType` — compare the value's vtable
-        // (cell offset 8) against the (StructType, iface) vtable's address.
-        if lhs_kind is .KInterface(iface_idx) {
-            let type_name = self.downcast_name(rhs)
-            let struct_idx = self.type_pat_struct(type_name)
-            if struct_idx < 0 {
-                mut msg = f"error: `is {type_name}` — `{type_name}` is not a struct type"
-                let qual_msg = self.is_rhs_qual_error(rhs)
-                if len(qual_msg) > 0 {
-                    msg = qual_msg
-                } else if len(self.type_elsewhere_hint(type_name)) > 0 {
-                    msg = f"error: unknown type `{type_name}`; {self.type_elsewhere_hint(type_name)}"
-                }
-                self.report_error(msg, span: self.p.expr_spans[rhs])
-                return .VImm(value: 0)
+        // A downcast is `e is b: T`, which compile_is_type took above.
+        if lhs_kind is .KInterface(_iface_idx) {
+            self.compile_discard(lhs)
+            mut msg = "error: `is` on an interface takes a type pattern such as `_: T`"
+            if len(self.downcast_name(rhs)) > 0 {
+                msg = self.downcast_spelling_msg(self.downcast_name(rhs), binding: "")
             }
-            if len(self.structs[struct_idx].type_param_names) > 0 {
-                self.report_error(self.generic_downcast_msg(struct_idx, shown: type_name), span: self.p.expr_spans[rhs])
-                return .VImm(value: 0)
-            }
-            self.register_vtable(struct_idx, iface_idx)
-            let ptr_v = self.compile_expr(lhs)
-            mut reg = self.load(ptr_v)
-            self.emit(f"ldr {reg}, [{reg}, #8]")
-            self.emit_type_id_cmp(reg, :struct_idx, :iface_idx)
-            self.emit(f"cset {reg}, {cond_match}")
-            return .VReg(name: reg)
+            self.report_error(msg, span: self.p.expr_spans[rhs])
+            return .VImm(value: 0)
         }
         // `T or Error` result: test the discriminant against Ok's disc.
         if self.is_result_kind(lhs_kind) {
@@ -8601,7 +8615,7 @@ type Codegen = struct {
     }
 
     // `_` and `_name` bind nothing.
-    // `x is _: T` on an interface or optional: the `match` that means.
+    // `x is T` on an interface or optional: the `match` that means.
     func compile_is_type(self, anon lhs: int64, type_name: str, negate: bool) -> Val {
         let span = self.p.expr_spans[lhs]
         let no_bindings: [str] = []
@@ -9075,7 +9089,10 @@ type Codegen = struct {
         let struct_idx = self.type_pat_struct(type_name)
         if struct_idx < 0 {
             mut msg = f"error: `{type_name}` is not a struct type"
-            if self.qualified_type_ref_of(type_name) == -1 {
+            let dot = name_dot(type_name)
+            if dot >= 0 and not self.is_import_alias(type_name[0..dot]) {
+                msg = f"error: unknown type `{type_name}`"
+            } else if self.qualified_type_ref_of(type_name) == -1 {
                 msg = self.pattern_qual_error(type_name)
             } else if len(self.type_elsewhere_hint(type_name)) > 0 {
                 msg = f"error: unknown type `{type_name}`; {self.type_elsewhere_hint(type_name)}"
@@ -14904,7 +14921,7 @@ type Codegen = struct {
         return .TypePat(:type_name, :binding)
     }
 
-    // On an interface, `alias.T(b)` is the downcast to a struct `T` of an imported module.
+    // On an interface, `alias.T(b)` is the old spelling of `b: alias.T`, already reported.
     func downcast_pattern(self, anon pat: ast.Pattern) -> ast.Pattern {
         let .EnumPat(alias, type_name, bindings) = pat else { return pat }
         if len(bindings) > 1 or not self.is_import_alias(alias) {

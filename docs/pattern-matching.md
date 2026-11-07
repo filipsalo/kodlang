@@ -172,8 +172,8 @@ if id is s: str {
 ```
 
 On a union, `T` has to be a member. On an interface, `T` is a struct, and the
-pattern is a downcast, so a `match` still needs an `else`. The older `Circle(c)` means
-the same on an interface, and doesn't work on a union:
+pattern is a downcast, so a `match` still needs an `else`. A downcast has no
+other spelling: `Circle(c)` is an error that names `c: Circle`.
 
 ```kod
 func describe(anon s: Shape) -> str {
@@ -250,9 +250,8 @@ match best {
 
 Patterns nest to any depth, and each kind above can appear inside another:
 literals, `none`, `Some(...)`, `Ok(...)`, `Err(...)`, enum variants, and a
-struct downcast such as `.Wrap(Sq(s))`. In a payload position a bare name
-always binds, so a downcast with no binding is not available there: write
-`Sq(_)`. A nested literal needs a field of its own type.
+struct downcast such as `.Wrap(s: Sq)` or `.Wrap(_: Sq)`. In a payload position a bare
+name always binds. A nested literal needs a field of its own type.
 
 Tests run left to right and from the outside in, and each nested pattern sees
 the field's type, so `.Pair(Some(0), "x")` needs an optional `int64` and a `str`.

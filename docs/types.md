@@ -465,7 +465,7 @@ func drain(anon r: Reader) -> int64 {
 let rc: ReadCloser = File(n: 7)
 drain(rc)                      // 7
 let r: Reader = rc
-if r is File(f) {              // still the File
+if r is f: File {              // still the File
     print_int(f.n)
 }
 ```
@@ -653,8 +653,7 @@ if r is Err(e) { print(e.to_str()) }
 
 `Err(e)` binds `e` as the `Error` interface. To get back the concrete error
 struct, downcast with `is binding: StructType` — a general interface downcast
-that tests the boxed type and, on a match, binds the typed value. The older
-`is StructType(binding)` means the same:
+that tests the boxed type and, on a match, binds the typed value:
 
 ```kod
 match read_size(path) {
@@ -675,7 +674,7 @@ declaration, or that generic instance, whichever module boxed it, so an error
 struct that an imported function throws matches its type in the caller. `T`
 may be an alias of a struct or of a generic instance
 (`type IntBox = Box[int64]`), written `dep.T` through another module. Naming
-a generic type itself (`is Box`) is an error:
+a generic type itself (`is _: Box`) is an error:
 `` `Box` is generic; downcast to one of its instances through a type alias such as `type IntBox = Box[int64]` ``.
 The pattern names such a struct through its module (`e is nf: errs.NotFound`,
 which needs `errs` to declare `NotFound`) or, when it is imported as an item,
