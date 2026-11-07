@@ -1,26 +1,539 @@
-// Decompression with the system's zlib. See docs/encoding.md.
-// kod:cc inflate.c
-// kod:link -lz
+// Decompression of gzip, zlib and raw deflate data (RFCs 1952, 1950, 1951).
+// See docs/encoding.md. Error details use zlib's wording.
 
 import "stream" { IoError }
+import "strbuilder" { StrBuilder }
+import "hash/crc32"
 
-extern func kod_inflate(anon input: bytes, anon mode: int64, anon max_output: int64) -> bytes
-extern func kod_inflate_status() -> int64
-extern func kod_inflate_message() -> str
+// A canonical Huffman code as a lookup table. Index it with the next `bits`
+// bits of input, in stream order, to get `symbol << 4 | code length`, or 0 for
+// bits that no code starts with.
+type Huffman = struct {
+    table: [int64]
+    bits: int64
+}
+
+func zeros(anon n: int64) -> [int64] {
+    mut out: [int64] = []
+    for _ in 0..n {
+        out += [0]
+    }
+    return out
+}
+
+// `code`'s low `n` bits in reverse order.
+func reversed(anon code: int64, anon n: int64) -> int64 {
+    mut out: int64 = 0
+    for i in 0..n {
+        out = (out << 1) | ((code >> i) & 1)
+    }
+    return out
+}
+
+func fixed_lengths() -> [int64] {
+    mut out: [int64] = []
+    for i in 0..288 {
+        if i < 144 {
+            out += [8]
+        } else if i < 256 {
+            out += [9]
+        } else if i < 280 {
+            out += [7]
+        } else {
+            out += [8]
+        }
+    }
+    return out
+}
+
+func fives() -> [int64] {
+    mut out: [int64] = []
+    for _ in 0..32 {
+        out += [5]
+    }
+    return out
+}
+
+// The window of earlier output that a back-reference can copy from.
+func window_size() -> int64 {
+    return 32768
+}
+
+type Inflater = struct {
+    data: bytes
+    // gzip (0), zlib (1) or raw deflate (2).
+    mode: int64
+    max_output: int64
+    // The next input byte, and the bits read from earlier ones but not used
+    // yet, oldest in the lowest bit. When the input runs out, `need` adds
+    // zero bits on top and counts them in `pad`, and using any of them is the
+    // error `truncated`.
+    pos: int64 = 0
+    buf: int64 = 0
+    count: int64 = 0
+    pad: int64 = 0
+    // The first error; once it is set, every loop stops.
+    err: str = ""
+    out: StrBuilder = StrBuilder()
+    out_len: int64 = 0
+    // The last `window_size()` bytes of output; it grows up to that size,
+    // then `wpos` goes round it.
+    window: [int64] = []
+    wpos: int64 = 0
+    // Output of the current gzip member or stream, and its checksum.
+    stream_len: int64 = 0
+    crc_table: [int64] = crc32.make_table()
+    crc: int64 = 0xFFFFFFFF
+    header_crc: int64 = 0xFFFFFFFF
+    adler_a: int64 = 1
+    adler_b: int64 = 0
+    fixed_lit: Huffman = Huffman(table: [], bits: 0)
+    fixed_dist: Huffman = Huffman(table: [], bits: 0)
+    len_base: [int64] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    len_extra: [int64] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    dist_base: [int64] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    dist_extra: [int64] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+
+    func fail(self, anon message: str) -> none {
+        if self.err == "" {
+            self.err = message
+        }
+    }
+
+    // Make at least `n` bits available in `buf`.
+    func need(self, anon n: int64) -> none {
+        for self.count < n {
+            if self.pos < len(self.data) {
+                self.buf = self.buf | (self.data[self.pos] << self.count)
+                self.pos += 1
+            } else {
+                self.pad += 8
+            }
+            self.count += 8
+        }
+    }
+
+    func drop(self, anon n: int64) -> none {
+        self.buf = self.buf >> n
+        self.count -= n
+        if self.count < self.pad {
+            self.fail("truncated")
+        }
+    }
+
+    func bits(self, anon n: int64) -> int64 {
+        self.need(n)
+        let v = self.buf & ((1 << n) - 1)
+        self.drop(n)
+        return v
+    }
+
+    // Skip to the start of the next byte.
+    func align(self) -> none {
+        self.drop(self.count % 8)
+    }
+
+    // Whether input is left after the current byte.
+    func more_input(self) -> bool {
+        return self.count - self.pad >= 8 or self.pos < len(self.data)
+    }
+
+    func byte(self) -> int64 {
+        return self.bits(8)
+    }
+
+    func le16(self) -> int64 {
+        let lo = self.byte()
+        return lo | (self.byte() << 8)
+    }
+
+    func le32(self) -> int64 {
+        let lo = self.le16()
+        return lo | (self.le16() << 16)
+    }
+
+    // A byte of a gzip header, which an optional header CRC covers.
+    func header_byte(self) -> int64 {
+        let b = self.byte()
+        self.header_crc = (self.header_crc >> 8) ^ self.crc_table[(self.header_crc ^ b) & 0xff]
+        return b
+    }
+
+    func start_stream(self) -> none {
+        self.stream_len = 0
+        self.crc = 0xFFFFFFFF
+        self.adler_a = 1
+        self.adler_b = 0
+    }
+
+    func put(self, anon b: int64) -> none {
+        if self.err != "" {
+            return
+        }
+        if self.out_len == self.max_output {
+            self.fail("output too large")
+            return
+        }
+        self.out.append_byte(b)
+        self.out_len += 1
+        self.stream_len += 1
+        if len(self.window) < window_size() {
+            self.window += [b]
+        } else {
+            self.window[self.wpos] = b
+        }
+        self.wpos = (self.wpos + 1) & (window_size() - 1)
+        if self.mode == 0 {
+            self.crc = (self.crc >> 8) ^ self.crc_table[(self.crc ^ b) & 0xff]
+        } else if self.mode == 1 {
+            self.adler_a = (self.adler_a + b) % 65521
+            self.adler_b = (self.adler_b + self.adler_a) % 65521
+        }
+    }
+
+    // The Huffman code with these code lengths, one per symbol (0 for a
+    // symbol that has no code). `what` names it in errors.
+    func code(self, anon lengths: [int64], anon what: str) -> Huffman {
+        mut counts = zeros(16)
+        mut longest: int64 = 0
+        for n in lengths {
+            counts[n] += 1
+            if n > longest {
+                longest = n
+            }
+        }
+        counts[0] = 0
+        // Too many codes of some length is never valid; too few only for a
+        // code with a single 1-bit code, as zlib allows.
+        mut left: int64 = 1
+        for n in 1..16 {
+            left = left * 2 - counts[n]
+            if left < 0 {
+                self.fail(f"invalid {what} set")
+                return Huffman(table: [0, 0], bits: 1)
+            }
+        }
+        if longest == 0 {
+            return Huffman(table: [0, 0], bits: 1)
+        }
+        if left > 0 and (what == "code lengths" or longest != 1) {
+            self.fail(f"invalid {what} set")
+            return Huffman(table: [0, 0], bits: 1)
+        }
+        mut next = zeros(16)
+        mut c: int64 = 0
+        for n in 1..16 {
+            c = (c + counts[n - 1]) << 1
+            next[n] = c
+        }
+        let size: int64 = 1 << longest
+        mut table = zeros(size)
+        for symbol, n in lengths {
+            if n != 0 {
+                mut at = reversed(next[n], n)
+                next[n] += 1
+                for at < size {
+                    table[at] = (symbol << 4) | n
+                    at += 1 << n
+                }
+            }
+        }
+        return Huffman(table: table, bits: longest)
+    }
+
+    // The next symbol in code `h`, or -1 after an error.
+    func decode(self, anon h: Huffman) -> int64 {
+        self.need(h.bits)
+        let entry = h.table[self.buf & ((1 << h.bits) - 1)]
+        if entry == 0 {
+            if self.count - self.pad < h.bits {
+                self.fail("truncated")
+            } else {
+                self.fail("invalid code")
+            }
+            return -1
+        }
+        self.drop(entry & 15)
+        if self.err != "" {
+            return -1
+        }
+        return entry >> 4
+    }
+
+    // The literals and back-references of one block, up to its end marker.
+    func symbols(self, anon lit: Huffman, anon dist: Huffman) -> none {
+        for self.err == "" {
+            let symbol = self.decode(lit)
+            if symbol < 0 or symbol == 256 {
+                return
+            }
+            if symbol < 256 {
+                self.put(symbol)
+                continue
+            }
+            let i = symbol - 257
+            if i >= 29 {
+                self.fail("invalid literal/length code")
+                return
+            }
+            let length = self.len_base[i] + self.bits(self.len_extra[i])
+            let d = self.decode(dist)
+            if d < 0 {
+                return
+            }
+            if d >= 30 {
+                self.fail("invalid distance code")
+                return
+            }
+            let distance = self.dist_base[d] + self.bits(self.dist_extra[d])
+            if self.err != "" {
+                return
+            }
+            if distance > self.stream_len {
+                self.fail("invalid distance too far back")
+                return
+            }
+            for _ in 0..length {
+                // While the window is still growing, `wpos` is its length.
+                self.put(self.window[(self.wpos - distance) & (window_size() - 1)])
+            }
+        }
+    }
+
+    func stored(self) -> none {
+        self.align()
+        let n = self.le16()
+        if n != (self.le16() ^ 0xffff) {
+            self.fail("invalid stored block lengths")
+            return
+        }
+        for _ in 0..n {
+            if self.err != "" {
+                return
+            }
+            self.put(self.byte())
+        }
+    }
+
+    // A block that sends its own codes, as code lengths that are themselves
+    // Huffman coded.
+    func dynamic(self) -> none {
+        let nlit = self.bits(5) + 257
+        let ndist = self.bits(5) + 1
+        let nlen = self.bits(4) + 4
+        if nlit > 286 or ndist > 30 {
+            self.fail("too many length or distance symbols")
+            return
+        }
+        let order: [int64] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+        mut len_lengths = zeros(19)
+        for i in 0..nlen {
+            len_lengths[order[i]] = self.bits(3)
+        }
+        let lens = self.code(len_lengths, "code lengths")
+        mut lengths: [int64] = []
+        for self.err == "" and len(lengths) < nlit + ndist {
+            let symbol = self.decode(lens)
+            if symbol < 0 {
+                return
+            }
+            if symbol < 16 {
+                lengths += [symbol]
+                continue
+            }
+            mut value: int64 = 0
+            mut repeat: int64 = 0
+            if symbol == 16 {
+                if len(lengths) == 0 {
+                    self.fail("invalid bit length repeat")
+                    return
+                }
+                value = lengths[len(lengths) - 1]
+                repeat = 3 + self.bits(2)
+            } else if symbol == 17 {
+                repeat = 3 + self.bits(3)
+            } else {
+                repeat = 11 + self.bits(7)
+            }
+            if len(lengths) + repeat > nlit + ndist {
+                self.fail("invalid bit length repeat")
+                return
+            }
+            for _ in 0..repeat {
+                lengths += [value]
+            }
+        }
+        if self.err != "" {
+            return
+        }
+        if lengths[256] == 0 {
+            self.fail("invalid code -- missing end-of-block")
+            return
+        }
+        let lit = self.code(lengths[0..nlit], "literal/lengths")
+        let dist = self.code(lengths[nlit..nlit + ndist], "distances")
+        if self.err == "" {
+            self.symbols(lit, dist)
+        }
+    }
+
+    // Blocks up to and including the one marked last.
+    func blocks(self) -> none {
+        for self.err == "" {
+            let last = self.bits(1)
+            let kind = self.bits(2)
+            if self.err != "" {
+                return
+            }
+            if kind == 0 {
+                self.stored()
+            } else if kind == 1 {
+                if len(self.fixed_lit.table) == 0 {
+                    self.fixed_lit = self.code(fixed_lengths(), "literal/lengths")
+                    self.fixed_dist = self.code(fives(), "distances")
+                }
+                self.symbols(self.fixed_lit, self.fixed_dist)
+            } else if kind == 2 {
+                self.dynamic()
+            } else {
+                self.fail("invalid block type")
+            }
+            if last == 1 {
+                return
+            }
+        }
+    }
+
+    func skip_zero_terminated(self) -> none {
+        for self.err == "" {
+            if self.header_byte() == 0 {
+                return
+            }
+        }
+    }
+
+    func gzip_member(self) -> none {
+        self.header_crc = 0xFFFFFFFF
+        let id1 = self.header_byte()
+        let id2 = self.header_byte()
+        if self.err != "" {
+            return
+        }
+        if id1 != 0x1f or id2 != 0x8b {
+            self.fail("incorrect header check")
+            return
+        }
+        if self.header_byte() != 8 {
+            self.fail("unknown compression method")
+            return
+        }
+        let flags = self.header_byte()
+        if (flags & 0xe0) != 0 {
+            self.fail("unknown header flags set")
+            return
+        }
+        // mtime, extra flags, os
+        for _ in 0..6 {
+            self.header_byte()
+        }
+        if (flags & 4) != 0 {
+            let lo = self.header_byte()
+            let n = lo | (self.header_byte() << 8)
+            for _ in 0..n {
+                if self.err != "" {
+                    return
+                }
+                self.header_byte()
+            }
+        }
+        if (flags & 8) != 0 {
+            self.skip_zero_terminated()
+        }
+        if (flags & 16) != 0 {
+            self.skip_zero_terminated()
+        }
+        if (flags & 2) != 0 {
+            let want = (self.header_crc ^ 0xFFFFFFFF) & 0xffff
+            if self.le16() != want and self.err == "" {
+                self.fail("header crc mismatch")
+                return
+            }
+        }
+        self.start_stream()
+        self.blocks()
+        self.align()
+        let crc = self.le32()
+        let size = self.le32()
+        if self.err != "" {
+            return
+        }
+        if crc != (self.crc ^ 0xFFFFFFFF) {
+            self.fail("incorrect data check")
+        } else if size != (self.stream_len & 0xFFFFFFFF) {
+            self.fail("incorrect length check")
+        }
+    }
+
+    func zlib_stream(self) -> none {
+        let cmf = self.byte()
+        let flags = self.byte()
+        if self.err != "" {
+            return
+        }
+        if (cmf * 256 + flags) % 31 != 0 {
+            self.fail("incorrect header check")
+            return
+        }
+        if (cmf & 15) != 8 {
+            self.fail("unknown compression method")
+            return
+        }
+        if (cmf >> 4) > 7 {
+            self.fail("invalid window size")
+            return
+        }
+        if (flags & 0x20) != 0 {
+            self.fail("needs a preset dictionary")
+            return
+        }
+        self.start_stream()
+        self.blocks()
+        self.align()
+        mut sum: int64 = 0
+        for _ in 0..4 {
+            sum = (sum << 8) | self.byte()
+        }
+        if self.err == "" and sum != ((self.adler_b << 16) | self.adler_a) {
+            self.fail("incorrect data check")
+        }
+    }
+
+    func run(self) -> none {
+        if self.mode == 0 {
+            // Members one after another give their output joined.
+            self.gzip_member()
+            for self.err == "" and self.more_input() {
+                self.gzip_member()
+            }
+        } else if self.mode == 1 {
+            self.zlib_stream()
+        } else {
+            self.start_stream()
+            self.blocks()
+        }
+    }
+}
 
 func run(anon op: str, anon data: bytes, anon mode: int64, anon max_output: int64) -> bytes or Error {
     if max_output < 0 {
         throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: "max_output cannot be negative")
     }
-    let out = kod_inflate(data, mode, max_output)
-    let status = kod_inflate_status()
-    if status == 0 {
-        return out
+    let inflater = Inflater(data: data, mode: mode, max_output: max_output)
+    inflater.run()
+    if inflater.err != "" {
+        throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: inflater.err)
     }
-    if status == 2 {
-        throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: "output too large")
-    }
-    throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: kod_inflate_message())
+    return inflater.out.to_bytes()
 }
 
 func gunzip(anon data: bytes, max_output: int64 = 16777216) -> bytes or Error {

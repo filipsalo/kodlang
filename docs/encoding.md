@@ -45,10 +45,9 @@ Errors are `IoError`s of kind `InvalidInput`, with `op` `base64 decode` and a
 
 ## Decompression
 
-`stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data with the
-system's zlib. A program that imports it compiles `inflate.c` and links `-lz`;
-no other program does. (Compressing is done by `compress/gzip` and
-`compress/deflate`, written in Kod.)
+`stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data. It is
+written in Kod, like compressing (`compress/gzip` and `compress/deflate`), so it
+links no C library.
 
 ```kod
 import "compress/inflate"
@@ -66,9 +65,10 @@ let text = kod_bytes_to_str(must inflate.gunzip(data))
 it would be exceeded, so a few kilobytes of input cannot make the program allocate
 gigabytes; the buffer grows only as output is produced. Errors are `IoError`s of
 kind `InvalidInput`, with `op` the function's name and a `detail` that says what was
-wrong: `output too large`, `truncated`, or zlib's own wording for corrupt data
-(`incorrect header check`, `invalid block type`, `incorrect data check` for a CRC
-that does not match, `incorrect length check`). Bytes after the last gzip member
+wrong: `output too large`, `truncated`, or the wording zlib uses for corrupt data
+(`incorrect header check`, `invalid block type`, `incorrect data check` for a
+checksum that does not match, `incorrect length check`, `invalid distance too far
+back`). Bytes after the last gzip member
 are an error, and so is a stream that ends before its final block.
 
 ## Percent-encoding
