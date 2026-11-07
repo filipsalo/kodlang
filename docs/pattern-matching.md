@@ -151,6 +151,31 @@ match maybe_n {
 }
 ```
 
+### Union member
+
+On a [union](types.md#union-types), `name: T` matches when the value holds the
+member `T`, and binds it as a `T`. Use `_` when the value isn't needed:
+
+```kod
+let id: int64 | str = "abc"
+
+match id {
+    n: int64 if n < 0 -> print("negative")
+    n: int64 -> print_int(n)
+    _: str -> print("text")
+}
+
+if id is s: str {
+    print(s)
+}
+```
+
+`T` has to be a member of the union. On the optional of a union, the members are
+inside `Some`, as in `Some(s: str)`, with `none` as the other arm; that form works
+in a `match`, not after `is`. A let-else can't test a member, since
+`let s: str = id else { ... }` isn't a pattern, so use `if` or `match`. To match a
+member's own variants, bind the enum and match that.
+
 ### `is` test
 
 A lightweight check without destructuring:
@@ -349,7 +374,7 @@ the enum, `if s is Shape.Rect(w, h)`, or an imported one,
 On a `T?` value, `.Some(v)` and `.None` are the same patterns as `Some(v)`
 and `none`, here, in a `match` and with a bare `is`. On a `T or Error`
 value, `.Ok(v)` and `.Err(e)` are the same as `Ok(v)` and `Err(e)`. Naming
-the enum works too, as in `Option.Some(v)` and `Result.Ok(v)`. A generic
+the enum works too, as in `Result.Ok(v)`. A generic
 enum is named without type arguments, and the bindings take the value's
 payload types: on a `Maybe[int64]`, `Maybe.Just(n)` binds an `int64`.
 
@@ -413,7 +438,7 @@ The pattern always starts with a `.`, and leaving it out is an error that
 says so (`` a `let` pattern starts with a `.`: `let .Some(v) = ...` ``). On a
 `T?` value (like
 `m.get(key)` above), `.Some(v)` binds the unwrapped payload and
-`.None` matches `none`, the same spelling as for an `Option[T]`.
+`.None` matches `none`.
 On a `T or Error` value, `.Ok(v)` binds the value and `.Err(e)` the
 error. On an enum value, the variant is looked up in that value's
 enum, even when another enum declares a variant of the same name:
@@ -425,7 +450,7 @@ print(f"{text}!")    // text is a str
 
 ## Exhaustiveness
 
-A `match` on an enum (or on `T?` or `bool`) must cover every variant.
+A `match` on an enum (or on `T?`, a union or `bool`) must cover every variant.
 The compiler reports an error if any variant is missing and no
 wildcard arm is present. An arm naming a variant the enum doesn't declare
 is reported instead, since it's usually a misspelling of the missing one,

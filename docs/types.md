@@ -474,6 +474,62 @@ Converting builds the new interface's method table when it runs, so it costs a
 small allocation. Arrays and optionals of interface values don't convert
 element by element: a `[ReadCloser]` is not a `[Reader]`.
 
+## Union types
+
+`A | B` holds a value of any one of its member types. A `match` or `is` says
+which one it holds:
+
+```kod
+type Id = int64 | str
+
+func show(anon id: Id) -> str {
+    match id {
+        n: int64 -> return f"#{n}"
+        s: str -> return s
+    }
+}
+
+let id: Id = 42
+if id is s: str {
+    print(s)
+}
+```
+
+A member can be any type: a primitive, a struct, an enum, an interface, an
+array, a generic instance or a function type. See
+[Pattern matching](pattern-matching.md#union-member) for the patterns.
+
+A union is a set, so order, repeats and nesting don't matter. `int64 | str` and
+`str | int64` are one type, in every module, and with `type Id = int64 | str`,
+`Id | bool` is `int64 | str | bool`. A union with only one member left is that
+member.
+
+`none` in a union makes it optional: `T | none` is exactly `T?`, and
+`A | B | none` is the optional of `A | B`. An optional member counts the same
+way, so `A? | B` is that type too.
+
+In a type, `|` binds tighter than `or`, so `int64 | str or Error` is a fallible
+`int64 | str`. A function type's return type takes every member after the `->`,
+so `func() -> int64 | str` returns a union. To put such a function in a union,
+give its type an alias first.
+
+A value goes into a union by being written where the union is declared, as a `T`
+goes into a `T?`. It goes to the member of its own type. Without one, a struct or
+primitive goes to an interface member it implements, and implementing two of them
+is an error, since it could be either. An enum's `.Variant` goes to the one enum
+member that declares that variant, and `[]` to the one array member. A value with
+no member reports the mismatch (`` expected `int64 | str`, got `bool` ``).
+
+A union is passed on as it is, so an `A | B` isn't accepted where an `A | B | C`
+is declared, as an `[Sq]` isn't a `[Shape]`. Match it and put the member in the
+other union instead. Nor is a union accepted where one of its members is declared.
+
+A union has no fields, methods or operators of its own, so `==`, printing and
+`f"{x}"` need a `match` first, and a union can't be a `Map` key. A union can't
+mention a type parameter, except as `T | none`, since `T | str` would have only
+one member when `T` is `str`. A union alias can't refer to itself, so a recursive
+type such as a JSON value is still an [enum](enums.md).
+
 ## Type aliases
 
 `type Name = T` gives an existing type a second name. An alias is
@@ -494,6 +550,7 @@ type MaybeNode = Node?
 type Callback = func(int64) -> int64
 type StrMap = Map[str, str]
 type Outcome = int64 or Error
+type Key = int64 | str
 
 type Node = struct {
     label: str

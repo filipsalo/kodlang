@@ -729,9 +729,39 @@ type Parser = struct {
 		return self.alloc_type(ast.TypeExpr.Named(:name), :span, :qual)
 	}
 
+	// `A | B | ...`. `T | none` is `T?` itself, so generic code can bind `T` through it.
+	func parse_union_type(self) -> int64 {
+		let span: ast.Span = self.here()
+		let first: int64 = self.parse_type_expr_core()
+		if not self.at(.Pipe) {
+			return first
+		}
+		mut members: [int64] = [first]
+		for self.try_consume(.Pipe) {
+			members += [self.parse_type_expr_core()]
+		}
+		mut others: [int64] = []
+		for member in members {
+			mut is_none = false
+			if self.type_exprs[member] is .Named(name) and name == "none" {
+				is_none = true
+			}
+			if not is_none {
+				others += [member]
+			}
+		}
+		if len(others) == 0 {
+			return first
+		}
+		if len(others) == 1 and len(members) > 1 {
+			return self.alloc_type(ast.TypeExpr.Optional(inner: others[0]), :span)
+		}
+		return self.alloc_type(ast.TypeExpr.Union(:members), :span)
+	}
+
 	func parse_type_expr(self) -> int64 {
 		let span: ast.Span = self.here()
-		mut id: int64 = self.parse_type_expr_core()
+		mut id: int64 = self.parse_union_type()
 		// Fallible result: `T or Error` desugars to Result[T, Error] — the
 		// unified tagged-sum representation. Only `or Error` is supported;
 		// the umbrella Error interface is the thrown type. Repeated
@@ -1065,7 +1095,39 @@ type Parser = struct {
 		return self.with_all_subs(self.alloc_pattern(ast.Pattern.ImplicitEnumPat(:variant_name, :bindings)), :items)
 	}
 
+	// `name: T` on a union. A built pattern has no id, so the type rides in the
+	// variant name, which find_variant_idx reads back.
+	func union_pattern_name(self) -> str {
+		return f"$t{self.parse_type_expr_core()}"
+	}
+
+	func at_union_pattern(self) -> bool {
+		return self.at(.Identifier) and self.peek_kind_at(1) == .Colon
+	}
+
+	func parse_union_pattern(self) -> int64 {
+		let binding: str = self.binding_identifier()
+		self.expect(.Colon)
+		let bindings: [str] = [binding]
+		return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: self.union_pattern_name(), :bindings))
+	}
+
+	// `x is s: str` reads as `x is .<member>(s)`, as any other pattern after `is` does.
+	func parse_union_is_rhs(self) -> int64 {
+		let span: ast.Span = self.here()
+		let name_tok: lexing.Token = self.peek()
+		let binding: str = self.binding_identifier()
+		let binding_id: int64 = self.alloc_expr(ast.Expr.Ident(name: binding), span: ast.Span(start: name_tok.start))
+		self.expect(.Colon)
+		let callee: int64 = self.alloc_expr(ast.Expr.ImplicitVariant(name: self.union_pattern_name()), :span)
+		let args: [ast.CallArg] = [ast.CallArg(label: "", label_span: span, value: binding_id)]
+		return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
+	}
+
 	func parse_pattern(self) -> int64 {
+		if self.at_union_pattern() {
+			return self.parse_union_pattern()
+		}
 		// Integer
 		if self.at(.IntegerLit) {
 			let tok: lexing.Token = self.advance()
@@ -1159,7 +1221,7 @@ type Parser = struct {
 
 	// A payload position: a name, which binds, or a pattern (pattern >= 0) under a hidden name.
 	func parse_payload_item(self) -> ast.SubPattern {
-		if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot {
+		if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot and self.peek_kind_at(1) != .Colon {
 			return ast.SubPattern(binding: self.binding_identifier(), pattern: -1)
 		}
 		let pattern = self.parse_pattern()
@@ -1876,7 +1938,12 @@ type Parser = struct {
 		for self.bin_op_prec() >= min_prec and self.bin_op_prec() > 0 {
 			let prec: int64 = self.bin_op_prec()
 			let op: ast.Op = self.consume_bin_op()
-			let rhs: int64 = self.parse_expr_prec(prec + 1)
+			mut rhs: int64 = 0
+			if (op is .Is or op is .IsNot) and self.at_union_pattern() {
+				rhs = self.parse_union_is_rhs()
+			} else {
+				rhs = self.parse_expr_prec(prec + 1)
+			}
 			// Python-style chained comparisons: `a < b < c` builds a
 			// single Chain instead of `((a < b) < c)`. Comparisons live
 			// at precedence 7; if the next token is also a comparison

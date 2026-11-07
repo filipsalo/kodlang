@@ -202,6 +202,9 @@ type EnumInfo = struct {
     // Which declaration this is: its file and name, or for an instance its
     // template's key and its arguments' keys.
     key: str = ""
+    // Written by the compiler for `A | B`: one variant per member, each with
+    // one field of that member's kind.
+    is_union: bool = false
 }
 
 type FieldInfo = struct {
@@ -1261,6 +1264,10 @@ type Codegen = struct {
         }
         if not unit_side {
             let shown = self.enum_display_name(enum_idx)
+            if self.enums[enum_idx].is_union {
+                self.report_error(f"error: cannot compare two `{shown}` values; test the member with `is` or `match`", span: self.p.expr_spans[lhs_id])
+                return
+            }
             self.report_error(f"error: cannot compare two `{shown}` values; some of its variants have payloads, so test the variant with `is` or `match`", span: self.p.expr_spans[lhs_id])
         }
     }
@@ -1287,6 +1294,9 @@ type Codegen = struct {
     }
 
     func unhashable_note(self, anon kind: TypeKind) -> str {
+        if self.is_union_kind(kind) {
+            return ""
+        }
         if kind is .KEnum(_idx) {
             return "; some of its variants have payloads"
         }
@@ -2009,6 +2019,9 @@ type Codegen = struct {
                 }
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
+                if variant_name.starts_with("$t") {
+                    return self.check_union_pattern(variant_name, :kind, :subject_id)
+                }
                 target = f"`.{variant_name}`"
                 variant = variant_name
             }
@@ -2160,7 +2173,11 @@ type Codegen = struct {
             .KEnum(idx) -> {
                 mut ctors: [PatternCtor] = []
                 for variant in self.enums[idx].variants {
-                    ctors += [PatternCtor(name: variant.name, shown: f".{variant.name}", fields: variant.field_kinds)]
+                    if self.enums[idx].is_union {
+                        ctors += [PatternCtor(name: variant.name, shown: f"_: {self.kind_display(variant.field_kinds[0])}", fields: no_fields)]
+                    } else {
+                        ctors += [PatternCtor(name: variant.name, shown: f".{variant.name}", fields: variant.field_kinds)]
+                    }
                 }
                 return ctors
             }
@@ -2271,7 +2288,7 @@ type Codegen = struct {
             for variant in enum_info.variants {
                 mut covered: bool = false
                 for pid in pattern_ids {
-                    match self.p.patterns[pid] {
+                    match self.subject_pattern(self.p.patterns[pid], subject_kind: subj_kind) {
                         .EnumPat(_enum_name, variant_name, _bindings) -> {
                             if variant_name == variant.name {
                                 covered = true
@@ -2285,7 +2302,9 @@ type Codegen = struct {
                         else none
                     }
                 }
-                if not covered {
+                if not covered and enum_info.is_union {
+                    self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover `_: {self.kind_display(variant.field_kinds[0])}`", span: self.p.expr_spans[subject_id])
+                } else if not covered {
                     self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover variant `{variant.name}`", span: self.p.expr_spans[subject_id])
                 }
             }
@@ -4373,6 +4392,9 @@ type Codegen = struct {
     }
 
     func find_variant_idx(self, anon variant_name: str, enum_idx: int64) -> int64 {
+        if self.enums[enum_idx].is_union and variant_name.starts_with("$t") {
+            return self.union_pattern_variant(variant_name, :enum_idx)
+        }
         for j, variant in self.enums[enum_idx].variants {
             if variant.name == variant_name {
                 return j
@@ -4384,6 +4406,13 @@ type Codegen = struct {
     // find_variant_idx, reporting an unknown variant at `span`.
     func check_variant(self, anon variant_name: str, enum_idx: int64, span: ast.Span) -> int64 {
         let variant_idx = self.find_variant_idx(variant_name, :enum_idx)
+        if variant_idx < 0 and variant_name.starts_with("$t") {
+            return variant_idx
+        }
+        if variant_idx < 0 and self.enums[enum_idx].is_union {
+            self.report_error(f"error: `{self.enum_display_name(enum_idx)}` has no variant `{variant_name}`; bind the member that does, as in `v: T`, and match that", :span)
+            return variant_idx
+        }
         if variant_idx < 0 {
             mut names: [str] = []
             for v in self.enums[enum_idx].variants {
@@ -4589,7 +4618,12 @@ type Codegen = struct {
             .KArrayOptional(inner_kind) -> return f"[{self.kind_display(inner_kind)}?]"
             .KEnum(idx) -> return self.enum_display_name(idx)
             .KInterface(idx) -> return self.iface_display_name(idx)
-            .KOptional(inner) -> return f"{self.kind_display(inner)}?"
+            .KOptional(inner) -> {
+                if self.is_union_kind(inner) {
+                    return f"{self.kind_display(inner)} | none"
+                }
+                return f"{self.kind_display(inner)}?"
+            }
             .KStruct(idx, type_args) -> {
                 if len(type_args) == 0 {
                     return self.struct_display_name(idx)
@@ -4636,6 +4670,16 @@ type Codegen = struct {
 
     func enum_display_name(self, anon idx: int64) -> str {
         let info = self.enums[idx]
+        if info.is_union {
+            mut shown = ""
+            for v in info.variants {
+                if len(shown) > 0 {
+                    shown = f"{shown} | "
+                }
+                shown = f"{shown}{self.kind_display(v.field_kinds[0])}"
+            }
+            return shown
+        }
         if info.template_idx < 0 {
             return self.shown_type_name(info.name, def_path: info.def_path)
         }
@@ -4980,6 +5024,17 @@ type Codegen = struct {
                 }
                 return .KOptional(inner: inner_kind)
             }
+            .Union(members) -> {
+                mut kinds: [TypeKind] = []
+                for member in members {
+                    let member_kind = self.resolve_type(member)
+                    if self.kind_has_unknown(member_kind) {
+                        return .KUnknown
+                    }
+                    kinds += [member_kind]
+                }
+                return self.union_kind(kinds)
+            }
             .Func(params, return_typ) -> {
                 mut pkinds: [TypeKind] = []
                 for p in params {
@@ -5036,6 +5091,221 @@ type Codegen = struct {
                 return .KUnknown
             }
         }
+    }
+
+    // The type a union's members make: nested unions and optionals flatten,
+    // repeats go, and the rest sort by key so that any spelling is one type.
+    func union_kind(self, anon members: [TypeKind]) -> TypeKind {
+        mut work: [TypeKind] = []
+        work += members
+        mut optional = false
+        mut kinds: [TypeKind] = []
+        mut keys: [str] = []
+        mut i = 0
+        for i < len(work) {
+            let kind = work[i]
+            i = i + 1
+            if self.is_void_kind(kind) {
+                optional = true
+                continue
+            }
+            if kind is .KOptional(inner) {
+                optional = true
+                work += [inner]
+                continue
+            }
+            if kind is .KEnum(idx) and self.enums[idx].is_union {
+                for v in self.enums[idx].variants {
+                    work += [v.field_kinds[0]]
+                }
+                continue
+            }
+            let key = self.type_key(kind)
+            mut at = 0
+            for at < len(keys) and keys[at] < key {
+                at = at + 1
+            }
+            if at == len(keys) or keys[at] != key {
+                keys = keys[..at] + [key] + keys[at..]
+                kinds = kinds[..at] + [kind] + kinds[at..]
+            }
+        }
+        mut kind: TypeKind = .KVoid
+        if len(kinds) == 1 {
+            kind = kinds[0]
+        } else if len(kinds) > 1 {
+            kind = .KEnum(idx: self.union_enum(kinds, :keys))
+        }
+        if optional and len(kinds) > 0 {
+            return .KOptional(inner: kind)
+        }
+        return kind
+    }
+
+    func union_enum(self, anon kinds: [TypeKind], keys: [str]) -> int64 {
+        mut key = "union"
+        for k in keys {
+            key = f"{key}|{k}"
+        }
+        if self.enum_insts.get(key) is Some(existing) {
+            return existing
+        }
+        mut variants: [VariantInfo] = []
+        for i, kind in kinds {
+            let no_exprs: [int64] = []
+            variants += [VariantInfo(name: f"={keys[i]}", discriminant: i + 1, field_names: ["value"], field_offsets: [0], field_kinds: [kind], field_type_exprs: no_exprs)]
+        }
+        let no_params: [str] = []
+        let no_args: [TypeKind] = []
+        let idx: int64 = len(self.enums)
+        self.enums += [EnumInfo(name: f"union${idx}", :variants, data_width: 16, module_prefix: "builtins", src_p: self.p, def_path: "", def_span: ast.Span(start: 0), type_param_names: no_params, template_idx: -1, template_args: no_args, :key, is_union: true)]
+        let insts = self.enum_insts
+        insts.set(key, idx)
+        return idx
+    }
+
+    func is_union_kind(self, anon kind: TypeKind) -> bool {
+        if kind is .KEnum(idx) {
+            return self.enums[idx].is_union
+        }
+        return false
+    }
+
+    // The member a value of kind `actual` goes to, or -1. Its own type first,
+    // then an interface it implements; two that fit is no answer.
+    func union_variant_of_kind(self, anon idx: int64, actual: TypeKind) -> int64 {
+        mut found = -1
+        for j, v in self.enums[idx].variants {
+            let member = v.field_kinds[0]
+            if not (member is .KInterface(_i)) and self.kinds_compatible(member, :actual) {
+                if found >= 0 {
+                    return -1
+                }
+                found = j
+            }
+        }
+        if found >= 0 {
+            return found
+        }
+        for j, v in self.enums[idx].variants {
+            if v.field_kinds[0] is .KInterface(iface_idx) and self.implements_iface(actual, :iface_idx) {
+                if found >= 0 {
+                    return -1
+                }
+                found = j
+            }
+        }
+        return found
+    }
+
+    func fits_several_members(self, anon expected: TypeKind, actual: TypeKind) -> bool {
+        let .KEnum(idx) = expected else { return false }
+        if not self.enums[idx].is_union {
+            return false
+        }
+        mut count = 0
+        for v in self.enums[idx].variants {
+            if v.field_kinds[0] is .KInterface(iface_idx) and self.implements_iface(actual, :iface_idx) {
+                count = count + 1
+            }
+        }
+        return count > 1
+    }
+
+    func implements_iface(self, anon actual: TypeKind, iface_idx: int64) -> bool {
+        if not self.kinds_compatible(.KInterface(idx: iface_idx), :actual) {
+            return false
+        }
+        if actual is .KInterface(_have) {
+            return true
+        }
+        return len(self.iface_gap(actual, :iface_idx)) == 0
+    }
+
+    // The member `value_id` is built as, or -1: for one that's already this
+    // union, and for one that fits no member.
+    func union_variant_for(self, anon value_id: int64, enum_idx: int64) -> int64 {
+        if self.is_implicit_variant_value(value_id) {
+            let name = self.implicit_variant_name(value_id)
+            mut found = -1
+            for j, v in self.enums[enum_idx].variants {
+                if v.field_kinds[0] is .KEnum(member) and self.find_variant_idx(name, enum_idx: member) >= 0 {
+                    if found >= 0 {
+                        return -1
+                    }
+                    found = j
+                }
+            }
+            return found
+        }
+        if self.p.exprs[value_id] is .ArrayLit(elements) and len(elements) == 0 {
+            mut found = -1
+            for j, v in self.enums[enum_idx].variants {
+                if self.is_array_kind(v.field_kinds[0]) {
+                    if found >= 0 {
+                        return -1
+                    }
+                    found = j
+                }
+            }
+            return found
+        }
+        let actual = self.infer_kind(value_id)
+        if actual is .KEnum(a_idx) and self.enums_compatible(enum_idx, :a_idx) {
+            return -1
+        }
+        return self.union_variant_of_kind(enum_idx, :actual)
+    }
+
+    // Build `value_id` as the member it goes to: a variant whose one field is the value.
+    func compile_union_member(self, anon value_id: int64, enum_idx: int64, variant_idx: int64) -> Val {
+        let span = self.p.expr_spans[value_id]
+        let args: [ast.CallArg] = [ast.CallArg(label: "", label_span: span, value: value_id)]
+        return self.compile_enum_construct(args, :enum_idx, :variant_idx, :span)
+    }
+
+    // What `name: T` tests: the variant of `T`, which has to be a member.
+    func union_pattern_variant(self, anon name: str, enum_idx: int64) -> int64 {
+        let kind = self.resolve_type(parsing.str_to_int(name[2..]))
+        if self.kind_has_unknown(kind) {
+            return -1
+        }
+        let want = f"={self.type_key(kind)}"
+        for j, v in self.enums[enum_idx].variants {
+            if v.name == want {
+                return j
+            }
+        }
+        return -1
+    }
+
+    func union_pattern_kind(self, anon name: str) -> TypeKind {
+        return self.resolve_type(parsing.str_to_int(name[2..]))
+    }
+
+    func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
+        let span = self.p.expr_spans[subject_id]
+        let type_id = parsing.str_to_int(name[2..])
+        let errors_before = self.report_attempts
+        self.check_type_expr(type_id)
+        if self.report_attempts > errors_before {
+            return false
+        }
+        let shown = self.kind_display(kind)
+        let member = self.kind_display(self.union_pattern_kind(name))
+        if kind is .KEnum(idx) and self.enums[idx].is_union {
+            if self.union_pattern_variant(name, enum_idx: idx) >= 0 {
+                return true
+            }
+            self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
+            return false
+        }
+        if self.is_union_kind(self.optional_inner(kind)) and kind is .KOptional(_inner) {
+            self.report_error(f"error: `{shown}` is optional, so its members are inside `Some`: `Some(_: {member})`", :span)
+            return false
+        }
+        self.report_error(f"error: `_: {member}` matches a member of a union, got `{shown}`", :span)
+        return false
     }
 
     // Instantiate a generic enum template with `type_args`, creating a new
@@ -5212,6 +5482,7 @@ type Codegen = struct {
                     self.settle_type_params(inner, kind: self.array_elem_kind(kind), :sig, :bound)
                 }
             }
+            .Union(_members) -> none
             .Optional(inner) -> {
                 if kind is .KOptional(held) {
                     self.settle_type_params(inner, kind: held, :sig, :bound)
@@ -6271,6 +6542,14 @@ type Codegen = struct {
             }
             .Array(inner) -> return self.type_resolvable(inner)
             .Optional(inner) -> return self.type_resolvable(inner)
+            .Union(members) -> {
+                for member in members {
+                    if not self.type_resolvable(member) {
+                        return false
+                    }
+                }
+                return true
+            }
             .Func(params, return_typ) -> {
                 for param in params {
                     if not self.type_resolvable(param) {
@@ -6304,6 +6583,15 @@ type Codegen = struct {
                 return true
             }
         }
+    }
+
+    func names_type_param(self, anon name: str) -> bool {
+        for sn in self.subst_names {
+            if sn == name {
+                return true
+            }
+        }
+        return false
     }
 
     func type_name_known(self, anon name: str) -> bool {
@@ -6405,7 +6693,7 @@ type Codegen = struct {
     func resolve_variant_field_kinds(self, start: int64) -> none {
         mut i: int64 = start
         for i < len(self.enums) {
-            if len(self.enums[i].type_param_names) > 0 {
+            if len(self.enums[i].type_param_names) > 0 or self.enums[i].is_union {
                 i = i + 1
                 continue
             }
@@ -7262,6 +7550,7 @@ type Codegen = struct {
         match kind {
             .KOptional(_inner) -> return true
             .KInterface(_idx) -> return true
+            .KEnum(idx) -> return self.enums[idx].is_union or self.is_ctor_for(value_id, :kind)
             else return self.is_ctor_for(value_id, :kind)
         }
     }
@@ -8136,7 +8425,7 @@ type Codegen = struct {
         return [qualifier, name]
     }
 
-    // `Option.Some` and `Result.Ok` name the variants `T?` and `T or Error` test.
+    // `Result.Ok` names a variant `T or Error` tests.
     func std_pattern_name(self, anon expr_id: int64, std_enum: str) -> str {
         mut callee = expr_id
         if self.p.exprs[expr_id] is .Call(call_callee, _args) {
@@ -8252,7 +8541,7 @@ type Codegen = struct {
         if not is_optional {
             self.report_error("error: `is` requires an optional, `T or Error`, enum or interface value", span: self.p.expr_spans[lhs])
         }
-        let opt_name = self.std_pattern_name(rhs, std_enum: "Option")
+        let opt_name = self.is_pattern_name(rhs)
         mut tests_none = opt_name == "None"
         if self.p.exprs[rhs] is .NoneLit {
             tests_none = true
@@ -8864,6 +9153,9 @@ type Codegen = struct {
                 }
             }
             .KEnum(enum_idx) -> {
+                if self.enums[enum_idx].is_union {
+                    self.report_error(f"error: `{self.enum_display_name(enum_idx)}` can't be turned into text; `match` it first", span: self.p.expr_spans[expr_id])
+                }
                 if not self.is_result_enum_idx(enum_idx) {
                     return self.compile_variant_name(expr_id, :enum_idx)
                 }
@@ -9782,6 +10074,16 @@ type Codegen = struct {
             }
             .Array(inner) -> self.check_type_expr(inner)
             .Optional(inner) -> self.check_type_expr(inner)
+            .Union(members) -> {
+                for member in members {
+                    self.check_type_expr(member)
+                    for name in self.type_expr_names(member) {
+                        if self.names_type_param(name) {
+                            self.report_error(f"error: a union can't mention the type parameter `{name}`, except as `{name} | none`", span: self.p.type_spans[member])
+                        }
+                    }
+                }
+            }
             .Func(params, return_typ) -> {
                 if len(params) > 8 and not self.checking_dep {
                     self.limit_kinds += [self.type_key(self.resolve_type(type_id))]
@@ -10253,6 +10555,11 @@ type Codegen = struct {
             }
             .Array(inner) -> names = self.type_expr_names(inner)
             .Optional(inner) -> names = self.type_expr_names(inner)
+            .Union(members) -> {
+                for member in members {
+                    names += self.type_expr_names(member)
+                }
+            }
             .Func(params, return_typ) -> {
                 for param in params {
                     names += self.type_expr_names(param)
@@ -12099,8 +12406,11 @@ type Codegen = struct {
                 return false
             }
             .KEnum(idx) -> {
-                if actual is .KEnum(a_idx) {
-                    return self.enums_compatible(idx, :a_idx)
+                if actual is .KEnum(a_idx) and self.enums_compatible(idx, :a_idx) {
+                    return true
+                }
+                if self.enums[idx].is_union {
+                    return self.union_variant_of_kind(idx, :actual) >= 0
                 }
                 return false
             }
@@ -12317,6 +12627,19 @@ type Codegen = struct {
             self.check_value_as(value_id, expected: self.optional_inner(expected), :slot)
             return
         }
+        if expected is .KEnum(array_union) and self.enums[array_union].is_union and self.p.exprs[value_id] is .ArrayLit(elements) and len(elements) == 0 {
+            if self.union_variant_for(value_id, enum_idx: array_union) < 0 {
+                self.report_error(f"error: `[]` needs one array member in `{self.kind_display(expected)}`, to know which it is", span: self.p.expr_spans[value_id])
+            }
+            return
+        }
+        if self.is_union_kind(expected) and self.is_implicit_variant_value(value_id) {
+            let .KEnum(union_idx) = expected else { return }
+            if self.union_variant_for(value_id, enum_idx: union_idx) < 0 and not self.checking_default {
+                self.report_error(f"error: no one member of `{self.kind_display(expected)}` has a variant `{self.implicit_variant_name(value_id)}`", span: self.p.expr_spans[value_id])
+            }
+            return
+        }
         if self.is_implicit_variant_value(value_id) {
             let enum_idx = self.expected_enum_idx(expected)
             if enum_idx >= 0 {
@@ -12368,6 +12691,8 @@ type Codegen = struct {
         mut hint = ""
         if self.is_result_kind(expected) and self.kinds_compatible(self.result_inner_kind(expected), :actual) {
             hint = "; write `.Ok(value: ...)` for a successful result"
+        } else if self.fits_several_members(expected, :actual) {
+            hint = "; it fits more than one member"
         } else if self.is_some_optional(actual) and self.kinds_compatible(expected, actual: self.optional_inner(actual)) {
             hint = self.unwrap_hint(value_id)
             if expected is .KOptional(_inner) {
@@ -12417,6 +12742,12 @@ type Codegen = struct {
         }
         match expected {
             .KEnum(idx) -> {
+                if self.enums[idx].is_union {
+                    let member_idx = self.union_variant_for(value_id, enum_idx: idx)
+                    if member_idx >= 0 {
+                        return self.load(self.compile_union_member(value_id, enum_idx: idx, variant_idx: member_idx))
+                    }
+                }
                 let variant_idx = self.ctor_variant_idx(value_id, enum_idx: idx)
                 if variant_idx >= 0 {
                     let val = self.compile_enum_construct(self.ctor_args(value_id), enum_idx: idx, :variant_idx, span: self.p.expr_spans[value_id])
@@ -13151,6 +13482,14 @@ type Codegen = struct {
         // Detect direct enum construction patterns and route through
         // compile_enum_construct; otherwise compile the expression and store
         // its (pointer) result.
+        if self.enums[enum_idx].is_union {
+            let member_idx = self.union_variant_for(value_id, :enum_idx)
+            if member_idx >= 0 {
+                self.compile_union_member(value_id, :enum_idx, variant_idx: member_idx)
+                self.emit_str(dest_off, reg: "x0")
+                return
+            }
+        }
         let variant_idx = self.ctor_variant_idx(value_id, :enum_idx)
         if variant_idx >= 0 {
             let val = self.compile_enum_construct(self.ctor_args(value_id), :enum_idx, :variant_idx, span: self.p.expr_spans[value_id])
@@ -13780,6 +14119,9 @@ type Codegen = struct {
             // caller's next method dispatch would walk into garbage.
             mut convert = self.builds_array_for(value_id, kind: self.return_kind)
             if self.return_kind is .KInterface(_idx) {
+                convert = true
+            }
+            if self.is_union_kind(self.return_kind) {
                 convert = true
             }
             if convert {
@@ -14454,23 +14796,23 @@ type Codegen = struct {
         return self.subject_pattern(self.p.patterns[pattern_id], subject_kind: self.infer_kind(value_id))
     }
 
-    // On a `T?` subject, `.Some(v)` and `.None`, or `Option.` ones, are its Some and none patterns.
+    // On a `T?` subject, `.Some(v)` and `.None` are its Some and none patterns.
     func subject_pattern(self, anon pat: ast.Pattern, subject_kind: TypeKind) -> ast.Pattern {
         if subject_kind is .KInterface(_idx) {
             return self.downcast_pattern(pat)
+        }
+        if subject_kind is .KEnum(union_idx) and self.enums[union_idx].is_union and pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+            let variant_idx = self.union_pattern_variant(v, enum_idx: union_idx)
+            if variant_idx >= 0 {
+                return .ImplicitEnumPat(variant_name: self.enums[union_idx].variants[variant_idx].name, bindings: b)
+            }
+            return pat
         }
         let .KOptional(_inner) = subject_kind else { return pat }
         mut variant_name = ""
         mut bindings: [str] = []
         match pat {
             .ImplicitEnumPat(v, b) -> {
-                variant_name = v
-                bindings = b
-            }
-            .EnumPat(e, v, b) -> {
-                if e != "Option" {
-                    return pat
-                }
                 variant_name = v
                 bindings = b
             }

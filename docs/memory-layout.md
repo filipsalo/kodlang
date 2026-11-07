@@ -78,6 +78,17 @@ through the ARM64 calling convention without any multi-word ABI gymnastics.
 
 See `docs/enums.md` for details.
 
+## Union values
+
+A union is an enum the compiler writes, with one variant per member, so its
+value is a pointer to a cell of the same shape: the discriminant says which
+member it holds, and the payload is that member's 8-byte value. Members are
+numbered in a fixed order worked out from the types themselves, so a union is
+laid out the same in every module however it's spelled. A struct, enum or other
+reference held in a union is a pointer to its own cell, so it costs a second
+allocation. A `T | none` is a `T?` with an optional's layout; the optional of a
+larger union is an optional cell holding a pointer to a union cell.
+
 ## Reclaiming memory
 
 Kod counts references. Every struct, enum value, optional cell, interface cell,
