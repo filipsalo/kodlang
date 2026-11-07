@@ -5259,6 +5259,50 @@ type Codegen = struct {
         return self.union_variant_of_kind(enum_idx, :actual)
     }
 
+    // A union value where a union with all of its members (and more) is
+    // declared: `A | B` into `A | B | C`. Only the value itself widens; an
+    // array or optional of it is passed on as it is.
+    func widens(self, anon actual: TypeKind, into: TypeKind) -> bool {
+        let .KEnum(from_idx) = actual else { return false }
+        let .KEnum(to_idx) = into else { return false }
+        if from_idx == to_idx or not self.enums[from_idx].is_union or not self.enums[to_idx].is_union {
+            return false
+        }
+        for v in self.enums[from_idx].variants {
+            mut found = false
+            for w in self.enums[to_idx].variants {
+                if w.name == v.name {
+                    found = true
+                }
+            }
+            if not found {
+                return false
+            }
+        }
+        return true
+    }
+
+    // `match v { A(a) -> body(a), ... }` over the members of the union `v` holds,
+    // where `wrap` makes each arm's value: the member itself, or `$str` of it.
+    func member_match(self, anon value_id: int64, wrap: str) -> int64 {
+        let .KEnum(from_idx) = self.infer_kind(value_id) else { return -1 }
+        let span = self.p.expr_spans[value_id]
+        mut arms: [int64] = []
+        for v in self.enums[from_idx].variants {
+            let name = self.fresh("__member")
+            self.alloc_var(:name, kind: v.field_kinds[0])
+            let bindings: [str] = [name]
+            let pat = self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, :bindings))
+            mut body = self.p.alloc_expr(.Ident(:name), :span)
+            if len(wrap) > 0 {
+                let callee = self.p.alloc_expr(.Ident(name: wrap), :span)
+                body = self.p.alloc_expr(.Call(:callee, args: [ast.CallArg(label: "", label_span: span, value: body)]), :span)
+            }
+            arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body))]
+        }
+        return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
+    }
+
     // Build `value_id` as the member it goes to: a variant whose one field is the value.
     func compile_union_member(self, anon value_id: int64, enum_idx: int64, variant_idx: int64) -> Val {
         let span = self.p.expr_spans[value_id]
@@ -9266,8 +9310,9 @@ type Codegen = struct {
                 }
             }
             .KEnum(enum_idx) -> {
+                // A union is its member's text.
                 if self.enums[enum_idx].is_union {
-                    self.report_error(f"error: `{self.enum_display_name(enum_idx)}` can't be turned into text; `match` it first", span: self.p.expr_spans[expr_id])
+                    return self.compile_expr(self.member_match(expr_id, wrap: "$str"))
                 }
                 if not self.is_result_enum_idx(enum_idx) {
                     return self.compile_variant_name(expr_id, :enum_idx)
@@ -12916,7 +12961,7 @@ type Codegen = struct {
             self.report_cannot_infer(value_id, what: "this expression", typed_slot: true)
             return
         }
-        if self.kinds_compatible(expected, :actual) or self.either_unknown(expected, actual) {
+        if self.kinds_compatible(expected, :actual) or self.either_unknown(expected, actual) or self.widens(actual, into: expected) {
             return
         }
         let shown = self.kind_display(actual)
@@ -12974,6 +13019,9 @@ type Codegen = struct {
         }
         match expected {
             .KEnum(idx) -> {
+                if self.widens(self.infer_kind(value_id), into: expected) {
+                    return self.compile_value_for_kind(self.member_match(value_id, wrap: ""), :expected)
+                }
                 if self.enums[idx].is_union {
                     let member_idx = self.union_variant_for(value_id, enum_idx: idx)
                     if member_idx >= 0 {
@@ -13714,6 +13762,12 @@ type Codegen = struct {
         // Detect direct enum construction patterns and route through
         // compile_enum_construct; otherwise compile the expression and store
         // its (pointer) result.
+        if self.widens(self.infer_kind(value_id), into: .KEnum(idx: enum_idx)) {
+            let reg = self.compile_value_for_kind(value_id, expected: .KEnum(idx: enum_idx))
+            self.emit_str(dest_off, :reg)
+            self.pool.free_reg(reg)
+            return
+        }
         if self.enums[enum_idx].is_union {
             let member_idx = self.union_variant_for(value_id, :enum_idx)
             if member_idx >= 0 {

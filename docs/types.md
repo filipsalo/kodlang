@@ -534,12 +534,16 @@ is an error, since it could be either. An enum's `.Variant` goes to the one enum
 member that declares that variant, and `[]` to the one array member. A value with
 no member reports the mismatch (`` expected `int64 | str`, got `bool` ``).
 
-A union is passed on as it is, so an `A | B` isn't accepted where an `A | B | C`
-is declared, as an `[Sq]` isn't a `[Shape]`. Match it and put the member in the
-other union instead. Nor is a union accepted where one of its members is declared.
+A union goes where a union with all of its members is declared: an `A | B` is
+accepted as an `A | B | C`, and holds the same member there. Only the value
+itself widens. An `[A | B]` isn't an `[A | B | C]`, as an `[Sq]` isn't a
+`[Shape]`, and an `(A | B)?` isn't an `(A | B | C)?`; match those and put each
+member in instead. Nor is a union accepted where one of its members is declared.
 
-A union has no fields, methods or operators of its own, so `==`, printing and
-`f"{x}"` need a `match` first, and a union can't be a `Map` key. A union can't
+A union prints as the member it holds, with `print(x)`, `f"{x}"` or `str(x)`,
+when every member can be printed. Otherwise it has no fields, methods or
+operators of its own, so `==` needs a `match` first, and a union can't be a `Map`
+key. A union can't
 mention a type parameter, except as `T | none`, since `T | str` would have only
 one member when `T` is `str`. A union alias can't refer to itself, so a recursive
 type such as a JSON value is still an [enum](enums.md).
