@@ -2054,7 +2054,7 @@ type Codegen = struct {
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
                 if variant_name.starts_with("$t") {
-                    return self.check_union_pattern(variant_name, :kind, :subject_id, :nested)
+                    return self.check_union_pattern(variant_name, :kind, :subject_id)
                 }
                 target = f"`.{variant_name}`"
                 variant = variant_name
@@ -2166,7 +2166,10 @@ type Codegen = struct {
                 }
                 if self.missing_case(spec, kinds: ctor.fields + rest) is Some(witness) {
                     mut shown = ctor.shown
-                    if arity > 0 {
+                    // An optional's member needs no `Some`.
+                    if ctor.name == "Some" and witness[0].starts_with("_: ") {
+                        shown = witness[0]
+                    } else if arity > 0 {
                         shown = f"{shown}({", ".join(witness[0..arity])})"
                     }
                     return [shown] + witness[arity..]
@@ -5317,7 +5320,7 @@ type Codegen = struct {
         return self.resolve_type(parsing.str_to_int(name[2..]))
     }
 
-    func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64, nested: bool) -> bool {
+    func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
         let span = self.p.expr_spans[subject_id]
         let type_id = parsing.str_to_int(name[2..])
         let errors_before = self.report_attempts
@@ -5342,10 +5345,6 @@ type Codegen = struct {
             return false
         }
         if kind is .KOptional(_inner) {
-            if nested {
-                self.report_error(f"error: an optional inside a pattern needs its `Some`: `Some(_: {member})`", :span)
-                return false
-            }
             self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
             return false
         }
@@ -9107,6 +9106,11 @@ type Codegen = struct {
         mut iface_idx = -1
         if subject_kind is .KInterface(ii) {
             iface_idx = ii
+        }
+        if iface_idx >= 0 and not self.implements_iface(.KStruct(idx: struct_idx, type_args: []), :iface_idx) {
+            let iface = self.iface_display_name(iface_idx)
+            self.report_error(f"error: `{type_name}` doesn't implement `{iface}`, so a `{iface}` is never a `{type_name}`", :span)
+            return none
         }
         self.register_vtable(struct_idx, iface_idx)
         let ptr_r = self.pool.alloc_reg()
@@ -15075,14 +15079,20 @@ type Codegen = struct {
     // generic function can give the same pattern a different subject.
     func flatten_optional_arms(self, anon pattern_ids: [int64], subject_id: int64) -> [FlatArm] {
         mut saved: [FlatArm] = []
-        let .KOptional(inner) = self.infer_kind(subject_id) else { return saved }
+        let kind = self.infer_kind(subject_id)
         for pid in pattern_ids {
-            let raw = self.p.patterns[pid]
-            if raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
-                let written = self.union_pattern_kind(v)
-                if self.kind_has_unknown(written) {
-                    continue
-                }
+            saved += self.flatten_pattern(pid, :kind)
+        }
+        return saved
+    }
+
+    // `n: T` on an optional, here or in a payload at any depth, as its `Some(...)`.
+    func flatten_pattern(self, anon pid: int64, kind: TypeKind) -> [FlatArm] {
+        mut saved: [FlatArm] = []
+        let raw = self.p.patterns[pid]
+        if kind is .KOptional(inner) and raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+            let written = self.union_pattern_kind(v)
+            if not self.kind_has_unknown(written) {
                 mut binding = ""
                 if len(b) == 1 {
                     binding = b[0]
@@ -15101,8 +15111,12 @@ type Codegen = struct {
                     self.alloc_var(name: hidden, kind: inner)
                     self.p.patterns[pid] = .SomePat(binding: hidden)
                     self.p.pattern_subs[pid] = [ast.SubPattern(binding: hidden, pattern: member)]
+                    return saved
                 }
             }
+        }
+        for sub in self.p.pattern_subs[pid] {
+            saved += self.flatten_pattern(sub.pattern, kind: self.sub_pattern_kind(pid, :sub, subject_kind: kind))
         }
         return saved
     }

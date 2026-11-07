@@ -669,6 +669,8 @@ match read_size(path) {
 
 It works in `match`, `if … is`, and the bare `is` operator (a `match` on an
 interface needs an `else`, since its set of implementors isn't enumerable).
+A struct that doesn't implement the interface can never be in one, so naming it is
+an error: `` `Point` doesn't implement `Shape`, so a `Shape` is never a `Point` ``.
 `x is _: T` and a `b: T` pattern hold only for a value of exactly that
 declaration, or that generic instance, whichever module boxed it, so an error
 struct that an imported function throws matches its type in the caller. `T`

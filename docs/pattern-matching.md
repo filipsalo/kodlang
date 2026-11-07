@@ -204,8 +204,9 @@ if maybe is s: str {
 }
 ```
 
-Inside another pattern, such as `.Full(s: str)`, an optional field still needs its
-`Some`. A let-else can't start with this pattern, since
+The same holds inside another pattern: on a field of type `int64 | str | none`,
+`.Full(s: str)` and `.Full(none)` cover what it holds. An error for a missing arm spells
+it the same way, as `` doesn't cover `_: str` ``. A let-else can't start with this pattern, since
 `let s: str = id else { ... }` isn't one, so use `if` or `match`, or
 `let .Some(s: str) = maybe else { ... }` on an optional. To match a member's own
 variants, bind the enum and match that.
