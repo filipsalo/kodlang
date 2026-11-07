@@ -707,24 +707,9 @@ static int64_t f64_bits(double d) {
     return bits;
 }
 
-int64_t kod_i64_to_f64(int64_t n) { return f64_bits((double)n); }
-
-// Truncates toward zero; not-a-number is 0 and out-of-range saturates.
-int64_t kod_f64_to_i64(int64_t bits) {
-    double d = f64_of(bits);
-    if (d != d) return 0;
-    if (d >= 9223372036854775808.0) return INT64_MAX;
-    if (d <= -9223372036854775808.0) return INT64_MIN;
-    return (int64_t)d;
-}
-
-int64_t kod_f64_abs(int64_t bits) { return f64_bits(fabs(f64_of(bits))); }
-int64_t kod_f64_floor(int64_t bits) { return f64_bits(floor(f64_of(bits))); }
-int64_t kod_f64_ceil(int64_t bits) { return f64_bits(ceil(f64_of(bits))); }
-int64_t kod_f64_round(int64_t bits) { return f64_bits(round(f64_of(bits))); }
-int64_t kod_f64_sqrt(int64_t bits) { return f64_bits(sqrt(f64_of(bits))); }
-int64_t kod_f64_is_nan(int64_t bits) { return isnan(f64_of(bits)) ? 1 : 0; }
-int64_t kod_f64_is_inf(int64_t bits) { return isinf(f64_of(bits)) ? 1 : 0; }
+// kod_i64_to_f64, kod_f64_to_i64, kod_f64_abs, floor, ceil, round, sqrt,
+// is_nan and is_inf have no C side: codegen's float_intrinsic compiles a call
+// to them to the instructions that do the work.
 
 // The fewest digits that read back as exactly `bits`, in plain decimal for
 // magnitudes from 1e-6 up to (not including) 1e21 and as d.ddde+X outside it;
