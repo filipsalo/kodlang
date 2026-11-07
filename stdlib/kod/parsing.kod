@@ -343,6 +343,16 @@ func string_body(anon raw: str) -> str {
 // `expect()` finds a token kind that doesn't match. Same field shape
 // as codegen.Diagnostic so callers can fold parser errors into the codegen's
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
+// An early exit parse_block folds the rest of the block into (see fold_guards):
+// `at` is where the rest starts in the block's statements and `from` in its tokens.
+type Guard = struct {
+	at: int64
+	from: int64
+	arm: int64
+	pattern: int64
+	name: str
+}
+
 // The name a payload position binds when it holds pattern `pattern_id`.
 func hidden_binding(anon pattern_id: int64) -> str {
 	return f"__pat{pattern_id}"
@@ -435,6 +445,11 @@ type Parser = struct {
 	arm_guarded: bool = false
 	binding_names: [str] = []
 	binding_starts: [int64] = []
+	// The guard the statement just parsed set up (see fold_guards): the match
+	// arm the rest of its block goes in, that arm's pattern, and the name it narrows.
+	guard_arm: int64 = -1
+	guard_pat: int64 = -1
+	guard_name: str = ""
 	// A name in a payload position, which binds unless it names a type.
 	payload_names: [str] = []
 	payload_starts: [int64] = []
@@ -2118,19 +2133,66 @@ type Parser = struct {
 		self.advance()
 		self.skip_newlines()
 		mut stmts: [int64] = []
+		mut guards: [Guard] = []
 		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
 			self.skip_newlines()
 			if self.peek_kind() == .CloseCurly {
 				break
 			}
 			let errors_before = len(self.errors)
+			self.guard_arm = -1
 			let stmt_id = self.parse_stmt()
 			stmts += [stmt_id]
 			self.expect_stmt_end(:stmt_id, :errors_before)
+			if self.guard_arm >= 0 {
+				guards += [Guard(at: len(stmts), from: self.pos, arm: self.guard_arm, pattern: self.guard_pat, name: self.guard_name)]
+				self.guard_arm = -1
+			}
 			self.skip_newlines()
 		}
+		let stmts_end = self.pos
 		self.expect(.CloseCurly)
-		return stmts
+		return self.fold_guards(stmts, :guards, to: stmts_end)
+	}
+
+	// `if x is none { return }` and the statements after it: those go in the
+	// match arm where `x` holds something, so `x` is narrowed there. The last
+	// guard folds first, so an earlier one takes it in. A rest that assigns `x`
+	// stays where it is.
+	func fold_guards(self, anon stmts: [int64], guards: [Guard], to: int64) -> [int64] {
+		mut out = stmts
+		mut i = len(guards) - 1
+		for i >= 0 {
+			let g = guards[i]
+			i -= 1
+			if g.at >= len(out) or self.assigns(g.name, from: g.from, :to) {
+				continue
+			}
+			self.match_arms[g.arm] = ast.MatchArm(pattern: g.pattern, body: out[g.at..])
+			out = out[0..g.at]
+		}
+		return out
+	}
+
+	// Whether a block ends in a statement that can't fall through. Only a
+	// written `return`, `throw`, `break`, `continue` or `kod_panic(...)` counts.
+	func ends_in_exit(self, anon stmts: [int64]) -> bool {
+		if len(stmts) == 0 {
+			return false
+		}
+		match self.stmts[stmts[len(stmts) - 1]] {
+			.Return(_v) -> return true
+			.Throw(_v) -> return true
+			.Break -> return true
+			.Continue -> return true
+			.ExprStmt(expr) -> {
+				if self.exprs[expr] is .Call(callee, _args) and self.exprs[callee] is .Ident(name) {
+					return name == "kod_panic"
+				}
+				return false
+			}
+			else return false
+		}
 	}
 
 	// A statement ends its line unless a block's `}` ended it.
@@ -2328,6 +2390,7 @@ type Parser = struct {
 				let else_to = self.pos
 				// Narrowing: the block the test proves something in binds the name.
 				let name = self.narrow_name(subject)
+				let pat_narrows = self.narrows(pat)
 				if len(name) > 0 {
 					let tests_none = self.patterns[pat] is .NonePat
 					// `x is T` narrows the body, and `x is not T` the else block.
@@ -2350,6 +2413,24 @@ type Parser = struct {
 				} else {
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: pat, :body))]
 					arms += [self.alloc_match_arm(ast.MatchArm(pattern: other, body: else_body))]
+				}
+				// A guard: with no else and a body that can't fall through, the rest of
+				// the block runs where the test failed, narrowed (see fold_guards).
+				if len(name) > 0 and else_to == else_from and self.ends_in_exit(body) {
+					if not negated and self.patterns[pat] is .NonePat {
+						self.guard_arm = arms[1]
+						self.guard_pat = self.alloc_pattern(ast.Pattern.SomePat(binding: name))
+						self.guard_name = name
+					} else if not negated and self.patterns[pat] is .ErrPat(_e) {
+						self.guard_arm = arms[1]
+						self.guard_pat = self.alloc_pattern(ast.Pattern.OkPat(binding: name))
+						self.guard_name = name
+					} else if negated and pat_narrows {
+						self.narrow_to(pat, :name)
+						self.guard_arm = arms[0]
+						self.guard_pat = pat
+						self.guard_name = name
+					}
 				}
 				return self.alloc_stmt(ast.Stmt.MatchStmt(:subject, :arms))
 			}

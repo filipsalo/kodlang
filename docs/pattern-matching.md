@@ -290,6 +290,36 @@ it applies only when:
 After the block, `x` has its declared type again. A `for` condition doesn't
 narrow.
 
+An early exit narrows the rest of its block too. After an `if` with no `else`
+whose block ends in `return`, `throw`, `break`, `continue` or `kod_panic(...)`,
+the statements that follow in the same block run only when the test failed:
+
+```kod
+func total(anon xs: [int64?], limit: int64 or Error) -> int64 {
+    if limit is Err(e) {
+        print(e.to_str())
+        return 0
+    }
+    mut sum = 0                     // limit is an int64 from here on
+    for x in xs {
+        if x is none {
+            continue
+        }
+        sum += x                    // x is an int64 from here on
+    }
+    if sum > limit {
+        return limit
+    }
+    return sum
+}
+```
+
+`x is none`, `x is Err` and `x is not T` narrow this way, under the rules
+above, with the rest of the block in place of the `else` block. Only an exit
+written at the end of the block counts: a block that ends in a call to a
+helper that never returns, or in an `if` whose branches all return, doesn't
+narrow what follows.
+
 ### Nested patterns
 
 A payload position can hold a pattern instead of a name. The arm matches only
