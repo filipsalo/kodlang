@@ -2349,8 +2349,8 @@ def test_an_instance_and_a_type_whose_paths_spell_one_label_stay_apart():
                 "    let two = m2.make()\n"
                 "    print(one.who())\n"
                 "    print(two.who())\n"
-                "    print(one is _: x.S)\n"
-                "    print(two is _: x.S)\n"
+                "    print(one is x.S)\n"
+                "    print(two is x.S)\n"
                 "    return 0\n}\n",
             },
         )

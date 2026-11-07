@@ -206,11 +206,6 @@ if n > 0 {
 print(label)
 ```
 
-An enum's name before a `.`, and a type's name as a type argument, still
-mean the type where a local of that name is in force: after
-`let Color = 3`, `Color.Blue` is the enum's variant and `Box[Color]` an
-instance of `Box`.
-
 A function literal doesn't see the locals of the function it's written
 in.
 

@@ -207,7 +207,7 @@ type EnumInfo = struct {
     is_union: bool = false
 }
 
-// A match arm as it was written, while it's compiled as `Some(n: T)`.
+// A match arm as it was written, while it's compiled as `Some(T(n))`.
 type FlatArm = struct {
     id: int64
     pattern: ast.Pattern
@@ -1932,47 +1932,11 @@ type Codegen = struct {
     // subject must have an optional type — `none`/`Some` aren't
     // meaningful patterns on a non-optional value, and
     // `if x is none {...}` lowers to a MatchStmt.
-    // `T(b)` and `T`, the old spellings of the downcasts `b: T` and `_: T`.
-    func old_downcast_msg(self, anon pattern_id: int64, kind: TypeKind) -> str {
-        mut type_name = ""
-        mut binding = ""
-        match self.p.patterns[pattern_id] {
-            .TypePat(t, b) -> {
-                type_name = t
-                binding = b
-            }
-            .EnumPat(alias, t, bindings) -> {
-                if not kind is .KInterface(_idx) or len(bindings) > 1 or not self.is_import_alias(alias) {
-                    return ""
-                }
-                type_name = f"{alias}.{t}"
-                if len(bindings) == 1 {
-                    binding = bindings[0]
-                }
-            }
-            else return ""
-        }
-        return self.downcast_spelling_msg(type_name, :binding)
-    }
-
-    func downcast_spelling_msg(self, anon type_name: str, binding: str) -> str {
-        mut shown = "_"
-        if len(binding) > 0 and not parsing.is_hidden_binding(binding) {
-            shown = self.source_name(binding)
-        }
-        return f"error: a type pattern is written `{shown}: {type_name}`"
-    }
-
     func check_match_subject(self, anon subject_id: int64, pattern_ids: [int64]) -> none {
         mut needs_optional: bool = false
         mut needs_result: bool = false
         let raw_kind = self.infer_kind(subject_id)
         for pid in pattern_ids {
-            let old_msg = self.old_downcast_msg(pid, kind: raw_kind)
-            if len(old_msg) > 0 {
-                self.report_error(old_msg, span: self.p.expr_spans[subject_id])
-                continue
-            }
             self.check_pattern_names(pid, :subject_id)
             let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: self.infer_kind(subject_id))
             match pat {
@@ -2167,7 +2131,7 @@ type Codegen = struct {
                 if self.missing_case(spec, kinds: ctor.fields + rest) is Some(witness) {
                     mut shown = ctor.shown
                     // An optional's member needs no `Some`.
-                    if ctor.name == "Some" and witness[0].starts_with("_: ") {
+                    if ctor.name == "Some" and len(ctor.fields) == 1 and self.is_union_kind(ctor.fields[0]) {
                         shown = witness[0]
                     } else if arity > 0 {
                         shown = f"{shown}({", ".join(witness[0..arity])})"
@@ -2211,7 +2175,7 @@ type Codegen = struct {
                 mut ctors: [PatternCtor] = []
                 for variant in self.enums[idx].variants {
                     if self.enums[idx].is_union {
-                        ctors += [PatternCtor(name: variant.name, shown: f"_: {self.kind_display(variant.field_kinds[0])}", fields: no_fields)]
+                        ctors += [PatternCtor(name: variant.name, shown: self.kind_display(variant.field_kinds[0]), fields: no_fields)]
                     } else {
                         ctors += [PatternCtor(name: variant.name, shown: f".{variant.name}", fields: variant.field_kinds)]
                     }
@@ -2340,7 +2304,7 @@ type Codegen = struct {
                     }
                 }
                 if not covered and enum_info.is_union {
-                    self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover `_: {self.kind_display(variant.field_kinds[0])}`", span: self.p.expr_spans[subject_id])
+                    self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover `{self.kind_display(variant.field_kinds[0])}`", span: self.p.expr_spans[subject_id])
                 } else if not covered {
                     self.report_error(f"error: match on `{self.enum_display_name(enum_idx)}` doesn't cover variant `{variant.name}`", span: self.p.expr_spans[subject_id])
                 }
@@ -4447,7 +4411,7 @@ type Codegen = struct {
             return variant_idx
         }
         if variant_idx < 0 and self.enums[enum_idx].is_union {
-            self.report_error(f"error: `{self.enum_display_name(enum_idx)}` has no variant `{variant_name}`; bind the member that does, as in `v: T`, and match that", :span)
+            self.report_error(f"error: `{self.enum_display_name(enum_idx)}` has no variant `{variant_name}`; bind the member that does, as in `T(v)`, and match that", :span)
             return variant_idx
         }
         if variant_idx < 0 {
@@ -5301,7 +5265,7 @@ type Codegen = struct {
         return self.compile_enum_construct(args, :enum_idx, :variant_idx, :span)
     }
 
-    // What `name: T` tests: the variant of `T`, which has to be a member.
+    // What a type pattern `T(n)` tests: the variant of `T`, which has to be a member.
     func union_pattern_variant(self, anon name: str, enum_idx: int64) -> int64 {
         let kind = self.resolve_type(parsing.str_to_int(name[2..]))
         if self.kind_has_unknown(kind) {
@@ -5323,6 +5287,11 @@ type Codegen = struct {
     func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
         let span = self.p.expr_spans[subject_id]
         let type_id = parsing.str_to_int(name[2..])
+        let variant_msg = self.variant_not_type_msg(type_id, :kind)
+        if len(variant_msg) > 0 {
+            self.report_error(variant_msg, :span)
+            return false
+        }
         let errors_before = self.report_attempts
         self.check_type_expr(type_id)
         if self.report_attempts > errors_before {
@@ -5338,18 +5307,41 @@ type Codegen = struct {
             return false
         }
         if kind is .KInterface(_iface) {
-            if self.p.type_exprs[type_id] is .Named(_type_name) {
+            let target = self.union_pattern_kind(name)
+            if self.p.type_exprs[type_id] is .Named(_type_name) and (target is .KStruct(_s, _a) or self.kind_has_unknown(target)) {
                 return true
             }
-            self.report_error(f"error: `_: {member}` can't test a `{shown}`; a downcast is to a struct", :span)
+            self.report_error(f"error: `{member}` can't test a `{shown}`; a downcast is to a struct", :span)
             return false
         }
         if kind is .KOptional(_inner) {
             self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
             return false
         }
-        self.report_error(f"error: `_: {member}` tests a union, interface or optional, got `{shown}`", :span)
+        self.report_error(f"error: a type pattern tests a union, an interface or an optional, got `{shown}`", :span)
         return false
+    }
+
+    // `Circle` where the subject's enum has a variant `Circle` and no type has that name.
+    func variant_not_type_msg(self, anon type_id: int64, kind: TypeKind) -> str {
+        let .Named(name) = self.p.type_exprs[type_id] else { return "" }
+        if len(self.type_qual(type_id)) > 0 or self.type_name_known(name) {
+            return ""
+        }
+        mut enum_kind = kind
+        if kind is .KOptional(inner) {
+            enum_kind = inner
+        }
+        let .KEnum(idx) = enum_kind else { return "" }
+        if self.enums[idx].is_union {
+            return ""
+        }
+        for v in self.enums[idx].variants {
+            if v.name == name {
+                return f"error: `{name}` is a variant of `{self.enum_display_name(idx)}`, not a type; write `.{name}`"
+            }
+        }
+        return ""
     }
 
     // Instantiate a generic enum template with `type_args`, creating a new
@@ -6821,7 +6813,7 @@ type Codegen = struct {
 
     // A pattern that doesn't resolve reports it, so its bindings are KUnknown.
     func pattern_binding_kinds(self, anon subject_pat: ast.Pattern, subject_kind: TypeKind) -> [TypeKind] {
-        // `n: T` says what it binds, whatever the subject turns out to be.
+        // `T(n)` says what it binds, whatever the subject turns out to be.
         if subject_pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
             mut written: [TypeKind] = []
             if len(b) > 0 {
@@ -7006,11 +6998,6 @@ type Codegen = struct {
     // names. Errors point at the match's subject, the only span a pattern has.
     func emit_pattern_test(self, anon pattern_id: int64, subject_kind: TypeKind, subj_slot: int64, subject_id: int64, skip_lbl: str) -> none {
         let raw = self.p.patterns[pattern_id]
-        let old_msg = self.old_downcast_msg(pattern_id, kind: subject_kind)
-        if len(old_msg) > 0 {
-            self.report_error(old_msg, span: self.p.expr_spans[subject_id])
-            return
-        }
         let pattern = self.subject_pattern(raw, :subject_kind)
         if not self.check_nested_pattern(pattern, kind: subject_kind, :subject_id) {
             return
@@ -8407,16 +8394,6 @@ type Codegen = struct {
         return ""
     }
 
-    // `T`, `T(b)`, `alias.T` or `alias.T(b)`, the old spellings of a downcast: the struct it
-    // names, as `T` or `alias.T` (see type_pat_struct).
-    func downcast_name(self, anon expr_id: int64) -> str {
-        let parts = self.qualified_parts(expr_id)
-        if len(parts) == 2 and self.is_import_alias(parts[0]) {
-            return f"{parts[0]}.{parts[1]}"
-        }
-        return self.is_pattern_name(expr_id)
-    }
-
     // Why an `is` right-hand side `m.T`, `m.T(b)`, `m.E.V` or `m.E.V(b)` names
     // no type: `m` imports no such type, or isn't an import and names no type
     // the module sees. "" when it names one.
@@ -8494,7 +8471,7 @@ type Codegen = struct {
         return self.is_pattern_name(expr_id)
     }
 
-    func compile_is(self, lhs: int64, rhs: int64, negate: bool) -> Val {
+    func compile_is(self, lhs: int64, rhs rhs_written: int64, negate: bool) -> Val {
         // Each branch below picks one of two ARM64 condition codes per
         // emit site: `cond_match` (the original "match" condition) and
         // `cond_no_match`. Negation just swaps the pair, since `is not`
@@ -8511,28 +8488,30 @@ type Codegen = struct {
             self.report_cannot_infer(lhs, what: "this expression")
             return .VImm(value: 0)
         }
-        let binding = self.is_rhs_binding(rhs)
+        let binding = self.is_rhs_binding(rhs_written)
         if len(binding) > 0 {
             self.compile_discard(lhs)
-            self.report_error(f"error: `is` can't bind `{binding}` here; a pattern binds names only in an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs])
+            self.report_error(f"error: `is` can't bind `{binding}` here; a pattern binds names only in an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs_written])
             return .VImm(value: 0)
         }
-        if self.is_rhs_nests(rhs) {
+        if self.is_rhs_nests(rhs_written) {
             self.compile_discard(lhs)
-            self.report_error("error: a nested pattern works in a `match`, a let-else, or an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs])
+            self.report_error("error: a nested pattern works in a `match`, a let-else, or an `if` or `for` condition, alone or joined to the rest by `and`", span: self.p.expr_spans[rhs_written])
             return .VImm(value: 0)
         }
+        let rhs = self.is_rhs_type_pattern(rhs_written)
         if not self.is_union_kind(lhs_kind) and self.p.exprs[rhs] is .Call(type_callee, _type_args) and self.p.exprs[type_callee] is .ImplicitVariant(type_name) and type_name.starts_with("$t") {
             return self.compile_is_type(lhs, :type_name, :negate)
         }
-        // A downcast is `e is b: T`, which compile_is_type took above.
+        // A downcast is `e is T`, which compile_is_type took above.
         if lhs_kind is .KInterface(_iface_idx) {
             self.compile_discard(lhs)
-            mut msg = "error: `is` on an interface takes a type pattern such as `_: T`"
-            if len(self.downcast_name(rhs)) > 0 {
-                msg = self.downcast_spelling_msg(self.downcast_name(rhs), binding: "")
+            let qual_msg = self.is_rhs_qual_error(rhs)
+            if len(qual_msg) > 0 {
+                self.report_error(qual_msg, span: self.p.expr_spans[lhs])
+            } else {
+                self.report_error("error: `is` on an interface takes a struct's type, as in `x is T`", span: self.p.expr_spans[rhs])
             }
-            self.report_error(msg, span: self.p.expr_spans[rhs])
             return .VImm(value: 0)
         }
         // `T or Error` result: test the discriminant against Ok's disc.
@@ -8560,7 +8539,9 @@ type Codegen = struct {
                 self.compile_discard(lhs)
                 let qual_msg = self.is_rhs_qual_error(rhs)
                 let name = self.is_pattern_name(rhs)
-                if len(qual_msg) > 0 {
+                if name.starts_with("$t") {
+                    self.check_union_pattern(name, kind: lhs_kind, subject_id: rhs)
+                } else if len(qual_msg) > 0 {
                     self.report_error(qual_msg, span: self.p.expr_spans[rhs])
                 } else if len(name) > 0 {
                     self.check_variant(name, :enum_idx, span: self.p.expr_spans[rhs])
@@ -8589,7 +8570,7 @@ type Codegen = struct {
             tests_none = true
         }
         if is_optional and not tests_none and opt_name != "Some" {
-            self.report_error("error: `is` on an optional takes `none` or `Some`", span: self.p.expr_spans[rhs])
+            self.report_error("error: `is` on an optional takes `none`, `Some` or a type such as `T`", span: self.p.expr_spans[rhs])
         }
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
@@ -8602,15 +8583,53 @@ type Codegen = struct {
         return .VReg(name: reg)
     }
 
+    // A payload name that names a type is a nested type pattern.
     func is_rhs_nests(self, anon rhs: int64) -> bool {
-        if self.p.exprs[rhs] is .Call(_callee, args) {
+        if self.p.exprs[rhs] is .Call(callee, args) {
             for arg in args {
-                if not (self.p.exprs[arg.value] is .Ident(_name)) {
+                if self.p.exprs[arg.value] is .Ident(name) {
+                    if self.type_name_known(name) and not (self.p.exprs[callee] is .Ident(_c)) and len(self.qualified_parts(rhs)) == 0 {
+                        return true
+                    }
+                } else {
                     return true
                 }
             }
         }
         return false
+    }
+
+    // `x is T`, `x is T(b)`, `x is m.T` or `x is m.T(b)` as the type pattern a match takes, or `rhs`.
+    func is_rhs_type_pattern(self, anon rhs: int64) -> int64 {
+        mut callee = rhs
+        mut args: [ast.CallArg] = []
+        if self.p.exprs[rhs] is .Call(call_callee, call_args) {
+            callee = call_callee
+            args = call_args
+        }
+        let span = self.p.expr_spans[callee]
+        mut type_id = -1
+        match self.p.exprs[callee] {
+            .Ident(name) -> {
+                if name == "Some" or name == "Ok" or name == "Err" or name == "None" {
+                    return rhs
+                }
+                type_id = self.p.alloc_type(.Named(:name), :span)
+            }
+            .Binary(_lhs, _op, name_id) -> {
+                let parts = self.qualified_parts(callee)
+                if len(parts) != 2 or not self.is_import_alias(parts[0]) {
+                    return rhs
+                }
+                type_id = self.p.alloc_type(.Named(name: parts[1]), span: self.p.expr_spans[name_id], qual: parts[0])
+            }
+            else return rhs
+        }
+        if len(args) == 0 {
+            args = [ast.CallArg(label: "", label_span: span, value: self.p.alloc_expr(.Ident(name: "_"), :span))]
+        }
+        let type_callee = self.p.alloc_expr(.ImplicitVariant(name: f"$t{type_id}"), :span)
+        return self.p.alloc_expr(.Call(callee: type_callee, :args), span: self.p.expr_spans[rhs])
     }
 
     // `_` and `_name` bind nothing.
@@ -8632,7 +8651,7 @@ type Codegen = struct {
     func is_rhs_binding(self, anon rhs: int64) -> str {
         if self.p.exprs[rhs] is .Call(_callee, args) {
             for arg in args {
-                if self.p.exprs[arg.value] is .Ident(name) and name[0] != '_' {
+                if self.p.exprs[arg.value] is .Ident(name) and name[0] != '_' and not self.type_name_known(name) {
                     return name
                 }
             }
@@ -10398,6 +10417,108 @@ type Codegen = struct {
             }
             i += 1
         }
+        for j, name in self.p.payload_names {
+            if arrays.contains(aliases, name) {
+                self.report_error(f"error: `{name}` is the name of an import; give the local another name", span: ast.Span(start: self.p.payload_starts[j]))
+            }
+        }
+    }
+
+    // Before any body compiles, in every module: a payload name that names a type is
+    // that type's pattern, as `m.T` or `m.T(b)` is for an import `m`, and no local
+    // takes a type's name.
+    func resolve_type_patterns(self) -> none {
+        let saved_p = self.p
+        self.resolve_module_type_patterns()
+        for scope in self.scopes {
+            if scope.path != saved_p.path {
+                self.p = scope.p
+                self.resolve_module_type_patterns()
+            }
+        }
+        self.p = saved_p
+    }
+
+    func resolve_module_type_patterns(self) -> none {
+        for i, pid in self.p.maybe_type_pats {
+            let slot = self.p.maybe_type_slots[i]
+            let type_id = self.p.maybe_type_ids[i]
+            if slot < 0 {
+                self.resolve_qualified_type_pattern(pid, :type_id)
+            } else {
+                self.resolve_payload_type_pattern(pid, :slot, :type_id)
+            }
+        }
+        if self.p.path == self.builtins_path {
+            return
+        }
+        for i, name in self.p.binding_names {
+            if self.type_name_known(name) {
+                self.report_error(f"error: `{name}` is the name of a type; give the local another name", span: ast.Span(start: self.p.binding_starts[i]))
+            }
+        }
+    }
+
+    // `m.T` or `m.T(b)`, read as `Enum.Variant`, where `m` is an import.
+    func resolve_qualified_type_pattern(self, anon pid: int64, type_id: int64) -> none {
+        let .EnumPat(alias, _type_name, bindings) = self.p.patterns[pid] else { return }
+        if len(bindings) > 1 or not self.is_import_alias(alias) {
+            return
+        }
+        mut binding = "_"
+        if len(bindings) == 1 {
+            binding = bindings[0]
+        }
+        let type_bindings: [str] = [binding]
+        self.p.patterns[pid] = .ImplicitEnumPat(variant_name: f"$t{type_id}", bindings: type_bindings)
+    }
+
+    // The name in payload position `slot` of pattern `pid`, if it names a type, as a
+    // hidden binding tested by that type's pattern. The name comes from `type_id`,
+    // since the block-scope pass may have renamed the binding.
+    func resolve_payload_type_pattern(self, anon pid: int64, slot: int64, type_id: int64) -> none {
+        let .Named(name) = self.p.type_exprs[type_id] else { return }
+        if not self.type_name_known(name) {
+            return
+        }
+        let pat = self.p.patterns[pid]
+        let bindings = self.pattern_binding_names(pat)
+        if slot >= len(bindings) or parsing.is_hidden_binding(bindings[slot]) {
+            return
+        }
+        let anon_binding: [str] = ["_"]
+        let q = self.p.alloc_pattern(.ImplicitEnumPat(variant_name: f"$t{type_id}", bindings: anon_binding))
+        let hidden = parsing.hidden_binding(q)
+        mut new_bindings: [str] = []
+        for i, b in bindings {
+            if i == slot {
+                new_bindings += [hidden]
+            } else {
+                new_bindings += [b]
+            }
+        }
+        match pat {
+            .EnumPat(enum_name, variant_name, _b) -> self.p.patterns[pid] = .EnumPat(:enum_name, :variant_name, bindings: new_bindings)
+            .ImplicitEnumPat(variant_name, _b) -> self.p.patterns[pid] = .ImplicitEnumPat(:variant_name, bindings: new_bindings)
+            .SomePat(_b) -> self.p.patterns[pid] = .SomePat(binding: hidden)
+            .OkPat(_b) -> self.p.patterns[pid] = .OkPat(binding: hidden)
+            .ErrPat(_b) -> self.p.patterns[pid] = .ErrPat(binding: hidden)
+            else return
+        }
+        // Subs in payload order, which is the order their tests run in.
+        let old_subs = self.p.pattern_subs[pid]
+        mut subs: [ast.SubPattern] = []
+        for b in new_bindings {
+            if b == hidden {
+                subs += [ast.SubPattern(binding: hidden, pattern: q)]
+            }
+            for sub in old_subs {
+                if sub.binding == b {
+                    subs += [sub]
+                }
+            }
+        }
+        self.p.pattern_subs[pid] = subs
     }
 
     func check_duplicate_decls(self, anon module: ast.Module) -> none {
@@ -14878,7 +14999,7 @@ type Codegen = struct {
             if pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
                 return self.struct_type_pattern(pat, name: v, bindings: b)
             }
-            return self.downcast_pattern(pat)
+            return pat
         }
         if subject_kind is .KEnum(union_idx) and self.enums[union_idx].is_union and pat is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
             let variant_idx = self.union_pattern_variant(v, enum_idx: union_idx)
@@ -14910,7 +15031,7 @@ type Codegen = struct {
         return pat
     }
 
-    // On an interface, `b: T` is the downcast to a struct `T`.
+    // On an interface, `T(b)` is the downcast to a struct `T`.
     func struct_type_pattern(self, anon pat: ast.Pattern, name: str, bindings: [str]) -> ast.Pattern {
         let type_id = parsing.str_to_int(name[2..])
         let .Named(type_name) = self.p.type_exprs[type_id] else { return pat }
@@ -14925,24 +15046,16 @@ type Codegen = struct {
         return .TypePat(:type_name, :binding)
     }
 
-    // On an interface, `alias.T(b)` is the old spelling of `b: alias.T`, already reported.
-    func downcast_pattern(self, anon pat: ast.Pattern) -> ast.Pattern {
-        let .EnumPat(alias, type_name, bindings) = pat else { return pat }
-        if len(bindings) > 1 or not self.is_import_alias(alias) {
-            return pat
-        }
-        mut binding = ""
-        if len(bindings) == 1 {
-            binding = bindings[0]
-        }
-        // A built pattern has no id, so the module rides in the name (see type_pat_struct).
-        return .TypePat(type_name: f"{alias}.{type_name}", :binding)
-    }
-
     // Refutable `let .Pat(...) = expr else { ... }`. On a successful pattern
     // match, the bindings receive the variant's payload fields and execution
     // falls through; on mismatch, the else-block runs (and must diverge).
     func compile_let_else(self, anon else_body: [int64], pattern_id: int64, value_id: int64) -> none {
+        let flat = self.flatten_optional_arms([pattern_id], subject_id: value_id)
+        self.compile_let_else_now(else_body, :pattern_id, :value_id)
+        self.restore_flat_arms(flat)
+    }
+
+    func compile_let_else_now(self, anon else_body: [int64], pattern_id: int64, value_id: int64) -> none {
         if self.walk_completes(else_body) {
             self.report_error("error: the else block of a let-else must leave the scope (return, throw, break, continue or panic)", span: self.p.expr_spans[value_id])
         }
@@ -15059,6 +15172,27 @@ type Codegen = struct {
                 self.emit(f"bne {else_lbl}")
                 self.pool.free_reg(disc_r)
             }
+            .OkPat(binding) -> {
+                let disc_r = self.pool.alloc_reg()
+                self.emit_ldr(subj_slot, reg: disc_r)
+                self.emit(f"ldr {disc_r}, [{disc_r}]")
+                self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
+                self.emit(f"bne {else_lbl}")
+                self.pool.free_reg(disc_r)
+                self.bind_result_payload(binding, :subj_slot)
+            }
+            .ErrPat(binding) -> {
+                let disc_r = self.pool.alloc_reg()
+                self.emit_ldr(subj_slot, reg: disc_r)
+                self.emit(f"ldr {disc_r}, [{disc_r}]")
+                self.emit(f"cmp {disc_r}, #{self.result_ok_disc()}")
+                self.emit(f"beq {else_lbl}")
+                self.pool.free_reg(disc_r)
+                self.bind_result_payload(binding, :subj_slot)
+            }
+            .TypePat(type_name, binding) -> {
+                self.emit_typepat_test(:type_name, :binding, subject_kind: value_kind, span: self.p.expr_spans[value_id], :subj_slot, skip_lbl: else_lbl)
+            }
             else {
                 self.report_error("error: pattern not supported in let-else", span: self.p.expr_spans[value_id])
                 return
@@ -15074,7 +15208,7 @@ type Codegen = struct {
         self.emit_label(done_lbl)
     }
 
-    // On an optional, `n: T` is `Some(n: T)`, or `Some(n)` when `T` is what the
+    // On an optional, `T(n)` is `Some(T(n))`, or `Some(n)` when `T` is what the
     // optional holds. Only while this match compiles: another instance of a
     // generic function can give the same pattern a different subject.
     func flatten_optional_arms(self, anon pattern_ids: [int64], subject_id: int64) -> [FlatArm] {
@@ -15086,7 +15220,7 @@ type Codegen = struct {
         return saved
     }
 
-    // `n: T` on an optional, here or in a payload at any depth, as its `Some(...)`.
+    // `T(n)` on an optional, here or in a payload at any depth, as its `Some(...)`.
     func flatten_pattern(self, anon pid: int64, kind: TypeKind) -> [FlatArm] {
         mut saved: [FlatArm] = []
         let raw = self.p.patterns[pid]
@@ -15572,6 +15706,7 @@ type Codegen = struct {
         self.resolve_field_kinds(start: local_structs)
         self.resolve_variant_field_kinds(start: local_enums)
         self.resolve_method_sigs(struct_start: local_structs, iface_start: local_ifaces)
+        self.resolve_type_patterns()
         self.check_module_types(module)
 
         for decl in module.decls {

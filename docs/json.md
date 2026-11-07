@@ -40,7 +40,7 @@ type JsonError = struct {
 ```
 
 Its `to_str` reads `json: unexpected character at line 2, column 7`. Recover
-it with a downcast (`e is je: JsonError`, see
+it with a downcast (`e is JsonError(je)`, see
 [Types](types.md#recovering-the-concrete-error-type)).
 
 What the parser accepts is exactly JSON text: one value, with optional

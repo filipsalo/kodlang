@@ -9,8 +9,7 @@ These names live in `stdlib/builtins.kod` and are available in every Kod program
 A call without a module name, `f(args)`, goes to the first of these that
 exists:
 
-1. a struct named `f` that the module sees (`Pt(x: 1)` constructs even
-   where a local named `Pt` is in force);
+1. a struct named `f` that the module sees (`Pt(x: 1)` constructs);
 2. the innermost binding of `f` in force, when it holds a function value;
 3. a function the module declares or lists in an `import`;
 4. the builtin of that name.

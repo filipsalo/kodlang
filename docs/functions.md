@@ -345,8 +345,7 @@ a value of its function type too.
 
 A bare identifier in value position resolves to the function's address
 when no local of that name is in force there. A call `f(args)` goes to a
-struct named `f` first, so `Pt(x: 1)` constructs even where a local
-named `Pt` is in force. Otherwise it does an indirect `blr` when the
+struct named `f` first, so `Pt(x: 1)` constructs. Otherwise it does an indirect `blr` when the
 innermost binding of `f` in force holds a function value, and a direct
 `bl` of the module's, an imported or the builtin function named `f` when
 no binding of `f` is in force or it holds anything else. A function value

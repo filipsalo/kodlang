@@ -433,10 +433,17 @@ type Parser = struct {
 	// pattern binding) and where its name starts, for codegen's checks.
 	// Whether the arm's patterns just parsed have a guard after them.
 	arm_guarded: bool = false
-	// Above zero while an `is` right-hand side parses, where `name: T` in a payload is a type pattern.
-	in_is_rhs: int64 = 0
 	binding_names: [str] = []
 	binding_starts: [int64] = []
+	// A name in a payload position, which binds unless it names a type.
+	payload_names: [str] = []
+	payload_starts: [int64] = []
+	// Names that are type patterns if they name types, which codegen decides
+	// (resolve_type_patterns): a bare payload name, by its pattern and position,
+	// and `m.T` or `m.T(b)`, by its pattern and position -1, with the type each would be.
+	maybe_type_pats: [int64] = []
+	maybe_type_slots: [int64] = []
+	maybe_type_ids: [int64] = []
 
 	func peek(self) -> lexing.Token {
 		if self.pos >= len(self.tokens) {
@@ -490,6 +497,31 @@ type Parser = struct {
 			self.record_unexpected(expected: lexing.kind_name(kind), got: self.peek())
 		}
 		return self.advance()
+	}
+
+	// A bare name in a payload position, noted in payload_names, with the type it may name.
+	func payload_name(self) -> ast.SubPattern {
+		let span = self.here()
+		self.payload_starts += [span.start]
+		let name = self.expect_identifier()
+		self.payload_names += [name]
+		return ast.SubPattern(binding: name, pattern: -1, type_id: self.alloc_type(ast.TypeExpr.Named(:name), :span))
+	}
+
+	func note_maybe_type(self, anon pat: int64, slot: int64, type_id: int64) -> none {
+		self.maybe_type_pats += [pat]
+		self.maybe_type_slots += [slot]
+		self.maybe_type_ids += [type_id]
+	}
+
+	// A type pattern on `type_id`, binding `binding` (`_` when empty).
+	func type_pattern(self, anon type_id: int64, binding: str) -> int64 {
+		mut b = binding
+		if len(b) == 0 {
+			b = "_"
+		}
+		let bindings: [str] = [b]
+		return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: f"$t{type_id}", :bindings))
 	}
 
 	// expect_identifier for a name a local binds, noted in binding_names.
@@ -857,14 +889,14 @@ type Parser = struct {
 			.BoolLit(value) -> return self.alloc_pattern(ast.Pattern.BoolPat(:value))
 			.NoneLit -> return self.alloc_pattern(ast.Pattern.NonePat)
 			.ImplicitVariant(name) -> return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, bindings: none_bindings))
-			.Ident(name) -> return self.named_pattern(name, binding: "")
+			.Ident(name) -> return self.named_pattern(name, binding: "", span: self.expr_spans[expr_id])
 			.Binary(lhs, op, rhs) -> {
 				// `-1` parsed as `0 - 1`; the `0` sits on the `-`, so a written `0 - 1` isn't one.
 				if op is .Sub and self.exprs[lhs] is .IntLit(zero) and zero == 0 and self.source[self.expr_spans[lhs].start] == '-' {
 					let .IntLit(value) = self.exprs[rhs] else { return -1 }
 					return self.alloc_pattern(ast.Pattern.IntPat(value: 0 - value))
 				}
-				return self.variant_pattern(expr_id, bindings: none_bindings)
+				return self.note_qualified(self.variant_pattern(expr_id, bindings: none_bindings), callee: expr_id)
 			}
 			.Call(callee, args) -> {
 				mut bindings: [str] = []
@@ -885,11 +917,17 @@ type Parser = struct {
 						subs += [ast.SubPattern(binding: hidden, pattern: sub)]
 					}
 				}
-				// The binding names of an `is` pattern, which parses as a call first.
-				for arg in args {
+				// The binding names of an `is` pattern, which parses as a call first,
+				// and the types they would name.
+				mut slots: [int64] = []
+				mut slot_types: [int64] = []
+				for i, arg in args {
 					if self.exprs[arg.value] is .Ident(binding) {
-						self.binding_starts += [self.expr_spans[arg.value].start]
-						self.binding_names += [binding]
+						let span = self.expr_spans[arg.value]
+						self.payload_starts += [span.start]
+						self.payload_names += [binding]
+						slots += [i]
+						slot_types += [self.alloc_type(ast.TypeExpr.Named(name: binding), :span)]
 					}
 				}
 				mut pat: int64 = -1
@@ -902,13 +940,22 @@ type Parser = struct {
 						if len(bindings) == 1 {
 							binding = bindings[0]
 						}
-						pat = self.named_pattern(name, :binding)
+						pat = self.named_pattern(name, :binding, span: self.expr_spans[callee])
 					}
 					.ImplicitVariant(name) -> pat = self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: name, :bindings))
-					else pat = self.variant_pattern(callee, :bindings)
+					else {
+						if len(bindings) <= 1 {
+							pat = self.note_qualified(self.variant_pattern(callee, :bindings), :callee)
+						} else {
+							pat = self.variant_pattern(callee, :bindings)
+						}
+					}
 				}
 				if pat >= 0 {
 					self.pattern_subs[pat] = subs
+					for i, slot in slots {
+						self.note_maybe_type(pat, :slot, type_id: slot_types[i])
+					}
 				}
 				return pat
 			}
@@ -1047,7 +1094,18 @@ type Parser = struct {
 		return self.alloc_stmt(ast.Stmt.If(cond: op, then_body: inner, else_body: otherwise))
 	}
 
-	func named_pattern(self, anon name: str, binding: str) -> int64 {
+	// `m.T` of a pattern `pat` that reads as `Enum.Variant`, noted as the type it may be.
+	func note_qualified(self, anon pat: int64, callee: int64) -> int64 {
+		if pat < 0 {
+			return pat
+		}
+		if self.exprs[callee] is .Binary(lhs, _op, rhs) and self.exprs[lhs] is .Ident(qual) and self.exprs[rhs] is .Ident(name) {
+			self.note_maybe_type(pat, slot: -1, type_id: self.alloc_type(ast.TypeExpr.Named(:name), span: self.expr_spans[rhs], :qual))
+		}
+		return pat
+	}
+
+	func named_pattern(self, anon name: str, binding: str, span: ast.Span) -> int64 {
 		if name == "Some" {
 			return self.alloc_pattern(ast.Pattern.SomePat(:binding))
 		}
@@ -1057,7 +1115,7 @@ type Parser = struct {
 		if name == "Err" {
 			return self.alloc_pattern(ast.Pattern.ErrPat(:binding))
 		}
-		return self.alloc_pattern(ast.Pattern.TypePat(type_name: name, :binding))
+		return self.type_pattern(self.alloc_type(ast.TypeExpr.Named(:name), :span), :binding)
 	}
 
 	func variant_pattern(self, anon expr_id: int64, bindings: [str]) -> int64 {
@@ -1097,39 +1155,7 @@ type Parser = struct {
 		return self.with_all_subs(self.alloc_pattern(ast.Pattern.ImplicitEnumPat(:variant_name, :bindings)), :items)
 	}
 
-	// `name: T` on a union. A built pattern has no id, so the type rides in the
-	// variant name, which find_variant_idx reads back.
-	func union_pattern_name(self) -> str {
-		return f"$t{self.parse_type_expr_core()}"
-	}
-
-	func at_union_pattern(self) -> bool {
-		return self.at(.Identifier) and self.peek_kind_at(1) == .Colon
-	}
-
-	func parse_union_pattern(self) -> int64 {
-		let binding: str = self.binding_identifier()
-		self.expect(.Colon)
-		let bindings: [str] = [binding]
-		return self.alloc_pattern(ast.Pattern.ImplicitEnumPat(variant_name: self.union_pattern_name(), :bindings))
-	}
-
-	// `x is s: str` reads as `x is .<member>(s)`, as any other pattern after `is` does.
-	func parse_union_is_rhs(self) -> int64 {
-		let span: ast.Span = self.here()
-		let name_tok: lexing.Token = self.peek()
-		let binding: str = self.binding_identifier()
-		let binding_id: int64 = self.alloc_expr(ast.Expr.Ident(name: binding), span: ast.Span(start: name_tok.start))
-		self.expect(.Colon)
-		let callee: int64 = self.alloc_expr(ast.Expr.ImplicitVariant(name: self.union_pattern_name()), :span)
-		let args: [ast.CallArg] = [ast.CallArg(label: "", label_span: span, value: binding_id)]
-		return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
-	}
-
 	func parse_pattern(self) -> int64 {
-		if self.at_union_pattern() {
-			return self.parse_union_pattern()
-		}
 		// Integer
 		if self.at(.IntegerLit) {
 			let tok: lexing.Token = self.advance()
@@ -1195,13 +1221,14 @@ type Parser = struct {
 		if self.try_consume(.Dot) {
 			return self.parse_implicit_variant()
 		}
-		// Interface downcast: `StructType` or `StructType(binding)`. A bare
-		// identifier NOT followed by `.` (which would make it `Enum.Variant`).
-		// codegen validates it names a struct and the subject is an interface.
+		// A type pattern: `T` or `T(binding)`, a bare identifier not followed by
+		// `.` (which would make it `Enum.Variant`). Codegen resolves the type.
 		if self.at(.Identifier) and self.peek_kind_at(1) != .Dot {
-			let type_name: str = self.expect_identifier()
+			let span = self.here()
+			let name: str = self.expect_identifier()
+			let type_id = self.alloc_type(ast.TypeExpr.Named(:name), :span)
 			let item = self.parse_one_payload()
-			return self.with_subs(self.alloc_pattern(ast.Pattern.TypePat(:type_name, binding: item.binding)), :item)
+			return self.with_subs(self.type_pattern(type_id, binding: item.binding), :item)
 		}
 		// Explicit enum variant: Enum.Variant or Enum.Variant(bindings...).
 		// Also accept three-part 'module.Enum.Variant', whose enum is named
@@ -1209,22 +1236,31 @@ type Parser = struct {
 		// can carry the module.
 		let first: str = self.expect_identifier()
 		self.expect(.Dot)
+		let second_span = self.here()
 		let second: str = self.expect_identifier()
 		mut enum_name: str = first
 		mut variant_name: str = second
+		mut qualified_type = true
 		if self.try_consume(.Dot) {
 			enum_name = f"{first}.{second}"
 			variant_name = self.expect_identifier()
+			qualified_type = false
 		}
 		let items = self.parse_payload()
 		let bindings = payload_bindings(items)
-		return self.with_all_subs(self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings)), :items)
+		let pat = self.with_all_subs(self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings)), :items)
+		// `m.T(b)` reads as `Enum.Variant(b)` until codegen knows `m` is an import.
+		if qualified_type and len(items) <= 1 {
+			self.note_maybe_type(pat, slot: -1, type_id: self.alloc_type(ast.TypeExpr.Named(name: second), span: second_span, qual: first))
+		}
+		return pat
 	}
 
 	// A payload position: a name, which binds, or a pattern (pattern >= 0) under a hidden name.
+	// A name that names a type is a type pattern, which codegen decides (resolve_type_patterns).
 	func parse_payload_item(self) -> ast.SubPattern {
-		if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot and self.peek_kind_at(1) != .Colon {
-			return ast.SubPattern(binding: self.binding_identifier(), pattern: -1)
+		if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot {
+			return self.payload_name()
 		}
 		let pattern = self.parse_pattern()
 		return ast.SubPattern(binding: hidden_binding(pattern), :pattern)
@@ -1261,9 +1297,11 @@ type Parser = struct {
 
 	func with_all_subs(self, anon pat: int64, items: [ast.SubPattern]) -> int64 {
 		mut subs: [ast.SubPattern] = []
-		for item in items {
+		for i, item in items {
 			if item.pattern >= 0 {
 				subs += [item]
+			} else if item.type_id > 0 {
+				self.note_maybe_type(pat, slot: i, type_id: item.type_id)
 			}
 		}
 		self.pattern_subs[pat] = subs
@@ -1693,8 +1731,6 @@ type Parser = struct {
 						mut name: str = self.expect_identifier()
 						let val: int64 = self.alloc_expr(ast.Expr.Ident(:name), span: label_span)
 						args += [ast.CallArg(label: name, :label_span, value: val)]
-					} else if self.in_is_rhs > 0 and self.at_union_pattern() {
-						args += [ast.CallArg(label: "", label_span: self.here(), value: self.parse_union_is_rhs())]
 					} else if self.at(.Identifier) and self.peek_kind_at(1) == .Colon {
 						// Labeled arg: identifier followed by colon.
 						let label_span: ast.Span = self.here()
@@ -1810,8 +1846,6 @@ type Parser = struct {
 								mut arg_name: str = self.expect_identifier()
 								let val: int64 = self.alloc_expr(ast.Expr.Ident(name: arg_name), span: label_span)
 								args += [ast.CallArg(label: arg_name, :label_span, value: val)]
-							} else if self.in_is_rhs > 0 and self.at_union_pattern() {
-								args += [ast.CallArg(label: "", label_span: self.here(), value: self.parse_union_is_rhs())]
 							} else if self.at(.Identifier) and self.peek_kind_at(1) == .Colon {
 								let label_span: ast.Span = self.here()
 								mut label: str = self.expect_identifier()
@@ -1944,16 +1978,7 @@ type Parser = struct {
 		for self.bin_op_prec() >= min_prec and self.bin_op_prec() > 0 {
 			let prec: int64 = self.bin_op_prec()
 			let op: ast.Op = self.consume_bin_op()
-			mut rhs: int64 = 0
-			if (op is .Is or op is .IsNot) and self.at_union_pattern() {
-				rhs = self.parse_union_is_rhs()
-			} else if op is .Is or op is .IsNot {
-				self.in_is_rhs = self.in_is_rhs + 1
-				rhs = self.parse_expr_prec(prec + 1)
-				self.in_is_rhs = self.in_is_rhs - 1
-			} else {
-				rhs = self.parse_expr_prec(prec + 1)
-			}
+			let rhs: int64 = self.parse_expr_prec(prec + 1)
 			// Python-style chained comparisons: `a < b < c` builds a
 			// single Chain instead of `((a < b) < c)`. Comparisons live
 			// at precedence 7; if the next token is also a comparison
@@ -2056,20 +2081,10 @@ type Parser = struct {
 
 		// let declaration (with optional refutable-pattern form)
 		if self.try_consume(.KwLet) {
-			// `let .Pat(...) = expr else { ... }` — refutable destructure.
-			if self.at(.Dot) {
+			// `let .Pat(...) = expr else { ... }` — refutable destructure, as is
+			// `let T(...) =`, `let Some(...) =` and `let E.V(...) =`.
+			if self.at(.Dot) or (self.at(.Identifier) and (self.peek_kind_at(1) == .OpenParen or self.peek_kind_at(1) == .Dot)) {
 				let pat: int64 = self.parse_pattern()
-				self.expect(.Equal)
-				let value: int64 = self.parse_expr()
-				self.expect(.KwElse)
-				mut else_body: [int64] = self.parse_block()
-				return self.alloc_stmt(ast.Stmt.LetElse(pattern: pat, :value, :else_body))
-			}
-			// `let Some(v) = ...`: what `is` would take, without the dot a `let` needs.
-			if self.at(.Identifier) and self.peek_kind_at(1) == .OpenParen {
-				let variant = self.peek()
-				self.record_error(f"error: a `let` pattern starts with a `.`: `let .{variant.value}(...) = ...`", got: variant)
-				let pat: int64 = self.parse_implicit_variant()
 				self.expect(.Equal)
 				let value: int64 = self.parse_expr()
 				self.expect(.KwElse)

@@ -151,65 +151,69 @@ match maybe_n {
 }
 ```
 
-### Union member
+### Type patterns
 
-`name: T` matches when the value holds a `T`, and binds it as a `T`. It works on a
-[union](types.md#union-types), an [interface](types.md#interfaces) and an
-optional. Use `_` when the value isn't needed:
+A [union](types.md#union-types) is an enum whose variants are named by their
+types. `T(name)` matches when the value holds a `T`, and binds it as a `T`; a
+bare `T` only tests. `none` is the member that holds nothing, so it takes no
+payload:
 
 ```kod
-let id: int64 | str = "abc"
+let id: int64 | str | none = "abc"
 
 match id {
-    n: int64 if n < 0 -> print("negative")
-    n: int64 -> print_int(n)
-    _: str -> print("text")
+    int64(n) if n < 0 -> print("negative")
+    int64(n) -> print_int(n)
+    str -> print("text")
+    none -> print("nothing")
 }
 
-if id is s: str {
+if id is str(s) {
     print(s)
 }
 ```
 
-On a union, `T` has to be a member. On an interface, `T` is a struct, and the
-pattern is a downcast, so a `match` still needs an `else`. A downcast has no
-other spelling: `Circle(c)` is an error that names `c: Circle`.
+On a union, `T` has to be a member. A member's type is written as it is
+declared, `pa.Pt(p)` for a type of another module; a member with no name of its
+own, such as `[str]`, needs a [type alias](types.md#type-aliases) to be matched
+by type.
+
+On an interface, `T` is a struct that implements it, and the pattern is a
+downcast, so a `match` still needs an `else`:
 
 ```kod
 func describe(anon s: Shape) -> str {
     match s {
-        c: Circle if c.r > 10 -> return "big circle"
-        c: Circle -> return f"circle {c.r}"
-        _: Square -> return "a square"
+        Circle(c) if c.r > 10 -> return "big circle"
+        Circle(c) -> return f"circle {c.r}"
+        Square -> return "a square"
         else -> return "something else"
     }
 }
 ```
 
-An optional takes these patterns directly, next to `none`, whether it holds the
-type itself, a union or an interface. `n: int64` on an `int64?` is `Some(n)`, and on
-an `int64 | str | none` it is `Some(n: int64)`, which is also valid:
+An optional takes these patterns directly, next to `Some` and `none`, whether it
+holds the type itself, a union or an interface. `int64(n)` on an `int64?` is
+`Some(n)`, and on an `int64 | str | none` it is `Some(int64(n))`, which is also
+valid:
 
 ```kod
 let maybe: int64 | str | none = "here"
 
 match maybe {
-    n: int64 -> print_int(n)
-    s: str -> print(s)
+    int64(n) -> print_int(n)
+    str(s) -> print(s)
     none -> print("nothing")
-}
-
-if maybe is s: str {
-    print(s)
 }
 ```
 
-The same holds inside another pattern: on a field of type `int64 | str | none`,
-`.Full(s: str)` and `.Full(none)` cover what it holds. An error for a missing arm spells
-it the same way, as `` doesn't cover `_: str` ``. A let-else can't start with this pattern, since
-`let s: str = id else { ... }` isn't one, so use `if` or `match`, or
-`let .Some(s: str) = maybe else { ... }` on an optional. To match a member's own
-variants, bind the enum and match that.
+The same holds inside another pattern. In a payload position a name that
+names a type is that type's pattern, not a binding: on a field of type
+`int64 | str | none`, `.Full(str)` tests and `.Full(str(s))` binds, next to
+`.Full(none)`. That's why a local can't take a type's name (see
+[Bindings and mutability](types.md#bindings-and-mutability)). An error for a missing arm spells it the same way, as
+`` doesn't cover `str` ``. A let-else takes it too:
+`let str(s) = id else { return }`.
 
 ### `is` test
 
@@ -251,8 +255,8 @@ match best {
 
 Patterns nest to any depth, and each kind above can appear inside another:
 literals, `none`, `Some(...)`, `Ok(...)`, `Err(...)`, enum variants, and a
-struct downcast such as `.Wrap(s: Sq)` or `.Wrap(_: Sq)`. In a payload position a bare
-name always binds. A nested literal needs a field of its own type.
+type pattern such as `.Wrap(Sq(s))` or `.Wrap(Sq)`. In a payload position a bare
+name binds, unless it names a type. A nested literal needs a field of its own type.
 
 Tests run left to right and from the outside in, and each nested pattern sees
 the field's type, so `.Pair(Some(0), "x")` needs an optional `int64` and a `str`.
@@ -468,11 +472,10 @@ let .Some(v) = m.get(key) else { return -1 }
 The bindings start after the else block, so inside it a name the
 pattern binds still has the binding it had before the let-else, if any.
 
-The pattern always starts with a `.`, and leaving it out is an error that
-says so (`` a `let` pattern starts with a `.`: `let .Some(v) = ...` ``). On a
-`T?` value (like
-`m.get(key)` above), `.Some(v)` binds the unwrapped payload and
-`.None` matches `none`.
+The pattern is a variant with its payload, as in `.Some(v)`, `Some(v)`,
+`Ok(v)` or `Shape.Circle(r)`, or a type pattern such as `str(s)` (see
+[Type patterns](#type-patterns)). On a `T?` value (like `m.get(key)` above),
+`.Some(v)` binds the unwrapped payload and `.None` matches `none`.
 On a `T or Error` value, `.Ok(v)` binds the value and `.Err(e)` the
 error. On an enum value, the variant is looked up in that value's
 enum, even when another enum declares a variant of the same name:
