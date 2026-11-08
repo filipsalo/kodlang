@@ -133,7 +133,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
 | `encoding/base64` | Base64, standard and URL-safe, strict decoding. See [Encodings](encoding.md). |
 | `hash/crc32` | CRC-32 (gzip polynomial), streaming or one-shot. |
-| `compress/deflate`, `compress/gzip` | Deflate encoder (fixed Huffman, optional LZ77) and a gzip writer. |
+| `compress/deflate`, `compress/inflate` | Compress to and decompress from gzip, zlib and raw deflate. See [Encodings](encoding.md#compression). |
 | `kod/ast` | AST node types (for the self-hosted compiler). |
 | `kod/lexing` | Tokenizer (self-hosted). |
 | `kod/parsing` | Parser (self-hosted). |

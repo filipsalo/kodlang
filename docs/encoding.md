@@ -43,11 +43,36 @@ and a mangled input is noticed:
 Errors are `IoError`s of kind `InvalidInput`, with `op` `base64 decode` and a
 `detail` that names the byte offset of the problem where there is one.
 
+## Compression
+
+`stdlib/compress/deflate.kod` compresses into the three formats that
+[`compress/inflate`](#decompression) reads, written in Kod like it.
+
+```kod
+import "compress/deflate"
+
+let packed = deflate.gzip(kod_str_to_bytes(text))
+let quick = deflate.gzip(data, level: 1)
+```
+
+| Function | Meaning |
+|---|---|
+| `gzip(data: bytes, level: int64 = 6) -> bytes` | a gzip file (RFC 1952) of one member, with no name and a zero time |
+| `zlib(data: bytes, level: int64 = 6) -> bytes` | a zlib stream (RFC 1950) |
+| `raw(data: bytes, level: int64 = 6) -> bytes` | a raw deflate stream (RFC 1951) |
+
+`level` trades speed for size as zlib's does: `0` only frames the data (stored
+blocks), `1` to `3` take the first good match, and `4` to `9` look further back and
+put off a match when the next byte starts a longer one; `9` is the smallest and
+slowest. A level outside `0..9` is taken as the nearest one. Each block is written
+whichever way is smallest: stored, with the standard codes, or with Huffman codes
+made for its own data, so data that doesn't compress grows by only about 5 bytes
+every 16 KB.
+
 ## Decompression
 
 `stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data. It is
-written in Kod, like compressing (`compress/gzip` and `compress/deflate`), so it
-links no C library.
+written in Kod, like [compressing](#compression), so it links no C library.
 
 ```kod
 import "compress/inflate"

@@ -1,0 +1,109 @@
+import "compress/deflate"
+import "compress/inflate"
+
+func numbered_lines() -> bytes {
+    mut out = ""
+    for i in 0..400 {
+        mut parity = "even"
+        if i % 2 == 1 {
+            parity = "odd"
+        }
+        out += f"line {i}: {i * i % 97} {parity}\n"
+    }
+    return kod_str_to_bytes(out)
+}
+
+// 20000 words drawn by a linear congruential generator.
+func words() -> bytes {
+    let pool = ["alpha", "beta", "gamma", "delta", "kod", "match", "struct", "enum", "func", "return"]
+    mut x: int64 = 1
+    mut picked: [str] = []
+    for _ in 0..20000 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        picked += [pool[(x >> 16) % 10]]
+    }
+    return kod_str_to_bytes(" ".join(picked))
+}
+
+// Bytes that don't compress: an xorshift generator's low bytes.
+func noise(anon n: int64) -> bytes {
+    mut x: int64 = 88172645463325252
+    mut values: [int64] = []
+    for _ in 0..n {
+        x = x ^ (x << 13)
+        x = x ^ ((x >> 7) & 0x1ffffffffffffff)
+        x = x ^ (x << 17)
+        values += [x & 255]
+    }
+    return kod_bytes_from_array(values)
+}
+
+func inputs() -> [bytes] {
+    let two_windows = kod_str_to_bytes("0123456789abcdef".repeat(4500))
+    return [
+        kod_str_to_bytes(""),
+        kod_str_to_bytes("a"),
+        kod_str_to_bytes("abcabcabcabc"),
+        numbered_lines(),
+        words(),
+        noise(70000),
+        kod_str_to_bytes("x".repeat(100000)),
+        two_windows + noise(3000) + two_windows,
+    ]
+}
+
+test "every level and format reads back as the input" {
+    for input in inputs() {
+        for level in 0..10 {
+            assert (must inflate.gunzip(deflate.gzip(input, :level))) == input
+            assert (must inflate.inflate_zlib(deflate.zlib(input, :level))) == input
+            assert (must inflate.inflate_raw(deflate.raw(input, :level))) == input
+        }
+    }
+}
+
+test "the default level is 6, and levels outside 0..9 are the nearest one" {
+    let input = numbered_lines()
+    assert deflate.zlib(input) == deflate.zlib(input, level: 6)
+    assert deflate.zlib(input, level: -4) == deflate.zlib(input, level: 0)
+    assert deflate.zlib(input, level: 42) == deflate.zlib(input, level: 9)
+}
+
+// zlib's sizes for the same inputs: lines 1800 / 1596 / 1597 and words
+// 20853 / 14844 / 14034 at levels 1 / 6 / 9.
+test "sizes are close to zlib's" {
+    let lines = numbered_lines()
+    assert len(deflate.zlib(lines, level: 1)) <= 1800 * 110 / 100
+    assert len(deflate.zlib(lines, level: 6)) <= 1596 * 105 / 100
+    assert len(deflate.zlib(lines, level: 9)) <= 1597 * 105 / 100
+    let text = words()
+    assert len(deflate.zlib(text, level: 1)) <= 20853 * 110 / 100
+    assert len(deflate.zlib(text, level: 6)) <= 14844 * 105 / 100
+    assert len(deflate.zlib(text, level: 9)) <= 14034 * 105 / 100
+}
+
+test "data that doesn't compress grows by a few bytes" {
+    let input = noise(200000)
+    // A stored block, five bytes of header, for each block of 16384 symbols.
+    assert len(deflate.raw(input)) <= len(input) + 5 * (len(input) / 16384 + 1)
+    // Level 0 stores blocks of 65535 bytes.
+    assert len(deflate.raw(input, level: 0)) <= len(input) + 5 * 4
+}
+
+test "level 0 stores, and a higher level packs smaller" {
+    let input = words()
+    let stored = len(deflate.raw(input, level: 0))
+    assert stored >= len(input)
+    assert len(deflate.raw(input, level: 1)) < stored / 4
+    assert len(deflate.raw(input, level: 9)) <= len(deflate.raw(input, level: 1))
+}
+
+test "headers" {
+    let packed = deflate.gzip(kod_str_to_bytes("hi"))
+    assert packed[0..10] == kod_bytes_from_array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3])
+    for level in 0..10 {
+        let z = deflate.zlib(kod_str_to_bytes("hi"), :level)
+        assert z[0] == 0x78
+        assert (z[0] * 256 + z[1]) % 31 == 0
+    }
+}

@@ -57,8 +57,6 @@ codegen bugs that this kind of code is most likely to hit.
 
 ## Later
 
-- Compression worth the name: `gzip.compress` writes stored blocks, and the LZ77 path
-  uses fixed codes only. Blocks with their own Huffman codes and hash chains.
 - Unions as `Map` keys (they compare with `==`, but don't hash yet).
 - Reference cycles: a cycle collector, or weak references.
 - Module-level mutable state, which the test runner and other runtime pieces need

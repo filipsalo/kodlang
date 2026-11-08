@@ -89,7 +89,7 @@ def scratch() -> Iterator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
-@pytest.mark.parametrize("stem", ["gzip", "sort"])
+@pytest.mark.parametrize("stem", ["deflate", "sort"])
 def test_a_bench_program_named_like_a_stdlib_module_builds(stem: str):
     with app_dir(stem):
         built = kod_build(f"bench/{stem}.kod")

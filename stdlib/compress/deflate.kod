@@ -1,277 +1,761 @@
-// Deflate compression (RFC 1951). Currently only the fixed-Huffman
-// path (BTYPE=01) with literals only — no LZ77 back-references yet,
-// so the output is slightly larger than the input (~6% on average).
-// Real LZ77 matching is the next step.
-
-// Bit-level output buffer. Deflate packs data and Huffman codes into
-// a byte stream with two different orderings (RFC 1951 §3.1.1):
+// Deflate compression (RFC 1951), in the gzip (RFC 1952) and zlib (RFC 1950)
+// framings or raw. See docs/encoding.md.
 //
-//   - Non-Huffman data: least-significant bit of each element first.
-//   - Huffman codes:    most-significant bit of each code first.
-//
-// `write_bits` handles the LSB-first path. `write_huffman` reverses
-// the code's bit order and reuses the same accumulator.
-type BitWriter = struct {
-    bytes: [int64]
-    cur: int64
-    n_bits: int64
+// Matches are found through hash chains over the last 32 KB, as zlib does, with
+// zlib's levels; symbols are collected a block at a time, and each block is
+// written stored, with the fixed codes or with its own Huffman codes, whichever
+// is smallest.
 
-    // Append `n` low bits of `v` to the stream, LSB-first.
-    func write_bits(self, anon v: int64, anon n: int64) -> none {
-        let mask: int64 = (1 << n) - 1
-        let masked: int64 = v & mask
-        let shifted: int64 = masked << self.n_bits
-        self.cur = self.cur | shifted
-        self.n_bits = self.n_bits + n
-        for self.n_bits >= 8 {
-            self.bytes += [self.cur & 0xff]
-            self.cur = self.cur >> 8
-            self.n_bits = self.n_bits - 8
-        }
-    }
+import "strbuilder" { StrBuilder }
+import "hash/crc32"
+import "sort"
 
-    // Append an `n`-bit Huffman code, MSB-first within the code. We
-    // reverse the bits so the LSB-first stream emits them in the
-    // right order.
-    func write_huffman(self, anon code: int64, anon n: int64) -> none {
-        mut reversed: int64 = 0
-        mut i: int64 = 0
-        for i < n {
-            let bit: int64 = (code >> i) & 1
-            reversed = (reversed << 1) | bit
-            i = i + 1
-        }
-        self.write_bits(reversed, n)
-    }
+// How hard a level looks for matches; the numbers are zlib's.
+type Level = struct {
+    // Search a quarter as far once the match in hand is this long.
+    good: int64
+    // Lazy levels: don't look for a longer match at the next byte once one is this
+    // long. Greedy levels: don't index the positions inside a match longer than this.
+    lazy: int64
+    // Stop searching at a match this long.
+    nice: int64
+    // How many earlier positions with the same hash to try.
+    chain: int64
+    greedy: bool
+}
 
-    // Flush any partial byte by padding with zero bits.
-    func flush_byte(self) -> none {
-        if self.n_bits > 0 {
-            self.bytes += [self.cur & 0xff]
-            self.cur = 0
-            self.n_bits = 0
-        }
+func level_config(anon level: int64) -> Level {
+    match level {
+        1 -> return Level(good: 4, lazy: 4, nice: 8, chain: 4, greedy: true)
+        2 -> return Level(good: 4, lazy: 5, nice: 16, chain: 8, greedy: true)
+        3 -> return Level(good: 4, lazy: 6, nice: 32, chain: 32, greedy: true)
+        4 -> return Level(good: 4, lazy: 4, nice: 16, chain: 16, greedy: false)
+        5 -> return Level(good: 8, lazy: 16, nice: 32, chain: 32, greedy: false)
+        6 -> return Level(good: 8, lazy: 16, nice: 128, chain: 128, greedy: false)
+        7 -> return Level(good: 8, lazy: 32, nice: 128, chain: 256, greedy: false)
+        8 -> return Level(good: 32, lazy: 128, nice: 258, chain: 1024, greedy: false)
+        else -> return Level(good: 32, lazy: 258, nice: 258, chain: 4096, greedy: false)
     }
 }
 
-func make_bitwriter() -> BitWriter {
-    return BitWriter(bytes: [], cur: 0, n_bits: 0)
+func bit(anon b: bool) -> int64 {
+    if b {
+        return 1
+    }
+    return 0
 }
 
-// RFC 1951 §3.2.6: fixed Huffman code for literal/length value 0-287.
-// Returns the raw code; the bit length varies by range.
-func fixed_lit_code(anon n: int64) -> int64 {
-    if n <= 143 {
-        return 0x30 + n
+func clamp_level(anon level: int64) -> int64 {
+    if level < 0 {
+        return 0
     }
-    if n <= 255 {
-        return 0x190 + n - 144
-    }
-    if n <= 279 {
-        return n - 256
-    }
-    return 0xC0 + n - 280
-}
-
-func fixed_lit_bits(anon n: int64) -> int64 {
-    if n <= 143 {
-        return 8
-    }
-    if n <= 255 {
+    if level > 9 {
         return 9
     }
-    if n <= 279 {
+    return level
+}
+
+func zeros(anon n: int64) -> [int64] {
+    mut out: [int64] = []
+    for _ in 0..n {
+        out += [0]
+    }
+    return out
+}
+
+func filled(anon n: int64, anon value: int64) -> [int64] {
+    mut out: [int64] = []
+    for _ in 0..n {
+        out += [value]
+    }
+    return out
+}
+
+// RFC 1951 §3.2.5: the lengths and distances each code starts at, and how many
+// extra bits follow it.
+func len_bases() -> [int64] {
+    return [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+}
+
+func len_extras() -> [int64] {
+    return [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+}
+
+func dist_bases() -> [int64] {
+    return [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+}
+
+func dist_extras() -> [int64] {
+    return [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+}
+
+// The code (0-28, for symbols 257-285) of each match length 0-258.
+func length_codes() -> [int64] {
+    let bases = len_bases()
+    mut out = zeros(259)
+    for length in 3..259 {
+        mut c: int64 = 28
+        for bases[c] > length {
+            c -= 1
+        }
+        out[length] = c
+    }
+    return out
+}
+
+func dist_code_of(anon d: int64) -> int64 {
+    let bases = dist_bases()
+    mut c: int64 = 29
+    for c > 0 and bases[c] > d {
+        c -= 1
+    }
+    return c
+}
+
+// zlib's two-part table: the code of distance d is entry d - 1 up to 256, and
+// entry 256 + (d - 1) >> 7 beyond, since codes past 256 cover multiples of 128.
+func distance_codes() -> [int64] {
+    mut out: [int64] = []
+    for d in 1..257 {
+        out += [dist_code_of(d)]
+    }
+    for k in 0..256 {
+        out += [dist_code_of((k << 7) + 1)]
+    }
+    return out
+}
+
+// `code`'s low `n` bits in reverse order: deflate sends a Huffman code's bits
+// from the top, into a stream that fills each byte from the bottom.
+func reversed(anon code: int64, anon n: int64) -> int64 {
+    mut out: int64 = 0
+    for i in 0..n {
+        out = (out << 1) | ((code >> i) & 1)
+    }
+    return out
+}
+
+// Code lengths of at most `limit` bits for symbols with these frequencies. A
+// symbol that never appears gets none, except that there are always at least two
+// codes: decoders reject a code of one symbol (zlib does the same).
+func code_lengths(anon freqs: [int64], anon limit: int64) -> [int64] {
+    let n = len(freqs)
+    mut lengths = zeros(n)
+    mut keys: [int64] = []
+    for symbol, f in freqs {
+        if f > 0 {
+            keys += [f * 512 + symbol]
+        }
+    }
+    if len(keys) < 2 {
+        mut wanted: int64 = 2
+        for symbol, f in freqs {
+            if f > 0 {
+                lengths[symbol] = 1
+                wanted -= 1
+            }
+        }
+        for symbol in 0..n {
+            if wanted > 0 and lengths[symbol] == 0 {
+                lengths[symbol] = 1
+                wanted -= 1
+            }
+        }
+        return lengths
+    }
+    // Symbols from least to most frequent.
+    let order = sort.sorted(keys)
+    let m = len(order)
+    // A Huffman tree, built with two queues: the leaves in order, and the inner
+    // nodes, which are made in order of weight. Nodes 0..m are the leaves.
+    mut weight = zeros(2 * m - 1)
+    mut parent = zeros(2 * m - 1)
+    for k, key in order {
+        weight[k] = key / 512
+    }
+    mut leaf: int64 = 0
+    mut inner: int64 = m
+    for next in m..2 * m - 1 {
+        mut pair: [int64] = []
+        for _ in 0..2 {
+            if leaf < m and (inner >= next or weight[leaf] <= weight[inner]) {
+                pair += [leaf]
+                leaf += 1
+            } else {
+                pair += [inner]
+                inner += 1
+            }
+        }
+        weight[next] = weight[pair[0]] + weight[pair[1]]
+        parent[pair[0]] = next
+        parent[pair[1]] = next
+    }
+    // A parent comes after its children, so depths fill in from the root down.
+    mut depth = zeros(2 * m - 1)
+    mut k = 2 * m - 3
+    for k >= 0 {
+        depth[k] = depth[parent[k]] + 1
+        k -= 1
+    }
+    // How many codes of each length, with the ones past the limit cut to it and
+    // the rest moved down until the code is complete again (as miniz does).
+    mut count = zeros(limit + 1)
+    for leaf_k in 0..m {
+        mut d = depth[leaf_k]
+        if d > limit {
+            d = limit
+        }
+        count[d] += 1
+    }
+    mut total: int64 = 0
+    for l in 1..limit + 1 {
+        total += count[l] << (limit - l)
+    }
+    for total > (1 << limit) {
+        count[limit] -= 1
+        mut l = limit - 1
+        for l > 0 {
+            if count[l] > 0 {
+                count[l] -= 1
+                count[l + 1] += 2
+                l = 0
+            } else {
+                l -= 1
+            }
+        }
+        total -= 1
+    }
+    // The shortest codes go to the most frequent symbols.
+    mut at = m - 1
+    for l in 1..limit + 1 {
+        for _ in 0..count[l] {
+            lengths[order[at] % 512] = l
+            at -= 1
+        }
+    }
+    return lengths
+}
+
+// The canonical code for each symbol with these lengths, already reversed.
+func codes_of(anon lengths: [int64]) -> [int64] {
+    mut count = zeros(16)
+    for l in lengths {
+        count[l] += 1
+    }
+    count[0] = 0
+    mut next = zeros(16)
+    mut c: int64 = 0
+    for l in 1..16 {
+        c = (c + count[l - 1]) << 1
+        next[l] = c
+    }
+    mut out = zeros(len(lengths))
+    for symbol, l in lengths {
+        if l > 0 {
+            out[symbol] = reversed(next[l], l)
+            next[l] += 1
+        }
+    }
+    return out
+}
+
+func fixed_lit_lengths() -> [int64] {
+    mut out: [int64] = []
+    for i in 0..288 {
+        if i < 144 {
+            out += [8]
+        } else if i < 256 {
+            out += [9]
+        } else if i < 280 {
+            out += [7]
+        } else {
+            out += [8]
+        }
+    }
+    return out
+}
+
+// Code lengths sent in a dynamic block's header, in this order, so that the ones
+// most often unused come last and can be left off.
+func code_length_order() -> [int64] {
+    return [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+}
+
+// A run of code lengths as code-length symbols: each entry is a symbol 0-18, with
+// the value of its extra bits from bit 5 up. 16 repeats the previous length 3-6
+// times, 17 repeats zero 3-10 times and 18 repeats zero 11-138 times.
+func run_lengths(anon lengths: [int64]) -> [int64] {
+    mut out: [int64] = []
+    let n = len(lengths)
+    mut i: int64 = 0
+    for i < n {
+        let l = lengths[i]
+        mut run: int64 = 1
+        for i + run < n and lengths[i + run] == l {
+            run += 1
+        }
+        mut left = run
+        if l == 0 {
+            for left >= 11 {
+                mut take = left
+                if take > 138 {
+                    take = 138
+                }
+                out += [18 | ((take - 11) << 5)]
+                left -= take
+            }
+            if left >= 3 {
+                out += [17 | ((left - 3) << 5)]
+                left = 0
+            }
+        } else {
+            out += [l]
+            left -= 1
+            for left >= 3 {
+                mut take = left
+                if take > 6 {
+                    take = 6
+                }
+                out += [16 | ((take - 3) << 5)]
+                left -= take
+            }
+        }
+        for _ in 0..left {
+            out += [l]
+        }
+        i += run
+    }
+    return out
+}
+
+func code_length_extra_bits(anon symbol: int64) -> int64 {
+    if symbol == 16 {
+        return 2
+    }
+    if symbol == 17 {
+        return 3
+    }
+    if symbol == 18 {
         return 7
     }
-    return 8
+    return 0
 }
 
-// Encode `data` as a single fixed-Huffman block (BTYPE=01) — every
-// input byte goes through the literal/length Huffman code, then the
-// end-of-block marker (256). No LZ77 matching, so output is slightly
-// larger than input.
-func deflate_fixed(anon data: bytes) -> [int64] {
-    let bw: BitWriter = make_bitwriter()
-    // 3-bit block header: BFINAL=1 (low bit) then BTYPE=01 (next 2),
-    // both packed LSB-first.
-    bw.write_bits(1, 1)
-    bw.write_bits(1, 2)
-    mut i: int64 = 0
-    let n: int64 = len(data)
-    for i < n {
-        let byte: int64 = data[i]
-        bw.write_huffman(fixed_lit_code(byte), fixed_lit_bits(byte))
-        i = i + 1
-    }
-    // End-of-block marker (literal/length code 256, 7 bits).
-    bw.write_huffman(fixed_lit_code(256), fixed_lit_bits(256))
-    bw.flush_byte()
-    return bw.bytes
+// A block holds at most this many symbols before it is written out.
+func block_symbols() -> int64 {
+    return 16384
 }
 
-// ── LZ77 + fixed Huffman ──────────────────────────────────────────────
-//
-// RFC 1951 §3.2.5 length / distance encoding tables. The deflate
-// stream packs each match as a length code (literal/length code
-// 257-285) + extra bits + distance code (0-29) + extra bits. The
-// extra-bit count grows in steps of 2/4/8/… so each code covers an
-// increasingly-wide range of lengths/distances.
+type Encoder = struct {
+    data: bytes
+    level: int64
+    out: StrBuilder = StrBuilder()
+    // Bits not yet written out, the oldest lowest.
+    acc: int64 = 0
+    nbits: int64 = 0
+    // The block being collected: a symbol is a literal byte, or 256 + the length
+    // of a match whose distance is in `dists` (0 for a literal). `block_start` is
+    // where the block's input starts and `covered` where the symbols so far end.
+    syms: [int64] = []
+    dists: [int64] = []
+    block_start: int64 = 0
+    covered: int64 = 0
+    len_code: [int64] = length_codes()
+    dist_code: [int64] = distance_codes()
+    len_base: [int64] = len_bases()
+    len_extra: [int64] = len_extras()
+    dist_base: [int64] = dist_bases()
+    dist_extra: [int64] = dist_extras()
+    // Hash chains: `head` holds the latest position of each hash, `prev` the one
+    // before a position with the same hash, both -1 for none. Both are a power of
+    // two in size, at most the 32 KB window.
+    head: [int64] = []
+    prev: [int64] = []
+    mask: int64 = 0
+    match_dist: int64 = 0
 
-// Length-code metadata for length 3..258. Returns the code (offset
-// from 257), the base length, and the number of extra bits.
-type LenCode = struct {
-    code: int64
-    base: int64
-    extra: int64
-}
-
-func length_code(anon length: int64) -> LenCode {
-    if length <= 10 {
-        // Codes 257-264: lengths 3-10 (1 each), 0 extra bits.
-        return LenCode(code: 257 + length - 3, base: length, extra: 0)
-    }
-    if length == 258 {
-        // Maximum match — RFC 1951 special-cases it as code 285.
-        return LenCode(code: 285, base: 258, extra: 0)
-    }
-    // The remaining codes group lengths in powers-of-two ranges.
-    // The table below mirrors RFC 1951 §3.2.5's "extra bits" /
-    // "lengths" columns for codes 265-284.
-    let bases: [int64] = [11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227]
-    let extras: [int64] = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
-    mut i: int64 = 0
-    for i < len(bases) {
-        let next_base: int64 = bases[i] + (1 << extras[i])
-        if length < next_base {
-            return LenCode(code: 265 + i, base: bases[i], extra: extras[i])
+    func bits(self, anon value: int64, anon n: int64) -> none {
+        self.acc = self.acc | (value << self.nbits)
+        self.nbits += n
+        for self.nbits >= 8 {
+            self.out.append_byte(self.acc & 255)
+            self.acc = self.acc >> 8
+            self.nbits -= 8
         }
-        i = i + 1
     }
-    // Fallback (unreachable for length 3..258).
-    return LenCode(code: 285, base: 258, extra: 0)
-}
 
-type DistCode = struct {
-    code: int64
-    base: int64
-    extra: int64
-}
-
-func distance_code(anon distance: int64) -> DistCode {
-    if distance <= 4 {
-        // Codes 0-3: distances 1-4 (1 each), 0 extra bits.
-        return DistCode(code: distance - 1, base: distance, extra: 0)
-    }
-    let bases: [int64] = [5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
-    let extras: [int64] = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
-    mut i: int64 = 0
-    for i < len(bases) {
-        let next_base: int64 = bases[i] + (1 << extras[i])
-        if distance < next_base {
-            return DistCode(code: 4 + i, base: bases[i], extra: extras[i])
+    // Pad with zero bits to the next byte.
+    func align(self) -> none {
+        if self.nbits > 0 {
+            self.out.append_byte(self.acc & 255)
+            self.acc = 0
+            self.nbits = 0
         }
-        i = i + 1
-    }
-    // Fallback (unreachable for distance 1..32768).
-    return DistCode(code: 29, base: 24577, extra: 13)
-}
-
-// Three-byte hash used as the LZ77 index key. Maps any 3-byte window
-// onto a 15-bit slot (the hash table has 32768 entries) — collisions
-// are tolerated because we only keep the most recent position with a
-// given hash, so a false-positive hash hit just makes us find a
-// shorter (or no) match.
-func lz_hash(anon b0: int64, anon b1: int64, anon b2: int64) -> int64 {
-    return ((b0 << 16) | (b1 << 8) | b2) & 0x7fff
-}
-
-// LZ77 + fixed-Huffman Deflate. Slides a 32 KB window over `data`,
-// finds back-references at each position via a 15-bit hash table
-// (most-recent only — no chain), emits matches of length ≥ 3 through
-// the length/distance codes, falls back to literals otherwise.
-func deflate_lz77_fixed(anon data: bytes) -> [int64] {
-    let bw: BitWriter = make_bitwriter()
-    bw.write_bits(1, 1)         // BFINAL
-    bw.write_bits(1, 2)         // BTYPE = 01 (fixed Huffman)
-
-    let n: int64 = len(data)
-    // hash[h] = most recent position where 3-byte prefix hashed to h.
-    // Initialised to -1; positions are compared as `pos - prev` so the
-    // distance check rejects -1 implicitly when the input's short.
-    mut hash_table: [int64] = []
-    mut h_init: int64 = 0
-    for h_init < 32768 {
-        hash_table += [-1]
-        h_init = h_init + 1
     }
 
-    mut i: int64 = 0
-    for i < n {
-        // Need at least 3 bytes left for a match attempt.
-        if i + 2 >= n {
-            bw.write_huffman(fixed_lit_code(data[i]), fixed_lit_bits(data[i]))
-            i = i + 1
-            continue
+    func dcode(self, anon d: int64) -> int64 {
+        if d <= 256 {
+            return self.dist_code[d - 1]
         }
-        let h: int64 = lz_hash(data[i], data[i + 1], data[i + 2])
-        let prev: int64 = hash_table[h]
-        hash_table[h] = i
-        // Distance must be in [1, 32768] and the prefix must actually
-        // match (hash collisions land here too).
-        let dist: int64 = i - prev
-        mut match_len: int64 = 0
-        if prev >= 0 and dist <= 32768 {
-            // Count how far the match extends, up to 258 bytes or
-            // end-of-input.
-            mut max_match: int64 = n - i
-            if max_match > 258 {
-                max_match = 258
+        return self.dist_code[256 + ((d - 1) >> 7)]
+    }
+
+    func literal(self, anon at: int64) -> none {
+        self.syms += [self.data[at]]
+        self.dists += [0]
+        self.covered = at + 1
+        if len(self.syms) >= block_symbols() {
+            self.block(false)
+        }
+    }
+
+    func matched(self, anon at: int64, anon length: int64, anon distance: int64) -> none {
+        self.syms += [256 + length]
+        self.dists += [distance]
+        self.covered = at + length
+        if len(self.syms) >= block_symbols() {
+            self.block(false)
+        }
+    }
+
+    // Stored blocks for data[from..to], the last of them final when `last` is.
+    func stored(self, anon from: int64, anon to: int64, anon last: bool) -> none {
+        mut at = from
+        // An empty range is still one (empty) block.
+        mut first = true
+        for first or at < to {
+            first = false
+            mut n = to - at
+            if n > 65535 {
+                n = 65535
             }
-            mut m: int64 = 0
-            for m < max_match {
-                if data[i + m] != data[prev + m] {
-                    m = max_match
-                } else {
-                    match_len = m + 1
-                    m = m + 1
-                }
-            }
-            if match_len < 3 {
-                match_len = 0
+            let final = last and at + n == to
+            self.bits(bit(final), 1)
+            self.bits(0, 2)
+            self.align()
+            self.bits(n, 16)
+            self.bits(n ^ 0xffff, 16)
+            self.out.append_bytes(self.data[at..at + n])
+            at += n
+        }
+    }
+
+    // Write out the block collected so far, whichever way is smallest.
+    func block(self, anon last: bool) -> none {
+        mut lit_freq = zeros(286)
+        mut dist_freq = zeros(30)
+        lit_freq[256] = 1
+        mut extra: int64 = 0
+        for k, symbol in self.syms {
+            if symbol < 256 {
+                lit_freq[symbol] += 1
+            } else {
+                let c = self.len_code[symbol - 256]
+                lit_freq[257 + c] += 1
+                extra += self.len_extra[c]
+                let dc = self.dcode(self.dists[k])
+                dist_freq[dc] += 1
+                extra += self.dist_extra[dc]
             }
         }
-        if match_len >= 3 {
-            // Emit length code + extra bits.
-            let lc: LenCode = length_code(match_len)
-            bw.write_huffman(fixed_lit_code(lc.code), fixed_lit_bits(lc.code))
-            if lc.extra > 0 {
-                bw.write_bits(match_len - lc.base, lc.extra)
-            }
-            // Emit 5-bit fixed distance code + extra bits.
-            let dc: DistCode = distance_code(dist)
-            bw.write_huffman(dc.code, 5)
-            if dc.extra > 0 {
-                bw.write_bits(dist - dc.base, dc.extra)
-            }
-            // Advance past the match. Update hash for every position
-            // inside the match (other than the first, which we already
-            // recorded above) so future matches can reach into it.
-            mut k: int64 = 1
-            for k < match_len {
-                let p: int64 = i + k
-                if p + 2 < n {
-                    let hp: int64 = lz_hash(data[p], data[p + 1], data[p + 2])
-                    hash_table[hp] = p
-                }
-                k = k + 1
-            }
-            i = i + match_len
+        let lit_len = code_lengths(lit_freq, 15)
+        let dist_len = code_lengths(dist_freq, 15)
+        mut nlit: int64 = 286
+        for nlit > 257 and lit_len[nlit - 1] == 0 {
+            nlit -= 1
+        }
+        mut ndist: int64 = 30
+        for ndist > 1 and dist_len[ndist - 1] == 0 {
+            ndist -= 1
+        }
+        let header = run_lengths(lit_len[0..nlit] + dist_len[0..ndist])
+        mut cl_freq = zeros(19)
+        for entry in header {
+            cl_freq[entry & 31] += 1
+        }
+        let cl_len = code_lengths(cl_freq, 7)
+        let order = code_length_order()
+        mut ncl: int64 = 19
+        for ncl > 4 and cl_len[order[ncl - 1]] == 0 {
+            ncl -= 1
+        }
+
+        let fixed_lit = fixed_lit_lengths()
+        mut dynamic_cost: int64 = 3 + 14 + 3 * ncl + extra
+        mut fixed_cost: int64 = 3 + extra
+        for symbol, f in lit_freq {
+            dynamic_cost += f * lit_len[symbol]
+            fixed_cost += f * fixed_lit[symbol]
+        }
+        for symbol, f in dist_freq {
+            dynamic_cost += f * dist_len[symbol]
+            fixed_cost += f * 5
+        }
+        for symbol, f in cl_freq {
+            dynamic_cost += f * (cl_len[symbol] + code_length_extra_bits(symbol))
+        }
+        let size = self.covered - self.block_start
+        let chunks = (size + 65534) / 65535
+        mut stored_cost = (size + 5 * chunks) * 8
+        if size == 0 {
+            stored_cost = 5 * 8
+        }
+
+        if stored_cost <= dynamic_cost and stored_cost <= fixed_cost {
+            self.stored(self.block_start, self.covered, last)
+        } else if fixed_cost <= dynamic_cost {
+            self.bits(bit(last), 1)
+            self.bits(1, 2)
+            self.symbols(fixed_lit, filled(30, 5))
         } else {
-            bw.write_huffman(fixed_lit_code(data[i]), fixed_lit_bits(data[i]))
-            i = i + 1
+            self.bits(bit(last), 1)
+            self.bits(2, 2)
+            self.bits(nlit - 257, 5)
+            self.bits(ndist - 1, 5)
+            self.bits(ncl - 4, 4)
+            for i in 0..ncl {
+                self.bits(cl_len[order[i]], 3)
+            }
+            let cl_code = codes_of(cl_len)
+            for entry in header {
+                let symbol = entry & 31
+                self.bits(cl_code[symbol], cl_len[symbol])
+                self.bits(entry >> 5, code_length_extra_bits(symbol))
+            }
+            self.symbols(lit_len, dist_len)
+        }
+        self.syms = []
+        self.dists = []
+        self.block_start = self.covered
+    }
+
+    // The block's symbols and its end marker, in the codes with these lengths.
+    func symbols(self, anon lit_len: [int64], anon dist_len: [int64]) -> none {
+        let lit_code = codes_of(lit_len)
+        let dist_code = codes_of(dist_len)
+        for k, symbol in self.syms {
+            if symbol < 256 {
+                self.bits(lit_code[symbol], lit_len[symbol])
+                continue
+            }
+            let length = symbol - 256
+            let c = self.len_code[length]
+            self.bits(lit_code[257 + c], lit_len[257 + c])
+            self.bits(length - self.len_base[c], self.len_extra[c])
+            let d = self.dists[k]
+            let dc = self.dcode(d)
+            self.bits(dist_code[dc], dist_len[dc])
+            self.bits(d - self.dist_base[dc], self.dist_extra[dc])
+        }
+        self.bits(lit_code[256], lit_len[256])
+    }
+
+    // Index position `p` under the hash of the three bytes from it.
+    func insert(self, anon p: int64) -> none {
+        if p + 2 >= len(self.data) {
+            return
+        }
+        let h = ((self.data[p] << 10) ^ (self.data[p + 1] << 5) ^ self.data[p + 2]) & self.mask
+        self.prev[p & self.mask] = self.head[h]
+        self.head[h] = p
+    }
+
+    // The length of the longest match for position `i` (already indexed) that is
+    // longer than `shorter`, with its distance in `match_dist`; 0 for none.
+    func longest(self, anon i: int64, anon shorter: int64, anon cfg: Level) -> int64 {
+        mut most = len(self.data) - i
+        if most > 258 {
+            most = 258
+        }
+        mut best = shorter
+        if best < 2 {
+            best = 2
+        }
+        if best >= most {
+            return 0
+        }
+        mut nice = cfg.nice
+        if nice > most {
+            nice = most
+        }
+        mut chain = cfg.chain
+        if shorter >= cfg.good {
+            chain = chain >> 2
+        }
+        mut found: int64 = 0
+        mut p = self.prev[i & self.mask]
+        for p >= 0 and i - p <= 32768 and chain > 0 {
+            if self.data[p + best] == self.data[i + best] and self.data[p] == self.data[i] and self.data[p + 1] == self.data[i + 1] {
+                mut l: int64 = 2
+                for l < most and self.data[p + l] == self.data[i + l] {
+                    l += 1
+                }
+                if l > best {
+                    best = l
+                    found = l
+                    self.match_dist = i - p
+                    if l >= nice {
+                        break
+                    }
+                }
+            }
+            let next = self.prev[p & self.mask]
+            if next >= p {
+                break
+            }
+            p = next
+            chain -= 1
+        }
+        // A short match far back costs more than its literals, as zlib judges.
+        if found == 3 and self.match_dist > 4096 {
+            return 0
+        }
+        return found
+    }
+
+    // Take the first match at each position.
+    func greedy(self, anon cfg: Level) -> none {
+        let n = len(self.data)
+        mut i: int64 = 0
+        for i < n {
+            self.insert(i)
+            let l = self.longest(i, 0, cfg)
+            if l >= 3 {
+                self.matched(i, l, self.match_dist)
+                if l <= cfg.lazy {
+                    for p in i + 1..i + l {
+                        self.insert(p)
+                    }
+                }
+                i += l
+            } else {
+                self.literal(i)
+                i += 1
+            }
         }
     }
-    bw.write_huffman(fixed_lit_code(256), fixed_lit_bits(256))
-    bw.flush_byte()
-    return bw.bytes
+
+    // Hold each match back a byte, and take a literal instead when the next
+    // position starts a longer one.
+    func lazy(self, anon cfg: Level) -> none {
+        let n = len(self.data)
+        mut i: int64 = 0
+        // Whether the byte before `i` is still to be written, and the match found there.
+        mut pending = false
+        mut prev_len: int64 = 0
+        mut prev_dist: int64 = 0
+        for i < n {
+            self.insert(i)
+            mut l: int64 = 0
+            if prev_len < cfg.lazy {
+                l = self.longest(i, prev_len, cfg)
+            }
+            if prev_len >= 3 and l <= prev_len {
+                self.matched(i - 1, prev_len, prev_dist)
+                let end = i - 1 + prev_len
+                for p in i + 1..end {
+                    self.insert(p)
+                }
+                i = end
+                pending = false
+                prev_len = 0
+            } else {
+                if pending {
+                    self.literal(i - 1)
+                }
+                pending = true
+                prev_len = l
+                prev_dist = self.match_dist
+                i += 1
+            }
+        }
+        if pending {
+            self.literal(n - 1)
+        }
+    }
+
+    // The whole deflate stream, ending on a byte boundary.
+    func run(self) -> none {
+        let n = len(self.data)
+        if self.level == 0 {
+            self.stored(0, n, true)
+            self.align()
+            return
+        }
+        mut size: int64 = 256
+        for size < n and size < 32768 {
+            size = size << 1
+        }
+        self.mask = size - 1
+        self.head = filled(size, -1)
+        self.prev = filled(size, -1)
+        let cfg = level_config(self.level)
+        if cfg.greedy {
+            self.greedy(cfg)
+        } else {
+            self.lazy(cfg)
+        }
+        self.block(true)
+        self.align()
+    }
+}
+
+func le32(anon out: StrBuilder, anon v: int64) -> none {
+    for k in 0..4 {
+        out.append_byte((v >> (8 * k)) & 255)
+    }
+}
+
+// A raw deflate stream of `data`.
+func raw(anon data: bytes, level: int64 = 6) -> bytes {
+    let e = Encoder(data: data, level: clamp_level(level))
+    e.run()
+    return e.out.to_bytes()
+}
+
+// A gzip file of one member, with no name and a zero modification time.
+func gzip(anon data: bytes, level: int64 = 6) -> bytes {
+    let e = Encoder(data: data, level: clamp_level(level))
+    for b in [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3] {
+        e.out.append_byte(b)
+    }
+    e.run()
+    le32(e.out, crc32.compute(data))
+    le32(e.out, len(data) & 0xffffffff)
+    return e.out.to_bytes()
+}
+
+// A zlib stream: a two-byte header that names the level, then the Adler-32 of
+// the data, high byte first.
+func zlib(anon data: bytes, level: int64 = 6) -> bytes {
+    let lv = clamp_level(level)
+    let e = Encoder(data: data, level: lv)
+    e.out.append_byte(0x78)
+    if lv <= 1 {
+        e.out.append_byte(0x01)
+    } else if lv <= 5 {
+        e.out.append_byte(0x5e)
+    } else if lv == 6 {
+        e.out.append_byte(0x9c)
+    } else {
+        e.out.append_byte(0xda)
+    }
+    e.run()
+    mut a: int64 = 1
+    mut b: int64 = 0
+    for k in 0..len(data) {
+        a += data[k]
+        b += a
+        if k % 4096 == 4095 {
+            a = a % 65521
+            b = b % 65521
+        }
+    }
+    a = a % 65521
+    b = b % 65521
+    let sum = (b << 16) | a
+    for k in 0..4 {
+        e.out.append_byte((sum >> (24 - 8 * k)) & 255)
+    }
+    return e.out.to_bytes()
 }
