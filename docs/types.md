@@ -121,10 +121,15 @@ others, is an error (``constant `A` refers to itself``).
 A constant is used by its name. Another module's is `import "limits" { MAX_BLOCK }` or
 `limits.MAX_BLOCK`, like a function's. A local variable or parameter of the same name hides
 it, as it does a function, and a constant and a function can't share a name in one
-module. A constant can't be assigned.
+module. A constant can't be assigned, and neither can its elements
+(`` `PRIMES` is a constant and can't be assigned; a module-level `mut` can be ``).
 
-The value is worked out at each use, like a [default](functions.md#default-values), so an
-array constant is a new array every time, and nothing is shared between uses.
+Each use of an array constant is an array of its own, so changing one changes nothing
+else: after `let p = PRIMES` and `p[0] = 1`, `PRIMES[0]` is still 2. A use that can't
+change the array, indexing it, `len` of it or a `for` over it, reads one copy that the
+program builds the first time and keeps, so a lookup table read in a loop allocates
+nothing. Indexing an array of arrays still makes a new array, since the element read
+could be changed. A string can't be changed, so a string constant is built once.
 
 ## Module-level variables
 

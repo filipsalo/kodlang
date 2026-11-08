@@ -86,6 +86,12 @@ type SigInfo = struct {
 }
 
 // `m.T`, with `m` an import.
+// A saved shared_const_id and its path; see Codegen.share_begin.
+type ConstShare = struct {
+    id: int64
+    path: str
+}
+
 type ModuleMember = struct {
     alias: str
     member: str
@@ -665,6 +671,10 @@ type Codegen = struct {
     in_const_body: bool = false
     // Compiling the call that reads a constant or variable, not one through its value.
     reading_const: bool = false
+    // The constant read (expression id, in the module at `shared_const_path`) that may use
+    // the constant's shared copy, because its value can't escape: see read_const.
+    shared_const_id: int64 = -1
+    shared_const_path: str = ""
 
     // When true, codegen runs all its checks but skips actually emitting
     // assembly. Used by test_support.try_compile so test code can run
@@ -1537,15 +1547,70 @@ type Codegen = struct {
         return none
     }
 
-    // A constant's or variable's value: a call to the function that gives it.
+    // A constant's or variable's value: a call to the function that gives it. A string
+    // constant, and an array constant where shared_const_id allows it, comes from the
+    // copy its `NAME$shared` getter built at the first such read.
     func read_const(self, anon expr_id: int64, sig: SigInfo) -> Val {
         self.check_const_use(expr_id, :sig)
+        if self.const_shared_kind(sig) {
+            let shareable = sig.return_kind is .KStr or (expr_id == self.shared_const_id and self.p.path == self.shared_const_path)
+            if shareable {
+                self.emit(f"bl {self.const_label(expr_id)}$shared")
+                return self.rc_temp_val(.VReg(name: "x0"), kind: sig.return_kind)
+            }
+        }
         let no_args: [ast.CallArg] = []
         self.reading_const = true
         let val = self.compile_call(no_args, callee_id: expr_id)
         self.reading_const = false
         // The value is the caller's, like any call's.
         return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // Whether a constant's value is one a shared copy can stand for: a string, which can't
+    // change, or an array whose elements are not arrays, read where it can't escape.
+    func const_shared_kind(self, anon sig: SigInfo) -> bool {
+        if self.sig_is_var(sig) {
+            return false
+        }
+        let k = sig.return_kind
+        return k is .KStr or k is .KArray or k is .KArrayStr or k is .KArrayBool or k is .KArrayFloat64 or k is .KArrayEnum(_e)
+    }
+
+    // Lets `expr_id`, if it reads a constant, use the shared copy, until share_end.
+    func share_begin(self, anon expr_id: int64) -> ConstShare {
+        let saved = ConstShare(id: self.shared_const_id, path: self.shared_const_path)
+        if self.const_signature(expr_id) is Some(_sig) {
+            self.shared_const_id = expr_id
+            self.shared_const_path = self.p.path
+        }
+        return saved
+    }
+
+    func share_end(self, anon saved: ConstShare) -> none {
+        self.shared_const_id = saved.id
+        self.shared_const_path = saved.path
+    }
+
+    // The label of the function that gives the constant `expr_id` reads.
+    func const_label(self, anon expr_id: int64) -> str {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> return self.fn_label(self.lookup_func(name))
+            .Binary(lhs, _op, rhs) -> {
+                let .Ident(mod_name) = self.p.exprs[lhs] else { return "" }
+                let .Ident(member) = self.p.exprs[rhs] else { return "" }
+                return self.import_fn_at(self.lookup_import_fn(mod_name, member)).label
+            }
+            else return ""
+        }
+    }
+
+    // The expression a store through `x[i]...[j] = v` changes the elements of.
+    func store_root(self, anon expr_id: int64) -> int64 {
+        if self.p.exprs[expr_id] is .Binary(lhs, op, _rhs) and op is .Index {
+            return self.store_root(lhs)
+        }
+        return expr_id
     }
 
     // Whether calling `callee_id` calls the function a constant or variable holds.
@@ -8247,7 +8312,13 @@ type Codegen = struct {
     func compile_binary(self, lhs: int64, op: ast.Op, rhs: int64) -> Val {
         match op {
             .Dot -> return self.compile_dot(:lhs, :rhs)
-            .Index -> return self.compile_index(:lhs, :rhs)
+            .Index -> {
+                // An element that is not an array can't share the array it came from.
+                let share = self.share_begin(lhs)
+                let val = self.compile_index(:lhs, :rhs)
+                self.share_end(share)
+                return val
+            }
             .And -> return self.compile_and(:lhs, :rhs)
             .Or -> return self.compile_or(:lhs, :rhs)
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
@@ -11243,7 +11314,10 @@ type Codegen = struct {
                 let name = self.source_name(key)
                 let builtin = self.is_builtin_call(key)
                 if name == "len" and len(args) == 1 and builtin {
-                    return self.compile_len(args[0].value)
+                    let share = self.share_begin(args[0].value)
+                    let val = self.compile_len(args[0].value)
+                    self.share_end(share)
+                    return val
                 }
                 // `print(x)` takes what `{x}` does.
                 if name == "print" and len(args) == 1 and builtin and len(args[0].label) == 0 and not (self.infer_kind(args[0].value) is .KStr) {
@@ -12720,7 +12794,11 @@ type Codegen = struct {
             .Return(value) -> self.compile_return(value)
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
             .For(cond, body) -> self.compile_for(body, cond_id: cond)
-            .ForEach(name, iter, body) -> self.compile_foreach(body, :name, iter_id: iter)
+            .ForEach(name, iter, body) -> {
+                let share = self.share_begin(iter)
+                self.compile_foreach(body, :name, iter_id: iter)
+                self.share_end(share)
+            }
             .Break -> self.compile_break()
             .Continue -> self.compile_continue()
             .ExprStmt(expr) -> {
@@ -14375,6 +14453,11 @@ type Codegen = struct {
             self.compile_var_store(sig, lhs_id: lhs_id, rhs_id: rhs_id)
             return
         }
+        if self.const_signature(self.store_root(lhs_id)) is Some(csig) and not self.sig_is_var(csig) {
+            let name = csig.src_p.func_decls[csig.decl_id].name
+            self.report_error(f"error: `{name}` is a constant and can't be assigned; a module-level `mut` can be", span: self.p.expr_spans[lhs_id])
+            return
+        }
         match self.p.exprs[lhs_id] {
             .Ident(name) -> {
                 if not self.var_declared(name) {
@@ -14460,12 +14543,32 @@ type Codegen = struct {
         let decl = self.p.func_decls[fd_id]
         let lbl = f"${self.path_prefix}${decl.name}"
         self.compile_func(:fd_id, struct_name: "", override_lbl: f"{lbl}$init")
-        let kind = self.resolve_type(decl.return_typ)
+        self.emit_cached_getter(lbl, init: f"{lbl}$init", name: decl.name, kind: self.resolve_type(decl.return_typ))
+        self.emit_symtab_entry(lbl, name: decl.name, file: self.p.path, line: self.line_of_offset(decl.name_span.start))
+    }
+
+    // A constant, and for a string or an array constant the getter `NAME$shared` of a copy
+    // built once, which reads that can't change it use.
+    func compile_const(self, anon fd_id: int64) -> none {
+        self.compile_func(:fd_id, struct_name: "", override_lbl: "")
+        let decl = self.p.func_decls[fd_id]
+        let slot = self.lookup_func(decl.name)
+        if slot < 0 or not self.const_shared_kind(self.fn_sig(slot)) {
+            return
+        }
+        let lbl = f"${self.path_prefix}${decl.name}"
+        self.emit_cached_getter(f"{lbl}$shared", init: lbl, name: decl.name, kind: self.fn_sig(slot).return_kind)
+    }
+
+    // A getter `lbl` that calls `init` at its first use and keeps what it returns in the
+    // cell `lbl$cell`, `{state, value}`: state 0 before the first use, 2 while `init`
+    // runs (a use then is a cycle, which panics), 1 after. It returns a new reference.
+    func emit_cached_getter(self, anon lbl: str, init: str, name: str, kind: TypeKind) -> none {
         let cell = f"{lbl}$cell"
         let ready = self.fresh("Lvar_ready")
-        let init = self.fresh("Lvar_init")
+        let init_lbl = self.fresh("Lvar_init")
         let cycle = self.fresh("Lvar_cycle")
-        let msg = self.intern_str(f"`{decl.name}` is used while its value is being worked out")
+        let msg = self.intern_str(f"`{name}` is used while its value is being worked out")
         self.emit_globl(lbl)
         self.emit_label(lbl)
         self.emit("stp fp, lr, [sp, #-16]!")
@@ -14474,7 +14577,7 @@ type Codegen = struct {
         self.emit(f"add x16, x16, {cell}@PAGEOFF")
         self.emit("ldr x17, [x16]")
         self.emit("cmp x17, #1")
-        self.emit(f"b.ne {init}")
+        self.emit(f"b.ne {init_lbl}")
         self.emit_label(ready)
         self.emit("ldr x0, [x16, #8]")
         if self.rc_heap_kind(kind) {
@@ -14483,12 +14586,12 @@ type Codegen = struct {
         }
         self.emit("ldp fp, lr, [sp], #16")
         self.emit("ret")
-        self.emit_label(init)
+        self.emit_label(init_lbl)
         self.emit(f"cbnz x17, {cycle}")
         self.emit("mov x17, #2")
         self.emit("str x17, [x16]")
         // The initializer's reference becomes the cell's.
-        self.emit(f"bl {lbl}$init")
+        self.emit(f"bl {init}")
         self.emit(f"adrp x16, {cell}@PAGE")
         self.emit(f"add x16, x16, {cell}@PAGEOFF")
         self.emit("str x0, [x16, #8]")
@@ -14505,7 +14608,6 @@ type Codegen = struct {
         self.println("\t.quad 0")
         self.println("\t.quad 0")
         self.println("\t.text")
-        self.emit_symtab_entry(lbl, name: decl.name, file: self.p.path, line: self.line_of_offset(decl.name_span.start))
     }
 
     func find_field_kind(self, anon field_name: str, struct_idx: int64) -> TypeKind {
@@ -16252,6 +16354,8 @@ type Codegen = struct {
                 .Func(decl_id) -> {
                     if self.p.func_decls[decl_id].is_var {
                         self.compile_var(decl_id)
+                    } else if self.p.func_decls[decl_id].is_const {
+                        self.compile_const(decl_id)
                     } else if len(self.p.func_decls[decl_id].type_params) == 0 {
                         self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
                     }
