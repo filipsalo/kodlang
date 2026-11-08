@@ -83,12 +83,17 @@ let g: int64 = 99.hash()
 Used internally by `Map[K, V]`.
 
 The `hash(x)` builtin takes a hashable value: an `int64`, `str`, `bytes` or
-`bool`, or a value of an enum whose variants have no payloads, which hashes
-by variant. Hashing anything else, such as a struct, an array, an optional
+`bool`, a value of an enum whose variants have no payloads, which hashes
+by variant, or a value of a union whose members are all hashable, such as
+`int64 | str`. Hashing anything else, such as a struct, an array, an optional
 or an enum with payload variants, is an error
-(`` cannot hash a value of type `[int64]` ``). It gives what the methods
-above give, a `bytes` value hashes like the `str` with the same bytes, and
-an enum value hashes to its variant's position, counting from 1.
+(`` cannot hash a value of type `[int64]` ``), as is hashing a union with a
+member that can't be hashed, which the error names
+(`` cannot hash a value of type `[int64] | int64`; its member `[int64]` can't be hashed ``).
+It gives what the methods above give, a `bytes` value hashes like the `str`
+with the same bytes, an enum value hashes to its variant's position, counting
+from 1, and a union value hashes the member it holds, mixed with which member
+that is, so the `int64` 0 and the `bool` false don't collide.
 
 ## `Map[K, V]`
 
@@ -107,10 +112,12 @@ print(len(m).to_str())   // 2
 
 A lookup finds the entry whose key is `==` to the one it's given, so key
 equality depends on the key type: `str` and `bytes` keys match by
-content, `int64` and `bool` keys by value, and enum keys by variant.
+content, `int64` and `bool` keys by value, enum keys by variant, and union
+keys when they hold the same member and those are equal, so in a
+`Map[int64 | str, V]` the keys `1` and `"1"` are two keys.
 
 The key type must be hashable, as for `hash(x)`: `int64`, `str`, `bytes`,
-`bool` or an enum without payload variants. Any other key type, such as
+`bool`, an enum without payload variants, or a union of those. Any other key type, such as
 `Map[[int64], int64]`, `Map[int64?, str]` or a struct, is an error at the
 type argument that names it, in whichever module it's written
 (`` `[int64]` can't be a `Map` key ``), reported once per key type. A key

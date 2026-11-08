@@ -593,8 +593,10 @@ and a value that goes into it (`x == 3`, `x == "a"`, `x == .Red`): they're equal
 when they hold the same member and those members are `==`. Every member needs a
 `==` of its own, so a union with a struct member that doesn't declare `op_eq`,
 or an array member, can't be compared. A union widens for `==` as it does
-elsewhere, so an `A | B` compares with an `A | B | C`. Otherwise a union has no
-fields, methods or operators of its own, and it can't be a `Map` key. A union can't
+elsewhere, so an `A | B` compares with an `A | B | C`. A union whose members can
+all be hashed (`int64`, `str`, `bytes`, `bool`, enums without payloads) can be
+hashed and be a `Map` key: `Map[int64 | str, V]` (see [`hash`](builtins.md)).
+Otherwise a union has no fields, methods or operators of its own. A union can't
 mention a type parameter, except as `T | none`, since `T | str` would have only
 one member when `T` is `str`. A union alias can't refer to itself, so a recursive
 type such as a JSON value is still an [enum](enums.md).

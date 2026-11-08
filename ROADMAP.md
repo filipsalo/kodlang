@@ -57,7 +57,6 @@ codegen bugs that this kind of code is most likely to hit.
 
 ## Later
 
-- Unions as `Map` keys (they compare with `==`, but don't hash yet).
 - Reference cycles: a cycle collector, or weak references.
 - More runtime pieces in C can move to Kod now that modules have variables, as the test
   runner has (compiler sources and primitives can use them after a snapshot refresh).

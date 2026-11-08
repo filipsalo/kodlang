@@ -1334,14 +1334,33 @@ type Codegen = struct {
             .KBool -> return true
             .KStr -> return true
             .KBytes -> return true
-            .KEnum(idx) -> return not self.enum_has_payload(idx)
+            .KEnum(idx) -> {
+                if self.enums[idx].is_union {
+                    return len(self.unhashable_member(idx)) == 0
+                }
+                return not self.enum_has_payload(idx)
+            }
             else return false
         }
     }
 
+    // The first member of the union `idx` that can't be hashed, as shown, or "".
+    func unhashable_member(self, anon idx: int64) -> str {
+        for v in self.enums[idx].variants {
+            if not self.is_hashable(v.field_kinds[0]) {
+                return self.kind_display(v.field_kinds[0])
+            }
+        }
+        return ""
+    }
+
     func unhashable_note(self, anon kind: TypeKind) -> str {
-        if self.is_union_kind(kind) {
-            return ""
+        if kind is .KEnum(idx) and self.enums[idx].is_union {
+            let member = self.unhashable_member(idx)
+            if len(member) == 0 {
+                return ""
+            }
+            return f"; its member `{member}` can't be hashed"
         }
         if kind is .KEnum(_idx) {
             return "; some of its variants have payloads"
@@ -1402,7 +1421,7 @@ type Codegen = struct {
                 }
                 i += 1
             }
-            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool` or enums without payloads{suffix}", span: site)
+            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool`, enums without payloads or unions of those{suffix}", span: site)
         }
         let none_pending: [int64] = []
         self.pending_bad_keys = none_pending
@@ -5482,6 +5501,27 @@ type Codegen = struct {
             arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: lhs_bindings)), body: inner))]
         }
         return self.compile_expr(self.p.alloc_expr(.MatchExpr(subject: l, :arms), :span))
+    }
+
+    // `match v { A(a) -> hash(a) * 31 + 0, B(b) -> hash(b) * 31 + 1, ... }`: the hash of
+    // the member the union `v` holds, mixed with which member it is, so members that
+    // hash alike (`0` and `false`) don't collide. `==` never holds across members.
+    func union_hash(self, anon value_id: int64, union_idx: int64) -> int64 {
+        let span = self.p.expr_spans[value_id]
+        mut arms: [int64] = []
+        for j, v in self.enums[union_idx].variants {
+            let name = self.fresh("__member")
+            self.alloc_var(:name, kind: v.field_kinds[0])
+            let bindings: [str] = [name]
+            let pat = self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, :bindings))
+            let callee = self.p.alloc_expr(.Ident(name: "hash"), :span)
+            let member = self.p.alloc_expr(.Ident(:name), :span)
+            let hashed = self.p.alloc_expr(.Call(:callee, args: [ast.CallArg(label: "", label_span: span, value: member)]), :span)
+            let scaled = self.p.alloc_expr(.Binary(lhs: hashed, op: .Mul, rhs: self.p.alloc_expr(.IntLit(value: 31), :span)), :span)
+            let body = self.p.alloc_expr(.Binary(lhs: scaled, op: .Add, rhs: self.p.alloc_expr(.IntLit(value: j), :span)), :span)
+            arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body))]
+        }
+        return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
     }
 
     func member_has_eq(self, anon kind: TypeKind) -> bool {
@@ -10179,6 +10219,15 @@ type Codegen = struct {
                             return self.qualified_type_arg_kind(self.source_name(mod_name), :name, span: self.p.expr_spans[rhs], :report)
                         }
                     }
+                    .BitOr -> {
+                        // `A | B`, read as `|` in an expression: a union, `T | none` an optional.
+                        let l = self.type_member_of_expr(lhs, :report)
+                        let r = self.type_member_of_expr(rhs, :report)
+                        if l is Some(lk) and r is Some(rk) {
+                            return self.union_kind([lk, rk])
+                        }
+                        return none
+                    }
                     .Index -> {
                         let root = self.index_chain_root(expr_id)
                         let name = self.chain_root_name(root)
@@ -10223,6 +10272,15 @@ type Codegen = struct {
             self.report_error("error: unsupported type argument", span: self.p.expr_spans[expr_id])
         }
         return none
+    }
+
+    // A member of a union type argument: a type, or `none` (KVoid, which union_kind reads
+    // as making the union optional).
+    func type_member_of_expr(self, anon expr_id: int64, report: bool) -> TypeKind? {
+        if self.p.exprs[expr_id] is .NoneLit {
+            return .KVoid
+        }
+        return self.type_kind_of_expr(expr_id, :report)
     }
 
     // `m.T` as a type argument: a type m declares, in a type position, so a local never hides m.
@@ -11344,7 +11402,7 @@ type Codegen = struct {
                     if not self.is_hashable(arg_kind) {
                         self.compile_discard(args[0].value)
                         if not self.kind_has_unknown(arg_kind) and self.report_attempts == self.stmt_error_mark {
-                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool` or enums without payloads", span: self.p.expr_spans[args[0].value])
+                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool`, enums without payloads or unions of those", span: self.p.expr_spans[args[0].value])
                         }
                         return .VImm(value: 0)
                     }
@@ -11353,6 +11411,9 @@ type Codegen = struct {
                         self.mov_to(val, dest: "x0")
                         self.emit("bl $primitives$str$hash")
                         return .VReg(name: "x0")
+                    }
+                    if arg_kind is .KEnum(union_idx) and self.enums[union_idx].is_union {
+                        return self.compile_expr(self.union_hash(args[0].value, union_idx: union_idx))
                     }
                     if arg_kind is .KEnum(_enum_idx) {
                         let val = self.compile_expr(args[0].value)
