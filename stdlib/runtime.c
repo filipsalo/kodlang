@@ -562,15 +562,10 @@ int64_t kod_kill(int64_t pid) {
 
 // float64: a Kod `float64` travels as the 8 bytes of its IEEE 754 pattern in an
 // ordinary integer register or slot. kod_i64_to_f64, kod_f64_to_i64,
-// kod_f64_abs, floor, ceil, round, sqrt, is_nan and is_inf have no C side:
-// codegen's float_intrinsic compiles a call to them to the instructions that do
-// the work. Printing and reading floats is Kod (stdlib/primitives/float_text.kod).
-
-// kod_f64_bits and kod_f64_from_bits are intrinsics too, but stdlib/primitives
-// is compiled by the bootstrap snapshot, which predates them and calls these.
-// Delete them once the snapshot knows the intrinsics.
-int64_t kod_f64_bits(int64_t bits) { return bits; }
-int64_t kod_f64_from_bits(int64_t bits) { return bits; }
+// kod_f64_abs, floor, ceil, round, sqrt, is_nan, is_inf, kod_f64_bits and
+// kod_f64_from_bits have no C side: codegen's float_intrinsic compiles a call
+// to them to the instructions that do the work. Printing and reading floats is
+// Kod (stdlib/primitives/float_text.kod).
 
 // Replace this process with `argv[0]` (found via PATH) and `argv`. Buffered
 // output is flushed first: the new image would never see it. Returns -1,
