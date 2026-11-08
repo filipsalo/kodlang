@@ -340,3 +340,13 @@ def test_deep_expression_in_a_large_frame(tmp_path):
         expr = f"(v{i} + match a {{ 1 -> {expr} else -> 0 }})"
     body = f"    let a = id(1)\n{lets}\n    print_int({expr})"
     assert run(tmp_path, body) == str(999 + sum(range(30)))
+
+
+def test_string_literals_past_8_mb(tmp_path):
+    # More string data than Mach-O can address as an offset into one section,
+    # with escapes, and fast: unescaping and emitting a literal is linear.
+    lines = [
+        f'    n += len("{chr(97 + i) * 1_000_000}\\n\\t\\"\\\\")' for i in range(9)
+    ]
+    body = "    mut n = 0\n" + "\n".join(lines) + "\n    print_int(n)"
+    assert run(tmp_path, body) == str(9 * 1_000_004)
