@@ -673,6 +673,25 @@ void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
     return lhs;
 }
 
+// `xs += [x]` without the one-element array: `value` goes on the end of `arr` in
+// place. When `refs` is set it is a counted reference the caller has already
+// retained for the array.
+void *kod_array_push(void *arr_raw, int64_t value, int64_t refs) {
+    KodArray *arr = (KodArray *)arr_raw;
+    if (arr->cap <= arr->len) {
+        int64_t new_cap = arr->cap > 0 ? arr->cap * 2 : 4;
+        int64_t *buf = (int64_t *)rc_alloc_raw(new_cap * 8, 0);
+        if (arr->len > 0) memcpy(buf, arr->ptr, arr->len * 8);
+        rc_release_c(arr->ptr);
+        arr->ptr = buf;
+        arr->cap = new_cap;
+    }
+    ((int64_t *)arr->ptr)[arr->len] = value;
+    if (refs && arr->len == 0) rc_arr_set_refs(arr);
+    arr->len++;
+    return arr;
+}
+
 void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;

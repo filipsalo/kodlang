@@ -115,7 +115,9 @@ and so is `names + [1]`, whose literal's element isn't a `str`.
 
 `+=` grows the array's buffer geometrically, so appending in a loop is
 amortized O(1) per element. `+` always copies both operands, so
-`xs = xs + [x]` costs O(len(xs)); prefer `xs += [x]` in loops.
+`xs = xs + [x]` costs O(len(xs)); prefer `xs += [x]` in loops. `xs += [x]`
+with one element builds no array for the literal: `x` goes straight onto the
+end of `xs`.
 
 `+=` appends to the array itself, not to a copy, so everything that holds
 the same array sees the new elements: after `let a = xs` and `xs += [3]`,
