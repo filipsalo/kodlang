@@ -59,8 +59,8 @@ codegen bugs that this kind of code is most likely to hit.
 
 - Unions as `Map` keys (they compare with `==`, but don't hash yet).
 - Reference cycles: a cycle collector, or weak references.
-- The test runner and other runtime pieces in C can move to Kod now that modules have
-  variables (compiler sources and primitives can use them after a snapshot refresh).
+- More runtime pieces in C can move to Kod now that modules have variables, as the test
+  runner has (compiler sources and primitives can use them after a snapshot refresh).
 - Fewer C pieces: float printing and parsing, and TLS. SecureTransport is deprecated
   and stops at TLS 1.2; the options are Network.framework from C, or TLS 1.3 written in
   Kod (hashes, AES-GCM, X25519, X.509), a much larger job.

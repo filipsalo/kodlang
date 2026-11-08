@@ -63,7 +63,7 @@ test "map lookup hits" {
 }
 ```
 
-`fail` is a builtin — no import needed.
+`fail` is a builtin — no import needed. It works from any function a test calls, not only inside the `test` block. Outside `kod test` there is no test to fail, so `fail` panics with its message, as `assert` does outside a test.
 
 ## Discovery
 
@@ -103,7 +103,8 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 
 - The parser turns `test "..." { ... }` into a `Decl.Test` carrying a synthesized `FuncDecl`.
 - The codegen emits each test as a regular function (`<prefix>$__test_N`) and, per module, a `<prefix>$__run_tests` dispatcher. `<prefix>` is described in [Modules](modules.md#symbol-and-object-names).
-- `kod test` builds a runtime `_main` that calls every test-bearing module's `__run_tests` in turn, then `_kod_test_summary` once at the end. Counters live in C runtime statics.
+- The runner is a Kod module, `stdlib/testing.kod`, which `kod test` links into every test program (and `kod build` into any program with a `test` block, since the block's code is linked even though nothing runs it). Its counters are [module-level variables](types.md#module-level-variables).
+- `kod test` builds a runtime `_main` that calls every test-bearing module's `__run_tests` in turn, then the runner's `summary` once at the end.
 - `fail`/`assert` set a per-test "failed" flag the dispatcher reads after each test returns; that flag drives the `ok` / `FAIL` line and the aggregate count.
 
 ## Testing the compiler itself

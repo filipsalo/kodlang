@@ -142,144 +142,11 @@ int64_t kod_puts(KodStr *s) {
 }
 
 
-// Test framework state. The per-module `__run_tests` dispatcher emitted
-// by the codegen calls kod_test_reset before each test, the test body
-// calls kod_test_fail (from `testing.fail(msg)`) on a failure, and the
-// dispatcher calls kod_test_report afterwards to print the outcome and
-// roll into the aggregate counters. kod_test_summary is called once at
-// the very end; its return value (number of failures) is what the
-// process exits with.
-static int g_kod_test_failed;
-static int g_kod_test_total;
-static int g_kod_test_failures;
-/* `start_ns` captures the first reset's timestamp so the summary can
- * report total wall time; `case_start_ns` is refreshed on every reset
- * and consumed by the matching report call to print a per-test
- * duration. Negative means "not yet set". */
-static int64_t g_kod_test_start_ns = -1;
-static int64_t g_kod_test_case_start_ns = -1;
-
-int64_t kod_monotonic_ns(void);
-
-void kod_test_reset(void) {
-    int64_t now = kod_monotonic_ns();
-    if (g_kod_test_start_ns < 0) {
-        g_kod_test_start_ns = now;
-    }
-    g_kod_test_case_start_ns = now;
-    g_kod_test_failed = 0;
-}
-
-/* The result lines go to stdout and the failure detail to stderr. Stdout is
- * block-buffered when it is a pipe or a log, stderr is not, so stdout is
- * flushed after every line of the report and before any detail: the two
- * streams then keep their order when they end up in one place (and what a
- * test printed itself comes out with them). */
-void kod_test_fail(KodStr *msg) {
-    g_kod_test_failed = 1;
-    fflush(stdout);
-    /* 6-space indent: 2 for the per-module nesting, 4 more so failure
-     * messages clearly belong to the test rather than the group. */
-    fwrite("      ", 1, 6, stderr);
-    fwrite(msg->buf, 1, msg->len, stderr);
-    fputc('\n', stderr);
-}
-
-/* Called once at the top of each module's `__run_tests` dispatcher
- * (the codegen emits the call with the module's source path). Prints
- * the path on its own line so subsequent per-test `ok` / `FAIL`
- * lines (indented by `kod_test_report`) read as a group. Separates
- * groups with a blank line; the first group prints without one. */
-static int g_kod_test_group_seen = 0;
-void kod_test_module_begin(KodStr *path) {
-    if (g_kod_test_group_seen) {
-        fputc('\n', stdout);
-    }
-    g_kod_test_group_seen = 1;
-    fwrite(path->buf, 1, path->len, stdout);
-    fputc('\n', stdout);
-    fflush(stdout);
-}
-
-/* Resolution of CLOCK_MONOTONIC_RAW in whole ns, cached. ~42 ns on
- * Apple silicon (24 MHz timebase, 41.67 ns/tick rounded up). This is the
- * smallest difference two reads can show, so it's the floor we report
- * for a same-tick (0 ns) measurement. */
-static int64_t monotonic_res_ns(void) {
-    static int64_t cached = 0;
-    if (cached == 0) {
-        struct timespec r;
-        if (clock_getres(CLOCK_MONOTONIC_RAW, &r) == 0) {
-            cached = (int64_t)r.tv_sec * 1000000000 + r.tv_nsec;
-        }
-        if (cached <= 0) {
-            cached = 1;
-        }
-    }
-    return cached;
-}
-
-/* Format `ns` as μs / ms / s with 3 significant figures. Microseconds is
- * the finest unit on purpose: the monotonic clock resolves to ~42 ns
- * (see monotonic_res_ns), so printing bare nanoseconds — especially with
- * a decimal like "84.0 ns" — would imply precision we don't have. Sub-μs
- * timings render as e.g. "0.21 μs". Examples:
- *   0 ns             → "<0.04 μs"   (same-tick read — below the clock
- *                                    resolution; report that floor in μs
- *                                    rather than claim a smaller number)
- *   208 ns           → "0.21 μs"
- *   3920 ns          → "3.92 μs"
- *   45678 ns         → "45.7 μs"
- *   123456 ns        → "123 μs"
- *   1234567 ns       → "1.23 ms"
- *   12345678 ns      → "12.3 ms"
- *   1234567890 ns    → "1.23 s"
- *
- * Used by both `kod_test_report` (per-test) and `kod_test_summary`.
- */
-static void format_duration(int64_t ns, char *out, size_t out_size) {
-    if (ns == 0) {
-        snprintf(out, out_size, "<%.2f μs", monotonic_res_ns() / 1000.0);
-        return;
-    }
-    double v;
-    const char *unit;
-    if (ns < 1000000)           { v = (double)ns / 1000.0;       unit = "μs"; }
-    else if (ns < 1000000000)   { v = (double)ns / 1000000.0;    unit = "ms"; }
-    else                        { v = (double)ns / 1000000000.0; unit = "s";  }
-    const char *fmt = v < 10  ? "%.2f %s"
-                    : v < 100 ? "%.1f %s"
-                    :           "%.0f %s";
-    snprintf(out, out_size, fmt, v, unit);
-}
-
-void kod_test_report(KodStr *name) {
-    g_kod_test_total++;
-    /* Two-space indent so the per-test lines visibly nest under the
-     * module-path header from `kod_test_module_begin`. */
-    if (g_kod_test_failed) {
-        g_kod_test_failures++;
-        fwrite("  FAIL ", 1, 7, stdout);
-    } else {
-        fwrite("  ok   ", 1, 7, stdout);
-    }
-    fwrite(name->buf, 1, name->len, stdout);
-    char dur[32];
-    format_duration(kod_monotonic_ns() - g_kod_test_case_start_ns, dur, sizeof dur);
-    printf(" (%s)\n", dur);
-    fflush(stdout);
-}
-
-int64_t kod_test_summary(void) {
-    int64_t elapsed_ns = 0;
-    if (g_kod_test_start_ns >= 0) {
-        elapsed_ns = kod_monotonic_ns() - g_kod_test_start_ns;
-    }
-    char dur[32];
-    format_duration(elapsed_ns, dur, sizeof dur);
-    printf("\n%d/%d passed in %s\n",
-           g_kod_test_total - g_kod_test_failures, g_kod_test_total, dur);
-    return g_kod_test_failures > 0 ? 1 : 0;
+// The builtin `fail`. The test runner is Kod (stdlib/testing.kod), and a test
+// program's `_main` defines this to call it; anywhere else there is no test to
+// fail, so it panics like `assert` outside a test.
+__attribute__((weak)) void kod_test_fail(KodStr *msg) {
+    kod_panic(msg);
 }
 
 // Reopen stdout against `path`, so subsequent prints go to the file.
@@ -1158,6 +1025,19 @@ int64_t kod_monotonic_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+}
+
+/* Resolution of CLOCK_MONOTONIC_RAW in whole ns (at least 1): about 42 ns
+ * on Apple silicon (24 MHz timebase). The smallest difference two reads of
+ * kod_monotonic_ns can show; the test runner reports a 0 ns duration as
+ * below it. */
+int64_t kod_monotonic_res_ns(void) {
+    struct timespec r;
+    if (clock_getres(CLOCK_MONOTONIC_RAW, &r) != 0) {
+        return 1;
+    }
+    int64_t ns = (int64_t)r.tv_sec * 1000000000 + r.tv_nsec;
+    return ns > 0 ? ns : 1;
 }
 
 int64_t kod_unix_ns(void) {
