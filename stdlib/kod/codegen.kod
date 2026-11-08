@@ -661,6 +661,10 @@ type Codegen = struct {
     // assertion calls `_kod_test_fail` (flag the test, keep going);
     // outside a test, it calls `_kod_panic` (print + exit 1).
     in_test: bool = false
+    // Compiling a module-level constant's value, which can't use a variable.
+    in_const_body: bool = false
+    // Compiling the call that reads a constant or variable, not one through its value.
+    reading_const: bool = false
 
     // When true, codegen runs all its checks but skips actually emitting
     // assembly. Used by test_support.try_compile so test code can run
@@ -1515,6 +1519,52 @@ type Codegen = struct {
             return false
         }
         return sig.src_p.func_decls[sig.decl_id].is_const
+    }
+
+    // Whether a signature is a module-level variable's (whose getter is flagged as a constant too).
+    func sig_is_var(self, anon sig: SigInfo) -> bool {
+        if sig.decl_id <= 0 {
+            return false
+        }
+        return sig.src_p.func_decls[sig.decl_id].is_var
+    }
+
+    // The module-level variable `expr_id` uses, as const_signature finds it.
+    func var_signature(self, anon expr_id: int64) -> SigInfo? {
+        if self.const_signature(expr_id) is Some(sig) and self.sig_is_var(sig) {
+            return sig
+        }
+        return none
+    }
+
+    // A constant's or variable's value: a call to the function that gives it.
+    func read_const(self, anon expr_id: int64, sig: SigInfo) -> Val {
+        self.check_const_use(expr_id, :sig)
+        let no_args: [ast.CallArg] = []
+        self.reading_const = true
+        let val = self.compile_call(no_args, callee_id: expr_id)
+        self.reading_const = false
+        // The value is the caller's, like any call's.
+        return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // Whether calling `callee_id` calls the function a constant or variable holds.
+    func const_func_value(self, anon callee_id: int64) -> bool {
+        if self.reading_const {
+            return false
+        }
+        if self.const_signature(callee_id) is Some(sig) and sig.return_kind is .KFunc(_params, _ret) {
+            return true
+        }
+        return false
+    }
+
+    // A constant has no side effects, and reading a variable may run its initializer.
+    func check_const_use(self, anon expr_id: int64, sig: SigInfo) -> none {
+        if self.in_const_body and self.sig_is_var(sig) {
+            let name = sig.src_p.func_decls[sig.decl_id].name
+            self.report_error(f"error: a module-level constant can't use the variable `{name}`", span: self.p.expr_spans[expr_id])
+        }
     }
 
     // Whether `expr_id` is a use of a module-level constant, by name (`NAME`) or through an
@@ -8059,9 +8109,8 @@ type Codegen = struct {
                 return .VStrLbl(page: lbl)
             }
             .Ident(name) -> {
-                if self.const_signature(expr_id) is Some(_const_sig) {
-                    let no_args: [ast.CallArg] = []
-                    return self.compile_call(no_args, callee_id: expr_id)
+                if self.const_signature(expr_id) is Some(const_sig) {
+                    return self.read_const(expr_id, sig: const_sig)
                 }
                 let i = self.var_index(name)
                 if i < 0 {
@@ -8144,9 +8193,8 @@ type Codegen = struct {
                     self.queue_func_instance(idx, span: self.p.expr_spans[expr_id])
                     return self.fn_value(self.func_insts[idx].label)
                 }
-                if op is .Dot and self.const_signature(expr_id) is Some(_const_sig) {
-                    let no_args: [ast.CallArg] = []
-                    return self.compile_call(no_args, callee_id: expr_id)
+                if op is .Dot and self.const_signature(expr_id) is Some(const_sig) {
+                    return self.read_const(expr_id, sig: const_sig)
                 }
                 if op is .Dot {
                     let slot = self.module_fn_value(expr_id)
@@ -11261,6 +11309,9 @@ type Codegen = struct {
                         return .VImm(value: 0)
                     }
                 }
+                if self.const_func_value(callee_id) {
+                    return self.compile_indirect_call(:callee_id, :args)
+                }
                 let slot = self.lookup_func(name)
                 if slot != -1 {
                     let sig = self.fn_sig(slot)
@@ -11334,6 +11385,9 @@ type Codegen = struct {
                         }
                     }
                     .Dot -> {
+                        if self.const_func_value(callee_id) {
+                            return self.compile_indirect_call(:callee_id, :args)
+                        }
                         if self.try_three_part_construct(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
                         }
@@ -12388,6 +12442,9 @@ type Codegen = struct {
                                 return var_ret
                             }
                         }
+                        if self.const_signature(callee) is Some(csig) and csig.return_kind is .KFunc(_cp, const_ret) {
+                            return const_ret
+                        }
                         let enum_idx = self.find_enum_idx(name)
                         if enum_idx >= 0 {
                             return self.ctor_kind(enum_idx)
@@ -12405,6 +12462,9 @@ type Codegen = struct {
                     .Binary(call_lhs, call_op, call_rhs) -> {
                         match call_op {
                             .Dot -> {
+                                if self.const_signature(callee) is Some(csig) and csig.return_kind is .KFunc(_cp, const_ret) {
+                                    return const_ret
+                                }
                                 if self.method_call_return_kind(callee_lhs: call_lhs, callee_rhs: call_rhs, :args) is Some(k) {
                                     return k
                                 }
@@ -14311,6 +14371,10 @@ type Codegen = struct {
     }
 
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
+        if self.var_signature(lhs_id) is Some(sig) {
+            self.compile_var_store(sig, lhs_id: lhs_id, rhs_id: rhs_id)
+            return
+        }
         match self.p.exprs[lhs_id] {
             .Ident(name) -> {
                 if not self.var_declared(name) {
@@ -14351,6 +14415,97 @@ type Codegen = struct {
             }
             else self.report_error("error: cannot assign to this expression", span: self.p.expr_spans[lhs_id])
         }
+    }
+
+    // `NAME = value` for a module-level variable: the first use runs its initializer (the
+    // read, whose value is dropped), then the value goes into the variable's cell.
+    func compile_var_store(self, anon sig: SigInfo, lhs_id: int64, rhs_id: int64) -> none {
+        let decl = sig.src_p.func_decls[sig.decl_id]
+        if sig.src_p.path != self.p.path {
+            self.report_error(f"error: `{decl.name}` can only be assigned in {sig.src_p.path}", span: self.p.expr_spans[lhs_id])
+            return
+        }
+        let kind = sig.return_kind
+        let read = self.compile_expr(lhs_id)
+        // The statement owns the value read until it ends; its register is free now.
+        self.rc_flush_pending()
+        if read is .VReg(name) {
+            self.pool.free_reg(name)
+        }
+        let stashed = self.stash_operand_as(rhs_id, :kind)
+        if not self.is_match_expr(rhs_id) {
+            self.check_value_kind(rhs_id, expected: kind)
+        }
+        let .Ident(tmp) = self.p.exprs[stashed] else { return }
+        let reg = self.pool.alloc_reg()
+        self.emit_ldr(self.find_var_offset(tmp), :reg)
+        self.rc_retain_kind(reg, :kind)
+        let cell = f"${self.path_prefix}${decl.name}$cell"
+        self.emit(f"adrp x16, {cell}@PAGE")
+        self.emit(f"add x16, x16, {cell}@PAGEOFF")
+        if self.rc_heap_kind(kind) {
+            self.emit("ldr x17, [x16, #8]")
+            self.emit(f"str {reg}, [x16, #8]")
+            self.rc_release_x17()
+        } else {
+            self.emit(f"str {reg}, [x16, #8]")
+        }
+        self.pool.free_reg(reg)
+    }
+
+    // A module-level variable: its initializer as `NAME$init`, then the getter under the
+    // name itself, which runs the initializer at the first use, and the variable's cell,
+    // `{state, value}`: state 0 before the first use, 2 while the initializer runs, 1 after.
+    func compile_var(self, anon fd_id: int64) -> none {
+        let decl = self.p.func_decls[fd_id]
+        let lbl = f"${self.path_prefix}${decl.name}"
+        self.compile_func(:fd_id, struct_name: "", override_lbl: f"{lbl}$init")
+        let kind = self.resolve_type(decl.return_typ)
+        let cell = f"{lbl}$cell"
+        let ready = self.fresh("Lvar_ready")
+        let init = self.fresh("Lvar_init")
+        let cycle = self.fresh("Lvar_cycle")
+        let msg = self.intern_str(f"`{decl.name}` is used while its value is being worked out")
+        self.emit_globl(lbl)
+        self.emit_label(lbl)
+        self.emit("stp fp, lr, [sp, #-16]!")
+        self.emit("mov fp, sp")
+        self.emit(f"adrp x16, {cell}@PAGE")
+        self.emit(f"add x16, x16, {cell}@PAGEOFF")
+        self.emit("ldr x17, [x16]")
+        self.emit("cmp x17, #1")
+        self.emit(f"b.ne {init}")
+        self.emit_label(ready)
+        self.emit("ldr x0, [x16, #8]")
+        if self.rc_heap_kind(kind) {
+            self.emit("mov x17, x0")
+            self.emit("bl _rc_retain_stub")
+        }
+        self.emit("ldp fp, lr, [sp], #16")
+        self.emit("ret")
+        self.emit_label(init)
+        self.emit(f"cbnz x17, {cycle}")
+        self.emit("mov x17, #2")
+        self.emit("str x17, [x16]")
+        // The initializer's reference becomes the cell's.
+        self.emit(f"bl {lbl}$init")
+        self.emit(f"adrp x16, {cell}@PAGE")
+        self.emit(f"add x16, x16, {cell}@PAGEOFF")
+        self.emit("str x0, [x16, #8]")
+        self.emit("mov x17, #1")
+        self.emit("str x17, [x16]")
+        self.emit(f"b {ready}")
+        self.emit_label(cycle)
+        self.emit(f"adrp x0, {msg}@PAGE")
+        self.emit(f"add x0, x0, {msg}@PAGEOFF")
+        self.emit("bl _kod_panic")
+        self.println("\t.data")
+        self.println("\t.p2align 3")
+        self.println(f"{cell}:")
+        self.println("\t.quad 0")
+        self.println("\t.quad 0")
+        self.println("\t.text")
+        self.emit_symtab_entry(lbl, name: decl.name, file: self.p.path, line: self.line_of_offset(decl.name_span.start))
     }
 
     func find_field_kind(self, anon field_name: str, struct_idx: int64) -> TypeKind {
@@ -15757,6 +15912,7 @@ type Codegen = struct {
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.in_func_literal = self.is_lambda_name(func_decl.name)
+        self.in_const_body = func_decl.is_const and not func_decl.is_var
         self.lit_let_name = self.source_name(func_decl.let_name)
         let lit_env = self.lit_env
         self.lit_env = none
@@ -16094,7 +16250,9 @@ type Codegen = struct {
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> {
-                    if len(self.p.func_decls[decl_id].type_params) == 0 {
+                    if self.p.func_decls[decl_id].is_var {
+                        self.compile_var(decl_id)
+                    } else if len(self.p.func_decls[decl_id].type_params) == 0 {
                         self.compile_func(fd_id: decl_id, struct_name: "", override_lbl: "")
                     }
                 }

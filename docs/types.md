@@ -126,6 +126,48 @@ module. A constant can't be assigned.
 The value is worked out at each use, like a [default](functions.md#default-values), so an
 array constant is a new array every time, and nothing is shared between uses.
 
+## Module-level variables
+
+A `mut` at the top level of a module names a variable that every function of the
+program shares. Like a constant, it needs a type:
+
+```kod
+mut calls: int64 = 0
+mut seen: Map[str, bool] = Map[str, bool]()
+mut log_lines: [str] = []
+
+func remember(anon name: str) -> bool {
+    calls += 1
+    if seen.contains(name) {
+        return false
+    }
+    seen.set(name, true)
+    log_lines += [name]
+    return true
+}
+```
+
+The value can be any expression, calls included. It is worked out once, the first time
+the program uses the variable (reads it or assigns it), so a variable nothing uses costs
+nothing, and the order in which modules are declared or imported doesn't matter. A value
+that needs its own variable to be worked out first, directly or through a function it
+calls, stops the program with ``panic: `calls` is used while its value is being worked
+out``.
+
+Another module reads a variable the way it reads a constant (`import "stats" { calls }`
+or `stats.calls`), but only the declaring module assigns it: `` `calls` can only be
+assigned in stats.kod ``. A value the variable holds can still be changed through
+its methods, fields and elements from anywhere (`stats.seen.set(...)`), as with any
+reference. A name that starts with `_` keeps the variable private to its module. A local of the same name
+hides it, and a variable, constant or function can't share a name in one module. A
+constant can't use a variable, since a constant has no side effects
+(`` a module-level constant can't use the variable `calls` ``). A variable or constant
+that holds a function is called like one: `mut on_error: func(str) -> none = log`, then
+`on_error("disk full")`.
+
+Tests run in one program, one after another, so a test sees what the tests
+before it left in a module-level variable.
+
 ## Primitive types
 
 | Type | Description | Example |

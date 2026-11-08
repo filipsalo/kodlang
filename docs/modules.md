@@ -65,7 +65,7 @@ To have both, import the module twice: `import "./math/vec"` binds `vec`
 and `import "./math/vec" { Vec2 }` adds `Vec2`, and then no local can be
 named `vec`.
 
-Each listed name must be a function, extern, constant or type the module declares; otherwise it's an error with a did-you-mean hint: `` module `vec` has no function, constant or type `dto`; did you mean `dot`? ``.
+Each listed name must be a function, extern, constant, variable or type the module declares; otherwise it's an error with a did-you-mean hint: `` module `vec` has no function, constant or type `dto`; did you mean `dot`? ``.
 
 ## Where names resolve
 
@@ -184,7 +184,7 @@ The same error is reported for `lib._LIMIT`, `lib._Slot(...)`, `lib._Slot` in a 
 
 A private name keeps a helper out of the module's interface, so the module can change or remove it without breaking its importers. A public function may still take or return a private type: callers can use such a value, its fields and its methods, but can't write the type's name. Fields and methods whose names start with `_` are private to their struct; see [Structs](structs.md#private-fields).
 
-A module's top level holds declarations (`func`, `type`, `interface`, `import`, `extern` and `test`) and constants (`let NAME: T = value`, see [Module-level constants](types.md#module-level-constants)). A top-level `mut` and any statement there are an error. A constant is visible to importing modules like a function.
+A module's top level holds declarations (`func`, `type`, `interface`, `import`, `extern` and `test`) constants (`let NAME: T = value`, see [Module-level constants](types.md#module-level-constants)) and variables (`mut NAME: T = value`, see [Module-level variables](types.md#module-level-variables)). Any statement there is an error. Constants and variables are visible to importing modules like functions, and only the declaring module assigns a variable.
 
 ## Symbol and object names
 

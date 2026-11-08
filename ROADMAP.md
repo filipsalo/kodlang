@@ -13,8 +13,8 @@ The language has structs, enums with payloads, `match` (statement and expression
 exhaustiveness checks, nested patterns and guards), generic types and functions
 (monomorphised), interfaces, `T?`, `T or Error` with `try` / `must`, unions (`A | B`, with
 `==` and type patterns), narrowing after `is` and after an early exit, function values
-and closures that capture enclosing locals, `str` / `bytes` / dynamic arrays, and `test`
-blocks. Memory is reference counted (cycles leak; see
+and closures that capture enclosing locals, module-level constants and variables, `str` /
+`bytes` / dynamic arrays, and `test` blocks. Memory is reference counted (cycles leak; see
 [Memory layout](docs/memory-layout.md)). The stdlib covers file and process I/O, `Map` /
 `Set`, sorting, time, CRC-32, deflate / gzip and inflate (all in Kod), JSON, base64, TCP,
 TLS, an HTTP/1.1 client, and LSP-style JSON-RPC framing.
@@ -59,8 +59,8 @@ codegen bugs that this kind of code is most likely to hit.
 
 - Unions as `Map` keys (they compare with `==`, but don't hash yet).
 - Reference cycles: a cycle collector, or weak references.
-- Module-level mutable state, which the test runner and other runtime pieces need
-  before they can move from C to Kod.
+- The test runner and other runtime pieces in C can move to Kod now that modules have
+  variables (compiler sources and primitives can use them after a snapshot refresh).
 - Fewer C pieces: float printing and parsing, and TLS. SecureTransport is deprecated
   and stops at TLS 1.2; the options are Network.framework from C, or TLS 1.3 written in
   Kod (hashes, AES-GCM, X25519, X.509), a much larger job.
