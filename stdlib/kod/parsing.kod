@@ -455,6 +455,9 @@ type Parser = struct {
 	// pattern binding) and where its name starts, for codegen's checks.
 	// Whether the arm's patterns just parsed have a guard after them.
 	arm_guarded: bool = false
+	// Set by parse_match_arm_patterns when an arm had no `->`: the rest of it was
+	// skipped, so the caller adds no arm for it.
+	arm_broken: bool = false
 	binding_names: [str] = []
 	binding_starts: [int64] = []
 	// The guard the statement just parsed set up (see fold_guards): the match
@@ -1695,6 +1698,10 @@ type Parser = struct {
 				break
 			}
 			let pats: [int64] = self.parse_match_arm_patterns()
+			if self.arm_broken {
+				self.skip_newlines()
+				continue
+			}
 			let guarded = self.arm_guarded
 			let body_pos = self.pos
 			let errors_before = len(self.errors)
@@ -1791,13 +1798,18 @@ type Parser = struct {
 	// once for each, so each is its own statements, as with an `else` body.
 	func parse_match_arm_patterns(self) -> [int64] {
 		self.arm_guarded = false
+		self.arm_broken = false
 		if self.try_consume(.KwElse) {
 			self.try_consume(.Arrow)
 			return [self.alloc_pattern(ast.Pattern.Wildcard)]
 		}
 		mut pats: [int64] = [self.parse_pattern()]
 		let bar_tok: lexing.Token = self.peek()
-		for self.try_consume(.Pipe) {
+		for self.at(.Pipe) or self.at(.Comma) {
+			if self.at(.Comma) {
+				self.record_error("error: alternatives in a match arm are joined by `|`, not `,`: `.A | .B -> ...`", got: self.peek())
+			}
+			self.advance()
 			self.skip_newlines()
 			pats += [self.parse_pattern()]
 		}
@@ -1813,8 +1825,37 @@ type Parser = struct {
 			self.arm_guarded = true
 			return pats
 		}
-		self.expect(.Arrow)
+		if not self.at(.Arrow) {
+			// Read on as if the arm were well formed and the rest of the match, and
+			// what follows it, comes out as errors too; skip to the `->` or the
+			// end of the arm instead.
+			self.record_unexpected(expected: lexing.kind_name(.Arrow), got: self.peek())
+			self.skip_rest_of_arm()
+			if not self.at(.Arrow) {
+				self.arm_broken = true
+				return pats
+			}
+		}
+		self.advance()
 		return pats
+	}
+
+	// Skips to a `->`, the end of the line or the `}` that ends the match, past any
+	// brackets in between.
+	func skip_rest_of_arm(self) -> none {
+		mut depth: int64 = 0
+		for not self.at(.EOF) {
+			let kind = self.peek_kind()
+			if depth == 0 and (kind == .Arrow or kind == .EOL or kind == .CloseCurly) {
+				return
+			}
+			if kind == .OpenCurly or kind == .OpenParen or kind == .OpenBracket {
+				depth += 1
+			} else if kind == .CloseCurly or kind == .CloseParen or kind == .CloseBracket {
+				depth -= 1
+			}
+			self.advance()
+		}
 	}
 
 	func pattern_binds(self, anon pat: int64) -> bool {
@@ -2552,6 +2593,10 @@ type Parser = struct {
 					break
 				}
 				let pats: [int64] = self.parse_match_arm_patterns()
+				if self.arm_broken {
+					self.skip_newlines()
+					continue
+				}
 				let guarded = self.arm_guarded
 				let body_pos = self.pos
 				let errors_before = len(self.errors)
