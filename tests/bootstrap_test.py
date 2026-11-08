@@ -32,12 +32,30 @@ def test_without_a_snapshot_make_says_how_to_restore_it(tmp_path):
     assert f"{missing} not found; restore it with: git checkout" in result.stderr
 
 
+def recipe(target: str) -> list[str]:
+    """`target`'s prerequisites, then its recipe lines, as the Makefile has them."""
+    lines = (ROOT / "Makefile").read_text().splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith(f"{target}:"))
+    body = [lines[at].split(":", 1)[1].strip()]
+    for line in lines[at + 1 :]:
+        if not line.startswith("\t"):
+            break
+        body.append(line.strip())
+    return body
+
+
 def test_a_refresh_replaces_the_snapshot_only_after_the_checks():
-    recipe = make("-n", "bootstrap-snapshot")
-    assert recipe.returncode == 0, recipe.stderr
-    out = recipe.stdout
+    # The checks are a prerequisite. They aren't dry-run: under `make -n` a
+    # recursive `$(MAKE)` still runs, and stage 3 would need a stage-2 compiler
+    # that a dry run never builds.
+    assert "selfhost-check" in recipe("bootstrap-snapshot")[0].split()
+    assert any(
+        "tools/asm_diff.py --compilers" in line for line in recipe("selfhost-check")
+    )
+    dry = make("-n", "-o", "selfhost-check", "bootstrap-snapshot")
+    assert dry.returncode == 0, dry.stderr
+    out = dry.stdout
     assert "rm -f bootstrap/sh_kodc" not in out
     assert "cp build/selfhost/stage2/stage1/sh_kodc bootstrap/sh_kodc.new" in out
     replace = out.index("mv bootstrap/sh_kodc.new bootstrap/sh_kodc")
     assert out.index("cmp build/selfhost/stage2/stage1/sh_kodc") < replace
-    assert out.index("tools/asm_diff.py --compilers") < replace
