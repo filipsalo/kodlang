@@ -386,7 +386,9 @@ Operators don't look inside an optional. With `n: int64?`, `n == 3`,
 
 On a struct `T?`, `x?.field` and `x?.method(...)` evaluate to an optional
 of the field or return type, and to `none` without touching the field
-when `x` is `none`. `x?.method(...)` takes arguments like an ordinary
+when `x` is `none`. A field or return type that is already optional stays
+one level deep, so chains read through: with `a: A?` whose `b: B?` has
+`n: int64?`, `a?.b?.n` is an `int64?`. `x?.method(...)` takes arguments like an ordinary
 method call: arguments it leaves out take the method's
 [defaults](functions.md#default-values), and none of them is evaluated
 when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
