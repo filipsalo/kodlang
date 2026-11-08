@@ -85,13 +85,21 @@ type SigInfo = struct {
     type_args: [TypeKind] = []
 }
 
-// `m.T`, with `m` an import.
 // A saved shared_const_id and its path; see Codegen.share_begin.
 type ConstShare = struct {
     id: int64
     path: str
 }
 
+// The module `self.p` reads and what type parameters resolve to (see
+// Codegen.subst_names), saved by `context` or `enter` and put back by `leave`.
+type TypeContext = struct {
+    p: parsing.Parser
+    names: [str]
+    args: [TypeKind]
+}
+
+// `m.T`, with `m` an import.
 type ModuleMember = struct {
     alias: str
     member: str
@@ -3876,18 +3884,11 @@ type Codegen = struct {
         if self.has_bad_key(s) {
             return
         }
-        let saved_p = self.p
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
-        self.p = s.src_p
-        self.subst_names = self.structs[s.template_idx].type_param_names
-        self.subst_args = s.template_args
+        let saved_ctx = self.enter(s.src_p, names: self.structs[s.template_idx].type_param_names, args: s.template_args)
         self.body_instance = inst.owner
         self.compile_func(fd_id: inst.decl_id, struct_name: s.name, override_lbl: "", owner: inst.owner)
         self.body_instance = -1
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
     }
 
     // Register a (struct, interface) pair so its vtable is emitted at the
@@ -4119,12 +4120,7 @@ type Codegen = struct {
     func add_scope_fn(self, anon si: int64, anon key: str, decl_idx: int64, lambda_id: int64) -> int64 {
         let s = self.scopes[si]
         // Resolved outside any generic body that happens to look it up first.
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
-        let no_names: [str] = []
-        let no_args: [TypeKind] = []
-        self.subst_names = no_names
-        self.subst_args = no_args
+        let saved_ctx = self.enter(self.p, names: [], args: [])
         mut fd_id = lambda_id
         mut k = -1
         if decl_idx >= 0 {
@@ -4140,8 +4136,7 @@ type Codegen = struct {
             let fd = s.p.func_decls[fd_id]
             k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: f"${s.prefix}${key}", sig: self.resolve_sig(fd_id, p: s.p), def_path: s.path, def_span: fd.name_span))
         }
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
         return k
     }
 
@@ -5069,12 +5064,7 @@ type Codegen = struct {
         let insts = self.struct_insts
         insts.set(key, new_idx)
         self.note_bad_key(new_idx)
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
-        let saved_p = self.p
-        self.subst_names = template.type_param_names
-        self.subst_args = type_args
-        self.p = template.src_p
+        let saved_ctx = self.enter(template.src_p, names: template.type_param_names, args: type_args)
         self.inst_depth += 1
         mut cloned_fields: [FieldInfo] = []
         for field in template.fields {
@@ -5085,9 +5075,7 @@ type Codegen = struct {
         // Re-resolve each method's sig with the new substitution context.
         self.structs[new_idx].methods = self.resolve_method_infos(template.methods, p: template.src_p)
         self.inst_depth -= 1
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
         if self.inst_depth == 0 {
             self.report_bad_keys(new_idx, shown: self.struct_display_name(new_idx), args: type_args, :arg_spans, :whole)
         }
@@ -5671,12 +5659,7 @@ type Codegen = struct {
         self.enum_idx.set(canonical, new_idx)
         let insts = self.enum_insts
         insts.set(key, new_idx)
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
-        let saved_p = self.p
-        self.subst_names = template.type_param_names
-        self.subst_args = type_args
-        self.p = template.src_p
+        let saved_ctx = self.enter(template.src_p, names: template.type_param_names, args: type_args)
         self.inst_depth += 1
         mut new_variants: [VariantInfo] = []
         for v in template.variants {
@@ -5688,9 +5671,7 @@ type Codegen = struct {
         }
         self.enums[new_idx].variants = new_variants
         self.inst_depth -= 1
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
         if self.inst_depth == 0 {
             self.report_bad_keys(-1, shown: self.enum_display_name(new_idx), args: type_args, :arg_spans, :whole)
         }
@@ -5729,9 +5710,7 @@ type Codegen = struct {
     // A generic function's parameters resolve to `type_args`, or else to unknown kinds.
     func resolve_sig(self, anon decl_id: int64, p: parsing.Parser, type_args: [TypeKind] = []) -> SigInfo {
         let func_decl = p.func_decls[decl_id]
-        let saved_p = self.p
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
+        let saved_ctx = self.context()
         self.bind_func_type_params(func_decl.type_params, :type_args)
         self.p = p
         mut param_kinds: [TypeKind] = []
@@ -5749,9 +5728,7 @@ type Codegen = struct {
             param_default_exprs += [param.default_expr]
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
         return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :decl_id, type_params: func_decl.type_params, :type_args)
     }
 
@@ -6651,10 +6628,8 @@ type Codegen = struct {
         match decl {
             .Enum(name, name_span, type_params, variants) -> {
                 self.check_builtin_type_name(name, :p, span: name_span)
-                let saved_p = self.p
+                let saved_ctx = self.context()
                 self.p = p
-                let saved_names = self.subst_names
-                let saved_args = self.subst_args
                 self.bind_type_params_unknown(type_params)
                 mut variant_infos: [VariantInfo] = []
                 // Discriminants start at 1, not 0. Disc 0 is reserved
@@ -6683,9 +6658,7 @@ type Codegen = struct {
                     variant_infos += [VariantInfo(name: variant.name, discriminant: disc, :field_names, :field_offsets, :field_kinds, :field_type_exprs)]
                     disc = disc + 1
                 }
-                self.p = saved_p
-                self.subst_names = saved_names
-                self.subst_args = saved_args
+                self.leave(saved_ctx)
                 let data_width = 8 + max_payload
                 let no_template_args: [TypeKind] = []
                 self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args, key: f"{p.path}:{name}")]
@@ -6694,6 +6667,27 @@ type Codegen = struct {
             }
             else none
         }
+    }
+
+    // The current module and type-parameter bindings, for `leave` to put back.
+    func context(self) -> TypeContext {
+        return TypeContext(p: self.p, names: self.subst_names, args: self.subst_args)
+    }
+
+    // Switches to module `p` with `names` bound to `args`, and returns what was
+    // there before for `leave`.
+    func enter(self, anon p: parsing.Parser, names: [str], args: [TypeKind]) -> TypeContext {
+        let saved = self.context()
+        self.p = p
+        self.subst_names = names
+        self.subst_args = args
+        return saved
+    }
+
+    func leave(self, anon saved: TypeContext) -> none {
+        self.p = saved.p
+        self.subst_names = saved.names
+        self.subst_args = saved.args
     }
 
     // A template's own type parameters have no kind until it's instantiated.
@@ -6717,10 +6711,8 @@ type Codegen = struct {
                 mut offset = 0
                 // Temporarily swap parser so resolve_type reads field type
                 // expressions from p (the source module's parser), not self.p.
-                let saved_p = self.p
+                let saved_ctx = self.context()
                 self.p = p
-                let saved_names = self.subst_names
-                let saved_args = self.subst_args
                 self.bind_type_params_unknown(type_params)
                 for field in fields {
                     mut field_kind = self.resolve_type(field.typ)
@@ -6730,7 +6722,7 @@ type Codegen = struct {
                 // Restore parser before resolve_sig (which swaps to p
                 // internally). One pass: append the fully-built MethodInfo
                 // and record its position in method_idx in the same step.
-                self.p = saved_p
+                self.p = saved_ctx.p
                 mut method_idx: FuncIdx = FuncIdx()
                 mut method_infos: [MethodInfo] = []
                 mut mi: int64 = 0
@@ -6741,8 +6733,7 @@ type Codegen = struct {
                     method_idx.set(func_decl.name, mi)
                     mi = mi + 1
                 }
-                self.subst_names = saved_names
-                self.subst_args = saved_args
+                self.leave(saved_ctx)
                 let no_template_args: [TypeKind] = []
                 self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span, key: f"{p.path}:{name}")]
                 self.struct_idx.set(name, len(self.structs) - 1)
@@ -6996,9 +6987,7 @@ type Codegen = struct {
                 i = i + 1
                 continue
             }
-            let saved_p = self.p
-            let saved_names = self.subst_names
-            let saved_args = self.subst_args
+            let saved_ctx = self.context()
             self.p = s.src_p
             // Monomorphised structs need the template's substitution context
             // restored before re-resolving — otherwise a field like `[K]`
@@ -7018,9 +7007,7 @@ type Codegen = struct {
                 new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr, default_expr: f.default_expr)]
             }
             self.structs[i].fields = new_fields
-            self.p = saved_p
-            self.subst_names = saved_names
-            self.subst_args = saved_args
+            self.leave(saved_ctx)
             i = i + 1
         }
     }
@@ -7039,9 +7026,7 @@ type Codegen = struct {
                 i = i + 1
                 continue
             }
-            let saved_p = self.p
-            let saved_names = self.subst_names
-            let saved_args = self.subst_args
+            let saved_ctx = self.context()
             self.p = self.enums[i].src_p
             // Monomorphised enums need the template's substitution context
             // restored — same reason as resolve_field_kinds for structs.
@@ -7059,9 +7044,7 @@ type Codegen = struct {
                 new_variants += [VariantInfo(name: v.name, discriminant: v.discriminant, field_names: v.field_names, field_offsets: v.field_offsets, field_kinds: new_kinds, field_type_exprs: v.field_type_exprs)]
             }
             self.enums[i].variants = new_variants
-            self.p = saved_p
-            self.subst_names = saved_names
-            self.subst_args = saved_args
+            self.leave(saved_ctx)
             i = i + 1
         }
     }
@@ -7075,16 +7058,14 @@ type Codegen = struct {
                 i = i + 1
                 continue
             }
-            let saved_names = self.subst_names
-            let saved_args = self.subst_args
+            let saved_ctx = self.context()
             if s.template_idx >= 0 {
                 let template = self.structs[s.template_idx]
                 self.subst_names = template.type_param_names
                 self.subst_args = s.template_args
             }
             self.structs[i].methods = self.resolve_method_infos(s.methods, p: s.src_p)
-            self.subst_names = saved_names
-            self.subst_args = saved_args
+            self.leave(saved_ctx)
             i = i + 1
         }
         for j in iface_start..len(self.interfaces) {
@@ -7684,11 +7665,9 @@ type Codegen = struct {
 
     // Locals are named so a call of one isn't taken for a same-named function.
     func body_never_returns(self, anon sig: SigInfo, owner: int64) -> bool {
-        let saved_p = self.p
+        let saved_ctx = self.context()
         let saved_vars = self.vars
         let saved_slots = self.frame_slots
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
         let saved_log = self.bound_log
         let saved_walk = self.untyped_walk
         let saved_walk_slots = self.walk_slots
@@ -7737,11 +7716,9 @@ type Codegen = struct {
         }
         self.naming_locals = false
         let never = not self.block_has_return(fd.body) and not self.walk_completes(fd.body)
-        self.p = saved_p
+        self.leave(saved_ctx)
         self.vars = saved_vars
         self.frame_slots = saved_slots
-        self.subst_names = saved_names
-        self.subst_args = saved_args
         self.bound_log = saved_log
         self.untyped_walk = saved_walk
         self.walk_slots = saved_walk_slots
@@ -12202,12 +12179,10 @@ type Codegen = struct {
                 }
                 self.rc_hold(args[ai].value, reg: arg_reg)
             } else {
-                let saved_names = self.subst_names
-                let saved_args = self.subst_args
+                let saved_ctx = self.context()
                 self.bind_func_type_params(type_params, :type_args)
                 arg_reg = self.compile_default(default_exprs[i], expected: expected_kinds[i], :src_p)
-                self.subst_names = saved_names
-                self.subst_args = saved_args
+                self.leave(saved_ctx)
             }
             self.emit(f"str {arg_reg}, [sp, #{i * 8}]")
             self.pool.free_reg(arg_reg)
@@ -13874,9 +13849,7 @@ type Codegen = struct {
         // live in the struct's defining module (src_p) and, for a
         // monomorphised instance, resolve under the template's
         // type-parameter substitution — swap both in, then restore.
-        let saved_p = self.p
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
+        let saved_ctx = self.context()
         self.p = self.structs[struct_idx].src_p
         if self.structs[struct_idx].template_idx >= 0 {
             self.subst_names = self.structs[self.structs[struct_idx].template_idx].type_param_names
@@ -13903,9 +13876,7 @@ type Codegen = struct {
             }
             fi = fi + 1
         }
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
         self.emit(f"mov x0, {ptr_r}")
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
@@ -16058,18 +16029,11 @@ type Codegen = struct {
     // `owner` is the struct whose method this is, or -1.
     func compile_func_instance(self, anon idx: int64) -> none {
         let inst = self.func_insts[idx]
-        let saved_p = self.p
-        let saved_names = self.subst_names
-        let saved_args = self.subst_args
-        self.p = inst.sig.src_p
-        self.subst_names = inst.sig.type_params
-        self.subst_args = inst.sig.type_args
+        let saved_ctx = self.enter(inst.sig.src_p, names: inst.sig.type_params, args: inst.sig.type_args)
         self.body_func_inst = idx
         self.compile_func(fd_id: inst.sig.decl_id, struct_name: "", override_lbl: inst.label)
         self.body_func_inst = -1
-        self.p = saved_p
-        self.subst_names = saved_names
-        self.subst_args = saved_args
+        self.leave(saved_ctx)
     }
 
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1) -> none {
