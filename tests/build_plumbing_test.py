@@ -2322,6 +2322,26 @@ def test_two_vtables_whose_paths_spell_one_label_stay_apart():
         assert run_from_root(root / "main.kod") == ["first S", "second S"]
 
 
+def test_a_method_and_a_function_whose_paths_spell_one_label_stay_apart():
+    # `T.m` in `x.kod` and `m` in `x/T.kod` were both `$<dir>$x$T$m`.
+    (ROOT / "build").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ROOT / "build", prefix="vt") as tmp:
+        root = Path(tmp)
+        write_modules(
+            root,
+            {
+                "x.kod": "type T = struct {\n    v: int64\n"
+                "    func m(self) -> int64 {\n        return self.v\n    }\n}\n",
+                "x/T.kod": "func m() -> int64 {\n    return 7\n}\n",
+                "main.kod": 'import "./x"\nimport "./x/T"\n'
+                "func main() -> int64 {\n"
+                '    print(f"{x.T(v: 1).m()} {T.m()}")\n'
+                "    return 0\n}\n",
+            },
+        )
+        assert run_from_root(root / "main.kod") == ["1 7"]
+
+
 def test_an_instance_and_a_type_whose_paths_spell_one_label_stay_apart():
     # `Box[x.S]` and the `S` of a directory path that spells it had one
     # identity word, so `is` took one for the other.
