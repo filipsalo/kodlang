@@ -60,7 +60,7 @@ codegen bugs that this kind of code is most likely to hit.
 - Reference cycles: a cycle collector, or weak references.
 - More runtime pieces in C can move to Kod now that modules have variables, as the test
   runner has (compiler sources and primitives can use them after a snapshot refresh).
-- Fewer C pieces: float printing and parsing, and TLS. SecureTransport is deprecated
+- Fewer C pieces: TLS. SecureTransport is deprecated
   and stops at TLS 1.2; the options are Network.framework from C, or TLS 1.3 written in
   Kod (hashes, AES-GCM, X25519, X.509), a much larger job.
 - A conditional branch over ±1 MB inside one function is an assembler error.

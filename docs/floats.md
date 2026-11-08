@@ -61,11 +61,19 @@ array element (`[float64]`), optional (`float64?`) or a type argument
 | `x.abs()` `x.floor()` `x.ceil()` `x.round()` `x.sqrt()` | the `float64` they name; `round` rounds halves away from zero |
 | `x.is_nan()` `x.is_inf()` | `bool` |
 
-`to_str` gives the fewest digits that parse back to exactly `x`, and always
-shows it is a float: `2.0`, not `2`. Magnitudes from `1e-6` up to `1e21` are
+`to_str` gives the fewest digits that parse back to exactly `x` (rounded half
+to even from its exact value, when more than one such text has that many
+digits), and always shows it is a float: `2.0`, not `2`. Magnitudes from `1e-6` up to `1e21` are
 written without an exponent (`0.000001`, `123456789.5`); outside that range as
 `1e+21` and `1.5e-7`. The special values are `inf`, `-inf` and `nan`. An
 f-string uses `to_str`; `print` takes a `str`, so write `print(x.to_str())`.
+
+`parse_float` gives the `float64` nearest the decimal value, however many
+digits it has; a value exactly halfway between two floats goes to the one whose
+last bit is 0. A value beyond the largest float is infinity, and one below half
+the smallest is zero, with the sign kept. Both directions are Kod, in
+`stdlib/primitives/float_text.kod`, with exact arithmetic on integers wider
+than 64 bits where a float can't be trusted.
 
 ```kod
 print((0.1 + 0.2).to_str())     // 0.30000000000000004

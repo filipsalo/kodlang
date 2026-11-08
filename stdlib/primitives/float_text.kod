@@ -1,0 +1,600 @@
+// Decimal text for float64, both ways, worked out exactly: the methods
+// float64.to_str and str.parse_float call these. Numbers that need more than
+// an int64 are held as arrays of 30-bit limbs, least significant first, with
+// no zero limb on top (zero is the empty array).
+
+extern func kod_f64_bits(anon x: float64) -> int64
+extern func kod_f64_from_bits(anon bits: int64) -> float64
+
+let _LIMB_BITS: int64 = 30
+let _LIMB_MASK: int64 = 1073741823
+// 2^52: the bit a normal float64 has above its stored fraction.
+let _HIDDEN: int64 = 4503599627370496
+let _POW10: [int64] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+// Every power of ten up to 10^22 is exact in a float64.
+let _POW10F: [float64] = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0, 1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0, 1000000000000000000000.0, 10000000000000000000000.0]
+
+// The fewest digits that read back as exactly `x`, rounded correctly (half to
+// even) from its exact value, in plain decimal for magnitudes from 1e-6 up to
+// (not including) 1e21 and as d.ddde+X outside it; always with a point or an
+// exponent, so a float never reads as an integer.
+func format(anon x: float64) -> str {
+	let bits = kod_f64_bits(x)
+	let negative = bits < 0
+	let biased = (bits >> 52) & 2047
+	let frac = bits & (_HIDDEN - 1)
+	if biased == 2047 {
+		if frac != 0 {
+			return "nan"
+		}
+		if negative {
+			return "-inf"
+		}
+		return "inf"
+	}
+	if biased == 0 and frac == 0 {
+		if negative {
+			return "-0.0"
+		}
+		return "0.0"
+	}
+	mut f = frac
+	mut e: int64 = -1074
+	if biased > 0 {
+		f = frac + _HIDDEN
+		e = biased - 1075
+	}
+	// x is r / s; the values that read back as x are those within mm below it
+	// and mp above it, on the same scale. The ends count when f is even, since
+	// a tie rounds to the even neighbour.
+	let even = f % 2 == 0
+	mut r: [int64] = []
+	mut s: [int64] = []
+	mut mp: [int64] = []
+	mut mm: [int64] = []
+	if e >= 0 {
+		if f != _HIDDEN {
+			r = _big_shl(_big(f), e + 1)
+			s = _big(2)
+			mp = _big_shl(_big(1), e)
+			mm = mp
+		} else {
+			// The float below is half as far away as the one above.
+			r = _big_shl(_big(f), e + 2)
+			s = _big(4)
+			mp = _big_shl(_big(1), e + 1)
+			mm = _big_shl(_big(1), e)
+		}
+	} else if f != _HIDDEN or e == -1074 {
+		r = _big(f * 2)
+		s = _big_shl(_big(1), 1 - e)
+		mp = _big(1)
+		mm = mp
+	} else {
+		r = _big(f * 4)
+		s = _big_shl(_big(1), 2 - e)
+		mp = _big(2)
+		mm = _big(1)
+	}
+	// Scale so that 10^(k-1) <= x < 10^k: r / s is then 0.d1d2d3...
+	mut k = _floor_div((e + _bit_len(f) - 1) * 78913, 262144) + 1
+	if k >= 0 {
+		s = _big_mul_pow10(s, k)
+	} else {
+		r = _big_mul_pow10(r, -k)
+		mp = _big_mul_pow10(mp, -k)
+		mm = _big_mul_pow10(mm, -k)
+	}
+	for _big_cmp(r, s) >= 0 {
+		s = _big_mul_small(s, 10)
+		k += 1
+	}
+	for _big_cmp(_big_mul_small(r, 10), s) < 0 {
+		r = _big_mul_small(r, 10)
+		mp = _big_mul_small(mp, 10)
+		mm = _big_mul_small(mm, 10)
+		k -= 1
+	}
+	// One more digit at a time, until the digits so far, rounded, read back as x.
+	mut digits: [int64] = []
+	for true {
+		r = _big_mul_small(r, 10)
+		mp = _big_mul_small(mp, 10)
+		mm = _big_mul_small(mm, 10)
+		mut d: int64 = 0
+		for _big_cmp(r, s) >= 0 {
+			r = _big_sub(r, s)
+			d += 1
+		}
+		digits += [d]
+		let half = _big_cmp(_big_shl(r, 1), s)
+		let up = half > 0 or (half == 0 and d % 2 == 1)
+		mut close = false
+		if up {
+			let c = _big_cmp(_big_add(r, mp), s)
+			close = c > 0 or (c == 0 and even)
+		} else {
+			let c = _big_cmp(r, mm)
+			close = c < 0 or (c == 0 and even)
+		}
+		if close {
+			if up {
+				mut i = len(digits) - 1
+				digits[i] = digits[i] + 1
+				for i > 0 and digits[i] == 10 {
+					digits[i] = 0
+					i -= 1
+					digits[i] = digits[i] + 1
+				}
+				if digits[0] == 10 {
+					digits[0] = 1
+					k += 1
+				}
+			}
+			break
+		}
+	}
+	mut nd = len(digits)
+	for nd > 1 and digits[nd - 1] == 0 {
+		nd -= 1
+	}
+	let exp10 = k - 1
+	let sb = kod_sb_new()
+	if negative {
+		kod_sb_append_byte(sb, '-')
+	}
+	if exp10 >= -6 and exp10 < 21 {
+		if exp10 >= 0 {
+			for i in 0..exp10 + 1 {
+				if i < nd {
+					kod_sb_append_byte(sb, '0' + digits[i])
+				} else {
+					kod_sb_append_byte(sb, '0')
+				}
+			}
+			kod_sb_append_byte(sb, '.')
+			if nd > exp10 + 1 {
+				for i in exp10 + 1..nd {
+					kod_sb_append_byte(sb, '0' + digits[i])
+				}
+			} else {
+				kod_sb_append_byte(sb, '0')
+			}
+		} else {
+			kod_sb_append(sb, "0.")
+			for _ in 0..-exp10 - 1 {
+				kod_sb_append_byte(sb, '0')
+			}
+			for i in 0..nd {
+				kod_sb_append_byte(sb, '0' + digits[i])
+			}
+		}
+	} else {
+		kod_sb_append_byte(sb, '0' + digits[0])
+		if nd > 1 {
+			kod_sb_append_byte(sb, '.')
+			for i in 1..nd {
+				kod_sb_append_byte(sb, '0' + digits[i])
+			}
+		}
+		if exp10 < 0 {
+			kod_sb_append(sb, f"e-{0 - exp10}")
+		} else {
+			kod_sb_append(sb, f"e+{exp10}")
+		}
+	}
+	return kod_sb_to_str(sb)
+}
+
+// `s` as the nearest float64 (a tie goes to the even one) when it is a
+// decimal number: an optional sign, digits with an optional point (one digit
+// at least) and an optional exponent with digits; otherwise none. A value too
+// large for a float64 is infinity, and one too small is zero.
+func parse(anon s: str) -> float64? {
+	let n = len(s)
+	mut i: int64 = 0
+	mut negative = false
+	if i < n and (s[i] == '+' or s[i] == '-') {
+		negative = s[i] == '-'
+		i += 1
+	}
+	// The value is digits × 10^exp10, with the digits' leading zeros dropped.
+	mut digits: [int64] = []
+	mut seen: int64 = 0
+	mut exp10: int64 = 0
+	for i < n and _is_digit(s[i]) {
+		seen += 1
+		if len(digits) > 0 or s[i] != '0' {
+			digits += [s[i] - '0']
+		}
+		i += 1
+	}
+	if i < n and s[i] == '.' {
+		i += 1
+		for i < n and _is_digit(s[i]) {
+			seen += 1
+			if len(digits) > 0 or s[i] != '0' {
+				digits += [s[i] - '0']
+			}
+			exp10 -= 1
+			i += 1
+		}
+	}
+	if seen == 0 {
+		return none
+	}
+	if i < n and (s[i] == 'e' or s[i] == 'E') {
+		i += 1
+		mut exp_negative = false
+		if i < n and (s[i] == '+' or s[i] == '-') {
+			exp_negative = s[i] == '-'
+			i += 1
+		}
+		mut exp_digits: int64 = 0
+		mut exp: int64 = 0
+		for i < n and _is_digit(s[i]) {
+			exp_digits += 1
+			// Past this, the value is infinity or zero anyway.
+			if exp < 1000000 {
+				exp = exp * 10 + s[i] - '0'
+			}
+			i += 1
+		}
+		if exp_digits == 0 {
+			return none
+		}
+		if exp_negative {
+			exp = 0 - exp
+		}
+		exp10 += exp
+	}
+	if i != n {
+		return none
+	}
+	mut sign: int64 = 0
+	if negative {
+		sign = 1 << 63
+	}
+	mut nd = len(digits)
+	if nd == 0 {
+		return kod_f64_from_bits(sign)
+	}
+	for digits[nd - 1] == 0 {
+		nd -= 1
+		exp10 += 1
+	}
+	// 10^(nd + exp10 - 1) <= value < 10^(nd + exp10).
+	if nd + exp10 > 310 {
+		return kod_f64_from_bits(sign | (2047 << 52))
+	}
+	if nd + exp10 < -330 {
+		return kod_f64_from_bits(sign)
+	}
+	if nd <= 15 and exp10 >= -22 and exp10 <= 22 {
+		// The digits and the power of ten are both exact, so one rounding.
+		mut whole: int64 = 0
+		for j in 0..nd {
+			whole = whole * 10 + digits[j]
+		}
+		mut value = whole.to_float64()
+		if exp10 >= 0 {
+			value = value * _POW10F[exp10]
+		} else {
+			value = value / _POW10F[0 - exp10]
+		}
+		return kod_f64_from_bits(kod_f64_bits(value) | sign)
+	}
+	if nd <= 18 and exp10 >= -22 and exp10 <= 22 {
+		return kod_f64_from_bits(_refine(digits, nd: nd, exp10: exp10) | sign)
+	}
+	// value = a / b. Scale one of them by 2^k so that the quotient q has 54 or
+	// 55 bits; value is then q × 2^-k, plus a remainder that only matters as a
+	// tie-breaker.
+	mut a: [int64] = []
+	for j in 0..nd {
+		a = _big_add(_big_mul_small(a, 10), _big(digits[j]))
+	}
+	mut b = _big(1)
+	if exp10 >= 0 {
+		a = _big_mul_pow10(a, exp10)
+	} else {
+		b = _big_mul_pow10(b, 0 - exp10)
+	}
+	let k = 54 - (_big_bits(a) - _big_bits(b))
+	if k >= 0 {
+		a = _big_shl(a, k)
+	} else {
+		b = _big_shl(b, 0 - k)
+	}
+	mut q: int64 = 0
+	mut rem = a
+	mut step = _big_shl(b, 55)
+	for _ in 0..56 {
+		q = q << 1
+		if _big_cmp(rem, step) >= 0 {
+			rem = _big_sub(rem, step)
+			q = q | 1
+		}
+		step = _big_shr1(step)
+	}
+	// Drop the bits below the 53 a float64 keeps, or more below its smallest
+	// exponent, and round half to even.
+	mut drop = _bit_len(q) - 53
+	mut e2 = drop - k
+	if e2 < -1074 {
+		drop = drop + (-1074 - e2)
+		e2 = -1074
+	}
+	if drop > 56 {
+		return kod_f64_from_bits(sign)
+	}
+	mut m = q >> drop
+	let half = (q >> (drop - 1)) & 1
+	let below = (q & ((1 << (drop - 1)) - 1)) != 0 or len(rem) > 0
+	if half == 1 and (below or m % 2 == 1) {
+		m += 1
+	}
+	if m == 2 * _HIDDEN {
+		m = _HIDDEN
+		e2 += 1
+	}
+	if e2 > 971 {
+		return kod_f64_from_bits(sign | (2047 << 52))
+	}
+	if m < _HIDDEN {
+		return kod_f64_from_bits(sign | m)
+	}
+	return kod_f64_from_bits(sign | ((e2 + 1075) << 52) | (m - _HIDDEN))
+}
+
+// The bits of digits × 10^exp10 (at most 18 digits, an exponent within ±22):
+// a float estimate, at most an ulp or two off, moved to the neighbour while an
+// exact comparison with the midpoint between them says that is nearer.
+func _refine(anon digits: [int64], nd: int64, exp10: int64) -> int64 {
+	mut whole: int64 = 0
+	for j in 0..nd {
+		whole = whole * 10 + digits[j]
+	}
+	mut estimate = whole.to_float64()
+	if exp10 >= 0 {
+		estimate = estimate * _POW10F[exp10]
+	} else {
+		estimate = estimate / _POW10F[0 - exp10]
+	}
+	// value × 10^-exp10 × 2^-q against a midpoint (2m ± 1) × 2^(q-1), in integers:
+	// both sides times 2 × 10^-exp10 × 2^-q when those are negative powers.
+	mut value = _big(whole)
+	mut ten = _big(1)
+	if exp10 >= 0 {
+		value = _big_mul_pow10(value, exp10)
+	} else {
+		ten = _big_mul_pow10(ten, 0 - exp10)
+	}
+	mut bits = kod_f64_bits(estimate)
+	for _ in 0..8 {
+		let biased = (bits >> 52) & 2047
+		let m = (bits & (_HIDDEN - 1)) + _HIDDEN
+		let q = biased - 1075
+		let up = _cmp_scaled(value, ten: ten, mid: 2 * m + 1, shift: q - 1)
+		if up > 0 or (up == 0 and m % 2 == 1) {
+			bits += 1
+			continue
+		}
+		// The float below a power of two is half as far away.
+		mut down = 0
+		if m == _HIDDEN {
+			down = _cmp_scaled(value, ten: ten, mid: 4 * m - 1, shift: q - 2)
+		} else {
+			down = _cmp_scaled(value, ten: ten, mid: 2 * m - 1, shift: q - 1)
+		}
+		if down < 0 or (down == 0 and m % 2 == 1) {
+			bits -= 1
+			continue
+		}
+		break
+	}
+	return bits
+}
+
+// How value / ten compares with mid × 2^shift.
+func _cmp_scaled(anon value: [int64], ten: [int64], mid: int64, shift: int64) -> int64 {
+	mut lhs = value
+	mut rhs = _big_mul_big(_big(mid), ten)
+	if shift >= 0 {
+		rhs = _big_shl(rhs, shift)
+	} else {
+		lhs = _big_shl(lhs, 0 - shift)
+	}
+	return _big_cmp(lhs, rhs)
+}
+
+func _big_mul_big(anon a: [int64], anon b: [int64]) -> [int64] {
+	if len(b) == 1 {
+		return _big_mul_small(a, b[0])
+	}
+	mut out: [int64] = []
+	mut shift: int64 = 0
+	for limb in b {
+		if limb != 0 {
+			out = _big_add(out, _big_shl(_big_mul_small(a, limb), shift))
+		}
+		shift += _LIMB_BITS
+	}
+	return out
+}
+
+func _is_digit(anon b: int64) -> bool {
+	return b >= '0' and b <= '9'
+}
+
+func _floor_div(anon a: int64, anon b: int64) -> int64 {
+	let q = a / b
+	if a % b != 0 and a < 0 {
+		return q - 1
+	}
+	return q
+}
+
+func _bit_len(anon n: int64) -> int64 {
+	mut v = n
+	mut bits: int64 = 0
+	for v > 0 {
+		bits += 1
+		v = v >> 1
+	}
+	return bits
+}
+
+func _big(anon n: int64) -> [int64] {
+	mut out: [int64] = []
+	mut v = n
+	for v > 0 {
+		out += [v & _LIMB_MASK]
+		v = v >> _LIMB_BITS
+	}
+	return out
+}
+
+func _big_trim(anon a: [int64]) -> [int64] {
+	mut n = len(a)
+	for n > 0 and a[n - 1] == 0 {
+		n -= 1
+	}
+	if n == len(a) {
+		return a
+	}
+	return a[0..n]
+}
+
+func _big_bits(anon a: [int64]) -> int64 {
+	if len(a) == 0 {
+		return 0
+	}
+	return (len(a) - 1) * _LIMB_BITS + _bit_len(a[len(a) - 1])
+}
+
+func _big_cmp(anon a: [int64], anon b: [int64]) -> int64 {
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	mut i = len(a) - 1
+	for i >= 0 {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+		i -= 1
+	}
+	return 0
+}
+
+func _big_add(anon a: [int64], anon b: [int64]) -> [int64] {
+	if len(b) > len(a) {
+		return _big_add(b, a)
+	}
+	mut out = a[0..len(a)]
+	mut carry: int64 = 0
+	for i in 0..len(out) {
+		mut t = out[i] + carry
+		if i < len(b) {
+			t += b[i]
+		} else if carry == 0 {
+			break
+		}
+		out[i] = t & _LIMB_MASK
+		carry = t >> _LIMB_BITS
+	}
+	if carry > 0 {
+		out += [carry]
+	}
+	return out
+}
+
+// a - b, for a >= b.
+func _big_sub(anon a: [int64], anon b: [int64]) -> [int64] {
+	mut out = a[0..len(a)]
+	mut borrow: int64 = 0
+	for i in 0..len(out) {
+		if i >= len(b) and borrow == 0 {
+			break
+		}
+		mut t = out[i] - borrow
+		if i < len(b) {
+			t = t - b[i]
+		}
+		borrow = 0
+		if t < 0 {
+			t += _LIMB_MASK + 1
+			borrow = 1
+		}
+		out[i] = t
+	}
+	return _big_trim(out)
+}
+
+// a × m, for 0 < m < 2^30.
+func _big_mul_small(anon a: [int64], anon m: int64) -> [int64] {
+	mut out = a[0..len(a)]
+	mut carry: int64 = 0
+	for i in 0..len(out) {
+		let t = out[i] * m + carry
+		out[i] = t & _LIMB_MASK
+		carry = t >> _LIMB_BITS
+	}
+	for carry > 0 {
+		out += [carry & _LIMB_MASK]
+		carry = carry >> _LIMB_BITS
+	}
+	return out
+}
+
+func _big_mul_pow10(anon a: [int64], anon n: int64) -> [int64] {
+	mut out = a
+	mut left = n
+	for left >= 9 {
+		out = _big_mul_small(out, 1000000000)
+		left -= 9
+	}
+	if left > 0 {
+		out = _big_mul_small(out, _POW10[left])
+	}
+	return out
+}
+
+func _big_shl(anon a: [int64], anon n: int64) -> [int64] {
+	if len(a) == 0 {
+		return a
+	}
+	mut out: [int64] = []
+	for _ in 0..n / _LIMB_BITS {
+		out += [0]
+	}
+	let bits = n % _LIMB_BITS
+	mut carry: int64 = 0
+	for limb in a {
+		let t = (limb << bits) | carry
+		out += [t & _LIMB_MASK]
+		carry = t >> _LIMB_BITS
+	}
+	if carry > 0 {
+		out += [carry]
+	}
+	return out
+}
+
+func _big_shr1(anon a: [int64]) -> [int64] {
+	mut out = a[0..len(a)]
+	for i in 0..len(out) {
+		mut t = out[i] >> 1
+		if i + 1 < len(out) {
+			t = t | ((out[i + 1] & 1) << (_LIMB_BITS - 1))
+		}
+		out[i] = t
+	}
+	return _big_trim(out)
+}
