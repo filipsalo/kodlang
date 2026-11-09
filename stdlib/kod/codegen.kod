@@ -501,6 +501,78 @@ type RcDesc = struct {
 // externs (stdlib/primitives), which are each an instruction or two: the
 // argument and the result are bit patterns in x0, and only d0 is used besides.
 // Empty for any other function.
+// A conditional branch reaches 1 MB either way (`tbz` 32 KB) and `b` 128 MB.
+// A function body of more instructions than this, each at most four once
+// big immediates are spelt out, may hold a conditional branch out of reach,
+// so `long_branches` rewrites its branches.
+let LONG_BODY_INSNS: int64 = 60000
+
+// The condition that holds when `cond` doesn't, or "" for none.
+func opposite_condition(anon cond: str) -> str {
+    match cond {
+        "eq" -> return "ne"
+        "ne" -> return "eq"
+        "hs" -> return "lo"
+        "cs" -> return "lo"
+        "lo" -> return "hs"
+        "cc" -> return "hs"
+        "mi" -> return "pl"
+        "pl" -> return "mi"
+        "vs" -> return "vc"
+        "vc" -> return "vs"
+        "hi" -> return "ls"
+        "ls" -> return "hi"
+        "ge" -> return "lt"
+        "lt" -> return "ge"
+        "gt" -> return "le"
+        "le" -> return "gt"
+        else return ""
+    }
+}
+
+// For a conditional branch `\tbeq L`, `\tcbz x1, L` or `\ttbz x1, #3, L`: the
+// branch on the opposite condition with its target left off, and the target,
+// as `["\tbne ", "L"]`. Empty for any other line.
+func split_conditional_branch(anon text: str) -> [str] {
+    let line = text.trim_start()
+    let .Some(at) = line.find(" ") else { return [] }
+    let mnemonic = line[0..at]
+    mut opposite = ""
+    match mnemonic {
+        "cbz" -> opposite = "cbnz"
+        "cbnz" -> opposite = "cbz"
+        "tbz" -> opposite = "tbnz"
+        "tbnz" -> opposite = "tbz"
+        else {
+            mut cond = ""
+            if mnemonic.starts_with("b.") {
+                cond = mnemonic[2..len(mnemonic)]
+            } else if len(mnemonic) == 3 and mnemonic.starts_with("b") {
+                cond = mnemonic[1..3]
+            }
+            let flipped = opposite_condition(cond)
+            if len(flipped) == 0 {
+                return []
+            }
+            opposite = f"b.{flipped}"
+        }
+    }
+    let operands = line[at + 1..len(line)]
+    mut last = -1
+    for i in 0..len(operands) {
+        if operands[i] == ',' {
+            last = i
+        }
+    }
+    mut kept = ""
+    mut target = operands.trim()
+    if last >= 0 {
+        kept = operands[0..last + 1] + " "
+        target = operands[last + 1..len(operands)].trim()
+    }
+    return [f"\t{opposite} {kept}", target]
+}
+
 // The symbol an extern calls: its name with the leading `_` of a C symbol,
 // except `panic`, which is the runtime's `kod_panic`.
 func extern_label(anon name: str) -> str {
@@ -15312,6 +15384,26 @@ type Codegen = struct {
         return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
     }
 
+    // Each conditional branch of `body` as the opposite one over a `b`, which
+    // reaches 128 MB instead of 1 MB: `beq L` becomes `bne Lfar; b L; Lfar:`.
+    func long_branches(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
+        mut out: [regalloc.Insn] = []
+        for insn in body {
+            if insn is .Raw(text) {
+                let parts = split_conditional_branch(text)
+                if len(parts) == 2 {
+                    let over = self.fresh("Lfar")
+                    out += [.Raw(text: parts[0] + over)]
+                    out += [.Raw(text: f"\tb {parts[1]}")]
+                    out += [.Label(name: over)]
+                    continue
+                }
+            }
+            out += [insn]
+        }
+        return out
+    }
+
     func compile_optional_method_call(self, value_id: int64, method: str, args: [ast.CallArg]) -> Val {
         let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
         if struct_idx < 0 {
@@ -16367,7 +16459,11 @@ type Codegen = struct {
             }
             rc_k = rc_k + 1
         }
-        for line in body_buf {
+        mut body_insns = body_buf
+        if len(body_insns) > LONG_BODY_INSNS {
+            body_insns = self.long_branches(body_insns)
+        }
+        for line in body_insns {
             self.out_buf += [line]
         }
         mut qi = cs

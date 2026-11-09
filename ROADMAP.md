@@ -63,4 +63,3 @@ codegen bugs that this kind of code is most likely to hit.
 - Fewer C pieces: TLS. SecureTransport is deprecated
   and stops at TLS 1.2; the options are Network.framework from C, or TLS 1.3 written in
   Kod (hashes, AES-GCM, X25519, X.509), a much larger job.
-- A conditional branch over ±1 MB inside one function is an assembler error.

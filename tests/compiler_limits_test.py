@@ -350,3 +350,23 @@ def test_string_literals_past_8_mb(tmp_path):
     ]
     body = "    mut n = 0\n" + "\n".join(lines) + "\n    print_int(n)"
     assert run(tmp_path, body) == str(9 * 1_000_004)
+
+
+@pytest.mark.parametrize("shape", ["if", "for", "match", "and"])
+def test_jumps_over_more_than_a_megabyte(tmp_path, shape):
+    # A conditional branch reaches 1 MB; each `t += id(i)` is about 20 bytes,
+    # so 60,000 of them put the branch's target out of its reach.
+    count = 60000
+    adds = "\n".join(f"        t += id({i})" for i in range(count))
+    total = sum(range(count))
+    body = {
+        "if": f"    if a == 1 {{\n{adds}\n    }}",
+        "for": f"    mut k = 0\n    for k < 2 {{\n        k += 1\n{adds}\n    }}",
+        "match": f"    match a {{\n        1 -> {{\n{adds}\n        }}\n        else none\n    }}",
+        "and": f"    if a == 1 and t == 0 {{\n{adds}\n    }}",
+    }[shape]
+    if shape == "for":
+        total *= 2
+    assert run(
+        tmp_path, f"    let a = id(1)\n    mut t = 0\n{body}\n    print_int(t)"
+    ) == str(total)
