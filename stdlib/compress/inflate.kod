@@ -7,6 +7,11 @@ import "hash/crc32"
 // The length and distance tables of RFC 1951 §3.2.5.
 import "compress/tables" { LEN_BASE, LEN_EXTRA, DIST_BASE, DIST_EXTRA }
 
+// The CRC-32 state and the Adler-32 sum after builder bytes start..end,
+// continuing from `crc` / `sum` (stdlib/runtime.c).
+extern func kod_crc32_sb(anon crc: int64, anon sb: str, anon start: int64, anon end: int64) -> int64
+extern func kod_adler32_sb(anon sum: int64, anon sb: str, anon start: int64, anon end: int64) -> int64
+
 // A canonical Huffman code as a lookup table. Index it with the next `bits`
 // bits of input, in stream order, to get `symbol << 4 | code length`, or 0 for
 // bits that no code starts with.
@@ -82,13 +87,11 @@ type Inflater = struct {
     // then `wpos` goes round it.
     window: [int64] = []
     wpos: int64 = 0
-    // Output of the current gzip member or stream, and its checksum.
+    // Output of the current gzip member or stream; its checksum is worked
+    // out over all of it once the stream ends.
     stream_len: int64 = 0
     crc_table: [int64] = crc32.make_table()
-    crc: int64 = 0xFFFFFFFF
     header_crc: int64 = 0xFFFFFFFF
-    adler_a: int64 = 1
-    adler_b: int64 = 0
     fixed_lit: Huffman = Huffman(table: [], bits: 0)
     fixed_dist: Huffman = Huffman(table: [], bits: 0)
 
@@ -159,9 +162,6 @@ type Inflater = struct {
 
     func start_stream(self) -> none {
         self.stream_len = 0
-        self.crc = 0xFFFFFFFF
-        self.adler_a = 1
-        self.adler_b = 0
     }
 
     func put(self, anon b: int64) -> none {
@@ -181,12 +181,6 @@ type Inflater = struct {
             self.window[self.wpos] = b
         }
         self.wpos = (self.wpos + 1) & (window_size() - 1)
-        if self.mode == 0 {
-            self.crc = (self.crc >> 8) ^ self.crc_table[(self.crc ^ b) & 0xff]
-        } else if self.mode == 1 {
-            self.adler_a = (self.adler_a + b) % 65521
-            self.adler_b = (self.adler_b + self.adler_a) % 65521
-        }
     }
 
     // The Huffman code with these code lengths, one per symbol (0 for a
@@ -465,7 +459,8 @@ type Inflater = struct {
         if self.err != "" {
             return
         }
-        if crc != (self.crc ^ 0xFFFFFFFF) {
+        let end = self.out_len
+        if crc != (kod_crc32_sb(0xFFFFFFFF, self.out.handle, end - self.stream_len, end) ^ 0xFFFFFFFF) {
             self.fail("incorrect data check")
         } else if size != (self.stream_len & 0xFFFFFFFF) {
             self.fail("incorrect length check")
@@ -501,7 +496,8 @@ type Inflater = struct {
         for _ in 0..4 {
             sum = (sum << 8) | self.byte()
         }
-        if self.err == "" and sum != ((self.adler_b << 16) | self.adler_a) {
+        let end = self.out_len
+        if self.err == "" and sum != kod_adler32_sb(1, self.out.handle, end - self.stream_len, end) {
             self.fail("incorrect data check")
         }
     }

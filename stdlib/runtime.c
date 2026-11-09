@@ -25,6 +25,10 @@
 
 #include "kod_rt.h"
 
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
+
 extern char **environ;
 
 // Defined in stdlib/kod/inspect.kod. Both panic handlers call it
@@ -296,6 +300,67 @@ void kod_sb_clear(int64_t handle) {
 KodStr *kod_sb_to_str(int64_t handle) {
     KodStrBuilder *sb = (KodStrBuilder *)handle;
     return kod_str_from_bytes(sb->buf, sb->len);
+}
+
+// CRC-32 (the gzip polynomial) of n bytes, continuing from `crc`, the
+// running state without gzip's final xor. Eight bytes per instruction where
+// the CPU has the CRC instructions, a byte at a time otherwise.
+static uint32_t kod_crc32_run(uint32_t crc, const unsigned char *p, int64_t n) {
+#if defined(__ARM_FEATURE_CRC32)
+    for (; n >= 8; p += 8, n -= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        crc = __crc32d(crc, w);
+    }
+    for (; n > 0; p++, n--) crc = __crc32b(crc, *p);
+#else
+    for (; n > 0; p++, n--) {
+        crc ^= *p;
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
+    }
+#endif
+    return crc;
+}
+
+// Adler-32 of n bytes, continuing from `sum` (b << 16 | a). 5552 bytes is
+// the most that can be added before the sums could overflow 32 bits.
+static uint32_t kod_adler32_run(uint32_t sum, const unsigned char *p, int64_t n) {
+    uint32_t a = sum & 0xffff, b = sum >> 16;
+    while (n > 0) {
+        int64_t chunk = n < 5552 ? n : 5552;
+        n -= chunk;
+        for (; chunk > 0; p++, chunk--) {
+            a += *p;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    return (b << 16) | a;
+}
+
+// The range start..end clamped to a buffer of `len` bytes.
+static int64_t kod_clamp_range(int64_t len, int64_t *start, int64_t end) {
+    if (*start < 0) *start = 0;
+    if (end > len) end = len;
+    return end > *start ? end - *start : 0;
+}
+
+int64_t kod_crc32_bytes(int64_t crc, KodStr *b, int64_t start, int64_t end) {
+    int64_t n = kod_clamp_range(b->len, &start, end);
+    return kod_crc32_run((uint32_t)crc, (const unsigned char *)b->buf + start, n);
+}
+
+int64_t kod_crc32_sb(int64_t crc, int64_t handle, int64_t start, int64_t end) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    int64_t n = kod_clamp_range(sb->len, &start, end);
+    return kod_crc32_run((uint32_t)crc, (const unsigned char *)sb->buf + start, n);
+}
+
+int64_t kod_adler32_sb(int64_t sum, int64_t handle, int64_t start, int64_t end) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    int64_t n = kod_clamp_range(sb->len, &start, end);
+    return kod_adler32_run((uint32_t)sum, (const unsigned char *)sb->buf + start, n);
 }
 
 // File descriptor I/O for stdlib/posix.kod. The calls return their result and
