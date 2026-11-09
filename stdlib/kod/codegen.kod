@@ -584,6 +584,37 @@ func extern_label(anon name: str) -> str {
     return f"_{name}"
 }
 
+// The value of `expr_id` in `p` when it is int64 or bool literals and the operators
+// + - * & | ^ << >> on them, worked out as the generated code would (wrapping, and
+// shifts by the amount mod 64, as the compiler's own arithmetic does); none otherwise.
+func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
+    match p.exprs[expr_id] {
+        .IntLit(value) -> return value
+        .BoolLit(value) -> {
+            if value {
+                return 1
+            }
+            return 0
+        }
+        .Binary(lhs, op, rhs) -> {
+            let .Some(a) = fold_int(p, lhs) else { return none }
+            let .Some(b) = fold_int(p, rhs) else { return none }
+            match op {
+                .Add -> return a + b
+                .Sub -> return a - b
+                .Mul -> return a * b
+                .BitAnd -> return a & b
+                .BitOr -> return a | b
+                .BitXor -> return a ^ b
+                .Shl -> return a << b
+                .Shr -> return a >> b
+                else return none
+            }
+        }
+        else return none
+    }
+}
+
 // The instructions that stand in for a call to `label`, with the arguments
 // in x0 and x1 and the result left in x0, or [] for an ordinary call.
 func inline_intrinsic(anon label: str) -> [str] {
@@ -1673,6 +1704,9 @@ type Codegen = struct {
     // copy its `NAME$shared` getter built at the first such read.
     func read_const(self, anon expr_id: int64, sig: SigInfo) -> Val {
         self.check_const_use(expr_id, :sig)
+        if self.folded_const(sig) is Some(folded) {
+            return folded
+        }
         if self.const_shared_kind(sig) {
             let shareable = sig.return_kind is .KStr or (expr_id == self.shared_const_id and self.p.path == self.shared_const_path)
             if shareable {
@@ -1686,6 +1720,40 @@ type Codegen = struct {
         self.reading_const = false
         // The value is the caller's, like any call's.
         return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // An int64 or bool constant's value, when it is literals and operators on them,
+    // as an immediate; a float64 constant that is one literal, loaded from its own
+    // copy of the literal. none for anything else, which reads through the getter.
+    func folded_const(self, anon sig: SigInfo) -> Val? {
+        if sig.decl_id <= 0 or self.sig_is_var(sig) {
+            return none
+        }
+        let fd = sig.src_p.func_decls[sig.decl_id]
+        if not fd.is_const or len(fd.body) != 1 {
+            return none
+        }
+        let .Return(value) = sig.src_p.stmts[fd.body[0]] else { return none }
+        match sig.return_kind {
+            .KInt64 | .KBool -> {
+                if fold_int(sig.src_p, value) is Some(n) {
+                    return .VImm(value: n)
+                }
+            }
+            .KFloat64 -> {
+                if sig.src_p.exprs[value] is .FloatLit(text) {
+                    let lbl = self.fresh("Lfloat")
+                    self.float_labels += [lbl]
+                    self.float_values += [text]
+                    let reg: str = self.pool.alloc_reg()
+                    self.emit(f"adrp {reg}, {lbl}@PAGE")
+                    self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
+                    return .VReg(name: reg)
+                }
+            }
+            else none
+        }
+        return none
     }
 
     // Whether a constant's value is one a shared copy can stand for: a string, which can't

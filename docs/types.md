@@ -131,6 +131,11 @@ program builds the first time and keeps, so a lookup table read in a loop alloca
 nothing. Indexing an array of arrays still makes a new array, since the element read
 could be changed. A string can't be changed, so a string constant is built once.
 
+An `int64` or `bool` constant whose value is literals and the operators `+`, `-`, `*`,
+`&`, `|`, `^`, `<<` and `>>` on them, like `MAX_BLOCK` and `SECONDS_PER_DAY` above, is
+worked out when the program is compiled and put in place at each use, and so is a
+`float64` constant that is one literal: reading one costs what the literal would.
+
 ## Module-level variables
 
 A `mut` at the top level of a module names a variable that every function of the
