@@ -129,6 +129,47 @@ variants take the one argument written, its type decides: with
 5 can't be a `Status`. An arm of a returned `match` works the same way,
 and so does a return type that names the `T or Error` through an alias.
 
+## Methods
+
+Declare methods inside the enum body, after the variants. The first
+parameter is `self`, the enum value:
+
+```kod
+type Shape = enum {
+    Circle(r: int64)
+    Rect(w: int64, h: int64)
+
+    func area(self) -> int64 {
+        return match self {
+            .Circle(r) -> 3 * r * r
+            .Rect(w, h) -> w * h
+        }
+    }
+
+    func scaled(self, by: int64) -> Shape {
+        return match self {
+            .Circle(r) -> .Circle(r: r * by)
+            .Rect(w, h) -> .Rect(w: w * by, h: h * by)
+        }
+    }
+}
+
+let s: Shape = .Rect(w: 2, h: 3)
+print(s.scaled(by: 2).area())    // 24
+```
+
+They take arguments, labels and defaults like struct methods, work through
+`s?.area()` on a `Shape?`, and can be called on any `Shape` value, including
+one that came from a function in another module without your module
+importing the one that declares `Shape`. A method whose name starts with `_` is private to the
+enum's own methods, as on a [struct](structs.md#private-methods).
+
+An enum that declares `func to_str(self) -> str` is printed by it in
+f-strings and `print`, instead of by its variant's name.
+
+Not yet: methods on a generic enum, operator methods (`op_eq` and the
+rest), and an enum as an interface value.
+
 ## Generic enums
 
 Type parameters go in square brackets after the name, as for structs, and
@@ -236,5 +277,4 @@ let dist: int64 = match m {
 
 ## Current limitations
 
-- No nested patterns (e.g. `Shape.Rect(w, 0)` matching on a specific field value).
-- No guard clauses on match arms.
+- A generic enum can't declare methods, and an enum can't be an interface value.

@@ -75,7 +75,8 @@ What can be interpolated:
 - a struct that declares `func to_str(self) -> str`
 - a value of an interface that declares the same `to_str`, such as
   `Stringable` or `Error`; the call goes to the concrete type's `to_str`
-- an enum, as the name of its variant: `f"{c}"` is `Red`, and an `Op.Lit(n: 4)`
+- an enum, by its `func to_str(self) -> str` if it declares one, and
+  otherwise as the name of its variant: `f"{c}"` is `Red`, and an `Op.Lit(n: 4)`
   is `Lit`, without its payload. A `T or Error` isn't one of these: test it first
 
 `print(x)` takes the same values as `{x}` does.
