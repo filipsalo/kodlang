@@ -315,6 +315,68 @@ func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int6
     }
 }
 
+// How many times each of the function's vregs (ids vreg_start up to
+// vreg_start + n_local) is named in `body`, as a def or a use.
+func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64] {
+    mut counts: [int64] = []
+    for _ in 0..n_local {
+        counts += [0]
+    }
+    for insn in body {
+        let .Raw(text) = insn else { continue }
+        let n = len(text)
+        mut i: int64 = 0
+        for i < n {
+            let c = text[i]
+            if c == '"' {
+                i = skip_quoted(text, start: i)
+            } else if (c == 'v' or c == 'w') and i + 1 < n and lexing.is_digit(text[i + 1]) and (i == 0 or not is_sym_char(text[i - 1])) {
+                mut j = i + 1
+                mut id: int64 = 0
+                for j < n and lexing.is_digit(text[j]) {
+                    id = id * 10 + text[j] - '0'
+                    j += 1
+                }
+                if (j == n or not is_sym_char(text[j])) and id >= vreg_start and id < vreg_start + n_local {
+                    counts[id - vreg_start] += 1
+                }
+                i = j
+            } else {
+                i += 1
+            }
+        }
+    }
+    return counts
+}
+
+// Whether an instruction calls something (`bl`, `blr`) or names one of the
+// caller-saved x8-x15 itself, so a value in one of those doesn't survive it.
+func clobbers_scratch(anon text: str) -> bool {
+    let n = len(text)
+    mut i: int64 = 0
+    for i < n and (text[i] == '\t' or text[i] == ' ') {
+        i += 1
+    }
+    if i + 2 < n and text[i] == 'b' and text[i + 1] == 'l' and (text[i + 2] == ' ' or text[i + 2] == '\t' or (text[i + 2] == 'r' and i + 3 < n and text[i + 3] == ' ')) {
+        return true
+    }
+    for k in i..n {
+        let c = text[k]
+        if (c == 'x' or c == 'w') and k + 1 < n and lexing.is_digit(text[k + 1]) and (k == 0 or not is_sym_char(text[k - 1])) {
+            mut j = k + 1
+            mut num: int64 = 0
+            for j < n and lexing.is_digit(text[j]) {
+                num = num * 10 + text[j] - '0'
+                j += 1
+            }
+            if (j == n or not is_sym_char(text[j])) and num >= 8 and num <= 15 {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 // Constrained linear scan for one function's vregs. Vregs are
 // partitioned by alloc-time class; each class's pool is the set of
 // distinct alloc-time physicals from that class. Walk vregs in
@@ -336,14 +398,24 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
         last_use += [-1]
     }
 
+    // clobbers_before[k]: how many lines before line k call something or
+    // name a caller-saved register outright.
+    mut clobbers_before: [int64] = [0]
     mut line_idx: int64 = 0
     for insn in body_buf {
+        mut clobbers = 0
         match insn {
-            .Raw(text) -> scan_line(text, :line_idx, :vreg_start, :n_local, :def_line, :last_use)
+            .Raw(text) -> {
+                scan_line(text, :line_idx, :vreg_start, :n_local, :def_line, :last_use)
+                if clobbers_scratch(text) {
+                    clobbers = 1
+                }
+            }
             .Label(_name) -> {
                 // Label lines hold a symbol, not asm — no vregs.
             }
         }
+        clobbers_before += [clobbers_before[line_idx] + clobbers]
         line_idx = line_idx + 1
     }
 
@@ -366,6 +438,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
             if not arrays.contains(free_caller, p) {
                 free_caller += [p]
             }
+        }
+    }
+    // A callee-saved vreg that no call or named scratch register comes
+    // between the def and the last use of can take any caller-saved one,
+    // which the prologue needn't save.
+    for p in ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"] {
+        if not arrays.contains(free_caller, p) {
+            free_caller = [p] + free_caller
         }
     }
 
@@ -399,10 +479,18 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
         let d: int64 = def_line[local_id]
         if d == -1 {
             // Allocated but never defined in the emitted body — keep
-            // its alloc-time phys (the safe default).
+            // its alloc-time phys (the safe default), unless it isn't
+            // named at all, when it needn't count as a register to save.
+            if last_use[local_id] == -1 {
+                new_phys[local_id] = "x8"
+            }
             continue
         }
-        let cls_callee: bool = is_callee_saved_phys(alloc_phys[local_id])
+        mut cls_callee: bool = is_callee_saved_phys(alloc_phys[local_id])
+        let u: int64 = last_use[local_id]
+        if cls_callee and u > d and clobbers_before[u] - clobbers_before[d + 1] == 0 {
+            cls_callee = false
+        }
 
         // Expire actives whose last_use <= this def line. The `<=`
         // (vs `<`) lets a `mov vDst, vSrc` whose vSrc dies at the mov
