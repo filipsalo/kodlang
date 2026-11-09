@@ -233,6 +233,23 @@ Dividing by zero, with `/` or `%`, panics:
 doesn't fit, the smallest `int64` divided by `-1`, wraps around to the smallest
 `int64`, and its remainder is `0`.
 
+`>>` shifts in zeros, so it treats an `int64` as 64 bits rather than a signed
+number, and so do these methods, each a single instruction:
+
+| Method | Gives |
+|--------|-------|
+| `n.leading_zeros()` | how many zero bits are above the highest one bit; 64 for `0` |
+| `n.trailing_zeros()` | how many zero bits are below the lowest one bit; 64 for `0` |
+| `n.count_ones()` | how many bits are one; 64 for `-1` |
+| `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n * m` is the bottom 64 |
+
+```kod
+print(1.leading_zeros())                // 63
+print(40.trailing_zeros())              // 3
+print(0xff.count_ones())                // 8
+print((1 << 62).mul_high(8))            // 2
+```
+
 ## Boolean literals
 
 ```kod
