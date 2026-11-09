@@ -577,6 +577,48 @@ func asm_parts(anon text: str) -> [str] {
     return parts
 }
 
+// The most instructions a body may have for promote_locals to try it.
+let PROMOTE_MAX_INSNS: int64 = 6000
+
+// Whether an instruction names the frame pointer.
+func names_fp(anon text: str) -> bool {
+    let n = len(text)
+    for k in 0..n - 1 {
+        if text[k] == 'f' and text[k + 1] == 'p' and (k == 0 or not regalloc.is_sym_char(text[k - 1])) and (k + 2 == n or not regalloc.is_sym_char(text[k + 2])) {
+            return true
+        }
+    }
+    return false
+}
+
+// The prologue's and epilogue's own uses of fp, which don't touch a slot.
+func is_frame_link(anon text: str) -> bool {
+    return text == "\tmov sp, fp" or text == "\tmov fp, sp" or text == "\tldp fp, lr, [sp], #16" or text == "\tstp fp, lr, [sp, #-16]!" or text == "\tstp fp, lr, [sp]" or text == "\tldp fp, lr, [sp]" or text == "\tadd fp, sp, #0"
+}
+
+// The register a slot load or store (`ldr R, [...]`, `str R, [...]`) moves.
+func slot_access_reg(anon text: str) -> str {
+    if text.find(", [") is Some(k) {
+        return text[5..k]
+    }
+    return ""
+}
+
+// The number `s` holds, which is only digits; -1 if it isn't.
+func parse_digits(anon s: str) -> int64 {
+    if len(s) == 0 {
+        return -1
+    }
+    mut v: int64 = 0
+    for k in 0..len(s) {
+        if not lexing.is_digit(s[k]) {
+            return -1
+        }
+        v = v * 10 + s[k] - '0'
+    }
+    return v
+}
+
 // `#n` with 0 <= n <= 4095: what add, sub and cmp take as an immediate.
 func small_imm(anon op: str) -> bool {
     if len(op) < 2 or op[0] != '#' {
@@ -15902,6 +15944,11 @@ type Codegen = struct {
         mut i: int64 = 0
         for i < n {
             let t0 = insn_text(body[i])
+            if not (t0.starts_with("\tcset ") or t0.starts_with("\tmov v")) {
+                out += [body[i]]
+                i += 1
+                continue
+            }
             let a = asm_parts(t0)
             if len(a) == 3 and a[0] == "cset" and len(opposite_condition(a[2])) > 0 and self.single_use_vreg(a[1], :counts, :vreg_start) and i + 1 < n {
                 let b = asm_parts(insn_text(body[i + 1]))
@@ -15944,6 +15991,141 @@ type Codegen = struct {
             i += 1
         }
         return out
+    }
+
+    // `body` with its locals in registers: each frame slot that is only
+    // loaded and stored (`ldr R, [fp, #-8]`, or past -256 the
+    // `mov x16, #K` / `sub x16, fp, x16` / `ldr R, [x16]` form) becomes a vreg,
+    // its loads and stores moves, and the body is register-allocated
+    // (strictly). `excluded` are slots the prologue writes, outside `body`. As
+    // many slots as fit, most used first: when the registers run out, half as
+    // many. [] when none can be, and the caller allocates `body` as it was.
+    func promote_locals(self, anon body: [regalloc.Insn], vreg_start: int64, excluded: [int64]) -> [regalloc.Insn] {
+        if self.pool.evicted or len(body) > PROMOTE_MAX_INSNS {
+            return []
+        }
+        // Each slot's offset and how often it's loaded or stored.
+        mut offs: [int64] = []
+        mut uses: [int64] = []
+        // Per line: the slot its access starts there, and how many lines it takes (0: none).
+        mut line_slot: [int64] = []
+        mut line_len: [int64] = []
+        let n = len(body)
+        for _ in 0..n {
+            line_slot += [0]
+            line_len += [0]
+        }
+        mut i: int64 = 0
+        for i < n {
+            let text = insn_text(body[i])
+            if not names_fp(text) or is_frame_link(text) {
+                i += 1
+                continue
+            }
+            mut off: int64 = 0
+            mut first: int64 = i
+            mut span: int64 = 0
+            mut reg = ""
+            if text.ends_with("]") and (text.starts_with("\tldr ") or text.starts_with("\tstr ")) {
+                if text.find(", [fp, #-") is Some(k) {
+                    reg = text[5..k]
+                    off = 0 - parse_digits(text[k + 9..len(text) - 1])
+                    span = 1
+                }
+            } else if text == "\tsub x16, fp, x16" and i > 0 and i + 1 < n {
+                let prev = insn_text(body[i - 1])
+                let next = insn_text(body[i + 1])
+                if prev.starts_with("\tmov x16, #") and next.ends_with(", [x16]") and (next.starts_with("\tldr ") or next.starts_with("\tstr ")) {
+                    off = 0 - parse_digits(prev[11..len(prev)])
+                    reg = next[5..len(next) - 7]
+                    first = i - 1
+                    span = 3
+                }
+            }
+            if span == 0 or off >= 0 or len(reg) == 0 or reg[0] == 'w' {
+                // Something else reads fp: leave every slot where it is.
+                return []
+            }
+            line_slot[first] = off
+            line_len[first] = span
+            mut found = -1
+            for k, o in offs {
+                if o == off {
+                    found = k
+                }
+            }
+            if found < 0 {
+                offs += [off]
+                uses += [0]
+                found = len(offs) - 1
+            }
+            uses[found] += 1
+            i = first + span
+        }
+        // Candidates, most used first.
+        mut cands: [int64] = []
+        mut cand_uses: [int64] = []
+        for k, off in offs {
+            if not arrays.contains(excluded, off) {
+                cands += [off]
+                cand_uses += [uses[k]]
+            }
+        }
+        if len(cands) == 0 {
+            return []
+        }
+        for a in 1..len(cands) {
+            mut b = a
+            for b > 0 and cand_uses[b - 1] < cand_uses[b] {
+                let t = cands[b]
+                cands[b] = cands[b - 1]
+                cands[b - 1] = t
+                let tu = cand_uses[b]
+                cand_uses[b] = cand_uses[b - 1]
+                cand_uses[b - 1] = tu
+                b -= 1
+            }
+        }
+        let saved_len = len(self.pool.vreg_phys)
+        mut count = len(cands)
+        for count > 0 {
+            mut vregs: [str] = []
+            for _ in 0..count {
+                vregs += [f"v{len(self.pool.vreg_phys)}"]
+                self.pool.vreg_phys += ["x19"]
+            }
+            mut out: [regalloc.Insn] = []
+            mut j: int64 = 0
+            for j < n {
+                if line_len[j] > 0 {
+                    mut which = -1
+                    for k in 0..count {
+                        if cands[k] == line_slot[j] {
+                            which = k
+                        }
+                    }
+                    if which >= 0 {
+                        let last = insn_text(body[j + line_len[j] - 1])
+                        let reg = slot_access_reg(last)
+                        if last.starts_with("\tldr ") {
+                            out += [.Raw(text: f"\tmov {reg}, {vregs[which]}")]
+                        } else {
+                            out += [.Raw(text: f"\tmov {vregs[which]}, {reg}")]
+                        }
+                        j += line_len[j]
+                        continue
+                    }
+                }
+                out += [body[j]]
+                j += 1
+            }
+            if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true) {
+                return out
+            }
+            self.pool.vreg_phys = self.pool.vreg_phys[0..saved_len]
+            count = count / 2
+        }
+        return []
     }
 
     // Whether `name` is one of this function's vregs, named exactly twice.
@@ -16982,7 +17164,7 @@ type Codegen = struct {
         self.emit("mov sp, fp")
         self.emit("ldp fp, lr, [sp], #16")
 
-        let body_buf = self.peephole(self.out_buf, :vreg_start)
+        mut body_buf = self.peephole(self.out_buf, :vreg_start)
         self.out_buf = saved_buf
         self.rc_ctor_mark = -1
 
@@ -16993,7 +17175,18 @@ type Codegen = struct {
         // callee-saved set into a dense `x19..` prefix and returns the
         // new high-water mark so the prologue saves exactly the
         // registers the body actually uses.
-        if not self.pool.evicted {
+        // A copy: `+=` of one element appends to the array in place.
+        mut excluded: [int64] = []
+        for off in self.rc_slots {
+            excluded += [off]
+        }
+        for off in capture_offs {
+            excluded += [off]
+        }
+        let promoted = self.promote_locals(body_buf, :vreg_start, :excluded)
+        if len(promoted) > 0 {
+            body_buf = promoted
+        } else if not self.pool.evicted {
             regalloc.run(:body_buf, pool: self.pool, :vreg_start)
         }
         self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)

@@ -249,7 +249,10 @@ func skip_quoted(anon text: str, start: int64) -> int64 {
 // quotes; the `w` form is the 32-bit alias used by the single
 // byte-load site. A vreg in the first operand of a writer mnemonic
 // (outside brackets) is a def; everything else is a use.
-func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64]) -> none {
+// Returns whether the line calls something (`bl`, `blr`) or names one of
+// the caller-saved x8-x15 itself, so a value in one of those doesn't
+// survive it; and records in `first` the line each vreg is first named on.
+func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64], first: [int64]) -> bool {
     let n: int64 = len(text)
     mut i: int64 = 0
     for i < n and (text[i] == '\t' or text[i] == ' ') {
@@ -260,9 +263,10 @@ func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int6
         i = i + 1
     }
     if i == mn_start {
-        return none
+        return false
     }
     let mnemonic: str = text[mn_start..i]
+    mut clobbers = mnemonic == "bl" or mnemonic == "blr"
     let writes_first: bool = is_writer_mnemonic(mnemonic)
     mut op_index: int64 = 0
     mut bracket_depth: int64 = 0
@@ -303,16 +307,31 @@ func scan_line(anon text: str, line_idx: int64, vreg_start: int64, n_local: int6
                 continue
             }
             let local_id: int64 = id - vreg_start
+            if first[local_id] < 0 {
+                first[local_id] = line_idx
+            }
             let is_def: bool = writes_first and op_index == 0 and bracket_depth == 0
             if is_def and def_line[local_id] == -1 {
                 def_line[local_id] = line_idx
             }
             last_use[local_id] = line_idx
             i = j
+        } else if c == 'x' and i + 1 < n and lexing.is_digit(text[i + 1]) and (i == 0 or not is_sym_char(text[i - 1])) {
+            mut j: int64 = i + 1
+            mut num: int64 = 0
+            for j < n and lexing.is_digit(text[j]) {
+                num = num * 10 + text[j] - '0'
+                j = j + 1
+            }
+            if (j == n or not is_sym_char(text[j])) and num >= 8 and num <= 15 {
+                clobbers = true
+            }
+            i = j
         } else {
             i = i + 1
         }
     }
+    return clobbers
 }
 
 // How many times each of the function's vregs (ids vreg_start up to
@@ -349,53 +368,33 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
     return counts
 }
 
-// Whether an instruction calls something (`bl`, `blr`) or names one of the
-// caller-saved x8-x15 itself, so a value in one of those doesn't survive it.
-func clobbers_scratch(anon text: str) -> bool {
-    let n = len(text)
-    mut i: int64 = 0
-    for i < n and (text[i] == '\t' or text[i] == ' ') {
-        i += 1
-    }
-    if i + 2 < n and text[i] == 'b' and text[i + 1] == 'l' and (text[i + 2] == ' ' or text[i + 2] == '\t' or (text[i + 2] == 'r' and i + 3 < n and text[i + 3] == ' ')) {
-        return true
-    }
-    for k in i..n {
-        let c = text[k]
-        if (c == 'x' or c == 'w') and k + 1 < n and lexing.is_digit(text[k + 1]) and (k == 0 or not is_sym_char(text[k - 1])) {
-            mut j = k + 1
-            mut num: int64 = 0
-            for j < n and lexing.is_digit(text[j]) {
-                num = num * 10 + text[j] - '0'
-                j += 1
-            }
-            if (j == n or not is_sym_char(text[j])) and num >= 8 and num <= 15 {
-                return true
-            }
-        }
-    }
-    return false
-}
-
 // Constrained linear scan for one function's vregs. Vregs are
 // partitioned by alloc-time class; each class's pool is the set of
 // distinct alloc-time physicals from that class. Walk vregs in
 // def_line order; expire intervals that ended before the current
 // def; pop a free phys (preferring reuse). Mutates `pool.vreg_phys`
 // in place over `[vreg_start, len(pool.vreg_phys))`.
-func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
+//
+// `strict` is for a body whose vregs aren't all expression temporaries (see
+// codegen's promote_locals): a vreg live at the top of a loop is kept to the
+// loop's backward branch, every register is in the pools, and running out of
+// them is a failure (false) instead of a fall back to the alloc-time
+// register, which only temporaries can share safely.
+func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = false) -> bool {
     let vreg_phys: [str] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
     let n_local: int64 = vreg_end - vreg_start
     if n_local <= 0 {
-        return none
+        return true
     }
 
     mut def_line: [int64] = []
     mut last_use: [int64] = []
+    mut first: [int64] = []
     for k in 0..n_local {
         def_line += [-1]
         last_use += [-1]
+        first += [-1]
     }
 
     // clobbers_before[k]: how many lines before line k call something or
@@ -406,8 +405,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
         mut clobbers = 0
         match insn {
             .Raw(text) -> {
-                scan_line(text, :line_idx, :vreg_start, :n_local, :def_line, :last_use)
-                if clobbers_scratch(text) {
+                if scan_line(text, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first) {
                     clobbers = 1
                 }
             }
@@ -417,6 +415,17 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
         }
         clobbers_before += [clobbers_before[line_idx] + clobbers]
         line_idx = line_idx + 1
+    }
+
+    if strict {
+        // A vreg named before its first def (a loop reading what the
+        // previous time round set) is live from there.
+        for k in 0..n_local {
+            if first[k] >= 0 and (def_line[k] < 0 or first[k] < def_line[k]) {
+                def_line[k] = first[k]
+            }
+        }
+        extend_over_loops(body_buf, :def_line, :last_use)
     }
 
     // Snapshot alloc-time phys per local vreg; this is also the
@@ -448,6 +457,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
             free_caller = [p] + free_caller
         }
     }
+    if strict {
+        for p in ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27"] {
+            if not arrays.contains(free_callee, p) {
+                free_callee = [p] + free_callee
+            }
+        }
+    }
+    mut ok = true
 
     // Sort vreg indices by def_line ascending. Insertion sort; n_local
     // is typically small per function.
@@ -546,8 +563,9 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
             }
         }
         if len(chosen) == 0 {
-            // Shouldn't happen — pool size equals alloc-time pressure.
-            // Fall back to the alloc-time phys.
+            // Without `strict` this can't happen: pool size equals
+            // alloc-time pressure. Fall back to the alloc-time phys.
+            ok = false
             chosen = alloc_phys[local_id]
         }
         new_phys[local_id] = chosen
@@ -559,6 +577,89 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64) -> none {
     // Write back.
     for k in 0..n_local {
         vreg_phys[vreg_start + k] = new_phys[k]
+    }
+    return ok or not strict
+}
+
+// The label a branch jumps to (`b L`, `beq L`, `b.ne L`, `cbz x1, L`,
+// `tbnz x1, #3, L`), or "" for anything else, a call included.
+func branch_target(anon text: str) -> str {
+    let n = len(text)
+    mut i: int64 = 0
+    for i < n and (text[i] == '\t' or text[i] == ' ') {
+        i += 1
+    }
+    let start = i
+    for i < n and (lexing.is_alpha(text[i]) or text[i] == '.') {
+        i += 1
+    }
+    let mn = text[start..i]
+    mut is_branch = mn == "b" or mn == "cbz" or mn == "cbnz" or mn == "tbz" or mn == "tbnz"
+    if not is_branch and len(mn) >= 3 and mn[0] == 'b' {
+        mut cond = mn[1..len(mn)]
+        if cond[0] == '.' {
+            cond = cond[1..len(cond)]
+        }
+        is_branch = arrays.contains(["eq", "ne", "hs", "cs", "lo", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"], cond)
+    }
+    if not is_branch {
+        return ""
+    }
+    mut j = n
+    for j > i and (text[j - 1] == ' ' or text[j - 1] == '\t') {
+        j -= 1
+    }
+    mut k = j
+    for k > i and text[k - 1] != ' ' and text[k - 1] != ',' and text[k - 1] != '\t' {
+        k -= 1
+    }
+    return text[k..j]
+}
+
+// A vreg live at a loop's top label, set before the loop, stays live to
+// the loop's backward branch, which takes its value round again: the
+// textual interval alone would end at its last use inside the loop.
+func extend_over_loops(anon body: [Insn], def_line: [int64], last_use: [int64]) -> none {
+    let label_line = Map[str, int64]()
+    for i, insn in body {
+        if insn is .Label(name) {
+            label_line.set(name, i)
+        }
+    }
+    mut tops: [int64] = []
+    mut bottoms: [int64] = []
+    for i, insn in body {
+        if insn is .Raw(text) {
+            let target = branch_target(text)
+            if len(target) > 0 {
+                if label_line.get(target) is Some(t) {
+                    if t <= i {
+                        tops += [t]
+                        bottoms += [i]
+                    }
+                }
+            }
+        }
+    }
+    if len(tops) == 0 {
+        return none
+    }
+    mut changed = true
+    for changed {
+        changed = false
+        for k in 0..len(def_line) {
+            let d = def_line[k]
+            if d < 0 {
+                continue
+            }
+            for e in 0..len(tops) {
+                let u = last_use[k]
+                if d < tops[e] and u >= tops[e] and u < bottoms[e] {
+                    last_use[k] = bottoms[e]
+                    changed = true
+                }
+            }
+        }
     }
 }
 
