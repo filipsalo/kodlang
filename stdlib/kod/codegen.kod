@@ -11822,7 +11822,8 @@ type Codegen = struct {
         }
         if len(method_lbl) == 0 {
             mut recv_desc: str = f"a value of type `{self.kind_display(recv_kind)}`"
-            if self.p.exprs[receiver_id] is .Ident(recv_name) {
+            // `__` names are the compiler's own, such as the receiver of `x?.m()`.
+            if self.p.exprs[receiver_id] is .Ident(recv_name) and not recv_name.starts_with("__") {
                 recv_desc = f"`{self.source_name(recv_name)}` of type `{self.kind_display(recv_kind)}`"
             }
             // Collect candidate method names for the typo hint: the
@@ -12789,7 +12790,7 @@ type Codegen = struct {
                 }
                 return .KUnknown
             }
-            .OptionalMethodCall(value, method, _args) -> {
+            .OptionalMethodCall(value, method, args) -> {
                 // `x?.method(args)` returns U?: look up the method on the
                 // value's inner struct and re-wrap its return type.
                 let struct_idx = self.find_struct_idx_of_optional(value)
@@ -12797,6 +12798,15 @@ type Codegen = struct {
                     if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
                         return optional_of(self.structs[struct_idx].methods[mi].sig.return_kind)
                     }
+                    return .KUnknown
+                }
+                let kind = self.infer_kind(value)
+                if kind is .KOptional(_inner) and not self.kind_has_unknown(kind) {
+                    let ret = self.infer_kind(self.optional_call_match(value, receiver: "", :method, :args))
+                    if ret is .KUnknown {
+                        return .KUnknown
+                    }
+                    return optional_of(ret)
                 }
                 return .KUnknown
             }
@@ -15265,18 +15275,52 @@ type Codegen = struct {
     // If x is none, the whole expression is none. Otherwise dereference
     // the Optional cell to get the struct pointer, dispatch the method,
     // and wrap the return value into a fresh Some cell.
+    // `x?.m(args)` on a `T?` whose T isn't a struct, as
+    // `match x { Some(receiver) -> receiver.m(args) else none }`. With `receiver`
+    // empty the call is on `x?` instead, which gives the same type without a binding.
+    func optional_call_match(self, anon value_id: int64, receiver: str, method: str, args: [ast.CallArg]) -> int64 {
+        let span = self.p.expr_spans[value_id]
+        mut recv = 0
+        if len(receiver) > 0 {
+            recv = self.p.alloc_expr(.Ident(name: receiver), :span)
+        } else {
+            recv = self.p.alloc_expr(.UnwrapOpt(value: value_id, default: 0), :span)
+        }
+        let callee = self.p.alloc_expr(.Binary(lhs: recv, op: .Dot, rhs: self.p.alloc_expr(.Ident(name: method), :span)), :span)
+        let call = self.p.alloc_expr(.Call(:callee, :args), :span)
+        if len(receiver) == 0 {
+            return call
+        }
+        mut some_arm = ast.MatchExprArm(pattern: self.p.alloc_pattern(.SomePat(binding: receiver)), body: call)
+        if self.infer_kind(self.optional_call_match(value_id, receiver: "", :method, :args)) is .KVoid {
+            // A method that returns nothing runs before the arm's `none`.
+            some_arm = ast.MatchExprArm(pattern: some_arm.pattern, body: self.p.alloc_expr(.NoneLit, :span), pre: [self.p.alloc_stmt(.ExprStmt(expr: call))])
+        }
+        let arms: [int64] = [
+            self.p.alloc_match_expr_arm(some_arm),
+            self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(ast.Pattern.Wildcard), body: self.p.alloc_expr(.NoneLit, :span))),
+        ]
+        return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
+    }
+
     func compile_optional_method_call(self, value_id: int64, method: str, args: [ast.CallArg]) -> Val {
         let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
         if struct_idx < 0 {
+            let kind = self.infer_kind(value_id)
+            if kind is .KOptional(inner) and not self.kind_has_unknown(kind) {
+                let name = self.fresh("__opt_self")
+                self.alloc_var(:name, kind: inner)
+                return self.compile_expr(self.optional_call_match(value_id, receiver: name, :method, :args))
+            }
             self.compile_discard(value_id)
             for arg in args {
                 self.compile_discard(arg.value)
             }
-            if self.kind_has_unknown(self.infer_kind(value_id)) {
+            if self.kind_has_unknown(kind) {
                 self.report_if_unknown(value_id)
                 return .VImm(value: 0)
             }
-            self.report_error(f"error: `?.{method}(...)` requires a `T?` value where T is a struct", span: self.p.expr_spans[value_id])
+            self.report_error(f"error: `?.{method}(...)` requires a `T?` value", span: self.p.expr_spans[value_id])
             return .VImm(value: 0)
         }
         mut method_lbl: str = ""
