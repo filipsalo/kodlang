@@ -87,6 +87,8 @@ type Inflater = struct {
     // then `wpos` goes round it.
     window: [int64] = []
     wpos: int64 = 0
+    // Where the window's bytes not yet in `out` start.
+    flushed: int64 = 0
     // Output of the current gzip member or stream; its checksum is worked
     // out over all of it once the stream ends.
     stream_len: int64 = 0
@@ -164,6 +166,9 @@ type Inflater = struct {
         self.stream_len = 0
     }
 
+    // A byte of output. It goes into the window only; `flush` moves it to
+    // `out` with the rest of the window's new bytes, when the window is full
+    // and when the stream ends.
     func put(self, anon b: int64) -> none {
         if self.err != "" {
             return
@@ -172,15 +177,27 @@ type Inflater = struct {
             self.fail("output too large")
             return
         }
-        self.out.append_byte(b)
         self.out_len += 1
         self.stream_len += 1
-        if len(self.window) < window_size() {
-            self.window += [b]
-        } else {
+        if self.wpos < len(self.window) {
             self.window[self.wpos] = b
+        } else {
+            self.window += [b]
         }
-        self.wpos = (self.wpos + 1) & (window_size() - 1)
+        self.wpos += 1
+        if self.wpos == 32768 {
+            self.flush()
+            self.wpos = 0
+            self.flushed = 0
+        }
+    }
+
+    // Appends the window's bytes from `flushed` up to `wpos` to `out`.
+    func flush(self) -> none {
+        if self.wpos > self.flushed {
+            self.out.append_bytes(kod_bytes_from_array(self.window[self.flushed..self.wpos]))
+            self.flushed = self.wpos
+        }
     }
 
     // The Huffman code with these code lengths, one per symbol (0 for a
@@ -287,7 +304,8 @@ type Inflater = struct {
             }
             for _ in 0..length {
                 // While the window is still growing, `wpos` is its length.
-                self.put(self.window[(self.wpos - distance) & (window_size() - 1)])
+                // 32767 is window_size() - 1.
+                self.put(self.window[(self.wpos - distance) & 32767])
             }
         }
     }
@@ -370,7 +388,14 @@ type Inflater = struct {
     }
 
     // Blocks up to and including the one marked last.
+    // The blocks of a stream, up to the last one; its output is then all in
+    // `out`.
     func blocks(self) -> none {
+        self.blocks_in_window()
+        self.flush()
+    }
+
+    func blocks_in_window(self) -> none {
         for self.err == "" {
             let last = self.bits(1)
             let kind = self.bits(2)
