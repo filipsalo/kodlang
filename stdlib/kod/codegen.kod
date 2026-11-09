@@ -532,6 +532,78 @@ func opposite_condition(anon cond: str) -> str {
     }
 }
 
+// The text of a Raw instruction, or "" for a label.
+func insn_text(anon insn: regalloc.Insn) -> str {
+    if insn is .Raw(text) {
+        return text
+    }
+    return ""
+}
+
+// An instruction as its mnemonic and operands, split at the commas (none of
+// the patterns `peephole` looks for has brackets or quotes); [] for anything
+// with them, or that isn't an instruction.
+func asm_parts(anon text: str) -> [str] {
+    mut i: int64 = 0
+    let n = len(text)
+    for i < n and (text[i] == '\t' or text[i] == ' ') {
+        i += 1
+    }
+    let start = i
+    for i < n and lexing.is_alpha(text[i]) {
+        i += 1
+    }
+    if i == start {
+        return []
+    }
+    mut parts: [str] = [text[start..i]]
+    mut from = i
+    for k in i..n {
+        let c = text[k]
+        if c == '[' or c == '"' or c == '{' {
+            return []
+        }
+        if c == ',' {
+            parts += [text[from..k].trim()]
+            from = k + 1
+        }
+    }
+    if from < n {
+        let last = text[from..n].trim()
+        if len(last) > 0 {
+            parts += [last]
+        }
+    }
+    return parts
+}
+
+// `#n` with 0 <= n <= 4095: what add, sub and cmp take as an immediate.
+func small_imm(anon op: str) -> bool {
+    if len(op) < 2 or op[0] != '#' {
+        return false
+    }
+    mut v: int64 = 0
+    for k in 1..len(op) {
+        if not lexing.is_digit(op[k]) {
+            return false
+        }
+        v = v * 10 + op[k] - '0'
+        if v > 4095 {
+            return false
+        }
+    }
+    return true
+}
+
+// A branch to `target` taken when condition `cond` holds, or when it
+// doesn't.
+func branch_on(anon cond: str, when_true: bool, target: str) -> str {
+    if when_true {
+        return f"\tb{cond} {target}"
+    }
+    return f"\tb{opposite_condition(cond)} {target}"
+}
+
 // For a conditional branch `\tbeq L`, `\tcbz x1, L` or `\ttbz x1, #3, L`: the
 // branch on the opposite condition with its target left off, and the target,
 // as `["\tbne ", "L"]`. Empty for any other line.
@@ -12639,6 +12711,9 @@ type Codegen = struct {
         if total == 0 {
             return none
         }
+        if self.args_in_registers(args, :expected_kinds, :slots, :total) {
+            return none
+        }
         // Reserve 16-byte aligned stack space and stash each compiled arg
         // there. Compiling an arg may issue bl calls (e.g. into match
         // expressions, struct/enum construction, array concat) which would
@@ -12684,6 +12759,59 @@ type Codegen = struct {
             k = k + 1
         }
         self.emit(f"add sp, sp, #{padded}")
+    }
+
+    // Compiles a call's arguments straight into registers and moves them to
+    // x0.. at the end, when each is an int64, bool or float64 that
+    // simple_arg says can't call anything (which would clobber the ones
+    // before it); false, having compiled nothing, otherwise.
+    func args_in_registers(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], slots: [int64], total: int64) -> bool {
+        if total > 8 or total > len(expected_kinds) {
+            return false
+        }
+        mut order: [int64] = []
+        for i in 0..total {
+            mut ai = -1
+            if len(slots) == 0 {
+                if i < len(args) {
+                    ai = i
+                }
+            } else if i < len(slots) {
+                ai = slots[i]
+            }
+            if ai < 0 or not inline_scalar(expected_kinds[i]) or not self.simple_arg(args[ai].value) {
+                return false
+            }
+            order += [ai]
+        }
+        mut regs: [str] = []
+        for i in 0..total {
+            regs += [self.compile_into(args[order[i]].value, expected: expected_kinds[i])]
+        }
+        for i in 0..total {
+            self.emit(f"mov x{i}, {regs[i]}")
+            self.pool.free_reg(regs[i])
+        }
+        return true
+    }
+
+    // Whether compiling `expr_id` emits no call: a local, a literal, or
+    // arithmetic, comparisons and field reads on them.
+    func simple_arg(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .IntLit(_value) -> return true
+            .BoolLit(_value) -> return true
+            .Ident(name) -> return self.inline_local(name) and inline_scalar(self.find_var_kind(name))
+            .Binary(lhs, op, rhs) -> {
+                match op {
+                    .Add | .Sub | .Mul | .BitAnd | .BitOr | .BitXor | .Shl | .Shr | .Eq | .Ne | .Lt | .Le | .Gt | .Ge -> {
+                        return self.simple_arg(lhs) and self.simple_arg(rhs) and inline_scalar(self.infer_kind(expr_id)) and self.infer_kind(lhs) is .KInt64
+                    }
+                    else return false
+                }
+            }
+            else return false
+        }
     }
 
     func compile_match_expr(self, anon arms: [int64], subject_id: int64) -> Val {
@@ -15757,6 +15885,82 @@ type Codegen = struct {
         return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
     }
 
+    // `body` with two patterns made shorter, where the vreg in them is named
+    // nowhere else: a condition turned into 0 or 1 only to be tested
+    // (`cset v, c` then `cmp v, #0` and `beq L`, or `cbz v, L`) becomes one
+    // branch on the flags, and a small constant moved into a register only to
+    // be added, subtracted or compared (`mov v, #5` then `add d, a, v`) becomes
+    // the instruction's immediate.
+    func peephole(self, anon body: [regalloc.Insn], vreg_start: int64) -> [regalloc.Insn] {
+        let n_local = len(self.pool.vreg_phys) - vreg_start
+        if n_local <= 0 {
+            return body
+        }
+        let counts = regalloc.vreg_counts(body, :vreg_start, :n_local)
+        mut out: [regalloc.Insn] = []
+        let n = len(body)
+        mut i: int64 = 0
+        for i < n {
+            let t0 = insn_text(body[i])
+            let a = asm_parts(t0)
+            if len(a) == 3 and a[0] == "cset" and len(opposite_condition(a[2])) > 0 and self.single_use_vreg(a[1], :counts, :vreg_start) and i + 1 < n {
+                let b = asm_parts(insn_text(body[i + 1]))
+                // cbz/cbnz v, L
+                if len(b) == 3 and b[1] == a[1] and (b[0] == "cbz" or b[0] == "cbnz") {
+                    out += [.Raw(text: branch_on(a[2], when_true: b[0] == "cbnz", target: b[2]))]
+                    i += 2
+                    continue
+                }
+                // cmp v, #0 then beq/bne L
+                if len(b) == 3 and b[0] == "cmp" and b[1] == a[1] and b[2] == "#0" and i + 2 < n {
+                    let c = asm_parts(insn_text(body[i + 2]))
+                    if len(c) == 2 and (c[0] == "beq" or c[0] == "bne") {
+                        out += [.Raw(text: branch_on(a[2], when_true: c[0] == "bne", target: c[1]))]
+                        i += 3
+                        continue
+                    }
+                }
+            }
+            if len(a) == 3 and a[0] == "mov" and self.single_use_vreg(a[1], :counts, :vreg_start) and small_imm(a[2]) and i + 1 < n {
+                let b = asm_parts(insn_text(body[i + 1]))
+                let v = a[1]
+                if len(b) == 4 and (b[0] == "add" or b[0] == "sub") and b[3] == v and b[2] != v and b[2] != "xzr" {
+                    out += [.Raw(text: f"\t{b[0]} {b[1]}, {b[2]}, {a[2]}")]
+                    i += 2
+                    continue
+                }
+                if len(b) == 4 and b[0] == "add" and b[2] == v and b[3] != v and b[3] != "xzr" {
+                    out += [.Raw(text: f"\tadd {b[1]}, {b[3]}, {a[2]}")]
+                    i += 2
+                    continue
+                }
+                if len(b) == 3 and b[0] == "cmp" and b[2] == v and b[1] != v and b[1] != "xzr" {
+                    out += [.Raw(text: f"\tcmp {b[1]}, {a[2]}")]
+                    i += 2
+                    continue
+                }
+            }
+            out += [body[i]]
+            i += 1
+        }
+        return out
+    }
+
+    // Whether `name` is one of this function's vregs, named exactly twice.
+    func single_use_vreg(self, anon name: str, counts: [int64], vreg_start: int64) -> bool {
+        if len(name) < 2 or name[0] != 'v' {
+            return false
+        }
+        mut id: int64 = 0
+        for k in 1..len(name) {
+            if not lexing.is_digit(name[k]) {
+                return false
+            }
+            id = id * 10 + name[k] - '0'
+        }
+        return id >= vreg_start and id - vreg_start < len(counts) and counts[id - vreg_start] == 2
+    }
+
     // Each conditional branch of `body` as the opposite one over a `b`, which
     // reaches 128 MB instead of 1 MB: `beq L` becomes `bne Lfar; b L; Lfar:`.
     func long_branches(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
@@ -16778,7 +16982,7 @@ type Codegen = struct {
         self.emit("mov sp, fp")
         self.emit("ldp fp, lr, [sp], #16")
 
-        let body_buf = self.out_buf
+        let body_buf = self.peephole(self.out_buf, :vreg_start)
         self.out_buf = saved_buf
         self.rc_ctor_mark = -1
 
