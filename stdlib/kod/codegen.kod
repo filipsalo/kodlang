@@ -7437,11 +7437,7 @@ type Codegen = struct {
             .StrPat(value) -> {
                 let slbl = self.intern_str(value)
                 self.emit_ldr(subj_slot, reg: "x0")
-                self.emit(f"adrp x1, {slbl}@PAGE")
-                self.emit(f"add x1, x1, {slbl}@PAGEOFF")
-                self.emit("bl _kod_str_cmp")
-                self.emit("cmp x0, #0")
-                self.emit(f"bne {skip_lbl}")
+                self.emit_str_pat_test(value, label: slbl, subject: "x0", other: "x1", :skip_lbl)
             }
             .EnumPat(_enum_name, _variant_name, _bindings) -> {
                 self.emit_variant_test(raw, subj_enum_idx: self.enum_idx_of_kind(subject_kind), :disc_r, :subj_slot, :skip_lbl, :span)
@@ -9599,15 +9595,65 @@ type Codegen = struct {
         }
     }
 
+    // Sets the flags to `eq` when the strs in registers `a` and `b` are equal
+    // and `ne` otherwise. A KodStr is {buf, len}: the same pointer is equal,
+    // different lengths aren't, and only equal nonzero lengths need memcmp.
+    func emit_str_eq_flags(self, a: str, b: str) -> none {
+        let done_lbl = self.fresh("Lstr_eq")
+        self.emit(f"cmp {a}, {b}")
+        self.emit(f"beq {done_lbl}")
+        self.emit(f"ldr x2, [{a}, #8]")
+        self.emit(f"ldr x16, [{b}, #8]")
+        self.emit("cmp x2, x16")
+        self.emit(f"bne {done_lbl}")
+        self.emit(f"cbz x2, {done_lbl}")
+        self.emit(f"ldr x16, [{a}]")
+        self.emit(f"ldr x17, [{b}]")
+        self.emit("mov x0, x16")
+        self.emit("mov x1, x17")
+        self.emit("bl _memcmp")
+        // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
+        // can't be written here: `w<n>` names a virtual register.)
+        self.emit("lsl x16, x0, #32")
+        self.emit("cmp x16, #0")
+        self.emit_label(done_lbl)
+    }
+
+    // Branches to `skip_lbl` unless the str in `subject` equals the literal
+    // `value` (interned at `label`), loaded into `other` when it isn't empty.
+    func emit_str_pat_test(self, anon value: str, label: str, subject: str, other: str, skip_lbl: str) -> none {
+        self.emit(f"ldr x16, [{subject}, #8]")
+        self.emit_cmp_imm("x16", value: len(value))
+        self.emit(f"bne {skip_lbl}")
+        if len(value) == 0 {
+            return
+        }
+        self.emit(f"adrp {other}, {label}@PAGE")
+        self.emit(f"add {other}, {other}, {label}@PAGEOFF")
+        self.emit("mov x2, x16")
+        self.emit(f"ldr x16, [{subject}]")
+        self.emit(f"ldr x17, [{other}]")
+        self.emit("mov x0, x16")
+        self.emit("mov x1, x17")
+        self.emit("bl _memcmp")
+        // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
+        // can't be written here: `w<n>` names a virtual register.)
+        self.emit("lsl x16, x0, #32")
+        self.emit("cmp x16, #0")
+        self.emit(f"bne {skip_lbl}")
+    }
+
     func compile_str_cmp(self, lhs_id: int64, rhs_id: int64, cond: str) -> Val {
         self.compile_str_operands(lhs_id, :rhs_id)
-        // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
-        // like memcmp. Replaces the previous `_strcmp` call, which
-        // would have compared struct headers byte-by-byte (and stopped
-        // at the first 0 in the embedded len field).
-        self.emit("bl _kod_str_cmp")
+        if cond == "eq" or cond == "ne" {
+            self.emit_str_eq_flags(a: "x0", b: "x1")
+        } else {
+            // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
+            // like memcmp.
+            self.emit("bl _kod_str_cmp")
+            self.emit("cmp x0, #0")
+        }
         mut result = self.pool.alloc_reg()
-        self.emit("cmp x0, #0")
         self.emit(f"cset {result}, {cond}")
         return .VReg(name: result)
     }
@@ -12493,14 +12539,10 @@ type Codegen = struct {
                 }
                 .StrPat(value) -> {
                     let slbl = self.intern_str(value)
-                    self.emit(f"adrp x0, {slbl}@PAGE")
-                    self.emit(f"add x0, x0, {slbl}@PAGEOFF")
                     // Reload from subj_slot — disc_r may have been clobbered
                     // by a prior arm's `bl _kod_str_cmp`.
                     self.emit_ldr(subj_slot, reg: "x1")
-                    self.emit("bl _kod_str_cmp")
-                    self.emit("cmp x0, #0")
-                    self.emit(f"bne {skip_lbl}")
+                    self.emit_str_pat_test(value, label: slbl, subject: "x1", other: "x0", :skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -16244,11 +16286,7 @@ type Codegen = struct {
                     // Reload from subj_slot — disc_r may have been clobbered
                     // by a prior arm's `bl _kod_str_cmp`.
                     self.emit_ldr(subj_slot, reg: "x0")
-                    self.emit(f"adrp x1, {slbl}@PAGE")
-                    self.emit(f"add x1, x1, {slbl}@PAGEOFF")
-                    self.emit("bl _kod_str_cmp")
-                    self.emit("cmp x0, #0")
-                    self.emit(f"bne {skip_lbl}")
+                    self.emit_str_pat_test(value, label: slbl, subject: "x0", other: "x1", :skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
