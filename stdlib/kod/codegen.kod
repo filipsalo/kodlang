@@ -615,6 +615,31 @@ func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
     }
 }
 
+// Whether a kind is one inline_call passes and returns: a value in one register
+// that nothing counts references to.
+func inline_scalar(anon kind: TypeKind) -> bool {
+    return kind is .KInt64 or kind is .KBool or kind is .KFloat64
+}
+
+// Whether the expression `expr_id` in `p` is literals, the names in `params`,
+// operators and field reads only: no call, index, `is`, or any other name.
+func inline_body(anon p: parsing.Parser, anon expr_id: int64, params: [str]) -> bool {
+    match p.exprs[expr_id] {
+        .IntLit(_value) -> return true
+        .FloatLit(_text) -> return true
+        .BoolLit(_value) -> return true
+        .Ident(name) -> return arrays.contains(params, name)
+        .Binary(lhs, op, rhs) -> {
+            match op {
+                .Dot -> return p.exprs[rhs] is .Ident(_field) and inline_body(p, lhs, :params)
+                .Index | .Is | .IsNot | .PlusEq -> return false
+                else return inline_body(p, lhs, :params) and inline_body(p, rhs, :params)
+            }
+        }
+        else return false
+    }
+}
+
 // The instructions that stand in for a call to `label`, with the arguments
 // in x0 and x1 and the result left in x0, or [] for an ordinary call.
 func inline_intrinsic(anon label: str) -> [str] {
@@ -851,6 +876,8 @@ type Codegen = struct {
     checking_default: bool = false
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
     cur_owner: int64 = -1
+    // Frame slots an inlined call's arguments used, free for the next one.
+    inline_free_slots: [int64] = []
     // The enum whose method is being compiled, or -1.
     cur_enum_owner: int64 = -1
     // Some struct declares an operator method (`op_add`, …); until one does, none of the operator checks run.
@@ -1754,6 +1781,113 @@ type Codegen = struct {
             else none
         }
         return none
+    }
+
+    // A call of `sig` (a function, or a method of struct `owner` called on the
+    // expression `recv`) compiled in place, when the body is `return` of an
+    // expression inline_body allows and the parameters and result are int64,
+    // bool or float64 (`self` a struct, given as a local); none for a real
+    // call. Each argument is worked out once, in order, into a slot of its
+    // own, unless it is a local, whose slot the parameter reads; then the
+    // body's expression is compiled with the parameters' names bound to those
+    // slots, as the callee's module and struct would compile it.
+    func inline_call(self, anon sig: SigInfo, owner: int64, recv: int64, args: [ast.CallArg], slots: [int64]) -> Val? {
+        if sig.decl_id <= 0 or len(sig.type_params) > 0 {
+            return none
+        }
+        let fd = sig.src_p.func_decls[sig.decl_id]
+        if fd.is_const or fd.expr_binds or len(fd.captures) > 0 or len(fd.body) != 1 {
+            return none
+        }
+        let .Return(value) = sig.src_p.stmts[fd.body[0]] else { return none }
+        if value == 0 or not inline_scalar(sig.return_kind) {
+            return none
+        }
+        // Parameters past `self` and the arguments that give them.
+        mut skip: int64 = 0
+        if owner >= 0 {
+            skip = 1
+        }
+        if len(fd.params) != len(slots) + skip or len(sig.param_kinds) != len(fd.params) {
+            return none
+        }
+        mut names: [str] = []
+        for param in fd.params {
+            names += [param.name]
+        }
+        for i in 0..len(slots) {
+            if slots[i] < 0 or not inline_scalar(sig.param_kinds[i + skip]) {
+                return none
+            }
+        }
+        mut recv_name = ""
+        if owner >= 0 {
+            let .Ident(name) = self.p.exprs[recv] else { return none }
+            if not self.inline_local(name) {
+                return none
+            }
+            recv_name = name
+        }
+        if not inline_body(sig.src_p, value, params: names) {
+            return none
+        }
+        // Work the arguments out in the caller's scope first.
+        mut offsets: [int64] = []
+        mut taken: [int64] = []
+        mut kinds: [TypeKind] = []
+        if owner >= 0 {
+            offsets += [self.find_var_offset(recv_name)]
+            kinds += [.KStruct(idx: owner, type_args: [])]
+        }
+        for i in 0..len(slots) {
+            let arg = args[slots[i]].value
+            let kind = sig.param_kinds[i + skip]
+            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) {
+                offsets += [self.find_var_offset(name)]
+            } else {
+                let reg = self.compile_into(arg, expected: kind)
+                mut offset: int64 = 0
+                if len(self.inline_free_slots) > 0 {
+                    offset = self.inline_free_slots[-1]
+                    self.inline_free_slots = self.inline_free_slots[0..len(self.inline_free_slots) - 1]
+                } else {
+                    self.frame_slots += 1
+                    offset = 0 - self.frame_slots * 8
+                }
+                self.emit_str(offset, :reg)
+                self.pool.free_reg(reg)
+                offsets += [offset]
+                taken += [offset]
+            }
+            kinds += [kind]
+        }
+        let mark = len(self.vars)
+        for i, name in names {
+            self.vars += [VarSlot(:name, offset: offsets[i], kind: kinds[i], mutable: false, bound: true, seen: true)]
+        }
+        let errors = len(self.errors)
+        let saved_ctx = self.enter(sig.src_p, names: [], args: [])
+        let saved_owner = self.cur_owner
+        self.cur_owner = owner
+        mut val = self.compile_expr(value)
+        self.cur_owner = saved_owner
+        self.leave(saved_ctx)
+        self.vars = self.vars[0..mark]
+        // The value may be one of the slots, which the next inlined call reuses.
+        if val is .VStack(_offset) {
+            val = .VReg(name: self.load(val))
+        }
+        self.inline_free_slots += taken
+        // The callee's own compile reports its errors.
+        if len(self.errors) > errors {
+            self.errors = self.errors[0..errors]
+        }
+        return val
+    }
+
+    // Whether `name` is a local in scope, which a parameter can read in place.
+    func inline_local(self, anon name: str) -> bool {
+        return self.var_bound(name) and self.find_var_offset(name) != -9999
     }
 
     // Whether a constant's value is one a shared copy can stand for: a string, which can't
@@ -11750,6 +11884,9 @@ type Codegen = struct {
                     }
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots
+                    if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
+                        return inlined
+                    }
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
                     let inline = inline_intrinsic(self.fn_label(slot))
                     if len(inline) > 0 {
@@ -12070,9 +12207,15 @@ type Codegen = struct {
         mut sig_labels: [str] = []
         mut sig_defaults: [int64] = []
         mut sig_src_p: parsing.Parser = self.p
+        mut inline_owner: int64 = -1
+        mut inline_mi: int64 = -1
         match recv_kind {
             .KStruct(idx, _struct_type_args) -> {
                 if self.structs[idx].method_idx.get(method_name) is Some(mi) {
+                    if self.structs[idx].template_idx < 0 {
+                        inline_owner = idx
+                        inline_mi = mi
+                    }
                     self.check_private_method(method_name, struct_idx: idx, :span)
                     method_lbl = self.method_label(idx, name: method_name)
                     sig_params = self.structs[idx].methods[mi].sig.param_kinds
@@ -12155,6 +12298,11 @@ type Codegen = struct {
         }
         self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name, call_span: span)
         let call_slots = self.plan_call(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name).slots
+        if inline_owner >= 0 {
+            if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
+                return inlined
+            }
+        }
 
         // Stash self and each compiled arg on the stack so that arg
         // expressions (which may issue bl calls) don't clobber preceding
@@ -16503,6 +16651,8 @@ type Codegen = struct {
         self.limit_fn_locals = []
         self.bound_log = []
         self.frame_slots = 0
+        let no_inline_slots: [int64] = []
+        self.inline_free_slots = no_inline_slots
         self.rc_slots = []
         self.rc_stmt_temps = []
         self.rc_free_temps = []

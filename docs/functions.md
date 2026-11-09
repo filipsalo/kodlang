@@ -30,6 +30,15 @@ them in a struct.
 let result: int64 = add(1, 2)
 ```
 
+The arguments are worked out left to right, each once, before the body runs.
+A small function or method whose whole body is `return` of an expression made
+of its parameters, literals, operators and field reads, with `int64`, `bool`
+or `float64` parameters (a method's `self` may be a struct) and result, like
+`add` above or a method `func area(self) -> int64 { return self.w * self.h }`,
+is compiled in place at each call instead of being called. It behaves the
+same, except that a backtrace from inside it, such as a division by zero,
+names the caller.
+
 ## Call labels
 
 Calls use labeled arguments by default; the parameter name *is* the label:
