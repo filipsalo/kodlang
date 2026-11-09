@@ -437,7 +437,7 @@ def test_k_each_result_arrives_while_the_next_test_runs(scratch):
     assert re.search(r"^2/3 passed", rest, re.MULTILINE), rest
 
 
-@pytest.mark.parametrize("how", ["index", "kod_panic"])
+@pytest.mark.parametrize("how", ["index", "panic"])
 def test_l_a_panic_comes_after_what_the_program_printed(scratch, how):
     # stdout is a pipe, so "before the panic" is still buffered when the panic
     # message goes to stderr, which is the same pipe.

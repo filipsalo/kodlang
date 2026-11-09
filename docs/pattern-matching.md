@@ -292,7 +292,7 @@ After the block, `x` has its declared type again. A `for` condition doesn't
 narrow.
 
 An early exit narrows the rest of its block too. After an `if` with no `else`
-whose block ends in `return`, `throw`, `break`, `continue` or `kod_panic(...)`,
+whose block ends in `return`, `throw`, `break`, `continue` or `panic(...)`,
 the statements that follow in the same block run only when the test failed:
 
 ```kod
@@ -318,14 +318,14 @@ func total(anon xs: [int64?], limit: int64 or Error) -> int64 {
 `x is none`, `x is Err` and `x is not T` narrow this way, under the rules
 above, with the rest of the block in place of the `else` block. The block has
 to end in the exit: a `return`, `throw`, `break` or `continue`, or a call that
-never returns, which is `kod_panic(...)` or a function or method that can't
+never returns, which is `panic(...)` or a function or method that can't
 finish by the rules in [`return`](control-flow.md#return) (a
 `-> none` function with no `return` that ends in such a call, or in a `for
 true` loop without a `break`):
 
 ```kod
 func fail(anon msg: str) -> none {
-    kod_panic(f"config: {msg}")
+    panic(f"config: {msg}")
 }
 
 func port(anon raw: str?) -> int64 {
@@ -469,7 +469,7 @@ which is how arms of different structs become one interface value:
 
 When the match's value is used, every arm needs a value: an arm that calls
 a function returning `none` is an error, unless the call never returns,
-like `kod_panic(...)` or a helper that ends in one, an imported module's
+like `panic(...)` or a helper that ends in one, an imported module's
 function (`log.die(...)`) included (see
 [Return values](functions.md#return-values)). In a `-> none`
 or `-> none or Error` function, `return match k { 1 -> a() else -> b() }`

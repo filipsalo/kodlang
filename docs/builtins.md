@@ -27,15 +27,15 @@ binding of `f` in force and no function of that name, the call is an
 error: `` `f` is called before its `let` `` or
 `` `f` is declared in a block that has ended; declare it outside the block to call it here ``.
 
-The same holds for `len`, `str`, `hash` and `kod_panic`: a module can
+The same holds for `len`, `str`, `hash` and `panic`: a module can
 declare its own `func hash(anon p: Point) -> int64`, and
 its `hash(...)` calls use it, while another module's `dep.hash(x)` names
 that one. An f-string always converts its values with the builtin `str`.
-Only the builtin `kod_panic` counts as a call that never returns; a
-module's own or imported `kod_panic`, or a local function value of that
-name, is an ordinary call. A local named `kod_panic` that holds anything
-else doesn't hide the builtin, so `kod_panic(msg)` after
-`let kod_panic = 5` never returns.
+Only the builtin `panic` counts as a call that never returns; a
+module's own or imported `panic`, or a local function value of that
+name, is an ordinary call. A local named `panic` that holds anything
+else doesn't hide the builtin, so `panic(msg)` after
+`let panic = 5` never returns.
 
 ## Output
 
@@ -156,7 +156,7 @@ and `k`, each evaluated once.
 |------|-------------|
 | `Error` (interface) | Marker for types that can be `throw`n. Requires `to_str(self) -> str`. |
 | `ExitCode` (interface) | `exit_code(self) -> int64`, declared but not consulted yet: an `Err` that `main` returns exits with status 1 whatever it implements. |
-| `kod_panic` (extern) | Print `panic: <msg>\n` to stderr and `exit(1)`. Used by `must` and by `assert` outside a test. |
+| `panic` | Print `panic: <msg>\n` to stderr and `exit(1)`. Used by `must` and by `assert` outside a test. |
 | `kod_eprint` (extern) | Write to stderr without exiting. |
 
 ## Testing

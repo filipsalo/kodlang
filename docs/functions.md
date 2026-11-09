@@ -202,7 +202,7 @@ A returned `T or Error` value must have the same `T`, so returning an
 `int64 or Error` from a `-> str or Error` function is an error.
 
 A function with a return type other than `none` must end every path with a
-`return`, a `throw`, or a call that doesn't return, like `kod_panic(...)`.
+`return`, a `throw`, or a call that doesn't return, like `panic(...)`.
 One that can reach the end of its body is an error at its name, or at the
 `func` of a function literal
 (`` `pick` can reach its end without returning a value ``), and that
@@ -220,17 +220,17 @@ Whether a path can reach the end is decided from the statements alone:
   `for` loop, including `for … in`, may finish.
 
 Code after a statement that ends every path is never run and isn't
-considered, so a `break` placed after a `return` or `kod_panic(...)` doesn't
+considered, so a `break` placed after a `return` or `panic(...)` doesn't
 let a `for true` loop finish.
 
-The builtin `kod_panic(...)` never returns, and neither does a function or
+The builtin `panic(...)` never returns, and neither does a function or
 method that returns `none`, has no `return`, and can't reach the end of its
 body by these rules. A function of the module or one it imports named
-`kod_panic`, or a local function value of that name in force at the
+`panic`, or a local function value of that name in force at the
 call, hides the builtin (see [Built-ins](builtins.md)). A local named
-`kod_panic` that holds anything else doesn't, so `kod_panic(msg)` after
-`let kod_panic = 5` never returns. So a helper that ends in
-`kod_panic(...)` never returns, and nor does one that ends in a call of
+`panic` that holds anything else doesn't, so `panic(msg)` after
+`let panic = 5` never returns. So a helper that ends in
+`panic(...)` never returns, and nor does one that ends in a call of
 another such helper (`self.fail(msg)`, `log.die(msg)`, or a function
 declared further down), or in a `for true` loop it can't `break` out of.
 A call that leads back to the function itself doesn't count:
@@ -256,7 +256,7 @@ chosen at run time:
   function type);
 - a method called through an interface value.
 
-End such a path with a `kod_panic(...)` or a `return` after the call.
+End such a path with a `panic(...)` or a `return` after the call.
 
 A call in a value's place, as a returned value, a match arm's value or an
 `x? or ...` default, is decided where it is written by the same rules, so
@@ -267,12 +267,12 @@ ends in a call taken to return, the error names that call and its line:
 `let r: Failer = Reporter()`, for an interface `Failer`
 (`` as `die` ends in `r.fail(msg)` (line 19) ``, or
 `` (line 19 of lib/log.kod) `` when the call is in another module), and
-it says to put a `kod_panic(...)` after it. The `can reach its end` error
+it says to put a `panic(...)` after it. The `can reach its end` error
 names that call too when the body ends in a call of such a function, and
 says so when the body itself ends in a call through a function value or
 a method called through an interface value. Such a call is taken to
 return wherever it is written: call it as a statement and end the path
-with `kod_panic(...)`.
+with `panic(...)`.
 
 ## `main`
 

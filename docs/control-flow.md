@@ -229,12 +229,12 @@ body (see [Return values](functions.md#return-values)). An `if` without an
 `else`, a `for` over a condition or an array, and a `for true` loop with a
 `break` can all finish, so a `return` has to follow them; a `match` whose
 arms all return, and a `for true` loop that only leaves through `return`,
-can't. Nor can a call that never returns: `kod_panic(...)`, or a `-> none`
+can't. Nor can a call that never returns: `panic(...)`, or a `-> none`
 function or method without a `return` whose body can't finish by these
 same rules, such as one that ends in another such call or in a `for true`
 loop without a `break`. A method counts whatever it's called on, a local
 included, as long as the receiver's type is known at the call. A call
 through a function value and a method called through an interface value
 are taken to return, since what they call is chosen at run time; end
-such a path with a `kod_panic(...)` or a `return` after the call (see
+such a path with a `panic(...)` or a `return` after the call (see
 [Return values](functions.md#return-values)).
