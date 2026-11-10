@@ -619,6 +619,105 @@ func parse_digits(anon s: str) -> int64 {
     return v
 }
 
+// Where `name` (a register) appears in `text` as a whole token: its start
+// indices.
+func token_spots(anon text: str, name: str) -> [int64] {
+    mut spots: [int64] = []
+    let n = len(text)
+    let m = len(name)
+    mut k: int64 = 0
+    for k + m <= n {
+        if text[k] == name[0] and text[k..k + m] == name and (k == 0 or not regalloc.is_sym_char(text[k - 1])) and (k + m == n or not regalloc.is_sym_char(text[k + m])) {
+            spots += [k]
+            k += m
+        } else {
+            k += 1
+        }
+    }
+    return spots
+}
+
+// A plain x or vreg register name: `x3`, `v12`.
+func plain_reg(anon name: str) -> bool {
+    return len(name) >= 2 and (name[0] == 'x' or name[0] == 'v') and parse_digits(name[1..len(name)]) >= 0
+}
+
+// Instructions whose first operand is read, not written.
+func first_operand_read(anon op: str) -> bool {
+    return op == "str" or op == "strb" or op == "strh" or op == "stp" or op == "cmp" or op == "cmn" or op == "tst" or op == "cbz" or op == "cbnz"
+}
+
+// `body` with copies a promoted body is full of taken out (vregs from
+// `vreg_start`, `n_local` of them):
+// - `mov A, B` then `ldr A, [A, ...]` loads from `[B, ...]` instead;
+// - `mov A, B` with A named only there and in the next instruction, which
+//   reads it, has the next instruction read B;
+// - `str R, [M]` then `ldr D, [M]` becomes `str` then `mov D, R`.
+func forward_copies(anon body: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
+    let counts = regalloc.vreg_counts(body, :vreg_start, :n_local)
+    mut b: [regalloc.Insn] = []
+    for insn in body {
+        b += [insn]
+    }
+    let n = len(b)
+    mut mid: [regalloc.Insn] = []
+    for i in 0..n {
+        let t = insn_text(b[i])
+        if i + 1 < n and t.starts_with("\tmov v") {
+            let a = asm_parts(t)
+            let next = insn_text(b[i + 1])
+            if len(a) == 3 and plain_reg(a[1]) and a[1][0] == 'v' and plain_reg(a[2]) and a[1] != a[2] and next.starts_with("\t") and not next.contains("!") and not next.contains("], #") and not next.contains("\"") {
+                let dst = a[1]
+                let src = a[2]
+                let spots = token_spots(next, name: dst)
+                let id = parse_digits(dst[1..len(dst)]) - vreg_start
+                let head = f"\tldr {dst}, [{dst}"
+                if len(spots) == 2 and next.starts_with(head) and len(next) > len(head) and (next[len(head)] == ']' or next[len(head)] == ',') {
+                    b[i + 1] = .Raw(text: f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
+                    continue
+                }
+                if len(spots) == 1 and id >= 0 and id < n_local and counts[id] == 2 {
+                    let na = next.trim()
+                    mut op_end: int64 = 0
+                    for op_end < len(na) and lexing.is_alpha(na[op_end]) {
+                        op_end += 1
+                    }
+                    let op = na[0..op_end]
+                    // The first operand starts after the mnemonic and a space.
+                    let is_first = spots[0] == 1 + op_end + 1
+                    if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
+                        b[i + 1] = .Raw(text: next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
+                        continue
+                    }
+                }
+            }
+        }
+        mid += [b[i]]
+    }
+    mut out: [regalloc.Insn] = []
+    let m = len(mid)
+    for i in 0..m {
+        let t = insn_text(mid[i])
+        if i > 0 and t.starts_with("\tldr ") and t.ends_with("]") and not t.contains("!") {
+            let prev = insn_text(mid[i - 1])
+            if prev.starts_with("\tstr ") and prev.ends_with("]") and not prev.contains("!") {
+                if t.find(", [") is Some(k) and prev.find(", [") is Some(pk) {
+                    let dst = t[5..k]
+                    let src = prev[5..pk]
+                    if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == prev[pk..len(prev)] {
+                        if dst != src {
+                            out += [.Raw(text: f"\tmov {dst}, {src}")]
+                        }
+                        continue
+                    }
+                }
+            }
+        }
+        out += [mid[i]]
+    }
+    return out
+}
+
 // `#n` with 0 <= n <= 4095: what add, sub and cmp take as an immediate.
 func small_imm(anon op: str) -> bool {
     if len(op) < 2 or op[0] != '#' {
@@ -9967,6 +10066,21 @@ type Codegen = struct {
     }
 
     func compile_str_cmp(self, lhs_id: int64, rhs_id: int64, cond: str) -> Val {
+        if (cond == "eq" or cond == "ne") and (self.is_empty_str_lit(lhs_id) or self.is_empty_str_lit(rhs_id)) {
+            // Against "" only the length counts.
+            mut other = lhs_id
+            if self.is_empty_str_lit(lhs_id) {
+                other = rhs_id
+            }
+            let reg = self.pool.alloc_reg()
+            self.mov_to(self.compile_expr(other), dest: reg)
+            self.emit(f"ldr x16, [{reg}, #8]")
+            self.emit("cmp x16, #0")
+            self.pool.free_reg(reg)
+            let result = self.pool.alloc_reg()
+            self.emit(f"cset {result}, {cond}")
+            return .VReg(name: result)
+        }
         self.compile_str_operands(lhs_id, :rhs_id)
         if cond == "eq" or cond == "ne" {
             self.emit_str_eq_flags(a: "x0", b: "x1")
@@ -10187,6 +10301,11 @@ type Codegen = struct {
     }
 
     // Read only where it's moved, so neither operand needs parking across it.
+    func is_empty_str_lit(self, anon expr_id: int64) -> bool {
+        let .StrLit(value) = self.p.exprs[expr_id] else { return false }
+        return len(value) == 0
+    }
+
     func emits_nothing(self, anon expr_id: int64) -> bool {
         match self.p.exprs[expr_id] {
             .IntLit(_value) -> return true
@@ -16119,6 +16238,7 @@ type Codegen = struct {
                 out += [body[j]]
                 j += 1
             }
+            out = forward_copies(out, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
             if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true) {
                 return out
             }
