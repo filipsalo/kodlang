@@ -853,6 +853,129 @@ func inline_body(anon p: parsing.Parser, anon expr_id: int64, params: [str]) -> 
     }
 }
 
+// The most expression and statement nodes a body inline_stmts compiles in place may have.
+let INLINE_MAX_NODES: int64 = 80
+
+// The most nodes of inlined bodies one function takes in, nested ones counted
+// too (a quarter for a call in a loop), so a function of many calls doesn't
+// grow without end.
+let INLINE_FUNC_BUDGET: int64 = 200
+
+// How many nodes the statements `stmts` of `p` have, or -1 when one is
+// something inline_stmts doesn't compile in place: a `match`, `for x in`,
+// `let ... else`, `throw`, `assert`, or an expression inline_expr_size refuses.
+// Past INLINE_MAX_NODES it stops counting and gives -1 too, so a long body costs little.
+func inline_stmts_size(anon p: parsing.Parser, anon stmts: [int64]) -> int64 {
+    if len(stmts) > INLINE_MAX_NODES {
+        return -1
+    }
+    mut total: int64 = 0
+    for id in stmts {
+        let n = inline_stmt_size(p, id)
+        if n < 0 {
+            return -1
+        }
+        total += n
+        if total > INLINE_MAX_NODES {
+            return -1
+        }
+    }
+    return total
+}
+
+func inline_stmt_size(anon p: parsing.Parser, anon id: int64) -> int64 {
+    match p.stmts[id] {
+        .Let(_name, _typ, value, _mutable) -> return inline_size_sum(1, inline_expr_size(p, value))
+        .Assign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
+        .PlusAssign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
+        .MinusAssign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
+        .Return(value) -> {
+            if value == 0 {
+                return 1
+            }
+            return inline_size_sum(1, inline_expr_size(p, value))
+        }
+        .If(cond, then_body, else_body) -> return inline_size_sum(inline_expr_size(p, cond), inline_size_sum(inline_stmts_size(p, then_body), inline_stmts_size(p, else_body)))
+        .For(cond, body) -> {
+            mut c: int64 = 1
+            if cond != 0 {
+                c = inline_expr_size(p, cond)
+            }
+            return inline_size_sum(c, inline_stmts_size(p, body))
+        }
+        .Break -> return 1
+        .Continue -> return 1
+        .ExprStmt(expr) -> return inline_expr_size(p, expr)
+        else -> return -1
+    }
+}
+
+// `a + b`, or -1 if either is.
+func inline_size_sum(anon a: int64, anon b: int64) -> int64 {
+    if a < 0 or b < 0 {
+        return -1
+    }
+    return a + b
+}
+
+// The nodes of expression `id`, or -1 for one that leaves the function or
+// binds names: `try`, a function literal, a `match`, `is`.
+func inline_expr_size(anon p: parsing.Parser, anon id: int64) -> int64 {
+    match p.exprs[id] {
+        .Binary(lhs, op, rhs) -> {
+            match op {
+                .Is | .IsNot -> return -1
+                else return inline_size_sum(1, inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs)))
+            }
+        }
+        .Chain(exprs, _ops) -> {
+            mut n: int64 = 1
+            for e in exprs {
+                n = inline_size_sum(n, inline_expr_size(p, e))
+            }
+            return n
+        }
+        .Call(callee, args) -> {
+            mut n = inline_size_sum(1, inline_expr_size(p, callee))
+            for a in args {
+                n = inline_size_sum(n, inline_expr_size(p, a.value))
+            }
+            return n
+        }
+        .ArrayLit(elements) -> {
+            mut n: int64 = 1
+            for e in elements {
+                n = inline_size_sum(n, inline_expr_size(p, e))
+            }
+            return n
+        }
+        .Slice(s, lo, hi) -> {
+            mut n = inline_size_sum(1, inline_expr_size(p, s))
+            if lo != 0 {
+                n = inline_size_sum(n, inline_expr_size(p, lo))
+            }
+            if hi != 0 {
+                n = inline_size_sum(n, inline_expr_size(p, hi))
+            }
+            return n
+        }
+        .UnwrapOpt(value, default) -> {
+            mut n = inline_size_sum(1, inline_expr_size(p, value))
+            if default != 0 {
+                n = inline_size_sum(n, inline_expr_size(p, default))
+            }
+            return n
+        }
+        .Must(inner) -> return inline_size_sum(1, inline_expr_size(p, inner))
+        .OptionalDot(value, _field) -> return inline_size_sum(1, inline_expr_size(p, value))
+        .Try(_inner) -> return -1
+        .FuncLit(_decl_id) -> return -1
+        .MatchExpr(_subject, _arms) -> return -1
+        .OptionalMethodCall(_value, _method, _args) -> return -1
+        else -> return 1
+    }
+}
+
 // The instructions that stand in for a call to `label`, with the arguments
 // in x0 and x1 and the result left in x0, or [] for an ordinary call.
 func inline_intrinsic(anon label: str) -> [str] {
@@ -1091,6 +1214,13 @@ type Codegen = struct {
     cur_owner: int64 = -1
     // Frame slots an inlined call's arguments used, free for the next one.
     inline_free_slots: [int64] = []
+    // While a body is compiled in place (inline_stmts): how many deep, and
+    // where its `return` stores the value and branches to.
+    inline_depth: int64 = 0
+    // How many more nodes of inlined bodies this function may take in.
+    inline_budget: int64 = 0
+    inline_ret_lbl: str = ""
+    inline_ret_off: int64 = 0
     // The enum whose method is being compiled, or -1.
     cur_enum_owner: int64 = -1
     // Some struct declares an operator method (`op_add`, …); until one does, none of the operator checks run.
@@ -2098,6 +2228,187 @@ type Codegen = struct {
         return val
     }
 
+    // A call of `sig` (as inline_call) whose body is a few statements, compiled
+    // in place: parameters int64, bool, float64 or a struct given as a local
+    // (`self` too), none `mut`; the result one of those scalars or nothing;
+    // the body what inline_stmts_size allows, with only scalar locals. The
+    // arguments are worked out as inline_call does. The body sees only the
+    // parameters, the callee's module and struct, and `return` stores its
+    // value in a slot and branches past the body. none for a real call.
+    func inline_stmts(self, anon sig: SigInfo, owner: int64, recv: int64, args: [ast.CallArg], slots: [int64]) -> Val? {
+        // The untyped walk keeps kinds by index into `vars`, which the body would swap out.
+        if self.untyped_walk or self.inline_depth >= 2 or sig.decl_id <= 0 or len(sig.type_params) > 0 {
+            return none
+        }
+        let fd = sig.src_p.func_decls[sig.decl_id]
+        if fd.is_const or fd.expr_binds or len(fd.captures) > 0 or len(fd.body) == 0 {
+            return none
+        }
+        let returns_value = not (sig.return_kind is .KVoid)
+        if returns_value and not inline_scalar(sig.return_kind) {
+            return none
+        }
+        let size = inline_stmts_size(sig.src_p, fd.body)
+        // In a loop, where it pays, a body costs a quarter of its size.
+        mut cost = size
+        if len(self.loop_stack) > 0 {
+            cost = size / 4
+        }
+        if size < 0 or size > INLINE_MAX_NODES or cost > self.inline_budget {
+            return none
+        }
+        mut skip: int64 = 0
+        if owner >= 0 {
+            skip = 1
+        }
+        if len(fd.params) != len(slots) + skip or len(sig.param_kinds) != len(fd.params) {
+            return none
+        }
+        for param in fd.params {
+            if param.mutable {
+                return none
+            }
+        }
+        mut recv_name = ""
+        if owner >= 0 {
+            let .Ident(name) = self.p.exprs[recv] else { return none }
+            if not self.inline_local(name) {
+                return none
+            }
+            recv_name = name
+        }
+        // Each argument: a scalar, or a struct that is a local of the same kind.
+        for i in 0..len(slots) {
+            if slots[i] < 0 {
+                return none
+            }
+            let kind = sig.param_kinds[i + skip]
+            if not inline_scalar(kind) {
+                if not (kind is .KStruct(_si, _sa)) {
+                    return none
+                }
+                let .Ident(name) = self.p.exprs[args[slots[i]].value] else { return none }
+                if not self.inline_local(name) or not self.same_kind(self.find_var_kind(name), kind) {
+                    return none
+                }
+            }
+        }
+        mut names: [str] = []
+        for param in fd.params {
+            names += [param.name]
+        }
+        // The body's locals must all be scalars: collect them as compile_func
+        // would, with placeholder parameter slots, and look.
+        let saved_vars = self.vars
+        let saved_frame = self.frame_slots
+        mut probe: [VarSlot] = []
+        for i, name in names {
+            probe += [VarSlot(:name, offset: 0, kind: sig.param_kinds[i], mutable: false, bound: true, seen: true)]
+        }
+        self.vars = probe
+        let probe_ctx = self.enter(sig.src_p, names: [], args: [])
+        let probe_owner = self.cur_owner
+        self.cur_owner = owner
+        for stmt_id in fd.body {
+            self.collect_stmt_vars(:stmt_id)
+        }
+        mut scalar_locals = true
+        for k in len(names)..len(self.vars) {
+            if not inline_scalar(self.vars[k].kind) {
+                scalar_locals = false
+            }
+        }
+        self.cur_owner = probe_owner
+        self.leave(probe_ctx)
+        self.vars = saved_vars
+        self.frame_slots = saved_frame
+        if not scalar_locals {
+            return none
+        }
+        self.inline_budget -= cost
+        // Work the arguments out in the caller's scope first.
+        mut offsets: [int64] = []
+        mut taken: [int64] = []
+        mut kinds: [TypeKind] = []
+        if owner >= 0 {
+            offsets += [self.find_var_offset(recv_name)]
+            kinds += [.KStruct(idx: owner, type_args: [])]
+        }
+        for i in 0..len(slots) {
+            let arg = args[slots[i]].value
+            let kind = sig.param_kinds[i + skip]
+            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) {
+                offsets += [self.find_var_offset(name)]
+            } else {
+                let reg = self.compile_into(arg, expected: kind)
+                let offset = self.inline_slot()
+                self.emit_str(offset, :reg)
+                self.pool.free_reg(reg)
+                offsets += [offset]
+                taken += [offset]
+            }
+            kinds += [kind]
+        }
+        mut ret_off: int64 = 0
+        if returns_value {
+            ret_off = self.inline_slot()
+        }
+        self.rc_flush_pending()
+        // Taken only now: compiling the arguments may append to `vars` in place.
+        let caller_vars = self.vars
+        mut body_vars: [VarSlot] = []
+        for i, name in names {
+            body_vars += [VarSlot(:name, offset: offsets[i], kind: kinds[i], mutable: false, bound: true, seen: true)]
+        }
+        self.vars = body_vars
+        let errors = len(self.errors)
+        let saved_ctx = self.enter(sig.src_p, names: [], args: [])
+        let saved_owner = self.cur_owner
+        let saved_ret_lbl = self.inline_ret_lbl
+        let saved_ret_off = self.inline_ret_off
+        let saved_return_kind = self.return_kind
+        let end_lbl = self.fresh("Linline_end")
+        self.cur_owner = owner
+        self.inline_ret_lbl = end_lbl
+        self.inline_ret_off = ret_off
+        self.return_kind = sig.return_kind
+        self.inline_depth += 1
+        for stmt_id in fd.body {
+            self.collect_stmt_vars(:stmt_id)
+        }
+        self.compile_block(fd.body)
+        self.emit_label(end_lbl)
+        self.inline_depth -= 1
+        self.return_kind = saved_return_kind
+        self.inline_ret_lbl = saved_ret_lbl
+        self.inline_ret_off = saved_ret_off
+        self.cur_owner = saved_owner
+        self.leave(saved_ctx)
+        self.vars = caller_vars
+        self.inline_free_slots += taken
+        if len(self.errors) > errors {
+            self.errors = self.errors[0..errors]
+        }
+        if not returns_value {
+            return .VImm(value: 0)
+        }
+        let reg = self.pool.alloc_reg()
+        self.emit_ldr(ret_off, :reg)
+        self.inline_free_slots += [ret_off]
+        return .VReg(name: reg)
+    }
+
+    // A frame slot for an inlined call's argument or result.
+    func inline_slot(self) -> int64 {
+        if len(self.inline_free_slots) > 0 {
+            let offset = self.inline_free_slots[-1]
+            self.inline_free_slots = self.inline_free_slots[0..len(self.inline_free_slots) - 1]
+            return offset
+        }
+        self.frame_slots += 1
+        return 0 - self.frame_slots * 8
+    }
+
     // Whether `name` is a local in scope, which a parameter can read in place.
     func inline_local(self, anon name: str) -> bool {
         return self.var_bound(name) and self.find_var_offset(name) != -9999
@@ -2406,6 +2717,12 @@ type Codegen = struct {
     }
 
     func report_message(self, anon msg: str, span: ast.Span) -> none {
+        // A body compiled in place reports nothing: its own compile does, and
+        // recording it here would make that a repeat.
+        if self.inline_depth > 0 {
+            self.report_attempts = self.report_attempts + 1
+            return
+        }
         if self.is_repeat_report(msg, :span) {
             self.report_attempts = self.report_attempts + 1
             return
@@ -3344,7 +3661,8 @@ type Codegen = struct {
     // synthesise repeated entries that the runtime lookup doesn't
     // need).
     func mark_stmt_line(self, anon stmt_id: int64) -> none {
-        if self.dry_run {
+        // An inlined body's lines are the callee's file's; the call's line stands for them.
+        if self.dry_run or self.inline_depth > 0 {
             return none
         }
         let off: int64 = self.stmt_offset(stmt_id)
@@ -12120,6 +12438,9 @@ type Codegen = struct {
                     if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
                         return inlined
                     }
+                    if self.inline_stmts(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
+                        return inlined
+                    }
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
                     let inline = inline_intrinsic(self.fn_label(slot))
                     if len(inline) > 0 {
@@ -12533,6 +12854,9 @@ type Codegen = struct {
         let call_slots = self.plan_call(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name).slots
         if inline_owner >= 0 {
             if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
+                return inlined
+            }
+            if self.inline_stmts(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
                 return inlined
             }
         }
@@ -15500,6 +15824,18 @@ type Codegen = struct {
     }
 
     func compile_return(self, anon value_id: int64) -> none {
+        if len(self.inline_ret_lbl) > 0 {
+            // A body with no result has no slot: `return none` only evaluates.
+            if value_id != 0 and self.inline_ret_off == 0 {
+                self.compile_discard(value_id)
+            } else if value_id != 0 {
+                let reg = self.compile_into(value_id, expected: self.return_kind)
+                self.emit_str(self.inline_ret_off, :reg)
+                self.pool.free_reg(reg)
+            }
+            self.emit(f"b {self.inline_ret_lbl}")
+            return
+        }
         if value_id == 0 {
             self.emit_no_value_return()
             self.emit_ret_jump()
@@ -17159,6 +17495,7 @@ type Codegen = struct {
         self.frame_slots = 0
         let no_inline_slots: [int64] = []
         self.inline_free_slots = no_inline_slots
+        self.inline_budget = INLINE_FUNC_BUDGET
         self.rc_slots = []
         self.rc_stmt_temps = []
         self.rc_free_temps = []

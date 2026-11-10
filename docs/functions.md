@@ -35,9 +35,14 @@ A small function or method whose whole body is `return` of an expression made
 of its parameters, literals, operators and field reads, with `int64`, `bool`
 or `float64` parameters (a method's `self` may be a struct) and result, like
 `add` above or a method `func area(self) -> int64 { return self.w * self.h }`,
-is compiled in place at each call instead of being called. It behaves the
-same, except that a backtrace from inside it, such as a division by zero,
-names the caller.
+is compiled in place at each call instead of being called. So is a short
+body of statements (`let` of a number or bool, assignments, `if`, `for` with
+a condition, `break`, `continue`, `return` and calls, but no `match`,
+`for x in`, `try`, `is` or function literal) whose parameters, none of them
+`mut`, are numbers, bools or structs, and whose result is a number, a bool or
+nothing; a struct argument must then be a local name, as `self` must. It
+behaves the same, except that a backtrace from inside it, such as a division
+by zero, names the caller.
 
 ## Call labels
 
