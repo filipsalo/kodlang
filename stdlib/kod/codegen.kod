@@ -9424,28 +9424,9 @@ type Codegen = struct {
         }
         mut result = self.pool.alloc_reg()
         if array_like {
-            // Normalise negative index: if idx < 0, idx += len.
-            let pos_lbl = self.fresh("Lidx_pos")
             let len_r = self.pool.alloc_reg()
             self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
-            self.emit(f"cmp {idx_r}, #0")
-            self.emit(f"bge {pos_lbl}")
-            self.emit(f"add {idx_r}, {idx_r}, {len_r}")
-            self.emit_label(pos_lbl)
-            // Bounds check via unsigned compare: catches both idx >= len
-            // and idx < 0 (negative signed → huge unsigned), and skips
-            // ahead to load on success. Forward branch to the panic
-            // call to keep the hot path (no panic) straight-line.
-            let ok_lbl = self.fresh("Lidx_ok")
-            let oob_lbl = self.fresh("Lidx_oob")
-            self.emit(f"cmp {idx_r}, {len_r}")
-            self.emit(f"b.hs {oob_lbl}")
-            self.emit(f"b {ok_lbl}")
-            self.emit_label(oob_lbl)
-            self.emit(f"mov x0, {idx_r}")
-            self.emit(f"mov x1, {len_r}")
-            self.emit("bl _kod_index_oob")
-            self.emit_label(ok_lbl)
+            self.emit_index_check(idx_r, len: len_r)
             self.pool.free_reg(len_r)
 
             let hdr = self.pool.alloc_reg()
@@ -9461,21 +9442,7 @@ type Codegen = struct {
             self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
             let buf_r = self.pool.alloc_reg()
             self.emit(f"ldr {buf_r}, [{ptr_r}]")
-            let pos_lbl = self.fresh("Lidx_pos")
-            self.emit(f"cmp {idx_r}, #0")
-            self.emit(f"bge {pos_lbl}")
-            self.emit(f"add {idx_r}, {idx_r}, {len_r}")
-            self.emit_label(pos_lbl)
-            let ok_lbl = self.fresh("Lidx_ok")
-            let oob_lbl = self.fresh("Lidx_oob")
-            self.emit(f"cmp {idx_r}, {len_r}")
-            self.emit(f"b.hs {oob_lbl}")
-            self.emit(f"b {ok_lbl}")
-            self.emit_label(oob_lbl)
-            self.emit(f"mov x0, {idx_r}")
-            self.emit(f"mov x1, {len_r}")
-            self.emit("bl _kod_index_oob")
-            self.emit_label(ok_lbl)
+            self.emit_index_check(idx_r, len: len_r)
             self.pool.free_reg(len_r)
             self.emit(f"ldrb w{result[1..len(result)]}, [{buf_r}, {idx_r}]")
             self.pool.free_reg(buf_r)
@@ -9483,6 +9450,27 @@ type Codegen = struct {
         self.pool.free_reg(ptr_r)
         self.pool.free_reg(idx_r)
         return .VReg(name: result)
+    }
+
+    // Checks index `idx` against `len`, leaving it in range: a negative one
+    // counts from the end (`idx += len`), and one out of range either way
+    // panics. An index already in range, nearly every one, takes one unsigned
+    // compare and one branch; the negative case and the panic are past it.
+    func emit_index_check(self, anon idx: str, len: str) -> none {
+        let ok_lbl = self.fresh("Lidx_ok")
+        let oob_lbl = self.fresh("Lidx_oob")
+        self.emit(f"cmp {idx}, {len}")
+        self.emit(f"b.lo {ok_lbl}")
+        self.emit(f"cmp {idx}, #0")
+        self.emit(f"b.ge {oob_lbl}")
+        self.emit(f"add {idx}, {idx}, {len}")
+        self.emit(f"cmp {idx}, {len}")
+        self.emit(f"b.lo {ok_lbl}")
+        self.emit_label(oob_lbl)
+        self.emit(f"mov x0, {idx}")
+        self.emit(f"mov x1, {len}")
+        self.emit("bl _kod_index_oob")
+        self.emit_label(ok_lbl)
     }
 
     func compile_and(self, lhs: int64, rhs: int64) -> Val {
@@ -15482,26 +15470,9 @@ type Codegen = struct {
                     len_r = self.array_buf_len(arr_ptr_r, len_out: true)
                     self.pool.free_reg(arr_ptr_r)
                 }
-                // Normalise negative index: if idx < 0, idx += len.
-                // Then bounds-check via unsigned compare. Mirrors the
-                // read path in compile_index — without the check a
-                // `buf[oob_idx] = ...` silently wrote into whatever
-                // memory followed the array's buf.
-                let pos_lbl = self.fresh("Lidx_pos")
-                self.emit(f"cmp {reloaded_idx_r}, #0")
-                self.emit(f"bge {pos_lbl}")
-                self.emit(f"add {reloaded_idx_r}, {reloaded_idx_r}, {len_r}")
-                self.emit_label(pos_lbl)
-                let ok_lbl = self.fresh("Lidx_ok")
-                let oob_lbl = self.fresh("Lidx_oob")
-                self.emit(f"cmp {reloaded_idx_r}, {len_r}")
-                self.emit(f"b.hs {oob_lbl}")
-                self.emit(f"b {ok_lbl}")
-                self.emit_label(oob_lbl)
-                self.emit(f"mov x0, {reloaded_idx_r}")
-                self.emit(f"mov x1, {len_r}")
-                self.emit("bl _kod_index_oob")
-                self.emit_label(ok_lbl)
+                // Without the check a `buf[oob_idx] = ...` would write
+                // into whatever memory followed the array's buf.
+                self.emit_index_check(reloaded_idx_r, len: len_r)
                 self.pool.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
                 if self.rc_heap_kind(self.array_elem_kind(lhs_kind)) {
