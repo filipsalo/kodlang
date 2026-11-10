@@ -270,7 +270,84 @@ type Inflater = struct {
     }
 
     // The literals and back-references of one block, up to its end marker.
+    // While at least 7 input bytes are left, the bit buffer is kept in
+    // locals and topped up once per symbol: 49 bits or more cover a
+    // literal/length code (15), its extra bits (5), a distance code (15) and
+    // its extra bits (13). Near the end of the input, `symbols_near_end`
+    // reads bit by bit and tells running out from a bad code.
     func symbols(self, anon lit: Huffman, anon dist: Huffman) -> none {
+        let n = len(self.data)
+        let lit_mask = (1 << lit.bits) - 1
+        let dist_mask = (1 << dist.bits) - 1
+        mut buf = self.buf
+        mut count = self.count
+        mut pos = self.pos
+        mut near_end = false
+        for self.err == "" {
+            if self.pad != 0 or pos + 7 > n {
+                near_end = true
+                break
+            }
+            for count <= 48 {
+                buf = buf | (self.data[pos] << count)
+                pos += 1
+                count += 8
+            }
+            let entry = lit.table[buf & lit_mask]
+            if entry == 0 {
+                self.fail("invalid code")
+                break
+            }
+            buf = buf >> (entry & 15)
+            count -= entry & 15
+            let symbol = entry >> 4
+            if symbol < 256 {
+                self.put(symbol)
+                continue
+            }
+            if symbol == 256 {
+                break
+            }
+            let i = symbol - 257
+            if i >= 29 {
+                self.fail("invalid literal/length code")
+                break
+            }
+            let len_extra = LEN_EXTRA[i]
+            let length = LEN_BASE[i] + (buf & ((1 << len_extra) - 1))
+            buf = buf >> len_extra
+            count -= len_extra
+            let dist_entry = dist.table[buf & dist_mask]
+            if dist_entry == 0 {
+                self.fail("invalid code")
+                break
+            }
+            buf = buf >> (dist_entry & 15)
+            count -= dist_entry & 15
+            let d = dist_entry >> 4
+            if d >= 30 {
+                self.fail("invalid distance code")
+                break
+            }
+            let dist_extra = DIST_EXTRA[d]
+            let distance = DIST_BASE[d] + (buf & ((1 << dist_extra) - 1))
+            buf = buf >> dist_extra
+            count -= dist_extra
+            if distance > self.stream_len {
+                self.fail("invalid distance too far back")
+                break
+            }
+            self.copy(distance: distance, length: length)
+        }
+        self.buf = buf
+        self.count = count
+        self.pos = pos
+        if near_end {
+            self.symbols_near_end(lit, dist)
+        }
+    }
+
+    func symbols_near_end(self, anon lit: Huffman, anon dist: Huffman) -> none {
         for self.err == "" {
             let symbol = self.decode(lit)
             if symbol < 0 or symbol == 256 {
