@@ -149,18 +149,20 @@ same on the handshake. Neither is by more than one `timeout`.
 ## Compression
 
 With `accept_gzip` on, requests carry `Accept-Encoding: gzip` (unless you set an
-`Accept-Encoding` yourself), and a response whose `Content-Encoding` is `gzip` or
-`x-gzip` is decoded before you see it: `Response.body` holds the decoded bytes,
-the `Content-Encoding` header is removed, and `Content-Length` is the decoded
-length. This happens whenever the response says it is gzip, even from a server that
-was not asked to compress, and with `accept_gzip` off.
+`Accept-Encoding` yourself), and a response whose `Content-Encoding` is `gzip`,
+`x-gzip` or `deflate` is decoded before you see it: `Response.body` holds the decoded
+bytes, the `Content-Encoding` header is removed, and `Content-Length` is the decoded
+length. This happens whenever the response says it is compressed, even from a server
+that was not asked to compress, and with `accept_gzip` off. A `deflate` body is
+meant to be zlib data, but some servers send raw deflate instead; both are read.
 
 The decoded body is held to `limits.max_body` like any other, so a response that
 inflates past it fails with a `Protocol` error `body too large` instead of filling
 memory. A body that is not valid gzip is a `Protocol` error `bad gzip body` with
-the reason, and `Content-Length` of the compressed data was already checked as
-usual. Any other `Content-Encoding` (`br`, `deflate`, `zstd`, or a list of codings)
-is left alone: the body comes back as received, with its header, for you to handle.
+the reason (`bad deflate body` for `deflate`), and `Content-Length` of the compressed
+data was already checked as usual. Any other `Content-Encoding` (`br`, `zstd`, or a
+list of codings) is left alone: the body comes back as received, with its header,
+for you to handle.
 A response with no body, such as one to `HEAD`, is not decoded.
 
 ## Redirects

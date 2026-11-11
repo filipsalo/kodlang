@@ -13,6 +13,7 @@ import ssl
 import sys
 import threading
 import time
+import zlib
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 TLS_FILES = sys.argv[2:4]
@@ -151,6 +152,13 @@ class Handler(socketserver.StreamRequestHandler):
             coding = "gzip, br"
         elif path == "/x-gzip":
             coding = "x-gzip"
+        elif path == "/deflate":
+            coding, body = "deflate", zlib.compress(plain)
+        elif path == "/deflate-raw":
+            raw = zlib.compressobj(wbits=-15)
+            coding, body = "deflate", raw.compress(plain) + raw.flush()
+        elif path == "/deflate-bad":
+            coding, body = "deflate", b"this is not deflate data"
         headers = f"Content-Encoding: {coding}\r\n"
         if path == "/gzip-chunked":
             half = len(body) // 2
@@ -179,7 +187,7 @@ class Handler(socketserver.StreamRequestHandler):
             return reply("200 OK", f"conn {self.conn_id} req {self.requests}".encode())
         if path == "/redir-id":
             return redirect("302 Found", "/conn-id")
-        if path.startswith("/gzip") or path in ("/x-gzip", "/br"):
+        if path.startswith(("/gzip", "/deflate")) or path in ("/x-gzip", "/br"):
             return self.encoded(method, path)
         if path == "/lies":
             # Says close but leaves the socket open: only the header can tell.

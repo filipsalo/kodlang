@@ -1026,24 +1026,49 @@ type Acquired = struct {
     reused: bool
 }
 
-// A gzip-encoded body decoded, with the headers saying so removed; any other
-// response as it is.
+// Whether `data` starts with a zlib header: deflate, a window of at most
+// 32 KiB, and a check that makes the two bytes a multiple of 31.
+func zlib_header(anon data: bytes) -> bool {
+    if len(data) < 2 {
+        return false
+    }
+    return (data[0] & 0x0f) == 8 and data[0] >> 4 <= 7 and (data[0] * 256 + data[1]) % 31 == 0
+}
+
+// `body` decoded as the coding `gzip` or `deflate` says, to at most `max` bytes.
+func inflated(anon body: bytes, coding: str, max: int64) -> bytes or Error {
+    if coding != "deflate" {
+        return try inflate.gunzip(body, max_output: max)
+    }
+    if zlib_header(body) {
+        return try inflate.inflate_zlib(body, max_output: max)
+    }
+    return try inflate.inflate_raw(body, max_output: max)
+}
+
+// A gzip- or deflate-encoded body decoded, with the headers saying so removed;
+// any other response as it is. A deflate body should be zlib data, but some
+// servers send raw deflate, told apart by the zlib header.
 func decode_content(anon resp: Response, anon limits: Limits) -> Response or Error {
     let coding = resp.headers.get("content-encoding")
     if coding is none or len(resp.body) == 0 {
         return resp
     }
     let name = (coding? or "").trim().lower()
-    if name != "gzip" and name != "x-gzip" {
+    if name != "gzip" and name != "x-gzip" and name != "deflate" {
         return resp
     }
-    let decoded = inflate.gunzip(resp.body, max_output: limits.max_body)
+    let decoded = inflated(resp.body, coding: name, max: limits.max_body)
     if decoded is Err(e) {
         if e is IoError(io) {
             if io.detail == "output too large" {
                 throw IoError(kind: .Protocol, op: "http", errno: 0, detail: "body too large")
             }
-            throw IoError(kind: .Protocol, op: "http", errno: 0, detail: "bad gzip body: " + io.detail)
+            mut what = "gzip"
+            if name == "deflate" {
+                what = "deflate"
+            }
+            throw IoError(kind: .Protocol, op: "http", errno: 0, detail: f"bad {what} body: {io.detail}")
         }
         throw e
     }
