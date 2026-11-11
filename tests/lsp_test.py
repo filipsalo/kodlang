@@ -775,6 +775,73 @@ def test_did_change_republishes_diagnostics(lsp_binary):
     assert any("oops" in d["message"] for d in diags)
 
 
+def test_did_close_forgets_the_document(lsp_binary):
+    uri = "file:///tmp/closing.kod"
+    text = "func helper() -> int64 { return 1 }\nfunc main() -> int64 { return helper() }\n"
+    hover = {"textDocument": {"uri": uri}, "position": {"line": 1, "character": 31}}
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": text,
+                    }
+                },
+            },
+            # The second hover reuses the first one's compile.
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": hover,
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/hover",
+                "params": hover,
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didClose",
+                "params": {"textDocument": {"uri": uri}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/hover",
+                "params": hover,
+            },
+            {"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    by_id = {r["id"]: r for r in responses if "id" in r}
+    assert by_id[2]["result"] is not None
+    assert "helper" in json.dumps(by_id[2]["result"])
+    assert by_id[3]["result"] == by_id[2]["result"]
+    # Closed, the document is gone: nothing to hover over.
+    assert by_id[4]["result"] is None
+    # The open's diagnostics (none), published with the first compile, then
+    # the close's empty list.
+    diag_msgs = [
+        r["params"]
+        for r in responses
+        if r.get("method") == "textDocument/publishDiagnostics"
+    ]
+    assert diag_msgs == [
+        {"uri": uri, "diagnostics": []},
+        {"uri": uri, "diagnostics": []},
+    ]
+
+
 def _completion_labels(responses, response_id):
     """Extract the list of completion labels from a completion response."""
     resp = next(r for r in responses if r.get("id") == response_id)

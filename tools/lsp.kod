@@ -19,21 +19,24 @@ import "kod/ast"
 import "kod/codegen"
 import "kod/build"
 
-// LSP-state externs in stdlib/runtime.c: the documents, the active URI, the
-// publish-pending flag and a compile cache, which holds a reference to the last
-// `cg`. `lsp_cache_invalidate` drops that reference, and with it the parse trees
-// and codegen state of that compile.
-extern func lsp_cache_invalidate() -> none
-extern func lsp_docs_set(anon uri: str, anon text: str) -> none
-extern func lsp_docs_get(anon uri: str) -> str
-extern func lsp_docs_remove(anon uri: str) -> none
-extern func lsp_set_active_uri(anon uri: str) -> none
-extern func lsp_get_active_uri() -> str
-extern func lsp_get_publish_pending() -> bool
-extern func lsp_set_publish_pending(anon v: bool) -> none
-extern func lsp_cache_lookup(anon uri: str, anon text: str) -> bool
-extern func lsp_cache_get_cg() -> codegen.Codegen
-extern func lsp_cache_store(anon uri: str, anon text: str, anon cg: codegen.Codegen) -> none
+// The open documents' texts by URI; a closed one's is "", like one never
+// opened.
+mut docs: Map[str, str] = Map[str, str]()
+// The document last opened or changed, and whether its diagnostics still
+// wait to be published.
+mut active_uri: str = ""
+mut publish_pending: bool = false
+// The last compile, of `cached_text` at `cached_uri`. Opening, changing or
+// closing a document drops it, and with it its parse trees and codegen
+// state.
+mut cached_cg: codegen.Codegen? = none
+mut cached_uri: str = ""
+mut cached_text: str = ""
+
+// The text of the document at `uri`, "" when it isn't open.
+func doc_text(anon uri: str) -> str {
+    return docs.get(uri)? or ""
+}
 
 func main() -> int64 {
     mut shutdown_received: bool = false
@@ -42,16 +45,16 @@ func main() -> int64 {
     // without making the gap noticeable when the user actually pauses.
     let debounce_ms: int64 = 250
     for true {
-        if lsp_get_publish_pending() {
+        if publish_pending {
             if io.stdin_data_ready(debounce_ms) == 0 {
-                let pending_uri: str = lsp_get_active_uri()
-                if len(pending_uri) > 0 and len(lsp_docs_get(pending_uri)) > 0 {
+                let pending_uri: str = active_uri
+                if len(pending_uri) > 0 and len(doc_text(pending_uri)) > 0 {
                     // compile_or_cached flushes the pending publish
                     // itself once it has a cg in hand, then clears the
                     // flag. The empty-doc branch still clears it.
                     let cg: codegen.Codegen = compile_or_cached(uri: pending_uri)
                 } else {
-                    lsp_set_publish_pending(false)
+                    publish_pending = false
                 }
             }
         }
@@ -85,12 +88,12 @@ func main() -> int64 {
                     // final view matches the latest edit before we go
                     // unresponsive. compile_or_cached flushes on its
                     // own once it has a cg.
-                    if lsp_get_publish_pending() {
-                        let pending_uri: str = lsp_get_active_uri()
-                        if len(pending_uri) > 0 and len(lsp_docs_get(pending_uri)) > 0 {
+                    if publish_pending {
+                        let pending_uri: str = active_uri
+                        if len(pending_uri) > 0 and len(doc_text(pending_uri)) > 0 {
                             let cg: codegen.Codegen = compile_or_cached(uri: pending_uri)
                         } else {
-                            lsp_set_publish_pending(false)
+                            publish_pending = false
                         }
                     }
                     shutdown_received = true
@@ -125,17 +128,17 @@ func main() -> int64 {
     return 0
 }
 
-// The three document-lifecycle handlers all end with `lsp_cache_invalidate`:
+// The three document-lifecycle handlers all end by dropping `cached_cg`:
 // didOpen and didChange replace the buffer the cached cg was compiled from, and
 // didClose drops it.
 func handle_did_open(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
     mut text: str = str_or_empty(json.get(td, key: "text"))
-    lsp_docs_set(uri, text)
-    lsp_set_active_uri(uri)
-    lsp_set_publish_pending(true)
-    lsp_cache_invalidate()
+    docs.set(uri, text)
+    active_uri = uri
+    publish_pending = true
+    cached_cg = none
 }
 
 // `textDocument/didChange` with full sync mode: each notification carries
@@ -155,24 +158,24 @@ func handle_did_change(params: json.Value) -> none {
         }
         else none
     }
-    lsp_docs_set(uri, text)
-    lsp_set_active_uri(uri)
-    lsp_set_publish_pending(true)
-    lsp_cache_invalidate()
+    docs.set(uri, text)
+    active_uri = uri
+    publish_pending = true
+    cached_cg = none
 }
 
 func handle_did_close(params: json.Value) -> none {
     let td: json.Value = json.get(params, key: "textDocument")
     let uri: str = str_or_empty(json.get(td, key: "uri"))
-    lsp_docs_remove(uri)
+    docs.set(uri, "")
     let empty: [json.Value] = []
     publish_raw(:uri, diagnostics: empty)
-    let was_active: bool = lsp_get_active_uri() == uri
+    let was_active: bool = active_uri == uri
     if was_active {
-        lsp_set_active_uri("")
-        lsp_set_publish_pending(false)
+        active_uri = ""
+        publish_pending = false
     }
-    lsp_cache_invalidate()
+    cached_cg = none
 }
 
 // Compile `text` against the full stdlib + its transitive imports
@@ -292,7 +295,7 @@ func handle_definition(id_val: json.Value, params: json.Value) -> none {
     mut pos: json.Value = json.get(params, key: "position")
     mut line: int64 = number_or_zero(json.get(pos, key: "line"))
     mut character: int64 = number_or_zero(json.get(pos, key: "character"))
-    mut text: str = lsp_docs_get(uri)
+    mut text: str = doc_text(uri)
     if len(text) == 0 {
         write_response(:id_val, result: json.Value.Null)
         return none
@@ -373,15 +376,17 @@ func number_or_zero(anon v: json.Value) -> int64 {
 // Cache hit when the request is for the same (uri, text) we last
 // compiled. Miss → recompile and repopulate the cache.
 func compile_or_cached(uri: str) -> codegen.Codegen {
-    mut text: str = lsp_docs_get(uri)
-    if lsp_cache_lookup(uri, text) {
-        return lsp_cache_get_cg()
+    mut text: str = doc_text(uri)
+    if cached_cg is Some(cached) and cached_uri == uri and cached_text == text {
+        return cached
     }
     let cg: codegen.Codegen = compile_buffer(:uri, :text)
-    lsp_cache_store(uri, text, cg)
-    if lsp_get_publish_pending() and lsp_get_active_uri() == uri {
+    cached_cg = cg
+    cached_uri = uri
+    cached_text = text
+    if publish_pending and active_uri == uri {
         publish_from_cg(:uri, :cg)
-        lsp_set_publish_pending(false)
+        publish_pending = false
     }
     return cg
 }
@@ -398,7 +403,7 @@ func handle_hover(id_val: json.Value, params: json.Value) -> none {
     mut pos: json.Value = json.get(params, key: "position")
     mut line: int64 = number_or_zero(json.get(pos, key: "line"))
     mut character: int64 = number_or_zero(json.get(pos, key: "character"))
-    mut text: str = lsp_docs_get(uri)
+    mut text: str = doc_text(uri)
     if len(text) == 0 {
         write_response(:id_val, result: json.Value.Null)
         return none
@@ -732,7 +737,7 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
     mut pos: json.Value = json.get(params, key: "position")
     mut line: int64 = number_or_zero(json.get(pos, key: "line"))
     mut character: int64 = number_or_zero(json.get(pos, key: "character"))
-    mut text: str = lsp_docs_get(uri)
+    mut text: str = doc_text(uri)
     if len(text) == 0 {
         let empty: [json.Value] = []
         write_response(:id_val, result: completion_list(items: empty))
