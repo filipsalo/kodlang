@@ -1167,6 +1167,9 @@ type Codegen = struct {
     // the constant's shared copy, because its value can't escape: see read_const.
     shared_const_id: int64 = -1
     shared_const_path: str = ""
+    // The `$shared` pointers this module's reads keep (see read_shared_const),
+    // each emitted once.
+    shared_refs: [str] = []
 
     // When true, codegen runs all its checks but skips actually emitting
     // assembly. Used by test_support.try_compile so test code can run
@@ -2080,8 +2083,7 @@ type Codegen = struct {
         if self.const_shared_kind(sig) {
             let shareable = sig.return_kind is .KStr or (expr_id == self.shared_const_id and self.p.path == self.shared_const_path)
             if shareable {
-                self.emit(f"bl {self.const_label(expr_id)}$shared")
-                return self.rc_temp_val(.VReg(name: "x0"), kind: sig.return_kind)
+                return self.read_shared_const(self.const_label(expr_id))
             }
         }
         let no_args: [ast.CallArg] = []
@@ -2090,6 +2092,35 @@ type Codegen = struct {
         self.reading_const = false
         // The value is the caller's, like any call's.
         return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // The shared copy of the constant `lbl`, borrowed: its getter's cell keeps
+    // it for good. This module keeps a pointer to it, 0 until the first read
+    // calls the getter (and gives back the reference that returns), so a
+    // read after that is one load and no call.
+    func read_shared_const(self, anon lbl: str) -> Val {
+        let ref = f"{lbl}$shared$in${self.path_prefix}"
+        if not arrays.contains(self.shared_refs, ref) {
+            self.shared_refs += [ref]
+            self.println("\t.data")
+            self.println("\t.p2align 3")
+            self.println(f"{ref}:")
+            self.println("\t.quad 0")
+            self.println("\t.text")
+        }
+        let done = self.fresh("Lshared")
+        self.emit(f"adrp x16, {ref}@PAGE")
+        self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
+        self.emit(f"cbnz x0, {done}")
+        self.emit(f"bl {lbl}$shared")
+        self.emit(f"adrp x16, {ref}@PAGE")
+        self.emit(f"str x0, [x16, {ref}@PAGEOFF]")
+        self.emit("mov x17, x0")
+        self.emit("bl _rc_release_stub")
+        self.emit(f"adrp x16, {ref}@PAGE")
+        self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
+        self.emit_label(done)
+        return .VReg(name: "x0")
     }
 
     // An int64 or bool constant's value, when it is literals and operators on them,
