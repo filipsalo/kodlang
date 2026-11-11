@@ -78,6 +78,10 @@ The aggregate exit code is 0 if every test passed, non-zero otherwise.
 
 `kod test` replaces itself with the test binary, so the output appears as the tests run, and the exit code is the binary's. The reporter flushes stdout around every `ok`/`FAIL` line and the file header, and before a failure's detail goes to stderr, so the lines stay in order when stdout and stderr are the same pipe or log. What a test prints with `print` is flushed with them, so it comes out before that test's result line. A panic (an index out of bounds, a failed `must`) flushes stdout before its message too.
 
+When stdout is a terminal, `ok` is green, `FAIL` red, and the time each test took
+dim; the summary line is green when all passed and red when any failed. The same
+`NO_COLOR` and `TERM=dumb` turn this off as for [errors](cli.md#kod-build-file).
+
 ## Hermetic tests
 
 A test needs nothing the repository does not have, and no network: a test of code that talks to a server starts a server of its own on the loopback interface. A test that needs the internet does not belong among the `*_test.kod` files that `kod test <dir>` and the test suite run. A module under test may declare C files and libraries (see [Link inputs](modules.md#link-inputs)); `kod test` compiles and links them like `kod build` does, and a `kod:require` file that is missing stops the build, naming the line that asks for it.

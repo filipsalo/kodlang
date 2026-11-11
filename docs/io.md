@@ -150,11 +150,36 @@ A `BufReader` doesn't close its inner stream.
 | `stdin()`, `stdout()`, `stderr()` | descriptors 0, 1 and 2 |
 | `Fd(fd: n)` | wrap a descriptor from elsewhere |
 | `f.close()` | close it; `none or Error` |
+| `f.is_terminal()` | whether it is a terminal, rather than a file or a pipe |
 
 `stdout()` writes straight to descriptor 1, bypassing the buffer that `print`
 uses. Call `flush_stdout()` first when you mix the two.
 Closing is explicit: an `Fd` that is dropped stays open until the program
 exits.
+
+### Colour
+
+`stdlib/term.kod` colours text for a terminal. `term.colour(fd)` says whether to:
+`fd` is a terminal, `NO_COLOR` is unset or empty, and `TERM` isn't `dumb`. The
+other functions wrap text in the escape codes of a style, whatever the output is,
+so check first:
+
+```kod
+import "io"
+import "posix"
+import "term"
+
+func main() -> int64 {
+    mut label = "error:"
+    if term.colour(posix.stderr()) {
+        label = term.red(term.bold(label))
+    }
+    io.write_stderr(f"{label} no such file\n")
+    return 1
+}
+```
+
+The styles are `bold`, `dim`, `red`, `green` and `yellow`.
 
 The older `io.read_file` and `io.write_file` keep their behavior: an empty
 string or `-1` on failure, with no reason.

@@ -34,6 +34,10 @@ field's type, is taken as written. Type errors inside a declaration (a function,
 a constant) that has a syntax error aren't reported, since they may come from what the
 parser skipped; the other declarations are checked as usual.
 
+On a terminal, errors are coloured: the location and message in bold, `error:` and
+the caret under the column in red. Set `NO_COLOR` to any non-empty value, or
+`TERM=dumb`, to turn colour off. When stderr is a file or a pipe there is none.
+
 ### `kod run <file>`
 
 `kod build` + execute. Arguments after the file are passed to the program.

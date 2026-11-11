@@ -424,6 +424,10 @@ int64_t kod_fd_close(int64_t fd) {
     return rc;
 }
 
+int64_t kod_fd_is_terminal(int64_t fd) {
+    return isatty((int)fd) ? 1 : 0;
+}
+
 KodStr *kod_errno_message(int64_t err) {
     return kod_str_from_cstr(strerror((int)err));
 }

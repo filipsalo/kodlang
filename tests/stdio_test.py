@@ -312,7 +312,12 @@ def test_f_on_a_terminal_a_failure_shows_its_detail_before_its_result(scratch):
     canary = scratch.copy(CANARY, f"test_block_canary_{scratch.token}.kod")
     try:
         with running(
-            [KOD, "test", canary], stdin=slave, stdout=slave, stderr=slave
+            [KOD, "test", canary],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            # The order is what is checked here; colour_test.py has the colours.
+            env={**os.environ, "NO_COLOR": "1"},
         ) as p:
             os.close(slave)
             slave = -1

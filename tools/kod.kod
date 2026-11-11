@@ -208,7 +208,7 @@ func run_check_cmd(anon entry_path: str, stage0: [str], cfg: build.LinkVars) -> 
                     shown += [line]
                 }
                 if not repeat {
-                    io.write_stderr(f"{line}\n")
+                    io.write_stderr(painted(line) + "\n")
                 }
             }
             errors = errors + 1
@@ -370,6 +370,12 @@ func collect_user_modules(anon entry_path: str, stage0: [str]) -> [str] {
     let module: ast.Module = p.parse_module()
     add_runner_for(module, modules: result)
     walk_imports(module: module, importer_path: entry_path, :stage0, modules: result)
+    // The runner, if a module brought it in, has imports of its own.
+    let runner = "stdlib/testing.kod"
+    if arrays.contains(result, runner) {
+        let rp: parsing.Parser = build.parse_file(runner)
+        walk_imports(module: rp.parse_module(), importer_path: runner, :stage0, modules: result)
+    }
     return result
 }
 
@@ -439,13 +445,81 @@ func basename_without(anon path: str, ext: str) -> str {
     return path[after_slash..end]
 }
 
+// -1 until `_colour` has looked, then 0 or 1.
+mut _colour_known: int64 = -1
+let BOLD: str = "\u{1b}[1m"
+let RED: str = "\u{1b}[31m"
+let RESET: str = "\u{1b}[0m"
+
+extern func kod_fd_is_terminal(anon fd: int64) -> int64
+extern func kod_env_has(anon name: str) -> int64
+extern func kod_env_get(anon name: str) -> str
+
+// Whether errors are coloured: stderr is a terminal and colour isn't off, as
+// stdlib/term.kod decides (the driver doesn't link it).
+func _colour() -> bool {
+    if _colour_known < 0 {
+        _colour_known = 0
+        let no_color = kod_env_has("NO_COLOR") != 0 and len(kod_env_get("NO_COLOR")) > 0
+        if kod_fd_is_terminal(2) != 0 and not no_color and kod_env_get("TERM") != "dumb" {
+            _colour_known = 1
+        }
+    }
+    return _colour_known == 1
+}
+
+// `line` coloured when errors are: in `path:line:col: error: message` the
+// location and message bold and `error:` red, and a caret line red. Any other
+// line as it is.
+func painted(anon line: str) -> str {
+    if not _colour() {
+        return line
+    }
+    if line.contains(": error: ") {
+        let k = line.find(": error: ")? or 0
+        let head = line[0..k + 1]
+        let message = line[k + 9..len(line)]
+        return f"{BOLD}{head}{RESET} {BOLD}{RED}error:{RESET} {BOLD}{message}{RESET}"
+    }
+    mut caret = false
+    for i in 0..len(line) {
+        let b = line[i]
+        if b == '^' {
+            caret = true
+        } else if b != ' ' {
+            return line
+        }
+    }
+    if caret {
+        return f"{BOLD}{RED}{line}{RESET}"
+    }
+    return line
+}
+
+// A tool's stderr, each error line coloured when errors are.
+func show_errors(anon text: str) -> none {
+    if not _colour() {
+        io.write_stderr(text)
+        return
+    }
+    mut out: [str] = []
+    for line in text.split("\n") {
+        out += [painted(line)]
+    }
+    io.write_stderr("\n".join(out))
+}
+
+func eprint_error(anon line: str) -> none {
+    kod_eprint(painted(line))
+}
+
 // Run a process, forwarding its stderr to ours when it fails so the
 // user sees the underlying tool's diagnostic. Returns the exit
 // status (0 on success).
 func run_check(anon argv: [str]) -> int64 {
     let r: process.ProcessResult = process.run(argv)
     if r.status != 0 {
-        io.write_stderr(r.stderr)
+        show_errors(r.stderr)
     }
     if r.status == -1 {
         // It never ran, or was killed: it has said nothing.
@@ -654,7 +728,7 @@ func reject_stage0_decls(anon cfg: build.LinkVars) -> int64 {
         if io.is_file(m) {
             let decls: build.LinkDecls = build.parse_link_decls(path: m, source: io.read_file(m), vars: cfg)
             if decls.first > 0 {
-                kod_eprint(f"{m}:{decls.first}:1: error: a module in STAGE0_KOD cannot declare link inputs; make builds it without reading them")
+                eprint_error(f"{m}:{decls.first}:1: error: a module in STAGE0_KOD cannot declare link inputs; make builds it without reading them")
                 rejected = rejected + 1
             }
         }
@@ -672,7 +746,7 @@ func add_cc_job(anon c: build.CcDecl, module: str, plan: LinkPlan) -> int64 {
             if arrays.equal(job.flags, c.flags) {
                 return 0
             }
-            kod_eprint(f"{origin}:1: error: {c.file} is also compiled by the kod:cc line at {job.origin}, with other flags")
+            eprint_error(f"{origin}:1: error: {c.file} is also compiled by the kod:cc line at {job.origin}, with other flags")
             return 1
         }
     }
@@ -700,14 +774,14 @@ func read_link_inputs(anon modules: [str], cfg: build.LinkVars, into: LinkPlan) 
     for m in modules {
         let decls: build.LinkDecls = build.parse_link_decls(path: m, source: io.read_file(m), vars: cfg)
         for e in decls.errors {
-            kod_eprint(e)
+            eprint_error(e)
             errors = errors + 1
         }
         for c in decls.cc {
             if io.is_file(c.file) {
                 errors = errors + add_cc_job(c, module: m, plan: into)
             } else {
-                kod_eprint(f"{m}:{c.line}:1: error: no such file {c.file}")
+                eprint_error(f"{m}:{c.line}:1: error: no such file {c.file}")
                 errors = errors + 1
             }
         }
@@ -726,9 +800,9 @@ func missing_needs(anon plan: LinkPlan) -> int64 {
     for n in plan.needs {
         if not io.is_file(n.file) {
             if len(n.hint) > 0 {
-                kod_eprint(f"{n.path}:{n.line}:1: error: needs {n.file} ({n.hint})")
+                eprint_error(f"{n.path}:{n.line}:1: error: needs {n.file} ({n.hint})")
             } else {
-                kod_eprint(f"{n.path}:{n.line}:1: error: needs {n.file}")
+                eprint_error(f"{n.path}:{n.line}:1: error: needs {n.file}")
             }
             missing = missing + 1
         }
