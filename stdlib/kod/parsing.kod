@@ -1,5 +1,6 @@
 import "kod/lexing"
 import "kod/ast"
+import "arrays"
 import "primitives/format"
 
 // A grouped literal's text without its spaces.
@@ -3442,6 +3443,9 @@ func reads_operand_rhs(anon op: ast.Op) -> bool {
 //   function literal          parent + 1 for its parameters and body
 // A default sees no locals. A read of a binding older than a function literal
 // is one it captures, which goes on the FuncDecl of every literal it's inside.
+// A `mut` that a literal captures is shared: once the function is walked,
+// `mut n = v` becomes `let n = _mut_cell(v)` (`_mut_cell[$t<type id>](v)` with a type)
+// and each read and store of `n` becomes `n.value`, so both use one cell.
 type Renamer = struct {
 	p: Parser
 	// The bindings in force, innermost last; `top` of them are live.
@@ -3458,6 +3462,15 @@ type Renamer = struct {
 	// The function literals being walked, outermost first, and `top` at each.
 	lit_ids: [int64] = []
 	lit_marks: [int64] = []
+	// Whether each binding in force was declared `mut`, and how many live ones were.
+	muts: [bool] = []
+	live_muts: int64 = 0
+	// Since the last `share_captured`: reads of `mut` bindings and their keys,
+	// the `mut` lets, and the keys a literal captures.
+	mut_reads: [int64] = []
+	mut_read_keys: [str] = []
+	mut_lets: [int64] = []
+	shared: [str] = []
 
 	func run(self, anon decls: [ast.Decl]) -> none {
 		// Last first: a literal's id is below the function it's in, so it's walked in place.
@@ -3471,6 +3484,7 @@ type Renamer = struct {
 			fd.walked = true
 			self.top = 0
 			self.renamed = 0
+			self.live_muts = 0
 			self.expr_binds = fd.expr_binds
 			self.depth = 1
 			for param in fd.params {
@@ -3478,6 +3492,7 @@ type Renamer = struct {
 			}
 			self.depth = 0
 			self.block(fd.body)
+			self.share_captured()
 			for param in fd.params {
 				self.walk_default(param.default_expr)
 			}
@@ -3502,9 +3517,42 @@ type Renamer = struct {
 	func walk_default(self, anon expr_id: int64) -> none {
 		self.top = 0
 		self.renamed = 0
+		self.live_muts = 0
 		self.expr_binds = true
 		self.depth = 1
 		self.expr(expr_id)
+		self.share_captured()
+	}
+
+	// Moves each captured `mut` into a cell (see the comment on Renamer).
+	func share_captured(self) -> none {
+		if len(self.shared) > 0 {
+			for k, expr_id in self.mut_reads {
+				let key = self.mut_read_keys[k]
+				if arrays.contains(self.shared, key) {
+					let span = self.p.expr_spans[expr_id]
+					let cell = self.p.alloc_expr(ast.Expr.Ident(name: key), :span)
+					let field = self.p.alloc_expr(ast.Expr.Ident(name: "value"), :span)
+					self.p.exprs[expr_id] = ast.Expr.Binary(lhs: cell, op: ast.Op.Dot, rhs: field)
+				}
+			}
+			for stmt_id in self.mut_lets {
+				if self.p.stmts[stmt_id] is .Let(name, typ, value, _mutable) and arrays.contains(self.shared, name) {
+					let span = self.p.expr_spans[value]
+					mut callee = self.p.alloc_expr(ast.Expr.Ident(name: "_mut_cell"), :span)
+					if typ != 0 {
+						let t = self.p.alloc_expr(ast.Expr.Ident(name: f"$t{typ}"), :span)
+						callee = self.p.alloc_expr(ast.Expr.Binary(lhs: callee, op: ast.Op.Index, rhs: t), :span)
+					}
+					let call = self.p.alloc_expr(ast.Expr.Call(:callee, args: [ast.CallArg(label: "", label_span: span, :value)]), :span)
+					self.p.stmts[stmt_id] = ast.Stmt.Let(:name, typ: 0, value: call, mutable: false)
+				}
+			}
+			self.shared = []
+		}
+		self.mut_reads = []
+		self.mut_read_keys = []
+		self.mut_lets = []
 	}
 
 	func literal(self, anon decl_id: int64) -> none {
@@ -3538,6 +3586,9 @@ type Renamer = struct {
 
 	// The binding at `i` is read: a capture of each literal younger than it.
 	func note_capture(self, anon i: int64, expr_id: int64) -> none {
+		if self.muts[i] and len(self.lit_marks) > 0 and i < self.lit_marks[len(self.lit_marks) - 1] and not arrays.contains(self.shared, self.keys[i]) {
+			self.shared += [self.keys[i]]
+		}
 		for k, mark in self.lit_marks {
 			if i < mark {
 				let fd = self.p.func_decls[self.lit_ids[k]]
@@ -3566,7 +3617,7 @@ type Renamer = struct {
 	}
 
 	// The name a binding of `name` at this depth gets.
-	func bind(self, anon name: str) -> str {
+	func bind(self, anon name: str, mutable: bool = false) -> str {
 		if len(name) == 0 {
 			return name
 		}
@@ -3587,11 +3638,16 @@ type Renamer = struct {
 			self.keys[self.top] = key
 			self.depths[self.top] = self.depth
 			self.levels[self.top] = level
+			self.muts[self.top] = mutable
 		} else {
 			self.names += [name]
 			self.keys += [key]
 			self.depths += [self.depth]
 			self.levels += [level]
+			self.muts += [mutable]
+		}
+		if mutable {
+			self.live_muts += 1
 		}
 		self.top += 1
 		if level > 0 {
@@ -3605,6 +3661,9 @@ type Renamer = struct {
 			self.top -= 1
 			if self.levels[self.top] > 0 {
 				self.renamed -= 1
+			}
+			if self.muts[self.top] {
+				self.live_muts -= 1
 			}
 		}
 	}
@@ -3696,9 +3755,12 @@ type Renamer = struct {
 					self.p.func_decls[decl_id].let_name = name
 				}
 				self.expr(value)
-				let key = self.bind(name)
+				let key = self.bind(name, mutable: mutable and self.expr_binds)
 				if key != name {
 					self.p.stmts[stmt_id] = ast.Stmt.Let(name: key, :typ, :value, :mutable)
+				}
+				if mutable and self.expr_binds {
+					self.mut_lets += [stmt_id]
 				}
 			}
 			.Assign(lhs, rhs) -> {
@@ -3757,12 +3819,16 @@ type Renamer = struct {
 	}
 
 	func read(self, anon expr_id: int64, name: str) -> none {
-		if self.renamed == 0 and len(self.lit_marks) == 0 {
+		if self.renamed == 0 and len(self.lit_marks) == 0 and self.live_muts == 0 {
 			return
 		}
 		let i = self.find(name)
 		if i < 0 {
 			return
+		}
+		if self.muts[i] {
+			self.mut_reads += [expr_id]
+			self.mut_read_keys += [self.keys[i]]
 		}
 		self.note_capture(i, :expr_id)
 		if self.levels[i] > 0 {

@@ -183,6 +183,12 @@ function reached that way finds its cell in `x17`. One that captures copies the
 values into its frame on entry and borrows them, like parameters, since its caller
 keeps the cell alive for the call. Other functions ignore `x17`.
 
+A `mut` that a literal captures is kept in a counted one-word struct from its
+declaration on (`_MutCell[T]` in `builtins.kod`). The function's slot and each
+closure that captures it hold a reference to the struct, and a read or an
+assignment loads or stores its word. The parser makes the change, so codegen
+sees an ordinary `let` of a struct and `n.value` for each use of `n`.
+
 ### Testing for mistakes
 
 To test the rules themselves, build the runtime so that freed memory is overwritten

@@ -404,23 +404,35 @@ A literal captures the value a name has when the literal is evaluated. Each pass
 of a loop makes its own closure, with that pass's `for` variable and pattern
 bindings. Literals nest, and an inner one can capture what the outer one can see.
 
-A captured name can't be assigned in the literal: `` a function literal can't
-assign to `n`, which it captures ``. A variable declared `mut` can't be captured
-at all: `` a function literal can't capture `total`, which is `mut` ``. To share
-state, capture a struct and change its fields, since a captured struct is the same
-struct:
+A variable declared `mut` is shared instead: the literal and the function it's
+in use the same variable, so what one assigns the other sees, even after the
+function has returned:
 
 ```kod
-type Counter = struct { n: int64 = 0 }
-
 func make_counter() -> func() -> int64 {
-    let c = Counter()
+    mut n = 0
     return func() -> int64 {
-        c.n += 1
-        return c.n
+        n += 1
+        return n
     }
 }
+
+let next = make_counter()
+next()
+print_int(next())            // 2
 ```
+
+A `mut` declared in a loop's body is a new variable on each pass, so each pass's
+closure has one of its own. Any other name the literal captures keeps the value
+it had when the literal was evaluated, and can't be assigned in it:
+`` a function literal can't assign to `x`, which it captures ``. That holds for a
+`let`, a parameter, a `for` variable and a pattern binding. A `mut` parameter
+can't be captured: `` a function literal can't capture `p`, a `mut` parameter;
+copy it into a `mut` local to share it ``.
+
+A captured `mut` lives in a counted cell from its declaration on, and each read
+and assignment of it goes through the cell, in the function too; a `mut` that no
+literal captures stays in the frame.
 
 Other limits:
 
