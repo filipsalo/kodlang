@@ -9,7 +9,10 @@
 #                         run selfhost-check, then copy the compiler it built
 #                         to bootstrap/sh_kodc. Commit the result on its own.
 #   make test             build sh_kodc + the kod driver, then run pytest
-#                         (example programs, every *_test.kod, self-hosting checks)
+#                         (example programs, every *_test.kod, self-hosting checks):
+#                         in parallel, then the `serial` tests one at a time
+#   make gates            make test, then make test again with a poisoned
+#                         runtime (-DRC_POISON); run before committing
 #   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
 #                         stage2 compiles it again (stage3); asm must match,
 #                         and stage1 and stage2 must compile every .kod file
@@ -124,7 +127,7 @@ STAGE1_OBJS := \
 
 AS := as -target arm64-apple-darwin
 
-.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test selfhost-check asm-diff clean clean-apps clean-stage1
+.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test gates selfhost-check asm-diff clean clean-apps clean-stage1
 
 # sh_kodc writes complete-looking assembly even when it reports errors;
 # without this a failed compile leaves a fresh .s that the next make
@@ -265,7 +268,19 @@ bootstrap-snapshot: selfhost-check
 	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Commit it on its own."
 
 test: stage1 kod
-	uv run pytest tests/
+	uv run pytest -q -n auto --dist loadgroup -m "not serial" tests/
+	uv run pytest -q -m serial tests/
+
+# The poisoned pass writes link.local.cfg, so one that is there already is not
+# ours to replace; the trap removes ours and rebuilds however the pass ends.
+POISON_CFLAGS := -target arm64-apple-darwin -I stdlib -O2 -DRC_POISON
+gates:
+	@if [ -e link.local.cfg ]; then echo "gates: link.local.cfg exists; move it aside first" >&2; exit 1; fi
+	$(MAKE) -s test
+	@echo "==> gates: again with a poisoned runtime"
+	@trap 'rm -f link.local.cfg; $(MAKE) -s stage1 kod' EXIT; \
+	    echo 'CFLAGS := $(POISON_CFLAGS)' > link.local.cfg && $(MAKE) -s test
+	@echo "==> gates: passed"
 
 # Rebuild the whole compiler (stage0 + stage1) twice more, first with the
 # current sh_kodc and then with the result, into scratch dirs. The two

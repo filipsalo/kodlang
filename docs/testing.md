@@ -120,3 +120,7 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 - **Self-hosting**: the fixed-point check described in [Self-hosting](self-hosting.md#verifying-self-hosting).
 
 The tests run programs through the native tools, `build/apps/kod/kod` and `build/stage1/sh_kodc`; Python is only the test harness and the launcher.
+
+`make test` runs most tests in parallel, one worker per core (with pytest-xdist). Tests that build the same program, into the same `build/apps/<name>`, share a group that one worker runs (`tests/conftest.py` decides the groups). The tests marked `serial` (those that rebuild or replace the `kod` driver, write into the project root, or run `make` on the real tree) run afterwards, one at a time. A plain `uv run pytest` runs everything one at a time, as before.
+
+`make gates` is what to run before a commit: `make test`, then `make test` again with the runtime built with `-DRC_POISON`, which overwrites freed memory so a use after free shows up. It refuses to run when there is a `link.local.cfg`, since it writes its own for the poisoned pass, and removes it again however the pass ends.

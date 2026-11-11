@@ -142,6 +142,7 @@ def test_kod_test_blocks(path: Path, sh_kodc):
     assert total >= len(TEST_BLOCK.findall((ROOT / path).read_text())), output
 
 
+@pytest.mark.xdist_group("test_block_canary")
 def test_kod_test_reports_failures(sh_kodc):
     """A failing `test` block fails the run (guards against the runner
     silently passing everything)."""
@@ -151,6 +152,7 @@ def test_kod_test_reports_failures(sh_kodc):
     assert "FAIL canary: this test fails" in result.stdout
 
 
+@pytest.mark.xdist_group("read_file_stdin")
 def test_read_file_pipe(sh_kodc):
     """io.read_file on a pipe must read to EOF; ftell can't size it."""
     path = "tests/read_file_stdin.kod"
