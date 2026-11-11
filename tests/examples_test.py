@@ -85,19 +85,13 @@ def test_example(func: types.FunctionType, path: str, expects: dict[str, str], s
     if "stderr" in expects:
         # The Kod CLI prints its own build-progress chatter to stderr,
         # so we accept any stderr that *contains* the expected substring
-        # (with terminal color escapes stripped) rather than requiring
-        # byte-for-byte equality.
-        stderr = re.sub("\033[^m]+?m", "", result.stderr)
-        assert expects["stderr"] in stderr
+        # rather than requiring byte-for-byte equality.
+        assert expects["stderr"] in result.stderr
     if "errors" in expects:
         expects["status"] = "1"
         for error in expects["errors"].splitlines():
             error = f"{path}:{error}"
-            stderr = result.stderr
-            # TODO: Don't emit colors at all when output is not a tty
-            stderr = re.sub("\033[^m]+?m", "", stderr)
-
-            assert error in stderr
+            assert error in result.stderr
     assert result.returncode == int(expects.get("status", 0))
 
 
