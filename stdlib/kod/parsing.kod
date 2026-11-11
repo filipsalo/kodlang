@@ -426,6 +426,30 @@ type Parser = struct {
 	// the parser advances past the bad token and keeps going so
 	// downstream errors don't cascade off the original cause.
 	errors: [ParseError]
+	// After an error, the parser is quiet until the next statement, field,
+	// parameter, match arm or declaration starts: what it reports meanwhile
+	// is likely a cascade. Such errors are still recorded, so the checks that
+	// count errors work as before, and `parse_module` drops them at the end.
+	quiet: bool = false
+	error_quiet: [bool] = []
+	// Set once the declarations are parsed: the checks after that report
+	// each error they find.
+	parsed: bool = false
+	// How many errors so far left the parser out of step with the source
+	// (an unexpected token, something after the end of a statement): only
+	// those make it quiet and mark their declaration broken. Others, such as
+	// a literal too large, leave the parse as written.
+	desyncs: int64 = 0
+	// Where each top-level declaration with such an error starts and ends
+	// (byte offsets), so codegen can leave out errors inside it.
+	broken_starts: [int64] = []
+	broken_ends: [int64] = []
+	// The column the module's first declaration starts in, which the others
+	// are taken to start in too, for skipping to one after an error.
+	decl_col: int64 = -1
+	// Where `expect` last left a token it didn't want: a second miss there
+	// takes it, so a loop that makes no progress can't go round for good.
+	kept_pos: int64 = -1
 
 	// Lazy cache of line-start byte offsets. `line_starts[i]` is the
 	// byte offset of the (i+1)-th line; line 1 starts at 0. Built
@@ -531,6 +555,10 @@ type Parser = struct {
 	func expect(self, anon kind: lexing.TokenKind) -> lexing.Token {
 		if self.peek_kind() != kind {
 			self.record_unexpected(expected: lexing.kind_name(kind), got: self.peek())
+			if self.structural(self.peek_kind()) and self.pos != self.kept_pos {
+				self.kept_pos = self.pos
+				return self.peek()
+			}
 		}
 		return self.advance()
 	}
@@ -571,6 +599,10 @@ type Parser = struct {
 	func expect_identifier(self) -> str {
 		if self.peek_kind() != .Identifier {
 			self.record_unexpected(expected: "identifier", got: self.peek())
+			if self.structural(self.peek_kind()) and self.pos != self.kept_pos {
+				self.kept_pos = self.pos
+				return ""
+			}
 		}
 		return self.advance().value
 	}
@@ -580,10 +612,10 @@ type Parser = struct {
 	// callers can render parse errors the same way (and the LSP can
 	// publish them as Diagnostics without reformatting).
 	func record_unexpected(self, expected: str, got: lexing.Token) -> none {
-		self.record_error(f"error: expected {expected}, got {lexing.kind_name(got.kind)}", :got)
+		self.record_error(f"error: expected {expected}, got {lexing.kind_name(got.kind)}", :got, desync: true)
 	}
 
-	func record_error(self, anon message: str, got: lexing.Token) -> none {
+	func record_error(self, anon message: str, got: lexing.Token, desync: bool = false) -> none {
 		let offset: int64 = got.start
 		mut line: int64 = 1
 		mut col: int64 = 1
@@ -628,6 +660,50 @@ type Parser = struct {
 		}
 		let end_col: int64 = col + width
 		self.errors += [ParseError(path: self.path, :line, :col, :end_col, :message, source_line: line_text, :caret)]
+		self.error_quiet += [self.quiet]
+		if desync and not self.parsed {
+			self.quiet = true
+			self.desyncs += 1
+		}
+	}
+
+	// The column (from 0) of the next token.
+	func column(self) -> int64 {
+		let start = self.peek().start
+		mut k = start
+		for k > 0 and self.source[k - 1] != '\n' {
+			k -= 1
+		}
+		return start - k
+	}
+
+	// Whether the next token is a keyword only a declaration starts with
+	// (`func name`, not `func(`), so no statement does.
+	func at_decl_keyword(self) -> bool {
+		match self.peek_kind() {
+			.KwType | .KwInterface | .KwImport | .KwExtern | .KwTest -> return true
+			.KwFunc -> return self.peek_kind_at(1) == .Identifier
+			else return false
+		}
+	}
+
+	// Whether the next token may start a declaration: it is in the column the
+	// module's declarations start in, and isn't a `}` (which ends one) or the
+	// end of a line.
+	func at_decl_start(self) -> bool {
+		if self.decl_col < 0 or self.at(.CloseCurly) or self.at(.EOL) {
+			return false
+		}
+		return self.column() == self.decl_col
+	}
+
+	// Whether `kind` closes something or ends a line or the file: `expect`
+	// leaves such a token for whoever it belongs to.
+	func structural(self, anon kind: lexing.TokenKind) -> bool {
+		match kind {
+			.CloseCurly | .CloseParen | .CloseBracket | .EOL | .EOF -> return true
+			else return false
+		}
 	}
 
 	// Report a malformed `\x` or `\u` escape in the string body `body` of `tok`.
@@ -901,16 +977,24 @@ type Parser = struct {
 		mut params: [ast.Param] = []
 		self.skip_newlines()
 		for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+			self.quiet = false
+			let start = self.pos
 			let errors_before: int64 = len(self.errors)
 			params += [self.parse_param()]
-			if len(self.errors) > errors_before {
+			if len(self.errors) > errors_before or self.pos == start {
 				break
 			}
 			self.skip_newlines()
-			if not self.try_consume(.Comma) {
-				break
+			if self.try_consume(.Comma) {
+				self.skip_newlines()
+				continue
 			}
-			self.skip_newlines()
+			// Another parameter without the `,` before it: taken as written.
+			if self.at(.Identifier) or self.at(.KwAnon) or self.at(.KwMut) {
+				self.record_unexpected(expected: "`,` or `)`", got: self.peek())
+				continue
+			}
+			break
 		}
 		self.expect(.CloseParen)
 		return params
@@ -1697,6 +1781,7 @@ type Parser = struct {
 			if self.peek_kind() == .CloseCurly {
 				break
 			}
+			self.quiet = false
 			let pats: [int64] = self.parse_match_arm_patterns()
 			if self.arm_broken {
 				self.skip_newlines()
@@ -2248,11 +2333,22 @@ type Parser = struct {
 			if self.peek_kind() == .CloseCurly {
 				break
 			}
+			// A declaration can't be a statement: the block's `}` is missing.
+			// Each block it is in ends here, and the declaration is parsed.
+			if self.at_decl_keyword() {
+				self.record_error(f"error: expected `}}` before {lexing.kind_name(self.peek_kind())}, which starts a declaration", got: self.peek(), desync: true)
+				return self.fold_guards(stmts, :guards, to: self.pos)
+			}
 			let errors_before = len(self.errors)
+			self.quiet = false
+			let start = self.pos
 			self.guard_arm = -1
 			let stmt_id = self.parse_stmt()
 			stmts += [stmt_id]
 			self.expect_stmt_end(:stmt_id, :errors_before)
+			if self.pos == start {
+				self.advance()
+			}
 			if self.guard_arm >= 0 {
 				guards += [Guard(at: len(stmts), from: self.pos, arm: self.guard_arm, pattern: self.guard_pat, name: self.guard_name, call: self.guard_call)]
 				self.guard_arm = -1
@@ -2343,7 +2439,7 @@ type Parser = struct {
 					else none
 				}
 			}
-			self.record_error(f"error: expected the end of the line after {what}, got {lexing.kind_name(self.peek_kind())}", got: self.peek())
+			self.record_error(f"error: expected the end of the line after {what}, got {lexing.kind_name(self.peek_kind())}", got: self.peek(), desync: true)
 		}
 		self.skip_rest_of_stmt(depth: 0)
 	}
@@ -2643,6 +2739,7 @@ type Parser = struct {
 				if self.peek_kind() == .CloseCurly {
 					break
 				}
+				self.quiet = false
 				let pats: [int64] = self.parse_match_arm_patterns()
 				if self.arm_broken {
 					self.skip_newlines()
@@ -2749,15 +2846,35 @@ type Parser = struct {
 			if self.peek_kind() == .CloseCurly or self.peek_kind() == .KwFunc {
 				break
 			}
+			self.quiet = false
+			let start = self.pos
 			let name_span = self.here()
 			mut name: str = self.expect_identifier()
-			self.expect(.Colon)
+			// A type right after the name: the `:` is taken as written.
+			if not self.try_consume(.Colon) {
+				self.record_unexpected(expected: lexing.kind_name(.Colon), got: self.peek())
+				if not self.at(.Identifier) {
+					self.skip_rest_of_stmt(depth: 0)
+					if self.pos == start {
+						self.advance()
+					}
+					self.skip_newlines()
+					continue
+				}
+			}
 			mut typ: int64 = self.parse_type_expr()
 			mut default_expr: int64 = 0
 			if self.try_consume(.Equal) {
 				default_expr = self.parse_expr()
 			}
 			fields += [ast.StructField(:name, :typ, :default_expr, :name_span)]
+			if not self.at(.EOL) and not self.at(.Comment) and not self.at(.CloseCurly) and not self.at(.KwFunc) {
+				self.record_error(f"error: expected the end of the line after field `{name}`, got {lexing.kind_name(self.peek_kind())}", got: self.peek(), desync: true)
+				self.skip_rest_of_stmt(depth: 0)
+			}
+			if self.pos == start {
+				self.advance()
+			}
 			self.skip_newlines()
 		}
 		return fields
@@ -2765,11 +2882,15 @@ type Parser = struct {
 
 	func parse_enum_variants(self) -> [ast.EnumVariant] {
 		mut variants: [ast.EnumVariant] = []
+		mut comma_seen = false
 		for self.peek_kind() != .CloseCurly and self.peek_kind() != .KwFunc and self.peek_kind() != .EOF {
 			self.skip_newlines()
 			if self.peek_kind() == .CloseCurly or self.peek_kind() == .KwFunc {
 				break
 			}
+			self.quiet = false
+			let start = self.pos
+			let desyncs_before = self.desyncs
 			let name_span = self.here()
 			mut name: str = self.expect_identifier()
 			mut fields: [ast.Param] = []
@@ -2790,6 +2911,21 @@ type Parser = struct {
 				self.expect(.CloseParen)
 			}
 			variants += [ast.EnumVariant(:name, :fields, :name_span)]
+			// The variants still read as written: the first `,` is reported.
+			if self.at(.Comma) {
+				if not comma_seen {
+					self.record_error("error: enum variants are separated by spaces or line breaks, not `,`", got: self.peek())
+					comma_seen = true
+				}
+				self.advance()
+			}
+			// After an error the rest of the line is likely more of it.
+			if self.desyncs > desyncs_before {
+				self.skip_rest_of_stmt(depth: 0)
+			}
+			if self.pos == start {
+				self.advance()
+			}
 			self.skip_newlines()
 		}
 		return variants
@@ -2947,7 +3083,7 @@ type Parser = struct {
 		}
 
 		let tok = self.advance()
-		self.record_error(f"error: expected a declaration (`func`, `type`, `interface`, `import`, `extern` or `test`), got {lexing.kind_name(tok.kind)}", got: tok)
+		self.record_error(f"error: expected a declaration (`func`, `type`, `interface`, `import`, `extern` or `test`), got {lexing.kind_name(tok.kind)}", got: tok, desync: true)
 		// Stray words before a declaration (`pub func f`) keep the declaration.
 		if tok.kind == .Identifier {
 			for self.at(.Identifier) {
@@ -3162,12 +3298,42 @@ type Parser = struct {
 				break
 			}
 			let errors_before = len(self.errors)
+			let desyncs_before = self.desyncs
+			self.quiet = false
+			let start = self.pos
+			let decl_start = self.peek().start
+			if self.decl_col < 0 {
+				self.decl_col = self.column()
+			}
 			decls += [self.parse_decl(:doc)]
 			self.expect_stmt_end(stmt_id: -1, :errors_before)
+			if self.pos == start {
+				self.advance()
+			}
+			if self.desyncs > desyncs_before {
+				// What follows up to the next line in the declarations' column
+				// is likely the rest of this one (a `}` too many ended it
+				// early): skip it quietly, and the `}` that ended it.
+				for not self.at(.EOF) and not self.at_decl_start() {
+					self.advance()
+				}
+				self.broken_starts += [decl_start]
+				self.broken_ends += [self.tokens[self.pos - 1].end]
+			}
 		}
+		self.quiet = false
+		self.parsed = true
 		self.check_const_cycles()
 		let renamer = Renamer(p: self)
 		renamer.run(decls)
+		// The errors reported while quiet are left out.
+		mut kept: [ParseError] = []
+		for i, e in self.errors {
+			if i >= len(self.error_quiet) or not self.error_quiet[i] {
+				kept += [e]
+			}
+		}
+		self.errors = kept
 		return ast.Module(:decls)
 	}
 

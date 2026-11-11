@@ -27,6 +27,13 @@ Build pipeline:
 
 The native driver (`build/apps/kod/kod`, built from `tools/kod.kod`) runs steps 2–5.
 
+A syntax error is reported once: the parser skips the rest of the statement, struct
+field, parameter or declaration it is in, and carries on with the next, so a later
+mistake is still found. A missing `,` between parameters, or a missing `:` before a
+field's type, is taken as written. Type errors inside a declaration (a function, a type,
+a constant) that has a syntax error aren't reported, since they may come from what the
+parser skipped; the other declarations are checked as usual.
+
 ### `kod run <file>`
 
 `kod build` + execute. Arguments after the file are passed to the program.
