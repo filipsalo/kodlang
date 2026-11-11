@@ -123,6 +123,21 @@ match m.get("a") {
 print(len(m).to_str())   // 2
 ```
 
+| Method | Description |
+|--------|-------------|
+| `set(k, v)` | Add `k` with value `v`, or replace the value `k` has. `m[k] = v` is the same. |
+| `get(k) -> V?` | `k`'s value, or `none` when `k` isn't in the map. `m[k]` is the same. |
+| `contains(k) -> bool` | Whether `k` is in the map. |
+| `remove(k) -> V?` | Take `k` out of the map, giving the value it had, or `none` when it wasn't there. |
+| `keys() -> [K]` / `values() -> [V]` | The keys, or the values, in the order the keys were first set, as a new array. |
+| `len(m)` | How many keys the map holds. |
+
+The entries keep the order their keys were first set in: setting a key again
+changes its value but not its place, and a key that is removed and set again goes
+last. `for k in m` and `for k, v in m` go over them in that order (see
+[`for` / `in`](control-flow.md#for-in-foreach)). `set`, `get`, `contains` and
+`remove` take constant time on average.
+
 A lookup finds the entry whose key is `==` to the one it's given, so key
 equality depends on the key type: `str` and `bytes` keys match by
 content, `int64` and `bool` keys by value, enum keys by variant, and union

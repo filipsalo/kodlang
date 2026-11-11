@@ -79,9 +79,34 @@ for i in 0..3 {
 
 Either form can take `_` for a name it doesn't use.
 
-Only arrays and `a..b` can be iterated. `for c in s` over a `str` and `for k in m`
-over a `Map` are errors for now: iterate over `s.code_points()` or
-`m.keys` instead. Iterating over any other kind of value is an error too.
+A `str` or `bytes` value is iterated byte by byte, each byte an `int64` from 0 to
+255, as `s[i]` gives it; `for i, b in s` numbers them. For text, iterate over
+`s.code_points()` instead.
+
+```kod
+mut spaces: int64 = 0
+for b in "a b c" {
+    if b == ' ' {
+        spaces += 1
+    }
+}
+```
+
+A `Map` is iterated in the order its keys were first set: `for k in m` gives the
+keys and `for k, v in m` each key with its value. The loop goes over the entries
+the map had when it started, so the body may set and remove entries freely.
+
+```kod
+for name, age in ages {
+    print(f"{name} is {age}")
+}
+```
+
+A `Set` from the `sets` module is iterated the same way, `for x in s`, over its
+elements in the order they were first added.
+
+Arrays, `str`, `bytes`, `Map`, `Set` and `a..b` can be iterated; any other kind
+of value is an error.
 
 ## `break` and `continue`
 

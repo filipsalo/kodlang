@@ -1,46 +1,60 @@
 // Open-addressing hash map laid out as in CPython's PEP 468 dict
-// (3.6+): a dense, insertion-ordered `keys` / `values` pair plus a
-// sparse `indices` table mapping hash slots to entry positions.
+// (3.6+): dense, insertion-ordered `_keys` / `_values` arrays plus a
+// sparse `_indices` table mapping hash slots to entry positions.
 //
-// Lookup hashes the key, probes `indices` until it finds an empty
+// Lookup hashes the key, probes `_indices` until it finds an empty
 // slot (miss) or a slot whose entry's key matches (hit). The probe
 // sequence is Python's `(5*i + 1 + perturb)` recurrence so a single
 // missing slot doesn't trigger a long linear scan.
 //
+// `remove` leaves a hole: the entry stays in `_keys` / `_values` marked dead
+// in `_live`, and its slot is marked -2, which a probe passes over. Once
+// holes are half the entries, `_rebuild` closes them.
+//
 // Keys are compared with `==` and hashed with `hash`, which agree for every key kind.
 type Map[K, V] = struct {
-	keys: [K] = []
-	values: [V] = []
-	// Sparse open-addressing index table; -1 marks an empty slot.
-	// Always a power of two with load factor at most ~2/3. Empty
-	// until the first insert (then lazy-initialised).
-	indices: [int64] = []
+	_keys: [K] = []
+	_values: [V] = []
+	_live: [bool] = []
+	// How many entries are live.
+	_count: int64 = 0
+	// Sparse open-addressing index table: an entry's position, -1 for an
+	// empty slot, -2 for a removed entry's. Always a power of two with
+	// entries (holes included) at most ~2/3 of it. Empty until the first
+	// insert.
+	_indices: [int64] = []
 
-	// Allocate a fresh `size`-slot indices table, all empty.
-	func empty_indices(self, anon size: int64) -> [int64] {
+	// A fresh `size`-slot indices table, all empty.
+	func _empty_indices(self, anon size: int64) -> [int64] {
 		mut arr: [int64] = []
-		mut i = 0
-		for i < size {
+		for _ in 0..size {
 			arr += [-1]
-			i = i + 1
 		}
 		return arr
 	}
 
-	// Find the slot in `indices` for `key`. Returns either the slot
-	// pointing at the matching entry, or an empty (-1) slot where a
-	// new entry could be inserted. Assumes len(self.indices) > 0.
-	func probe(self, anon key: K) -> int64 {
-		let size = len(self.indices)
+	// The slot in `_indices` of `key`'s entry; when it has none, where it
+	// would go: the first removed entry's slot on the way, or else the empty
+	// slot that ends the search. Assumes len(self._indices) > 0.
+	func _probe(self, anon key: K) -> int64 {
+		let size = len(self._indices)
 		let h = hash(key)
 		mut perturb = h
 		mut slot = ((h % size) + size) % size
+		mut free = -1
 		for true {
-			let entry_idx = self.indices[slot]
+			let entry_idx = self._indices[slot]
 			if entry_idx == -1 {
+				if free >= 0 {
+					return free
+				}
 				return slot
 			}
-			if self.keys[entry_idx] == key {
+			if entry_idx == -2 {
+				if free < 0 {
+					free = slot
+				}
+			} else if self._keys[entry_idx] == key {
 				return slot
 			}
 			perturb = perturb / 32
@@ -49,61 +63,115 @@ type Map[K, V] = struct {
 		return -1
 	}
 
-	// Grow the indices table to `new_size` (power of two), re-probing
-	// every live entry. Order in `keys` / `values` is preserved.
-	func resize(self, anon new_size: int64) -> none {
-		self.indices = self.empty_indices(new_size)
-		mut i = 0
-		for i < len(self.keys) {
-			mut slot = self.probe(self.keys[i])
-			let tmp = self.indices
-			tmp[slot] = i
-			i = i + 1
+	// Close the holes, keeping the order, and lay out a `size`-slot table.
+	func _rebuild(self, anon size: int64) -> none {
+		if self._count < len(self._keys) {
+			mut keys: [K] = []
+			mut values: [V] = []
+			mut live: [bool] = []
+			for i in 0..len(self._keys) {
+				if self._live[i] {
+					keys += [self._keys[i]]
+					values += [self._values[i]]
+					live += [true]
+				}
+			}
+			self._keys = keys
+			self._values = values
+			self._live = live
+		}
+		self._indices = self._empty_indices(size)
+		for i in 0..len(self._keys) {
+			let slot = self._probe(self._keys[i])
+			self._indices[slot] = i
 		}
 	}
 
 	func get(self, anon key: K) -> V? {
-		if len(self.indices) == 0 {
+		if len(self._indices) == 0 {
 			return none
 		}
-		mut slot = self.probe(key)
-		let entry_idx = self.indices[slot]
-		if entry_idx == -1 {
+		let entry_idx = self._indices[self._probe(key)]
+		if entry_idx < 0 {
 			return none
 		}
-		return self.values[entry_idx]
+		return self._values[entry_idx]
 	}
 
 	func set(self, anon key: K, anon value: V) -> none {
-		if len(self.indices) == 0 {
-			self.indices = self.empty_indices(8)
+		if len(self._indices) == 0 {
+			self._indices = self._empty_indices(8)
 		}
-		mut slot = self.probe(key)
-		let entry_idx = self.indices[slot]
-		if entry_idx != -1 {
-			// Existing entry: update in place. Mutating values[i]
-			// through a local alias works because arrays are heap
-			// references.
-			let vals = self.values
-			vals[entry_idx] = value
+		let slot = self._probe(key)
+		let entry_idx = self._indices[slot]
+		if entry_idx >= 0 {
+			self._values[entry_idx] = value
 			return none
 		}
-		self.keys += [key]
-		self.values += [value]
-		let tmp = self.indices
-		tmp[slot] = len(self.keys) - 1
-		// Grow the indices table whenever it would exceed ~2/3 load.
-		if len(self.keys) * 3 > len(self.indices) * 2 {
-			self.resize(len(self.indices) * 2)
+		self._keys += [key]
+		self._values += [value]
+		self._live += [true]
+		self._count += 1
+		self._indices[slot] = len(self._keys) - 1
+		// Past ~2/3 full, holes included: close the holes, and double the
+		// table if the live entries alone are past it.
+		let size = len(self._indices)
+		if len(self._keys) * 3 > size * 2 {
+			if self._count * 3 > size * 2 {
+				self._rebuild(size * 2)
+			} else {
+				self._rebuild(size)
+			}
 		}
 	}
 
 	func contains(self, anon key: K) -> bool {
-		if len(self.indices) == 0 {
+		if len(self._indices) == 0 {
 			return false
 		}
-		mut slot = self.probe(key)
-		return self.indices[slot] != -1
+		return self._indices[self._probe(key)] >= 0
+	}
+
+	// Take `key` out of the map: the value it had, or none.
+	func remove(self, anon key: K) -> V? {
+		if len(self._indices) == 0 {
+			return none
+		}
+		let slot = self._probe(key)
+		let entry_idx = self._indices[slot]
+		if entry_idx < 0 {
+			return none
+		}
+		let value = self._values[entry_idx]
+		self._indices[slot] = -2
+		self._live[entry_idx] = false
+		self._count -= 1
+		if (len(self._keys) - self._count) * 2 > len(self._keys) and len(self._keys) >= 8 {
+			self._rebuild(len(self._indices))
+		}
+		return value
+	}
+
+	// The keys, in the order they were first set, as a new array.
+	func keys(self) -> [K] {
+		mut out: [K] = []
+		for i in 0..len(self._keys) {
+			if self._live[i] {
+				out += [self._keys[i]]
+			}
+		}
+		return out
+	}
+
+	// The values, in their keys' order, as a new array.
+	func values(self) -> [V] {
+		mut out: [V] = []
+		for i in 0..len(self._values) {
+			if self._live[i] {
+				out += [self._values[i]]
+			}
+		}
+		return out
 	}
 
 	func op_index(self, anon key: K) -> V? {
@@ -118,7 +186,7 @@ type Map[K, V] = struct {
 	// codegen dispatches `len(x)` to a struct's `len` method when the
 	// struct defines one.
 	func len(self) -> int64 {
-		return len(self.keys)
+		return self._count
 	}
 }
 

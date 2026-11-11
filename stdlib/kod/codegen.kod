@@ -4403,7 +4403,7 @@ type Codegen = struct {
         for a in ts.alias_names {
             if a == alias {
                 if self.type_scope_idx.get(ts.alias_paths[i]) is Some(mi) {
-                    for n in self.type_scopes[mi].own.keys {
+                    for n in self.type_scopes[mi].own.keys() {
                         if not n.starts_with("_") {
                             names += [n]
                         }
@@ -4481,7 +4481,7 @@ type Codegen = struct {
         }
         mut candidates: [str] = []
         if target >= 0 {
-            for n in self.type_scopes[target].own.keys {
+            for n in self.type_scopes[target].own.keys() {
                 if not n.starts_with("_") {
                     candidates += [n]
                 }
@@ -11381,7 +11381,7 @@ type Codegen = struct {
     func own_type_names(self, anon ti: int64, what: int64) -> [str] {
         mut names: [str] = []
         let own = self.type_scopes[ti].own
-        for n in own.keys {
+        for n in own.keys() {
             if own.get(n) is Some(r) and (what < 0 or r % 4 == what) {
                 names += [n]
             }
@@ -16851,6 +16851,18 @@ type Codegen = struct {
     }
 
     func compile_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
+        // A Map or Set goes over a snapshot of its keys or elements, an array.
+        if self.infer_kind(iter_id) is .KStruct(idx, _type_args) and self.structs[idx].template_idx >= 0 {
+            let noun = self.hashed_arg_noun(self.structs[idx].template_idx)
+            if noun == "key" {
+                self.compile_map_foreach(body, :name, :iter_id)
+                return
+            }
+            if noun == "element" {
+                self.compile_foreach(body, :name, iter_id: self.method_call_expr(iter_id, method: "values"))
+                return
+            }
+        }
         self.note_wide_fn_local(name, value: iter_id)
         // Pin the element binding's kind for THIS loop. Collection only
         // pre-reserved a slot (with a placeholder kind) because two loops
@@ -16873,7 +16885,10 @@ type Codegen = struct {
             .KArrayArray(inner) -> elem_kind = inner
             else none
         }
-        mut iterable = self.is_array_kind(iter_kind)
+        // A str or bytes value has an array's header, {data, len}, and is
+        // gone over a byte at a time.
+        let by_byte = iter_kind is .KStr or iter_kind is .KBytes
+        mut iterable = self.is_array_kind(iter_kind) or by_byte
         if iter_kind is .KUnknown {
             iterable = true
         }
@@ -16925,8 +16940,12 @@ type Codegen = struct {
 
         mut elem_reg = self.pool.alloc_reg()
         self.emit(f"ldr {elem_reg}, [{hdr_reg}]")
-        self.emit(f"lsl {idx_reg}, {idx_reg}, #3")
-        self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
+        if by_byte {
+            self.emit(f"ldrb w{elem_reg[1..len(elem_reg)]}, [{elem_reg}, {idx_reg}]")
+        } else {
+            self.emit(f"lsl {idx_reg}, {idx_reg}, #3")
+            self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
+        }
         self.emit_str(elem_off, reg: elem_reg)
         self.pool.free_reg(elem_reg)
         self.pool.free_reg(idx_reg)
@@ -16950,27 +16969,55 @@ type Codegen = struct {
         self.end_loop()
     }
 
+    // `for k in m` over a Map is `for k in m.keys()`. `for k, v in m`, which
+    // the parser numbers (`let k = counter` and `counter += 1` start the
+    // body), goes over `m.values()` with `k` read from `m.keys()` at the
+    // counter, both of one snapshot of `m`, held in locals of its own.
+    func compile_map_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
+        mut key_name = ""
+        mut counter = ""
+        if len(body) >= 2 and self.p.stmts[body[0]] is .Let(k, typ, value, _mutable) and typ == 0 and self.p.exprs[value] is .Ident(c) and c.starts_with("__for_index_") and self.p.stmts[body[1]] is .PlusAssign(_lhs, _rhs) {
+            key_name = k
+            counter = c
+        }
+        if len(key_name) == 0 {
+            self.compile_foreach(body, :name, iter_id: self.method_call_expr(iter_id, method: "keys"))
+            return
+        }
+        let span = self.p.expr_spans[iter_id]
+        let map_name = f"__map_{iter_id}"
+        let keys_name = f"__map_keys_{iter_id}"
+        self.hold_in_local(map_name, value: iter_id)
+        let map_ref = self.p.alloc_expr(.Ident(name: map_name), :span)
+        self.hold_in_local(keys_name, value: self.method_call_expr(map_ref, method: "keys"))
+        let keys_ref = self.p.alloc_expr(.Ident(name: keys_name), :span)
+        let at = self.p.alloc_expr(.Ident(name: counter), :span)
+        let key = self.p.alloc_expr(.Binary(lhs: keys_ref, op: .Index, rhs: at), :span)
+        let first = self.p.alloc_stmt(.Let(name: key_name, typ: 0, value: key, mutable: false))
+        self.compile_foreach([first] + body[1..len(body)], :name, iter_id: self.method_call_expr(map_ref, method: "values"))
+    }
+
+    // A local of the compiler's own named `name`, set to `value`.
+    func hold_in_local(self, anon name: str, value: int64) -> none {
+        if self.find_var_offset(name) == -9999 {
+            self.alloc_var(:name, kind: self.infer_kind(value))
+        }
+        self.compile_let(:name, typ: 0, :value, mutable: false)
+        self.bind_var(name)
+    }
+
+    // `recv.method()`, as an expression the parser could have made.
+    func method_call_expr(self, anon recv: int64, method: str) -> int64 {
+        let span = self.p.expr_spans[recv]
+        let member = self.p.alloc_expr(.Ident(name: method), :span)
+        let callee = self.p.alloc_expr(.Binary(lhs: recv, op: .Dot, rhs: member), :span)
+        let no_args: [ast.CallArg] = []
+        return self.p.alloc_expr(.Call(:callee, args: no_args), :span)
+    }
+
     func foreach_error(self, anon kind: TypeKind, iter_id: int64) -> str {
         let msg = f"error: cannot iterate over a value of type `{self.kind_display(kind)}`"
-        mut hint = ""
-        if kind is .KStr {
-            hint = ".code_points()"
-        }
-        if kind is .KStruct(idx, _type_args) {
-            let template_idx = self.structs[idx].template_idx
-            if template_idx >= 0 {
-                if self.structs[template_idx].name == "Map" {
-                    hint = ".keys"
-                }
-            }
-        }
-        if len(hint) == 0 {
-            return msg
-        }
-        if self.p.exprs[iter_id] is .Ident(name) {
-            return f"{msg}; iterate over `{self.source_name(name)}{hint}` instead"
-        }
-        return f"{msg}; iterate over its `{hint}` instead"
+        return msg
     }
 
     func compile_break(self) -> none {
