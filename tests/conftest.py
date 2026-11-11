@@ -26,6 +26,7 @@ SHARED_PROGRAM = {
     "lsp_test.py": "lsp",
     "compiler_limits_test.py": "limits",
     "api_example_test.py": "api_example",
+    "colour_test.py": "colour",
 }
 
 
