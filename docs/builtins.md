@@ -56,6 +56,19 @@ else doesn't hide the builtin, so `panic(msg)` after
 
 As a value, `len` is its string form: `let n: func(str) -> int64 = len`.
 
+## Bytes
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `kod_str_to_bytes` | `(str) -> bytes` | The same bytes, typed `bytes`; nothing is copied. |
+| `kod_bytes_to_str` | `(bytes) -> str` | The same bytes, typed `str`; nothing is copied. |
+| `kod_bytes_from_array` | `([int64]) -> bytes` | One byte per element, from its low 8 bits. |
+| `kod_bytes_le64` | `(bytes, int64) -> int64` | The 8 bytes from `at` as one `int64`, the first byte lowest (little-endian). An `at` below 0, or fewer than 8 bytes left, panics with the index of the first missing byte. |
+
+`kod_bytes_le64(b, at)` is what reading the 8 bytes one at a time and
+shifting them together gives, in one load: a decoder reading many bits at a
+time uses it to fill its bit buffer.
+
 ## String conversion
 
 There is no `int_to_str` builtin — primitives carry their own `to_str` methods:

@@ -678,6 +678,17 @@ KodStr *kod_bytes_from_array(void *arr_raw) {
 KodStr *kod_str_to_bytes(void *s) { rc_retain_c(s); return (KodStr *)s; }
 KodStr *kod_bytes_to_str(void *b) { rc_retain_c(b); return (KodStr *)b; }
 
+// Only reached through a function value: codegen compiles a direct call to
+// a bounds check and one load. Out of range panics with the first missing
+// byte's index, as the compiled check does.
+int64_t kod_bytes_le64(KodStr *b, int64_t at) {
+    if (at < 0 || at >= b->len) kod_index_oob(at, b->len);
+    if (b->len - at < 8) kod_index_oob(b->len, b->len);
+    uint64_t v;
+    memcpy(&v, b->buf + at, 8);
+    return (int64_t)v;
+}
+
 #define RC_ARRAY_BIT (1ULL << 22)
 #define RC_REFS_BIT (1ULL << 21)
 static inline int rc_arr_counted(const void *p) { return ((uint64_t)p >> 36) == 0x300; }
