@@ -16712,16 +16712,55 @@ type Codegen = struct {
         return .VReg(name: result)
     }
 
+    // Branches to `to` when the condition is `when`, and falls through
+    // otherwise. `and` and `or` become branches between their operands
+    // instead of a 0/1 value tested again; any other condition is compiled
+    // as a value and tested, which the peephole turns into one compare and
+    // branch. `need` and `optional_hint` are for a condition that isn't a
+    // `bool`.
+    func compile_branch(self, anon cond_id: int64, to: str, when: bool, need: str, optional_hint: str) -> none {
+        match self.p.exprs[cond_id] {
+            .Binary(lhs, op, rhs) -> {
+                if op is .And or op is .Or {
+                    let is_and = op is .And
+                    mut op_need = "`or` needs `bool` operands"
+                    mut lhs_hint = f"; did you mean `{self.unwrap_name(lhs)}? or default`?"
+                    if is_and {
+                        op_need = "`and` needs `bool` operands"
+                        lhs_hint = "; test it with `is not none`"
+                    }
+                    // `a and b` is false as soon as `a` is, `a or b` true.
+                    if is_and != when {
+                        self.compile_branch(lhs, :to, :when, need: op_need, optional_hint: lhs_hint)
+                        self.compile_branch(rhs, :to, :when, need: op_need, optional_hint: "; test it with `is not none`")
+                        return
+                    }
+                    let skip = self.fresh("Lcond")
+                    self.compile_branch(lhs, to: skip, when: not when, need: op_need, optional_hint: lhs_hint)
+                    self.compile_branch(rhs, :to, :when, need: op_need, optional_hint: "; test it with `is not none`")
+                    self.emit_label(skip)
+                    return
+                }
+            }
+            else none
+        }
+        let cond_val = self.compile_expr(cond_id)
+        self.check_bool(cond_id, :need, :optional_hint)
+        let cond_reg = self.load(cond_val)
+        self.emit(f"cmp {cond_reg}, #0")
+        self.pool.free_reg(cond_reg)
+        if when {
+            self.emit(f"bne {to}")
+        } else {
+            self.emit(f"beq {to}")
+        }
+    }
+
     func compile_if(self, cond_id: int64, then_body: [int64], else_body: [int64]) -> none {
         let lbl = self.fresh("Lif")
         let false_lbl = f"{lbl}_false"
         let end_lbl = f"{lbl}_end"
-        let cond_val = self.compile_expr(cond_id)
-        self.check_bool(cond_id, need: "an `if` condition must be a `bool`", optional_hint: "; test it with `is not none`")
-        let cond_reg = self.load(cond_val)
-        self.emit(f"cmp {cond_reg}, #0")
-        self.pool.free_reg(cond_reg)
-        self.emit(f"beq {false_lbl}")
+        self.compile_branch(cond_id, to: false_lbl, when: false, need: "an `if` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         self.compile_block(then_body)
         self.emit(f"b {end_lbl}")
         self.emit_label(false_lbl)
@@ -16737,12 +16776,7 @@ type Codegen = struct {
         // pointed at end_lbl, which made `continue` behave as `break`.
         self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: len(self.out_buf))]
         self.emit_label(start_lbl)
-        let cond_val = self.compile_expr(cond_id)
-        self.check_bool(cond_id, need: "a `for` condition must be a `bool`", optional_hint: "; test it with `is not none`")
-        let cond_reg = self.load(cond_val)
-        self.emit(f"cmp {cond_reg}, #0")
-        self.pool.free_reg(cond_reg)
-        self.emit(f"beq {end_lbl}")
+        self.compile_branch(cond_id, to: end_lbl, when: false, need: "a `for` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         self.compile_block(body)
         self.emit(f"b {start_lbl}")
         self.emit_label(end_lbl)
