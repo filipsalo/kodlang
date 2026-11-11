@@ -3,6 +3,7 @@ import "kod/ast"
 import "kod/parsing"
 import "kod/lexing"
 import "kod/regalloc"
+import "primitives/format"
 
 // Concrete instantiation of the builtin Map used for string interning.
 // Declared here so resolve_type registers the monomorphised entry early,
@@ -7332,7 +7333,8 @@ type Codegen = struct {
         // `str(x)` of a `bytes` or a `str` is the same object.
         if self.p.exprs[callee] is .Ident(key) {
             let name = self.source_name(key)
-            if name == "str" or name == "$str" {
+            // `$fmt` is a method call, which counts its own result.
+            if name == "str" or name == "$str" or name == "$fmt" {
                 return val
             }
         }
@@ -12422,6 +12424,9 @@ type Codegen = struct {
                 if name == "$str" or (name == "str" and len(args) == 1 and builtin) {
                     return self.compile_as_str(args[0].value)
                 }
+                if name == "$fmt" {
+                    return self.compile_format(args[0].value, spec_id: args[1].value)
+                }
                 // Like `==`: str/bytes by content, enums by variant, else bits.
                 if name == "hash" and len(args) == 1 and builtin {
                     let arg_kind = self.infer_kind(args[0].value)
@@ -13690,7 +13695,7 @@ type Codegen = struct {
                 match self.p.exprs[callee] {
                     .Ident(key) -> {
                         let name = self.source_name(key)
-                        if name == "$str" or (name == "str" and self.is_builtin_call(key)) {
+                        if name == "$str" or name == "$fmt" or (name == "str" and self.is_builtin_call(key)) {
                             return .KStr
                         }
                         if name == "hash" and self.is_builtin_call(key) {
@@ -16997,6 +17002,39 @@ type Codegen = struct {
         self.compile_foreach([first] + body[1..len(body)], :name, iter_id: self.method_call_expr(map_ref, method: "values"))
     }
 
+    // `{value:spec}` of an f-string: the spec is checked against the value's
+    // type, then it's `value.format(spec)` for an int64, a float64 or a str,
+    // and `$str(value).format(spec)` for anything else `{value}` takes.
+    func compile_format(self, anon value_id: int64, spec_id: int64) -> Val {
+        let .StrLit(spec) = self.p.exprs[spec_id] else { return self.compile_as_str(value_id) }
+        let kind = self.infer_kind(value_id)
+        if self.kind_has_unknown(kind) {
+            return self.compile_as_str(value_id)
+        }
+        mut which: int64 = 0
+        if kind is .KInt64 {
+            which = 1
+        } else if kind is .KFloat64 {
+            which = 2
+        }
+        // How the spec is written the parser has checked and reported.
+        if len(format.check(spec, kind: -1, shown: "")) > 0 {
+            return self.compile_as_str(value_id)
+        }
+        let problem = format.check(spec, kind: which, shown: self.kind_display(kind))
+        if len(problem) > 0 {
+            self.report_error(f"error: in the format spec `{spec}`, {problem}", span: self.p.expr_spans[spec_id])
+            return self.compile_as_str(value_id)
+        }
+        mut recv = value_id
+        if which == 0 and not (kind is .KStr) {
+            let span = self.p.expr_spans[value_id]
+            let str_callee = self.p.alloc_expr(.Ident(name: "$str"), :span)
+            recv = self.p.alloc_expr(.Call(callee: str_callee, args: [ast.CallArg(label: "", label_span: span, value: value_id)]), :span)
+        }
+        return self.compile_expr(self.method_call_expr(recv, method: "format", args: [ast.CallArg(label: "", label_span: self.p.expr_spans[spec_id], value: spec_id)]))
+    }
+
     // A local of the compiler's own named `name`, set to `value`.
     func hold_in_local(self, anon name: str, value: int64) -> none {
         if self.find_var_offset(name) == -9999 {
@@ -17007,12 +17045,11 @@ type Codegen = struct {
     }
 
     // `recv.method()`, as an expression the parser could have made.
-    func method_call_expr(self, anon recv: int64, method: str) -> int64 {
+    func method_call_expr(self, anon recv: int64, method: str, args: [ast.CallArg] = []) -> int64 {
         let span = self.p.expr_spans[recv]
         let member = self.p.alloc_expr(.Ident(name: method), :span)
         let callee = self.p.alloc_expr(.Binary(lhs: recv, op: .Dot, rhs: member), :span)
-        let no_args: [ast.CallArg] = []
-        return self.p.alloc_expr(.Call(:callee, args: no_args), :span)
+        return self.p.alloc_expr(.Call(:callee, :args), :span)
     }
 
     func foreach_error(self, anon kind: TypeKind, iter_id: int64) -> str {

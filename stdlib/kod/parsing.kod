@@ -1,5 +1,6 @@
 import "kod/lexing"
 import "kod/ast"
+import "primitives/format"
 
 // A grouped literal's text without its spaces.
 func strip_spaces(anon s: str) -> str {
@@ -447,6 +448,9 @@ type Parser = struct {
 	// The column the module's first declaration starts in, which the others
 	// are taken to start in too, for skipping to one after an error.
 	decl_col: int64 = -1
+	// Set by parse_expr_substring: where the `:` before a format spec is in the
+	// substring, or -1.
+	fspec_at: int64 = -1
 	// Where `expect` last left a token it didn't want: a second miss there
 	// takes it, so a loop that makes no progress can't go round for good.
 	kept_pos: int64 = -1
@@ -1539,7 +1543,9 @@ type Parser = struct {
 	func parse_expr_substring(self, anon source: str, base: int64, pinned: bool) -> int64 {
 		let sub_lexer: lexing.Lexer = lexing.Lexer(:source, pos: 0, start: 0)
 		mut sub_tokens: [lexing.Token] = []
+		mut sub_starts: [int64] = []
 		for tok in sub_lexer.lex() {
+			sub_starts += [tok.start]
 			if pinned {
 				sub_tokens += [lexing.Token(kind: tok.kind, value: tok.value, start: base, end: base)]
 			} else {
@@ -1551,8 +1557,9 @@ type Parser = struct {
 		self.tokens = sub_tokens
 		self.pos = 0
 		mut result: int64 = self.parse_expr()
+		self.fspec_at = -1
 		if self.at(.Colon) {
-			self.record_error("error: an f-string has no format specs; `{...}` holds one expression", got: self.peek())
+			self.fspec_at = sub_starts[self.pos]
 		} else if not self.at(.EOF) and not self.at(.EOL) {
 			self.record_error("error: the braces of an f-string hold one expression, but this one goes on with " + lexing.kind_name(self.peek_kind()), got: self.peek())
 		}
@@ -1604,10 +1611,29 @@ type Parser = struct {
 					base = span.start + 2 + j + 1
 				}
 				let inner_expr: int64 = self.parse_expr_substring(expr_text, :base, pinned: triple)
-				let str_callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "$str"), :span)
 				let arg: ast.CallArg = ast.CallArg(label: "", label_span: span, value: inner_expr)
-				let call_args: [ast.CallArg] = [arg]
-				parts += [self.alloc_expr(ast.Expr.Call(callee: str_callee, args: call_args), :span)]
+				let spec_at = self.fspec_at
+				if spec_at >= 0 {
+					// `{x:spec}` is `$fmt(x, "spec")`, which codegen checks
+					// against x's type; how the spec is written is checked here.
+					let spec = expr_text[spec_at + 1..len(expr_text)]
+					mut spec_start = base
+					if not triple {
+						spec_start = base + spec_at + 1
+					}
+					let problem = format.check(spec, kind: -1, shown: "")
+					if len(problem) > 0 {
+						self.record_error(f"error: in the format spec `{spec}`, {problem}", got: lexing.Token(kind: .FStringLit, value: spec, start: spec_start, end: spec_start + len(spec)))
+					}
+					let fmt_callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "$fmt"), :span)
+					let spec_lit: int64 = self.alloc_expr(ast.Expr.StrLit(value: spec), span: ast.Span(start: spec_start))
+					let spec_arg: ast.CallArg = ast.CallArg(label: "", label_span: span, value: spec_lit)
+					parts += [self.alloc_expr(ast.Expr.Call(callee: fmt_callee, args: [arg, spec_arg]), :span)]
+				} else {
+					let str_callee: int64 = self.alloc_expr(ast.Expr.Ident(name: "$str"), :span)
+					let call_args: [ast.CallArg] = [arg]
+					parts += [self.alloc_expr(ast.Expr.Call(callee: str_callee, args: call_args), :span)]
+				}
 				i = k + 1
 			}
 		}

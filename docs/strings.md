@@ -87,8 +87,48 @@ array, a function value, and a struct or interface without a
 or returns something else.
 Unwrap an optional first, e.g. `f"{n? or 0}"`.
 
-The braces hold one expression. There are no format specs, so `f"{n:03}"` is an
-error rather than a number that isn't padded.
+The braces hold one expression, which may be followed by a format spec.
+
+### Format specs
+
+After a `:`, a format spec says how wide the text is and how a number is
+written, as in Python:
+
+```kod
+let n = 42
+let x = 3.14159
+let name = "kod"
+print(f"[{n:5}] [{n:<5}] [{n:^5}] [{n:05}] [{n:+}]")  // [   42] [42   ] [ 42  ] [00042] [+42]
+print(f"{x:.2} {x:8.3} {x:e} {0.25:.1%}")            // 3.14    3.142 3.141590e+00 25.0%
+print(f"{255:x} {255:#X} {5:08b} {1234567:,}")        // ff 0XFF 00000101 1,234,567
+print(f"[{name:>6}] [{name:*^7}] [{"truncated":.5}]")  // [   kod] [**kod**] [trunc]
+```
+
+The parts, in this order, each optional:
+
+| Part | Meaning |
+|------|---------|
+| fill and align | `<` left, `>` right, `^` centred, after an optional fill character (a space if none). Numbers align right and everything else left unless told otherwise. |
+| sign | `+` writes a `+` before a positive number, and a space writes a space there; a negative number always has its `-`. |
+| `#` | Puts `0x`, `0X`, `0o` or `0b` before a number written in that base. |
+| `0` | Pads a number with zeros after its sign and base prefix, to the width. |
+| width | The least number of characters (code points); a longer value isn't cut. |
+| `,` or `_` | Groups the digits of a decimal number in threes, or with `_` those of a hex, octal or binary number in fours. |
+| `.precision` | For a float, the digits after the point; for a string, the most characters to keep. |
+| type | For an `int64`: `d` decimal (the default), `x` and `X` hex, `o` octal, `b` binary. For a `float64`: `f` fixed point (six digits after the point unless a precision says), `e` exponent form (`3.141590e+00`), `%` the value times 100 with a `%`. For a string: `s`. |
+
+A float without a type or precision is written as `{x}` writes it, then
+padded; with a precision and no type, it has that many digits after the point.
+Digits are rounded correctly from the float's exact value, ties to even. A
+`bool`, an enum or a struct is formatted as the text `{x}` gives it, so only
+the fill, align, width and precision apply.
+
+A spec that doesn't fit the value is a compile error: `{n:.2}` on an
+`int64`, `{x:x}` on a `float64`, `{name:05}` on a `str`. The spec is written
+out, so `{n:{w}}` with a width taken from a variable is an error too.
+
+The same specs are also methods: `n.format("05")`, `x.format(".2")` and
+`s.format(">10")` give what `f"{n:05}"` and the others do.
 
 ## Concatenation
 

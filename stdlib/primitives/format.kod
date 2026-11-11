@@ -1,0 +1,379 @@
+// Format specs: what follows the `:` in `f"{x:spec}"`, and the argument of
+// the `format` methods of int64, float64 and str. They read as Python's:
+//
+//   [[fill]align][sign][#][0][width][,|_][.precision][type]
+//
+// except that a float64's precision with no type means digits after the
+// point. The compiler checks a written spec with `check`, so the formatting
+// functions here only panic on a spec given at run time.
+
+import "primitives/float_text"
+
+extern func kod_f64_bits(anon x: float64) -> int64
+
+type Spec = struct {
+	fill: str = " "
+	// '<', '>' or '^', or 0 for the value's own: right for a number, else left.
+	align: int64 = 0
+	// '-' (a sign only on a negative number), '+' or ' '.
+	sign: int64 = '-'
+	alt: bool = false
+	zero: bool = false
+	width: int64 = 0
+	// ',' or '_', or 0.
+	group: int64 = 0
+	precision: int64 = -1
+	// The type letter, or 0.
+	kind: int64 = 0
+	// What is wrong with the spec, or "".
+	error: str = ""
+}
+
+let _SHAPE: str = "a spec is [[fill]align][sign][#][0][width][,|_][.precision][type]"
+
+func _is_align(anon b: int64) -> bool {
+	return b == '<' or b == '>' or b == '^'
+}
+
+func _is_digit(anon b: int64) -> bool {
+	return b >= '0' and b <= '9'
+}
+
+func _is_type(anon b: int64) -> bool {
+	return b == 'd' or b == 'x' or b == 'X' or b == 'o' or b == 'b' or b == 'f' or b == 'e' or b == '%' or b == 's'
+}
+
+// The number the digits of spec[from..to] make, or -1 past 9999.
+func _number(anon spec: str, from: int64, to: int64) -> int64 {
+	if to - from > 4 {
+		return -1
+	}
+	mut v: int64 = 0
+	for i in from..to {
+		v = v * 10 + spec[i] - '0'
+	}
+	return v
+}
+
+func parse(anon spec: str) -> Spec {
+	mut out = Spec()
+	let n = len(spec)
+	mut i: int64 = 0
+	mut fill_given = false
+	if n > 0 {
+		let first = spec.char_slice(0, 1)
+		let w = len(first)
+		if w < n and _is_align(spec[w]) {
+			out.fill = first
+			out.align = spec[w]
+			fill_given = true
+			i = w + 1
+		} else if _is_align(spec[0]) {
+			out.align = spec[0]
+			i = 1
+		}
+	}
+	if i < n and (spec[i] == '+' or spec[i] == '-' or spec[i] == ' ') {
+		out.sign = spec[i]
+		i += 1
+	}
+	if i < n and spec[i] == '#' {
+		out.alt = true
+		i += 1
+	}
+	if i < n and spec[i] == '0' {
+		out.zero = true
+		if not fill_given {
+			out.fill = "0"
+		}
+		i += 1
+	}
+	let width_at = i
+	for i < n and _is_digit(spec[i]) {
+		i += 1
+	}
+	if i > width_at {
+		out.width = _number(spec, from: width_at, to: i)
+		if out.width < 0 {
+			out.error = "the width is more than 9999"
+			return out
+		}
+	}
+	if i < n and (spec[i] == ',' or spec[i] == '_') {
+		out.group = spec[i]
+		i += 1
+	}
+	if i < n and spec[i] == '.' {
+		i += 1
+		let precision_at = i
+		for i < n and _is_digit(spec[i]) {
+			i += 1
+		}
+		if i == precision_at {
+			out.error = "the `.` needs a precision after it"
+			return out
+		}
+		out.precision = _number(spec, from: precision_at, to: i)
+		if out.precision < 0 {
+			out.error = "the precision is more than 9999"
+			return out
+		}
+	}
+	if i < n and _is_type(spec[i]) {
+		out.kind = spec[i]
+		i += 1
+	}
+	if i < n {
+		out.error = f"`{spec[i..n].char_slice(0, 1)}` can't go there; {_SHAPE}"
+	}
+	return out
+}
+
+// What is wrong with `spec` for a value of the kind `kind`: 1 for an int64, 2
+// for a float64, 0 for text (`shown` names its type), and -1 to check only how
+// it's written. "" when nothing is.
+func check(anon spec: str, kind: int64, shown: str) -> str {
+	let s = parse(spec)
+	if len(s.error) > 0 or kind < 0 {
+		return s.error
+	}
+	let t = s.kind
+	mut letter = ""
+	if t != 0 {
+		letter = spec[len(spec) - 1..len(spec)]
+	}
+	let base = t == 'x' or t == 'X' or t == 'o' or t == 'b'
+	if kind == 1 {
+		if s.precision >= 0 {
+			return "a precision doesn't apply to an `int64`"
+		}
+		if t == 'f' or t == 'e' or t == '%' {
+			return f"`{letter}` formats a `float64`, not an `int64`"
+		}
+		if t == 's' {
+			return "`s` formats text, not an `int64`"
+		}
+		if s.group == ',' and base {
+			return f"`,` groups decimal digits; `_` groups those of `{letter}` in fours"
+		}
+		if s.alt and not base {
+			return "`#` applies to `x`, `X`, `o` and `b`"
+		}
+		return ""
+	}
+	if kind == 2 {
+		if base or t == 'd' {
+			return f"`{letter}` formats an `int64`, not a `float64`"
+		}
+		if t == 's' {
+			return "`s` formats text, not a `float64`"
+		}
+		if s.alt {
+			return "`#` applies to an `int64` in hex, octal or binary"
+		}
+		return ""
+	}
+	if t != 0 and t != 's' {
+		return f"`{letter}` formats a number, not a `{shown}`"
+	}
+	if s.sign != '-' {
+		return f"a sign applies to numbers, not to a `{shown}`"
+	}
+	if s.alt {
+		return f"`#` applies to numbers, not to a `{shown}`"
+	}
+	if s.zero {
+		return f"`0` pads numbers, not a `{shown}`; write `0>` to fill with zeros"
+	}
+	if s.group != 0 {
+		return f"grouping applies to numbers, not to a `{shown}`"
+	}
+	return ""
+}
+
+func _require(anon spec: str, kind: int64, shown: str) -> Spec {
+	let problem = check(spec, :kind, :shown)
+	if len(problem) > 0 {
+		panic(f"in the format spec `{spec}`, {problem}")
+	}
+	return parse(spec)
+}
+
+// `text` padded to the spec's width with its fill, aligned as it says or as
+// `own` when it doesn't.
+func _pad(anon text: str, s: Spec, own: int64) -> str {
+	let n = text.char_count()
+	if n >= s.width {
+		return text
+	}
+	let room = s.width - n
+	mut align = s.align
+	if align == 0 {
+		align = own
+	}
+	if align == '<' {
+		return text + s.fill.repeat(room)
+	}
+	if align == '^' {
+		return s.fill.repeat(room / 2) + text + s.fill.repeat(room - room / 2)
+	}
+	return s.fill.repeat(room) + text
+}
+
+// `digits` with `sep` before each group of `every` from the right.
+func _group(anon digits: str, sep: str, every: int64) -> str {
+	let n = len(digits)
+	mut out = ""
+	for i in 0..n {
+		if i > 0 and (n - i) % every == 0 {
+			out += sep
+		}
+		out += digits[i..i + 1]
+	}
+	return out
+}
+
+// A number: `head` (sign and base prefix), its integer digits, and `tail`
+// (point, fraction, exponent, `%`), grouped and padded as the spec says. A `0`
+// with no align pads with zeros between the head and the digits, grouping
+// them too.
+func _number_text(anon head: str, digits: str, tail: str, s: Spec, every: int64) -> str {
+	mut sep = ""
+	if s.group == ',' {
+		sep = ","
+	} else if s.group == '_' {
+		sep = "_"
+	}
+	mut body = digits
+	if len(sep) > 0 {
+		body = _group(digits, :sep, :every)
+	}
+	if s.zero and s.align == 0 {
+		let room = s.width - len(head) - len(tail)
+		if len(sep) > 0 {
+			mut k = len(digits)
+			for k + (k - 1) / every < room {
+				k += 1
+			}
+			body = _group("0".repeat(k - len(digits)) + digits, :sep, :every)
+		} else if len(body) < room {
+			body = "0".repeat(room - len(body)) + body
+		}
+		return head + body + tail
+	}
+	return _pad(head + body + tail, :s, own: '>')
+}
+
+func format_int(anon n: int64, spec: str) -> str {
+	let s = _require(spec, kind: 1, shown: "int64")
+	mut base: int64 = 10
+	mut prefix = ""
+	mut chars = "0123456789abcdef"
+	mut every: int64 = 3
+	if s.kind == 'x' or s.kind == 'X' {
+		base = 16
+		prefix = "0x"
+		every = 4
+		if s.kind == 'X' {
+			prefix = "0X"
+			chars = "0123456789ABCDEF"
+		}
+	} else if s.kind == 'o' {
+		base = 8
+		prefix = "0o"
+		every = 4
+	} else if s.kind == 'b' {
+		base = 2
+		prefix = "0b"
+		every = 4
+	}
+	mut digits = ""
+	mut v = n
+	if v == 0 {
+		digits = "0"
+	}
+	// Digit by digit from the low end, negative values included, so the
+	// smallest int64 needs no negating.
+	for v != 0 {
+		mut d = v % base
+		if d < 0 {
+			d = -d
+		}
+		digits = chars[d..d + 1] + digits
+		v = v / base
+	}
+	mut head = ""
+	if n < 0 {
+		head = "-"
+	} else if s.sign == '+' {
+		head = "+"
+	} else if s.sign == ' ' {
+		head = " "
+	}
+	if s.alt {
+		head += prefix
+	}
+	return _number_text(head, :digits, tail: "", :s, :every)
+}
+
+func format_float(anon x: float64, spec: str) -> str {
+	let s = _require(spec, kind: 2, shown: "float64")
+	mut negative = kod_f64_bits(x) < 0
+	let a = x.abs()
+	mut text = ""
+	mut tail = ""
+	if a.is_nan() {
+		negative = false
+		text = "nan"
+	} else if a.is_inf() {
+		text = "inf"
+	} else if s.kind == 'e' {
+		mut p = s.precision
+		if p < 0 {
+			p = 6
+		}
+		text = float_text.exponent(a, digits: p)
+	} else if s.kind == '%' {
+		mut p = s.precision
+		if p < 0 {
+			p = 6
+		}
+		text = float_text.fixed(a, digits: p, scale: 2)
+		tail = "%"
+	} else if s.kind == 'f' or s.precision >= 0 {
+		mut p = s.precision
+		if p < 0 {
+			p = 6
+		}
+		text = float_text.fixed(a, digits: p)
+	} else {
+		text = float_text.format(a)
+	}
+	// The integer digits are grouped and zero padded; the rest stays.
+	mut cut = len(text)
+	for i in 0..len(text) {
+		if text[i] == '.' or text[i] == 'e' {
+			cut = i
+			break
+		}
+	}
+	tail = text[cut..len(text)] + tail
+	mut head = ""
+	if negative {
+		head = "-"
+	} else if s.sign == '+' {
+		head = "+"
+	} else if s.sign == ' ' {
+		head = " "
+	}
+	return _number_text(head, digits: text[0..cut], :tail, :s, every: 3)
+}
+
+func format_text(anon text: str, spec: str) -> str {
+	let s = _require(spec, kind: 0, shown: "str")
+	mut kept = text
+	if s.precision >= 0 and text.char_count() > s.precision {
+		kept = text.char_slice(0, s.precision)
+	}
+	return _pad(kept, :s, own: '<')
+}
