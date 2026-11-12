@@ -108,8 +108,10 @@ type ModuleMember = struct {
 
 // A method of a generic instance that something uses.
 type MethodInst = struct {
+    // A struct's index, or an enum's when `is_enum`.
     owner: int64
     decl_id: int64
+    is_enum: bool = false
 }
 
 // One copy of a generic function for one list of type arguments. Its sig is
@@ -222,6 +224,8 @@ type EnumInfo = struct {
     is_union: bool = false
     // Methods declared in the enum body; sigs resolved like a struct's.
     methods: [MethodInfo] = []
+    // As StructInfo.body_depth, for an instance.
+    body_depth: int64 = 0
 }
 
 // A match arm as it was written, while it's compiled as `Some(T(n))`.
@@ -1210,6 +1214,8 @@ type Codegen = struct {
     in_func_literal: bool = false
     // The generic instance whose method bodies are being compiled, or -1.
     body_instance: int64 = -1
+    // The enum instance whose method body is being compiled, or -1.
+    body_enum_inst: int64 = -1
     // The generic function instance whose body is being compiled, or -1.
     body_func_inst: int64 = -1
     // A default checked at its declaration isn't compiled, so only its type is.
@@ -2732,7 +2738,7 @@ type Codegen = struct {
     // compile.
     func report_error(self, anon text: str, span: ast.Span) -> none {
         // Past the instance limit, a generic body's errors are mostly what the refused instance leaves.
-        if self.inst_limit_hit and (self.body_instance >= 0 or self.body_func_inst >= 0) {
+        if self.inst_limit_hit and (self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0) {
             self.report_attempts += 1
             return
         }
@@ -2743,6 +2749,10 @@ type Codegen = struct {
         }
         if self.body_func_inst >= 0 {
             self.report_message(f"{text} (in `{self.func_insts[self.body_func_inst].display}`)", :span)
+            return
+        }
+        if self.body_enum_inst >= 0 {
+            self.report_message(f"{text} (in `{self.enum_display_name(self.body_enum_inst)}`)", :span)
             return
         }
         self.report_message(text, :span)
@@ -2841,10 +2851,14 @@ type Codegen = struct {
             return true
         }
         seen.set(key, 1)
-        // Struct instances count up from 0, function instances down from -2.
+        // Struct instances count up from 0, function instances down from -2,
+        // and enum instances down from -1000000.
         mut instance = self.body_instance
         if self.body_func_inst >= 0 {
             instance = -2 - self.body_func_inst
+        }
+        if self.body_enum_inst >= 0 {
+            instance = -1000000 - self.body_enum_inst
         }
         if instance != -1 {
             let pos_key = f"{self.p.path}:{span.start}"
@@ -4747,6 +4761,15 @@ type Codegen = struct {
 
     // Compile a generic instance's method for its type arguments.
     func compile_method_inst(self, anon inst: MethodInst) -> none {
+        if inst.is_enum {
+            let e = self.enums[inst.owner]
+            let saved_ctx = self.enter(e.src_p, names: self.enums[e.template_idx].type_param_names, args: e.template_args)
+            self.body_enum_inst = inst.owner
+            self.compile_func(fd_id: inst.decl_id, struct_name: e.name, override_lbl: "", enum_owner: inst.owner)
+            self.body_enum_inst = -1
+            self.leave(saved_ctx)
+            return
+        }
         mut s = self.structs[inst.owner]
         if self.has_bad_key(s) {
             return
@@ -5581,17 +5604,35 @@ type Codegen = struct {
         return -1
     }
 
-    // The label to call an enum's method by.
+    // The label to call an enum's method by. An instance's method gets compiled because of this.
     func enum_method_label(self, anon enum_idx: int64, name: str) -> str {
         let e = self.enums[enum_idx]
+        let mi = self.enum_method(enum_idx, :name)
+        if e.template_idx >= 0 and mi >= 0 {
+            let key = f"e{enum_idx}${name}"
+            if not self.method_inst_idx.contains(key) {
+                let seen = self.method_inst_idx
+                seen.set(key, len(self.method_insts))
+                self.method_insts += [MethodInst(owner: enum_idx, decl_id: e.methods[mi].decl_id, is_enum: true)]
+            }
+        }
         return f"${e.module_prefix}${e.name}$$m${name}"
     }
 
     // A `_` method of an enum is callable only in the enum's own methods.
     func check_private_enum_method(self, anon method_name: str, enum_idx: int64, span: ast.Span) -> none {
-        if method_name.starts_with("_") and self.cur_enum_owner != enum_idx {
-            self.report_error(f"error: method `{method_name}` is private to `{self.enums[enum_idx].name}`", :span)
+        if method_name.starts_with("_") and (self.cur_enum_owner < 0 or self.enum_root(self.cur_enum_owner) != self.enum_root(enum_idx)) {
+            self.report_error(f"error: method `{method_name}` is private to `{self.enum_display_name(enum_idx)}`", :span)
         }
+    }
+
+    // The template an enum instance was made from, or the enum itself.
+    func enum_root(self, anon enum_idx: int64) -> int64 {
+        let template_idx = self.enums[enum_idx].template_idx
+        if template_idx >= 0 {
+            return template_idx
+        }
+        return enum_idx
     }
 
     // A `_` method is callable only in its struct's own functions; reports one called elsewhere at `span`.
@@ -6533,7 +6574,8 @@ type Codegen = struct {
         if self.enum_insts.get(key) is Some(existing) {
             return existing
         }
-        if self.type_instances_too_deep(template.name, body_depth: self.body_depth_here(), span: whole) {
+        let body_depth = self.body_depth_here()
+        if self.type_instances_too_deep(template.name, :body_depth, span: whole) {
             return template_idx
         }
         mut canonical = template.name
@@ -6544,7 +6586,7 @@ type Codegen = struct {
             canonical = self.decl_instance_label(f"{template.module_prefix}${template.name}", args: type_args)
         }
         let empty_params: [str] = []
-        self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args, :key)]
+        self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args, :key, methods: template.methods, :body_depth)]
         let new_idx: int64 = len(self.enums) - 1
         self.enum_idx.set(canonical, new_idx)
         let insts = self.enum_insts
@@ -6560,6 +6602,7 @@ type Codegen = struct {
             new_variants += [VariantInfo(name: v.name, discriminant: v.discriminant, field_names: v.field_names, field_offsets: v.field_offsets, field_kinds: new_kinds, field_type_exprs: v.field_type_exprs)]
         }
         self.enums[new_idx].variants = new_variants
+        self.enums[new_idx].methods = self.resolve_method_infos(template.methods, p: template.src_p)
         self.inst_depth -= 1
         self.leave(saved_ctx)
         if self.inst_depth == 0 {
@@ -6810,6 +6853,9 @@ type Codegen = struct {
         }
         if self.body_instance >= 0 {
             return self.structs[self.body_instance].body_depth + 1
+        }
+        if self.body_enum_inst >= 0 {
+            return self.enums[self.body_enum_inst].body_depth + 1
         }
         return 0
     }
@@ -7549,14 +7595,12 @@ type Codegen = struct {
                     variant_infos += [VariantInfo(name: variant.name, discriminant: disc, :field_names, :field_offsets, :field_kinds, :field_type_exprs)]
                     disc = disc + 1
                 }
-                self.leave(saved_ctx)
-                // A generic enum's methods are reported, not registered.
+                // A generic template's sigs have unknown kinds; each instance resolves its own.
                 mut method_infos: [MethodInfo] = []
-                if len(type_params) == 0 {
-                    for method_id in methods {
-                        method_infos += [MethodInfo(name: p.func_decls[method_id].name, decl_id: method_id, sig: self.resolve_sig(method_id, :p))]
-                    }
+                for method_id in methods {
+                    method_infos += [MethodInfo(name: p.func_decls[method_id].name, decl_id: method_id, sig: self.resolve_sig(method_id, :p))]
                 }
+                self.leave(saved_ctx)
                 let data_width = 8 + max_payload
                 let no_template_args: [TypeKind] = []
                 self.enums += [EnumInfo(:name, variants: variant_infos, :data_width, module_prefix: prefix, src_p: p, def_path: p.path, def_span: name_span, type_param_names: type_params, template_idx: -1, template_args: no_template_args, key: f"{p.path}:{name}", methods: method_infos)]
@@ -11761,8 +11805,16 @@ type Codegen = struct {
                     }
                     self.subst_names = saved_names
                     self.check_takes_self(enum_name, :methods, init_allowed: false)
-                    if len(type_params) > 0 and len(methods) > 0 {
-                        self.report_error(f"error: generic enum `{enum_name}` can't declare methods yet", span: self.p.func_decls[methods[0]].name_span)
+                    // Non-generic methods are checked when compile_func runs.
+                    if len(type_params) > 0 {
+                        self.subst_names = type_params
+                        for method_id in methods {
+                            let fd = self.p.func_decls[method_id]
+                            self.check_sig_types(fd.params, return_typ: fd.return_typ)
+                            self.check_param_count(fd.params, what: f"`{enum_name}.{fd.name}`", span: fd.name_span)
+                            self.check_param_names(fd.params)
+                        }
+                        self.subst_names = saved_names
                     }
                     for method_id in methods {
                         let fd = self.p.func_decls[method_id]
@@ -12296,7 +12348,7 @@ type Codegen = struct {
         mut ok = true
         for i, c in fd.captures {
             let name = self.source_name(c.key)
-            if self.body_instance >= 0 or self.body_func_inst >= 0 {
+            if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 {
                 self.report_error(f"error: a function literal in a generic function or type can't capture `{name}`", span: c.span)
                 ok = false
             } else if self.find_var_declared_mut(c.key) {
@@ -17638,7 +17690,7 @@ type Codegen = struct {
             self.check_init_decl(func_decl, :owner)
         }
         // A generic template's methods and functions are checked once, in check_module_types.
-        let once = self.body_instance < 0 and self.body_func_inst < 0
+        let once = self.body_instance < 0 and self.body_func_inst < 0 and self.body_enum_inst < 0
         if self.body_func_inst < 0 {
             self.check_param_order(func_decl, func_decl.name)
         }

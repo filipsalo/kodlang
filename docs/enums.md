@@ -167,8 +167,29 @@ enum's own methods, as on a [struct](structs.md#private-methods).
 An enum that declares `func to_str(self) -> str` is printed by it in
 f-strings and `print`, instead of by its variant's name.
 
-Not yet: methods on a generic enum, operator methods (`op_eq` and the
-rest), and an enum as an interface value.
+A [generic enum](#generic-enums) declares methods the same way, and they
+use its type parameters:
+
+```kod
+type Either[L, R] = enum {
+    Left(value: L)
+    Right(value: R)
+
+    func swapped(self) -> Either[R, L] {
+        return match self {
+            .Left(value) -> .Right(:value)
+            .Right(value) -> .Left(:value)
+        }
+    }
+}
+```
+
+As with a [generic struct](structs.md#generic-structs), a method is compiled for
+an instance when something calls it, only its signature is checked otherwise,
+and an error in its body names the instance, as in ``(in `Either[int64, str]`)``.
+
+Not yet: operator methods (`op_eq` and the rest), and an enum as an
+interface value.
 
 ## Generic enums
 
@@ -277,4 +298,4 @@ let dist: int64 = match m {
 
 ## Current limitations
 
-- A generic enum can't declare methods, and an enum can't be an interface value.
+- An enum can't declare operator methods or be an interface value.
