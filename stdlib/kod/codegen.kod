@@ -1053,10 +1053,10 @@ type Codegen = struct {
     structs: [StructInfo] = []
     interfaces: [IfaceInfo] = []
 
-    // Pending vtables to emit at end of compile_module. Each (s, i) pair
-    // means "struct s conforms to interface i and has been observed in an
-    // upcast"; we emit one vtable per unique pair.
-    vtable_struct_idx: [int64] = []
+    // Pending vtables to emit at end of compile_module. Each (t, i) pair
+    // means "struct or enum t conforms to interface i and has been observed
+    // in an upcast"; we emit one vtable per unique pair.
+    vtable_types: [TypeKind] = []
     vtable_iface_idx: [int64] = []
     // Same idea for primitives: each (kind, iface) means "kind conforms
     // to iface and was observed in an upcast". One vtable per unique pair.
@@ -4513,6 +4513,31 @@ type Codegen = struct {
     }
 
     // The struct a type pattern names: `T`, or `alias.T` of a downcast through a module.
+    // The struct or enum a type pattern names, or .KUnknown.
+    func type_pat_kind(self, anon type_name: str) -> TypeKind {
+        let struct_idx = self.type_pat_struct(type_name)
+        if struct_idx >= 0 {
+            return .KStruct(idx: struct_idx, type_args: [])
+        }
+        let enum_idx = self.type_pat_enum(type_name)
+        if enum_idx >= 0 and not self.enums[enum_idx].is_union {
+            return .KEnum(idx: enum_idx)
+        }
+        return .KUnknown
+    }
+
+    func type_pat_enum(self, anon type_name: str) -> int64 {
+        let idx = self.find_enum_idx(type_name)
+        if idx >= 0 {
+            return idx
+        }
+        let dot = name_dot(type_name)
+        if dot < 0 {
+            return -1
+        }
+        return self.qualified_idx(type_name[0..dot], name: type_name[dot + 1..], what: 1)
+    }
+
     func type_pat_struct(self, anon type_name: str) -> int64 {
         let idx = self.find_struct_idx(type_name)
         if idx >= 0 {
@@ -4684,9 +4709,38 @@ type Codegen = struct {
     // The label of the vtable for a struct acting as an interface. A generic
     // instance's label doesn't depend on the unit, so every unit that boxes it
     // shares one vtable and `is` holds wherever the value was boxed.
-    func vtable_label(self, anon struct_idx: int64, anon iface_idx: int64) -> str {
+    func vtable_label(self, anon owner: TypeKind, anon iface_idx: int64) -> str {
         let iface_info = self.interfaces[iface_idx]
-        return f"${iface_info.module_prefix}${iface_info.name}$$for${self.decl_label(.KStruct(idx: struct_idx, type_args: []))}$vtable"
+        return f"${iface_info.module_prefix}${iface_info.name}$$for${self.decl_label(owner)}$vtable"
+    }
+
+    // Whether two structs or enums that can own a vtable are one type.
+    func same_vtable_owner(self, anon a: TypeKind, anon b: TypeKind) -> bool {
+        if a is .KStruct(a_idx, _a_args) and b is .KStruct(b_idx, _b_args) {
+            return self.same_struct(a_idx, b_idx)
+        }
+        if a is .KEnum(a_idx) and b is .KEnum(b_idx) {
+            return a_idx == b_idx or (self.enums[a_idx].template_idx < 0 and self.same_enum_decl(a_idx, b_idx))
+        }
+        return false
+    }
+
+    // The label of a struct's or enum's method; an instance's gets compiled because of this. "" when it has none.
+    func owner_method_label(self, anon owner: TypeKind, name: str) -> str {
+        match owner {
+            .KStruct(idx, _args) -> {
+                if self.structs[idx].method_idx.contains(name) {
+                    return self.method_label(idx, :name)
+                }
+            }
+            .KEnum(idx) -> {
+                if self.enum_method(idx, :name) >= 0 {
+                    return self.enum_method_label(idx, :name)
+                }
+            }
+            else none
+        }
+        return ""
     }
 
     // canonical_kind_name with each declared type spelled with its declaring module's prefix.
@@ -4738,6 +4792,15 @@ type Codegen = struct {
 
     // `is Box` names no struct a value can have; one of its instances does.
     // `shown` is the template as written, `Box` or `pa.Box`.
+    func generic_enum_downcast_msg(self, anon enum_idx: int64, shown: str) -> str {
+        let e = self.enums[enum_idx]
+        mut args = "int64"
+        for i in 1..len(e.type_param_names) {
+            args = f"{args}, int64"
+        }
+        return f"error: `{shown}` is generic; downcast to one of its instances through a type alias such as `type Int{e.name} = {shown}[{args}]`"
+    }
+
     func generic_downcast_msg(self, anon struct_idx: int64, shown: str) -> str {
         let s = self.structs[struct_idx]
         mut args = "int64"
@@ -4786,15 +4849,15 @@ type Codegen = struct {
     // Register a (struct, interface) pair so its vtable is emitted at the
     // end of compile_module. Idempotent: subsequent calls for the same
     // pair do nothing. Returns the vtable label.
-    func register_vtable(self, anon struct_idx: int64, anon iface_idx: int64) -> str {
-        for k in 0..len(self.vtable_struct_idx) {
-            if self.same_struct(self.vtable_struct_idx[k], struct_idx) and self.same_iface(self.vtable_iface_idx[k], iface_idx) {
-                return self.vtable_label(struct_idx, iface_idx)
+    func register_vtable(self, anon owner: TypeKind, anon iface_idx: int64) -> str {
+        for k, have in self.vtable_types {
+            if self.same_vtable_owner(have, owner) and self.same_iface(self.vtable_iface_idx[k], iface_idx) {
+                return self.vtable_label(owner, iface_idx)
             }
         }
-        self.vtable_struct_idx += [struct_idx]
+        self.vtable_types += [owner]
         self.vtable_iface_idx += [iface_idx]
-        return self.vtable_label(struct_idx, iface_idx)
+        return self.vtable_label(owner, iface_idx)
     }
 
     // Hardcoded module prefix for each primitive type. Used to compose
@@ -8086,14 +8149,7 @@ type Codegen = struct {
                     kind = self.result_err_kind(subject_kind)
                 }
             }
-            .TypePat(type_name, _binding) -> {
-                let struct_idx = self.type_pat_struct(type_name)
-                if struct_idx >= 0 {
-                    kind = .KStruct(idx: struct_idx, type_args: [])
-                } else {
-                    kind = .KUnknown
-                }
-            }
+            .TypePat(type_name, _binding) -> kind = self.type_pat_kind(type_name)
             .EnumPat(enum_name, variant_name, _bindings) -> {
                 return self.variant_binding_kinds(self.named_pattern_enum_idx(enum_name, :subject_kind), :variant_name, :count)
             }
@@ -10379,9 +10435,9 @@ type Codegen = struct {
     // skip_lbl on mismatch. On match, bind the concrete pointer (offset 0)
     // — typed `KStruct` — into `binding`'s slot.
     func emit_typepat_test(self, type_name: str, binding: str, subject_kind: TypeKind, span: ast.Span, subj_slot: int64, skip_lbl: str) -> none {
-        let struct_idx = self.type_pat_struct(type_name)
-        if struct_idx < 0 {
-            mut msg = f"error: `{type_name}` is not a struct type"
+        let owner = self.type_pat_kind(type_name)
+        if owner is .KUnknown {
+            mut msg = f"error: `{type_name}` is not a struct or enum type"
             let dot = name_dot(type_name)
             if dot >= 0 and not self.is_import_alias(type_name[0..dot]) {
                 msg = f"error: unknown type `{type_name}`"
@@ -10393,25 +10449,29 @@ type Codegen = struct {
             self.report_error(msg, :span)
             return none
         }
-        if len(self.structs[struct_idx].type_param_names) > 0 {
+        if owner is .KStruct(struct_idx, _args) and len(self.structs[struct_idx].type_param_names) > 0 {
             self.report_error(self.generic_downcast_msg(struct_idx, shown: type_name), :span)
+            return none
+        }
+        if owner is .KEnum(enum_idx) and len(self.enums[enum_idx].type_param_names) > 0 {
+            self.report_error(self.generic_enum_downcast_msg(enum_idx, shown: type_name), :span)
             return none
         }
         mut iface_idx = -1
         if subject_kind is .KInterface(ii) {
             iface_idx = ii
         }
-        if iface_idx >= 0 and not self.implements_iface(.KStruct(idx: struct_idx, type_args: []), :iface_idx) {
+        if iface_idx >= 0 and not self.implements_iface(owner, :iface_idx) {
             let iface = self.iface_display_name(iface_idx)
             self.report_error(f"error: `{type_name}` doesn't implement `{iface}`, so a `{iface}` is never a `{type_name}`", :span)
             return none
         }
-        self.register_vtable(struct_idx, iface_idx)
+        self.register_vtable(owner, iface_idx)
         let ptr_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: ptr_r)
         let vt_r = self.pool.alloc_reg()
         self.emit(f"ldr {vt_r}, [{ptr_r}, #8]")
-        self.emit_type_id_cmp(vt_r, :struct_idx, :iface_idx)
+        self.emit_type_id_cmp(vt_r, :owner, :iface_idx)
         self.emit(f"bne {skip_lbl}")
         self.pool.free_reg(vt_r)
         if len(binding) > 0 {
@@ -13053,8 +13113,8 @@ type Codegen = struct {
     // into an arena-allocated {data_ptr, vtable_ptr} cell for interface
     // ii. Returns a fresh register holding the cell pointer. Frees the
     // input register.
-    func emit_iface_box(self, anon arg_reg: str, struct_idx: int64, iface_idx: int64) -> str {
-        let vt_lbl = self.register_vtable(struct_idx, iface_idx)
+    func emit_iface_box(self, anon arg_reg: str, owner: TypeKind, iface_idx: int64) -> str {
+        let vt_lbl = self.register_vtable(owner, iface_idx)
         let arg_spilled = self.preserve_begin(arg_reg)
         self.emit("mov x0, #16")
         self.rc_alloc_cell(mask: 1)
@@ -13089,10 +13149,19 @@ type Codegen = struct {
             if actual is .KStruct(struct_idx, _type_args) {
                 what = f"struct `{self.struct_display_name(struct_idx)}`"
             }
+            if actual is .KEnum(enum_idx) {
+                what = f"enum `{self.enum_display_name(enum_idx)}`"
+            }
             self.report_error(f"error: {what} doesn't implement interface `{self.iface_display_name(iface_idx)}`: {gap}", :span)
         }
         match actual {
-            .KStruct(struct_idx, _struct_type_args) -> return self.emit_iface_box(arg_reg, :struct_idx, :iface_idx)
+            .KStruct(struct_idx, _struct_type_args) -> return self.emit_iface_box(arg_reg, owner: .KStruct(idx: struct_idx, type_args: []), :iface_idx)
+            .KEnum(enum_idx) -> {
+                if self.enums[enum_idx].is_union {
+                    return arg_reg
+                }
+                return self.emit_iface_box(arg_reg, owner: .KEnum(idx: enum_idx), :iface_idx)
+            }
             .KInt64 -> return self.emit_prim_iface_box(arg_reg, kind: .KInt64, :iface_idx)
             .KStr -> return self.emit_prim_iface_box(arg_reg, kind: .KStr, :iface_idx)
             .KBool -> return self.emit_prim_iface_box(arg_reg, kind: .KBool, :iface_idx)
@@ -13163,15 +13232,15 @@ type Codegen = struct {
     }
 
     // The identity word that ends every vtable of a struct: the same for all of its interfaces.
-    func type_id_label(self, anon struct_idx: int64) -> str {
-        return f"${self.decl_label(.KStruct(idx: struct_idx, type_args: []))}$typeid"
+    func type_id_label(self, anon owner: TypeKind) -> str {
+        return f"${self.decl_label(owner)}$typeid"
     }
 
     // Leave in `vt_r` whether the vtable it holds is the struct's, as `cond` for a following `cset`/branch.
-    func emit_type_id_cmp(self, anon vt_r: str, struct_idx: int64, iface_idx: int64) -> none {
+    func emit_type_id_cmp(self, anon vt_r: str, owner: TypeKind, iface_idx: int64) -> none {
         self.emit(f"ldr {vt_r}, [{vt_r}, #{8 * len(self.interfaces[iface_idx].methods)}]")
         let exp_r = self.pool.alloc_reg()
-        let id_lbl = self.type_id_label(struct_idx)
+        let id_lbl = self.type_id_label(owner)
         self.emit(f"adrp {exp_r}, {id_lbl}@PAGE")
         self.emit(f"add {exp_r}, {exp_r}, {id_lbl}@PAGEOFF")
         self.emit(f"cmp {vt_r}, {exp_r}")
@@ -13183,6 +13252,7 @@ type Codegen = struct {
         mut boxable = false
         match actual {
             .KStruct(_idx, _type_args) -> boxable = true
+            .KEnum(idx) -> boxable = not self.enums[idx].is_union
             .KInt64 -> boxable = true
             .KStr -> boxable = true
             .KBool -> boxable = true
@@ -13198,6 +13268,12 @@ type Codegen = struct {
                 if self.structs[struct_idx].method_idx.get(m.name) is Some(mi) {
                     found = true
                     sig = self.structs[struct_idx].methods[mi].sig
+                }
+            } else if actual is .KEnum(enum_idx) {
+                let mi = self.enum_method(enum_idx, name: m.name)
+                if mi >= 0 {
+                    found = true
+                    sig = self.enums[enum_idx].methods[mi].sig
                 }
             } else {
                 let pm = self.find_prim_method(m.name, kind: actual)
@@ -14203,6 +14279,7 @@ type Codegen = struct {
             .KInterface(idx) -> {
                 match actual {
                     .KStruct(_a_idx, _a_args) -> return true
+                    .KEnum(a_idx) -> return not self.enums[a_idx].is_union
                     .KInt64 -> return true
                     .KBool -> return true
                     .KStr -> return true
@@ -18183,10 +18260,10 @@ type Codegen = struct {
         mut vtable_cursor = 0
         mut method_cursor = 0
         mut func_cursor = 0
-        for vtable_cursor < len(self.vtable_struct_idx) or method_cursor < len(self.method_insts) or func_cursor < len(self.func_inst_queue) {
-            for vtable_cursor < len(self.vtable_struct_idx) {
+        for vtable_cursor < len(self.vtable_types) or method_cursor < len(self.method_insts) or func_cursor < len(self.func_inst_queue) {
+            for vtable_cursor < len(self.vtable_types) {
                 for m in self.interfaces[self.vtable_iface_idx[vtable_cursor]].methods {
-                    let _ = self.method_label(self.vtable_struct_idx[vtable_cursor], name: m.name)
+                    let _ = self.owner_method_label(self.vtable_types[vtable_cursor], name: m.name)
                 }
                 vtable_cursor += 1
             }
@@ -18210,7 +18287,7 @@ type Codegen = struct {
         }
         self.body_instance = saved_instance
 
-        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_struct_idx) > 0 or len(self.prim_vtable_kinds) > 0 or len(self.fn_cells) > 0 or len(self.rc_descs) > 0 {
+        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_types) > 0 or len(self.prim_vtable_kinds) > 0 or len(self.fn_cells) > 0 or len(self.rc_descs) > 0 {
             self.println(".data")
             for fi, float_label in self.float_labels {
                 self.println("\t.p2align 3")
@@ -18245,11 +18322,10 @@ type Codegen = struct {
     // pointing at its mangled label.
     func emit_vtables(self) -> none {
         self.emit_rc_descs()
-        for i, struct_idx in self.vtable_struct_idx {
+        for i, owner in self.vtable_types {
             let iface_idx = self.vtable_iface_idx[i]
-            let struct_info = self.structs[struct_idx]
             let iface_info = self.interfaces[iface_idx]
-            let label = self.vtable_label(struct_idx, iface_idx)
+            let label = self.vtable_label(owner, iface_idx)
             self.println("\t.p2align 3")
             // `is` compares vtable addresses, so all modules must share one copy.
             self.println(f"\t.globl {label}")
@@ -18257,17 +18333,19 @@ type Codegen = struct {
             self.println(f"\t.weak_definition {label}")
             self.println(f"{label}:")
             for m in iface_info.methods {
-                match struct_info.method_idx.get(m.name) {
-                    Some(_mi) -> self.println(f"\t.quad ${struct_info.module_prefix}${struct_info.name}$$m${m.name}")
-                    none -> self.println(f"\t.quad 0")
+                let method_lbl = self.owner_method_label(owner, name: m.name)
+                if len(method_lbl) > 0 {
+                    self.println(f"\t.quad {method_lbl}")
+                } else {
+                    self.println(f"\t.quad 0")
                 }
             }
-            self.println(f"\t.quad {self.type_id_label(struct_idx)}")
+            self.println(f"\t.quad {self.type_id_label(owner)}")
         }
-        // The identity words themselves, one per struct however many interfaces it has.
+        // The identity words themselves, one per type however many interfaces it has.
         mut ids: [str] = []
-        for struct_idx in self.vtable_struct_idx {
-            let id_lbl = self.type_id_label(struct_idx)
+        for owner in self.vtable_types {
+            let id_lbl = self.type_id_label(owner)
             mut seen = false
             for done in ids {
                 if done == id_lbl {

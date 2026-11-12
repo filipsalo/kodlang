@@ -224,7 +224,33 @@ print(a < .Cents(n: 5))          // true
 An enum without `op_eq` keeps comparing variants, as described under
 [Equality](#equality).
 
-Not yet: an enum as an interface value.
+An enum that declares an interface's methods is a value of that interface,
+as a struct is (see [Interfaces](types.md#interfaces)), and an interface value
+holding one downcasts to it with `if v is Dir(d)` or a `Dir(d)` arm:
+
+```kod
+interface Named {
+    func name(self) -> str
+}
+
+type Dir = enum {
+    Up
+    Down
+
+    func name(self) -> str {
+        return match self {
+            .Up -> "up"
+            .Down -> "down"
+        }
+    }
+}
+
+let n: Named = Dir.Down
+print(n.name())                  // down
+```
+
+A generic enum's instance is one too, and downcasts through a type alias such
+as `type IntPick = Pick[int64]`, as a generic struct's does.
 
 ## Generic enums
 
@@ -330,7 +356,3 @@ let dist: int64 = match m {
     else 0
 }
 ```
-
-## Current limitations
-
-- An enum can't be an interface value.

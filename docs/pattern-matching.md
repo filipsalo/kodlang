@@ -205,8 +205,8 @@ declared, `pa.Pt(p)` for a type of another module; a member with no name of its
 own, such as `[str]`, needs a [type alias](types.md#type-aliases) to be matched
 by type.
 
-On an interface, `T` is a struct that implements it, and the pattern is a
-downcast, so a `match` still needs an `else`:
+On an interface, `T` is a struct or enum that implements it, and the pattern
+is a downcast, so a `match` still needs an `else`:
 
 ```kod
 func describe(anon s: Shape) -> str {

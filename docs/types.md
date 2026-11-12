@@ -517,8 +517,8 @@ trailing argument the call leaves out takes the default the interface
 declares for it (`func greet(self, times: int64 = 2) -> str`), so give
 each implementation the same default.
 
-A struct, `int64`, `str` or `bool` becomes an interface value wherever one
-is expected (a `bytes` value can't be one):
+A struct, an enum, `int64`, `str` or `bool` becomes an interface value wherever
+one is expected (a `bytes` value or a union can't be one):
 an annotated `let`, an argument, a field, an array element, a value stored
 with `m[k] = v`, and a return value, including the value of a `-> Shape?`
 or `-> Shape or Error` function.
@@ -527,6 +527,7 @@ The type must declare every method of the interface, with the same
 parameter and return types (labels and defaults may differ). Otherwise
 using it as the interface is an error at that spot, such as
 ``struct `P` doesn't implement interface `Shape`: missing method `area` ``
+(``enum `E` ...`` for an enum)
 or ``method `area` is `func(int64) -> int64`, not `func() -> int64` ``.
 `throw` counts too, since it makes its value an `Error`.
 
@@ -601,8 +602,8 @@ so `func() -> int64 | str` returns a union. To put such a function in a union,
 give its type an alias first.
 
 A value goes into a union by being written where the union is declared, as a `T`
-goes into a `T?`. It goes to the member of its own type. Without one, a struct or
-primitive goes to an interface member it implements, and implementing two of them
+goes into a `T?`. It goes to the member of its own type. Without one, a struct,
+enum or primitive goes to an interface member it implements, and implementing two of them
 is an error, since it could be either. An enum's `.Variant` goes to the one enum
 member that declares that variant, and `[]` to the one array member. A value with
 no member reports the mismatch (`` expected `int64 | str`, got `bool` ``).
@@ -703,10 +704,10 @@ Outside a fallible function's `return`, a plain value isn't a result:
 `let r: int64 or Error = .Ok(value: 3)` is a successful result.
 
 `Error` is the only type that can follow `or`: `-> int64 or IoError` is a
-parse error. Throw a struct that implements `Error` instead, and recover it
-with a downcast (see below). `throw` takes an `Error` value, so throwing an
-enum, an array or an optional is an error, such as
-``expected `Error`, got `Color` ``.
+parse error. Throw a struct or enum that implements `Error` instead, and
+recover it with a downcast (see below). `throw` takes an `Error` value, so
+throwing an array, an optional, or an enum without a `to_str` is an error, such
+as ``enum `Color` doesn't implement interface `Error`: missing method `to_str` ``.
 
 ```kod
 type IoError = struct {
