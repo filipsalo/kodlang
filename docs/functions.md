@@ -528,7 +528,7 @@ reported once, for the first instance that hits it, and names that instance:
 
 ```kod
 func largest[T](a: T, b: T) -> T {
-    if a < b {               // with Color: `<` doesn't take `Color` operands (in `largest[Color]`)
+    if a < b {               // with Color: `<` doesn't take `Color` operands; … (in `largest[Color]`)
         return b
     }
     return a

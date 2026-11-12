@@ -146,14 +146,16 @@ type FnRef = struct {
     name: str
 }
 
-// A binary operator that calls a struct's operator method: `negate` flips the
-// method's `bool`, and `swap` makes the right operand the receiver.
+// A binary operator that calls a struct's or enum's operator method: `negate`
+// flips the method's `bool`, and `swap` makes the right operand the receiver.
 type OpCall = struct {
+    // A struct's index, or an enum's when `is_enum`.
     struct_idx: int64
     method_idx: int64
     swap: bool
     negate: bool
     compare: bool
+    is_enum: bool = false
 }
 
 // How the arguments of a call line up with the declared parameters: for each
@@ -6446,7 +6448,7 @@ type Codegen = struct {
     func member_has_eq(self, anon kind: TypeKind) -> bool {
         match kind {
             .KStruct(idx, _args) -> return self.structs[idx].method_idx.contains("op_eq")
-            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx)
+            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0
             else return len(self.equality_scalar(kind)) > 0
         }
     }
@@ -7599,6 +7601,9 @@ type Codegen = struct {
                 mut method_infos: [MethodInfo] = []
                 for method_id in methods {
                     method_infos += [MethodInfo(name: p.func_decls[method_id].name, decl_id: method_id, sig: self.resolve_sig(method_id, :p))]
+                    if self.is_operator_method(p.func_decls[method_id].name) {
+                        self.has_ops = true
+                    }
                 }
                 self.leave(saved_ctx)
                 let data_width = 8 + max_payload
@@ -11816,12 +11821,6 @@ type Codegen = struct {
                         }
                         self.subst_names = saved_names
                     }
-                    for method_id in methods {
-                        let fd = self.p.func_decls[method_id]
-                        if self.is_operator_method(fd.name) {
-                            self.report_error(f"error: an enum can't declare operator method `{fd.name}` yet", span: fd.name_span)
-                        }
-                    }
                 }
                 .Interface(iface_name, _name_span, methods) -> {
                     for method_id in methods {
@@ -14813,13 +14812,19 @@ type Codegen = struct {
     // For a struct operand: the method that would give the operator a meaning.
     func op_declare_hint(self, anon kind: TypeKind, op: ast.Op) -> str {
         let name = self.op_method_name(op)
-        if len(name) > 0 and kind is .KStruct(_idx, _args) {
+        if len(name) == 0 {
+            return ""
+        }
+        if kind is .KStruct(_idx, _args) {
+            return f"; declare `{name}` on `{self.kind_display(kind)}` to use it"
+        }
+        if kind is .KEnum(idx) and not self.enums[idx].is_union {
             return f"; declare `{name}` on `{self.kind_display(kind)}` to use it"
         }
         return ""
     }
 
-    // The method an operator calls, or "" for an operator no struct can take.
+    // The method an operator calls, or "" for an operator no struct or enum can take.
     func op_method_name(self, anon op: ast.Op) -> str {
         match op {
             .Add -> return "op_add"
@@ -14856,12 +14861,38 @@ type Codegen = struct {
             }
             return none
         }
+        if lhs_kind is .KEnum(idx) {
+            if compare and not self.same_enum_operand(idx, rhs_kind) {
+                return none
+            }
+            let mi = self.enum_method(idx, :name)
+            if mi >= 0 {
+                return OpCall(struct_idx: idx, method_idx: mi, swap: op is .Gt or op is .Le, negate: op is .Ne or op is .Le or op is .Ge, compare: compare, is_enum: true)
+            }
+            return none
+        }
         if not compare and lhs_kind is .KInt64 {
             if rhs_kind is .KStruct(idx, _args) and self.structs[idx].method_idx.get("op_r" + name[3..]) is Some(mi) {
                 return OpCall(struct_idx: idx, method_idx: mi, swap: true, negate: false, compare: false)
             }
+            if rhs_kind is .KEnum(idx) {
+                let mi = self.enum_method(idx, name: "op_r" + name[3..])
+                if mi >= 0 {
+                    return OpCall(struct_idx: idx, method_idx: mi, swap: true, negate: false, compare: false, is_enum: true)
+                }
+            }
         }
         return none
+    }
+
+    // Whether the right operand of a comparison on enum `idx` is that enum. A
+    // `.Variant` whose enum the operand alone doesn't tell takes the left one's.
+    func same_enum_operand(self, anon idx: int64, anon rhs_kind: TypeKind) -> bool {
+        match rhs_kind {
+            .KEnum(rhs_idx) -> return rhs_idx == idx or (self.enums[idx].template_idx < 0 and self.same_enum_decl(idx, rhs_idx))
+            .KUnknown -> return true
+            else return false
+        }
     }
 
     // `*`, `/` and `%`: int64, unless the left operand's struct (or the right one's, reflected) defines them.
@@ -14887,6 +14918,10 @@ type Codegen = struct {
         if lhs_kind is .KStruct(_idx, _args) {
             can_overload = true
         }
+        if lhs_kind is .KEnum(_idx) {
+            rhs_kind = self.infer_kind(rhs_id)
+            can_overload = true
+        }
         if lhs_kind is .KInt64 {
             rhs_kind = self.infer_kind(rhs_id)
             can_overload = true
@@ -14895,15 +14930,27 @@ type Codegen = struct {
             return none
         }
         if self.op_call_for(lhs_kind, :op, :rhs_kind) is Some(oc) {
-            return self.structs[oc.struct_idx].methods[oc.method_idx].sig.return_kind
+            return self.op_method(oc).sig.return_kind
         }
         return none
     }
 
+    func op_method(self, anon oc: OpCall) -> MethodInfo {
+        if oc.is_enum {
+            return self.enums[oc.struct_idx].methods[oc.method_idx]
+        }
+        return self.structs[oc.struct_idx].methods[oc.method_idx]
+    }
+
     // `lhs op rhs` as a call of the operator method, operands evaluated left to right.
     func compile_op_call(self, lhs_id: int64, rhs_id: int64, oc: OpCall) -> Val {
-        let method = self.structs[oc.struct_idx].methods[oc.method_idx]
-        let shown = self.struct_display_name(oc.struct_idx)
+        let method = self.op_method(oc)
+        mut shown = ""
+        if oc.is_enum {
+            shown = self.enum_display_name(oc.struct_idx)
+        } else {
+            shown = self.struct_display_name(oc.struct_idx)
+        }
         if not self.takes_self_and(method.sig, count: 1) {
             self.compile_discard(lhs_id)
             self.compile_discard(rhs_id)
@@ -14936,7 +14983,11 @@ type Codegen = struct {
         }
         self.pool.free_reg(lhs_r)
         self.pool.free_reg(other_r)
-        self.emit(f"bl {self.method_label(oc.struct_idx, name: method.name)}")
+        if oc.is_enum {
+            self.emit(f"bl {self.enum_method_label(oc.struct_idx, name: method.name)}")
+        } else {
+            self.emit(f"bl {self.method_label(oc.struct_idx, name: method.name)}")
+        }
         if oc.negate {
             self.emit("cmp x0, #0")
             self.emit("cset x0, eq")
@@ -18044,9 +18095,7 @@ type Codegen = struct {
                     if len(enum_type_params) == 0 {
                         let enum_owner = self.declared_type_idx(name, path: self.p.path, what: 1)
                         for method_id in methods {
-                            if not self.is_operator_method(self.p.func_decls[method_id].name) {
-                                self.compile_func(fd_id: method_id, struct_name: name, override_lbl: "", :enum_owner)
-                            }
+                            self.compile_func(fd_id: method_id, struct_name: name, override_lbl: "", :enum_owner)
                         }
                     }
                 }

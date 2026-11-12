@@ -301,7 +301,7 @@ long as nothing calls `contains` on that `Box`. Only a method's signature is
 checked otherwise, so a mistake in the body of a method nothing uses isn't
 reported, as with a generic function nothing calls. An error in a body names the
 instance, as in
-`` `<` doesn't take `Color` operands (in `Box[Color]`) ``, and a line of
+`` `<` doesn't take `Color` operands; declare `op_lt` on `Color` to use it (in `Box[Color]`) ``, and a line of
 the template is reported for one instance only.
 
 A generic struct or enum may name itself, with any type arguments, in its

@@ -188,8 +188,43 @@ As with a [generic struct](structs.md#generic-structs), a method is compiled for
 an instance when something calls it, only its signature is checked otherwise,
 and an error in its body names the instance, as in ``(in `Either[int64, str]`)``.
 
-Not yet: operator methods (`op_eq` and the rest), and an enum as an
-interface value.
+An enum gives operators a meaning with the same
+[operator methods](structs.md#operators) as a struct: `op_add`, `op_sub`,
+`op_mul`, `op_div`, `op_mod`, `op_eq`, `op_lt` and the reflected `op_radd` and
+the rest. An enum that declares `op_eq` is compared by it, payloads and all,
+so `==` and `!=` work on any two of its values, including a `.Variant` on the
+right:
+
+```kod
+type Amount = enum {
+    Cents(n: int64)
+    Free
+
+    func op_eq(self, other: Amount) -> bool {
+        return self.cents() == other.cents()
+    }
+
+    func op_lt(self, other: Amount) -> bool {
+        return self.cents() < other.cents()
+    }
+
+    func cents(self) -> int64 {
+        return match self {
+            .Cents(n) -> n
+            .Free -> 0
+        }
+    }
+}
+
+let a: Amount = .Cents(n: 0)
+print(a == .Free)                // true
+print(a < .Cents(n: 5))          // true
+```
+
+An enum without `op_eq` keeps comparing variants, as described under
+[Equality](#equality).
+
+Not yet: an enum as an interface value.
 
 ## Generic enums
 
@@ -256,7 +291,7 @@ Total size: 8 (discriminant) + 16 (max payload) = **24 bytes**.
 
 ## Equality
 
-Two enum values are equal if and only if they are the same variant. Payload contents are not compared.
+Two enum values are equal if and only if they are the same variant. Payload contents are not compared. An enum that declares `op_eq` is compared by that method instead (see [Methods](#methods)).
 
 ```kod
 Direction.North == Direction.North  // true
@@ -298,4 +333,4 @@ let dist: int64 = match m {
 
 ## Current limitations
 
-- An enum can't declare operator methods or be an interface value.
+- An enum can't be an interface value.
