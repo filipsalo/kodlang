@@ -21,7 +21,7 @@
 #                         compile every .kod file with sh_kodc built at BASE
 #                         (default HEAD) and with the working tree's; report
 #                         differences. A pure compiler refactor shows none.
-#   make clean-apps       drop build/apps/ (per-app outputs)
+#   make clean-apps       drop build/apps/ and build/cache/ (per-app outputs)
 #   make clean            drop build/ entirely (keeps bootstrap/sh_kodc)
 #
 # Linking: link.cfg (and link.local.cfg, untracked, which overrides single
@@ -229,8 +229,11 @@ $(STAGE0)/%.o: $(STAGE0)/%.s
 
 stage1: $(STAGE1)/sh_kodc
 
+# build/cache/ holds module objects keyed by this compiler (docs/cli.md), so a
+# new one makes them all dead.
 $(STAGE1)/sh_kodc: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS) $(LINK_CFG)
 	mkdir -p $(STAGE1)
+	rm -rf build/cache
 	$(LINK) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS)
 
@@ -303,7 +306,7 @@ asm-diff:
 	$(PY) tools/asm_diff.py $(BASE)
 
 clean-apps:
-	rm -rf build/apps
+	rm -rf build/apps build/cache
 
 clean-stage1:
 	rm -rf $(STAGE1)

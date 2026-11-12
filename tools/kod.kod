@@ -454,6 +454,7 @@ let RESET: str = "\u{1b}[0m"
 extern func kod_fd_is_terminal(anon fd: int64) -> int64
 extern func kod_env_has(anon name: str) -> int64
 extern func kod_env_get(anon name: str) -> str
+extern func kod_sha256_hex(anon data: str) -> str
 
 // Whether errors are coloured: stderr is a terminal and colour isn't off, as
 // stdlib/term.kod decides (the driver doesn't link it).
@@ -528,6 +529,89 @@ func run_check(anon argv: [str]) -> int64 {
     return r.status
 }
 
+// What names a module's object in `build/cache/` (docs/cli.md, step 3): the
+// compiler, the module's path, and the path and text of each module its
+// compile loads. One per build, so each file is read and parsed once.
+type ObjectKeys = struct {
+    // `sh_kodc`'s hash, then a line per `STAGE0_KOD` module.
+    base: str
+    stage0: [str]
+    hashes: Map[str, str] = Map[str, str]()
+    // The modules each one loads itself: its imports, and the runner if it has tests.
+    loads: Map[str, [str]] = Map[str, [str]]()
+
+    func hash(self, anon path: str) -> str {
+        if self.hashes.get(path) is Some(h) {
+            return h
+        }
+        let h = kod_sha256_hex(io.read_file(path))
+        self.hashes.set(path, h)
+        return h
+    }
+
+    func direct(self, anon path: str) -> [str] {
+        if self.loads.get(path) is Some(known) {
+            return known
+        }
+        mut out: [str] = []
+        let module: ast.Module = build.parse_file(path).parse_module()
+        add_runner_for(module, modules: out)
+        for d in module.decls {
+            if d is .Import(module_name, _local_name, _items) and len(module_name) > 0 {
+                let file = build.resolve_import(target_path: path, :module_name).file
+                if not is_stage0(file, stage0: self.stage0) and not arrays.contains(out, file) {
+                    out += [file]
+                }
+            }
+        }
+        self.loads.set(path, out)
+        return out
+    }
+
+    // `path`'s key, or "" for none: a module outside the project (an absolute
+    // path, as a test's scratch file has, which would only fill the cache), or
+    // one that loads a missing module (its compile says so).
+    func key(self, anon path: str) -> str {
+        if path.starts_with("/") {
+            return ""
+        }
+        mut seen: [str] = [path]
+        mut i = 0
+        for i < len(seen) {
+            if not io.is_file(seen[i]) {
+                return ""
+            }
+            for next in self.direct(seen[i]) {
+                if not arrays.contains(seen, next) {
+                    seen += [next]
+                }
+            }
+            i += 1
+        }
+        mut text = self.base
+        for m in seen {
+            text += f"{m} {self.hash(m)}\n"
+        }
+        return kod_sha256_hex(text)
+    }
+}
+
+func object_keys(anon sh_kodc: str, stage0: [str]) -> ObjectKeys {
+    let keys = ObjectKeys(base: "", :stage0)
+    mut base = f"sh_kodc {keys.hash(sh_kodc)}\n"
+    for m in stage0 {
+        base += f"{m} {keys.hash(m)}\n"
+    }
+    keys.base = base
+    return keys
+}
+
+// Copy the file at `from` to `to`; false if it can't be read or written.
+func copy_file(anon from: str, to: str) -> bool {
+    let data = io.read_file(from)
+    return (len(data) > 0 or io.is_file(from)) and io.write_file(to, data) == 0
+}
+
 // Build an executable from `entries` and everything they import. `app`
 // names the directory `build/apps/<app>/` that holds it and its objects,
 // `exe_name` is the file dropped into it; `emit_main_cmd` is the
@@ -598,14 +682,34 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
     if run_check(mkdir_argv) != 0 {
         return ""
     }
+    // A module compiled before, in any program, comes from `build/cache/`.
+    let keys = object_keys(sh_kodc, :stage0)
+    let cache_dir = "build/cache"
     mut user_objs: [str] = []
     for m in user_modules {
         let obj: str = build.obj_path(root: obj_root, source: m)
+        user_objs += [obj]
+        let key = keys.key(m)
+        let cached = f"{cache_dir}/{key}.o"
+        if len(key) > 0 and io.is_file(cached) and copy_file(cached, to: obj) {
+            // Its `.s` would be from an older compile.
+            let asm = obj[0..len(obj) - 2] + ".s"
+            if io.is_file(asm) {
+                process.run(["rm", "-f", asm])
+            }
+            continue
+        }
         let rc: int64 = run_check([sh_kodc, "_compile", m, obj] + user_modules)
         if rc != 0 {
             return ""
         }
-        user_objs += [obj]
+        // Written beside it and renamed, so a build running alongside sees all of it or none.
+        if len(key) > 0 {
+            let tmp = f"{cached}.{app}.tmp"
+            if process.run(["mkdir", "-p", cache_dir]).status == 0 and copy_file(obj, to: tmp) {
+                process.run(["mv", "-f", tmp, cached])
+            }
+        }
     }
     // The C files the modules name.
     for job in plan.jobs {

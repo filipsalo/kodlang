@@ -6,6 +6,7 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
 
+#include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -422,6 +423,31 @@ int64_t kod_fd_close(int64_t fd) {
     int rc = close((int)fd);
     g_io_errno = rc < 0 ? errno : 0;
     return rc;
+}
+
+// The SHA-256 of `data`, as 64 lowercase hex digits. The driver names cached
+// objects by it.
+KodStr *kod_sha256_hex(KodStr *data) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    const char *p = data->buf;
+    int64_t left = data->len;
+    while (left > 0) {
+        CC_LONG n = left > 0x40000000 ? 0x40000000 : (CC_LONG)left;
+        CC_SHA256_Update(&ctx, p, n);
+        p += n;
+        left -= n;
+    }
+    CC_SHA256_Final(digest, &ctx);
+    static const char hex[] = "0123456789abcdef";
+    char out[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        out[2 * i] = hex[digest[i] >> 4];
+        out[2 * i + 1] = hex[digest[i] & 0xf];
+    }
+    out[2 * CC_SHA256_DIGEST_LENGTH] = 0;
+    return kod_str_from_cstr(out);
 }
 
 int64_t kod_fd_is_terminal(int64_t fd) {

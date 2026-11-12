@@ -152,16 +152,45 @@ def test_objects_are_named_after_their_source_in_a_tree(scratch: Path):
         found = sorted(
             str(p.relative_to(objects)) for p in objects.rglob("*") if p.is_file()
         )
-        wanted = []
-        for module in [
+        modules = [
             "stdlib/json",
             "stdlib/strbuilder",
             str(source.with_suffix("")),
             str(scratch.relative_to(ROOT) / "lib" / "helper"),
-        ]:
-            wanted += [f"{module}.kod.o", f"{module}.kod.s"]
-        wanted += [f"{source}.main.o", f"{source}.main.s"]
-        assert found == sorted(wanted)
+        ]
+        # A module's `.s` is there when it was compiled, not taken from the cache.
+        objs = [f"{m}.kod.o" for m in modules] + [f"{source}.main.o"]
+        sources = [f"{m}.kod.s" for m in modules] + [f"{source}.main.s"]
+        assert sorted(f for f in found if f.endswith(".o")) == sorted(objs)
+        assert set(f for f in found if f.endswith(".s")) <= set(sources)
+        assert f"{source}.main.s" in found
+
+
+def test_a_module_compiled_before_comes_from_the_cache(scratch: Path):
+    (scratch / "helper.kod").write_text("func n() -> int64 {\n    return 1\n}\n")
+    for name in ["cache_a", "cache_b"]:
+        (scratch / f"{name}.kod").write_text(
+            'import "./helper"\n\n'
+            "func main() -> int64 {\n    print_int(helper.n())\n    return 0\n}\n"
+        )
+    helper_s = str((scratch / "helper.kod.s").relative_to(ROOT))
+    with app_dir("cache_a") as a, app_dir("cache_b") as b:
+        source_a = (scratch / "cache_a.kod").relative_to(ROOT)
+        source_b = (scratch / "cache_b.kod").relative_to(ROOT)
+        assert build_and_run(source_a, "cache_a") == "1\n"
+        # Another program with the same helper takes its object from the cache.
+        assert build_and_run(source_b, "cache_b") == "1\n"
+        assert not (b / "cache_b.obj" / helper_s).exists()
+        # Its own entry has a path of its own, so it was compiled.
+        assert (b / "cache_b.obj" / f"{source_b}.s").exists()
+        # A changed import is compiled again, and so is what imports it.
+        (scratch / "helper.kod").write_text("func n() -> int64 {\n    return 2\n}\n")
+        assert build_and_run(source_a, "cache_a") == "2\n"
+        assert (a / "cache_a.obj" / helper_s).exists()
+        # Back as it was: both objects are the first build's again.
+        (scratch / "helper.kod").write_text("func n() -> int64 {\n    return 1\n}\n")
+        assert build_and_run(source_a, "cache_a") == "1\n"
+        assert not (a / "cache_a.obj" / helper_s).exists()
 
 
 # Shapes that only occur at the repository root: a module named like a
