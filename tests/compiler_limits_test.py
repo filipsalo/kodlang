@@ -2,6 +2,7 @@
 still compile and give the right answer. The sources are generated, because
 what matters is their size, and each answer is worked out here."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,18 +41,23 @@ type Oops = struct {
 
 
 def run(tmp_path: Path, body: str, decls: str = "") -> str:
-    source = tmp_path / "limits.kod"
+    # A program name of its own, so the tests can run in parallel.
+    stem = f"limits_{tmp_path.parent.name}_{tmp_path.name}"
+    source = tmp_path / f"{stem}.kod"
     source.write_text(
         f"{HELPERS}{decls}\nfunc main() -> int64 {{\n{body}\n    return 0\n}}\n"
     )
-    result = subprocess.run(
-        [str(KOD), "run", str(source)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [str(KOD), "run", str(source)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(ROOT / "build" / "apps" / stem, ignore_errors=True)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.strip()
 
