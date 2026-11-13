@@ -55,6 +55,111 @@ type TypeKind = enum {
     // A 64-bit IEEE float, held as its bit pattern in an ordinary 8-byte slot.
     KFloat64
     KArrayFloat64
+
+    // The kinds `+` and the ordering operators take, by name; "" for the rest.
+    func operand_scalar(self) -> str {
+        match self {
+            .KInt64 -> return "int64"
+            .KFloat64 -> return "float64"
+            .KStr -> return "str"
+            .KBytes -> return "bytes"
+            else return ""
+        }
+    }
+
+    func prints_as_str(self) -> bool {
+        match self {
+            .KInt64 -> return true
+            .KFloat64 -> return true
+            .KBool -> return true
+            else return false
+        }
+    }
+
+    // Whether a kind is one inline_call passes and returns: a value in one
+    // register that nothing counts references to.
+    func is_inline_scalar(self) -> bool {
+        return self is .KInt64 or self is .KBool or self is .KFloat64
+    }
+
+    func is_array(self) -> bool {
+        match self {
+            .KArray -> return true
+            .KArrayStruct(_elem_idx) -> return true
+            .KArrayEnum(_elem_idx) -> return true
+            .KArrayStr -> return true
+            .KArrayBytes -> return true
+            .KArrayInterface(_elem_idx) -> return true
+            .KArrayOptional(_inner) -> return true
+            .KArrayFunc(_pk, _rk) -> return true
+            .KArrayBool -> return true
+            .KArrayFloat64 -> return true
+            .KArrayArray(_inner) -> return true
+            else return false
+        }
+    }
+
+    func is_str_or_bytes(self) -> bool {
+        return self is .KStr or self is .KBytes
+    }
+
+    func is_void(self) -> bool {
+        return self is .KVoid
+    }
+
+    // The element kind of an array kind, or KUnknown.
+    func array_elem(self) -> TypeKind {
+        match self {
+            .KArray -> return .KInt64
+            .KArrayStruct(idx) -> return .KStruct(:idx, type_args: [])
+            .KArrayEnum(idx) -> return .KEnum(:idx)
+            .KArrayStr -> return .KStr
+            .KArrayBytes -> return .KBytes
+            .KArrayInterface(idx) -> return .KInterface(:idx)
+            .KArrayOptional(inner) -> return .KOptional(:inner)
+            .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
+            .KArrayBool -> return .KBool
+            .KArrayFloat64 -> return .KFloat64
+            .KArrayArray(inner) -> return inner
+            else return .KUnknown
+        }
+    }
+
+    // The inner kind of an optional, or KVoid.
+    func optional_inner(self) -> TypeKind {
+        if self is .KOptional(inner) {
+            return inner
+        }
+        return .KVoid
+    }
+
+    // `T?`, which is `T` itself when `T` is already optional: `T | none` is a set.
+    func optional(self) -> TypeKind {
+        if self is .KOptional(_inner) {
+            return self
+        }
+        return .KOptional(inner: self)
+    }
+
+    // The enum index of a KEnum, or -1.
+    func enum_idx(self) -> int64 {
+        if self is .KEnum(idx) {
+            return idx
+        }
+        return -1
+    }
+
+    // Hardcoded module prefix for each primitive type. Used to compose
+    // primitive vtable labels and to mangle primitive method symbols.
+    func prim_module_prefix(self) -> str {
+        match self {
+            .KInt64 -> return "primitives$int64"
+            .KStr -> return "primitives$str"
+            .KBool -> return "primitives$bool"
+            .KFloat64 -> return "primitives$float64"
+            else return ""
+        }
+    }
 }
 
 // ── Type layout structures ────────────────────────────────────────────────────
@@ -835,12 +940,6 @@ func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
     }
 }
 
-// Whether a kind is one inline_call passes and returns: a value in one register
-// that nothing counts references to.
-func inline_scalar(anon kind: TypeKind) -> bool {
-    return kind is .KInt64 or kind is .KBool or kind is .KFloat64
-}
-
 // Whether the expression `expr_id` in `p` is literals, the names in `params`,
 // operators and field reads only: no call, index, `is`, or any other name.
 func inline_body(anon p: parsing.Parser, anon expr_id: int64, params: [str]) -> bool {
@@ -1583,13 +1682,13 @@ type Codegen = struct {
             return
         }
         let sym = self.op_symbol(op)
-        let lhs_name = self.operand_scalar(lhs_kind)
-        let rhs_name = self.operand_scalar(rhs_kind)
+        let lhs_name = lhs_kind.operand_scalar()
+        let rhs_name = rhs_kind.operand_scalar()
         let lhs_shown = self.kind_display(lhs_kind)
         let rhs_shown = self.kind_display(rhs_kind)
         let ordering = self.is_comparison_op(op)
         if op is .Add or ordering {
-            if op is .Add and self.is_array_kind(lhs_kind) {
+            if op is .Add and lhs_kind.is_array() {
                 return
             }
             if lhs_name == "" {
@@ -1606,11 +1705,11 @@ type Codegen = struct {
             mut bad = rhs_id
             mut hint = ""
             let convert = "; convert with `str(...)` or use an f-string"
-            if lhs_name == "str" and self.prints_as_str(rhs_kind) {
+            if lhs_name == "str" and rhs_kind.prints_as_str() {
                 hint = convert
             }
             let appending = lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path
-            if rhs_name == "str" and self.prints_as_str(lhs_kind) and not appending {
+            if rhs_name == "str" and lhs_kind.prints_as_str() and not appending {
                 hint = convert
                 bad = lhs_id
             }
@@ -1786,11 +1885,11 @@ type Codegen = struct {
         if kind is .KBool {
             return "bool"
         }
-        return self.operand_scalar(kind)
+        return kind.operand_scalar()
     }
 
     func no_equality_note(self, anon kind: TypeKind) -> str {
-        if self.is_array_kind(kind) {
+        if kind.is_array() {
             return "arrays; compare `len(...)` and the elements"
         }
         match kind {
@@ -1998,26 +2097,6 @@ type Codegen = struct {
         return not self.kind_has_unknown(key) and not self.is_hashable(key)
     }
 
-    // The kinds `+` and the ordering operators take, by name; "" for the rest.
-    func operand_scalar(self, anon kind: TypeKind) -> str {
-        match kind {
-            .KInt64 -> return "int64"
-            .KFloat64 -> return "float64"
-            .KStr -> return "str"
-            .KBytes -> return "bytes"
-            else return ""
-        }
-    }
-
-    func prints_as_str(self, anon kind: TypeKind) -> bool {
-        match kind {
-            .KInt64 -> return true
-            .KFloat64 -> return true
-            .KBool -> return true
-            else return false
-        }
-    }
-
     // An index or slice bound, compiled already, so its own errors come first.
     func check_int_operand(self, anon expr_id: int64, what: str) -> none {
         let k = self.infer_kind(expr_id)
@@ -2183,7 +2262,7 @@ type Codegen = struct {
             return none
         }
         let .Return(value) = sig.src_p.stmts[fd.body[0]] else { return none }
-        if value == 0 or not inline_scalar(sig.return_kind) {
+        if value == 0 or not sig.return_kind.is_inline_scalar() {
             return none
         }
         // Parameters past `self` and the arguments that give them.
@@ -2199,7 +2278,7 @@ type Codegen = struct {
             names += [param.name]
         }
         for i in 0..len(slots) {
-            if slots[i] < 0 or not inline_scalar(sig.param_kinds[i + skip]) {
+            if slots[i] < 0 or not sig.param_kinds[i + skip].is_inline_scalar() {
                 return none
             }
         }
@@ -2285,7 +2364,7 @@ type Codegen = struct {
             return none
         }
         let returns_value = not (sig.return_kind is .KVoid)
-        if returns_value and not inline_scalar(sig.return_kind) {
+        if returns_value and not sig.return_kind.is_inline_scalar() {
             return none
         }
         let size = inline_stmts_size(sig.src_p, fd.body)
@@ -2323,7 +2402,7 @@ type Codegen = struct {
                 return none
             }
             let kind = sig.param_kinds[i + skip]
-            if not inline_scalar(kind) {
+            if not kind.is_inline_scalar() {
                 if not (kind is .KStruct(_si, _sa)) {
                     return none
                 }
@@ -2354,7 +2433,7 @@ type Codegen = struct {
         }
         mut scalar_locals = true
         for k in len(names)..len(self.vars) {
-            if not inline_scalar(self.vars[k].kind) {
+            if not self.vars[k].kind.is_inline_scalar() {
                 scalar_locals = false
             }
         }
@@ -2612,31 +2691,6 @@ type Codegen = struct {
     func compile_discard(self, anon expr_id: int64) -> none {
         let val = self.compile_expr(expr_id)
         self.free_val(val)
-    }
-
-    func is_array_kind(self, anon kind: TypeKind) -> bool {
-        match kind {
-            .KArray -> return true
-            .KArrayStruct(_elem_idx) -> return true
-            .KArrayEnum(_elem_idx) -> return true
-            .KArrayStr -> return true
-            .KArrayBytes -> return true
-            .KArrayInterface(_elem_idx) -> return true
-            .KArrayOptional(_inner) -> return true
-            .KArrayFunc(_pk, _rk) -> return true
-            .KArrayBool -> return true
-            .KArrayFloat64 -> return true
-            .KArrayArray(_inner) -> return true
-            else return false
-        }
-    }
-
-    func is_str_or_bytes(self, anon kind: TypeKind) -> bool {
-        match kind {
-            .KStr -> return true
-            .KBytes -> return true
-            else return false
-        }
     }
 
     // The tail of a "cannot index / slice / assign an element of" error.
@@ -4860,22 +4914,10 @@ type Codegen = struct {
         return self.vtable_label(owner, iface_idx)
     }
 
-    // Hardcoded module prefix for each primitive type. Used to compose
-    // primitive vtable labels and to mangle primitive method symbols.
-    func prim_module_prefix(self, kind: TypeKind) -> str {
-        match kind {
-            .KInt64 -> return "primitives$int64"
-            .KStr -> return "primitives$str"
-            .KBool -> return "primitives$bool"
-            .KFloat64 -> return "primitives$float64"
-            else return ""
-        }
-    }
-
     // The label of the vtable for a primitive type acting as an interface.
     func prim_vtable_label(self, anon iface_idx: int64, kind: TypeKind) -> str {
         let iface_info = self.interfaces[iface_idx]
-        let prim_prefix = self.prim_module_prefix(:kind)
+        let prim_prefix = kind.prim_module_prefix()
         return f"${iface_info.module_prefix}${iface_info.name}$$for${prim_prefix}$vtable"
     }
 
@@ -5488,14 +5530,6 @@ type Codegen = struct {
             i += 1
         }
         return ""
-    }
-
-    // Extract the enum index from a TypeKind, or -1 if not an enum.
-    func enum_idx_of_kind(self, anon kind: TypeKind) -> int64 {
-        if kind is .KEnum(idx) {
-            return idx
-        }
-        return -1
     }
 
     func find_variant_idx(self, anon variant_name: str, enum_idx: int64) -> int64 {
@@ -6113,7 +6147,7 @@ type Codegen = struct {
 
     // The kind of an array whose elements have kind `elem`.
     func array_kind_of(self, anon elem: TypeKind) -> TypeKind {
-        if self.is_array_kind(elem) {
+        if elem.is_array() {
             return .KArrayArray(inner: elem)
         }
         match elem {
@@ -6163,7 +6197,7 @@ type Codegen = struct {
                 if inner_kind is .KUnknown {
                     return .KUnknown
                 }
-                return optional_of(inner_kind)
+                return inner_kind.optional()
             }
             .Union(members) -> {
                 mut kinds: [TypeKind] = []
@@ -6246,7 +6280,7 @@ type Codegen = struct {
         for i < len(work) {
             let kind = work[i]
             i = i + 1
-            if self.is_void_kind(kind) {
+            if kind.is_void() {
                 optional = true
                 continue
             }
@@ -6382,7 +6416,7 @@ type Codegen = struct {
         if self.p.exprs[value_id] is .ArrayLit(elements) and len(elements) == 0 {
             mut found = -1
             for j, v in self.enums[enum_idx].variants {
-                if self.is_array_kind(v.field_kinds[0]) {
+                if v.field_kinds[0].is_array() {
                     if found >= 0 {
                         return -1
                     }
@@ -6784,8 +6818,8 @@ type Codegen = struct {
                 }
             }
             .Array(inner) -> {
-                if self.is_array_kind(kind) {
-                    self.settle_type_params(inner, kind: self.array_elem_kind(kind), :sig, :bound)
+                if kind.is_array() {
+                    self.settle_type_params(inner, kind: kind.array_elem(), :sig, :bound)
                 }
             }
             .Union(_members) -> none
@@ -7148,7 +7182,7 @@ type Codegen = struct {
     // The walk starts from the parameters' declared kinds, not the ones the body left in their slots.
     func check_reaches_end(self, anon func_decl: ast.FuncDecl, struct_name: str, owner: int64, param_kinds: [TypeKind]) -> none {
         let kind = self.return_kind
-        if self.is_void_kind(kind) or self.kind_has_unknown(kind) {
+        if kind.is_void() or self.kind_has_unknown(kind) {
             return
         }
         let seeds = len(self.walk_slots)
@@ -7158,7 +7192,7 @@ type Codegen = struct {
             self.walk_kinds += [param_kind]
             i += 1
         }
-        if not self.walk_completes(func_decl.body) or (self.is_result_kind(kind) and self.is_void_kind(self.result_inner_kind(kind))) {
+        if not self.walk_completes(func_decl.body) or (self.is_result_kind(kind) and self.result_inner_kind(kind).is_void()) {
             self.drop_walk_kinds(seeds)
             return
         }
@@ -8154,7 +8188,7 @@ type Codegen = struct {
                 return self.variant_binding_kinds(self.named_pattern_enum_idx(enum_name, :subject_kind), :variant_name, :count)
             }
             .ImplicitEnumPat(variant_name, _bindings) -> {
-                return self.variant_binding_kinds(self.enum_idx_of_kind(subject_kind), :variant_name, :count)
+                return self.variant_binding_kinds(subject_kind.enum_idx(), :variant_name, :count)
             }
             else none
         }
@@ -8165,7 +8199,7 @@ type Codegen = struct {
     // A generic enum's pattern names the template; the subject's instance has the payload kinds.
     func named_pattern_enum_idx(self, anon enum_name: str, subject_kind: TypeKind) -> int64 {
         let named = self.pattern_named_enum(enum_name)
-        let subj = self.enum_idx_of_kind(subject_kind)
+        let subj = subject_kind.enum_idx()
         if named < 0 or subj < 0 {
             return -1
         }
@@ -8326,10 +8360,10 @@ type Codegen = struct {
                 self.emit_str_pat_test(value, label: slbl, subject: "x0", other: "x1", :skip_lbl)
             }
             .EnumPat(_enum_name, _variant_name, _bindings) -> {
-                self.emit_variant_test(raw, subj_enum_idx: self.enum_idx_of_kind(subject_kind), :disc_r, :subj_slot, :skip_lbl, :span)
+                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span)
             }
             .ImplicitEnumPat(_variant_name, _bindings) -> {
-                self.emit_variant_test(raw, subj_enum_idx: self.enum_idx_of_kind(subject_kind), :disc_r, :subj_slot, :skip_lbl, :span)
+                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span)
             }
             .NonePat -> {
                 self.emit(f"cmp {disc_r}, #0")
@@ -8429,7 +8463,7 @@ type Codegen = struct {
             if self.is_none_kind(k) or self.is_some_optional(k) {
                 widen = true
             }
-            if not found and not self.is_void_kind(k) and not self.is_none_kind(k) {
+            if not found and not k.is_void() and not self.is_none_kind(k) {
                 kind = k
                 found = true
             }
@@ -8463,7 +8497,7 @@ type Codegen = struct {
         if ok_wrap {
             target = self.result_inner_kind(expected)
         }
-        if self.is_void_kind(body_kind) and not self.is_void_kind(target) and not self.is_diverging_call(body) {
+        if body_kind.is_void() and not target.is_void() and not self.is_diverging_call(body) {
             self.report_error(f"error: this arm has no value, but the match is used as a value; give the arm a value or use a match statement{self.diverge_hint(body)}", span: self.p.expr_spans[body])
         }
         mut wrap = false
@@ -8473,7 +8507,7 @@ type Codegen = struct {
         if wrap {
             self.compile_wrap_ok(body)
             self.mov_to(.VReg(name: "x0"), dest: result_r)
-            if not self.is_void_kind(body_kind) {
+            if not body_kind.is_void() {
                 self.check_value_kind(body, expected: self.result_inner_kind(expected))
             }
         } else {
@@ -8485,7 +8519,7 @@ type Codegen = struct {
                 self.mov_to(val, dest: result_r)
                 self.report_if_unknown(body)
             }
-            if not self.is_void_kind(body_kind) {
+            if not body_kind.is_void() {
                 self.check_value_kind(body, :expected)
             }
         }
@@ -8562,7 +8596,7 @@ type Codegen = struct {
 
     // A `false` resting on functions still being decided holds until one of them never returns.
     func never_returns(self, anon sig: SigInfo, owner: int64) -> bool {
-        if sig.decl_id <= 0 or not self.is_void_kind(sig.return_kind) {
+        if sig.decl_id <= 0 or not sig.return_kind.is_void() {
             return false
         }
         let key = f"{sig.src_p.path}:{sig.decl_id}:{owner}"
@@ -9542,9 +9576,9 @@ type Codegen = struct {
             }
             else none
         }
-        let array_like = self.is_array_kind(lhs_kind)
+        let array_like = lhs_kind.is_array()
         if not array_like {
-            if not self.is_str_or_bytes(lhs_kind) {
+            if not lhs_kind.is_str_or_bytes() {
                 self.compile_discard(lhs)
                 self.compile_discard(rhs)
                 if not self.kind_has_unknown(lhs_kind) {
@@ -10014,7 +10048,7 @@ type Codegen = struct {
         }
         if op is .Add {
             let chain_kind = self.concat_kind(lhs_id, :rhs_id)
-            if self.is_array_kind(chain_kind) {
+            if chain_kind.is_array() {
                 lhs_kind = chain_kind
             }
         }
@@ -10087,7 +10121,7 @@ type Codegen = struct {
                 }
             }
         }
-        if self.is_str_or_bytes(lhs_kind) {
+        if lhs_kind.is_str_or_bytes() {
             let cond = self.str_cmp_cond(op)
             if len(cond) > 0 {
                 return self.compile_str_cmp(:lhs_id, :rhs_id, :cond)
@@ -10100,7 +10134,7 @@ type Codegen = struct {
                     .KBytes -> return self.compile_str_concat(:lhs_id, :rhs_id)
                     else none
                 }
-                if self.is_array_kind(lhs_kind) {
+                if lhs_kind.is_array() {
                     return self.compile_concat(:lhs_id, :rhs_id, kind: lhs_kind, typed_anchor: 0)
                 }
             }
@@ -10311,7 +10345,7 @@ type Codegen = struct {
     // An appended literal or match is built as the array's element kind.
     func builds_for_operand(self, anon value_id: int64, op: ast.Op, other_kind: TypeKind) -> bool {
         if op is .Add {
-            if self.is_array_kind(other_kind) {
+            if other_kind.is_array() {
                 return self.converts_for(value_id, kind: other_kind)
             }
         }
@@ -10824,7 +10858,7 @@ type Codegen = struct {
     // `xs += [x]`: x goes on the end of xs in place, compiled as the literal's one
     // element would be, with no one-element array built for it.
     func compile_push(self, anon lhs_val: Val, elem_id: int64, literal_id: int64, kind: TypeKind) -> Val {
-        let expected_elem = self.array_elem_kind(kind)
+        let expected_elem = kind.array_elem()
         let parked = self.park_lhs(lhs_val)
         mut elem_reg = ""
         if self.elem_needs_conversion(expected_elem) {
@@ -10835,7 +10869,7 @@ type Codegen = struct {
             elem_reg = self.load(elem_val)
         }
         mut rc_elem = expected_elem
-        if self.is_void_kind(rc_elem) {
+        if rc_elem.is_void() {
             rc_elem = self.infer_kind(elem_id)
         }
         // The array's reference; the C side only stores it.
@@ -10862,7 +10896,7 @@ type Codegen = struct {
                 return .VReg(name: self.compile_into(value_id, expected: kind))
             }
             // Built as the chain's element type, so checked against that.
-            let val = self.compile_typed_array_value(value_id, expected_elem: self.array_elem_kind(kind))
+            let val = self.compile_typed_array_value(value_id, expected_elem: kind.array_elem())
             self.check_value_kind(value_id, expected: kind)
             return val
         }
@@ -10884,8 +10918,8 @@ type Codegen = struct {
 
     func compile_slice(self, s_id: int64, lo_id: int64, hi_id: int64) -> Val {
         let s_kind = self.infer_kind(s_id)
-        if not self.is_array_kind(s_kind) {
-            mut sliceable = self.is_str_or_bytes(s_kind)
+        if not s_kind.is_array() {
+            mut sliceable = s_kind.is_str_or_bytes()
             if s_kind is .KUnknown {
                 sliceable = true
             }
@@ -11038,7 +11072,7 @@ type Codegen = struct {
         self.emit("mov x0, #24")
         mut rc_mask = 1 << 22
         mut rc_elem = expected_elem
-        if self.is_void_kind(rc_elem) and n > 0 {
+        if rc_elem.is_void() and n > 0 {
             rc_elem = self.infer_kind(elements[0])
         }
         if self.rc_heap_kind(rc_elem) {
@@ -11057,10 +11091,10 @@ type Codegen = struct {
         let typed = self.elem_needs_conversion(expected_elem)
         // With no type to go to, the literal takes its first element's.
         mut rest_kind: TypeKind = .KVoid
-        if self.is_void_kind(expected_elem) {
+        if expected_elem.is_void() {
             rest_kind = self.first_elem_kind(elements)
         }
-        let check_rest = not self.is_void_kind(rest_kind)
+        let check_rest = not rest_kind.is_void()
         let rest_typed = self.elem_needs_conversion(rest_kind)
         for i in 0..n {
             mut elem_reg = ""
@@ -11081,7 +11115,7 @@ type Codegen = struct {
             let buf_r = self.pool.alloc_reg()
             self.emit(f"ldr {buf_r}, [sp, #8]")
             mut rc_elem = expected_elem
-            if self.is_void_kind(rc_elem) {
+            if rc_elem.is_void() {
                 rc_elem = self.infer_kind(elements[0])
             }
             self.rc_retain_kind(elem_reg, kind: rc_elem)
@@ -12560,7 +12594,7 @@ type Codegen = struct {
                         }
                         return .VImm(value: 0)
                     }
-                    if self.is_str_or_bytes(arg_kind) {
+                    if arg_kind.is_str_or_bytes() {
                         let val = self.compile_expr(args[0].value)
                         self.mov_to(val, dest: "x0")
                         self.emit("bl $primitives$str$hash")
@@ -12765,7 +12799,7 @@ type Codegen = struct {
         // Every array (whatever its element kind) and `str` is a
         // length-prefixed header: the count lives at offset 8 of the
         // pointer. One load covers them all.
-        mut header_len = self.is_array_kind(kind)
+        mut header_len = kind.is_array()
         match kind {
             .KStr -> header_len = true
             .KBytes -> header_len = true
@@ -13458,7 +13492,7 @@ type Codegen = struct {
             } else if i < len(slots) {
                 ai = slots[i]
             }
-            if ai < 0 or not inline_scalar(expected_kinds[i]) or not self.simple_arg(args[ai].value) {
+            if ai < 0 or not expected_kinds[i].is_inline_scalar() or not self.simple_arg(args[ai].value) {
                 return false
             }
             order += [ai]
@@ -13480,11 +13514,11 @@ type Codegen = struct {
         match self.p.exprs[expr_id] {
             .IntLit(_value) -> return true
             .BoolLit(_value) -> return true
-            .Ident(name) -> return self.inline_local(name) and inline_scalar(self.find_var_kind(name))
+            .Ident(name) -> return self.inline_local(name) and self.find_var_kind(name).is_inline_scalar()
             .Binary(lhs, op, rhs) -> {
                 match op {
                     .Add | .Sub | .Mul | .BitAnd | .BitOr | .BitXor | .Shl | .Shr | .Eq | .Ne | .Lt | .Le | .Gt | .Ge -> {
-                        return self.simple_arg(lhs) and self.simple_arg(rhs) and inline_scalar(self.infer_kind(expr_id)) and self.infer_kind(lhs) is .KInt64
+                        return self.simple_arg(lhs) and self.simple_arg(rhs) and self.infer_kind(expr_id).is_inline_scalar() and self.infer_kind(lhs) is .KInt64
                     }
                     else return false
                 }
@@ -13532,7 +13566,7 @@ type Codegen = struct {
         // Static enum kind for `.Foo` pattern disambiguation. See
         // compile_match_stmt for the analogous reasoning.
         let subj_kind = self.infer_kind(subject_id)
-        let subj_enum_idx: int64 = self.enum_idx_of_kind(subj_kind)
+        let subj_enum_idx: int64 = subj_kind.enum_idx()
         let done_lbl = self.fresh("Lmexpr_done")
         let subj_val = self.compile_expr(subject_id)
         let sptr_r = self.load(subj_val)
@@ -13809,7 +13843,7 @@ type Codegen = struct {
             // `[T][lo..hi]` is `[T]`.
             .Slice(s, lo, hi) -> {
                 let k = self.infer_kind(s)
-                if self.is_array_kind(k) {
+                if k.is_array() {
                     return k
                 }
                 match k {
@@ -14047,7 +14081,7 @@ type Codegen = struct {
                     if field_kind is .KUnknown {
                         return .KUnknown
                     }
-                    return optional_of(field_kind)
+                    return field_kind.optional()
                 }
                 return .KUnknown
             }
@@ -14057,7 +14091,7 @@ type Codegen = struct {
                 let struct_idx = self.find_struct_idx_of_optional(value)
                 if struct_idx >= 0 {
                     if self.structs[struct_idx].method_idx.get(method) is Some(mi) {
-                        return optional_of(self.structs[struct_idx].methods[mi].sig.return_kind)
+                        return self.structs[struct_idx].methods[mi].sig.return_kind.optional()
                     }
                     return .KUnknown
                 }
@@ -14067,7 +14101,7 @@ type Codegen = struct {
                     if ret is .KUnknown {
                         return .KUnknown
                     }
-                    return optional_of(ret)
+                    return ret.optional()
                 }
                 return .KUnknown
             }
@@ -14210,7 +14244,7 @@ type Codegen = struct {
         self.compile_store(dest_off: off, :kind, value_id: value)
         self.rc_let_off = rc_saved_off
         self.rc_let_kind = rc_saved_kind
-        if mutable and self.is_array_kind(kind) and self.is_array_place(value) {
+        if mutable and kind.is_array() and self.is_array_place(value) {
             self.emit_ldr(off, reg: "x0")
             self.emit("bl _kod_array_copy")
             self.rc_temp("x0")
@@ -14287,7 +14321,7 @@ type Codegen = struct {
                     else return false
                 }
             }
-            .KVoid -> return self.is_void_kind(actual) or self.is_none_kind(actual)
+            .KVoid -> return actual.is_void() or self.is_none_kind(actual)
             .KStruct(idx, _type_args) -> {
                 if actual is .KStruct(a_idx, _a_args) {
                     return self.same_struct(idx, a_idx)
@@ -14311,7 +14345,7 @@ type Codegen = struct {
             }
             else none
         }
-        if self.is_array_kind(expected) {
+        if expected.is_array() {
             return self.array_kinds_compatible(expected, :actual)
         }
         return self.same_primitive(expected, :actual)
@@ -14332,16 +14366,9 @@ type Codegen = struct {
     // A TypeKind param: the snapshot types payload bindings as int64.
     func is_none_kind(self, anon kind: TypeKind) -> bool {
         if kind is .KOptional(inner) {
-            return self.is_void_kind(inner)
+            return inner.is_void()
         }
         return false
-    }
-
-    func is_void_kind(self, anon kind: TypeKind) -> bool {
-        match kind {
-            .KVoid -> return true
-            else return false
-        }
     }
 
     // A `T?` going where an optional `T?` goes gets a Some cell, like a `T` into a `T?`.
@@ -14399,7 +14426,7 @@ type Codegen = struct {
     }
 
     func array_kinds_compatible(self, anon expected: TypeKind, actual: TypeKind) -> bool {
-        if not self.is_array_kind(actual) {
+        if not actual.is_array() {
             return false
         }
         match expected {
@@ -14449,23 +14476,6 @@ type Codegen = struct {
         return self.type_key(expected) == self.type_key(actual)
     }
 
-    func array_elem_kind(self, anon kind: TypeKind) -> TypeKind {
-        match kind {
-            .KArray -> return .KInt64
-            .KArrayStruct(idx) -> return .KStruct(:idx, type_args: [])
-            .KArrayEnum(idx) -> return .KEnum(:idx)
-            .KArrayStr -> return .KStr
-            .KArrayBytes -> return .KBytes
-            .KArrayInterface(idx) -> return .KInterface(:idx)
-            .KArrayOptional(inner) -> return .KOptional(:inner)
-            .KArrayFunc(param_kinds, return_kind) -> return .KFunc(:param_kinds, :return_kind)
-            .KArrayBool -> return .KBool
-            .KArrayFloat64 -> return .KFloat64
-            .KArrayArray(inner) -> return inner
-            else return .KUnknown
-        }
-    }
-
     // These resolve against the declared enum, not by inference.
     func is_implicit_variant_value(self, anon value_id: int64) -> bool {
         match self.p.exprs[value_id] {
@@ -14513,7 +14523,7 @@ type Codegen = struct {
             return
         }
         if self.wraps_into_optional(value_id, :expected) {
-            self.check_value_as(value_id, expected: self.optional_inner(expected), :slot)
+            self.check_value_as(value_id, expected: expected.optional_inner(), :slot)
             return
         }
         if expected is .KEnum(array_union) and self.enums[array_union].is_union and self.p.exprs[value_id] is .ArrayLit(elements) and len(elements) == 0 {
@@ -14538,14 +14548,14 @@ type Codegen = struct {
                 return
             }
         }
-        if self.p.exprs[value_id] is .ArrayLit(elements) and self.is_array_kind(expected) {
-            let elem = self.array_elem_kind(expected)
+        if self.p.exprs[value_id] is .ArrayLit(elements) and expected.is_array() {
+            let elem = expected.array_elem()
             for e in elements {
                 self.check_value_kind(e, expected: elem)
             }
             return
         }
-        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) and op is .Add and self.is_array_kind(expected) {
+        if self.p.exprs[value_id] is .Binary(lhs, op, rhs) and op is .Add and expected.is_array() {
             self.check_value_kind(lhs, :expected)
             self.check_value_kind(rhs, :expected)
             return
@@ -14559,7 +14569,7 @@ type Codegen = struct {
                 self.bind_pattern(arm.pattern)
                 let kinds_mark = len(self.walk_slots)
                 self.bind_arm_pre(arm.pre)
-                if not self.is_void_kind(self.infer_kind(arm.body)) {
+                if not self.infer_kind(arm.body).is_void() {
                     self.check_value_as(arm.body, :expected, :slot)
                 }
                 self.unbind_to(mark)
@@ -14582,12 +14592,12 @@ type Codegen = struct {
             hint = "; write `.Ok(value: ...)` for a successful result"
         } else if self.fits_several_members(expected, :actual) {
             hint = "; it fits more than one member"
-        } else if self.is_some_optional(actual) and self.kinds_compatible(expected, actual: self.optional_inner(actual)) {
+        } else if self.is_some_optional(actual) and self.kinds_compatible(expected, actual: actual.optional_inner()) {
             hint = self.unwrap_hint(value_id)
             if expected is .KOptional(_inner) {
                 hint = self.rewrap_hint(value_id)
             }
-        } else if self.is_void_kind(actual) and value_id == self.diverge_ok_id {
+        } else if actual.is_void() and value_id == self.diverge_ok_id {
             hint = self.diverge_hint(value_id)
         }
         self.report_error(f"error: expected `{self.kind_display(slot)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
@@ -15556,7 +15566,7 @@ type Codegen = struct {
     // Any other struct's `op_index` is user code.
     func indexes_builtin(self, anon recv: int64) -> bool {
         let kind = self.infer_kind(recv)
-        if self.is_array_kind(kind) or self.is_str_or_bytes(kind) {
+        if kind.is_array() or kind.is_str_or_bytes() {
             return true
         }
         if kind is .KStruct(idx, _type_args) {
@@ -15630,10 +15640,10 @@ type Codegen = struct {
             setter_struct = struct_idx
         }
         if setter is none {
-            if not self.is_array_kind(lhs_kind) {
+            if not lhs_kind.is_array() {
                 let shown = self.kind_display(lhs_kind)
                 mut note = self.index_error_note(lhs_kind, method: "op_index_set", value_id: lhs)
-                if self.is_str_or_bytes(lhs_kind) {
+                if lhs_kind.is_str_or_bytes() {
                     note = f"; `{shown}` values are immutable"
                 }
                 self.compile_discard(lhs)
@@ -15715,7 +15725,7 @@ type Codegen = struct {
                 // `xs[i] = 42` on a `[int64?]` stores a Some-cell and
                 // `pets[i] = Cat()` on a `[Greet]` stores an iface cell —
                 // mirroring the struct-field and call-arg store paths.
-                let rhs_r = self.compile_into(rhs_id, expected: self.array_elem_kind(lhs_kind))
+                let rhs_r = self.compile_into(rhs_id, expected: lhs_kind.array_elem())
                 // Preserve rhs across the lhs computation too.
                 let rhs_spilled = self.preserve_begin(rhs_r)
                 mut buf_r = ""
@@ -15741,7 +15751,7 @@ type Codegen = struct {
                 self.emit_index_check(reloaded_idx_r, len: len_r)
                 self.pool.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
-                if self.rc_heap_kind(self.array_elem_kind(lhs_kind)) {
+                if self.rc_heap_kind(lhs_kind.array_elem()) {
                     self.rc_retain(reloaded_rhs_r)
                     self.emit(f"ldr x17, [{buf_r}, {reloaded_idx_r}]")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
@@ -16156,7 +16166,7 @@ type Codegen = struct {
             else none
         }
         if needs_wrap {
-            let ret_inner = self.optional_inner(self.return_kind)
+            let ret_inner = self.return_kind.optional_inner()
             mut reg = ""
             if self.converts_for(value_id, kind: ret_inner) {
                 reg = self.compile_value_for_kind(value_id, expected: ret_inner)
@@ -16166,9 +16176,9 @@ type Codegen = struct {
             }
             let reg_spilled = self.preserve_begin(reg)
             self.emit("mov x0, #8")
-            let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(self.optional_inner(self.return_kind), slot: 0))
+            let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(self.return_kind.optional_inner(), slot: 0))
             let tmp = self.preserve_end(reg, spilled: reg_spilled)
-            self.rc_retain_kind(tmp, kind: self.optional_inner(self.return_kind))
+            self.rc_retain_kind(tmp, kind: self.return_kind.optional_inner())
             self.emit(f"str {tmp}, [x0]")
             self.pool.free_reg(tmp)
             self.rc_mark_owned("x0", slot: rc_cell)
@@ -16220,7 +16230,7 @@ type Codegen = struct {
 
     // A `none or Error` function returns an Ok(none) cell, not the none sentinel.
     func emit_no_value_return(self) -> none {
-        if not self.is_result_kind(self.return_kind) or not self.is_void_kind(self.result_inner_kind(self.return_kind)) {
+        if not self.is_result_kind(self.return_kind) or not self.result_inner_kind(self.return_kind).is_void() {
             self.emit("mov x0, #0")
             return
         }
@@ -16231,13 +16241,6 @@ type Codegen = struct {
         self.emit(f"str {disc_r}, [x0]")
         self.pool.free_reg(disc_r)
         self.emit("str xzr, [x0, #8]")
-    }
-
-    func optional_inner(self, anon kind: TypeKind) -> TypeKind {
-        if kind is .KOptional(inner) {
-            return inner
-        }
-        return .KVoid
     }
 
     // The caller would get the optional's cell instead of the value.
@@ -16491,7 +16494,7 @@ type Codegen = struct {
             self.emit(f"add x0, x0, {msg_lbl}@PAGEOFF")
             self.emit("bl _kod_panic")
         } else {
-            let inner = self.optional_inner(value_kind)
+            let inner = value_kind.optional_inner()
             let panics = self.is_diverging_call(default_id)
             if not panics and self.converts_for(default_id, kind: inner) {
                 let dreg = self.compile_value_for_kind(default_id, expected: inner)
@@ -17087,7 +17090,7 @@ type Codegen = struct {
         // A str or bytes value has an array's header, {data, len}, and is
         // gone over a byte at a time.
         let by_byte = iter_kind is .KStr or iter_kind is .KBytes
-        mut iterable = self.is_array_kind(iter_kind) or by_byte
+        mut iterable = iter_kind.is_array() or by_byte
         if iter_kind is .KUnknown {
             iterable = true
         }
@@ -17360,7 +17363,7 @@ type Codegen = struct {
         let old_kinds = self.retype_pattern_bindings(pattern_id, subject_kind: value_kind)
         match pattern {
             .EnumPat(enum_name, variant_name, bindings) -> {
-                let enum_idx = self.pattern_enum_idx(:enum_name, :variant_name, subj_enum_idx: self.enum_idx_of_kind(value_kind), span: self.p.expr_spans[value_id])
+                let enum_idx = self.pattern_enum_idx(:enum_name, :variant_name, subj_enum_idx: value_kind.enum_idx(), span: self.p.expr_spans[value_id])
                 if enum_idx < 0 {
                     return
                 }
@@ -17391,7 +17394,7 @@ type Codegen = struct {
                 }
             }
             .ImplicitEnumPat(variant_name, bindings) -> {
-                let enum_idx = self.pattern_enum_idx(enum_name: "", :variant_name, subj_enum_idx: self.enum_idx_of_kind(value_kind), span: self.p.expr_spans[value_id])
+                let enum_idx = self.pattern_enum_idx(enum_name: "", :variant_name, subj_enum_idx: value_kind.enum_idx(), span: self.p.expr_spans[value_id])
                 if enum_idx < 0 {
                     return
                 }
@@ -17660,7 +17663,7 @@ type Codegen = struct {
         // implicit `.Foo` patterns when multiple enums declare a
         // variant named `Foo`. -1 if the subject isn't an enum.
         let subj_kind = self.infer_kind(subject_id)
-        let subj_enum_idx: int64 = self.enum_idx_of_kind(subj_kind)
+        let subj_enum_idx: int64 = subj_kind.enum_idx()
         let done_lbl = self.fresh("Lmatch_done")
         // Evaluate subject once; stash its pointer on the stack so pattern
         // bindings can read fields off the subject after disc_r is consumed.
@@ -18534,14 +18537,6 @@ func tests_inside_optional(anon pat: ast.Pattern) -> bool {
         .ImplicitEnumPat(v, _b) -> return not v.starts_with("$t") and v != "Some" and v != "None"
         else return false
     }
-}
-
-// `T?`, which is `T` itself when `T` is already optional: `T | none` is a set.
-func optional_of(anon kind: TypeKind) -> TypeKind {
-    if kind is .KOptional(_inner) {
-        return kind
-    }
-    return .KOptional(inner: kind)
 }
 
 // An import alias as source writes it: a listed import's internal `#vec` is `vec`.
