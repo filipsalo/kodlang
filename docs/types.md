@@ -386,7 +386,11 @@ instead:
 let n: int64? = find("hello", 'l')
 let idx: int64       = n?           // panics if none
 let idx2: int64      = n? or -1     // -1 if none
+let idx3: int64      = must n       // panics if none
 ```
+
+`must n` is the same as a bare `n?`: the `T`, or a stop with the position of
+the `none`, as `must` stops on a failed `T or Error`.
 
 The default is evaluated lazily (only when the value is `none`), and
 its type must match the unwrapped `T`, unless it's a call that never
@@ -706,7 +710,8 @@ that isn't generic. Each of these is reported once, at the alias.
 A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)` or an `Err(Error)`. Use `try` to propagate, `must` to panic, or pattern-match the result directly.
 
 `try` and `must` take a `T or Error` value, and `try` only works inside a
-function that returns `T or Error` itself; anything else is an error. Either
+function that returns `T or Error` itself; anything else is an error. `must`
+also takes a `T?` (see [Postfix `?`](#postfix-)). Either
 can appear anywhere a value can, as in `out += [try parse(s)]` or
 `xs[try first(xs)..]`; on an `Err`, `try` returns from the function there. An
 explicit `Result[T, E]` with an `E` other than `Error` doesn't count, since
