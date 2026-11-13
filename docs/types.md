@@ -776,6 +776,25 @@ match read_size("missing.txt") {
 }
 ```
 
+A [type pattern](pattern-matching.md#type-patterns) on a result tests what it
+holds when it succeeded, so a result matches like the value it carries.
+`Error(e)` is another way to write `Err(e)`:
+
+```kod
+match parse(s) {                         // -> int64 | str or Error
+    int64(n) -> use(n)
+    str(t) -> show(t)
+    Error(e) -> print(e.to_str())
+}
+```
+
+`T(t)` matches an `Ok` whose value matches `T(t)` as a pattern on the success
+type: a member of a union, a union or optional of several, the success type
+itself (any `Ok`), a downcast when it is an interface, and `none` when it is
+optional. A type pattern never looks inside the error, even for a type that
+implements `Error`: `NotFound(nf)` on an `int64 or Error` is an error that
+points at `Err(NotFound(nf))`, which downcasts it.
+
 The same patterns work with `if … is` and the bare `is` operator, which is
 handy in tests:
 

@@ -6749,6 +6749,16 @@ type Codegen = struct {
         self.emit_label(done_lbl)
     }
 
+    // On a result, a type pattern tests the success value; an error type names
+    // the error, which `Err(...)` downcasts.
+    func error_pattern_hint(self, anon name: str, subject_id: int64) -> str {
+        let target = self.union_pattern_kind(name)
+        if not self.is_result_kind(self.infer_kind(subject_id)) or not self.is_error_value_kind(target) {
+            return ""
+        }
+        return f"; on a result it tests the success value, so to test the error write `Err({self.kind_display(target)}(...))`"
+    }
+
     func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
         let span = self.p.expr_spans[subject_id]
         let type_id = parsing.str_to_int(name[2..])
@@ -6772,7 +6782,7 @@ type Codegen = struct {
             if self.union_pattern_variant(name, enum_idx: idx) >= 0 {
                 return true
             }
-            self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
+            self.report_error(f"error: `{member}` isn't a member of `{shown}`" + self.error_pattern_hint(name, :subject_id), :span)
             return false
         }
         if kind is .KInterface(_iface) {
@@ -6780,14 +6790,14 @@ type Codegen = struct {
             if self.p.type_exprs[type_id] is .Named(_type_name) and (target is .KStruct(_s, _a) or self.kind_has_unknown(target)) {
                 return true
             }
-            self.report_error(f"error: `{member}` can't test a `{shown}`; a downcast is to a struct", :span)
+            self.report_error(f"error: `{member}` can't test a `{shown}`; a downcast is to a struct" + self.error_pattern_hint(name, :subject_id), :span)
             return false
         }
         if kind is .KOptional(_inner) {
-            self.report_error(f"error: `{member}` isn't a member of `{shown}`", :span)
+            self.report_error(f"error: `{member}` isn't a member of `{shown}`" + self.error_pattern_hint(name, :subject_id), :span)
             return false
         }
-        self.report_error(f"error: a type pattern tests a union, an interface or an optional, got `{shown}`", :span)
+        self.report_error(f"error: a type pattern tests a union, an interface or an optional, got `{shown}`" + self.error_pattern_hint(name, :subject_id), :span)
         return false
     }
 
@@ -14841,6 +14851,13 @@ type Codegen = struct {
         return true
     }
 
+    func is_error_iface(self, anon kind: TypeKind) -> bool {
+        if kind is .KInterface(idx) {
+            return idx == self.find_iface_idx("Error")
+        }
+        return false
+    }
+
     // A value that reads as a failure: an `Error`, or a struct or enum that implements it.
     func is_error_value_kind(self, anon kind: TypeKind) -> bool {
         let err_idx = self.find_iface_idx("Error")
@@ -17795,6 +17812,33 @@ type Codegen = struct {
     func flatten_pattern(self, anon pid: int64, kind: TypeKind) -> [FlatArm] {
         mut saved: [FlatArm] = []
         let raw = self.p.patterns[pid]
+        if self.is_result_kind(kind) and not self.kind_has_unknown(kind) {
+            let inner = self.result_inner_kind(kind)
+            mut tests_ok = raw is .NonePat and inner is .KOptional(_held)
+            if raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") {
+                let written = self.union_pattern_kind(v)
+                if self.is_error_iface(written) {
+                    mut binding = ""
+                    if len(b) == 1 {
+                        binding = b[0]
+                    }
+                    saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+                    self.p.patterns[pid] = .ErrPat(:binding)
+                    return saved
+                }
+                tests_ok = not self.kind_has_unknown(written)
+            }
+            if tests_ok {
+                saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
+                let member = self.p.alloc_pattern(raw)
+                self.p.pattern_subs[member] = self.p.pattern_subs[pid]
+                let hidden = parsing.hidden_binding(member)
+                self.alloc_var(name: hidden, kind: inner)
+                self.p.patterns[pid] = .OkPat(binding: hidden)
+                self.p.pattern_subs[pid] = [ast.SubPattern(binding: hidden, pattern: member)]
+                return saved + self.flatten_pattern(member, kind: inner)
+            }
+        }
         if raw is .ImplicitEnumPat(v, b) and v.starts_with("$t") and not self.kind_has_unknown(kind) {
             let written = self.union_pattern_kind(v)
             if not self.kind_has_unknown(written) and self.type_key(written) == self.type_key(kind) {

@@ -211,6 +211,9 @@ declared, `pa.Pt(p)` for a type of another module; a member with no name of its
 own, such as `[str]`, needs a [type alias](types.md#type-aliases) to be matched
 by type.
 
+On a `T or Error`, a type pattern tests the value of an `Ok`, and `Error(e)` is
+`Err(e)` (see [Fallible types](types.md#fallible-types-t-or-error)).
+
 On an interface, `T` is a struct or enum that implements it, and the pattern
 is a downcast, so a `match` still needs an `else`:
 
