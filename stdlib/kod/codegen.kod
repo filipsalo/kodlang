@@ -3179,9 +3179,10 @@ type Codegen = struct {
         if self.report_attempts != attempts_before {
             return
         }
+        let kind = self.infer_kind(subject_id)
         mut nests = false
         for pid in pattern_ids {
-            if len(self.p.pattern_subs[pid]) > 0 {
+            if len(self.p.pattern_subs[pid]) > 0 or len(self.type_pattern_cover(self.p.patterns[pid], subject: kind)) > 0 {
                 nests = true
             }
         }
@@ -3189,7 +3190,6 @@ type Codegen = struct {
             return
         }
         // Every variant has an arm; what nests in those arms can still leave gaps.
-        let kind = self.infer_kind(subject_id)
         mut rows: [[int64]] = []
         for pid in pattern_ids {
             rows += [[pid]]
@@ -3225,7 +3225,7 @@ type Codegen = struct {
                 mut spec: [[int64]] = []
                 for row in rows {
                     let name = self.pattern_ctor_name(row[0], subject_kind: kind)
-                    if name == ctor.name or len(name) == 0 {
+                    if name == ctor.name or len(name) == 0 or arrays.contains(name.split("\n"), ctor.name) {
                         spec += [self.pattern_ctor_args(row[0], subject_kind: kind, :arity) + row[1..]]
                     }
                 }
@@ -3296,6 +3296,10 @@ type Codegen = struct {
         if pattern_id < 0 {
             return ""
         }
+        let cover = self.type_pattern_cover(self.p.patterns[pattern_id], subject: subject_kind)
+        if len(cover) > 0 {
+            return "\n".join(cover)
+        }
         match self.subject_pattern(self.p.patterns[pattern_id], :subject_kind) {
             .Wildcard -> return ""
             .BindPat(_binding) -> return ""
@@ -3323,6 +3327,9 @@ type Codegen = struct {
         }
         if pattern_id < 0 {
             return args
+        }
+        if subject_kind is .KOptional(_inner) and arity == 1 and arrays.contains(self.type_pattern_cover(self.p.patterns[pattern_id], subject: subject_kind), "Some") {
+            return [pattern_id]
         }
         let names = self.pattern_binding_names(self.subject_pattern(self.p.patterns[pattern_id], :subject_kind))
         for i, name in names {
@@ -3391,6 +3398,9 @@ type Codegen = struct {
             for variant in enum_info.variants {
                 mut covered: bool = false
                 for pid in pattern_ids {
+                    if arrays.contains(self.type_pattern_cover(self.p.patterns[pid], subject: subj_kind), variant.name) {
+                        covered = true
+                    }
                     match self.subject_pattern(self.p.patterns[pid], subject_kind: subj_kind) {
                         .EnumPat(_enum_name, variant_name, _bindings) -> {
                             if variant_name == variant.name {
@@ -3416,6 +3426,13 @@ type Codegen = struct {
             mut has_some: bool = false
             mut has_none: bool = false
             for pid in pattern_ids {
+                let cover = self.type_pattern_cover(self.p.patterns[pid], subject: subj_kind)
+                if arrays.contains(cover, "Some") {
+                    has_some = true
+                }
+                if arrays.contains(cover, "none") {
+                    has_none = true
+                }
                 let pat = self.subject_pattern(self.p.patterns[pid], subject_kind: subj_kind)
                 if pat is .SomePat(_b) {
                     has_some = true
@@ -6597,6 +6614,141 @@ type Codegen = struct {
         return self.resolve_type(parsing.str_to_int(name[2..]))
     }
 
+    // The members a value of `kind` can hold, by variant name (`=<type key>`),
+    // with "none" for an optional's empty one.
+    func member_leaves(self, anon kind: TypeKind) -> [str] {
+        mut leaves: [str] = []
+        mut held = kind
+        if kind is .KOptional(inner) {
+            leaves += ["none"]
+            held = inner
+        }
+        if held is .KEnum(idx) and self.enums[idx].is_union {
+            for v in self.enums[idx].variants {
+                leaves += [v.name]
+            }
+        } else {
+            leaves += [f"={self.type_key(held)}"]
+        }
+        return leaves
+    }
+
+    // What a type pattern naming a union or optional covers of a subject that
+    // can hold all of its members (`none` aside, which a union can't hold): the
+    // subject's union variants, or `none` and `Some` of an optional. Empty for
+    // any other pattern, and for one naming exactly the subject's type.
+    func type_pattern_cover(self, anon pat: ast.Pattern, subject: TypeKind) -> [str] {
+        mut cover: [str] = []
+        let .ImplicitEnumPat(name, _bindings) = pat else { return cover }
+        if not name.starts_with("$t") or self.kind_has_unknown(subject) {
+            return cover
+        }
+        let written = self.union_pattern_kind(name)
+        if self.kind_has_unknown(written) {
+            return cover
+        }
+        mut w = self.member_leaves(written)
+        if len(w) < 2 or self.type_key(written) == self.type_key(subject) {
+            return cover
+        }
+        let s = self.member_leaves(subject)
+        mut within: [str] = []
+        for leaf in w {
+            if arrays.contains(s, leaf) {
+                within += [leaf]
+            } else if leaf != "none" {
+                return cover
+            }
+        }
+        w = within
+        if subject is .KOptional(_inner) {
+            if arrays.contains(w, "none") {
+                cover += ["none"]
+            }
+            if len(w) > 1 or not arrays.contains(w, "none") {
+                cover += ["Some"]
+            }
+            return cover
+        }
+        return w
+    }
+
+    // A type pattern naming several of the members the subject in `subj_slot`
+    // can hold: test which one it holds, and bind it as the type written.
+    func emit_members_test(self, anon name: str, bindings: [str], subject_kind: TypeKind, subj_slot: int64, skip_lbl: str, span: ast.Span) -> none {
+        let written = self.union_pattern_kind(name)
+        let w = self.member_leaves(written)
+        let optional = subject_kind is .KOptional(_inner)
+        mut held = subject_kind
+        if subject_kind is .KOptional(inner) {
+            held = inner
+        }
+        let .KEnum(union_idx) = held else {
+            self.emit(f"b {skip_lbl}")
+            return
+        }
+        mut binding = ""
+        if len(bindings) == 1 and bindings[0] != "_" {
+            binding = bindings[0]
+        }
+        let done_lbl = self.fresh("Lmembers_done")
+        let u_r = self.pool.alloc_reg()
+        self.emit_ldr(subj_slot, reg: u_r)
+        if optional {
+            let some_lbl = self.fresh("Lmembers_some")
+            self.emit(f"cbnz {u_r}, {some_lbl}")
+            if arrays.contains(w, "none") {
+                if len(binding) > 0 {
+                    let r = self.compile_into(self.p.alloc_expr(ast.Expr.NoneLit, :span), expected: written)
+                    self.emit_str(self.find_var_offset(binding), reg: r)
+                    self.pool.free_reg(r)
+                }
+                self.emit(f"b {done_lbl}")
+            } else {
+                self.emit(f"b {skip_lbl}")
+            }
+            self.emit_label(some_lbl)
+            self.emit(f"ldr {u_r}, [{u_r}]")
+        }
+        let d_r = self.pool.alloc_reg()
+        self.emit(f"ldr {d_r}, [{u_r}]")
+        mut hit_lbls: [str] = []
+        mut hit_kinds: [TypeKind] = []
+        for v in self.enums[union_idx].variants {
+            if arrays.contains(w, v.name) {
+                let lbl = self.fresh("Lmembers_hit")
+                self.emit(f"cmp {d_r}, #{v.discriminant}")
+                self.emit(f"beq {lbl}")
+                hit_lbls += [lbl]
+                hit_kinds += [v.field_kinds[0]]
+            }
+        }
+        self.pool.free_reg(d_r)
+        self.pool.free_reg(u_r)
+        self.emit(f"b {skip_lbl}")
+        for i, lbl in hit_lbls {
+            self.emit_label(lbl)
+            if len(binding) > 0 {
+                let member = self.fresh("__member")
+                let member_off = self.alloc_var(name: member, kind: hit_kinds[i])
+                self.bind_var(member)
+                let p_r = self.pool.alloc_reg()
+                self.emit_ldr(subj_slot, reg: p_r)
+                if optional {
+                    self.emit(f"ldr {p_r}, [{p_r}]")
+                }
+                self.emit(f"ldr {p_r}, [{p_r}, #8]")
+                self.emit_str(member_off, reg: p_r)
+                self.pool.free_reg(p_r)
+                let r = self.compile_into(self.p.alloc_expr(.Ident(name: member), :span), expected: written)
+                self.emit_str(self.find_var_offset(binding), reg: r)
+                self.pool.free_reg(r)
+            }
+            self.emit(f"b {done_lbl}")
+        }
+        self.emit_label(done_lbl)
+    }
+
     func check_union_pattern(self, anon name: str, kind: TypeKind, subject_id: int64) -> bool {
         let span = self.p.expr_spans[subject_id]
         let type_id = parsing.str_to_int(name[2..])
@@ -6612,6 +6764,10 @@ type Codegen = struct {
         }
         let shown = self.kind_display(kind)
         let member = self.kind_display(self.union_pattern_kind(name))
+        let no_bindings: [str] = []
+        if len(self.type_pattern_cover(.ImplicitEnumPat(variant_name: name, bindings: no_bindings), subject: kind)) > 0 {
+            return true
+        }
         if kind is .KEnum(idx) and self.enums[idx].is_union {
             if self.union_pattern_variant(name, enum_idx: idx) >= 0 {
                 return true
@@ -6822,7 +6978,7 @@ type Codegen = struct {
                     self.settle_type_params(inner, kind: kind.array_elem(), :sig, :bound)
                 }
             }
-            .Union(_members) -> none
+            .Union(members) -> self.settle_union_param(members, :kind, :sig, :bound)
             .Optional(inner) -> {
                 if kind is .KOptional(held) {
                     self.settle_type_params(inner, kind: held, :sig, :bound)
@@ -6849,6 +7005,58 @@ type Codegen = struct {
                 }
             }
         }
+    }
+
+    // A union parameter with one bare type parameter among members that name
+    // none: the parameter is what the argument holds besides those members.
+    func settle_union_param(self, anon members: [int64], kind: TypeKind, sig: SigInfo, bound: [TypeKind]) -> none {
+        let no_args: [TypeKind] = []
+        let saved_ctx = self.enter(sig.src_p, names: sig.type_params, args: no_args)
+        mut open = 0
+        mut fixed: [str] = []
+        mut ok = true
+        for member in members {
+            if self.p.type_exprs[member] is .Named(name) and arrays.contains(sig.type_params, name) and len(self.type_qual(member)) == 0 {
+                if open != 0 {
+                    ok = false
+                }
+                open = member
+                continue
+            }
+            for name in self.type_expr_names(member) {
+                if arrays.contains(sig.type_params, name) {
+                    ok = false
+                }
+            }
+            if ok {
+                fixed += self.member_leaves(self.resolve_type(member))
+            }
+        }
+        self.leave(saved_ctx)
+        if not ok or open == 0 {
+            return
+        }
+        mut rest: [TypeKind] = []
+        if kind is .KOptional(_inner) and not arrays.contains(fixed, "none") {
+            rest += [.KVoid]
+        }
+        mut held = kind
+        if kind is .KOptional(inner) {
+            held = inner
+        }
+        if held is .KEnum(idx) and self.enums[idx].is_union {
+            for v in self.enums[idx].variants {
+                if not arrays.contains(fixed, v.name) {
+                    rest += [v.field_kinds[0]]
+                }
+            }
+        } else if not arrays.contains(fixed, f"={self.type_key(held)}") {
+            rest += [held]
+        }
+        if len(rest) == 0 or (len(rest) == 1 and rest[0] is .KVoid) {
+            return
+        }
+        self.settle_type_params(open, kind: self.union_kind(rest), :sig, :bound)
     }
 
     // The type arguments of `kind`, when it's an instance of the generic `name` that `type_id` writes.
@@ -8360,10 +8568,10 @@ type Codegen = struct {
                 self.emit_str_pat_test(value, label: slbl, subject: "x0", other: "x1", :skip_lbl)
             }
             .EnumPat(_enum_name, _variant_name, _bindings) -> {
-                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span)
+                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span, :subject_kind)
             }
             .ImplicitEnumPat(_variant_name, _bindings) -> {
-                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span)
+                self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span, :subject_kind)
             }
             .NonePat -> {
                 self.emit(f"cmp {disc_r}, #0")
@@ -9872,6 +10080,10 @@ type Codegen = struct {
         }
         if lhs_kind is .KEnum(enum_idx) {
             let variant_idx = self.is_variant_idx(rhs, :enum_idx)
+            let members_pat = self.p.pattern_of_expr(rhs)
+            if variant_idx < 0 and members_pat >= 0 and len(self.type_pattern_cover(self.p.patterns[members_pat], subject: lhs_kind)) > 0 {
+                return self.compile_is_pattern(lhs, pattern_id: members_pat, :negate)
+            }
             if variant_idx < 0 {
                 self.compile_discard(lhs)
                 let qual_msg = self.is_rhs_qual_error(rhs)
@@ -10421,7 +10633,11 @@ type Codegen = struct {
     }
 
     // Variant arm test + payload binding, shared by match stmts and exprs.
-    func emit_variant_test(self, anon pattern: ast.Pattern, subj_enum_idx: int64, disc_r: str, subj_slot: int64, skip_lbl: str, span: ast.Span) -> none {
+    func emit_variant_test(self, anon pattern: ast.Pattern, subj_enum_idx: int64, disc_r: str, subj_slot: int64, skip_lbl: str, span: ast.Span, subject_kind: TypeKind = .KUnknown) -> none {
+        if pattern is .ImplicitEnumPat(name, bindings) and len(self.type_pattern_cover(pattern, subject: subject_kind)) > 0 {
+            self.emit_members_test(name, :bindings, :subject_kind, :subj_slot, :skip_lbl, :span)
+            return
+        }
         mut enum_name = ""
         mut variant_name = ""
         mut bindings: [str] = []
@@ -11672,11 +11888,6 @@ type Codegen = struct {
             .Union(members) -> {
                 for member in members {
                     self.check_type_expr(member)
-                    for name in self.type_expr_names(member) {
-                        if self.names_type_param(name) {
-                            self.report_error(f"error: a union can't mention the type parameter `{name}`, except as `{name} | none`", span: self.p.type_spans[member])
-                        }
-                    }
                 }
             }
             .Func(params, return_typ) -> {
@@ -13619,13 +13830,13 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
-                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
-                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
@@ -17265,6 +17476,41 @@ type Codegen = struct {
     }
 
     // `T?` is a nullable cell, not an Option enum cell: `.Some`/`.None` on it mean SomePat/NonePat.
+    // A let-else's `.Variant(...)`: test the subject in `subj_slot` and bind the
+    // payload. False when the pattern was reported and nothing more is compiled.
+    func let_else_variant(self, anon variant_name: str, bindings: [str], value_kind: TypeKind, value_id: int64, subj_slot: int64, else_lbl: str) -> bool {
+        let enum_idx = self.pattern_enum_idx(enum_name: "", :variant_name, subj_enum_idx: value_kind.enum_idx(), span: self.p.expr_spans[value_id])
+        if enum_idx < 0 {
+            return false
+        }
+        mut variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), span: self.p.expr_spans[value_id])
+        if variant_idx < 0 {
+            return false
+        }
+        mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
+        let disc_r = self.pool.alloc_reg()
+        let ptr_r = self.pool.alloc_reg()
+        self.emit_ldr(subj_slot, reg: ptr_r)
+        self.emit(f"ldr {disc_r}, [{ptr_r}]")
+        self.emit(f"cmp {disc_r}, #{disc}")
+        self.emit(f"bne {else_lbl}")
+        self.pool.free_reg(disc_r)
+        self.pool.free_reg(ptr_r)
+        let vinfo2 = self.enums[enum_idx].variants[variant_idx]
+        for key_idx, binding in bindings {
+            mut foff = vinfo2.field_offsets[key_idx]
+            let binding_off = self.find_var_offset(binding)
+            let ptr_r2 = self.pool.alloc_reg()
+            self.emit_ldr(subj_slot, reg: ptr_r2)
+            let fv_r = self.pool.alloc_reg()
+            self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
+            self.emit_str(binding_off, reg: fv_r)
+            self.pool.free_reg(fv_r)
+            self.pool.free_reg(ptr_r2)
+        }
+        return true
+    }
+
     func let_else_pattern(self, anon pattern_id: int64, value_id: int64) -> ast.Pattern {
         return self.subject_pattern(self.p.patterns[pattern_id], subject_kind: self.infer_kind(value_id))
     }
@@ -17394,34 +17640,10 @@ type Codegen = struct {
                 }
             }
             .ImplicitEnumPat(variant_name, bindings) -> {
-                let enum_idx = self.pattern_enum_idx(enum_name: "", :variant_name, subj_enum_idx: value_kind.enum_idx(), span: self.p.expr_spans[value_id])
-                if enum_idx < 0 {
+                if len(self.type_pattern_cover(pattern, subject: value_kind)) > 0 {
+                    self.emit_members_test(variant_name, :bindings, subject_kind: value_kind, :subj_slot, skip_lbl: else_lbl, span: self.p.expr_spans[value_id])
+                } else if not self.let_else_variant(variant_name, :bindings, :value_kind, :value_id, :subj_slot, :else_lbl) {
                     return
-                }
-                mut variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), span: self.p.expr_spans[value_id])
-                if variant_idx < 0 {
-                    return
-                }
-                mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
-                let disc_r = self.pool.alloc_reg()
-                let ptr_r = self.pool.alloc_reg()
-                self.emit_ldr(subj_slot, reg: ptr_r)
-                self.emit(f"ldr {disc_r}, [{ptr_r}]")
-                self.emit(f"cmp {disc_r}, #{disc}")
-                self.emit(f"bne {else_lbl}")
-                self.pool.free_reg(disc_r)
-                self.pool.free_reg(ptr_r)
-                let vinfo2 = self.enums[enum_idx].variants[variant_idx]
-                for key_idx, binding in bindings {
-                    mut foff = vinfo2.field_offsets[key_idx]
-                    let binding_off = self.find_var_offset(binding)
-                    let ptr_r2 = self.pool.alloc_reg()
-                    self.emit_ldr(subj_slot, reg: ptr_r2)
-                    let fv_r = self.pool.alloc_reg()
-                    self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
-                    self.emit_str(binding_off, reg: fv_r)
-                    self.pool.free_reg(fv_r)
-                    self.pool.free_reg(ptr_r2)
                 }
             }
             .SomePat(binding) -> {
@@ -17526,7 +17748,7 @@ type Codegen = struct {
                 }
                 mut holds_member = inner is .KInterface(_iface)
                 if inner is .KEnum(idx) and self.enums[idx].is_union {
-                    holds_member = self.union_pattern_variant(v, enum_idx: idx) >= 0
+                    holds_member = self.union_pattern_variant(v, enum_idx: idx) >= 0 or (not (written is .KOptional(_w)) and len(self.type_pattern_cover(raw, subject: inner)) > 0)
                 }
                 if self.type_key(written) == self.type_key(inner) {
                     saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
@@ -17717,13 +17939,13 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
-                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
-                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id])
+                    self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit(f"b {done_lbl}")
                     self.emit_label(skip_lbl)

@@ -200,7 +200,13 @@ if id is str(s) {
 On a value whose type is exactly `T`, `T(name)` always matches and binds the
 value, so it covers every case on its own: `int64(n)` on an `int64`,
 `Shape(s)` on a `Shape`, or `T(x)` in a generic function whatever `T` turns
-out to be. On a union, `T` has to be a member otherwise. A member's type is written as it is
+out to be. On a union, `T` has to be a member otherwise, or a union or optional
+whose members all are: on an `int64 | str | bool`, `Id(i)` with
+`type Id = int64 | str` matches an `int64` or a `str` and binds it as an `Id`,
+and with `type MaybeInt = int64?`, `MaybeInt(n)` on an `int64 | str | none`
+matches an `int64` or `none`. That
+is also what `T(t)` does in a generic function when `T` is a union or an
+optional. When two arms cover the same member, the first one wins. A member's type is written as it is
 declared, `pa.Pt(p)` for a type of another module; a member with no name of its
 own, such as `[str]`, needs a [type alias](types.md#type-aliases) to be matched
 by type.

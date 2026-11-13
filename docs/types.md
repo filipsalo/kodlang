@@ -623,9 +623,34 @@ or an array member, can't be compared. A union widens for `==` as it does
 elsewhere, so an `A | B` compares with an `A | B | C`. A union whose members can
 all be hashed (`int64`, `str`, `bytes`, `bool`, enums without payloads) can be
 hashed and be a `Map` key: `Map[int64 | str, V]` (see [`hash`](builtins.md)).
-Otherwise a union has no fields, methods or operators of its own. A union can't
-mention a type parameter, except as `T | none`, since `T | str` would have only
-one member when `T` is `str`. A union alias can't refer to itself, so a recursive
+Otherwise a union has no fields, methods or operators of its own.
+
+A union can mention a type parameter, in a generic function, struct or enum:
+
+```kod
+func label[T](anon x: T | str) -> str {
+    match x {
+        str(s) -> return f"text {s}"
+        T(t) -> return f"other {t}"
+    }
+}
+
+print(label(3))                  // other 3
+print(label[int64]("a"))         // text a
+```
+
+Each instance is the union of what the parameters stand for, as a set. With
+`T` = `int64` the parameter above is an `int64 | str`; with `T` = `str` it is
+just `str`, so `label[str]("a")` takes the first arm that matches, `text a`;
+and with `T` = `int64 | bool` it is `bool | int64 | str`, where `T(t)` matches
+an `int64` or a `bool` and binds it as an `int64 | bool` (see
+[type patterns](pattern-matching.md#type-patterns)). A call infers `T` from an
+argument for such a parameter: `T` is the argument's members that the
+parameter doesn't list, so `label(3)` is `label[int64]`, and an argument of
+type `int64 | str` makes it `int64` too. When that leaves nothing, as in
+`label("a")`, the type arguments have to be written.
+
+A union alias can't refer to itself, so a recursive
 type such as a JSON value is still an [enum](enums.md).
 
 ## Type aliases
