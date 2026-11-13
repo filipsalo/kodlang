@@ -592,14 +592,16 @@ A union is a set, so order, repeats and nesting don't matter. `int64 | str` and
 member.
 
 `none` in a union makes it optional: `T | none` is exactly `T?`, and
-`A | B | none` is the optional of `A | B`. An optional member counts the same
-way, so `A? | B` is that type too. Its arms sit side by side, with no `Some`:
+`A | B | none` is the optional of `A | B`, which can also be written
+`(A | B)?`. An optional member counts the same way, so `A? | B` is that type
+too. Its arms sit side by side, with no `Some`:
 `A(a)`, `B(b)` and `none`.
 
 In a type, `|` binds tighter than `or`, so `int64 | str or Error` is a fallible
 `int64 | str`. A function type's return type takes every member after the `->`,
 so `func() -> int64 | str` returns a union. To put such a function in a union,
-give its type an alias first.
+put it in parentheses: `(func() -> int64) | str`. Parentheses group any type
+this way, and a `?` after them makes the group optional.
 
 A value goes into a union by being written where the union is declared, as a `T`
 goes into a `T?`. It goes to the member of its own type. Without one, a struct,
@@ -735,8 +737,8 @@ let rs: [int64 or Error] = [1, read_size("a.txt")]
 ```
 
 A value that is already a `T or Error` goes as it is, and a nested result wraps
-as often as it takes: with `type Halved = int64 or Error`,
-`let r: Halved or Error = 3` is `Ok(Ok(3))`.
+as often as it takes: `let r: (int64 or Error) or Error = 3` is `Ok(Ok(3))`.
+Without the parentheses, `int64 or Error or Error` is just `int64 or Error`.
 A failure is never implicit. An `Error` where an `int64 or Error` is declared is
 an error that says to `throw` it, or to write `.Err(error: e)`. Only when `T`
 itself takes the value, as with `Error or Error`, is it the `Ok`.
