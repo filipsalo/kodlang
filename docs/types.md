@@ -804,6 +804,23 @@ assert r is Err(_)              // it failed
 if r is Err(e) { print(e.to_str()) }
 ```
 
+### A default for a failure: `?` on a result
+
+`r? or default`, `r?.field` and `r?.method()` work on a `T or Error` as they do
+on a `T?`. Each takes the success value, and on a failure gives up the error
+right there, where the code says so:
+
+```kod
+let n = read_size("a.txt")? or 0
+let name = load(path)?.name? or "?"
+```
+
+`r?.field` and `r?.method()` give an optional, `none` for a failure, so a chain
+ends in `? or default` as an optional's does. When `T` is itself optional, a
+failure and a `none` look the same, as for a `T??`. A bare `r?` on a result is
+an error: it would stop the program without saying what failed, which is what
+`must r` does with the error's message.
+
 ### Recovering the concrete error type
 
 `Err(e)` binds `e` as the `Error` interface. To get back the concrete error

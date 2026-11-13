@@ -14287,7 +14287,7 @@ type Codegen = struct {
                 return k
             }
             .UnwrapOpt(value, _default) -> {
-                let k = self.infer_kind(value)
+                let k = self.optional_view_kind(value)
                 if k is .KOptional(inner) {
                     return inner
                 }
@@ -14316,7 +14316,7 @@ type Codegen = struct {
                     }
                     return .KUnknown
                 }
-                let kind = self.infer_kind(value)
+                let kind = self.optional_view_kind(value)
                 if kind is .KOptional(_inner) and not self.kind_has_unknown(kind) {
                     let ret = self.infer_kind(self.optional_call_match(value, receiver: "", :method, :args))
                     if ret is .KUnknown {
@@ -14870,6 +14870,28 @@ type Codegen = struct {
             .KEnum(idx) -> return not self.enums[idx].is_union and self.implements_iface(kind, iface_idx: err_idx)
             else return false
         }
+    }
+
+    // What `?` sees in a value: a result's success value as an optional, or the value's own kind.
+    func optional_view_kind(self, anon value_id: int64) -> TypeKind {
+        let kind = self.infer_kind(value_id)
+        if self.is_result_kind(kind) {
+            return self.result_inner_kind(kind).optional()
+        }
+        return kind
+    }
+
+    // `match value { Ok(v) -> v  else -> none }`: a result's success value as an optional.
+    func result_as_optional(self, anon value_id: int64) -> int64 {
+        let span = self.p.expr_spans[value_id]
+        let name = self.fresh("__ok")
+        self.alloc_var(:name, kind: self.result_inner_kind(self.infer_kind(value_id)))
+        self.bind_var(name)
+        let arms: [int64] = [
+            self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.OkPat(binding: name)), body: self.p.alloc_expr(.Ident(:name), :span))),
+            self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(ast.Pattern.Wildcard), body: self.p.alloc_expr(.NoneLit, :span))),
+        ]
+        return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
     }
 
     // `value_id` as the Ok of the result `kind`: a cell {Ok's discriminant, value}.
@@ -16755,6 +16777,14 @@ type Codegen = struct {
     // non-null dereferences to the payload, null either panics (no `or
     // default`) or evaluates `default_id`.
     func compile_unwrap_opt(self, value_id: int64, default_id: int64) -> Val {
+        if self.is_result_kind(self.infer_kind(value_id)) {
+            if default_id == 0 {
+                self.compile_discard(value_id)
+                self.report_error(f"error: a bare `?` on `{self.kind_display(self.infer_kind(value_id))}` would stop without saying what failed; write `must` to stop with the error, or `? or default`", span: self.p.expr_spans[value_id])
+                return .VImm(value: 0)
+            }
+            return self.compile_unwrap_opt(value_id: self.result_as_optional(value_id), :default_id)
+        }
         let value_kind = self.infer_kind(value_id)
         mut optional = false
         if value_kind is .KOptional(_inner) {
@@ -16820,7 +16850,7 @@ type Codegen = struct {
     func find_struct_idx_of_optional(self, anon expr_id: int64) -> int64 {
         mut inner_kind: TypeKind = .KVoid
         mut is_opt: bool = false
-        if self.infer_kind(expr_id) is .KOptional(u) {
+        if self.optional_view_kind(expr_id) is .KOptional(u) {
             inner_kind = u
             is_opt = true
         }
@@ -16838,6 +16868,9 @@ type Codegen = struct {
     // the struct pointer, read .field, and wrap the value into a fresh
     // Some cell so the result is `U?` (U = field's type).
     func compile_optional_dot(self, value_id: int64, field: str) -> Val {
+        if self.is_result_kind(self.infer_kind(value_id)) {
+            return self.compile_optional_dot(value_id: self.result_as_optional(value_id), :field)
+        }
         let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
         if struct_idx < 0 {
             self.compile_discard(value_id)
@@ -17159,6 +17192,9 @@ type Codegen = struct {
     }
 
     func compile_optional_method_call(self, value_id: int64, method: str, args: [ast.CallArg]) -> Val {
+        if self.is_result_kind(self.infer_kind(value_id)) {
+            return self.compile_optional_method_call(value_id: self.result_as_optional(value_id), :method, :args)
+        }
         let struct_idx: int64 = self.find_struct_idx_of_optional(value_id)
         if struct_idx < 0 {
             let kind = self.infer_kind(value_id)
