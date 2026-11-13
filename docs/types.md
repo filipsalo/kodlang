@@ -724,9 +724,23 @@ statement, as before.
 A `none or Error` function that ends without a `return`, or with a bare
 `return`, returns `Ok(none)`, as `return none` does.
 
-Outside a fallible function's `return`, a plain value isn't a result:
-`let r: int64 or Error = 3` is an error, and
-`let r: int64 or Error = .Ok(value: 3)` is a successful result.
+A `T` goes where a `T or Error` is declared as its `Ok`, the way a `T` goes into a
+`T?`. That holds in a `return`, an annotated `let`, an assignment, an argument,
+a struct field, an array element, and an arm of a `match` whose value goes to
+one of them:
+
+```kod
+let r: int64 or Error = 3                // Ok(3)
+let rs: [int64 or Error] = [1, read_size("a.txt")]
+```
+
+A value that is already a `T or Error` goes as it is, and a nested result wraps
+as often as it takes: with `type Halved = int64 or Error`,
+`let r: Halved or Error = 3` is `Ok(Ok(3))`.
+A failure is never implicit. An `Error` where an `int64 or Error` is declared is
+an error that says to `throw` it, or to write `.Err(error: e)`. Only when `T`
+itself takes the value, as with `Error or Error`, is it the `Ok`.
+`.Ok(value: 3)` still works, and so does `.Err(error: e)`.
 
 `Error` is the only type that can follow `or`: `-> int64 or IoError` is a
 parse error. Throw a struct or enum that implements `Error` instead, and

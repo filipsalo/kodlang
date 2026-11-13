@@ -9114,7 +9114,7 @@ type Codegen = struct {
         if self.p.exprs[value_id] is .MatchExpr(_subject, _arms) {
             return true
         }
-        if self.builds_array_for(value_id, :kind) {
+        if self.builds_array_for(value_id, :kind) or self.wraps_into_result(value_id, expected: kind) {
             return true
         }
         match kind {
@@ -14733,6 +14733,10 @@ type Codegen = struct {
         if self.is_ctor_for(value_id, kind: expected) {
             return
         }
+        if self.wraps_into_result(value_id, :expected) {
+            self.check_value_as(value_id, expected: self.result_inner_kind(expected), :slot)
+            return
+        }
         if self.wraps_into_optional(value_id, :expected) {
             self.check_value_as(value_id, expected: expected.optional_inner(), :slot)
             return
@@ -14799,8 +14803,8 @@ type Codegen = struct {
         }
         let shown = self.kind_display(actual)
         mut hint = ""
-        if self.is_result_kind(expected) and self.kinds_compatible(self.result_inner_kind(expected), :actual) {
-            hint = "; write `.Ok(value: ...)` for a successful result"
+        if self.is_result_kind(slot) and self.is_error_value_kind(actual) {
+            hint = "; to fail, `throw` it or write `.Err(error: ...)`"
         } else if self.fits_several_members(expected, :actual) {
             hint = "; it fits more than one member"
         } else if self.is_some_optional(actual) and self.kinds_compatible(expected, actual: actual.optional_inner()) {
@@ -14812,6 +14816,64 @@ type Codegen = struct {
             hint = self.diverge_hint(value_id)
         }
         self.report_error(f"error: expected `{self.kind_display(slot)}`, got `{shown}`{hint}", span: self.p.expr_spans[value_id])
+    }
+
+    // A value going where a `T or Error` is declared is its Ok, unless it's
+    // one of the result's own constructors or a result that already fits.
+    func wraps_into_result(self, anon value_id: int64, expected: TypeKind) -> bool {
+        if not self.is_result_kind(expected) or self.is_match_expr(value_id) or self.is_ctor_for(value_id, kind: expected) {
+            return false
+        }
+        if self.is_implicit_variant_value(value_id) {
+            let inner = self.result_inner_kind(expected)
+            if inner is .KEnum(union_idx) and self.enums[union_idx].is_union {
+                return self.union_variant_for(value_id, enum_idx: union_idx) >= 0
+            }
+            return self.is_ctor_for(value_id, kind: inner)
+        }
+        let actual = self.infer_kind(value_id)
+        if actual is .KUnknown {
+            return self.lacks_own_type(value_id)
+        }
+        if self.is_result_kind(actual) {
+            return not self.kinds_compatible(expected, :actual) and self.kinds_compatible(self.result_inner_kind(expected), :actual)
+        }
+        return true
+    }
+
+    // A value that reads as a failure: an `Error`, or a struct or enum that implements it.
+    func is_error_value_kind(self, anon kind: TypeKind) -> bool {
+        let err_idx = self.find_iface_idx("Error")
+        if err_idx < 0 or self.kind_has_unknown(kind) {
+            return false
+        }
+        match kind {
+            .KInterface(idx) -> return idx == err_idx
+            .KStruct(_idx, _args) -> return self.implements_iface(kind, iface_idx: err_idx)
+            .KEnum(idx) -> return not self.enums[idx].is_union and self.implements_iface(kind, iface_idx: err_idx)
+            else return false
+        }
+    }
+
+    // `value_id` as the Ok of the result `kind`: a cell {Ok's discriminant, value}.
+    func compile_ok_value(self, anon value_id: int64, kind: TypeKind) -> str {
+        let ok_kind = self.result_inner_kind(kind)
+        let val_reg = self.compile_value_for_kind(value_id, expected: ok_kind)
+        let val_spilled = self.preserve_begin(val_reg)
+        self.emit("mov x0, #16")
+        let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(ok_kind, slot: 1))
+        let ptr_reg = self.pool.alloc_reg()
+        self.emit(f"mov {ptr_reg}, x0")
+        let payload = self.preserve_end(val_reg, spilled: val_spilled)
+        let disc_r = self.pool.alloc_reg()
+        self.emit_load_imm(disc_r, value: self.result_ok_disc())
+        self.emit(f"str {disc_r}, [{ptr_reg}]")
+        self.pool.free_reg(disc_r)
+        self.rc_retain_kind(payload, kind: ok_kind)
+        self.emit(f"str {payload}, [{ptr_reg}, #8]")
+        self.pool.free_reg(payload)
+        self.rc_mark_owned(ptr_reg, slot: rc_cell)
+        return ptr_reg
     }
 
     // As compile_value_for_kind wraps it, after building it as the inner type.
@@ -14849,6 +14911,9 @@ type Codegen = struct {
         if self.p.exprs[value_id] is .MatchExpr(subject, arms) {
             let val = self.compile_match_expr_for(arms, subject_id: subject, :expected, ok_wrap: false)
             return self.load(val)
+        }
+        if self.wraps_into_result(value_id, :expected) {
+            return self.compile_ok_value(value_id, kind: expected)
         }
         match expected {
             .KEnum(idx) -> {
@@ -15643,6 +15708,12 @@ type Codegen = struct {
         // Detect direct enum construction patterns and route through
         // compile_enum_construct; otherwise compile the expression and store
         // its (pointer) result.
+        if self.wraps_into_result(value_id, expected: .KEnum(idx: enum_idx)) {
+            let reg = self.compile_ok_value(value_id, kind: .KEnum(idx: enum_idx))
+            self.emit_str(dest_off, :reg)
+            self.pool.free_reg(reg)
+            return
+        }
         if self.widens(self.infer_kind(value_id), into: .KEnum(idx: enum_idx)) {
             let reg = self.compile_value_for_kind(value_id, expected: .KEnum(idx: enum_idx))
             self.emit_str(dest_off, :reg)
@@ -16321,7 +16392,7 @@ type Codegen = struct {
             mut already = false
             let ok_kind = self.result_inner_kind(self.return_kind)
             let value_kind = self.infer_kind(value_id)
-            if self.is_result_kind(value_kind) {
+            if self.is_result_kind(value_kind) and not self.wraps_into_result(value_id, expected: self.return_kind) {
                 already = true
             }
             if self.is_ctor_for(value_id, kind: ok_kind) or self.builds_array_for(value_id, kind: ok_kind) {
