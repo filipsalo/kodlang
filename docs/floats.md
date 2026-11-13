@@ -78,7 +78,7 @@ than 64 bits where a float can't be trusted.
 ```kod
 print((0.1 + 0.2).to_str())     // 0.30000000000000004
 print((1.0).to_str())           // 1.0
-print(("2.5e3".parse_float()?).to_str())   // 2500.0
+print((must "2.5e3".parse_float()).to_str())   // 2500.0
 ```
 
 ## JSON
@@ -88,8 +88,8 @@ A JSON number that is not a whole `int64` keeps its text in a
 and writing one is `to_str`:
 
 ```kod
-let text = item.get("price").as_number_text()?
-let price = text.parse_float()?
+let text = must item.get("price").as_number_text()
+let price = must text.parse_float()
 let out = json.Value.Decimal(text: (price * 1.2).to_str())
 ```
 

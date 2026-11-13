@@ -63,7 +63,7 @@ declared and is checked as a `T`: with `type Words = [str]`,
 declared type (`` expected `int64?`, got `str` ``). `none` is accepted
 wherever an optional or `none` is declared, a struct or primitive other
 than `bytes` where an interface is, and `[]` as any array type. A `T?`
-isn't accepted where a `T` is declared; unwrap it first with `x?` or
+isn't accepted where a `T` is declared; unwrap it first with `must x` or
 `x? or default`. An optional is passed on as it is, so a `T?` where a `U?`
 is declared needs `T` to be `U`: like an `[Sq]` isn't a `[Shape]`, an
 `Sq?` or `int64?` isn't a `Shape?` even when `Sq` and `int64` implement
@@ -376,36 +376,39 @@ thing. A `Map[str, int64?]`'s `get` returns `none` both for a missing key and
 for a stored `none`; `contains` tells them apart. Where the difference
 matters, an enum that names both cases says it better.
 
-### Postfix `?`
+### Unwrapping: `x? or default` and `must x`
 
-`expr?` on a `T?` value evaluates to `T`. Without a trailing clause it
-panics on `none`; with `or default` it substitutes the default
-instead:
+`x? or default` on a `T?` value evaluates to `T`, or to the default when `x`
+is `none`. `must x` evaluates to `T`, and stops the program on `none` with the
+position of the value, as it stops on a failed `T or Error`:
 
 ```kod
 let n: int64? = find("hello", 'l')
-let idx: int64       = n?           // panics if none
-let idx2: int64      = n? or -1     // -1 if none
-let idx3: int64      = must n       // panics if none
+let idx: int64  = n? or -1     // -1 if none
+let idx2: int64 = must n       // stops if none
 ```
 
-`must n` is the same as a bare `n?`: the `T`, or a stop with the position of
-the `none`, as `must` stops on a failed `T or Error`.
+`?` is always the safe side: it goes before `or` or `.` (see
+[Optional chaining](#optional-chaining)), and a bare `x?` is an error that
+says to write `must x` or `x? or default`. Whatever can stop the program is
+spelled `must`. `must` takes the expression and its `.`, `[...]` and `(...)`
+steps, so `must m.get(k)` unwraps what `get` returns, and indexing the
+unwrapped value needs parentheses: `(must m.get(k))[0]`.
 
 The default is evaluated lazily (only when the value is `none`), and
 its type must match the unwrapped `T`, unless it's a call that never
 returns, such as `panic(...)` or a helper that ends in one
 (see [Return values](functions.md#return-values)).
 It's built as a `T`: with `T` an interface, a struct default becomes an
-interface value, and with `T` an enum, `.Up` names `T`'s variant. `x?` on
+interface value, and with `T` an enum, `.Up` names `T`'s variant. `x? or d` on
 a value that isn't optional is an error. A following `or` outside the
 unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
-`(x?) or some_bool` is a boolean-or on the unwrapped value (and a type
+`(must x) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
 
 Operators don't look inside an optional. With `n: int64?`, `n == 3`,
 `n < 4` and `n + 1` are errors, and so is comparing a `bool?` such as
-`m.get(key)` with `true`; unwrap first, as in `n? == 3` or
+`m.get(key)` with `true`; unwrap first, as in `must n == 3` or
 `(n? or 0) + 1`. Only `== none` and `!= none` compare the optional itself.
 
 ### Optional chaining
@@ -711,7 +714,7 @@ A function declared `-> T or Error` returns a `Result` cell — either an `Ok(T)
 
 `try` and `must` take a `T or Error` value, and `try` only works inside a
 function that returns `T or Error` itself; anything else is an error. `must`
-also takes a `T?` (see [Postfix `?`](#postfix-)). Either
+also takes a `T?` (see [Unwrapping](#unwrapping-x-or-default-and-must-x)). Either
 can appear anywhere a value can, as in `out += [try parse(s)]` or
 `xs[try first(xs)..]`; on an `Err`, `try` returns from the function there. An
 explicit `Result[T, E]` with an `E` other than `Error` doesn't count, since
@@ -829,9 +832,8 @@ let name = load(path)?.name? or "?"
 
 `r?.field` and `r?.method()` give an optional, `none` for a failure, so a chain
 ends in `? or default` as an optional's does. When `T` is itself optional, a
-failure and a `none` look the same, as for a `T??`. A bare `r?` on a result is
-an error: it would stop the program without saying what failed, which is what
-`must r` does with the error's message.
+failure and a `none` look the same, as for a `T??`. To stop on a failure,
+write `must r`, which prints the error's message.
 
 ### Recovering the concrete error type
 
