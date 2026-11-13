@@ -88,7 +88,7 @@ A JSON number that is not a whole `int64` keeps its text in a
 and writing one is `to_str`:
 
 ```kod
-let text = json.as_number_text(json.get(item, key: "price"))?
+let text = item.get("price").as_number_text()?
 let price = text.parse_float()?
 let out = json.Value.Decimal(text: (price * 1.2).to_str())
 ```

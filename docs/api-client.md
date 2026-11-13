@@ -69,11 +69,11 @@ so a missing or null field is a fallback, not a crash:
 
 ```kod
 func text_of(anon v: json.Value, key: str, fallback: str) -> str {
-    return json.as_str(json.get(v, key: key))? or fallback
+    return v.get(key).as_str()? or fallback
 }
 ```
 
-`json.get(license, key: "spdx_id")` on a `null` license is `Null`, and `as_str` of
+`license.get("spdx_id")` on a `null` license is `Null`, and `as_str` of
 that is `none`, which `? or "none"` turns into the text `none`.
 
 **Errors.** A non-2xx response is not a Kod error; `fetch` hands it back so you can
@@ -110,7 +110,7 @@ body.put_str("title", "It crashes")
 body.put_str("body", "Steps to reproduce: ...")
 body.put("labels", json.array_of([json.str_value("bug")]))
 
-let payload = kod_str_to_bytes(json.emit(body.build()))
+let payload = kod_str_to_bytes(body.build().emit())
 let response = try post(
     "https://api.example.com/issues",
     payload,
@@ -129,5 +129,5 @@ let response = try post(
 - TLS goes through the system's SecureTransport, which speaks TLS 1.2 at most. A
   server that insists on TLS 1.3 fails with a `Tls` error.
 - Numbers with a fraction or an exponent come back as `Decimal` text:
-  `json.as_int` is `none` for them, `json.as_number_text` gives the digits, and
+  `as_int()` is `none` for them, `as_number_text()` gives the digits, and
   `.parse_float()` on those turns them into a [`float64`](floats.md).

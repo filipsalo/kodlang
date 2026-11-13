@@ -13,10 +13,10 @@ import "json"
 
 func main() -> int64 or Error {
     let v = try json.parse("{\"name\": \"kod\", \"tags\": [1, 2.5, \"\\u00e9\"]}")
-    let name = json.as_str(json.get(v, key: "name"))
+    let name = v.get("name").as_str()
     print(name? or "?")                       // kod
-    print(json.emit(v))                       // {"name":"kod","tags":[1,2.5,"é"]}
-    print(json.emit_pretty(v))
+    print(v.emit())                           // {"name":"kod","tags":[1,2.5,"é"]}
+    print(v.emit_pretty())
     return 0
 }
 ```
@@ -83,7 +83,7 @@ number is a `Decimal`: one with a fraction or an exponent (`2.5`, `1e3`,
 `-0.0`), or an integer too large for `int64`. A `Decimal` keeps the number's
 text exactly as it was written, so nothing is rounded and it is written back
 unchanged. Read it as a [`float64`](floats.md) with `parse_float` on
-`as_number_text`, and build one with `to_str`. `\uXXXX` escapes are
+`as_number_text()`, and build one with `to_str`. `\uXXXX` escapes are
 decoded into UTF-8, with a surrogate pair giving one four-byte character, and
 `\u0000` gives a NUL byte inside the `str`.
 
@@ -93,20 +93,20 @@ Object entries are stored as parallel arrays (`keys[i]` is the key of
 
 ## Accessors
 
-Free functions (Kod has no methods on enums). None of them can fail: they
-return `Null` or `none` when the value isn't what you asked for, so
-`get(get(v, key: "a"), key: "b")` is safe on any input.
+Methods on `Value`. None of them can fail: they return `Null` or `none` when
+the value isn't what you asked for, so `v.get("a").get("b")` is safe on any
+input.
 
-| Function | Returns |
+| Method | Returns |
 |---|---|
-| `get(v, key)` | the first value of that key in an object; `Null` if the key is missing or `v` isn't an object |
-| `at(v, index)` | the element of an array; `Null` if out of range or `v` isn't an array |
-| `as_str(v)` | `str?`, for a `Str` |
-| `as_int(v)` | `int64?`, for a `Number` (a `Decimal` is `none`, even `3.0`) |
-| `as_bool(v)` | `bool?`, for a `Bool` |
-| `as_array(v)` | `[Value]?`, for an `Array` |
-| `as_number_text(v)` | `str?`, the text of a `Number` or a `Decimal` |
-| `is_null(v)` | `bool` |
+| `v.get(key)` | the first value of that key in an object; `Null` if the key is missing or `v` isn't an object |
+| `v.at(index)` | the element of an array; `Null` if out of range or `v` isn't an array |
+| `v.as_str()` | `str?`, for a `Str` |
+| `v.as_int()` | `int64?`, for a `Number` (a `Decimal` is `none`, even `3.0`) |
+| `v.as_bool()` | `bool?`, for a `Bool` |
+| `v.as_array()` | `[Value]?`, for an `Array` |
+| `v.as_number_text()` | `str?`, the text of a `Number` or a `Decimal` |
+| `v.is_null()` | `bool` |
 
 ## Building values
 
@@ -119,7 +119,7 @@ body.put_str("title", "a bug")
 body.put_int("priority", 2)
 body.put_bool("urgent", false)
 body.put("labels", json.array_of([.Str(value: "bug"), .Str(value: "ui")]))
-let text = json.emit(body.build())
+let text = body.build().emit()
 // {"title":"a bug","priority":2,"urgent":false,"labels":["bug","ui"]}
 ```
 
@@ -136,9 +136,11 @@ arrays.
 ## Emitting
 
 ```kod
-func emit(anon v: Value) -> str
-func emit_pretty(anon v: Value, indent: int64 = 2) -> str
+func emit(self) -> str
+func emit_pretty(self, indent: int64 = 2) -> str
 ```
+
+Both are methods on `Value`: `v.emit()`, `v.emit_pretty(indent: 4)`.
 
 `emit` writes compact JSON with no spaces. `emit_pretty` puts each array
 element and object entry on its own line, indented by `indent` spaces per
@@ -149,5 +151,5 @@ everything else, UTF-8 included, as it is. The text of a `Decimal` is written
 verbatim; a `Decimal` built by hand whose text isn't a JSON number is written
 as `null`, so the output is always valid JSON.
 
-`emit(parse(s))` and `s` mean the same JSON, with these exceptions: the
+Emitting what `parse(s)` returns gives the same JSON as `s`, except for the
 whitespace, the choice of escapes in strings, and `-0` written as `0`.
