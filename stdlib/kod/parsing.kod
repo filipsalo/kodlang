@@ -2065,6 +2065,10 @@ type Parser = struct {
 		// same base expression. For `obj.method(args)` and similar, the
 		// resulting nodes all point back to where the base started.
 		let lhs_span: ast.Span = self.expr_spans[lhs]
+		// An open chain `x?.a.b`: the value before `?.` and the hidden name
+		// the steps after it read, as `lhs`, in place of the unwrapped value.
+		mut chain_value: int64 = 0
+		mut chain_name: str = ""
 		for self.at(.OpenParen) or self.at(.Dot) or self.at(.OpenBracket) or self.at(.Question) {
 			// Function/method call
 			if self.at(.OpenParen) {
@@ -2177,6 +2181,10 @@ type Parser = struct {
 			// surrounding parse_expr_prec (where it'll be the boolean
 			// operator, or a type error if applied to the unwrap result).
 			if self.at(.Question) {
+				if chain_value != 0 {
+					lhs = self.close_chain(chain_value, name: chain_name, body: lhs, span: lhs_span)
+					chain_value = 0
+				}
 				self.advance()
 				if self.at(.Dot) {
 					// `x?.field` — short-circuit field access on a
@@ -2219,7 +2227,18 @@ type Parser = struct {
 							self.skip_newlines()
 						}
 						self.expect(.CloseParen)
-						lhs = self.alloc_expr(ast.Expr.OptionalMethodCall(value: lhs, method: name, :args), span: lhs_span)
+						if self.at(.Dot) or self.at(.OpenBracket) {
+							chain_value = lhs
+							chain_name = f"__patchain{lhs}"
+							let method: int64 = self.chain_step(chain_name, field: name, span: lhs_span)
+							lhs = self.alloc_expr(ast.Expr.Call(callee: method, :args), span: lhs_span)
+						} else {
+							lhs = self.alloc_expr(ast.Expr.OptionalMethodCall(value: lhs, method: name, :args), span: lhs_span)
+						}
+					} else if self.at(.Dot) or self.at(.OpenBracket) {
+						chain_value = lhs
+						chain_name = f"__patchain{lhs}"
+						lhs = self.chain_step(chain_name, field: name, span: lhs_span)
 					} else {
 						lhs = self.alloc_expr(ast.Expr.OptionalDot(value: lhs, field: name), span: lhs_span)
 					}
@@ -2232,7 +2251,30 @@ type Parser = struct {
 				}
 			}
 		}
+		if chain_value != 0 {
+			lhs = self.close_chain(chain_value, name: chain_name, body: lhs, span: lhs_span)
+		}
 		return lhs
+	}
+
+	// `name.field`: the first step of a chain, on the unwrapped value.
+	func chain_step(self, anon name: str, field: str, span: ast.Span) -> int64 {
+		let unwrapped: int64 = self.alloc_expr(ast.Expr.Ident(:name), :span)
+		let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field), :span)
+		return self.alloc_expr(ast.Expr.Binary(lhs: unwrapped, op: ast.Op.Dot, :rhs), :span)
+	}
+
+	// `x?.a.b` as `match x { Some(v) -> v.a.b  else -> none }`, with `x` seen as an
+	// optional so that a result's failure is `none` too.
+	func close_chain(self, anon value: int64, name: str, body: int64, span: ast.Span) -> int64 {
+		let subject: int64 = self.alloc_expr(ast.Expr.AsOptional(:value), :span)
+		let some: int64 = self.alloc_pattern(ast.Pattern.SomePat(binding: name))
+		let none_lit: int64 = self.alloc_expr(ast.Expr.NoneLit, :span)
+		let arms: [int64] = [
+			self.alloc_match_expr_arm(ast.MatchExprArm(pattern: some, :body)),
+			self.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.alloc_pattern(ast.Pattern.Wildcard), body: none_lit)),
+		]
+		return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
 	}
 
 	func bin_op_prec(self) -> int64 {
@@ -3909,6 +3951,7 @@ type Renamer = struct {
 				self.expr(default)
 			}
 			.OptionalDot(value, _field) -> self.expr(value)
+			.AsOptional(value) -> self.expr(value)
 			.OptionalMethodCall(value, _method, args) -> {
 				self.expr(value)
 				self.args(args)

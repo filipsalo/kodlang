@@ -412,7 +412,12 @@ when `x` is `none`. `x?.method(...)` works on any `T?` whose `T` has
 methods: `n?.to_str()` on an `int64?`, `s?.find("l")` on a `str?`, or a
 method of an interface value. A field or return type that is already optional stays
 one level deep, so chains read through: with `a: A?` whose `b: B?` has
-`n: int64?`, `a?.b?.n` is an `int64?`. `x?.method(...)` takes arguments like an ordinary
+`n: int64?`, `a?.b?.n` is an `int64?`. The rest of a chain after `?.` runs on
+the unwrapped value, so `x?.name.upper()`, `x?.items[0]` and
+`json.parse(s)?.get("k").as_str()` reach past the first step and are `none`
+as soon as `x` is; a `?.` is needed again only where a step gives an optional
+itself, as `a?.b?.n` does. The chain ends at a `?` that isn't followed by
+`.`, so `x?.name.upper()? or ""` defaults the whole chain. `x?.method(...)` takes arguments like an ordinary
 method call: arguments it leaves out take the method's
 [defaults](functions.md#default-values), and none of them is evaluated
 when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
