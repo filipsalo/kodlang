@@ -730,6 +730,21 @@ must file.close()          // panic on it
 let _ = file.close()       // ignore it, on purpose
 ```
 
+`try r` or `must r` on its own line, with `r` a plain name, narrows `r` for
+the rest of the block: it is `let r = try r`, so `r` is the `T` from there on.
+`must o` narrows a `T?` the same way. Like the other narrowing in
+[Narrowing](pattern-matching.md#narrowing), this doesn't apply when the rest
+of the block assigns to `r`, and after the block `r` has its declared type
+again:
+
+```kod
+func size_plus(anon path: str) -> int64 or Error {
+    let size = file_size(path)
+    try size                    // size is an int64 from here on
+    return size + 1
+}
+```
+
 `let _ = expr` evaluates `expr`, whatever its type, and keeps nothing: it binds no
 name, so it can be written any number of times in a block, and `_` can't be read
 afterwards. It is for fallible calls whose failure doesn't matter, like closing a

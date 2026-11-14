@@ -357,6 +357,13 @@ func string_body(anon raw: str) -> str {
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
 // An early exit parse_block folds the rest of the block into (see fold_guards):
 // `at` is where the rest starts in the block's statements and `from` in its tokens.
+// A `try x` or `must x` statement, which narrows `x` from token `from` on.
+type Unwrap = struct {
+	stmt: int64
+	from: int64
+	name: str
+}
+
 type Guard = struct {
 	at: int64
 	from: int64
@@ -2410,6 +2417,7 @@ type Parser = struct {
 		self.skip_newlines()
 		mut stmts: [int64] = []
 		mut guards: [Guard] = []
+		mut unwraps: [Unwrap] = []
 		for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
 			self.skip_newlines()
 			if self.peek_kind() == .CloseCurly {
@@ -2419,6 +2427,7 @@ type Parser = struct {
 			// Each block it is in ends here, and the declaration is parsed.
 			if self.at_decl_keyword() {
 				self.record_error(f"error: expected `}}` before {self.peek_kind().name()}, which starts a declaration", got: self.peek(), desync: true)
+				self.narrow_unwraps(unwraps, to: self.pos)
 				return self.fold_guards(stmts, :guards, to: self.pos)
 			}
 			let errors_before = len(self.errors)
@@ -2435,11 +2444,40 @@ type Parser = struct {
 				guards += [Guard(at: len(stmts), from: self.pos, arm: self.guard_arm, pattern: self.guard_pat, name: self.guard_name, call: self.guard_call)]
 				self.guard_arm = -1
 			}
+			let unwrapped = self.unwrap_stmt_name(stmt_id)
+			if len(unwrapped) > 0 {
+				unwraps += [Unwrap(stmt: stmt_id, from: self.pos, name: unwrapped)]
+			}
 			self.skip_newlines()
 		}
 		let stmts_end = self.pos
 		self.expect(.CloseCurly)
+		self.narrow_unwraps(unwraps, to: stmts_end)
 		return self.fold_guards(stmts, :guards, to: stmts_end)
+	}
+
+	// The name of a `try x` or `must x` statement, or "".
+	func unwrap_stmt_name(self, anon stmt_id: int64) -> str {
+		if stmt_id < 0 {
+			return ""
+		}
+		let .ExprStmt(expr) = self.stmts[stmt_id] else { return "" }
+		match self.exprs[expr] {
+			.Try(inner) -> return self.narrow_name(inner)
+			.Must(inner) -> return self.narrow_name(inner)
+			else return ""
+		}
+	}
+
+	// `try x` and `must x` statements narrow `x` for the rest of the block: each
+	// becomes `let x = try x`, unless the rest assigns `x`.
+	func narrow_unwraps(self, anon unwraps: [Unwrap], to: int64) -> none {
+		for u in unwraps {
+			if not self.assigns(u.name, from: u.from, :to) {
+				let .ExprStmt(expr) = self.stmts[u.stmt] else { continue }
+				self.stmts[u.stmt] = ast.Stmt.Let(name: u.name, typ: 0, value: expr, mutable: false)
+			}
+		}
 	}
 
 	// `if x is none { return }` and the statements after it: those go in the

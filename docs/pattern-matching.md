@@ -350,6 +350,9 @@ doesn't narrow, and neither does a block that ends in an `if` whose branches
 all return. When the call can return, the rest of the block sees the name as
 it was.
 
+`try x` or `must x` on its own line narrows the rest of the block the same
+way, under the same rules: see [`T or Error`](types.md#fallible-types-t-or-error).
+
 ### Nested patterns
 
 A payload position can hold a pattern instead of a name. The arm matches only
