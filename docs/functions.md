@@ -569,7 +569,7 @@ extern func labs(anon n: int64) -> int64     // compiled programs only
 extern func putchar(anon c: int64) -> int64
 ```
 
-An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`, so a libc function that takes a C string does not fit.
+An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`; to call a libc function that takes a C string, a buffer or a pointer to write to, pass addresses from [`unsafe`](unsafe.md) as `int64`.
 
 ## Recursion
 
