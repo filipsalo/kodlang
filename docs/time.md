@@ -23,6 +23,7 @@ print(took.to_str())                       // 250.31ms
 |---|---|
 | `monotonic_ns()` | nanoseconds from an unspecified origin that never go backwards; only differences mean anything. Use it to time things. |
 | `unix_ns()` | nanoseconds since 1970-01-01 UTC by the wall clock. It can jump if the system clock is adjusted, so it is not for measuring elapsed time. |
+| `monotonic_res_ns()` | the smallest step `monotonic_ns()` can take, in nanoseconds; at least 1. |
 
 Both are plain `int64`, which holds about 292 years of nanoseconds.
 

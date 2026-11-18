@@ -446,53 +446,6 @@ int64_t kod_errno_kind(int64_t err) {
     }
 }
 
-// Wait until one of `fds` is ready for what `events` asks (1 read, 2 write),
-// for up to `timeout_ms` (-1: no limit), and set each `ready` slot to 0 or 1.
-// A negative fd is skipped. The count of ready fds, or -1 with g_io_errno set.
-// An interrupted wait resumes with the time that is left.
-int64_t kod_poll(KodArray *fds_arr, KodArray *events_arr, KodArray *ready_arr, int64_t timeout_ms) {
-    int64_t n = fds_arr->len;
-    int64_t *fds = (int64_t *)fds_arr->ptr;
-    int64_t *events = (int64_t *)events_arr->ptr;
-    int64_t *ready = (int64_t *)ready_arr->ptr;
-    if (events_arr->len < n || ready_arr->len < n) {
-        g_io_errno = EINVAL;
-        return -1;
-    }
-    struct pollfd *p = calloc(n > 0 ? (size_t)n : 1, sizeof(struct pollfd));
-    for (int64_t i = 0; i < n; i++) {
-        p[i].fd = (int)fds[i];
-        p[i].events = events[i] == 2 ? POLLOUT : POLLIN;
-    }
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    int got;
-    for (;;) {
-        int wait_ms = -1;
-        if (timeout_ms >= 0) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t spent = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
-            int64_t left = timeout_ms - spent;
-            if (left < 0) left = 0;
-            wait_ms = left > 2147483647 ? 2147483647 : (int)left;
-        }
-        got = poll(p, (nfds_t)n, wait_ms);
-        if (got >= 0 || errno != EINTR) break;
-    }
-    if (got < 0) {
-        g_io_errno = errno;
-        free(p);
-        return -1;
-    }
-    for (int64_t i = 0; i < n; i++) {
-        ready[i] = p[i].fd >= 0 && p[i].revents != 0;
-    }
-    free(p);
-    g_io_errno = 0;
-    return got;
-}
-
 // fcntl with a third argument, for Kod: fcntl is variadic, which an extern
 // can't call. The result, or -1 with errno set.
 int64_t kod_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
@@ -721,58 +674,6 @@ KodStr *read_stdin_exact(int64_t n) {
         s->buf[got] = '\0';
     }
     return s;
-}
-
-/* ── Time ─────────────────────────────────────────────────────────────
- *
- * Two primitives: a monotonic clock (origin is unspecified — only
- * differences are meaningful, but it never goes backwards) and a
- * wall clock (nanoseconds since the Unix epoch). Both return int64
- * to avoid carrying a time-struct around at the language level;
- * users do the arithmetic. Sufficient for ~292 years of nanoseconds,
- * comfortably past any test-runner timing or "is this stale?" use.
- */
-int64_t kod_monotonic_ns(void) {
-    // CLOCK_MONOTONIC_RAW, not CLOCK_MONOTONIC: the latter is only 1 µs
-    // granular on macOS (clock_getres reports 1000 ns), so durations
-    // came out as whole microseconds with three trailing zeros. The RAW
-    // clock is backed by the hardware timebase (~41 ns/tick on Apple
-    // silicon), giving honest sub-µs resolution. RAW also skips NTP
-    // slewing, which is what we want for measuring elapsed time anyway.
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
-}
-
-/* Resolution of CLOCK_MONOTONIC_RAW in whole ns (at least 1): about 42 ns
- * on Apple silicon (24 MHz timebase). The smallest difference two reads of
- * kod_monotonic_ns can show; the test runner reports a 0 ns duration as
- * below it. */
-int64_t kod_monotonic_res_ns(void) {
-    struct timespec r;
-    if (clock_getres(CLOCK_MONOTONIC_RAW, &r) != 0) {
-        return 1;
-    }
-    int64_t ns = (int64_t)r.tv_sec * 1000000000 + r.tv_nsec;
-    return ns > 0 ? ns : 1;
-}
-
-int64_t kod_unix_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
-}
-
-// Sleep for `ns` nanoseconds; a signal doesn't end it early. Zero or less returns at once.
-void kod_sleep_ns(int64_t ns) {
-    if (ns <= 0) {
-        return;
-    }
-    struct timespec ts;
-    ts.tv_sec = ns / 1000000000;
-    ts.tv_nsec = ns % 1000000000;
-    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
-    }
 }
 
 // ── Sampling profiler ─────────────────────────────────────────────────

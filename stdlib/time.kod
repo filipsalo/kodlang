@@ -1,4 +1,4 @@
-// Time primitives backed by `clock_gettime` in stdlib/runtime.c.
+// Time primitives backed by C's `clock_gettime`.
 //
 // Two clocks, two contracts:
 //
@@ -14,16 +14,53 @@
 //
 // The clocks return int64 nanoseconds, which covers ~292 years. A `Duration`
 // is a length of time, and `sleep` waits for one.
-extern func kod_monotonic_ns() -> int64
-extern func kod_unix_ns() -> int64
-extern func kod_sleep_ns(anon ns: int64) -> none
+import "libc"
+import "unsafe"
+
+// macOS clock ids. CLOCK_MONOTONIC_RAW, not CLOCK_MONOTONIC: the latter is
+// only 1 µs granular on macOS, while RAW is backed by the hardware timebase
+// (~41 ns a tick on Apple silicon) and skips NTP slewing, which is what
+// measuring elapsed time wants.
+let CLOCK_REALTIME: int64 = 0
+let CLOCK_MONOTONIC_RAW: int64 = 4
+let EINTR: int64 = 4
+
+// A C struct timespec { seconds, nanoseconds } the clocks write to, allocated
+// on first use and kept.
+mut _ts: int64 = 0
+
+func _timespec() -> int64 {
+    if _ts == 0 {
+        _ts = unsafe.alloc(16)
+    }
+    return _ts
+}
+
+func _read_clock(anon clock: int64) -> int64 {
+    let ts = _timespec()
+    libc.clock_gettime(clock, ts)
+    return unsafe.load64(ts) * 1000000000 + unsafe.load64(ts + 8)
+}
 
 func monotonic_ns() -> int64 {
-    return kod_monotonic_ns()
+    return _read_clock(CLOCK_MONOTONIC_RAW)
 }
 
 func unix_ns() -> int64 {
-    return kod_unix_ns()
+    return _read_clock(CLOCK_REALTIME)
+}
+
+// The smallest step monotonic_ns can take, at least 1 ns.
+func monotonic_res_ns() -> int64 {
+    let ts = _timespec()
+    if unsafe.c_int(libc.clock_getres(CLOCK_MONOTONIC_RAW, ts)) != 0 {
+        return 1
+    }
+    let ns = unsafe.load64(ts) * 1000000000 + unsafe.load64(ts + 8)
+    if ns > 0 {
+        return ns
+    }
+    return 1
 }
 
 // A length of time, in nanoseconds. See docs/time.md.
@@ -146,7 +183,16 @@ func decimal(anon whole: int64, anon frac: int64, scale: int64) -> str {
 
 // Wait at least `d`; a signal doesn't cut it short, and zero or less returns at once.
 func sleep(anon d: Duration) -> none {
-    kod_sleep_ns(d.ns)
+    if d.ns <= 0 {
+        return none
+    }
+    // nanosleep leaves what is left in `ts` when a signal cuts it short.
+    let ts = unsafe.alloc(16)
+    unsafe.store64(ts, d.ns / 1000000000)
+    unsafe.store64(ts + 8, d.ns % 1000000000)
+    for unsafe.c_int(libc.nanosleep(ts, ts)) != 0 and unsafe.errno() == EINTR {
+    }
+    unsafe.free(ts)
 }
 
 // A moment: `seconds` since 1970-01-01 UTC, negative before it, and `nanos`
@@ -226,7 +272,7 @@ type Utc = struct {
 }
 
 func now() -> Time {
-    let ns = kod_unix_ns()
+    let ns = unix_ns()
     return Time(seconds: ns / 1000000000, nanos: ns % 1000000000)
 }
 
