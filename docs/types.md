@@ -613,14 +613,17 @@ if r is File(f) {              // still the File
 }
 ```
 
-The second interface's provided methods don't have to be in the first: a
-value converted to it gets the ones the first lacks, as written in the second
-interface, even when its type declares a method of the same name, which only
-the first interface's table could have carried. A method the first interface
-has keeps what that table holds, except that a provided body the value got
-from an earlier conversion becomes the second interface's. A method the first
-interface provides can't stand in for one the second requires: that converts
-nothing, and is the usual ``expected `B`, got `A` `` error.
+The second interface's provided methods don't have to be in the first. For
+each one the first lacks, the converted value gets its type's own method of
+that name, when the type declares one with the same parameter and return
+types, as it would have been boxed straight into the second interface; else
+the body in the second interface. (An instance of a generic type is the one
+exception: it gets the second interface's body, since only the methods it
+uses are compiled.) A method the first interface has keeps what that table
+holds, except that a provided body the value got from an earlier conversion
+is looked up again the same way. A method the first interface provides can't
+stand in for one the second requires: that converts nothing, and is the
+usual ``expected `B`, got `A` `` error.
 
 Converting builds the new interface's method table when it runs, so it costs a
 small allocation. Arrays and optionals of interface values don't convert

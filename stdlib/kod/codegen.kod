@@ -366,6 +366,12 @@ type MethodInfo = struct {
     sig: SigInfo
 }
 
+// A type's methods with their code labels, for its method directory.
+type MethodDirectory = struct {
+    methods: [MethodInfo]
+    labels: [str]
+}
+
 type StructInfo = struct {
     // How many instances' bodies led to this instance.
     body_depth: int64 = 0
@@ -14036,7 +14042,7 @@ type Codegen = struct {
         for m in want {
             let at = self.iface_method_pos(from_idx, name: m.name)
             if at < 0 {
-                self.emit_label_addr(tmp, label: self.provided_conv_label(to_idx, name: m.name))
+                self.emit_own_or_provided(tmp, old_vt: old_vt, have_count: have_count, to_idx: to_idx, m: m)
             } else {
                 self.emit(f"ldr {tmp}, [{old_vt}, #{8 * at}]")
                 if self.is_provided(self.interfaces[from_idx].methods[at]) {
@@ -14046,7 +14052,7 @@ type Codegen = struct {
                     self.emit(f"cmp {tmp}, {old_body}")
                     self.pool.free_reg(old_body)
                     self.emit(f"bne {keep_lbl}")
-                    self.emit_label_addr(tmp, label: self.provided_conv_label(to_idx, name: m.name))
+                    self.emit_own_or_provided(tmp, old_vt: old_vt, have_count: have_count, to_idx: to_idx, m: m)
                     self.emit_label(keep_lbl)
                 }
             }
@@ -14063,6 +14069,42 @@ type Codegen = struct {
         let out_r = self.pool.alloc_reg()
         self.emit(f"mov {out_r}, x0")
         return out_r
+    }
+
+    // The entry a converted vtable has for the provided method `m` of
+    // interface `to_idx`, which the old vtable `old_vt` can't give: the
+    // value's type's own method, from the directory its identity word points
+    // at (see owner_directory), else the interface's body.
+    func emit_own_or_provided(self, anon dest: str, old_vt: str, have_count: int64, to_idx: int64, m: MethodInfo) -> none {
+        let done = self.fresh("Lown_done")
+        let again = self.fresh("Lown_loop")
+        let next = self.fresh("Lown_next")
+        let dir_r = self.pool.alloc_reg()
+        let count_r = self.pool.alloc_reg()
+        let key_r = self.pool.alloc_reg()
+        let probe_r = self.pool.alloc_reg()
+        self.emit_label_addr(dest, label: self.provided_conv_label(to_idx, name: m.name))
+        self.emit(f"ldr {dir_r}, [{old_vt}, #{8 * have_count}]")
+        self.emit(f"cbz {dir_r}, {done}")
+        self.emit(f"ldr {count_r}, [{dir_r}]")
+        self.emit(f"add {dir_r}, {dir_r}, #8")
+        self.emit_load_imm(key_r, value: self.method_key(m.name, sig: m.sig))
+        self.emit_label(again)
+        self.emit(f"cbz {count_r}, {done}")
+        self.emit(f"ldr {probe_r}, [{dir_r}]")
+        self.emit(f"cmp {probe_r}, {key_r}")
+        self.emit(f"bne {next}")
+        self.emit(f"ldr {dest}, [{dir_r}, #8]")
+        self.emit(f"b {done}")
+        self.emit_label(next)
+        self.emit(f"add {dir_r}, {dir_r}, #16")
+        self.emit(f"sub {count_r}, {count_r}, #1")
+        self.emit(f"b {again}")
+        self.emit_label(done)
+        self.pool.free_reg(probe_r)
+        self.pool.free_reg(key_r)
+        self.pool.free_reg(count_r)
+        self.pool.free_reg(dir_r)
     }
 
     // Leave the address of `label` in `reg`.
@@ -19524,7 +19566,7 @@ type Codegen = struct {
                 self.println(f"\t.private_extern {id_lbl}")
                 self.println(f"\t.weak_definition {id_lbl}")
                 self.println(f"{id_lbl}:")
-                self.println("\t.quad 0")
+                self.emit_method_directory(self.owner_directory(owner))
             }
         }
         // Primitive vtables: same layout, but methods come from the
@@ -19545,8 +19587,81 @@ type Codegen = struct {
                     self.println(f"\t.quad 0")
                 }
             }
-            self.println("\t.quad 0")
+            self.println(f"\t.quad {self.prim_directory_label(kind)}")
         }
+        // A primitive's directory, one per kind in this module.
+        mut prim_ids: [str] = []
+        for kind in self.prim_vtable_kinds {
+            let lbl = self.prim_directory_label(kind)
+            if not arrays.contains(prim_ids, lbl) {
+                prim_ids += [lbl]
+                self.println("\t.p2align 3")
+                self.println(f"{lbl}:")
+                mut methods: [MethodInfo] = []
+                mut labels: [str] = []
+                for pm in self.prim_methods {
+                    if self.same_kind(pm.kind, kind) {
+                        methods += [MethodInfo(name: pm.name, decl_id: 0, sig: pm.sig)]
+                        labels += [pm.label]
+                    }
+                }
+                self.emit_method_directory(MethodDirectory(:methods, :labels))
+            }
+        }
+    }
+
+    // The label of this module's directory of a primitive kind's methods.
+    func prim_directory_label(self, anon kind: TypeKind) -> str {
+        return f"$prim${self.kind_display(kind)}$methods$in${self.path_prefix}"
+    }
+
+    // The methods a converted interface value can find its type's own by
+    // (see emit_iface_convert): those a struct or enum declares that take
+    // `self`, with their labels. A generic type's instance has none, since
+    // only the methods it uses are compiled.
+    func owner_directory(self, anon owner: TypeKind) -> MethodDirectory {
+        mut candidates: [MethodInfo] = []
+        match owner {
+            .KStruct(idx, _args) -> {
+                if self.structs[idx].template_idx < 0 {
+                    candidates = self.structs[idx].methods
+                }
+            }
+            .KEnum(idx) -> {
+                if self.enums[idx].template_idx < 0 {
+                    candidates = self.enums[idx].methods
+                }
+            }
+            else none
+        }
+        mut methods: [MethodInfo] = []
+        mut labels: [str] = []
+        for m in candidates {
+            if len(m.sig.type_params) > 0 or len(m.sig.param_names) == 0 or m.sig.param_names[0] != "self" {
+                continue
+            }
+            let lbl = self.owner_method_label(owner, name: m.name)
+            if len(lbl) > 0 {
+                methods += [m]
+                labels += [lbl]
+            }
+        }
+        return MethodDirectory(:methods, :labels)
+    }
+
+    // A count, then each method's key (method_key) and code address.
+    func emit_method_directory(self, anon dir: MethodDirectory) -> none {
+        self.println(f"\t.quad {len(dir.methods)}")
+        for i, m in dir.methods {
+            self.println(f"\t.quad {self.method_key(m.name, sig: m.sig)}")
+            self.println(f"\t.quad {dir.labels[i]}")
+        }
+    }
+
+    // A method's name and type without `self`, hashed: equal keys, a method
+    // that can stand in for an interface's.
+    func method_key(self, anon name: str, sig: SigInfo) -> int64 {
+        return f"{name}|{self.type_key(self.method_kind(sig))}".hash()
     }
 
     // Registers the builtins before compile_module and sets builtins_path.
