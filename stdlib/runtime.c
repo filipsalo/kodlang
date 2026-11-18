@@ -6,7 +6,6 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
 
-#include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -165,49 +164,6 @@ int64_t redirect_stdout(KodStr *path) {
 // the on-disk file is complete before another process reads it.
 void flush_stdout(void) {
     fflush(stdout);
-}
-
-// Write `content` to `path`, replacing the file if it exists. Parent
-// directory must already exist. Returns 0 on success, -1 on any failure
-// (open or write). Mirrors read_file's bare naming convention.
-int64_t write_file(KodStr *path, KodStr *content) {
-    FILE *fp = fopen(path->buf, "wb");
-    if (!fp) return -1;
-    size_t written = fwrite(content->buf, 1, (size_t)content->len, fp);
-    fclose(fp);
-    return written == (size_t)content->len ? 0 : -1;
-}
-
-int64_t kod_is_file(KodStr *path) {
-    struct stat st;
-    return stat(path->buf, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-// Read until EOF: fseek/ftell can't size pipes and FIFOs.
-KodStr *read_file(KodStr *path) {
-    FILE *fp = fopen(path->buf, "rb");
-    if (!fp) return kod_empty_str();
-    size_t cap = 64 * 1024;
-    size_t len = 0;
-    char *buf = (char *)malloc(cap);
-    while (buf) {
-        len += fread(buf + len, 1, cap - len, fp);
-        if (len < cap) break;
-        cap *= 2;
-        char *grown = (char *)realloc(buf, cap);
-        if (!grown) free(buf);
-        buf = grown;
-    }
-    int failed = !buf || ferror(fp);
-    fclose(fp);
-    if (failed) {
-        free(buf);
-        return kod_empty_str();
-    }
-    KodStr *s = kod_str_alloc((int64_t)len);
-    memcpy(s->buf, buf, len);
-    free(buf);
-    return s;
 }
 
 static int64_t clamp_slice(int64_t len, int64_t *start, int64_t end) {
@@ -388,50 +344,6 @@ int64_t kod_fd_open(KodStr *path, int64_t mode) {
     } while (fd < 0 && errno == EINTR);
     g_io_errno = fd < 0 ? errno : 0;
     return fd;
-}
-
-// The SHA-256 of `data`, as 64 lowercase hex digits. The driver names cached
-// objects by it.
-KodStr *kod_sha256_hex(KodStr *data) {
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_CTX ctx;
-    CC_SHA256_Init(&ctx);
-    const char *p = data->buf;
-    int64_t left = data->len;
-    while (left > 0) {
-        CC_LONG n = left > 0x40000000 ? 0x40000000 : (CC_LONG)left;
-        CC_SHA256_Update(&ctx, p, n);
-        p += n;
-        left -= n;
-    }
-    CC_SHA256_Final(digest, &ctx);
-    static const char hex[] = "0123456789abcdef";
-    char out[2 * CC_SHA256_DIGEST_LENGTH + 1];
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-        out[2 * i] = hex[digest[i] >> 4];
-        out[2 * i + 1] = hex[digest[i] & 0xf];
-    }
-    out[2 * CC_SHA256_DIGEST_LENGTH] = 0;
-    return kod_str_from_cstr(out);
-}
-
-KodStr *kod_errno_message(int64_t err) {
-    return kod_str_from_cstr(strerror((int)err));
-}
-
-// The position in stdlib/stream.kod's IoKind that an OS error number maps to.
-int64_t kod_errno_kind(int64_t err) {
-    switch (err) {
-    case ENOENT: return 0;
-    case EACCES: case EPERM: return 1;
-    case EEXIST: case EADDRINUSE: return 2;
-    case EINVAL: case EBADF: case EISDIR: case ENOTDIR: return 3;
-    case EAGAIN: case ETIMEDOUT: return 5;
-    case ECONNREFUSED: return 6;
-    case ECONNRESET: return 7;
-    case EPIPE: return 8;
-    default: return 10;
-    }
 }
 
 // fcntl with a third argument, for Kod: fcntl is variadic, which an extern

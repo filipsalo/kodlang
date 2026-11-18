@@ -1,21 +1,76 @@
-// Filesystem operations. Backed by C in stdlib/runtime.c.
+// Filesystem operations, over the C library through unsafe; standard output
+// and input are still C in stdlib/runtime.c.
+
+import "libc"
+import "unsafe"
+
+// What a file's mode says it is (S_IFMT), and a regular file (S_IFREG).
+let MODE_TYPE: int64 = 61440
+let MODE_REGULAR: int64 = 32768
+// Where st_mode sits in a macOS struct stat, and the struct's size.
+let STAT_MODE: int64 = 4
+let STAT_SIZE: int64 = 144
 
 // Read the file at `path` and return its contents. Pipes and FIFOs
 // (e.g. "/dev/stdin") are read until EOF. Returns the empty string if
 // the file can't be opened or read.
-extern func read_file(anon path: str) -> str
-
-extern func kod_is_file(anon path: str) -> int64
+func read_file(anon path: str) -> str {
+    let file = libc.fopen(unsafe.c_str(path), unsafe.c_str("rb"))
+    if file == 0 {
+        return ""
+    }
+    // Read until EOF into a buffer that doubles: fseek/ftell can't size a pipe.
+    mut cap = 65536
+    mut used = 0
+    mut buf = unsafe.alloc(cap)
+    for true {
+        used += libc.fread(buf + used, 1, cap - used, file)
+        if used < cap {
+            break
+        }
+        cap = cap * 2
+        let grown = libc.realloc(buf, cap)
+        if grown == 0 {
+            unsafe.free(buf)
+            libc.fclose(file)
+            return ""
+        }
+        buf = grown
+    }
+    let failed = unsafe.c_int(libc.ferror(file)) != 0
+    libc.fclose(file)
+    mut out = ""
+    if not failed {
+        out = str(unsafe.copy_out(buf, used))
+    }
+    unsafe.free(buf)
+    return out
+}
 
 // True if `path` names an existing regular file.
 func is_file(anon path: str) -> bool {
-    return kod_is_file(path) != 0
+    let st = unsafe.alloc(STAT_SIZE)
+    let found = unsafe.c_int(libc.stat(unsafe.c_str(path), st)) == 0
+    let regular = found and (unsafe.load32(st + STAT_MODE) & MODE_TYPE) == MODE_REGULAR
+    unsafe.free(st)
+    return regular
 }
 
 // Write `content` to a file at `path`, replacing it if it exists.
 // Returns 0 on success, -1 on failure. The parent directory must
 // already exist (no mkdir -p; caller's responsibility).
-extern func write_file(anon path: str, anon content: str) -> int64
+func write_file(anon path: str, anon content: str) -> int64 {
+    let file = libc.fopen(unsafe.c_str(path), unsafe.c_str("wb"))
+    if file == 0 {
+        return -1
+    }
+    let written = libc.fwrite(unsafe.c_str(content), 1, len(content), file)
+    libc.fclose(file)
+    if written == len(content) {
+        return 0
+    }
+    return -1
+}
 
 // Reopen stdout against `path` for the rest of the process. Subsequent
 // `print` / `puts` calls write there instead of the terminal. Used by
