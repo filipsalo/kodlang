@@ -3,7 +3,9 @@
 // test program can just call `process.run` itself.
 
 import "process"
+import "posix"
 import "stream" { IoError, IoKind }
+import "time" { Duration }
 
 test "process.run captures stdout and status from echo" {
     let r: process.ProcessResult = process.run(["echo", "hello"])
@@ -111,4 +113,123 @@ test "process.kill ends a child that wait reports" {
     } else {
         assert false
     }
+}
+
+test "child.kill sends the signal it is given" {
+    let child = must process.start(["sleep", "60"])
+    must child.kill(signal: .Kill)
+    let r = child.wait()
+    if r is Err(process.ProcessError(e)) {
+        assert e.message == "sleep was killed by SIGKILL"
+    } else {
+        assert false
+    }
+}
+
+test "child.try_wait is none while the child runs, then its exit code" {
+    let child = must process.start(["sh", "-c", "read x; exit 4"], stdin: .Pipe)
+    assert (must child.try_wait()) is none
+    must child.stdin.close()
+    mut code: int64? = none
+    for code is none {
+        code = must child.try_wait()
+    }
+    assert (code? or -1) == 4
+    assert child.wait() is Err(_)
+}
+
+test "child.try_wait reports a signal" {
+    let child = must process.start(["sleep", "60"])
+    must child.kill(signal: .Int)
+    mut r = child.try_wait()
+    for r is Ok(none) {
+        r = child.try_wait()
+    }
+    if r is Err(process.ProcessError(e)) {
+        assert e.message == "sleep was killed by SIGINT"
+    } else {
+        assert false
+    }
+}
+
+test "process.output captures stdout, stderr and the status" {
+    let out = must process.output(["sh", "-c", "echo out; echo err 1>&2; exit 2"])
+    assert out.status == 2
+    assert out.stdout == "out\n"
+    assert out.stderr == "err\n"
+}
+
+test "process.output passes input and runs in dir with env" {
+    let out = must process.output(["tr", "a-z", "A-Z"], input: "shout\n")
+    assert out.stdout == "SHOUT\n"
+    let here = must process.output(["sh", "-c", "pwd; printf %s \"$KOD_ONE\""], dir: "/", env: ["KOD_ONE=1"])
+    assert here.stdout == "/\n1"
+    let empty = must process.output(["cat"])
+    assert empty.stdout == ""
+}
+
+test "process.output doesn't stall on a lot of output to both streams and input" {
+    let big = "0123456789".repeat(50000)
+    let script = "cat; i=0; while [ $i -lt 2000 ]; do echo error line $i 1>&2; i=$((i+1)); done"
+    let out = must process.output(["sh", "-c", script], input: big)
+    assert out.stdout == big
+    assert len(out.stderr) > 30000
+}
+
+test "process.output doesn't mind a program that ignores its input" {
+    let out = must process.output(["true"], input: "x".repeat(200000))
+    assert out.status == 0
+}
+
+test "process.output fails for a missing program or a signal" {
+    let missing = process.output(["this-binary-does-not-exist-on-purpose"])
+    if missing is Err(IoError(e)) {
+        assert e.kind is .NotFound
+    } else {
+        assert false
+    }
+    let killed = process.output(["sh", "-c", "kill -9 $$"])
+    if killed is Err(process.ProcessError(e)) {
+        assert e.message == "sh was killed by SIGKILL"
+    } else {
+        assert false
+    }
+}
+
+test "posix.poll says which pipe is ready" {
+    let quiet = must process.start(["sleep", "60"], stdout: .Pipe)
+    let loud = must process.start(["echo", "hi"], stdout: .Pipe)
+    let ready = must posix.poll(read: [quiet.stdout, loud.stdout])
+    assert not ready.read[0]
+    assert ready.read[1]
+    let none_yet = must posix.poll(read: [quiet.stdout], timeout: Duration(ms: 20))
+    assert not none_yet.read[0]
+    must quiet.kill()
+    let ended = must posix.poll(read: [quiet.stdout])
+    assert ended.read[0]
+    assert len(must quiet.stdout.read(10)) == 0
+    assert quiet.wait() is Err(_)
+    must loud.wait()
+    must quiet.stdout.close()
+    must loud.stdout.close()
+}
+
+test "posix.poll on a pipe to write to" {
+    let child = must process.start(["sleep", "60"], stdin: .Pipe)
+    let ready = must posix.poll(read: [], write: [child.stdin], timeout: Duration())
+    assert ready.write[0]
+    assert len(ready.read) == 0
+    must child.kill()
+    assert child.wait() is Err(_)
+}
+
+test "posix.poll needs something to wait for" {
+    let closed = posix.Fd(fd: -1)
+    let r = posix.poll(read: [closed])
+    if r is Err(IoError(e)) {
+        assert e.kind is .InvalidInput
+    } else {
+        assert false
+    }
+    assert posix.poll(read: []) is Err(_)
 }

@@ -711,18 +711,26 @@ int64_t kod_proc_start(KodArray *argv_arr, KodArray *env_arr, int64_t use_env, K
 
 // Wait for a child to end: its raw wait status, or -1 with the reason in
 // kod_io_errno().
-int64_t kod_proc_wait(int64_t pid) {
+// With `nohang`, -2 when the child is still running.
+int64_t kod_proc_wait(int64_t pid, int64_t nohang) {
     int status;
     pid_t r;
     do {
-        r = waitpid((pid_t)pid, &status, 0);
+        r = waitpid((pid_t)pid, &status, nohang ? WNOHANG : 0);
     } while (r < 0 && errno == EINTR);
     if (r < 0) {
         g_io_errno = errno;
         return -1;
     }
     g_io_errno = 0;
-    return status;
+    return r == 0 ? -2 : status;
+}
+
+// Make reads and writes on `fd` fail with EAGAIN instead of waiting: 0, or the errno.
+int64_t kod_fd_set_nonblocking(int64_t fd) {
+    int flags = fcntl((int)fd, F_GETFL);
+    if (flags < 0 || fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0) return errno;
+    return 0;
 }
 
 // Wait until one of `fds` is ready for what `events` asks (1 read, 2 write),

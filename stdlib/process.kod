@@ -1,10 +1,10 @@
-// Subprocess support. `run` spawns argv[0] via PATH lookup, captures stdout
-// and stderr (concurrently, so neither pipe deadlocks), waits for the
-// child to exit. `exec` instead
-// turns the calling process into argv[0].
+// Subprocesses: `start` a child with pipes, run one to the end with
+// `output`, or turn this process into another with `exec`. See
+// docs/builtins.md.
 
-import "posix" { Fd }
-import "stream" { os_error }
+import "posix" { Fd, poll }
+import "stream" { IoError, IoKind, os_error }
+import "strbuilder" { StrBuilder }
 
 type ProcessResult = struct {
     status: int64
@@ -17,7 +17,8 @@ extern func kod_exec(anon argv: [str]) -> int64
 extern func kod_spawn(anon argv: [str]) -> int64
 extern func kod_kill(anon pid: int64) -> int64
 extern func kod_proc_start(anon argv: [str], anon env: [str], anon use_env: int64, anon dir: str, anon modes: int64, anon slots: [int64]) -> int64
-extern func kod_proc_wait(anon pid: int64) -> int64
+extern func kod_proc_wait(anon pid: int64, anon nohang: int64) -> int64
+extern func kod_fd_set_nonblocking(anon fd: int64) -> int64
 extern func kod_proc_signal(anon pid: int64, anon sig: int64) -> int64
 extern func kod_io_errno() -> int64
 
@@ -37,6 +38,36 @@ type Stdio = enum {
             .Null -> return 2
         }
     }
+}
+
+// A signal for `Child.kill`.
+type Signal = enum {
+    Hup
+    Int
+    Quit
+    Kill
+    Term
+    Usr1
+    Usr2
+
+    func number(self) -> int64 {
+        match self {
+            .Hup -> return 1
+            .Int -> return 2
+            .Quit -> return 3
+            .Kill -> return 9
+            .Term -> return 15
+            .Usr1 -> return 30
+            .Usr2 -> return 31
+        }
+    }
+}
+
+// What `output` collected from a program that ran to the end.
+type Output = struct {
+    status: int64
+    stdout: str
+    stderr: str
 }
 
 // A child that ended other than by exiting, or another failure of a child.
@@ -63,10 +94,26 @@ type Child = struct {
         if self.stdin.fd >= 0 {
             try self.stdin.close()
         }
-        let status = kod_proc_wait(self.pid)
+        let status = kod_proc_wait(self.pid, 0)
         if status < 0 {
             throw os_error(f"wait {self.name}", errno: kod_io_errno())
         }
+        return try self.exit_code(status)
+    }
+
+    // The exit code if the child has ended, none while it runs.
+    func try_wait(self) -> int64? or Error {
+        let status = kod_proc_wait(self.pid, 1)
+        if status == -2 {
+            return none
+        }
+        if status < 0 {
+            throw os_error(f"wait {self.name}", errno: kod_io_errno())
+        }
+        return try self.exit_code(status)
+    }
+
+    func exit_code(self, anon status: int64) -> int64 or Error {
         let sig = status & 127
         if sig == 0 {
             return (status >> 8) & 255
@@ -74,9 +121,10 @@ type Child = struct {
         throw ProcessError(message: f"{self.name} was killed by {signal_name(sig)}")
     }
 
-    // Send the child SIGTERM, without waiting for it.
-    func kill(self) -> none or Error {
-        let err = kod_proc_signal(self.pid, 15)
+    // Send the child a signal, SIGTERM unless told otherwise, without
+    // waiting for it.
+    func kill(self, signal: Signal = .Term) -> none or Error {
+        let err = kod_proc_signal(self.pid, signal.number())
         if err != 0 {
             throw os_error(f"kill {self.name}", errno: err)
         }
@@ -98,6 +146,8 @@ func signal_name(anon sig: int64) -> str {
         13 -> return "SIGPIPE"
         14 -> return "SIGALRM"
         15 -> return "SIGTERM"
+        30 -> return "SIGUSR1"
+        31 -> return "SIGUSR2"
         else return f"signal {sig}"
     }
 }
@@ -119,6 +169,76 @@ func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, 
         throw os_error(f"start {argv[0]}", errno: err)
     }
     return Child(pid: slots[0], name: argv[0], stdin: Fd(fd: slots[1]), stdout: Fd(fd: slots[2]), stderr: Fd(fd: slots[3]))
+}
+
+// Run `argv[0]` (found via PATH) to the end, with `input` on its stdin, and
+// collect what it writes to stdout and stderr. See docs/builtins.md.
+func output(anon argv: [str], input: str = "", dir: str = "", env: [str]? = none) -> Output or Error {
+    let child = try start(argv, stdin: .Pipe, stdout: .Pipe, stderr: .Pipe, :dir, :env)
+    let r = collect(child, input: kod_str_to_bytes(input))
+    if r is Err(e) {
+        // Don't leave a child or its pipes behind.
+        for f in [child.stdin, child.stdout, child.stderr] {
+            if f.fd >= 0 {
+                let _ = f.close()
+            }
+        }
+        let _ = child.kill(signal: .Kill)
+        let _ = child.wait()
+        throw e
+    }
+    return r
+}
+
+// Write `input` and read stdout and stderr, whichever is ready, until both
+// end; then wait for the child.
+func collect(anon child: Child, input: bytes) -> Output or Error {
+    let out = StrBuilder()
+    let err = StrBuilder()
+    mut sent = 0
+    if len(input) == 0 {
+        try child.stdin.close()
+    } else if kod_fd_set_nonblocking(child.stdin.fd) != 0 {
+        throw os_error(f"start {child.name}", errno: kod_io_errno())
+    }
+    for child.stdout.fd >= 0 or child.stderr.fd >= 0 {
+        let ready = try poll(read: [child.stdout, child.stderr], write: [child.stdin])
+        if ready.read[0] {
+            try take(child.stdout, into: out)
+        }
+        if ready.read[1] {
+            try take(child.stderr, into: err)
+        }
+        if ready.write[0] {
+            let w = child.stdin.write(input[sent..len(input)])
+            if w is Err(IoError(e)) and e.kind is .BrokenPipe {
+                // It stopped reading; what it wrote still counts.
+                sent = len(input)
+            } else if w is Err(IoError(e)) and e.kind is .TimedOut {
+                // The pipe filled up after all; wait for room again.
+            } else {
+                sent += try w
+            }
+            if sent >= len(input) {
+                try child.stdin.close()
+            }
+        }
+    }
+    if child.stdin.fd >= 0 {
+        try child.stdin.close()
+    }
+    let status = try child.wait()
+    return Output(:status, stdout: out.to_str(), stderr: err.to_str())
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: Fd, into: StrBuilder) -> none or Error {
+    let piece = try f.read(65536)
+    if len(piece) == 0 {
+        try f.close()
+    } else {
+        into.append_bytes(piece)
+    }
 }
 
 // User-facing wrapper. Keep the public name stable across any future

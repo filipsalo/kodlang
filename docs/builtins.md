@@ -221,6 +221,31 @@ assert r.status == 0
 assert r.stdout == "hello\n"
 ```
 
+`process.output(argv)` runs `argv[0]`, looked up on `PATH`, to the end and
+returns what it wrote, as a `process.Output` or an `Error`:
+
+```kod
+import "process"
+
+func branch() -> str or Error {
+    let out = try process.output(["git", "branch", "--show-current"], dir: "/src/kod")
+    if out.status != 0 {
+        throw process.ProcessError(message: f"git: {out.stderr}")
+    }
+    return out.stdout.trim()
+}
+```
+
+- `out.status` is the exit code, and `out.stdout` and `out.stderr` are what
+  the program wrote to each, read together, so a program that writes a lot
+  to both can't stall.
+- `input:` is written to the program's stdin while its output is read,
+  then stdin is closed. Without it, stdin is empty. A program that exits
+  without reading all of its input is not an error.
+- `dir:` and `env:` work as for `start`, below.
+- It fails as `start` does when the program can't be run, and with a
+  `process.ProcessError` when a signal ends it.
+
 `process.start(argv)` starts `argv[0]`, looked up on `PATH`, without
 waiting for it, and returns a `process.Child` or an `Error`:
 
@@ -257,14 +282,19 @@ func shout(anon text: str) -> str or Error {
   to end, and returns its exit code. A child ended by a signal is a
   `process.ProcessError` that names it, as in `tr was killed by SIGTERM`.
   A child can be waited for once.
+- `child.try_wait()` is `wait` without the waiting. It returns the exit code
+  (`int64?`) if the child has ended, which counts as its one wait, or `none`
+  if it is still running. It doesn't close `stdin`.
 - `child.kill()` sends it `SIGTERM` and returns without waiting; `wait`
-  then collects it.
+  then collects it. `kill(signal: .Kill)` sends another `process.Signal`:
+  `.Hup`, `.Int`, `.Quit`, `.Kill`, `.Term`, `.Usr1` or `.Usr2`.
 - `child.pid` is its process id.
 
 A child that is never waited for stays a zombie until this process exits.
 `process.run`, `process.spawn` and `process.kill` are shorthands for common cases:
 
-`process.run(argv)` captures stdout and stderr. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run.
+`process.run(argv)` captures stdout and stderr; unlike `output`, it can't
+fail: a program that can't be run, or that a signal ends, has the status -1. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run.
 
 ```kod
 import "process"
