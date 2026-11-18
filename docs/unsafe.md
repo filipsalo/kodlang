@@ -37,6 +37,15 @@ func home() -> str {
 }
 ```
 
+## The libc module
+
+`stdlib/libc.kod` declares the C library functions the standard library
+calls (`read`, `write`, `close`, `pipe`, `kill`, `waitpid`, `posix_spawnp`
+and its file actions, `getenv`, `setenv`, and so on), with pointers as
+`int64`. Import it to call one as `libc.read(fd, buf, n)` instead of
+declaring it again; that also keeps the C name out of the module's own
+names, so a module can have a `kill` or `poll` of its own.
+
 ## Addresses
 
 An address is an `int64`, and arithmetic on it is ordinary arithmetic:
