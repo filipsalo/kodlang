@@ -3,6 +3,7 @@
 // test program can just call `process.run` itself.
 
 import "process"
+import "stream" { IoError, IoKind, read_all, write_str }
 
 test "process.run captures stdout and status from echo" {
     let r: process.ProcessResult = process.run(["echo", "hello"])
@@ -42,4 +43,72 @@ test "process.spawn gives the child /dev/null for its output" {
     let pid = process.spawn(["sh", "-c", "echo lost; echo lost 1>&2; sleep 60"])
     assert pid > 0
     assert process.kill(pid)
+}
+
+func output(anon child: process.Child) -> str {
+    let out = must read_all(child.stdout)
+    must child.stdout.close()
+    return str(out)
+}
+
+test "process.start pipes stdin and stdout" {
+    let child = must process.start(["cat"], stdin: .Pipe, stdout: .Pipe)
+    assert child.pid > 0
+    must write_str(child.stdin, "through the pipe\n")
+    must child.stdin.close()
+    assert output(child) == "through the pipe\n"
+    assert (must child.wait()) == 0
+}
+
+test "process.start gives the exit code and stderr" {
+    let child = must process.start(["sh", "-c", "echo out; echo err 1>&2; exit 3"], stdout: .Null, stderr: .Pipe)
+    let err = must read_all(child.stderr)
+    assert str(err) == "err\n"
+    assert (must child.wait()) == 3
+}
+
+test "process.start inherits by default" {
+    let child = must process.start(["true"])
+    assert child.stdin.fd == -1
+    assert child.stdout.read(1) is Err(_)
+    assert (must child.wait()) == 0
+}
+
+test "process.wait closes a piped stdin" {
+    let child = must process.start(["cat"], stdin: .Pipe, stdout: .Null)
+    assert (must child.wait()) == 0
+    assert child.stdin.fd == -1
+    assert child.wait() is Err(_)
+}
+
+test "process.start runs in dir and with env" {
+    let here = must process.start(["pwd"], stdout: .Pipe, dir: "/")
+    assert output(here) == "/\n"
+    must here.wait()
+    let child = must process.start(["sh", "-c", "printf %s \"$KOD_ONE-${HOME-none}\""], stdout: .Pipe, env: ["KOD_ONE=1"])
+    assert output(child) == "1-none"
+    must child.wait()
+}
+
+test "process.start fails for a missing program or directory" {
+    let missing = process.start(["this-binary-does-not-exist-on-purpose"])
+    if missing is Err(IoError(e)) {
+        assert e.kind is .NotFound
+        assert e.to_str().contains("this-binary-does-not-exist-on-purpose")
+    } else {
+        assert false
+    }
+    assert process.start(["true"], dir: "/no/such/dir/on/purpose") is Err(_)
+    assert process.start([]) is Err(_)
+}
+
+test "process.kill ends a child that wait reports" {
+    let child = must process.start(["sleep", "60"])
+    must child.kill()
+    let r = child.wait()
+    if r is Err(process.ProcessError(e)) {
+        assert e.message == "sleep was killed by SIGTERM"
+    } else {
+        assert false
+    }
 }

@@ -647,6 +647,90 @@ int64_t kod_spawn(KodArray *argv_arr) {
     return rc == 0 ? (int64_t)pid : -1;
 }
 
+// A pipe whose ends close on exec and, for the end this process keeps, don't
+// raise SIGPIPE: a write to a child that has gone fails with EPIPE instead.
+static int kod_proc_pipe(int fds[2], int keep) {
+    if (pipe(fds) != 0) return errno;
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[keep], F_SETNOSIGPIPE, 1);
+    return 0;
+}
+
+// process.start: run `argv[0]` (found via PATH) without waiting. `modes` holds
+// a code per stream, stdin + 3 * stdout + 9 * stderr: 0 inherit, 1 pipe,
+// 2 /dev/null. `dir` (when not empty) is the child's directory, and with
+// `use_env` its environment is `env` instead of this process's. Writes the pid
+// and this process's end of each pipe (-1 for a stream that isn't one) to
+// `slots`; returns 0, or the errno of what failed.
+int64_t kod_proc_start(KodArray *argv_arr, KodArray *env_arr, int64_t use_env, KodStr *dir, int64_t modes, KodArray *slots_arr) {
+    int64_t *slots = (int64_t *)slots_arr->ptr;
+    if (argv_arr->len == 0 || slots_arr->len < 4) return EINVAL;
+    int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    int err = 0;
+    for (int fd = 0; fd < 3 && err == 0; fd++) {
+        int mode = (int)(modes % 3);
+        modes /= 3;
+        if (mode == 1) {
+            // The child reads stdin's pipe and writes the others.
+            int child_end = fd == 0 ? 0 : 1;
+            err = kod_proc_pipe(pipes[fd], 1 - child_end);
+            if (err == 0) posix_spawn_file_actions_adddup2(&actions, pipes[fd][child_end], fd);
+        } else if (mode == 2) {
+            posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0);
+        }
+    }
+    if (err == 0 && dir->len > 0) {
+        err = posix_spawn_file_actions_addchdir(&actions, dir->buf);
+    }
+    pid_t pid = 0;
+    if (err == 0) {
+        char **argv = c_argv(argv_arr);
+        char **envp = use_env ? c_argv(env_arr) : environ;
+        err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, envp);
+        rc_release_c(argv);
+        if (use_env) rc_release_c(envp);
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    slots[0] = pid;
+    for (int fd = 0; fd < 3; fd++) {
+        int keep = fd == 0 ? 1 : 0;
+        slots[fd + 1] = -1;
+        if (pipes[fd][0] < 0) continue;
+        close(pipes[fd][1 - keep]);
+        if (err == 0) {
+            slots[fd + 1] = pipes[fd][keep];
+        } else {
+            close(pipes[fd][keep]);
+        }
+    }
+    return err;
+}
+
+// Wait for a child to end: its raw wait status, or -1 with the reason in
+// kod_io_errno().
+int64_t kod_proc_wait(int64_t pid) {
+    int status;
+    pid_t r;
+    do {
+        r = waitpid((pid_t)pid, &status, 0);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) {
+        g_io_errno = errno;
+        return -1;
+    }
+    g_io_errno = 0;
+    return status;
+}
+
+// Send `sig` to a process: 0, or the errno.
+int64_t kod_proc_signal(int64_t pid, int64_t sig) {
+    if (pid <= 0) return ESRCH;
+    return kill((pid_t)pid, (int)sig) == 0 ? 0 : errno;
+}
+
 // SIGTERM a child and reap it. False when the signal could not be sent.
 int64_t kod_kill(int64_t pid) {
     if (pid <= 0 || kill((pid_t)pid, SIGTERM) != 0) return 0;

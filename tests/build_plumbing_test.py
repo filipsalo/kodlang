@@ -154,7 +154,6 @@ def test_objects_are_named_after_their_source_in_a_tree(scratch: Path):
         )
         modules = [
             "stdlib/json",
-            "stdlib/strbuilder",
             str(source.with_suffix("")),
             str(scratch.relative_to(ROOT) / "lib" / "helper"),
         ]

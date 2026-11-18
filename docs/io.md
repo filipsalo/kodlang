@@ -149,7 +149,7 @@ A `BufReader` doesn't close its inner stream.
 | `append(path)` | a file for writing, created if missing, written at its end |
 | `stdin()`, `stdout()`, `stderr()` | descriptors 0, 1 and 2 |
 | `Fd(fd: n)` | wrap a descriptor from elsewhere |
-| `f.close()` | close it; `none or Error` |
+| `f.close()` | close it and set `f.fd` to -1, so closing it again fails; `none or Error` |
 | `f.is_terminal()` | whether it is a terminal, rather than a file or a pipe |
 
 `stdout()` writes straight to descriptor 1, bypassing the buffer that `print`

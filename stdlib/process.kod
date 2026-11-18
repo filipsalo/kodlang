@@ -3,6 +3,9 @@
 // child to exit. `exec` instead
 // turns the calling process into argv[0].
 
+import "posix" { Fd }
+import "stream" { os_error }
+
 type ProcessResult = struct {
     status: int64
     stdout: str
@@ -13,6 +16,110 @@ extern func kod_run_process(anon argv: [str]) -> ProcessResult
 extern func kod_exec(anon argv: [str]) -> int64
 extern func kod_spawn(anon argv: [str]) -> int64
 extern func kod_kill(anon pid: int64) -> int64
+extern func kod_proc_start(anon argv: [str], anon env: [str], anon use_env: int64, anon dir: str, anon modes: int64, anon slots: [int64]) -> int64
+extern func kod_proc_wait(anon pid: int64) -> int64
+extern func kod_proc_signal(anon pid: int64, anon sig: int64) -> int64
+extern func kod_io_errno() -> int64
+
+// What a child's stdin, stdout or stderr is connected to.
+type Stdio = enum {
+    // This process's stream.
+    Inherit
+    // A pipe to this process, a `posix.Fd` on the `Child`.
+    Pipe
+    // /dev/null.
+    Null
+
+    func code(self) -> int64 {
+        match self {
+            .Inherit -> return 0
+            .Pipe -> return 1
+            .Null -> return 2
+        }
+    }
+}
+
+// A child that ended other than by exiting, or another failure of a child.
+type ProcessError = struct {
+    message: str
+
+    func to_str(self) -> str {
+        return self.message
+    }
+}
+
+// A program that `start` started. A stream that isn't piped has the `Fd` -1.
+type Child = struct {
+    pid: int64
+    // `argv[0]`, for errors.
+    name: str
+    stdin: Fd
+    stdout: Fd
+    stderr: Fd
+
+    // Close a piped stdin, wait for the child to end, and return its exit
+    // code. A child ended by a signal is a ProcessError.
+    func wait(self) -> int64 or Error {
+        if self.stdin.fd >= 0 {
+            try self.stdin.close()
+        }
+        let status = kod_proc_wait(self.pid)
+        if status < 0 {
+            throw os_error(f"wait {self.name}", errno: kod_io_errno())
+        }
+        let sig = status & 127
+        if sig == 0 {
+            return (status >> 8) & 255
+        }
+        throw ProcessError(message: f"{self.name} was killed by {signal_name(sig)}")
+    }
+
+    // Send the child SIGTERM, without waiting for it.
+    func kill(self) -> none or Error {
+        let err = kod_proc_signal(self.pid, 15)
+        if err != 0 {
+            throw os_error(f"kill {self.name}", errno: err)
+        }
+    }
+}
+
+func signal_name(anon sig: int64) -> str {
+    match sig {
+        1 -> return "SIGHUP"
+        2 -> return "SIGINT"
+        3 -> return "SIGQUIT"
+        4 -> return "SIGILL"
+        5 -> return "SIGTRAP"
+        6 -> return "SIGABRT"
+        8 -> return "SIGFPE"
+        9 -> return "SIGKILL"
+        10 -> return "SIGBUS"
+        11 -> return "SIGSEGV"
+        13 -> return "SIGPIPE"
+        14 -> return "SIGALRM"
+        15 -> return "SIGTERM"
+        else return f"signal {sig}"
+    }
+}
+
+// Start `argv[0]` (found via PATH) without waiting for it. See docs/builtins.md.
+func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, stderr: Stdio = .Inherit, dir: str = "", env: [str]? = none) -> Child or Error {
+    if len(argv) == 0 {
+        throw ProcessError(message: "start: no program to run")
+    }
+    let slots = [0, -1, -1, -1]
+    let none_set: [str] = []
+    mut use_env = 1
+    if env is none {
+        use_env = 0
+    }
+    let modes = stdin.code() + 3 * stdout.code() + 9 * stderr.code()
+    let err = kod_proc_start(argv, env? or none_set, use_env, dir, modes, slots)
+    if err != 0 {
+        throw os_error(f"start {argv[0]}", errno: err)
+    }
+    return Child(pid: slots[0], name: argv[0], stdin: Fd(fd: slots[1]), stdout: Fd(fd: slots[2]), stderr: Fd(fd: slots[3]))
+}
 
 // User-facing wrapper. Keep the public name stable across any future
 // ABI churn on the C side.
