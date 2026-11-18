@@ -362,19 +362,7 @@ int64_t kod_adler32_sb(int64_t sum, int64_t handle, int64_t start, int64_t end) 
     return kod_adler32_run((uint32_t)sum, (const unsigned char *)sb->buf + start, n);
 }
 
-// stdlib/unsafe.kod. The compiler emits the loads, stores, kod_unsafe_c_int
-// and the refs as single instructions; these are for code that the bootstrap
-// snapshot, which predates them, compiles.
-int64_t kod_unsafe_load8(int64_t a) { return *(uint8_t *)a; }
-int64_t kod_unsafe_load32(int64_t a) { return *(int32_t *)a; }
-int64_t kod_unsafe_load64(int64_t a) { return *(int64_t *)a; }
-void kod_unsafe_store8(int64_t a, int64_t v) { *(uint8_t *)a = (uint8_t)v; }
-void kod_unsafe_store32(int64_t a, int64_t v) { *(int32_t *)a = (int32_t)v; }
-void kod_unsafe_store64(int64_t a, int64_t v) { *(int64_t *)a = v; }
-int64_t kod_unsafe_c_int(int64_t x) { return (int32_t)x; }
-int64_t kod_unsafe_str_ref(KodStr *s) { return (int64_t)s; }
-int64_t kod_unsafe_bytes_ref(KodStr *b) { return (int64_t)b; }
-
+// stdlib/unsafe.kod; its loads, stores, c_int and refs are compiler intrinsics.
 // A `bytes` holding a copy of the `n` bytes at `addr`.
 KodStr *kod_unsafe_copy_out(int64_t addr, int64_t n) {
     return kod_str_from_bytes((const char *)addr, n < 0 ? 0 : n);
