@@ -1908,7 +1908,11 @@ type Codegen = struct {
             self.report_error(f"error: `{sym}` doesn't compare {lhs_note}", span: self.p.expr_spans[lhs_id])
             return
         }
-        if lhs_kind is .KEnum(idx) {
+        if lhs_kind.is_array() {
+            if self.same_kind(lhs_kind, rhs_kind) or self.is_untyped_literal(rhs_id) {
+                return
+            }
+        } else if lhs_kind is .KEnum(idx) {
             if rhs_kind is .KEnum(rhs_idx) and self.enums_compatible(idx, a_idx: rhs_idx) {
                 self.check_enum_equality(:lhs_id, :rhs_id, enum_idx: idx)
                 return
@@ -1935,7 +1939,15 @@ type Codegen = struct {
 
     func no_equality_note(self, anon kind: TypeKind) -> str {
         if kind.is_array() {
-            return "arrays; compare `len(...)` and the elements"
+            let elem = kind.array_elem()
+            if self.equatable_kind(elem) or self.kind_has_unknown(elem) {
+                return ""
+            }
+            let shown = self.kind_display(elem)
+            if elem is .KStruct(_idx, _args) {
+                return f"arrays of `{shown}`, which has no `==`; compare their elements, or declare `op_eq` on `{shown}`"
+            }
+            return f"arrays of `{shown}`, which has no `==`; compare their elements"
         }
         match kind {
             .KStruct(_idx, _type_args) -> return "structs; compare their fields, or declare `op_eq`"
@@ -1943,6 +1955,82 @@ type Codegen = struct {
             .KFunc(_params, _ret) -> return "function values"
             else return ""
         }
+    }
+
+    // Whether `==` takes two values of `kind`: what an array's elements need.
+    func equatable_kind(self, anon kind: TypeKind) -> bool {
+        if kind.is_array() {
+            return self.equatable_kind(kind.array_elem())
+        }
+        match kind {
+            .KInt64 | .KStr | .KBytes | .KBool | .KFloat64 -> return true
+            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx)
+            .KStruct(idx, _args) -> return self.structs[idx].method_idx.get("op_eq") is Some(_)
+            else return false
+        }
+    }
+
+    // Whether an f-string can show a value of `kind`: what an array's elements need.
+    func printable_kind(self, anon kind: TypeKind) -> bool {
+        if kind.is_array() {
+            return self.printable_kind(kind.array_elem())
+        }
+        match kind {
+            .KInt64 | .KStr | .KBytes | .KBool | .KFloat64 -> return true
+            .KStruct(idx, _args) -> {
+                let .Some(mi) = self.structs[idx].method_idx.get("to_str") else { return false }
+                return self.is_to_str_sig(self.structs[idx].methods[mi].sig)
+            }
+            .KEnum(idx) -> {
+                if self.enums[idx].is_union {
+                    return true
+                }
+                let mi = self.enum_method(idx, name: "to_str")
+                if mi >= 0 {
+                    return self.is_to_str_sig(self.enums[idx].methods[mi].sig)
+                }
+                return not self.is_result_enum_idx(idx)
+            }
+            .KInterface(idx) -> {
+                for m in self.interfaces[idx].methods {
+                    if m.name == "to_str" {
+                        return self.is_to_str_sig(m.sig)
+                    }
+                }
+                return false
+            }
+            else return false
+        }
+    }
+
+    // A call to one of the builtins' array helpers (`_array_eq`, `_array_str`),
+    // as an expression to compile.
+    func array_helper_call(self, anon name: str, args: [int64], span: ast.Span) -> int64 {
+        let callee = self.p.alloc_expr(.Ident(:name), :span)
+        mut call_args: [ast.CallArg] = []
+        for a in args {
+            call_args += [ast.CallArg(label: "", label_span: span, value: a)]
+        }
+        return self.p.alloc_expr(.Call(:callee, args: call_args), :span)
+    }
+
+    // `a == b` and `a != b` on arrays: `_array_eq(a, b)`, the second negated.
+    func compile_array_eq(self, anon lhs: int64, op: ast.Op, rhs: int64) -> Val {
+        let lhs_kind = self.infer_kind(lhs)
+        let before = self.report_attempts
+        self.check_operand_kinds(lhs_id: lhs, :op, rhs_id: rhs, :lhs_kind, rhs_kind: self.infer_kind(rhs))
+        if self.report_attempts > before {
+            self.compile_discard(lhs)
+            self.compile_discard(rhs)
+            return .VImm(value: 0)
+        }
+        let span = self.p.expr_spans[lhs]
+        mut call = self.array_helper_call("_array_eq", args: [lhs, rhs], :span)
+        if op is .Ne {
+            let no = self.p.alloc_expr(.BoolLit(value: false), :span)
+            call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: no), :span)
+        }
+        return self.compile_expr(call)
     }
 
     // Only the variant is compared, so a payload could only be ignored.
@@ -10076,7 +10164,12 @@ type Codegen = struct {
             .Or -> return self.compile_or(:lhs, :rhs)
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
             .IsNot -> return self.compile_is(:lhs, :rhs, negate: true)
-            else return self.compile_arith_cmp(lhs_id: lhs, :op, rhs_id: rhs)
+            else {
+                if (op is .Eq or op is .Ne) and self.infer_kind(lhs).is_array() {
+                    return self.compile_array_eq(lhs, :op, :rhs)
+                }
+                return self.compile_arith_cmp(lhs_id: lhs, :op, rhs_id: rhs)
+            }
         }
     }
 
@@ -11423,6 +11516,9 @@ type Codegen = struct {
             }
             else none
         }
+        if k.is_array() and self.printable_kind(k.array_elem()) {
+            return self.compile_expr(self.array_helper_call("_array_str", args: [expr_id], span: self.p.expr_spans[expr_id]))
+        }
         self.compile_discard(expr_id)
         if self.kind_has_unknown(k) {
             return .VImm(value: 0)
@@ -11438,6 +11534,14 @@ type Codegen = struct {
             .KStruct(_idx, _type_args) -> note = f"; `{shown}` has no `to_str` method"
             .KInterface(_idx) -> note = f"; `{shown}` doesn't declare `to_str`"
             else none
+        }
+        if k.is_array() {
+            let elem = k.array_elem()
+            if elem is .KStruct(_idx, _args) {
+                note = f"; an array shows its elements, and `{self.kind_display(elem)}` has no `to_str` method"
+            } else {
+                note = f"; an array shows its elements, and `{self.kind_display(elem)}` has no text"
+            }
         }
         if bad_to_str {
             note = f"; `{shown}.to_str` isn't `func to_str(self) -> str`"

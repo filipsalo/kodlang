@@ -163,6 +163,36 @@ copies, it is shallow: `[[0]] * 3` holds the same inner array three times, so
 `+=` on one of them shows in all three; build each row on its own when they
 must differ.
 
+## Comparing
+
+`==` and `!=` compare two arrays of the same type element by element: they are
+equal when they have the same length and each element is `==` to the one at
+the same place in the other.
+
+```kod
+[1, 2] == [1, 2]             // true
+["a"] != ["a", "b"]          // true
+[[1], [2, 3]] == [[1], [2, 3]]
+```
+
+The elements must have an `==` of their own, so an array of structs without
+`op_eq`, interface values or functions doesn't compare (see
+[Operators](types.md)).
+
+## As text
+
+An f-string, `str(xs)` and `print(xs)` show an array as its elements in
+brackets, separated by `, `, each as an f-string would show it:
+
+```kod
+print([1, 2, 3])             // [1, 2, 3]
+print(f"{["a", "b"]}")       // [a, b]
+print([[1], []])             // [[1], []]
+```
+
+A `str` element shows as its text, without quotes. The elements must have a
+text of their own: an array of structs without `to_str` can't be shown.
+
 ## Iterating
 
 **Index-based:**

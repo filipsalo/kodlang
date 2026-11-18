@@ -298,17 +298,19 @@ and of the same type:
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
-`"n = " + str(5)` or `f"n = {5}"`. `s - t` on two strings, `xs * 2` on an
-array, `-s` on a string, `s + b` with `b: bytes` and `red < blue` on an enum
-are errors too. `+=` and `-=` follow the rules of `+` and `-`. An index,
+`"n = " + str(5)` or `f"n = {5}"`. `s - t` on two strings, `xs * "2"` on an
+array (an array repeats by an `int64`: see
+[Repetition](arrays.md#repetition)), `-s` on a string, `s + b` with
+`b: bytes` and `red < blue` on an enum are errors too. `+=` and `-=` follow the rules of `+` and `-`. An index,
 as in `xs[i]`, `s[i]` and `xs[i] = v`, and the bounds of a slice must be
 `int64`, so `xs["a"]` and `xs[true]` are errors, and so is an `int64?`
 index; unwrap it first.
 
-`==` and `!=` compare `str` and `bytes` by content and enums by variant (see
-[Equality](enums.md#equality)). Nothing else has an `==`: comparing two
-structs, arrays, interface values or function values is an error, so
-compare a struct's fields, or an array's `len(...)` and elements, instead.
+`==` and `!=` compare `str` and `bytes` by content, enums by variant (see
+[Equality](enums.md#equality)) and arrays by their elements (see
+[Comparing](arrays.md#comparing)). Nothing else has an `==`: comparing two
+structs, interface values or function values is an error, so compare a
+struct's fields instead, or declare `op_eq` on it.
 Comparing values of two different types, like an `int64` with a `str` or
 values of two different enums, is an error too.
 
