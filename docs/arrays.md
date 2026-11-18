@@ -141,6 +141,23 @@ To keep the old contents in any other case, copy the array first with
 `xs + []` or `xs[..]`. All of these copies are shallow: the inner arrays of a
 `[[T]]` are still shared.
 
+## Repetition
+
+`*` with an `int64` repeats an array, in a new array, which is the way to make
+one of a given size:
+
+```kod
+mut seen = [false] * 1000      // 1000 times false
+let zeros: [int64] = [0] * n
+let ab = [1, 2] * 3            // [1, 2, 1, 2, 1, 2]
+```
+
+The count comes second, and zero or less gives an empty array. It is one
+allocation and a copy, much faster than appending in a loop. Like the other
+copies, it is shallow: `[[0]] * 3` holds the same inner array three times, so
+`+=` on one of them shows in all three; build each row on its own when they
+must differ.
+
 ## Iterating
 
 **Index-based:**
@@ -174,7 +191,7 @@ The `ptr` field points to a block of elements, each 8 bytes wide. `len` is the n
 Appending (`+=`) goes through `_kod_array_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity
 only when `cap` runs out. `+` goes through `_kod_array_concat_new`, which
-allocates a fresh header and buffer.
+allocates a fresh header and buffer, and `*` through `_kod_array_repeat`.
 
 ## Helpers
 

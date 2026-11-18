@@ -425,6 +425,34 @@ void *kod_array_push(void *arr_raw, int64_t value, int64_t refs) {
     return arr;
 }
 
+// `arr * n`: a new array of `n` copies of `arr`'s elements in order; empty for
+// `n` of zero or less. The copies double until they fill it.
+void *kod_array_repeat(void *arr_raw, int64_t n) {
+    KodArray *arr = (KodArray *)arr_raw;
+    int64_t len = arr->len;
+    if (n < 0) n = 0;
+    if (len > 0 && n > INT64_MAX / 8 / len) {
+        static KodStr too_big = {"array repetition too large", 26};
+        kod_panic(&too_big);
+    }
+    int64_t total = len * n;
+    int refs = rc_arr_refs(arr);
+    KodArray *out = rc_arr_new(total, refs);
+    out->len = total;
+    if (total > 0) {
+        int64_t *dst = (int64_t *)out->ptr;
+        memcpy(dst, arr->ptr, len * 8);
+        int64_t filled = len;
+        while (filled < total) {
+            int64_t chunk = filled < total - filled ? filled : total - filled;
+            memcpy(dst + filled, dst, chunk * 8);
+            filled += chunk;
+        }
+        if (refs) rc_arr_retain_all((void **)dst, total);
+    }
+    return out;
+}
+
 void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
