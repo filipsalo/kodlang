@@ -1002,7 +1002,7 @@ def test_runtime_o_exports_what_it_did_and_nothing_from_the_header():
         "_kod_panic",
         "_kod_str_from_cstr",
         "_kod_str_concat",
-        "_read_file",
+        "_kod_arr_concat",
     ]:
         assert exported in names
     for local in ["_kod_str_new", "_kod_str_from_bytes", "_kod_str_alloc"]:
