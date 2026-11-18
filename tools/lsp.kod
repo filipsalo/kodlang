@@ -304,6 +304,15 @@ func handle_definition(id_val: json.Value, params: json.Value) -> none {
     }
     let entry_path: str = uri_to_path(uri)
     let cg: codegen.Codegen = compile_or_cached(:uri)
+    let field_owner = field_struct(:cg, source: text, :offset, :word)
+    if field_owner >= 0 {
+        for f in cg.structs[field_owner].fields {
+            if f.name == word {
+                write_definition_response(:id_val, def_path: cg.structs[field_owner].def_path, def_span: f.name_span, buffer_path: entry_path, buffer_text: text)
+                return none
+            }
+        }
+    }
     // Same-module + named-import resolution: cg.func_idx covers both.
     // Map[str, int64]'s K equality is bit-identical, which doesn't work
     // for our string keys: the word at the cursor and the func_decl.name
@@ -390,6 +399,85 @@ func compile_or_cached(uri: str) -> codegen.Codegen {
 // free functions and `mod.fn` import targets. Returns null for any
 // other token (locals, struct fields, methods, type names — future
 // work).
+// The struct whose field `word`, at `offset`, is: after `receiver.` where the
+// receiver's type is declared, or as a label in `T(word: ...)` or `T(:word)`,
+// a construction or a struct pattern. -1 when it's none of those.
+func field_struct(cg: codegen.Codegen, source: str, offset: int64, word: str) -> int64 {
+    // Back to the start of the word.
+    mut start = offset
+    for start > 0 and is_word_byte(source[start - 1]) {
+        start -= 1
+    }
+    mut end = start
+    for end < len(source) and is_word_byte(source[end]) {
+        end += 1
+    }
+    mut struct_idx = -1
+    if start > 0 and source[start - 1] == '.' {
+        let receiver = qualifier_before_dot(:source, offset: start)
+        let type_expr = find_type_of(:source, offset: start, name: receiver)
+        if len(type_expr) > 0 {
+            let type_ref = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: base_type_name(expr: type_expr))
+            if type_ref >= 0 and type_ref % 4 == 0 {
+                struct_idx = type_ref / 4
+            }
+        }
+    } else {
+        mut after = end
+        for after < len(source) and source[after] == ' ' {
+            after += 1
+        }
+        let labelled = after < len(source) and source[after] == ':'
+        let shorthand = start > 0 and source[start - 1] == ':'
+        if labelled or shorthand {
+            // The `(` this label is inside, and the type named before it.
+            mut depth = 0
+            mut i = start - 1
+            for i >= 0 {
+                let c = source[i]
+                if c == ')' {
+                    depth += 1
+                } else if c == '(' {
+                    if depth == 0 {
+                        break
+                    }
+                    depth -= 1
+                }
+                i -= 1
+            }
+            if i > 0 {
+                mut name_end = i
+                mut name_start = name_end
+                for name_start > 0 and is_word_byte(source[name_start - 1]) {
+                    name_start -= 1
+                }
+                let type_name = source[name_start..name_end]
+                mut qualifier = ""
+                if name_start > 1 and source[name_start - 1] == '.' {
+                    qualifier = qualifier_before_dot(:source, offset: name_start)
+                }
+                let type_ref = buffer_type(:cg, :qualifier, word: type_name)
+                if type_ref >= 0 and type_ref % 4 == 0 {
+                    struct_idx = type_ref / 4
+                }
+            }
+        }
+    }
+    if struct_idx < 0 {
+        return -1
+    }
+    for f in cg.structs[struct_idx].fields {
+        if f.name == word {
+            return struct_idx
+        }
+    }
+    return -1
+}
+
+func is_word_byte(anon c: int64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+}
+
 func handle_hover(id_val: json.Value, params: json.Value) -> none {
     let td: json.Value = params.get("textDocument")
     let uri: str = str_or_empty(td.get("uri"))
@@ -410,6 +498,20 @@ func handle_hover(id_val: json.Value, params: json.Value) -> none {
     let cg: codegen.Codegen = compile_or_cached(:uri)
     mut signature: str = ""
     mut doc: str = ""
+    let field_owner = field_struct(:cg, source: text, :offset, :word)
+    if field_owner >= 0 {
+        for f in cg.structs[field_owner].fields {
+            if f.name == word {
+                mut weak = ""
+                if f.weak {
+                    weak = "weak "
+                }
+                signature = f"{weak}{cg.structs[field_owner].name}.{f.name}: {cg.kind_display(f.kind)}"
+            }
+        }
+        write_hover_response(:id_val, :signature, :doc)
+        return none
+    }
     mut i: int64 = 0
     for i < len(cg.func_names) {
         if cg.func_names[i] == word {
@@ -544,7 +646,7 @@ func block_open_at(source: str, from: int64, offset: int64) -> bool {
 func find_type_of(source: str, offset: int64, name: str) -> str {
     // The `let` pattern comes last and stops at the parameter found
     // first, so the blocks it has to check are the ones after that.
-    let patterns: [str] = [f"({name}:", f", {name}:", f"let {name}:"]
+    let patterns: [str] = [f"({name}:", f", {name}:", f"anon {name}:", f"mut {name}:", f"let {name}:"]
     mut best_pos: int64 = -1
     mut best_after: int64 = -1
     for pat in patterns {

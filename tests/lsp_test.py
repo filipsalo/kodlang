@@ -1617,3 +1617,87 @@ def test_hover_shows_a_struct_methods_doc_but_not_a_trailing_comment(lsp_binary)
     double, _ = _hover_and_diagnostics(lsp_binary, source, 14, 26)
     assert double is not None
     assert "Twice x.\nNever negative for a positive x." in double
+
+
+FIELD_SOURCE = (
+    "type Node = struct {\n"  # 0
+    "    name: str\n"  # 1
+    "    weak up: Node?\n"  # 2
+    "}\n"  # 3
+    "func label(anon n: Node) -> str {\n"  # 4
+    "    match n {\n"  # 5
+    "        Node(up: Node(:name)) -> return name\n"  # 6
+    "        else -> return n.name\n"  # 7
+    "    }\n"  # 8
+    "}\n"  # 9
+    "func main() -> int64 {\n"  # 10
+    '    let root = Node(name: "root")\n'  # 11
+    "    print(label(root))\n"  # 12
+    "    return 0\n"  # 13
+    "}\n"  # 14
+)
+
+
+def _definition_at(lsp_binary, source, line, character):
+    uri = "file:///tmp/fields.kod"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    return next(r for r in responses if r.get("id") == 2)["result"]
+
+
+def test_hover_on_a_struct_shows_its_weak_fields(lsp_binary):
+    value, diagnostics = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 11, 16)
+    assert diagnostics == []
+    assert value is not None
+    assert "type Node = struct { name: str, weak up: Node? }" in value
+
+
+def test_hover_on_a_field_after_a_dot(lsp_binary):
+    value, _ = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 7, 26)
+    assert value is not None
+    assert "Node.name: str" in value
+
+
+def test_hover_on_a_field_label_in_a_construction_and_a_pattern(lsp_binary):
+    built, _ = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 11, 21)
+    assert built is not None and "Node.name: str" in built
+    weak, _ = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 6, 14)
+    assert weak is not None and "weak Node.up: Node?" in weak
+    short, _ = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 6, 24)
+    assert short is not None and "Node.name: str" in short
+
+
+def test_definition_of_a_field_goes_to_its_declaration(lsp_binary):
+    loc = _definition_at(lsp_binary, FIELD_SOURCE, 6, 14)
+    assert loc is not None
+    assert loc["range"]["start"] == {"line": 2, "character": 9}
+    dotted = _definition_at(lsp_binary, FIELD_SOURCE, 7, 26)
+    assert dotted is not None
+    assert dotted["range"]["start"] == {"line": 1, "character": 4}
