@@ -184,6 +184,32 @@ func send_signal(anon pid: int64, anon sig: int64) -> none or Error {
     try signal(pid, sig)
 }
 
+// Where the name of a `NAME=value` entry ends: the index of its `=`, or -1.
+func name_end(anon entry: str) -> int64 {
+    for i in 0..len(entry) {
+        if entry[i] == '=' {
+            return i
+        }
+    }
+    return -1
+}
+
+// This process's environment, as `NAME=value` strings.
+func current_environment() -> [str] {
+    let vars = unsafe.load64(_NSGetEnviron())
+    mut out: [str] = []
+    mut at = 0
+    for true {
+        let entry = unsafe.load64(vars + 8 * at)
+        if entry == 0 {
+            break
+        }
+        out += [unsafe.str_at(entry)]
+        at += 1
+    }
+    return out
+}
+
 // A C `char **` of `strs`, ending in a 0, for as long as `strs` lives. Free it.
 func c_array(anon strs: [str]) -> int64 {
     let out = unsafe.alloc(8 * (len(strs) + 1))
@@ -194,9 +220,31 @@ func c_array(anon strs: [str]) -> int64 {
 }
 
 // Start `argv[0]` (found via PATH) without waiting for it. See docs/builtins.md.
-func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, stderr: Stdio = .Inherit, dir: str = "", env: [str]? = none) -> Child or Error {
+func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, stderr: Stdio = .Inherit, dir: str = "", env: [str]? = none, add_env: [str] = []) -> Child or Error {
     if len(argv) == 0 {
         throw ProcessError(message: "start: no program to run")
+    }
+    for entry in add_env {
+        if name_end(entry) <= 0 {
+            throw ProcessError(message: f"start: add_env entry `{entry}` is not NAME=value")
+        }
+    }
+    // The environment to give the child: `env` or this process's, then
+    // `add_env` over it; none when that is this process's as it is.
+    mut child_env = env
+    if len(add_env) > 0 {
+        mut vars = env? or current_environment()
+        for entry in add_env {
+            let prefix = entry[0..name_end(entry) + 1]
+            mut kept: [str] = []
+            for v in vars {
+                if not v.starts_with(prefix) {
+                    kept += [v]
+                }
+            }
+            vars = kept + [entry]
+        }
+        child_env = vars
     }
     let modes = [stdin, stdout, stderr]
     // Three pipes of two C ints, -1 until made, then the child's pid.
@@ -210,7 +258,7 @@ func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, 
     if init_err != 0 {
         r = .Err(error: os_error(f"start {argv[0]}", errno: init_err))
     } else {
-        r = spawn_with(actions, block: block, argv: argv, modes: modes, dir: dir, env: env)
+        r = spawn_with(actions, block: block, argv: argv, modes: modes, dir: dir, env: child_env)
         libc.posix_spawn_file_actions_destroy(actions)
     }
     unsafe.free(actions)
@@ -307,8 +355,8 @@ func spawn_check(anon result: int64, what: str) -> none or Error {
 
 // Run `argv[0]` (found via PATH) to the end, with `input` on its stdin, and
 // collect what it writes to stdout and stderr. See docs/builtins.md.
-func output(anon argv: [str], input: str = "", dir: str = "", env: [str]? = none) -> Output or Error {
-    let child = try start(argv, stdin: .Pipe, stdout: .Pipe, stderr: .Pipe, :dir, :env)
+func output(anon argv: [str], input: str = "", dir: str = "", env: [str]? = none, add_env: [str] = []) -> Output or Error {
+    let child = try start(argv, stdin: .Pipe, stdout: .Pipe, stderr: .Pipe, :dir, :env, :add_env)
     let out = try gather(child, input: kod_str_to_bytes(input))
     out.status = try child.wait()
     return out

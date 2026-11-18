@@ -242,7 +242,7 @@ func branch() -> str or Error {
 - `input:` is written to the program's stdin while its output is read,
   then stdin is closed. Without it, stdin is empty. A program that exits
   without reading all of its input is not an error.
-- `dir:` and `env:` work as for `start`, below.
+- `dir:`, `env:` and `add_env:` work as for `start`, below.
 - It fails as `start` does when the program can't be run, and with a
   `process.ProcessError` when a signal ends it.
 
@@ -276,6 +276,11 @@ func shout(anon text: str) -> str or Error {
 - `env:` replaces the child's environment with a list of `NAME=value`
   strings; without it, the child gets this process's environment. `argv[0]`
   is looked up on this process's `PATH` either way.
+- `add_env:` sets variables on top of that, as `NAME=value` strings: each
+  replaces a variable of the same name or adds one, so
+  `add_env: ["DEBUG=1"]` runs the child with this process's environment
+  plus `DEBUG`. An entry without a `=`, or with nothing before it, is a
+  `process.ProcessError`.
 - `start` fails with an `IoError` when the program can't be run, as for a
   missing program (`.NotFound`) or directory.
 - `child.wait()` closes `child.stdin` if it is a pipe, waits for the child
