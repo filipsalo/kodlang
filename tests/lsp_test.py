@@ -1540,3 +1540,80 @@ def test_a_directive_block_with_no_blank_line_after_it_is_the_first_declarations
     assert value is not None and "func crc" in value
     assert "kod:link -lz" in value
     assert diagnostics == []
+
+
+INTERFACE_SOURCE = (
+    "interface Counter {\n"  # 0
+    "    func next(self) -> int64\n"  # 1
+    "\n"  # 2
+    "    // Add up the next n values.\n"  # 3
+    "    func sum(self, anon n: int64) -> int64 {\n"  # 4
+    "        return self.next() * n\n"  # 5
+    "    }\n"  # 6
+    "}\n"  # 7
+    "type Steps = struct {\n"  # 8
+    "    func next(self) -> int64 {\n"  # 9
+    "        return 1\n"  # 10
+    "    }\n"  # 11
+    "}\n"  # 12
+    "type Dice = enum {\n"  # 13
+    "    Six\n"  # 14
+    "    func roll(self) -> int64 {\n"  # 15
+    "        return 6\n"  # 16
+    "    }\n"  # 17
+    "}\n"  # 18
+    "func main() -> int64 {\n"  # 19
+    "    let c: Counter = Steps()\n"  # 20
+    "    return c.sum(2) + Dice.Six.roll()\n"  # 21
+    "}\n"  # 22
+)
+
+
+def test_hover_on_an_interface_name_lists_its_methods(lsp_binary):
+    value, diagnostics = _hover_and_diagnostics(lsp_binary, INTERFACE_SOURCE, 20, 12)
+    assert diagnostics == []
+    assert value is not None
+    assert "interface Counter {" in value
+    assert "func next() -> int64" in value
+    assert "func sum(anon n: int64) -> int64 { ... }" in value
+
+
+def test_hover_on_an_interface_method_shows_it_and_its_doc(lsp_binary):
+    value, _ = _hover_and_diagnostics(lsp_binary, INTERFACE_SOURCE, 21, 14)
+    assert value is not None
+    assert "func Counter.sum(" in value
+    assert "Add up the next n values." in value
+
+
+def test_hover_on_an_enum_method(lsp_binary):
+    value, _ = _hover_and_diagnostics(lsp_binary, INTERFACE_SOURCE, 21, 32)
+    assert value is not None
+    assert "func Dice.roll(" in value
+
+
+def test_hover_shows_a_struct_methods_doc_but_not_a_trailing_comment(lsp_binary):
+    source = (
+        "type Box = struct {\n"  # 0
+        "    x: int64 // not a doc\n"  # 1
+        "    func plain(self) -> int64 {\n"  # 2
+        "        return self.x\n"  # 3
+        "    }\n"  # 4
+        "\n"  # 5
+        "    // Twice x.\n"  # 6
+        "    // Never negative for a positive x.\n"  # 7
+        "    func double(self) -> int64 {\n"  # 8
+        "        return self.x * 2\n"  # 9
+        "    }\n"  # 10
+        "}\n"  # 11
+        "func main() -> int64 {\n"  # 12
+        "    let b = Box(x: 1)\n"  # 13
+        "    return b.plain() + b.double()\n"  # 14
+        "}\n"  # 15
+    )
+    plain, diagnostics = _hover_and_diagnostics(lsp_binary, source, 14, 14)
+    assert diagnostics == []
+    assert plain is not None and "func Box.plain(self) -> int64" in plain
+    assert "not a doc" not in plain
+    double, _ = _hover_and_diagnostics(lsp_binary, source, 14, 26)
+    assert double is not None
+    assert "Twice x.\nNever negative for a positive x." in double
