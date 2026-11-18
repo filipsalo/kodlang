@@ -468,12 +468,3 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
     if (refs) rc_arr_retain_all((void **)out->ptr, total);
     return out;
 }
-
-// The same with 8-byte elements, for code the bootstrap snapshot compiled
-// before arrays had a width.
-void *kod_array_slice(void *a, int64_t start, int64_t end) { return kod_arr_slice(a, start, end, 8); }
-void *kod_array_copy(void *a) { return kod_arr_copy(a, 8); }
-void *kod_array_concat(void *a, void *b) { return kod_arr_concat(a, b, 8); }
-void *kod_array_push(void *a, int64_t v, int64_t refs) { return kod_arr_push(a, v, refs, 8); }
-void *kod_array_repeat(void *a, int64_t n) { return kod_arr_repeat(a, n, 8); }
-void *kod_array_concat_new(void *a, void *b) { return kod_arr_concat_new(a, b, 8); }
