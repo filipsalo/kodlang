@@ -1,5 +1,4 @@
-// Filesystem operations, over the C library through unsafe; standard output
-// and input are still C in stdlib/runtime.c.
+// Files, standard input and standard output, over the C library through unsafe.
 
 import "libc"
 import "unsafe"
@@ -10,6 +9,12 @@ let MODE_REGULAR: int64 = 32768
 // Where st_mode sits in a macOS struct stat, and the struct's size.
 let STAT_MODE: int64 = 4
 let STAT_SIZE: int64 = 144
+let POLLIN: int64 = 1
+
+// C's stdin, stdout and stderr: FILE pointers, shared with `print`.
+extern let __stdinp: int64
+extern let __stdoutp: int64
+extern let __stderrp: int64
 
 // Read the file at `path` and return its contents. Pipes and FIFOs
 // (e.g. "/dev/stdin") are read until EOF. Returns the empty string if
@@ -76,35 +81,94 @@ func write_file(anon path: str, anon content: str) -> int64 {
 // `print` / `puts` calls write there instead of the terminal. Used by
 // sh_kodc to capture codegen output to a .s file. Returns 0 on success,
 // -1 on failure.
-extern func redirect_stdout(anon path: str) -> int64
+func redirect_stdout(anon path: str) -> int64 {
+    if libc.freopen(unsafe.c_str(path), unsafe.c_str("w"), __stdoutp) == 0 {
+        return -1
+    }
+    return 0
+}
 
 // Flush stdout to disk. Pair with `redirect_stdout` before invoking a
 // subprocess that reads the captured file.
-extern func flush_stdout() -> none
+func flush_stdout() -> none {
+    libc.fflush(__stdoutp)
+}
 
 // Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
 // timeout, -1 on error. Lets LSP-style loops detect idle periods —
 // e.g. wait briefly after a didChange before doing the expensive
 // compile so a burst of keystrokes coalesces.
-extern func stdin_data_ready(anon timeout_ms: int64) -> int64
+func stdin_data_ready(anon timeout_ms: int64) -> int64 {
+    let p = unsafe.alloc(8)
+    unsafe.store32(p, 0)
+    unsafe.store32(p + 4, POLLIN)
+    let n = unsafe.c_int(libc.poll(p, 1, timeout_ms))
+    unsafe.free(p)
+    if n < 0 {
+        return -1
+    }
+    if n > 0 {
+        return 1
+    }
+    return 0
+}
 
 // Read one '\n'-terminated line from stdin. The trailing newline (and
 // CR, if any) is stripped. Returns an empty string on EOF with no
 // buffered bytes. Intended for LSP-style framing: read Content-Length
 // headers line-by-line, then call `read_stdin_exact` for the body.
-extern func read_stdin_line() -> str
+func read_stdin_line() -> str {
+    // getline's buffer and its size, which it allocates and grows.
+    let slots = unsafe.alloc(16)
+    let n = libc.getline(slots, slots + 8, __stdinp)
+    let line = unsafe.load64(slots)
+    mut out = ""
+    if n > 0 {
+        mut size = n
+        if unsafe.load8(line + size - 1) == 10 {
+            size -= 1
+        }
+        if size > 0 and unsafe.load8(line + size - 1) == 13 {
+            size -= 1
+        }
+        out = str(unsafe.copy_out(line, size))
+    }
+    unsafe.free(line)
+    unsafe.free(slots)
+    return out
+}
 
 // Read exactly `n` bytes from stdin and return them as a string. On a
 // short read (EOF before n bytes), returns the truncated content;
 // callers detect that by checking `len(result) == n`.
-extern func read_stdin_exact(anon n: int64) -> str
+func read_stdin_exact(anon n: int64) -> str {
+    if n <= 0 {
+        return ""
+    }
+    let buf = unsafe.alloc(n)
+    mut got = 0
+    for got < n {
+        let r = libc.fread(buf + got, 1, n - got, __stdinp)
+        if r == 0 {
+            break
+        }
+        got += r
+    }
+    let out = str(unsafe.copy_out(buf, got))
+    unsafe.free(buf)
+    return out
+}
 
 // Write `s` to stdout verbatim — no trailing newline, no flush. Use
 // where you control framing (e.g. LSP message bodies). Pair with
 // `flush_stdout` when downstream is reading immediately.
-extern func write_stdout(anon s: str) -> none
+func write_stdout(anon s: str) -> none {
+    libc.fwrite(unsafe.c_str(s), 1, len(s), __stdoutp)
+}
 
 // Same as `write_stdout` but to stderr. Used by the kod-side build /
 // run driver to forward a child process's captured stderr without
 // adding a trailing newline.
-extern func write_stderr(anon s: str) -> none
+func write_stderr(anon s: str) -> none {
+    libc.fwrite(unsafe.c_str(s), 1, len(s), __stderrp)
+}

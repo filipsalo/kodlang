@@ -151,21 +151,6 @@ __attribute__((weak)) void kod_test_fail(KodStr *msg) {
     kod_panic(msg);
 }
 
-// Reopen stdout against `path`, so subsequent prints go to the file.
-// Used by sh_kodc to capture codegen output to a .s file in a single
-// process (rather than parent-captured stdout). Returns 0 on success,
-// -1 on failure.
-int64_t redirect_stdout(KodStr *path) {
-    if (!freopen(path->buf, "w", stdout)) return -1;
-    return 0;
-}
-
-// Flush stdout. Needed after a `redirect_stdout` block to make sure
-// the on-disk file is complete before another process reads it.
-void flush_stdout(void) {
-    fflush(stdout);
-}
-
 static int64_t clamp_slice(int64_t len, int64_t *start, int64_t end) {
     if (*start < 0) *start = 0;
     if (*start > len) *start = len;
@@ -469,92 +454,6 @@ void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
     if (rhs->len > 0) memcpy((int64_t *)out->ptr + lhs->len, rhs->ptr, rhs->len * 8);
     if (refs) rc_arr_retain_all((void **)out->ptr, total);
     return out;
-}
-
-// Return 1 if stdin has data ready (or EOF) within `timeout_ms`, 0 on
-// timeout, -1 on error. Used by the LSP loop to detect typing pauses:
-// after a didChange, wait a short window for the next message; if it
-// doesn't arrive, the user has paused and it's worth doing the
-// expensive compile + diagnostics publish.
-int64_t stdin_data_ready(int64_t timeout_ms) {
-    struct pollfd pfd = { .fd = 0, .events = POLLIN };
-    int n = poll(&pfd, 1, (int)timeout_ms);
-    if (n < 0) {
-        return -1;
-    }
-    return n > 0 ? 1 : 0;
-}
-
-// Read one '\n'-terminated line from stdin, NUL-terminate it, strip a
-// trailing '\r' if present, and return the body. Returns an empty
-// string on EOF with no bytes buffered. Used by LSP-style framing:
-// callers read Content-Length headers line-by-line and then switch to
-// read_stdin_exact for the body.
-KodStr *read_stdin_line(void) {
-    // Read into a scratch buffer first (length unknown up front), then
-    // copy into a properly-headed KodStr at the end.
-    int64_t cap = 64;
-    int64_t len = 0;
-    char *scratch = (char *)rc_alloc_raw(cap, 0);
-    while (1) {
-        int ch = getchar();
-        if (ch == EOF) {
-            break;
-        }
-        if (ch == '\n') {
-            break;
-        }
-        if (len + 1 >= cap) {
-            int64_t new_cap = cap * 2;
-            char *new_buf = (char *)rc_alloc_raw(new_cap, 0);
-            for (int64_t i = 0; i < len; i++) new_buf[i] = scratch[i];
-            rc_release_c(scratch);
-            scratch = new_buf;
-            cap = new_cap;
-        }
-        scratch[len++] = (char)ch;
-    }
-    if (len > 0 && scratch[len - 1] == '\r') {
-        len--;
-    }
-    KodStr *s = kod_str_alloc(len);
-    memcpy(s->buf, scratch, len);
-    rc_release_c(scratch);
-    return s;
-}
-
-// Write `s` to stdout verbatim — no trailing newline, no flush. Use
-// for output where you control framing (e.g. LSP messages where the
-// `\n` puts/print appends would split the next message's headers).
-void write_stdout(KodStr *s) {
-    fwrite(s->buf, 1, (size_t)s->len, stdout);
-}
-
-// Same for stderr — used by the kod-side build/run driver to forward
-// a child process's captured stderr without an extra newline.
-void write_stderr(KodStr *s) {
-    fwrite(s->buf, 1, (size_t)s->len, stderr);
-}
-
-// Read exactly `n` bytes from stdin into a fresh KodStr. On a short
-// read (EOF before n bytes), the header's `len` is shrunk to match
-// what was actually read — callers length-check against `n`. Used
-// for LSP message bodies after Content-Length headers.
-KodStr *read_stdin_exact(int64_t n) {
-    KodStr *s = kod_str_alloc(n);
-    int64_t got = 0;
-    while (got < n) {
-        size_t r = fread(s->buf + got, 1, (size_t)(n - got), stdin);
-        if (r == 0) {
-            break;
-        }
-        got += (int64_t)r;
-    }
-    if (got != n) {
-        s->len = got;
-        s->buf[got] = '\0';
-    }
-    return s;
 }
 
 // ── Sampling profiler ─────────────────────────────────────────────────
