@@ -228,9 +228,8 @@ string or `-1` on failure, with no reason.
 
 `stdlib/net/tcp.kod` opens TCP connections. A connection is an `Fd`, so it is
 a `Reader` and a `Writer`: it works with `BufReader` and has `read_all`,
-`write_str` and the rest.
-A program that imports it compiles and links `stdlib/net/tcp.c`; no other
-program does.
+`write_str` and the rest. It is Kod throughout, calling the C library's socket
+functions through [`unsafe`](unsafe.md).
 
 ```kod
 import "net/tcp" { connect, set_timeout }

@@ -1,31 +1,158 @@
-// TCP connections as file descriptors. See docs/io.md.
-// kod:cc tcp.c
+// TCP connections as file descriptors, over the C library's sockets through
+// unsafe. See docs/io.md.
 
 import "libc"
 import "stream" { IoError, IoKind, os_error }
-import "posix" { Fd, kod_io_errno }
+import "posix" { Fd }
 import "time" { Duration }
 import "unsafe"
 
-extern func kod_tcp_connect(anon host: str, anon port: int64, anon timeout_ms: int64) -> int64
-extern func kod_tcp_listen(anon host: str, anon port: int64, anon backlog: int64) -> int64
-extern func kod_tcp_accept(anon fd: int64) -> int64
-extern func kod_tcp_port(anon fd: int64) -> int64
-extern func kod_tcp_set_timeout(anon fd: int64, anon ms: int64) -> int64
-extern func kod_tcp_gai_message() -> str
-extern func kod_tcp_idle(anon fd: int64) -> int64
+// macOS values of the C constants used here.
+let AF_UNSPEC: int64 = 0
+let AF_INET: int64 = 2
+let SOCK_STREAM: int64 = 1
+let AI_PASSIVE: int64 = 1
+let EAI_SYSTEM: int64 = 11
+let SOL_SOCKET: int64 = 65535
+let SO_REUSEADDR: int64 = 4
+let SO_SNDTIMEO: int64 = 4101
+let SO_RCVTIMEO: int64 = 4102
+let SO_ERROR: int64 = 4103
+let SO_NOSIGPIPE: int64 = 4130
+let IPPROTO_TCP: int64 = 6
+let TCP_NODELAY: int64 = 1
+let EINTR: int64 = 4
+let EINPROGRESS: int64 = 36
+let EADDRNOTAVAIL: int64 = 49
+let ETIMEDOUT: int64 = 60
+let ECONNREFUSED: int64 = 61
+let F_SETFD: int64 = 2
+let F_GETFL: int64 = 3
+let F_SETFL: int64 = 4
+let FD_CLOEXEC: int64 = 1
+let O_NONBLOCK: int64 = 4
+let POLLIN: int64 = 1
+let POLLOUT: int64 = 4
+let INT_MAX: int64 = 2147483647
+
+// Where the fields of a C struct addrinfo are, on macOS.
+let AI_FLAGS: int64 = 0
+let AI_FAMILY: int64 = 4
+let AI_SOCKTYPE: int64 = 8
+let AI_PROTOCOL: int64 = 12
+let AI_ADDRLEN: int64 = 16
+let AI_ADDR: int64 = 32
+let AI_NEXT: int64 = 40
+let ADDRINFO_SIZE: int64 = 48
 
 func bad_input(anon op: str, anon detail: str) -> IoError {
     return IoError(kind: .InvalidInput, op: op, errno: 0, detail: detail)
 }
 
-// The error for a failed call that may have been a name that didn't resolve.
-func last_error(anon op: str, resolving: str) -> IoError {
-    let gai = kod_tcp_gai_message()
-    if len(gai) > 0 and kod_io_errno() == 0 {
-        return IoError(kind: .HostNotFound, op: resolving, errno: 0, detail: gai)
+// getaddrinfo's list of addresses for `host` (none: any address) and `port`;
+// free it with libc.freeaddrinfo. A name that doesn't resolve is a
+// HostNotFound error for `resolving`, a system failure an error for `op`.
+func resolve(anon host: str, port: int64, family: int64, passive: bool, op: str, resolving: str) -> int64 or Error {
+    let hints = unsafe.alloc(ADDRINFO_SIZE)
+    unsafe.store32(hints + AI_FAMILY, family)
+    unsafe.store32(hints + AI_SOCKTYPE, SOCK_STREAM)
+    if passive {
+        unsafe.store32(hints + AI_FLAGS, AI_PASSIVE)
     }
-    return os_error(op, errno: kod_io_errno())
+    let service = f"{port}"
+    mut host_addr = 0
+    if len(host) > 0 {
+        host_addr = unsafe.c_str(host)
+    }
+    let out = unsafe.alloc(8)
+    let rc = unsafe.c_int(libc.getaddrinfo(host_addr, unsafe.c_str(service), hints, out))
+    let err = unsafe.errno()
+    let list = unsafe.load64(out)
+    unsafe.free(out)
+    unsafe.free(hints)
+    if rc == EAI_SYSTEM {
+        throw os_error(op, errno: err)
+    }
+    if rc != 0 {
+        throw IoError(kind: .HostNotFound, op: resolving, errno: 0, detail: unsafe.str_at(libc.gai_strerror(rc)))
+    }
+    return list
+}
+
+// Set an int socket option to 1: 0, or -1 with errno set.
+func set_flag(anon fd: int64, level: int64, option: int64) -> int64 {
+    let one = unsafe.alloc(4)
+    unsafe.store32(one, 1)
+    let r = unsafe.c_int(libc.setsockopt(fd, level, option, one, 4))
+    unsafe.free(one)
+    return r
+}
+
+// A socket for the address `ai`, closed on exec and without SIGPIPE: the fd,
+// or -1 with errno set.
+func new_socket(anon ai: int64) -> int64 {
+    let fd = unsafe.c_int(libc.socket(unsafe.load32(ai + AI_FAMILY), unsafe.load32(ai + AI_SOCKTYPE), unsafe.load32(ai + AI_PROTOCOL)))
+    if fd < 0 {
+        return -1
+    }
+    libc.kod_fcntl(fd, F_SETFD, FD_CLOEXEC)
+    set_flag(fd, level: SOL_SOCKET, option: SO_NOSIGPIPE)
+    return fd
+}
+
+// Wait up to `ms` for one `events` on `fd`: the count ready (0 or 1), or -1
+// with errno set.
+func wait_for(anon fd: int64, events: int64, ms: int64) -> int64 {
+    let p = unsafe.alloc(8)
+    unsafe.store32(p, fd)
+    unsafe.store32(p + 4, events)
+    mut wait_ms = ms
+    if wait_ms > INT_MAX {
+        wait_ms = INT_MAX
+    }
+    mut n = -1
+    for true {
+        n = unsafe.c_int(libc.poll(p, 1, wait_ms))
+        if n >= 0 or unsafe.errno() != EINTR {
+            break
+        }
+    }
+    unsafe.free(p)
+    return n
+}
+
+// Connect `fd` to the address `ai` within `ms`: 0, or the errno.
+func connect_within(anon fd: int64, ai: int64, ms: int64) -> int64 {
+    let flags = unsafe.c_int(libc.kod_fcntl(fd, F_GETFL, 0))
+    libc.kod_fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    if unsafe.c_int(libc.connect(fd, unsafe.load64(ai + AI_ADDR), unsafe.load32(ai + AI_ADDRLEN))) < 0 {
+        let err = unsafe.errno()
+        if err != EINPROGRESS and err != EINTR {
+            return err
+        }
+        let ready = wait_for(fd, events: POLLOUT, :ms)
+        if ready < 0 {
+            return unsafe.errno()
+        }
+        if ready == 0 {
+            return ETIMEDOUT
+        }
+        // An int, then its socklen_t size.
+        let slot = unsafe.alloc(8)
+        unsafe.store32(slot + 4, 4)
+        mut so_error = 0
+        if unsafe.c_int(libc.getsockopt(fd, SOL_SOCKET, SO_ERROR, slot, slot + 4)) < 0 {
+            so_error = unsafe.errno()
+        } else {
+            so_error = unsafe.load32(slot)
+        }
+        unsafe.free(slot)
+        if so_error != 0 {
+            return so_error
+        }
+    }
+    libc.kod_fcntl(fd, F_SETFL, flags)
+    return 0
 }
 
 func connect(anon host: str, port: int64, timeout: Duration = Duration(seconds: 10)) -> Fd or Error {
@@ -36,38 +163,84 @@ func connect(anon host: str, port: int64, timeout: Duration = Duration(seconds: 
     if port < 0 or port > 65535 {
         throw bad_input(op, "port out of range")
     }
-    let fd = kod_tcp_connect(host, port, timeout.ceil_ms())
-    if fd < 0 {
-        throw last_error(op, resolving: f"resolve {host}")
+    let list = try resolve(host, :port, family: AF_UNSPEC, passive: false, :op, resolving: f"resolve {host}")
+    mut last = ECONNREFUSED
+    mut ai = list
+    for ai != 0 {
+        let fd = new_socket(ai)
+        if fd < 0 {
+            last = unsafe.errno()
+        } else {
+            let err = connect_within(fd, :ai, ms: timeout.ceil_ms())
+            if err == 0 {
+                set_flag(fd, level: IPPROTO_TCP, option: TCP_NODELAY)
+                libc.freeaddrinfo(list)
+                return Fd(:fd)
+            }
+            libc.close(fd)
+            last = err
+        }
+        ai = unsafe.load64(ai + AI_NEXT)
     }
-    return Fd(fd: fd)
+    libc.freeaddrinfo(list)
+    throw os_error(op, errno: last)
 }
 
 func set_timeout(anon f: Fd, timeout: Duration) -> none or Error {
-    if kod_tcp_set_timeout(f.fd, timeout.ceil_ms()) < 0 {
-        throw os_error("set timeout", errno: kod_io_errno())
+    let ms = timeout.ceil_ms()
+    // A C struct timeval: 8 bytes of seconds, then an int of microseconds.
+    let tv = unsafe.alloc(16)
+    unsafe.store64(tv, ms / 1000)
+    unsafe.store32(tv + 8, (ms % 1000) * 1000)
+    mut failed = unsafe.c_int(libc.setsockopt(f.fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16)) < 0
+    if not failed {
+        failed = unsafe.c_int(libc.setsockopt(f.fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16)) < 0
+    }
+    let err = unsafe.errno()
+    unsafe.free(tv)
+    if failed {
+        throw os_error("set timeout", errno: err)
     }
 }
 
 // True if nothing is waiting to be read from `f`: no data, and the peer has not
 // closed it.
 func is_idle(anon f: Fd) -> bool {
-    return kod_tcp_idle(f.fd) != 0
+    return wait_for(f.fd, events: POLLIN, ms: 0) == 0
 }
 
 type Listener = struct {
     fd: int64
 
     func accept(self) -> Fd or Error {
-        let c = kod_tcp_accept(self.fd)
-        if c < 0 {
-            throw os_error("accept", errno: kod_io_errno())
+        mut c = -1
+        for true {
+            c = unsafe.c_int(libc.accept(self.fd, 0, 0))
+            if c >= 0 {
+                break
+            }
+            let err = unsafe.errno()
+            if err != EINTR {
+                throw os_error("accept", errno: err)
+            }
         }
+        libc.kod_fcntl(c, F_SETFD, FD_CLOEXEC)
+        set_flag(c, level: SOL_SOCKET, option: SO_NOSIGPIPE)
+        set_flag(c, level: IPPROTO_TCP, option: TCP_NODELAY)
         return Fd(fd: c)
     }
 
     func port(self) -> int64 {
-        return kod_tcp_port(self.fd)
+        // A struct sockaddr_storage, then its socklen_t size. The port is
+        // the big-endian 2 bytes at offset 2, for IPv4 and IPv6 alike.
+        let addr = unsafe.alloc(136)
+        unsafe.store32(addr + 128, 128)
+        mut port = -1
+        if unsafe.c_int(libc.getsockname(self.fd, addr, addr + 128)) == 0 {
+            port = unsafe.load8(addr + 2) * 256 + unsafe.load8(addr + 3)
+        }
+        unsafe.free(addr)
+        return port
     }
 
     func close(self) -> none or Error {
@@ -82,9 +255,29 @@ func listen(anon host: str, port: int64, backlog: int64 = 128) -> Listener or Er
     if port < 0 or port > 65535 {
         throw bad_input(op, "port out of range")
     }
-    let fd = kod_tcp_listen(host, port, backlog)
-    if fd < 0 {
-        throw last_error(op, resolving: f"resolve {host}")
+    // No host: every IPv4 interface.
+    mut family = AF_UNSPEC
+    if len(host) == 0 {
+        family = AF_INET
     }
-    return Listener(fd: fd)
+    let list = try resolve(host, :port, :family, passive: true, :op, resolving: f"resolve {host}")
+    mut last = EADDRNOTAVAIL
+    mut ai = list
+    for ai != 0 {
+        let fd = new_socket(ai)
+        if fd < 0 {
+            last = unsafe.errno()
+        } else {
+            set_flag(fd, level: SOL_SOCKET, option: SO_REUSEADDR)
+            if unsafe.c_int(libc.bind(fd, unsafe.load64(ai + AI_ADDR), unsafe.load32(ai + AI_ADDRLEN))) == 0 and unsafe.c_int(libc.listen(fd, backlog)) == 0 {
+                libc.freeaddrinfo(list)
+                return Listener(:fd)
+            }
+            last = unsafe.errno()
+            libc.close(fd)
+        }
+        ai = unsafe.load64(ai + AI_NEXT)
+    }
+    libc.freeaddrinfo(list)
+    throw os_error(op, errno: last)
 }
