@@ -569,6 +569,25 @@ extern func labs(anon n: int64) -> int64     // compiled programs only
 extern func putchar(anon c: int64) -> int64
 ```
 
+A C function that takes a variable number of arguments, such as `fcntl`,
+`open` or `printf`, ends its parameters with `...`:
+
+```kod
+extern func fcntl(anon fd: int64, anon cmd: int64, ...) -> int64
+extern func snprintf(anon buf: int64, anon size: int64, anon format: int64, ...) -> int64
+
+fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+```
+
+- Only an `extern` can take `...`, and it comes last.
+- The parameters before it must be `int64` or `bool`; pass a pointer as an
+  `int64` from [`unsafe`](unsafe.md).
+- A call gives at least those, then any number more. Each extra argument is
+  an `int64` or a `bool`, without a label. On arm64 macOS each goes in an
+  8-byte slot on the stack, where C's `va_arg` looks for it.
+- A float can't be an extra argument, and neither can a `str`; pass
+  `unsafe.c_str(s)` for C's `%s`.
+
 An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`; to call a libc function that takes a C string, a buffer or a pointer to write to, pass addresses from [`unsafe`](unsafe.md) as `int64`.
 
 ## Recursion

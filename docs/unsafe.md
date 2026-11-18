@@ -97,10 +97,10 @@ call that failed: anything else in between, a `print` too, may change it.
 
 ## What doesn't fit
 
-- C functions that take a variable number of arguments, such as `open`,
-  `fcntl` and `printf`, pass them in a way an `extern` doesn't. Call them
-  through a small C function instead (see
-  [Link inputs](modules.md#link-inputs)).
+- Variable arguments, as `printf` takes them, are only `int64` and `bool`:
+  declare the function with `...` (see
+  [Extern functions](functions.md#extern-functions)) and pass numbers and
+  addresses, but no `double`.
 - A C function that takes or returns a `struct` by value, or a `float` or
   `double`. Pointers to structs are fine: `alloc` the bytes C's layout
   needs and `load`/`store` the fields at their offsets.

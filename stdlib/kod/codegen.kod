@@ -189,6 +189,8 @@ type SigInfo = struct {
     // kinds are unknown where they name a parameter, and set for an instance.
     type_params: [str] = []
     type_args: [TypeKind] = []
+    // An extern whose parameters end in `...`: a call may pass more.
+    variadic: bool = false
 }
 
 // A saved shared_const_id and its path; see Codegen.share_begin.
@@ -5318,7 +5320,7 @@ type Codegen = struct {
                     own.set(s.p.func_decls[decl_id].name, di)
                     self.scopes[si].names += [s.p.func_decls[decl_id].name]
                 }
-                .Extern(name, _name_span, _params, _return_typ) -> {
+                .Extern(name, _name_span, _params, _return_typ, _variadic) -> {
                     own.set(name, di)
                     self.scopes[si].names += [name]
                 }
@@ -5353,8 +5355,8 @@ type Codegen = struct {
         if decl_idx >= 0 {
             match s.module.decls[decl_idx] {
                 .Func(decl_id) -> fd_id = decl_id
-                .Extern(_name, name_span, params, return_typ) -> {
-                    k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: extern_label(key), sig: self.resolve_extern_sig(params, :return_typ, p: s.p), def_path: s.path, def_span: name_span))
+                .Extern(_name, name_span, params, return_typ, variadic) -> {
+                    k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: extern_label(key), sig: self.resolve_extern_sig(params, :return_typ, p: s.p, :variadic), def_path: s.path, def_span: name_span))
                 }
                 else none
             }
@@ -6228,6 +6230,12 @@ type Codegen = struct {
             } else {
                 result = result + f"{label}: {self.kind_display(sig.param_kinds[i])}"
             }
+        }
+        if sig.variadic {
+            if shown > 0 {
+                result = result + ", "
+            }
+            result = result + "..."
         }
         return f"{result}) -> {self.kind_display(sig.return_kind)}"
     }
@@ -7747,7 +7755,7 @@ type Codegen = struct {
 
     // Same as resolve_sig but for an Extern decl, whose params/return_typ
     // are inlined in the Decl variant rather than wrapped in a FuncDecl.
-    func resolve_extern_sig(self, anon params: [ast.Param], return_typ: int64, p: parsing.Parser) -> SigInfo {
+    func resolve_extern_sig(self, anon params: [ast.Param], return_typ: int64, p: parsing.Parser, variadic: bool = false) -> SigInfo {
         let saved_p = self.p
         self.p = p
         mut param_kinds: [TypeKind] = []
@@ -7766,7 +7774,80 @@ type Codegen = struct {
         }
         let return_kind = self.resolve_type(return_typ)
         self.p = saved_p
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p)
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :variadic)
+    }
+
+    // A call to an extern with `...`. Apple's arm64 convention passes the
+    // arguments for `...` on the stack, 8 bytes each from sp up, and the others
+    // in x0-x7. Every argument is worked out in order into a stack area: the
+    // extra ones at its bottom, where the call needs them, the others above,
+    // loaded into registers last.
+    func compile_variadic_call(self, anon sig: SigInfo, label: str, args: [ast.CallArg], name: str, span: ast.Span) -> Val {
+        let fixed = len(sig.param_kinds)
+        if len(args) < fixed {
+            self.report_error(f"error: `{name}` takes at least {self.arg_noun(fixed)}, got {len(args)}", :span)
+            return .VImm(value: 0)
+        }
+        mut kinds: [TypeKind] = []
+        mut ok = true
+        for i, arg in args {
+            if i < fixed {
+                if arg.label != sig.param_labels[i] {
+                    if len(sig.param_labels[i]) == 0 {
+                        self.report_error(f"error: argument {i + 1} of `{name}` takes no label", span: arg.label_span)
+                    } else {
+                        self.report_error(f"error: argument {i + 1} of `{name}` is labelled `{sig.param_labels[i]}:`", span: self.p.expr_spans[arg.value])
+                    }
+                    ok = false
+                }
+                kinds += [sig.param_kinds[i]]
+                continue
+            }
+            if len(arg.label) > 0 {
+                self.report_error("error: an argument for `...` can't have a label", span: arg.label_span)
+                ok = false
+            }
+            let kind = self.infer_kind(arg.value)
+            if not (kind is .KInt64) and not (kind is .KBool) {
+                self.report_error(f"error: an argument for `...` must be an `int64` or a `bool`, not `{self.kind_display(kind)}`", span: self.p.expr_spans[arg.value])
+                ok = false
+            }
+            kinds += [kind]
+        }
+        if not ok {
+            return .VImm(value: 0)
+        }
+        let extra = len(args) - fixed
+        mut area = 8 * len(args)
+        if area % 16 != 0 {
+            area += 8
+        }
+        self.emit(f"sub sp, sp, #{area}")
+        for i, arg in args {
+            let reg = self.compile_into(arg.value, expected: kinds[i])
+            mut at = 8 * (i - fixed)
+            if i < fixed {
+                at = 8 * (extra + i)
+            }
+            self.emit(f"str {reg}, [sp, #{at}]")
+            self.pool.free_reg(reg)
+        }
+        for i in 0..fixed {
+            self.emit(f"ldr x{i}, [sp, #{8 * (extra + i)}]")
+        }
+        self.emit(f"bl {label}")
+        self.emit(f"add sp, sp, #{area}")
+        return .VReg(name: "x0")
+    }
+
+    // The parameters before an extern's `...` are words C reads as they are.
+    func check_variadic_params(self, anon params: [ast.Param]) -> none {
+        for param in params {
+            let kind = self.resolve_type(param.typ)
+            if not (kind is .KInt64) and not (kind is .KBool) {
+                self.report_error(f"error: the parameters of an extern with `...` must be `int64` or `bool`, not `{self.kind_display(kind)}`", span: param.span)
+            }
+        }
     }
 
 
@@ -12264,7 +12345,7 @@ type Codegen = struct {
                     self.check_sig_types(fd.params, return_typ: fd.return_typ)
                     self.subst_names = saved_names
                 }
-                .Extern(_name, _name_span, params, return_typ) -> self.check_sig_types(params, :return_typ)
+                .Extern(_name, _name_span, params, return_typ, _variadic) -> self.check_sig_types(params, :return_typ)
                 .Struct(_name, _name_span, type_params, fields, methods) -> {
                     self.subst_names = type_params
                     for field in fields {
@@ -12399,8 +12480,11 @@ type Codegen = struct {
                         self.check_param_names(fd.params)
                     }
                 }
-                .Extern(name, name_span, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ, variadic) -> {
                     self.check_sig_types(params, :return_typ)
+                    if variadic {
+                        self.check_variadic_params(params)
+                    }
                     self.check_extern_no_func(params, :return_typ)
                     self.check_param_count(params, what: f"`{name}`", span: name_span)
                     self.check_param_names(params)
@@ -12612,7 +12696,7 @@ type Codegen = struct {
                     self.check_first_name(seen, :listed, :name, span: name_span)
                     self.check_duplicate_methods(name, :methods)
                 }
-                .Extern(name, name_span, _params, _return_typ) -> self.check_first_name(seen, :listed, :name, span: name_span)
+                .Extern(name, name_span, _params, _return_typ, _variadic) -> self.check_first_name(seen, :listed, :name, span: name_span)
                 .TypeAlias(name, _target, name_span) -> self.check_first_name(seen, :listed, :name, span: name_span)
                 else none
             }
@@ -12818,6 +12902,9 @@ type Codegen = struct {
             let sig = ifn.sig
             if self.is_generic_sig(sig) {
                 return self.compile_generic_call(FnRef(:sig, label: ifn.label, name: f"{mod_or_obj}.{method_name}"), :args, chain: 0, span: self.p.expr_spans[callee_lhs])
+            }
+            if sig.variadic {
+                return self.compile_variadic_call(sig, label: ifn.label, :args, name: f"{mod_or_obj}.{method_name}", span: self.p.expr_spans[callee_lhs])
             }
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: method_name).slots
@@ -13125,6 +13212,9 @@ type Codegen = struct {
                     let sig = self.fn_sig(slot)
                     if self.is_generic_sig(sig) {
                         return self.compile_generic_call(FnRef(:sig, label: self.fn_label(slot), :name), :args, chain: 0, span: self.p.expr_spans[callee_id])
+                    }
+                    if sig.variadic {
+                        return self.compile_variadic_call(sig, label: self.fn_label(slot), :args, :name, span: self.p.expr_spans[callee_id])
                     }
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots
@@ -18853,11 +18943,11 @@ type Codegen = struct {
                     self.func_def_spans += [func_decl.name_span]
                     self.func_docs += [func_decl.doc]
                 }
-                .Extern(name, name_span, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ, variadic) -> {
                     idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [extern_label(name)]
-                    self.func_sigs += [self.resolve_extern_sig(params, :return_typ, p: self.p)]
+                    self.func_sigs += [self.resolve_extern_sig(params, :return_typ, p: self.p, :variadic)]
                     self.func_def_paths += [self.p.path]
                     self.func_def_spans += [name_span]
                     self.func_docs += [""]
@@ -19163,11 +19253,11 @@ type Codegen = struct {
                     self.func_def_spans += [func_decl.name_span]
                     self.func_docs += [func_decl.doc]
                 }
-                .Extern(name, name_span, params, return_typ) -> {
+                .Extern(name, name_span, params, return_typ, variadic) -> {
                     idx_m.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [extern_label(name)]
-                    self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p)]
+                    self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p, :variadic)]
                     self.func_def_paths += [p.path]
                     self.func_def_spans += [name_span]
                     self.func_docs += [""]
@@ -19215,12 +19305,12 @@ type Codegen = struct {
                             self.func_docs += [func_decl.doc]
                         }
                     }
-                    .Extern(name, name_span, params, return_typ) -> {
+                    .Extern(name, name_span, params, return_typ, variadic) -> {
                         if name == want {
                             idx_m.set(name, len(self.func_names))
                             self.func_names += [name]
                             self.func_labels += [extern_label(name)]
-                            self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p)]
+                            self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p, :variadic)]
                             self.func_def_paths += [p.path]
                             self.func_def_spans += [name_span]
                             self.func_docs += [""]
@@ -19258,8 +19348,8 @@ type Codegen = struct {
                     let sig = self.resolve_sig(decl_id, :p)
                     self.import_fns += [ImportFn(module: local_mod, name: func_decl.name, label: f"${prefix}${func_decl.name}", :sig, def_path: p.path, def_span: func_decl.name_span)]
                 }
-                .Extern(name, name_span, params, return_typ) -> {
-                    let sig = self.resolve_extern_sig(params, :return_typ, :p)
+                .Extern(name, name_span, params, return_typ, variadic) -> {
+                    let sig = self.resolve_extern_sig(params, :return_typ, :p, :variadic)
                     self.import_fns += [ImportFn(module: local_mod, :name, label: extern_label(name), :sig, def_path: p.path, def_span: name_span)]
                 }
                 else none
