@@ -356,6 +356,8 @@ type FieldInfo = struct {
     // parser, `src_p`), or 0 if the field has no default. Used by
     // compile_struct_construct to fill fields a construction omits.
     default_expr: int64
+    // Declared `weak`: the slot holds the value's weak box (see rc.c).
+    weak: bool = false
 }
 
 // One method on a struct (or interface — `decl_id` is -1 for interfaces,
@@ -5930,6 +5932,40 @@ type Codegen = struct {
         }
     }
 
+    // Whether field `field_name` of the struct is declared `weak`.
+    func field_is_weak(self, anon field_name: str, struct_idx: int64) -> bool {
+        for field in self.structs[struct_idx].fields {
+            if field.name == field_name {
+                return field.weak
+            }
+        }
+        return false
+    }
+
+    // A `weak` field holds a weak box, which only a struct has: its type is `S?`.
+    func check_weak_field(self, anon field: ast.StructField) -> none {
+        let kind = self.resolve_type(field.typ)
+        if kind is .KOptional(inner) and inner is .KStruct(_idx, _args) {
+            return
+        }
+        mut hint = ""
+        if kind is .KStruct(_idx, _args) {
+            hint = f"; write `{self.kind_display(kind)}?`"
+        }
+        self.report_error(f"error: a `weak` field must be an optional struct (`S?`), not `{self.kind_display(kind)}`{hint}", span: field.name_span)
+    }
+
+    // The weak box for the `S?` value in `reg`, counted, in a new register;
+    // `reg` is freed. See rc.c's kod_weak_box.
+    func emit_weak_box(self, anon reg: str) -> str {
+        self.emit(f"mov x0, {reg}")
+        self.pool.free_reg(reg)
+        self.emit("bl _kod_weak_box")
+        let out = self.pool.alloc_reg()
+        self.emit(f"mov {out}, x0")
+        return out
+    }
+
     func find_field_offset(self, anon field_name: str, struct_idx: int64) -> int64 {
         for field in self.structs[struct_idx].fields {
             if field.name == field_name {
@@ -6404,7 +6440,7 @@ type Codegen = struct {
         mut cloned_fields: [FieldInfo] = []
         for field in template.fields {
             let new_kind = self.resolve_type(field.type_expr)
-            cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr, default_expr: field.default_expr)]
+            cloned_fields += [FieldInfo(name: field.name, offset: field.offset, kind: new_kind, type_expr: field.type_expr, default_expr: field.default_expr, weak: field.weak)]
         }
         self.structs[new_idx].fields = cloned_fields
         // Re-resolve each method's sig with the new substitution context.
@@ -8409,7 +8445,7 @@ type Codegen = struct {
                 self.bind_type_params_unknown(type_params)
                 for field in fields {
                     mut field_kind = self.resolve_type(field.typ)
-                    field_infos += [FieldInfo(name: field.name, :offset, kind: field_kind, type_expr: field.typ, default_expr: field.default_expr)]
+                    field_infos += [FieldInfo(name: field.name, :offset, kind: field_kind, type_expr: field.typ, default_expr: field.default_expr, weak: field.weak)]
                     offset = offset + 8
                 }
                 // Restore parser before resolve_sig (which swaps to p
@@ -8697,7 +8733,7 @@ type Codegen = struct {
             mut new_fields: [FieldInfo] = []
             for f in s.fields {
                 let new_kind: TypeKind = self.resolve_type(f.type_expr)
-                new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr, default_expr: f.default_expr)]
+                new_fields += [FieldInfo(name: f.name, offset: f.offset, kind: new_kind, type_expr: f.type_expr, default_expr: f.default_expr, weak: f.weak)]
             }
             self.structs[i].fields = new_fields
             self.leave(saved_ctx)
@@ -10166,10 +10202,12 @@ type Codegen = struct {
                 // Resolve the struct via infer_kind so chained accesses
                 // (e.g. obj.field, arr[i].field) work, not just Ident lhs.
                 mut field_off = 0
+                mut weak = false
                 let lhs_kind: TypeKind = self.infer_kind(lhs)
                 if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
                     if self.check_field(field_name, :struct_idx, span: self.p.expr_spans[rhs]) {
                         field_off = self.find_field_offset(field_name, :struct_idx)
+                        weak = self.field_is_weak(field_name, :struct_idx)
                     }
                 } else {
                     if lhs_kind is .KUnknown {
@@ -10179,6 +10217,14 @@ type Codegen = struct {
                             self.report_field_on_non_struct(field_name, kind: lhs_kind, span: self.p.expr_spans[rhs], optional_hint: f"; did you mean `?.{field_name}`?")
                         }
                     }
+                }
+                if weak {
+                    // A new `S?` from the weak box, which the reader owns.
+                    self.emit(f"ldr x0, [{ptr_r}, #{field_off}]")
+                    self.pool.free_reg(ptr_r)
+                    self.emit("bl _kod_weak_get")
+                    self.rc_temp("x0")
+                    return .VReg(name: "x0")
                 }
                 mut result = self.pool.alloc_reg()
                 self.emit(f"ldr {result}, [{ptr_r}, #{field_off}]")
@@ -12597,6 +12643,9 @@ type Codegen = struct {
                     self.subst_names = type_params
                     for field in fields {
                         self.check_type_expr(field.typ)
+                        if field.weak and len(type_params) == 0 {
+                            self.check_weak_field(field)
+                        }
                     }
                     self.check_takes_self(struct_name, :methods, init_allowed: true)
                     // Non-generic methods are checked when compile_func runs.
@@ -16301,9 +16350,15 @@ type Codegen = struct {
             // field expression (constructor calls, rc_alloc for
             // wrapping an optional, etc).
             let ptr_spilled = self.spill_across(ptr_r)
-            let field_reg = self.compile_into(arg.value, expected: field_kind)
+            mut field_reg = self.compile_into(arg.value, expected: field_kind)
+            let weak = self.field_is_weak(arg.label, :struct_idx)
+            if weak {
+                field_reg = self.emit_weak_box(field_reg)
+            }
             self.restore_across(ptr_r, spilled: ptr_spilled)
-            self.rc_retain_kind(field_reg, kind: field_kind)
+            if not weak {
+                self.rc_retain_kind(field_reg, kind: field_kind)
+            }
             self.emit(f"str {field_reg}, [{ptr_r}, #{foff}]")
             self.pool.free_reg(field_reg)
         }
@@ -16312,7 +16367,7 @@ type Codegen = struct {
         // every field that has no default must be supplied, else the
         // field would read arena garbage.
         for cf in self.structs[struct_idx].fields {
-            if cf.default_expr == 0 {
+            if cf.default_expr == 0 and not cf.weak {
                 mut cf_provided = false
                 for pname in provided {
                     if pname == cf.name {
@@ -16346,9 +16401,14 @@ type Codegen = struct {
                 }
                 if not was_provided {
                     let dptr_spilled = self.spill_across(ptr_r)
-                    let dreg = self.compile_default(field.default_expr, expected: field.kind, src_p: self.structs[struct_idx].src_p)
+                    mut dreg = self.compile_default(field.default_expr, expected: field.kind, src_p: self.structs[struct_idx].src_p)
+                    if field.weak {
+                        dreg = self.emit_weak_box(dreg)
+                    }
                     self.restore_across(ptr_r, spilled: dptr_spilled)
-                    self.rc_retain_kind(dreg, kind: self.find_field_kind(field.name, :struct_idx))
+                    if not field.weak {
+                        self.rc_retain_kind(dreg, kind: self.find_field_kind(field.name, :struct_idx))
+                    }
                     self.emit(f"str {dreg}, [{ptr_r}, #{field.offset}]")
                     self.pool.free_reg(dreg)
                 }
@@ -16577,11 +16637,13 @@ type Codegen = struct {
             self.report_cannot_infer(lhs, what: "this expression")
             return
         }
+        mut weak = false
         if lhs_kind is .KStruct(struct_idx, _struct_type_args) {
             lhs_is_struct = true
             if self.check_field(field_name, :struct_idx, span: self.p.expr_spans[rhs]) {
                 foff = self.find_field_offset(field_name, :struct_idx)
                 field_kind = self.find_field_kind(field_name, :struct_idx)
+                weak = self.field_is_weak(field_name, :struct_idx)
             }
         }
         let recv_first = not self.commutes(lhs, rhs_id)
@@ -16592,12 +16654,18 @@ type Codegen = struct {
             ptr_spilled = self.preserve_begin(ptr_reg)
         }
         // Kind-aware, so an int assigned to an optional field gets wrapped.
-        let rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
+        mut rhs_reg = self.compile_value_for_kind(rhs_id, expected: field_kind)
+        if weak {
+            if lhs_is_struct {
+                self.check_value_kind(rhs_id, expected: field_kind)
+            }
+            rhs_reg = self.emit_weak_box(rhs_reg)
+        }
         let rhs_spilled = self.preserve_begin(rhs_reg)
         if not recv_first {
             ptr_reg = self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
         }
-        if lhs_is_struct {
+        if lhs_is_struct and not weak {
             self.check_value_kind(rhs_id, expected: field_kind)
         }
         let tmp_reg = self.preserve_end(rhs_reg, spilled: rhs_spilled)
@@ -16605,7 +16673,10 @@ type Codegen = struct {
             ptr_reg = self.preserve_end(ptr_reg, spilled: ptr_spilled)
         }
         if self.rc_heap_kind(field_kind) {
-            self.rc_retain(tmp_reg)
+            // A weak box comes counted for the field already.
+            if not weak {
+                self.rc_retain(tmp_reg)
+            }
             self.emit(f"ldr x17, [{ptr_reg}, #{foff}]")
             self.emit(f"str {tmp_reg}, [{ptr_reg}, #{foff}]")
             self.rc_release_x17()
@@ -17703,6 +17774,17 @@ type Codegen = struct {
         self.emit(f"ldr {reg}, [{reg}]")
         self.emit(f"ldr {reg}, [{reg}, #{foff}]")
         let field_kind = self.find_field_kind(field, :struct_idx)
+        if self.field_is_weak(field, :struct_idx) {
+            // A weak field: a new `U?` from its box, already the reader's.
+            self.emit(f"mov x0, {reg}")
+            self.emit("bl _kod_weak_get")
+            self.emit(f"mov {reg}, x0")
+            self.emit(f"b {done_lbl}")
+            self.emit_label(none_lbl)
+            self.emit(f"mov {reg}, #0")
+            self.emit_label(done_lbl)
+            return .VReg(name: reg)
+        }
         if field_kind is .KOptional(_inner) {
             // Already a `U?`, which is the result as it is: `T??` is `T?`.
             self.rc_retain_kind(reg, kind: field_kind)

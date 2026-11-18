@@ -7,7 +7,9 @@
  * and a 24-bit mask of the 8-byte slots that hold references. Bit 22 of the mask
  * marks an array and bit 21 an array whose elements are references. Bit 23 marks an
  * object with references past slot 20: the last word of its block points at a
- * descriptor of them.
+ * descriptor of them. The size class takes the low 7 bits of the info word; bit 7
+ * (RC_WEAK_BIT) marks an object something refers to weakly, which has a weak box
+ * (see kod_weak_box).
  *
  * Build with -DRC_POISON to overwrite freed memory and never reuse it, and to
  * fill memory the caller said it would fill, so a use after free shows up as
@@ -23,6 +25,10 @@
 #define RC_SMALL 64 /* classes 0..63: (i+1)*16 bytes; then powers of two from 2 KB */
 
 typedef struct { uint32_t count; uint32_t info; } RcHdr;
+
+#define RC_CLASS_MASK 0x7fu
+#define RC_WEAK_BIT 0x80u
+static void rc_weak_clear(void *p);
 
 static char *rc_cur, *rc_end;
 __attribute__((used)) void *rc_free_lists[128];
@@ -125,7 +131,7 @@ void *rc_alloc(int64_t size, int64_t mask) {
 void *rc_alloc_big(int64_t size, const int64_t *desc) {
     void *p = rc_alloc(size + 8, RC_BIG_BIT);
     RcHdr *h = (RcHdr *)p - 1;
-    *(const int64_t **)((char *)h + rc_class_size((int)(h->info & 0xff)) - 8) = desc;
+    *(const int64_t **)((char *)h + rc_class_size((int)(h->info & RC_CLASS_MASK)) - 8) = desc;
     return p;
 }
 
@@ -139,11 +145,12 @@ void rc_free_object(void *p) {
     while (pending) {
         RcHdr *h = pending;
         pending = h->count ? (RcHdr *)((char *)RC_BASE + ((uint64_t)h->count << 4)) : NULL;
+        if (h->info & RC_WEAK_BIT) rc_weak_clear(h + 1);
         void **slots = (void **)(h + 1);
         uint32_t mask = h->info >> 8;
         if (mask & RC_BIG_BIT) {
             const int64_t *desc =
-                *(const int64_t **)((char *)h + rc_class_size((int)(h->info & 0xff)) - 8);
+                *(const int64_t **)((char *)h + rc_class_size((int)(h->info & RC_CLASS_MASK)) - 8);
             for (int64_t w = 0; w < desc[0]; w++) {
                 uint64_t bits = (uint64_t)desc[w + 1];
                 for (int i = 0; bits; i++, bits >>= 1) {
@@ -192,7 +199,7 @@ void rc_free_object(void *p) {
                 pending = ch;
             }
         }
-        int cls = (int)(h->info & 0xff);
+        int cls = (int)(h->info & RC_CLASS_MASK);
 #ifdef RC_STATS
         rc_n_free++;
         rc_live -= rc_class_size(cls);
@@ -267,10 +274,11 @@ __attribute__((naked)) void rc_release_stub(void) {
         "str w16, [x17, #-8]\n"
         "cbnz w16, 1f\n"
 #if !defined(RC_POISON) && !defined(RC_STATS)
-        /* No references inside: on to its free list, without touching the frame. */
+        /* No references inside and none weak to it: on to its free list,
+         * without touching the frame. */
         "ldr w16, [x17, #-4]\n"
         "stp x0, x1, [sp, #-16]!\n"
-        "lsr w0, w16, #8\n"
+        "lsr w0, w16, #7\n"
         "cbnz w0, 2f\n"
         "adrp x0, _rc_free_lists@PAGE\n"
         "add x0, x0, _rc_free_lists@PAGEOFF\n"
@@ -286,6 +294,106 @@ __attribute__((naked)) void rc_release_stub(void) {
         "b _rc_free_stub\n"
 #endif
         "1: ret\n");
+}
+
+/* Weak references. A `weak` field doesn't point at its struct but at a weak
+ * box: a counted one-word object holding the struct's address, uncounted.
+ * Each struct something refers to weakly has one box, found through a table
+ * from its address and marked by RC_WEAK_BIT in its header; the table holds a
+ * reference to the box. Freeing the struct empties the box and drops the
+ * table's reference, so the box lives on, empty, while weak fields hold it. */
+static void **rc_weak_keys, **rc_weak_boxes;
+static int64_t rc_weak_cap, rc_weak_used;
+
+static int64_t rc_weak_slot(void *key) {
+    uint64_t h = ((uint64_t)key >> 4) * 0x9E3779B97F4A7C15ULL;
+    int64_t i = (int64_t)(h & (uint64_t)(rc_weak_cap - 1));
+    while (rc_weak_keys[i] && rc_weak_keys[i] != key) i = (i + 1) & (rc_weak_cap - 1);
+    return i;
+}
+
+static void rc_weak_grow(void) {
+    void **keys = rc_weak_keys, **boxes = rc_weak_boxes;
+    int64_t cap = rc_weak_cap;
+    rc_weak_cap = cap ? cap * 2 : 64;
+    rc_weak_keys = calloc((size_t)rc_weak_cap, sizeof(void *));
+    rc_weak_boxes = calloc((size_t)rc_weak_cap, sizeof(void *));
+    if (!rc_weak_keys || !rc_weak_boxes) {
+        fprintf(stderr, "rc: out of memory for weak references\n");
+        abort();
+    }
+    for (int64_t i = 0; i < cap; i++) {
+        if (keys[i]) {
+            int64_t j = rc_weak_slot(keys[i]);
+            rc_weak_keys[j] = keys[i];
+            rc_weak_boxes[j] = boxes[i];
+        }
+    }
+    free(keys);
+    free(boxes);
+}
+
+/* `p` is being freed: empty its box and take it out of the table, moving the
+ * entries after it back so no probe stops early. */
+static void rc_weak_clear(void *p) {
+    int64_t i = rc_weak_slot(p);
+    if (rc_weak_keys[i] != p) return;
+    void *box = rc_weak_boxes[i];
+    *(void **)box = NULL;
+    rc_weak_keys[i] = NULL;
+    rc_weak_boxes[i] = NULL;
+    rc_weak_used--;
+    for (int64_t j = (i + 1) & (rc_weak_cap - 1); rc_weak_keys[j]; j = (j + 1) & (rc_weak_cap - 1)) {
+        void *k = rc_weak_keys[j], *b = rc_weak_boxes[j];
+        rc_weak_keys[j] = NULL;
+        rc_weak_boxes[j] = NULL;
+        int64_t to = rc_weak_slot(k);
+        rc_weak_keys[to] = k;
+        rc_weak_boxes[to] = b;
+    }
+    rc_release_c(box);
+}
+
+/* What a weak field stores for the `S?` value `opt` (none, or a Some cell
+ * holding the struct): the struct's weak box, counted for the caller, or none. */
+void *kod_weak_box(void *opt) {
+    if (!opt) return NULL;
+    void *target = *(void **)opt;
+    if (!rc_is_counted(target)) {
+        /* Never freed, so its box never empties and needs no table. */
+        void **box = rc_alloc(8, 0);
+        *box = target;
+        return box;
+    }
+    RcHdr *th = (RcHdr *)target - 1;
+    if (th->info & RC_WEAK_BIT) {
+        void *box = rc_weak_boxes[rc_weak_slot(target)];
+        rc_retain_c(box);
+        return box;
+    }
+    if ((rc_weak_used + 1) * 3 > rc_weak_cap * 2) rc_weak_grow();
+    void **box = rc_alloc(8, 0);
+    *box = target;
+    int64_t i = rc_weak_slot(target);
+    rc_weak_keys[i] = target;
+    rc_weak_boxes[i] = box;
+    rc_weak_used++;
+    th->info |= RC_WEAK_BIT;
+    /* One reference for the table, one for the caller. */
+    rc_retain_c(box);
+    return box;
+}
+
+/* Reading a weak field: a new Some cell holding the struct, counted, or none
+ * when the field is none or the struct has been freed. */
+void *kod_weak_get(void *box) {
+    if (!box) return NULL;
+    void *target = *(void **)box;
+    if (!target) return NULL;
+    void **cell = rc_alloc(8, 1);
+    rc_retain_c(target);
+    *cell = target;
+    return cell;
 }
 
 /* Bytes in use: what the heap took from the OS, less what the free lists hold. */

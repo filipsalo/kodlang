@@ -117,9 +117,26 @@ struct it captures keeps that struct alive, as in
 lives as long as the program, and leaks once per `req` for something made per
 request.
 
-For a long-running program, break the cycle when you are done with it
-(`a.other = none`), or keep the back reference as an index or a key instead of a
-struct. Most data, including all of the compiler's, has no cycles.
+Make the back reference a [weak field](structs.md#weak-fields) and the cycle
+doesn't form: a `weak` field doesn't keep its value alive, and reads as `none`
+once the value is freed.
+
+```kod
+type Node = struct {
+    name: str
+    weak other: Node?
+}
+```
+
+Otherwise break the cycle when you are done with it (`a.other = none`), or keep
+the back reference as an index or a key instead of a struct. A closure's
+captures can't be weak. Most data, including all of the compiler's, has no
+cycles.
+
+A weak field holds a small counted box with the value's address, made the first
+time anything refers to that value weakly and shared by every weak field that
+does; freeing the value empties the box. A value nothing refers to weakly costs
+nothing extra.
 
 Memory that has been freed is used again for new values but isn't returned to the
 OS, so a program stays as big as it has ever been. There are no threads, so counts

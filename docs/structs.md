@@ -217,6 +217,42 @@ them, out of the struct's interface. A method of a primitive type such as
 An interface can't declare a private method: calling it through the
 interface would reach the struct's method from outside.
 
+## Weak fields
+
+A field declared `weak` refers to a struct without keeping it alive, for a
+reference back up a tree or across a graph, which would otherwise make a
+[cycle](memory-layout.md#reclaiming-memory) that is never freed:
+
+```kod
+type Node = struct {
+    name: str
+    children: [Node] = []
+    weak parent: Node?           // starts as none
+}
+
+let root = Node(name: "root")
+let leaf = Node(name: "leaf", parent: root)
+root.children += [leaf]
+
+if leaf.parent is Node(p) {
+    print(p.name)                // root
+}
+```
+
+- A weak field's type is an optional struct, `S?`. It starts as `none`
+  unless it has a default or the construction gives it a value.
+- Assigning to it, or giving it a value in a construction, doesn't count as
+  a reference: when nothing else refers to the struct, it is freed, and from
+  then on the field reads as `none`.
+- Reading it gives a `S?` of its own, which keeps the struct alive for as
+  long as it is used, as any other value does: `p` above can't be freed out
+  from under the code that reads it.
+- Each read checks whether the struct is still there and makes a new
+  optional, so a weak field costs a little more to read than a plain one.
+
+`weak` is only special before a field's name; elsewhere it is an ordinary
+name.
+
 ## Field access
 
 ```kod
