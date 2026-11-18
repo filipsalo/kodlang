@@ -725,6 +725,53 @@ int64_t kod_proc_wait(int64_t pid) {
     return status;
 }
 
+// Wait until one of `fds` is ready for what `events` asks (1 read, 2 write),
+// for up to `timeout_ms` (-1: no limit), and set each `ready` slot to 0 or 1.
+// A negative fd is skipped. The count of ready fds, or -1 with g_io_errno set.
+// An interrupted wait resumes with the time that is left.
+int64_t kod_poll(KodArray *fds_arr, KodArray *events_arr, KodArray *ready_arr, int64_t timeout_ms) {
+    int64_t n = fds_arr->len;
+    int64_t *fds = (int64_t *)fds_arr->ptr;
+    int64_t *events = (int64_t *)events_arr->ptr;
+    int64_t *ready = (int64_t *)ready_arr->ptr;
+    if (events_arr->len < n || ready_arr->len < n) {
+        g_io_errno = EINVAL;
+        return -1;
+    }
+    struct pollfd *p = calloc(n > 0 ? (size_t)n : 1, sizeof(struct pollfd));
+    for (int64_t i = 0; i < n; i++) {
+        p[i].fd = (int)fds[i];
+        p[i].events = events[i] == 2 ? POLLOUT : POLLIN;
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int got;
+    for (;;) {
+        int wait_ms = -1;
+        if (timeout_ms >= 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t spent = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+            int64_t left = timeout_ms - spent;
+            if (left < 0) left = 0;
+            wait_ms = left > 2147483647 ? 2147483647 : (int)left;
+        }
+        got = poll(p, (nfds_t)n, wait_ms);
+        if (got >= 0 || errno != EINTR) break;
+    }
+    if (got < 0) {
+        g_io_errno = errno;
+        free(p);
+        return -1;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        ready[i] = p[i].fd >= 0 && p[i].revents != 0;
+    }
+    free(p);
+    g_io_errno = 0;
+    return got;
+}
+
 // Send `sig` to a process: 0, or the errno.
 int64_t kod_proc_signal(int64_t pid, int64_t sig) {
     if (pid <= 0) return ESRCH;

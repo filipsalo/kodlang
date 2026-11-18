@@ -163,6 +163,34 @@ A `BufReader` doesn't close its inner stream.
 | `f.close()` | close it and set `f.fd` to -1, so closing it again fails; `none or Error` |
 | `f.is_terminal()` | whether it is a terminal, rather than a file or a pipe |
 
+### Waiting on several descriptors
+
+`poll(read:, write:, timeout:)` waits until at least one of the descriptors
+is ready, and says which, so a program can serve several pipes or
+connections without blocking on any one of them:
+
+```kod
+let ready = try posix.poll(read: [out, err], write: [input], timeout: Duration(seconds: 5))
+if ready.read[0] {
+    let piece = try out.read(65536)         // doesn't wait
+}
+```
+
+It returns a `posix.Ready` or an `Error`. `ready.read` and `ready.write` hold a
+`bool` for each descriptor in `read` and `write`, in the same order.
+
+- **Ready for reading** means a `read` won't wait: there is data, the stream
+  has ended, or an error is pending.
+- **Ready for writing** means a `write` of up to 512 bytes won't wait, or will
+  fail at once because the reader has gone.
+- **Ignored descriptors:** a descriptor of -1, such as a closed `Fd`, is never
+  ready.
+- **Timeout:** without `timeout:` it waits as long as it takes. When the
+  timeout passes first, every entry is false. With a zero `Duration` it only
+  looks.
+- **Nothing to wait for:** if both lists are empty or hold only -1, it fails
+  with an `InvalidInput` error instead of waiting forever.
+
 `stdout()` writes straight to descriptor 1, bypassing the buffer that `print`
 uses. Call `flush_stdout()` first when you mix the two.
 Closing is explicit: an `Fd` that is dropped stays open until the program
