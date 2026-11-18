@@ -543,6 +543,50 @@ using it as the interface is an error at that spot, such as
 or ``method `area` is `func(int64) -> int64`, not `func() -> int64` ``.
 `throw` counts too, since it makes its value an `Error`.
 
+### Provided methods
+
+A method in an interface can have a body. It is *provided*: every type that
+implements the interface has it, without declaring it:
+
+```kod
+interface Reader {
+    func read(self, anon max: int64) -> bytes or Error
+
+    // Read until the end of the stream.
+    func read_all(self) -> bytes or Error {
+        mut out: bytes = kod_str_to_bytes("")
+        for true {
+            let chunk = try self.read(4096)
+            if len(chunk) == 0 {
+                return out
+            }
+            out += chunk
+        }
+    }
+}
+
+let f = try posix.open_read("data.bin")     // a posix.Fd, which has `read`
+let data = try f.read_all()                  // the Reader's `read_all`
+```
+
+- In the body, `self` is the interface: it can call the interface's methods,
+  provided or not, be passed where the interface is expected, and be
+  downcast with `is`. It has no fields, and the implementing type's other
+  methods aren't reachable through it.
+- Only the methods without a body are required: a type with `read` is a
+  `Reader`, and has `read_all` too.
+- A type that declares a method of the same name overrides it; the
+  signature must match the interface's, and calls through the interface
+  run the type's own method.
+- On a value of the type itself, as `f.read_all()` above, a method the type
+  doesn't declare is looked up among the provided methods of the
+  interfaces it implements that the calling module can see: its own and
+  those of the modules it imports, directly or not. When more than one of
+  them provides a method of that name, the call is an error that names
+  them; convert the value to the one you mean, as in `let r: Reader = f`.
+- The body runs once for all types: its calls on `self` go through the
+  method table, as for any interface value.
+
 An interface value converts to another interface that declares only methods
 the first one has, with the same parameter and return types, in any order. It
 goes wherever a struct would (an argument, an annotated `let`, a field, a

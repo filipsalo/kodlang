@@ -4783,6 +4783,149 @@ type Codegen = struct {
         return -1
     }
 
+    // Whether an interface method has a body.
+    func is_provided(self, anon m: MethodInfo) -> bool {
+        return m.sig.decl_id > 0 and m.sig.src_p.func_decls[m.sig.decl_id].provided
+    }
+
+    func iface_provides(self, anon iface_idx: int64, name: str) -> bool {
+        for m in self.interfaces[iface_idx].methods {
+            if m.name == name {
+                return self.is_provided(m)
+            }
+        }
+        return false
+    }
+
+    // The label of an interface's provided method, compiled once in its module.
+    func provided_label(self, anon iface_idx: int64, name: str) -> str {
+        let iface_info = self.interfaces[iface_idx]
+        return f"${iface_info.module_prefix}${iface_info.name}$$p${name}"
+    }
+
+    // Whether a value of `kind` declares a method `name` itself.
+    func declares_method(self, anon kind: TypeKind, name: str) -> bool {
+        match kind {
+            .KStruct(_idx, _args) -> return len(self.owner_method_label(kind, :name)) > 0
+            .KEnum(_idx) -> return len(self.owner_method_label(kind, :name)) > 0
+            else return self.find_prim_method(name, :kind) >= 0
+        }
+    }
+
+    // Whether a value of `kind` can be boxed as an interface value.
+    func boxable_kind(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KStruct(_idx, _args) -> return not self.kind_has_unknown(kind)
+            .KEnum(idx) -> return not self.enums[idx].is_union
+            .KInt64 -> return true
+            .KStr -> return true
+            .KBool -> return true
+            else return false
+        }
+    }
+
+    // The interfaces that provide `name` to a value of `kind`, which doesn't
+    // declare it: each interface it implements whose `name` has a body.
+    func providers_of(self, anon kind: TypeKind, name: str) -> [int64] {
+        mut found: [int64] = []
+        if not self.boxable_kind(kind) or self.declares_method(kind, :name) {
+            return found
+        }
+        for i, _iface in self.interfaces {
+            if not self.iface_provides(i, :name) {
+                continue
+            }
+            mut seen = false
+            for f in found {
+                if self.same_iface(f, i) {
+                    seen = true
+                }
+            }
+            if not seen and self.implements_iface(kind, iface_idx: i) {
+                found += [i]
+            }
+        }
+        return found
+    }
+
+    // The code a value of `kind` runs for interface `iface_idx`'s provided
+    // `name`: it boxes the value, calls the provided method and drops the box.
+    // Registers the vtable, whose module emits the code.
+    func provided_thunk(self, anon kind: TypeKind, iface_idx: int64, name: str) -> str {
+        mut vt = ""
+        match kind {
+            .KStruct(idx, _args) -> vt = self.register_vtable(.KStruct(:idx, type_args: []), iface_idx)
+            .KEnum(_idx) -> vt = self.register_vtable(kind, iface_idx)
+            else vt = self.register_prim_vtable(iface_idx, :kind)
+        }
+        return f"{vt}$p${name}"
+    }
+
+    // A provided-method thunk: `self` arrives as the raw value in x0, the
+    // arguments in x1-x7. They are saved, a {value, vtable} cell is made, the
+    // provided method runs with it as `self`, and the cell is released.
+    func emit_provided_thunk(self, anon label: str, vtable: str, body: str, mask: int64, global: bool) -> none {
+        self.println("	.p2align 2")
+        if global {
+            self.println(f"	.globl {label}")
+            self.println(f"	.private_extern {label}")
+            self.println(f"	.weak_definition {label}")
+        }
+        self.println(f"{label}:")
+        self.println("	stp x29, x30, [sp, #-80]!")
+        self.println("	mov x29, sp")
+        self.println("	stp x1, x2, [sp, #16]")
+        self.println("	stp x3, x4, [sp, #32]")
+        self.println("	stp x5, x6, [sp, #48]")
+        self.println("	stp x7, x0, [sp, #64]")
+        self.println("	mov x0, #16")
+        self.println(f"	mov x1, #{mask}")
+        self.println("	bl _rc_alloc")
+        self.println("	ldr x17, [sp, #72]")
+        self.println("	str x17, [x0]")
+        if mask != 0 {
+            self.println("	bl _rc_retain_stub")
+        }
+        self.println(f"	adrp x16, {vtable}@PAGE")
+        self.println(f"	add x16, x16, {vtable}@PAGEOFF")
+        self.println("	str x16, [x0, #8]")
+        self.println("	str x0, [sp, #72]")
+        self.println("	ldp x1, x2, [sp, #16]")
+        self.println("	ldp x3, x4, [sp, #32]")
+        self.println("	ldp x5, x6, [sp, #48]")
+        self.println("	ldr x7, [sp, #64]")
+        self.println(f"	bl {body}")
+        self.println("	ldr x17, [sp, #72]")
+        self.println("	str x0, [sp, #72]")
+        self.println("	bl _rc_release_stub")
+        self.println("	ldr x0, [sp, #72]")
+        self.println("	ldp x29, x30, [sp], #80")
+        self.println("	ret")
+    }
+
+    // The thunks for every vtable this module emits, for the provided methods
+    // its type doesn't declare.
+    func emit_provided_thunks(self) -> none {
+        for i, owner in self.vtable_types {
+            let iface_idx = self.vtable_iface_idx[i]
+            for m in self.interfaces[iface_idx].methods {
+                if self.is_provided(m) and len(self.owner_method_label(owner, name: m.name)) == 0 {
+                    let vt = self.vtable_label(owner, iface_idx)
+                    self.emit_provided_thunk(f"{vt}$p${m.name}", vtable: vt, body: self.provided_label(iface_idx, name: m.name), mask: 1, global: true)
+                }
+            }
+        }
+        for pi, kind in self.prim_vtable_kinds {
+            let iface_idx = self.prim_vtable_iface_idx[pi]
+            for m in self.interfaces[iface_idx].methods {
+                if self.is_provided(m) and self.find_prim_method(m.name, :kind) < 0 {
+                    let vt = self.prim_vtable_label(iface_idx, :kind)
+                    self.emit_provided_thunk(f"{vt}$p${m.name}", vtable: vt, body: self.provided_label(iface_idx, name: m.name), mask: self.rc_kind_mask(kind, slot: 0), global: false)
+                }
+            }
+        }
+    }
+
     // The label of the vtable for a struct acting as an interface. A generic
     // instance's label doesn't depend on the unit, so every unit that boxes it
     // shares one vtable and `is` holds wherever the value was boxed.
@@ -12157,6 +12300,7 @@ type Codegen = struct {
                     }
                 }
                 .Interface(iface_name, _name_span, methods) -> {
+                    self.check_takes_self(iface_name, :methods, init_allowed: false)
                     for method_id in methods {
                         let fd = self.p.func_decls[method_id]
                         if fd.name.starts_with("_") {
@@ -13261,6 +13405,28 @@ type Codegen = struct {
             }
         }
         if len(method_lbl) == 0 {
+            let providers = self.providers_of(recv_kind, name: method_name)
+            if len(providers) > 1 {
+                mut names: [str] = []
+                for pi in providers {
+                    names += [f"`{self.iface_display_name(pi)}`"]
+                }
+                self.report_error(f"error: `{self.kind_display(recv_kind)}` gets a provided `{method_name}` from more than one interface: {", ".join(names)}; convert it to the one you mean first, as in `let v: {self.iface_display_name(providers[0])} = ...`", :span)
+                return .VImm(value: 0)
+            }
+            if len(providers) == 1 {
+                for m in self.interfaces[providers[0]].methods {
+                    if m.name == method_name {
+                        method_lbl = self.provided_thunk(recv_kind, iface_idx: providers[0], name: method_name)
+                        sig_params = m.sig.param_kinds
+                        sig_labels = m.sig.param_labels
+                        sig_defaults = m.sig.param_default_exprs
+                        sig_src_p = m.sig.src_p
+                    }
+                }
+            }
+        }
+        if len(method_lbl) == 0 {
             mut recv_desc: str = f"a value of type `{self.kind_display(recv_kind)}`"
             // `__` names are the compiler's own, such as the receiver of `x?.m()`.
             if self.p.exprs[receiver_id] is .Ident(recv_name) and not recv_name.starts_with("__") {
@@ -13557,6 +13723,9 @@ type Codegen = struct {
                 }
             }
             if not found {
+                if self.is_provided(m) {
+                    continue
+                }
                 return f"missing method `{m.name}`"
             }
             let want = self.method_kind(m.sig)
@@ -13982,20 +14151,34 @@ type Codegen = struct {
             if self.structs[sidx].method_idx.get(method_name) is Some(mi) {
                 return self.structs[sidx].methods[mi].sig.return_kind
             }
-            return none
+            return self.provided_return_kind(obj_kind, name: method_name)
         }
         if obj_kind is .KEnum(eidx) {
             let mi = self.enum_method(eidx, name: method_name)
             if mi >= 0 {
                 return self.enums[eidx].methods[mi].sig.return_kind
             }
-            return none
+            return self.provided_return_kind(obj_kind, name: method_name)
         }
         // Primitive receivers (int64.to_str, str.hash, etc.) go through
         // the primitive method table.
         let prim_idx = self.find_prim_method(method_name, kind: obj_kind)
         if prim_idx >= 0 {
             return self.prim_methods[prim_idx].sig.return_kind
+        }
+        return self.provided_return_kind(obj_kind, name: method_name)
+    }
+
+    // The return kind of the one provided method `name` a value of `kind` gets.
+    func provided_return_kind(self, anon kind: TypeKind, name: str) -> TypeKind? {
+        let providers = self.providers_of(kind, :name)
+        if len(providers) != 1 {
+            return none
+        }
+        for m in self.interfaces[providers[0]].methods {
+            if m.name == name {
+                return m.sig.return_kind
+            }
         }
         return none
     }
@@ -18215,7 +18398,7 @@ type Codegen = struct {
         self.leave(saved_ctx)
     }
 
-    func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1, enum_owner: int64 = -1) -> none {
+    func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1, enum_owner: int64 = -1, iface_owner: int64 = -1) -> none {
         let func_decl = self.p.func_decls[fd_id]
         self.in_func_literal = self.is_lambda_name(func_decl.name)
         self.in_const_body = func_decl.is_const and not func_decl.is_var
@@ -18288,6 +18471,10 @@ type Codegen = struct {
             }
             if param.name == "self" and enum_owner >= 0 {
                 kind = .KEnum(idx: enum_owner)
+            }
+            // A provided method's `self` is the interface value.
+            if param.name == "self" and iface_owner >= 0 {
+                kind = .KInterface(idx: iface_owner)
             }
             if param.default_expr != 0 {
                 self.check_default(param.default_expr, expected: kind)
@@ -18594,6 +18781,17 @@ type Codegen = struct {
                         }
                     }
                 }
+                .Interface(name, _name_span, methods) -> {
+                    let iface_owner = self.declared_type_idx(name, path: self.p.path, what: 2)
+                    if iface_owner >= 0 {
+                        for method_id in methods {
+                            let fd = self.p.func_decls[method_id]
+                            if fd.provided and len(fd.params) > 0 and fd.params[0].name == "self" {
+                                self.compile_func(fd_id: method_id, struct_name: name, override_lbl: self.provided_label(iface_owner, name: self.p.func_decls[method_id].name), :iface_owner)
+                            }
+                        }
+                    }
+                }
                 .Struct(name, _name_span, struct_type_params, fields, methods) -> {
                     // A generic template's methods only compile per instance.
                     if len(struct_type_params) == 0 {
@@ -18694,6 +18892,7 @@ type Codegen = struct {
                 func_cursor += 1
             }
         }
+        self.emit_provided_thunks()
         let saved_instance = self.body_instance
         mut ci = 0
         for span in self.limit_call_spans {
@@ -18754,6 +18953,8 @@ type Codegen = struct {
                 let method_lbl = self.owner_method_label(owner, name: m.name)
                 if len(method_lbl) > 0 {
                     self.println(f"\t.quad {method_lbl}")
+                } else if self.is_provided(m) {
+                    self.println(f"\t.quad {label}$p${m.name}")
                 } else {
                     self.println(f"\t.quad 0")
                 }
@@ -18792,6 +18993,8 @@ type Codegen = struct {
                 let pm_idx = self.find_prim_method(m.name, :kind)
                 if pm_idx >= 0 {
                     self.println(f"\t.quad {self.prim_methods[pm_idx].label}")
+                } else if self.is_provided(m) {
+                    self.println(f"\t.quad {self.prim_vtable_label(iface_idx, :kind)}$p${m.name}")
                 } else {
                     self.println(f"\t.quad 0")
                 }
