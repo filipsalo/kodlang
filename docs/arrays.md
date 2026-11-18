@@ -191,12 +191,16 @@ Arrays are represented as a header struct on the heap:
 { void* ptr, int64 len, int64 cap }
 ```
 
-The `ptr` field points to a block of elements, each 8 bytes wide. `len` is the number of live elements; `cap` is the allocated capacity.
+The `ptr` field points to a block of elements, each 8 bytes wide except in a
+`[bool]`, whose elements are a byte each (a 1000-element `[bool]` takes 1000
+bytes, not 8000). `len` is the number of live elements; `cap` is the
+allocated capacity, in elements.
 
-Appending (`+=`) goes through `_kod_array_concat` in the runtime, which
+Appending (`+=`) goes through `_kod_arr_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity
-only when `cap` runs out. `+` goes through `_kod_array_concat_new`, which
-allocates a fresh header and buffer, and `*` through `_kod_array_repeat`.
+only when `cap` runs out. `+` goes through `_kod_arr_concat_new`, which
+allocates a fresh header and buffer, and `*` through `_kod_arr_repeat`. Each
+takes the element width from the compiler, which knows the type.
 
 ## Helpers
 

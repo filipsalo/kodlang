@@ -235,7 +235,7 @@ A module that declares link inputs cannot be one that the Makefile builds: it do
 C files export bare symbols into one namespace shared with libc and `runtime.c`: name them `kod_<module>_...`. `#include "kod_rt.h"` (`CFLAGS` has `-I stdlib`) declares what they need of the runtime:
 
 - `KodStr`: what a Kod `str` is when it crosses into C. `buf` points at `len` bytes followed by a NUL byte, and a `str` parameter or result is a `KodStr *`.
-- `KodArray`: a Kod `[T]`: `ptr` points at `len` 8-byte slots, with room for `cap`.
+- `KodArray`: a Kod `[T]`: `ptr` points at `len` elements of 8 bytes each (one byte each for a `[bool]`), with room for `cap`.
 - `arena_alloc(size)`: memory that is never freed.
 - `rc_alloc(size, mask)`: a counted object, zeroed, with a count of 1 that the caller owns. `mask` says which of its 8-byte slots hold references, bit 0 for the first; it must not use bits past 20. `rc_alloc_raw` is the same but leaves filling it to the caller. `rc_retain_c(p)` and `rc_release_c(p)` count a reference up and down, and do nothing for memory outside the counted heap.
 - `kod_str_new(len)`: a new `str` of `len` bytes for the caller to fill in. `kod_str_from_bytes(p, n)`: a `str` that is a copy of `n` bytes at `p`, which may contain NUL bytes.

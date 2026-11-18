@@ -10269,8 +10269,12 @@ type Codegen = struct {
 
             let hdr = self.pool.alloc_reg()
             self.emit(f"ldr {hdr}, [{ptr_r}]")
-            self.emit(f"lsl {idx_r}, {idx_r}, #3")
-            self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
+            if self.elem_width(lhs_kind) == 1 {
+                self.emit(f"ldrb w{result[1..len(result)]}, [{hdr}, {idx_r}]")
+            } else {
+                self.emit(f"lsl {idx_r}, {idx_r}, #3")
+                self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
+            }
             self.pool.free_reg(hdr)
         } else {
             // KStr indexing. ptr_r is the `{ buf, len }` struct pointer.
@@ -11517,10 +11521,11 @@ type Codegen = struct {
             self.mov_to(self.compile_concat_operand(rhs_id, :kind, :typed_anchor), dest: "x1")
             self.unpark_lhs(parked)
         }
+        self.emit(f"mov x2, #{self.elem_width(kind)}")
         if lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path {
-            self.emit("bl _kod_array_concat")
+            self.emit("bl _kod_arr_concat")
         } else {
-            self.emit("bl _kod_array_concat_new")
+            self.emit("bl _kod_arr_concat_new")
             self.rc_temp("x0")
         }
         return .VReg(name: "x0")
@@ -11537,7 +11542,8 @@ type Codegen = struct {
             self.mov_to(self.compile_expr(rhs_id), dest: "x1")
             self.unpark_lhs(parked)
         }
-        self.emit("bl _kod_array_repeat")
+        self.emit(f"mov x2, #{self.elem_width(kind)}")
+        self.emit("bl _kod_arr_repeat")
         self.rc_temp("x0")
         return .VReg(name: "x0")
     }
@@ -11570,7 +11576,8 @@ type Codegen = struct {
             refs = 1
         }
         self.emit(f"mov x2, #{refs}")
-        self.emit("bl _kod_array_push")
+        self.emit(f"mov x3, #{self.elem_width(kind)}")
+        self.emit("bl _kod_arr_push")
         return .VReg(name: "x0")
     }
 
@@ -11662,7 +11669,8 @@ type Codegen = struct {
             }
             .KUnknown -> self.report_cannot_infer(s_id, what: "this expression")
             else {
-                self.emit("bl _kod_array_slice")
+                self.emit(f"mov x3, #{self.elem_width(self.infer_kind(s_id))}")
+                self.emit("bl _kod_arr_slice")
                 self.rc_temp("x0")
             }
         }
@@ -11751,7 +11759,15 @@ type Codegen = struct {
     // type (the element store is then a plain compile_expr + load).
     func compile_array_lit_typed(self, anon elements: [int64], expected_elem: TypeKind) -> Val {
         let n = len(elements)
-        let item_sz = 8
+        // A `[bool]`'s elements are a byte each.
+        mut width_elem = expected_elem
+        if width_elem.is_void() and n > 0 {
+            width_elem = self.infer_kind(elements[0])
+        }
+        mut item_sz = 8
+        if width_elem is .KBool {
+            item_sz = 1
+        }
         // Allocate header (24 bytes) and buf, saving both pointers on
         // the stack so element compilation (which may bl) doesn't
         // clobber them via pool-register reuse.
@@ -11806,7 +11822,15 @@ type Codegen = struct {
                 rc_elem = self.infer_kind(elements[0])
             }
             self.rc_retain_kind(elem_reg, kind: rc_elem)
-            self.emit(f"str {elem_reg}, [{buf_r}, #{i * item_sz}]")
+            if item_sz == 1 {
+                let view = self.byte_view(elem_reg)
+                self.emit(f"strb {view[0]}, [{buf_r}, #{i}]")
+                if len(view[1]) > 0 {
+                    self.pool.free_reg(view[1])
+                }
+            } else {
+                self.emit(f"str {elem_reg}, [{buf_r}, #{i * item_sz}]")
+            }
             self.pool.free_reg(buf_r)
             self.pool.free_reg(elem_reg)
         }
@@ -15016,6 +15040,27 @@ type Codegen = struct {
         self.safe_array_names = saved[1]
     }
 
+    // How many bytes an element of an array of `kind` takes: 1 for a
+    // `[bool]`, 8 for anything else.
+    func elem_width(self, anon kind: TypeKind) -> int64 {
+        if kind is .KArrayBool {
+            return 1
+        }
+        return 8
+    }
+
+    // `reg` as a register a byte store can name: a pool register's `w` view.
+    // A fixed register such as x0 is copied into a pool register first, which
+    // the caller frees with the second result.
+    func byte_view(self, anon reg: str) -> [str] {
+        if reg.starts_with("v") {
+            return [f"w{reg[1..len(reg)]}", ""]
+        }
+        let copy = self.pool.alloc_reg()
+        self.emit(f"mov {copy}, {reg}")
+        return [f"w{copy[1..len(copy)]}", copy]
+    }
+
     // Whether `array[index]` is a range loop's own, in range by construction.
     func is_safe_index(self, anon array_id: int64, index_id: int64) -> bool {
         let .Ident(array) = self.p.exprs[array_id] else { return false }
@@ -15163,7 +15208,8 @@ type Codegen = struct {
         self.rc_let_kind = rc_saved_kind
         if mutable and kind.is_array() and self.is_array_place(value) {
             self.emit_ldr(off, reg: "x0")
-            self.emit("bl _kod_array_copy")
+            self.emit(f"mov x1, #{self.elem_width(kind)}")
+            self.emit("bl _kod_arr_copy")
             self.rc_temp("x0")
             self.emit_str(off, reg: "x0")
         }
@@ -16770,13 +16816,20 @@ type Codegen = struct {
                     self.emit_index_check(reloaded_idx_r, len: len_r)
                 }
                 self.pool.free_reg(len_r)
-                self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
-                if self.rc_heap_kind(lhs_kind.array_elem()) {
+                if self.elem_width(lhs_kind) == 1 {
+                    let view = self.byte_view(reloaded_rhs_r)
+                    self.emit(f"strb {view[0]}, [{buf_r}, {reloaded_idx_r}]")
+                    if len(view[1]) > 0 {
+                        self.pool.free_reg(view[1])
+                    }
+                } else if self.rc_heap_kind(lhs_kind.array_elem()) {
+                    self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
                     self.rc_retain(reloaded_rhs_r)
                     self.emit(f"ldr x17, [{buf_r}, {reloaded_idx_r}]")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
                     self.rc_release_x17()
                 } else {
+                    self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
                 }
                 self.pool.free_reg(buf_r)
@@ -18137,7 +18190,7 @@ type Codegen = struct {
         }
         // A str or bytes value has an array's header, {data, len}, and is
         // gone over a byte at a time.
-        let by_byte = iter_kind is .KStr or iter_kind is .KBytes
+        let by_byte = iter_kind is .KStr or iter_kind is .KBytes or self.elem_width(iter_kind) == 1
         mut iterable = iter_kind.is_array() or by_byte
         if iter_kind is .KUnknown {
             iterable = true

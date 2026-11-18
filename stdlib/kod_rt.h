@@ -18,7 +18,8 @@ typedef struct {
     int64_t len;
 } KodStr;
 
-// A Kod `[T]`: `ptr` points at `len` 8-byte slots, with room for `cap`.
+// A Kod `[T]`: `ptr` points at `len` elements of 8 bytes each, one byte each
+// for a `[bool]`, with room for `cap`.
 typedef struct {
     void *ptr;
     int64_t len;

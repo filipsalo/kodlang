@@ -355,9 +355,11 @@ static inline int rc_arr_refs(const void *a) {
 static inline void rc_arr_set_refs(void *a) {
     if (rc_arr_counted(a)) ((uint32_t *)a)[-1] |= (uint32_t)(RC_REFS_BIT << 8);
 }
-static KodArray *rc_arr_new(int64_t cap, int refs) {
+// An array's elements are `width` bytes each: 1 for a `[bool]`, else 8. The
+// compiler knows the element type at every call and passes it.
+static KodArray *rc_arr_new(int64_t cap, int refs, int64_t width) {
     KodArray *out = (KodArray *)rc_alloc(sizeof(KodArray), (int64_t)(RC_ARRAY_BIT | (refs ? RC_REFS_BIT : 0)));
-    out->ptr = rc_alloc_raw(cap > 0 ? cap * 8 : 8, 0);
+    out->ptr = rc_alloc_raw(cap > 0 ? cap * width : 8, 0);
     out->cap = cap;
     return out;
 }
@@ -365,39 +367,43 @@ static void rc_arr_retain_all(void **p, int64_t n) {
     for (int64_t i = 0; i < n; i++) rc_retain_c(p[i]);
 }
 
-void *kod_array_slice(void *src_raw, int64_t start, int64_t end) {
+void *kod_arr_slice(void *src_raw, int64_t start, int64_t end, int64_t width) {
     KodArray *src = (KodArray *)src_raw;
     int64_t len = clamp_slice(src->len, &start, end);
     int refs = rc_arr_refs(src);
-    KodArray *out = rc_arr_new(len, refs);
+    KodArray *out = rc_arr_new(len, refs, width);
     out->len = len;
     if (len > 0) {
-        memcpy(out->ptr, (char *)src->ptr + start * 8, len * 8);
+        memcpy(out->ptr, (char *)src->ptr + start * width, len * width);
         if (refs) rc_arr_retain_all((void **)out->ptr, len);
     }
     return out;
 }
 
-void *kod_array_copy(void *src_raw) {
-    return kod_array_slice(src_raw, 0, ((KodArray *)src_raw)->len);
+void *kod_arr_copy(void *src_raw, int64_t width) {
+    return kod_arr_slice(src_raw, 0, ((KodArray *)src_raw)->len, width);
 }
 
-void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
+// Grow `arr`'s buffer to hold at least `need` elements, doubling.
+static void rc_arr_reserve(KodArray *arr, int64_t need, int64_t width, int64_t first_cap) {
+    if (arr->cap >= need) return;
+    int64_t new_cap = arr->cap > 0 ? arr->cap : first_cap;
+    while (new_cap < need) new_cap *= 2;
+    char *buf = (char *)rc_alloc_raw(new_cap * width, 0);
+    if (arr->len > 0) memcpy(buf, arr->ptr, arr->len * width);
+    rc_release_c(arr->ptr);
+    arr->ptr = buf;
+    arr->cap = new_cap;
+}
+
+void *kod_arr_concat(void *lhs_raw, void *rhs_raw, int64_t width) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
     int64_t total = lhs->len + rhs->len;
     int refs = rc_arr_refs(rhs) || rc_arr_refs(lhs);
-    if (lhs->cap < total) {
-        int64_t new_cap = lhs->cap > 0 ? lhs->cap : 4;
-        while (new_cap < total) new_cap *= 2;
-        int64_t *buf = (int64_t *)rc_alloc_raw(new_cap * 8, 0);
-        if (lhs->len > 0) memcpy(buf, lhs->ptr, lhs->len * 8);
-        rc_release_c(lhs->ptr);
-        lhs->ptr = buf;
-        lhs->cap = new_cap;
-    }
+    rc_arr_reserve(lhs, total, width, 4);
     int64_t rhs_len = rhs->len;
-    if (rhs_len > 0) memmove((int64_t *)lhs->ptr + lhs->len, rhs->ptr, rhs_len * 8);
+    if (rhs_len > 0) memmove((char *)lhs->ptr + lhs->len * width, rhs->ptr, rhs_len * width);
     if (refs) {
         rc_arr_retain_all((void **)lhs->ptr + lhs->len, rhs_len);
         if (lhs->len == 0) rc_arr_set_refs(lhs);
@@ -409,17 +415,14 @@ void *kod_array_concat(void *lhs_raw, void *rhs_raw) {
 // `xs += [x]` without the one-element array: `value` goes on the end of `arr` in
 // place. When `refs` is set it is a counted reference the caller has already
 // retained for the array.
-void *kod_array_push(void *arr_raw, int64_t value, int64_t refs) {
+void *kod_arr_push(void *arr_raw, int64_t value, int64_t refs, int64_t width) {
     KodArray *arr = (KodArray *)arr_raw;
-    if (arr->cap <= arr->len) {
-        int64_t new_cap = arr->cap > 0 ? arr->cap * 2 : 4;
-        int64_t *buf = (int64_t *)rc_alloc_raw(new_cap * 8, 0);
-        if (arr->len > 0) memcpy(buf, arr->ptr, arr->len * 8);
-        rc_release_c(arr->ptr);
-        arr->ptr = buf;
-        arr->cap = new_cap;
+    rc_arr_reserve(arr, arr->len + 1, width, 4);
+    if (width == 1) {
+        ((uint8_t *)arr->ptr)[arr->len] = (uint8_t)value;
+    } else {
+        ((int64_t *)arr->ptr)[arr->len] = value;
     }
-    ((int64_t *)arr->ptr)[arr->len] = value;
     if (refs && arr->len == 0) rc_arr_set_refs(arr);
     arr->len++;
     return arr;
@@ -427,7 +430,7 @@ void *kod_array_push(void *arr_raw, int64_t value, int64_t refs) {
 
 // `arr * n`: a new array of `n` copies of `arr`'s elements in order; empty for
 // `n` of zero or less. The copies double until they fill it.
-void *kod_array_repeat(void *arr_raw, int64_t n) {
+void *kod_arr_repeat(void *arr_raw, int64_t n, int64_t width) {
     KodArray *arr = (KodArray *)arr_raw;
     int64_t len = arr->len;
     if (n < 0) n = 0;
@@ -437,15 +440,15 @@ void *kod_array_repeat(void *arr_raw, int64_t n) {
     }
     int64_t total = len * n;
     int refs = rc_arr_refs(arr);
-    KodArray *out = rc_arr_new(total, refs);
+    KodArray *out = rc_arr_new(total, refs, width);
     out->len = total;
     if (total > 0) {
-        int64_t *dst = (int64_t *)out->ptr;
-        memcpy(dst, arr->ptr, len * 8);
+        char *dst = (char *)out->ptr;
+        memcpy(dst, arr->ptr, len * width);
         int64_t filled = len;
         while (filled < total) {
             int64_t chunk = filled < total - filled ? filled : total - filled;
-            memcpy(dst + filled, dst, chunk * 8);
+            memcpy(dst + filled * width, dst, chunk * width);
             filled += chunk;
         }
         if (refs) rc_arr_retain_all((void **)dst, total);
@@ -453,15 +456,24 @@ void *kod_array_repeat(void *arr_raw, int64_t n) {
     return out;
 }
 
-void *kod_array_concat_new(void *lhs_raw, void *rhs_raw) {
+void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;
     int64_t total = lhs->len + rhs->len;
     int refs = rc_arr_refs(lhs) || rc_arr_refs(rhs);
-    KodArray *out = rc_arr_new(total, refs);
+    KodArray *out = rc_arr_new(total, refs, width);
     out->len = total;
-    if (lhs->len > 0) memcpy(out->ptr, lhs->ptr, lhs->len * 8);
-    if (rhs->len > 0) memcpy((int64_t *)out->ptr + lhs->len, rhs->ptr, rhs->len * 8);
+    if (lhs->len > 0) memcpy(out->ptr, lhs->ptr, lhs->len * width);
+    if (rhs->len > 0) memcpy((char *)out->ptr + lhs->len * width, rhs->ptr, rhs->len * width);
     if (refs) rc_arr_retain_all((void **)out->ptr, total);
     return out;
 }
+
+// The same with 8-byte elements, for code the bootstrap snapshot compiled
+// before arrays had a width.
+void *kod_array_slice(void *a, int64_t start, int64_t end) { return kod_arr_slice(a, start, end, 8); }
+void *kod_array_copy(void *a) { return kod_arr_copy(a, 8); }
+void *kod_array_concat(void *a, void *b) { return kod_arr_concat(a, b, 8); }
+void *kod_array_push(void *a, int64_t v, int64_t refs) { return kod_arr_push(a, v, refs, 8); }
+void *kod_array_repeat(void *a, int64_t n) { return kod_arr_repeat(a, n, 8); }
+void *kod_array_concat_new(void *a, void *b) { return kod_arr_concat_new(a, b, 8); }
