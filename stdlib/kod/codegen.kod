@@ -2184,6 +2184,10 @@ type Codegen = struct {
     // copy its `NAME$shared` getter built at the first such read.
     func read_const(self, anon expr_id: int64, sig: SigInfo) -> Val {
         self.check_const_use(expr_id, :sig)
+        let symbol = sig.src_p.func_decls[sig.decl_id].extern_symbol
+        if len(symbol) > 0 {
+            return self.read_extern_var(symbol)
+        }
         if self.folded_const(sig) is Some(folded) {
             return folded
         }
@@ -2199,6 +2203,17 @@ type Codegen = struct {
         self.reading_const = false
         // The value is the caller's, like any call's.
         return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // The value of the C variable `symbol` (an `extern let`), through the GOT,
+    // since it may live in a shared library.
+    func read_extern_var(self, anon symbol: str) -> Val {
+        let label = extern_label(symbol)
+        let reg = self.pool.alloc_reg()
+        self.emit(f"adrp {reg}, {label}@GOTPAGE")
+        self.emit(f"ldr {reg}, [{reg}, {label}@GOTPAGEOFF]")
+        self.emit(f"ldr {reg}, [{reg}]")
+        return .VReg(name: reg)
     }
 
     // The shared copy of the constant `lbl`, borrowed: its getter's cell keeps
@@ -12415,6 +12430,12 @@ type Codegen = struct {
                 .Func(decl_id) -> {
                     // A generic function's body is compiled per instance, or not at all.
                     let fd = self.p.func_decls[decl_id]
+                    if len(fd.extern_symbol) > 0 {
+                        let kind = self.resolve_type(fd.return_typ)
+                        if not (kind is .KInt64) {
+                            self.report_error(f"error: an `extern let` must be an `int64`, not `{self.kind_display(kind)}`", span: fd.name_span)
+                        }
+                    }
                     if len(fd.type_params) > 0 {
                         self.subst_names = fd.type_params
                         self.check_sig_types(fd.params, return_typ: fd.return_typ)
@@ -18999,7 +19020,9 @@ type Codegen = struct {
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> {
-                    if self.p.func_decls[decl_id].is_var {
+                    if len(self.p.func_decls[decl_id].extern_symbol) > 0 {
+                        // An `extern let`: reads load the C variable; no getter.
+                    } else if self.p.func_decls[decl_id].is_var {
                         self.compile_var(decl_id)
                     } else if self.p.func_decls[decl_id].is_const {
                         self.compile_const(decl_id)

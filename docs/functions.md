@@ -588,6 +588,19 @@ fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 - A float can't be an extra argument, and neither can a `str`; pass
   `unsafe.c_str(s)` for C's `%s`.
 
+A C global variable of 8 bytes, such as a pointer or a `long`, is an
+`extern let`:
+
+```kod
+extern let __stdoutp: int64     // C's `stdout`, a FILE *
+
+fflush(__stdoutp)
+```
+
+Each read loads the variable's value as it is then; Kod can't assign it.
+The type must be `int64`. A name that starts with `_`, as most of libc's
+globals do, is private to the module that declares it.
+
 An `extern func` is a C symbol, resolved at link time against the C runtime and whatever the modules of the program declare (see [Link inputs](modules.md#link-inputs)): `labs` is in libc, and a module can name a C file of its own or a library to link. A `str` argument reaches C as a `KodStr *`, not as a `char *`; to call a libc function that takes a C string, a buffer or a pointer to write to, pass addresses from [`unsafe`](unsafe.md) as `int64`.
 
 ## Recursion
