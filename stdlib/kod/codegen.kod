@@ -7855,6 +7855,76 @@ type Codegen = struct {
         return .VReg(name: "x0")
     }
 
+    // Whether `sig` is stdlib/unsafe.kod's `c_function`, which the compiler does itself.
+    func is_c_function_sig(self, anon sig: SigInfo) -> bool {
+        if sig.decl_id <= 0 or not sig.src_p.path.ends_with("unsafe.kod") {
+            return false
+        }
+        return sig.src_p.func_decls[sig.decl_id].name == "c_function" and sig.src_p.path.ends_with("stdlib/unsafe.kod")
+    }
+
+    // `unsafe.c_function(f)`: the code address of the top-level Kod function
+    // `f`. Its parameters and result are words in x0-x7 and x0, as C passes
+    // them, and it saves what C expects saved, so C can call it as it is.
+    func compile_c_function(self, anon args: [ast.CallArg], span: ast.Span) -> Val {
+        if len(args) != 1 or len(args[0].label) > 0 {
+            self.report_error("error: `unsafe.c_function` takes the name of a top-level function", :span)
+            return .VImm(value: 0)
+        }
+        let arg = args[0].value
+        mut label = ""
+        mut name = ""
+        mut sig: SigInfo? = none
+        match self.p.exprs[arg] {
+            .Ident(ident) -> {
+                name = ident
+                if self.var_index(ident) < 0 {
+                    let slot = self.lookup_func(ident)
+                    if slot != -1 {
+                        label = self.fn_label(slot)
+                        sig = self.fn_sig(slot)
+                    }
+                }
+            }
+            .Binary(_lhs, op, rhs) -> {
+                if op is .Dot {
+                    let slot = self.module_fn_value(arg)
+                    if slot != -1 {
+                        label = self.import_fn_at(slot).label
+                        sig = self.import_fn_at(slot).sig
+                        if self.p.exprs[rhs] is .Ident(member) {
+                            name = member
+                        }
+                    }
+                }
+            }
+            else none
+        }
+        if sig is none or (must sig).decl_id <= 0 or self.is_generic_sig(must sig) {
+            if len(name) > 0 {
+                self.report_error(f"error: `unsafe.c_function` takes the name of a top-level function, not `{name}`", span: self.p.expr_spans[arg])
+            } else {
+                self.report_error("error: `unsafe.c_function` takes the name of a top-level function", span: self.p.expr_spans[arg])
+            }
+            return .VImm(value: 0)
+        }
+        let found = must sig
+        mut kinds = found.param_kinds
+        if not (found.return_kind is .KVoid) {
+            kinds += [found.return_kind]
+        }
+        for kind in kinds {
+            if not (kind is .KInt64) and not (kind is .KBool) {
+                self.report_error(f"error: C can't call `{name}`: its parameters and result must be `int64` or `bool`, not `{self.kind_display(kind)}`", span: self.p.expr_spans[arg])
+                return .VImm(value: 0)
+            }
+        }
+        let reg = self.pool.alloc_reg()
+        self.emit(f"adrp {reg}, {label}@PAGE")
+        self.emit(f"add {reg}, {reg}, {label}@PAGEOFF")
+        return .VReg(name: reg)
+    }
+
     // The parameters before an extern's `...` are words C reads as they are.
     func check_variadic_params(self, anon params: [ast.Param]) -> none {
         for param in params {
@@ -12927,6 +12997,9 @@ type Codegen = struct {
             if sig.variadic {
                 return self.compile_variadic_call(sig, label: ifn.label, :args, name: f"{mod_or_obj}.{method_name}", span: self.p.expr_spans[callee_lhs])
             }
+            if self.is_c_function_sig(sig) {
+                return self.compile_c_function(args, span: self.p.expr_spans[callee_lhs])
+            }
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: method_name).slots
             if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
@@ -13236,6 +13309,9 @@ type Codegen = struct {
                     }
                     if sig.variadic {
                         return self.compile_variadic_call(sig, label: self.fn_label(slot), :args, :name, span: self.p.expr_spans[callee_id])
+                    }
+                    if self.is_c_function_sig(sig) {
+                        return self.compile_c_function(args, span: self.p.expr_spans[callee_id])
                     }
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots

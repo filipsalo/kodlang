@@ -95,6 +95,41 @@ otherwise read as `4294967295`. A function returning `long`, `ssize_t`,
 `size_t` or a pointer fills all 8 bytes. Read `errno()` straight after the
 call that failed: anything else in between, a `print` too, may change it.
 
+## Callbacks
+
+`c_function(f)` is the address of the top-level function `f`, for a C
+function that calls back, such as `qsort`'s comparison:
+
+```kod
+extern func qsort(anon base: int64, anon count: int64, anon size: int64, anon compare: int64) -> none
+
+// C passes the addresses of two of the int64s being sorted.
+func by_value(anon a: int64, anon b: int64) -> int64 {
+    let x = unsafe.load64(a)
+    let y = unsafe.load64(b)
+    if x < y {
+        return -1
+    }
+    if x > y {
+        return 1
+    }
+    return 0
+}
+
+qsort(nums, count, 8, unsafe.c_function(by_value))
+```
+
+- `f` is a function's name, `f` or `module.f`: not a function literal, a
+  local holding a function, a method or a generic function.
+- Its parameters and its result are `int64`, `bool` or, for the result,
+  `none`: C calls it with machine words and nothing to count.
+- A C `int` parameter arrives with its upper half undefined, as a C `int`
+  result does; wrap it in `c_int` before using it.
+- C calls it on whatever thread C runs, and Kod's heap isn't safe to use
+  from two threads at once, so a callback C makes from a thread of its own
+  must not allocate. Inside a signal handler, likewise, it may only load
+  and store.
+
 ## What doesn't fit
 
 - Variable arguments, as `printf` takes them, are only `int64` and `bool`:
@@ -104,4 +139,5 @@ call that failed: anything else in between, a `print` too, may change it.
 - A C function that takes or returns a `struct` by value, or a `float` or
   `double`. Pointers to structs are fine: `alloc` the bytes C's layout
   needs and `load`/`store` the fields at their offsets.
-- A function pointer, for a callback: a Kod function value isn't one.
+- A function value, a closure, as a callback: only a named top-level
+  function can be one (see [Callbacks](#callbacks)).
