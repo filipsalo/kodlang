@@ -404,45 +404,6 @@ int64_t kod_fd_open(KodStr *path, int64_t mode) {
     return fd;
 }
 
-// At most `max` bytes (and never more than 64 KiB) from `fd`; empty at the
-// end of the stream, and on failure, which sets the errno.
-KodStr *kod_fd_read(int64_t fd, int64_t max) {
-    char chunk[65536];
-    if (max > (int64_t)sizeof chunk) max = (int64_t)sizeof chunk;
-    g_io_errno = 0;
-    if (max <= 0) return kod_str_new(0);
-    ssize_t n;
-    do {
-        n = read((int)fd, chunk, (size_t)max);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        g_io_errno = errno;
-        return kod_str_new(0);
-    }
-    return kod_str_from_bytes(chunk, n);
-}
-
-// Bytes written, or -1 with the errno set.
-int64_t kod_fd_write(int64_t fd, KodStr *data) {
-    g_io_errno = 0;
-    if (data->len == 0) return 0;
-    ssize_t n;
-    do {
-        n = write((int)fd, data->buf, (size_t)data->len);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        g_io_errno = errno;
-        return -1;
-    }
-    return n;
-}
-
-int64_t kod_fd_close(int64_t fd) {
-    int rc = close((int)fd);
-    g_io_errno = rc < 0 ? errno : 0;
-    return rc;
-}
-
 // The SHA-256 of `data`, as 64 lowercase hex digits. The driver names cached
 // objects by it.
 KodStr *kod_sha256_hex(KodStr *data) {
@@ -468,10 +429,6 @@ KodStr *kod_sha256_hex(KodStr *data) {
     return kod_str_from_cstr(out);
 }
 
-int64_t kod_fd_is_terminal(int64_t fd) {
-    return isatty((int)fd) ? 1 : 0;
-}
-
 KodStr *kod_errno_message(int64_t err) {
     return kod_str_from_cstr(strerror((int)err));
 }
@@ -489,25 +446,6 @@ int64_t kod_errno_kind(int64_t err) {
     case EPIPE: return 8;
     default: return 10;
     }
-}
-
-// Environment variables for stdlib/env.kod. The Kod side has already refused
-// names that are empty or hold `=` or a NUL byte, and values with a NUL byte.
-int64_t kod_env_has(KodStr *name) {
-    return getenv(name->buf) != NULL;
-}
-
-KodStr *kod_env_get(KodStr *name) {
-    const char *value = getenv(name->buf);
-    return kod_str_from_cstr(value ? value : "");
-}
-
-int64_t kod_env_set(KodStr *name, KodStr *value) {
-    return setenv(name->buf, value->buf, 1) == 0 ? 0 : -1;
-}
-
-void kod_env_unset(KodStr *name) {
-    unsetenv(name->buf);
 }
 
 // {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`

@@ -1,47 +1,81 @@
 // File descriptors as streams, with the POSIX calls behind them. See docs/io.md.
 import "stream" { IoError, os_error }
 import "time" { Duration }
+import "unsafe"
 
 extern func kod_io_errno() -> int64
+// open is variadic, which an extern can't call, so this stays C.
 extern func kod_fd_open(anon path: str, anon mode: int64) -> int64
-extern func kod_fd_read(anon fd: int64, anon max: int64) -> bytes
-extern func kod_fd_write(anon fd: int64, anon data: bytes) -> int64
-extern func kod_fd_close(anon fd: int64) -> int64
-extern func kod_fd_is_terminal(anon fd: int64) -> int64
 extern func kod_poll(anon fds: [int64], anon events: [int64], anon ready: [int64], anon timeout_ms: int64) -> int64
+extern func read(anon fd: int64, anon buf: int64, anon n: int64) -> int64
+extern func write(anon fd: int64, anon buf: int64, anon n: int64) -> int64
+extern func close(anon fd: int64) -> int64
+extern func isatty(anon fd: int64) -> int64
+
+let EINTR: int64 = 4
+// The most one `read` takes in.
+let READ_MAX: int64 = 65536
+
+// Where every `read` lands before it is copied out: allocated once, on the
+// first read, and kept.
+mut _read_buf: int64 = 0
 
 type Fd = struct {
     fd: int64
 
     func read(self, anon max: int64) -> bytes or Error {
-        let data = kod_fd_read(self.fd, max)
-        let err = kod_io_errno()
-        if err != 0 {
-            throw os_error("read", errno: err)
+        if max <= 0 {
+            return kod_str_to_bytes("")
         }
-        return data
+        mut want = max
+        if want > READ_MAX {
+            want = READ_MAX
+        }
+        if _read_buf == 0 {
+            _read_buf = unsafe.alloc(READ_MAX)
+        }
+        for true {
+            let n = read(self.fd, _read_buf, want)
+            if n >= 0 {
+                return unsafe.copy_out(_read_buf, n)
+            }
+            let err = unsafe.errno()
+            if err != EINTR {
+                throw os_error("read", errno: err)
+            }
+        }
+        return kod_str_to_bytes("")
     }
 
     func write(self, anon data: bytes) -> int64 or Error {
-        let n = kod_fd_write(self.fd, data)
-        if n < 0 {
-            throw os_error("write", errno: kod_io_errno())
+        if len(data) == 0 {
+            return 0
         }
-        return n
+        for true {
+            let n = write(self.fd, unsafe.data(data), len(data))
+            if n >= 0 {
+                return n
+            }
+            let err = unsafe.errno()
+            if err != EINTR {
+                throw os_error("write", errno: err)
+            }
+        }
+        return 0
     }
 
     // Closes it and sets `fd` to -1, so a second close fails instead of
     // closing whatever file reused the number.
     func close(self) -> none or Error {
-        if kod_fd_close(self.fd) < 0 {
-            throw os_error("close", errno: kod_io_errno())
+        if unsafe.c_int(close(self.fd)) < 0 {
+            throw os_error("close", errno: unsafe.errno())
         }
         self.fd = -1
     }
 
     // Whether it is a terminal, rather than a file or a pipe.
     func is_terminal(self) -> bool {
-        return kod_fd_is_terminal(self.fd) != 0
+        return unsafe.c_int(isatty(self.fd)) != 0
     }
 }
 
