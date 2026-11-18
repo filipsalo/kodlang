@@ -12,7 +12,6 @@
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +29,6 @@
 #include <arm_acle.h>
 #endif
 
-extern char **environ;
 
 // Defined in stdlib/kod/inspect.kod. Both panic handlers call it
 // inline with `__builtin_frame_address(0)` (NOT through a wrapper —
@@ -448,247 +446,6 @@ int64_t kod_errno_kind(int64_t err) {
     }
 }
 
-// {status, stdout_buf, stderr_buf} matches the Kod-side `ProcessResult`
-// struct's field order (each slot 8 bytes). The two `*` slots hold
-// Kod `str` values (i.e. pointers to KodStr structs).
-typedef struct {
-    int64_t status;
-    KodStr *stdout_buf;
-    KodStr *stderr_buf;
-} KodProcessResult;
-
-// Append `n` bytes from `src` onto a growable buffer.
-// Updates *buf, *len, *cap; allocates fresh storage when the
-// current capacity isn't enough. Returns the (possibly-new) buffer ptr.
-static char *append_to_buf(char *buf, int64_t *len, int64_t *cap,
-                           const char *src, int64_t n) {
-    if (*len + n > *cap) {
-        int64_t new_cap = *cap;
-        while (new_cap < *len + n) new_cap *= 2;
-        char *new_buf = (char *)rc_alloc_raw(new_cap + 1, 0);
-        memcpy(new_buf, buf, *len);
-        rc_release_c(buf);
-        buf = new_buf;
-        *cap = new_cap;
-    }
-    memcpy(buf + *len, src, n);
-    *len += n;
-    return buf;
-}
-
-// The NULL-terminated C `argv` for a Kod `[str]`, for the caller to release. What
-// posix_spawnp and execvp want is NUL-terminated C strings, not KodStr —
-// pull the underlying `buf` field out of each entry.
-static char **c_argv(KodArray *argv_arr) {
-    int64_t argc = argv_arr->len;
-    char **argv = (char **)rc_alloc_raw((argc + 1) * sizeof(char *), 0);
-    KodStr **kod_argv = (KodStr **)argv_arr->ptr;
-    for (int64_t i = 0; i < argc; i++) argv[i] = kod_argv[i]->buf;
-    argv[argc] = NULL;
-    return argv;
-}
-
-// Spawn `argv[0]` with `argv` (NULL-terminated rebuilt from the Kod
-// `[str]`), capture stdout and stderr concurrently (via poll to avoid
-// the obvious deadlock where one pipe fills while we're blocked on the
-// other), wait, and return {status, stdout, stderr}. On spawn failure
-// status is -1 and the buffers are empty.
-KodProcessResult *kod_run_process(KodArray *argv_arr) {
-    char **argv = c_argv(argv_arr);
-
-    KodProcessResult *result =
-        (KodProcessResult *)rc_alloc(sizeof(KodProcessResult), 6); // the two strs
-
-    int out_pipe[2], err_pipe[2];
-    if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
-        result->status = -1;
-        result->stdout_buf = kod_empty_str();
-        result->stderr_buf = kod_empty_str();
-        return result;
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
-    posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
-    posix_spawn_file_actions_addclose(&actions, out_pipe[1]);
-    posix_spawn_file_actions_addclose(&actions, err_pipe[0]);
-    posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
-    posix_spawn_file_actions_addclose(&actions, err_pipe[1]);
-
-    pid_t pid;
-    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(out_pipe[1]);
-    close(err_pipe[1]);
-
-    if (rc != 0) {
-        close(out_pipe[0]);
-        close(err_pipe[0]);
-        result->status = -1;
-        result->stdout_buf = kod_empty_str();
-        result->stderr_buf = kod_empty_str();
-        return result;
-    }
-
-    struct pollfd pfds[2];
-    pfds[0].fd = out_pipe[0];
-    pfds[0].events = POLLIN;
-    pfds[1].fd = err_pipe[0];
-    pfds[1].events = POLLIN;
-
-    int64_t out_cap = 256, out_len = 0;
-    int64_t err_cap = 256, err_len = 0;
-    char *out_buf = (char *)rc_alloc_raw(out_cap + 1, 0);
-    char *err_buf = (char *)rc_alloc_raw(err_cap + 1, 0);
-
-    int open_count = 2;
-    while (open_count > 0) {
-        int n = poll(pfds, 2, -1);
-        if (n < 0) break;
-        for (int i = 0; i < 2; i++) {
-            if (pfds[i].fd < 0) continue;
-            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            char tmp[4096];
-            ssize_t r = read(pfds[i].fd, tmp, sizeof(tmp));
-            if (r <= 0) {
-                close(pfds[i].fd);
-                pfds[i].fd = -1;
-                open_count--;
-                continue;
-            }
-            if (i == 0) {
-                out_buf = append_to_buf(out_buf, &out_len, &out_cap, tmp, r);
-            } else {
-                err_buf = append_to_buf(err_buf, &err_len, &err_cap, tmp, r);
-            }
-        }
-    }
-    // Copy the raw capture buffers into properly-headed Kod strings.
-    // append_to_buf grows storage without leaving room for a KodStr
-    // header, so we can't hand the raw buffers back as Kod strs.
-    KodStr *out_str = kod_str_alloc(out_len);
-    memcpy(out_str->buf, out_buf, out_len);
-    KodStr *err_str = kod_str_alloc(err_len);
-    memcpy(err_str->buf, err_buf, err_len);
-    rc_release_c(out_buf);
-    rc_release_c(err_buf);
-    rc_release_c(argv);
-
-    int status;
-    waitpid(pid, &status, 0);
-    int exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-
-    result->status = exit_status;
-    result->stdout_buf = out_str;
-    result->stderr_buf = err_str;
-    return result;
-}
-
-// Start `argv[0]` (found via PATH) with stdin, stdout and stderr on
-// /dev/null and return its pid without waiting, or -1 when it could not be
-// started.
-int64_t kod_spawn(KodArray *argv_arr) {
-    if (argv_arr->len == 0) return -1;
-    char **argv = c_argv(argv_arr);
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
-    pid_t pid;
-    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    rc_release_c(argv);
-    return rc == 0 ? (int64_t)pid : -1;
-}
-
-// A pipe whose ends close on exec and, for the end this process keeps, don't
-// raise SIGPIPE: a write to a child that has gone fails with EPIPE instead.
-static int kod_proc_pipe(int fds[2], int keep) {
-    if (pipe(fds) != 0) return errno;
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    fcntl(fds[keep], F_SETNOSIGPIPE, 1);
-    return 0;
-}
-
-// process.start: run `argv[0]` (found via PATH) without waiting. `modes` holds
-// a code per stream, stdin + 3 * stdout + 9 * stderr: 0 inherit, 1 pipe,
-// 2 /dev/null. `dir` (when not empty) is the child's directory, and with
-// `use_env` its environment is `env` instead of this process's. Writes the pid
-// and this process's end of each pipe (-1 for a stream that isn't one) to
-// `slots`; returns 0, or the errno of what failed.
-int64_t kod_proc_start(KodArray *argv_arr, KodArray *env_arr, int64_t use_env, KodStr *dir, int64_t modes, KodArray *slots_arr) {
-    int64_t *slots = (int64_t *)slots_arr->ptr;
-    if (argv_arr->len == 0 || slots_arr->len < 4) return EINVAL;
-    int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    int err = 0;
-    for (int fd = 0; fd < 3 && err == 0; fd++) {
-        int mode = (int)(modes % 3);
-        modes /= 3;
-        if (mode == 1) {
-            // The child reads stdin's pipe and writes the others.
-            int child_end = fd == 0 ? 0 : 1;
-            err = kod_proc_pipe(pipes[fd], 1 - child_end);
-            if (err == 0) posix_spawn_file_actions_adddup2(&actions, pipes[fd][child_end], fd);
-        } else if (mode == 2) {
-            posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0);
-        }
-    }
-    if (err == 0 && dir->len > 0) {
-        err = posix_spawn_file_actions_addchdir(&actions, dir->buf);
-    }
-    pid_t pid = 0;
-    if (err == 0) {
-        char **argv = c_argv(argv_arr);
-        char **envp = use_env ? c_argv(env_arr) : environ;
-        err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, envp);
-        rc_release_c(argv);
-        if (use_env) rc_release_c(envp);
-    }
-    posix_spawn_file_actions_destroy(&actions);
-    slots[0] = pid;
-    for (int fd = 0; fd < 3; fd++) {
-        int keep = fd == 0 ? 1 : 0;
-        slots[fd + 1] = -1;
-        if (pipes[fd][0] < 0) continue;
-        close(pipes[fd][1 - keep]);
-        if (err == 0) {
-            slots[fd + 1] = pipes[fd][keep];
-        } else {
-            close(pipes[fd][keep]);
-        }
-    }
-    return err;
-}
-
-// Wait for a child to end: its raw wait status, or -1 with the reason in
-// kod_io_errno().
-// With `nohang`, -2 when the child is still running.
-int64_t kod_proc_wait(int64_t pid, int64_t nohang) {
-    int status;
-    pid_t r;
-    do {
-        r = waitpid((pid_t)pid, &status, nohang ? WNOHANG : 0);
-    } while (r < 0 && errno == EINTR);
-    if (r < 0) {
-        g_io_errno = errno;
-        return -1;
-    }
-    g_io_errno = 0;
-    return r == 0 ? -2 : status;
-}
-
-// Make reads and writes on `fd` fail with EAGAIN instead of waiting: 0, or the errno.
-int64_t kod_fd_set_nonblocking(int64_t fd) {
-    int flags = fcntl((int)fd, F_GETFL);
-    if (flags < 0 || fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0) return errno;
-    return 0;
-}
-
 // Wait until one of `fds` is ready for what `events` asks (1 read, 2 write),
 // for up to `timeout_ms` (-1: no limit), and set each `ready` slot to 0 or 1.
 // A negative fd is skipped. The count of ready fds, or -1 with g_io_errno set.
@@ -736,36 +493,10 @@ int64_t kod_poll(KodArray *fds_arr, KodArray *events_arr, KodArray *ready_arr, i
     return got;
 }
 
-// Send `sig` to a process: 0, or the errno.
-int64_t kod_proc_signal(int64_t pid, int64_t sig) {
-    if (pid <= 0) return ESRCH;
-    return kill((pid_t)pid, (int)sig) == 0 ? 0 : errno;
-}
-
-// SIGTERM a child and reap it. False when the signal could not be sent.
-int64_t kod_kill(int64_t pid) {
-    if (pid <= 0 || kill((pid_t)pid, SIGTERM) != 0) return 0;
-    int status;
-    waitpid((pid_t)pid, &status, 0);
-    return 1;
-}
-
-// float64: a Kod `float64` travels as the 8 bytes of its IEEE 754 pattern in an
-// ordinary integer register or slot. kod_i64_to_f64, kod_f64_to_i64,
-// kod_f64_abs, floor, ceil, round, sqrt, is_nan, is_inf, kod_f64_bits and
-// kod_f64_from_bits have no C side: codegen's float_intrinsic compiles a call
-// to them to the instructions that do the work. Printing and reading floats is
-// Kod (stdlib/primitives/float_text.kod).
-
-// Replace this process with `argv[0]` (found via PATH) and `argv`. Buffered
-// output is flushed first: the new image would never see it. Returns -1,
-// and only then, when the exec failed (nothing to run, or an empty argv).
-int64_t kod_exec(KodArray *argv_arr) {
-    if (argv_arr->len == 0) return -1;
-    char **argv = c_argv(argv_arr);
-    fflush(NULL);
-    execvp(argv[0], argv);
-    return -1;
+// fcntl with a third argument, for Kod: fcntl is variadic, which an extern
+// can't call. The result, or -1 with errno set.
+int64_t kod_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
+    return fcntl((int)fd, (int)cmd, (int)arg);
 }
 
 // Append rhs to lhs, mutating lhs in place when its `cap` is large enough

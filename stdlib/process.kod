@@ -2,9 +2,10 @@
 // `output`, or turn this process into another with `exec`. See
 // docs/builtins.md.
 
-import "posix" { Fd, poll }
+import "posix" { Fd, poll, signal }
 import "stream" { IoError, IoKind, os_error }
 import "strbuilder" { StrBuilder }
+import "unsafe"
 
 type ProcessResult = struct {
     status: int64
@@ -12,15 +13,33 @@ type ProcessResult = struct {
     stderr: str
 }
 
-extern func kod_run_process(anon argv: [str]) -> ProcessResult
-extern func kod_exec(anon argv: [str]) -> int64
-extern func kod_spawn(anon argv: [str]) -> int64
-extern func kod_kill(anon pid: int64) -> int64
-extern func kod_proc_start(anon argv: [str], anon env: [str], anon use_env: int64, anon dir: str, anon modes: int64, anon slots: [int64]) -> int64
-extern func kod_proc_wait(anon pid: int64, anon nohang: int64) -> int64
-extern func kod_fd_set_nonblocking(anon fd: int64) -> int64
-extern func kod_proc_signal(anon pid: int64, anon sig: int64) -> int64
-extern func kod_io_errno() -> int64
+// fcntl is variadic, which an extern can't call, so it goes through C.
+extern func kod_fcntl(anon fd: int64, anon cmd: int64, anon arg: int64) -> int64
+extern func pipe(anon fds: int64) -> int64
+extern func close(anon fd: int64) -> int64
+extern func waitpid(anon pid: int64, anon status: int64, anon options: int64) -> int64
+extern func execvp(anon file: int64, anon argv: int64) -> int64
+extern func fflush(anon stream: int64) -> int64
+extern func _NSGetEnviron() -> int64
+extern func posix_spawnp(anon pid: int64, anon file: int64, anon actions: int64, anon attr: int64, anon argv: int64, anon envp: int64) -> int64
+extern func posix_spawn_file_actions_init(anon actions: int64) -> int64
+extern func posix_spawn_file_actions_destroy(anon actions: int64) -> int64
+extern func posix_spawn_file_actions_adddup2(anon actions: int64, anon fd: int64, anon to: int64) -> int64
+extern func posix_spawn_file_actions_addopen(anon actions: int64, anon fd: int64, anon path: int64, anon flags: int64, anon mode: int64) -> int64
+extern func posix_spawn_file_actions_addchdir(anon actions: int64, anon path: int64) -> int64
+
+// macOS values of the C constants used here.
+let EINTR: int64 = 4
+let F_SETFD: int64 = 2
+let F_GETFL: int64 = 3
+let F_SETFL: int64 = 4
+let F_SETNOSIGPIPE: int64 = 73
+let FD_CLOEXEC: int64 = 1
+let O_RDONLY: int64 = 0
+let O_WRONLY: int64 = 1
+let O_NONBLOCK: int64 = 4
+let WNOHANG: int64 = 1
+let SIGTERM: int64 = 15
 
 // What a child's stdin, stdout or stderr is connected to.
 type Stdio = enum {
@@ -94,21 +113,14 @@ type Child = struct {
         if self.stdin.fd >= 0 {
             try self.stdin.close()
         }
-        let status = kod_proc_wait(self.pid, 0)
-        if status < 0 {
-            throw os_error(f"wait {self.name}", errno: kod_io_errno())
-        }
-        return try self.exit_code(status)
+        return try self.exit_code(try wait_status(self.pid, name: self.name, hang: true))
     }
 
     // The exit code if the child has ended, none while it runs.
     func try_wait(self) -> int64? or Error {
-        let status = kod_proc_wait(self.pid, 1)
-        if status == -2 {
-            return none
-        }
+        let status = try wait_status(self.pid, name: self.name, hang: false)
         if status < 0 {
-            throw os_error(f"wait {self.name}", errno: kod_io_errno())
+            return none
         }
         return try self.exit_code(status)
     }
@@ -124,9 +136,8 @@ type Child = struct {
     // Send the child a signal, SIGTERM unless told otherwise, without
     // waiting for it.
     func kill(self, signal: Signal = .Term) -> none or Error {
-        let err = kod_proc_signal(self.pid, signal.number())
-        if err != 0 {
-            throw os_error(f"kill {self.name}", errno: err)
+        if send_signal(self.pid, signal.number()) is Err(IoError(e)) {
+            throw os_error(f"kill {self.name}", errno: e.errno)
         }
     }
 }
@@ -152,30 +163,173 @@ func signal_name(anon sig: int64) -> str {
     }
 }
 
+// A child's raw wait status, or -1 if `hang` is false and it is still running.
+func wait_status(anon pid: int64, name: str, hang: bool) -> int64 or Error {
+    mut options = WNOHANG
+    if hang {
+        options = 0
+    }
+    let slot = unsafe.alloc(4)
+    for true {
+        let got = unsafe.c_int(waitpid(pid, slot, options))
+        if got > 0 {
+            let status = unsafe.load32(slot)
+            unsafe.free(slot)
+            return status
+        }
+        if got == 0 {
+            unsafe.free(slot)
+            return -1
+        }
+        let err = unsafe.errno()
+        if err != EINTR {
+            unsafe.free(slot)
+            throw os_error(f"wait {name}", errno: err)
+        }
+    }
+    return -1
+}
+
+// posix.signal, by a name the `signal:` parameter of Child.kill doesn't hide.
+func send_signal(anon pid: int64, anon sig: int64) -> none or Error {
+    try signal(pid, sig)
+}
+
+// A C `char **` of `strs`, ending in a 0, for as long as `strs` lives. Free it.
+func c_array(anon strs: [str]) -> int64 {
+    let out = unsafe.alloc(8 * (len(strs) + 1))
+    for i, s in strs {
+        unsafe.store64(out + 8 * i, unsafe.c_str(s))
+    }
+    return out
+}
+
 // Start `argv[0]` (found via PATH) without waiting for it. See docs/builtins.md.
 func start(anon argv: [str], stdin: Stdio = .Inherit, stdout: Stdio = .Inherit, stderr: Stdio = .Inherit, dir: str = "", env: [str]? = none) -> Child or Error {
     if len(argv) == 0 {
         throw ProcessError(message: "start: no program to run")
     }
-    let slots = [0, -1, -1, -1]
+    let modes = [stdin, stdout, stderr]
+    // Three pipes of two C ints, -1 until made, then the child's pid.
+    let block = unsafe.alloc(32)
+    for i in 0..6 {
+        unsafe.store32(block + 4 * i, -1)
+    }
+    let actions = unsafe.alloc(8)
+    let init_err = unsafe.c_int(posix_spawn_file_actions_init(actions))
+    mut r: int64 or Error = 0
+    if init_err != 0 {
+        r = .Err(error: os_error(f"start {argv[0]}", errno: init_err))
+    } else {
+        r = spawn_with(actions, block: block, argv: argv, modes: modes, dir: dir, env: env)
+        posix_spawn_file_actions_destroy(actions)
+    }
+    unsafe.free(actions)
+    // The child has its ends now; this process keeps the others if it started.
+    mut kept = [-1, -1, -1]
+    for fd in 0..3 {
+        let read_end = unsafe.load32(block + 8 * fd)
+        let write_end = unsafe.load32(block + 8 * fd + 4)
+        if read_end >= 0 {
+            mut theirs = write_end
+            mut mine = read_end
+            if fd == 0 {
+                theirs = read_end
+                mine = write_end
+            }
+            close(theirs)
+            if r is Err(_) {
+                close(mine)
+            } else {
+                kept[fd] = mine
+            }
+        }
+    }
+    unsafe.free(block)
+    let pid = try r
+    return Child(:pid, name: argv[0], stdin: Fd(fd: kept[0]), stdout: Fd(fd: kept[1]), stderr: Fd(fd: kept[2]))
+}
+
+// Fill `actions` for `modes`, making the pipes in `block`, and spawn: the pid.
+func spawn_with(anon actions: int64, block: int64, argv: [str], modes: [Stdio], dir: str, env: [str]?) -> int64 or Error {
+    let what = f"start {argv[0]}"
+    let null = "/dev/null"
+    for fd, mode in modes {
+        match mode {
+            .Inherit -> none
+            .Pipe -> {
+                let pair = block + 8 * fd
+                if unsafe.c_int(pipe(pair)) != 0 {
+                    throw os_error(what, errno: unsafe.errno())
+                }
+                let read_end = unsafe.load32(pair)
+                let write_end = unsafe.load32(pair + 4)
+                kod_fcntl(read_end, F_SETFD, FD_CLOEXEC)
+                kod_fcntl(write_end, F_SETFD, FD_CLOEXEC)
+                // A write to a child that has gone fails with EPIPE instead
+                // of raising SIGPIPE.
+                mut theirs = write_end
+                mut mine = read_end
+                if fd == 0 {
+                    theirs = read_end
+                    mine = write_end
+                }
+                kod_fcntl(mine, F_SETNOSIGPIPE, 1)
+                try spawn_check(posix_spawn_file_actions_adddup2(actions, theirs, fd), what: what)
+            }
+            .Null -> {
+                mut flags = O_WRONLY
+                if fd == 0 {
+                    flags = O_RDONLY
+                }
+                try spawn_check(posix_spawn_file_actions_addopen(actions, fd, unsafe.c_str(null), flags, 0), what: what)
+            }
+        }
+    }
+    if len(dir) > 0 {
+        try spawn_check(posix_spawn_file_actions_addchdir(actions, unsafe.c_str(dir)), what: what)
+    }
+    let c_argv = c_array(argv)
     let none_set: [str] = []
-    mut use_env = 1
-    if env is none {
-        use_env = 0
+    let env_list = env? or none_set
+    mut envp = unsafe.load64(_NSGetEnviron())
+    mut c_env = 0
+    if env is not none {
+        c_env = c_array(env_list)
+        envp = c_env
     }
-    let modes = stdin.code() + 3 * stdout.code() + 9 * stderr.code()
-    let err = kod_proc_start(argv, env? or none_set, use_env, dir, modes, slots)
+    let pid_slot = block + 24
+    let err = unsafe.c_int(posix_spawnp(pid_slot, unsafe.c_str(argv[0]), actions, 0, c_argv, envp))
+    unsafe.free(c_argv)
+    unsafe.free(c_env)
     if err != 0 {
-        throw os_error(f"start {argv[0]}", errno: err)
+        throw os_error(what, errno: err)
     }
-    return Child(pid: slots[0], name: argv[0], stdin: Fd(fd: slots[1]), stdout: Fd(fd: slots[2]), stderr: Fd(fd: slots[3]))
+    return unsafe.load32(pid_slot)
+}
+
+// A posix_spawn call's result: 0, or the errno it failed with.
+func spawn_check(anon result: int64, what: str) -> none or Error {
+    let err = unsafe.c_int(result)
+    if err != 0 {
+        throw os_error(what, errno: err)
+    }
 }
 
 // Run `argv[0]` (found via PATH) to the end, with `input` on its stdin, and
 // collect what it writes to stdout and stderr. See docs/builtins.md.
 func output(anon argv: [str], input: str = "", dir: str = "", env: [str]? = none) -> Output or Error {
     let child = try start(argv, stdin: .Pipe, stdout: .Pipe, stderr: .Pipe, :dir, :env)
-    let r = collect(child, input: kod_str_to_bytes(input))
+    let out = try gather(child, input: kod_str_to_bytes(input))
+    out.status = try child.wait()
+    return out
+}
+
+// What `child` writes to stdout and stderr while it is given `input`, until
+// both end; status is left at -1. On a failure the child is killed and
+// collected and its pipes closed.
+func gather(anon child: Child, input: bytes) -> Output or Error {
+    let r = collect(child, :input)
     if r is Err(e) {
         // Don't leave a child or its pipes behind.
         for f in [child.stdin, child.stdout, child.stderr] {
@@ -190,16 +344,20 @@ func output(anon argv: [str], input: str = "", dir: str = "", env: [str]? = none
     return r
 }
 
-// Write `input` and read stdout and stderr, whichever is ready, until both
-// end; then wait for the child.
+// Write `input` and read stdout and stderr, whichever is ready, until both end.
 func collect(anon child: Child, input: bytes) -> Output or Error {
     let out = StrBuilder()
     let err = StrBuilder()
     mut sent = 0
-    if len(input) == 0 {
+    if child.stdin.fd < 0 {
+        // Not a pipe: nothing to write or close.
+    } else if len(input) == 0 {
         try child.stdin.close()
-    } else if kod_fd_set_nonblocking(child.stdin.fd) != 0 {
-        throw os_error(f"start {child.name}", errno: kod_io_errno())
+    } else {
+        let flags = kod_fcntl(child.stdin.fd, F_GETFL, 0)
+        if flags < 0 or kod_fcntl(child.stdin.fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+            throw os_error(f"start {child.name}", errno: unsafe.errno())
+        }
     }
     for child.stdout.fd >= 0 or child.stderr.fd >= 0 {
         let ready = try poll(read: [child.stdout, child.stderr], write: [child.stdin])
@@ -227,8 +385,7 @@ func collect(anon child: Child, input: bytes) -> Output or Error {
     if child.stdin.fd >= 0 {
         try child.stdin.close()
     }
-    let status = try child.wait()
-    return Output(:status, stdout: out.to_str(), stderr: err.to_str())
+    return Output(status: -1, stdout: out.to_str(), stderr: err.to_str())
 }
 
 // One read from `f` into `into`; closes `f` at the end of the stream.
@@ -241,10 +398,27 @@ func take(anon f: Fd, into: StrBuilder) -> none or Error {
     }
 }
 
-// User-facing wrapper. Keep the public name stable across any future
-// ABI churn on the C side.
+// Run `argv[0]` (found via PATH) to the end and capture its stdout and
+// stderr. It can't fail: a program that can't be run, or that a signal
+// ends, has the status -1.
 func run(anon argv: [str]) -> ProcessResult {
-    return kod_run_process(argv)
+    let failed = ProcessResult(status: -1, stdout: "", stderr: "")
+    let started = start(argv, stdout: .Pipe, stderr: .Pipe)
+    if started is Err(_) {
+        return failed
+    }
+    let child = started
+    let none_given: bytes = kod_str_to_bytes("")
+    let got = gather(child, input: none_given)
+    if got is Err(_) {
+        return failed
+    }
+    let out = got
+    mut status = -1
+    if child.wait() is Ok(code) {
+        status = code
+    }
+    return ProcessResult(:status, stdout: out.stdout, stderr: out.stderr)
 }
 
 // Start `argv[0]` (found via PATH) without waiting for it, its stdin, stdout
@@ -252,14 +426,22 @@ func run(anon argv: [str]) -> ProcessResult {
 // started. End it with `kill`; until then, or until this process exits, it
 // is a child that has not been waited for.
 func spawn(anon argv: [str]) -> int64 {
-    return kod_spawn(argv)
+    let started = start(argv, stdin: .Null, stdout: .Null, stderr: .Null)
+    if started is Err(_) {
+        return -1
+    }
+    return started.pid
 }
 
 // Send SIGTERM to a child that `spawn` started and wait for it. Returns
 // whether the signal was delivered: false for a pid that is not a child of
 // this process, such as one already killed.
 func kill(anon pid: int64) -> bool {
-    return kod_kill(pid) != 0
+    if pid <= 0 or signal(pid, SIGTERM) is Err(_) {
+        return false
+    }
+    let _ = wait_status(pid, name: "", hang: true)
+    return true
 }
 
 // Replace the calling process with `argv[0]` (found via PATH), which has
@@ -267,5 +449,12 @@ func kill(anon pid: int64) -> bool {
 // Input already read from a piped stdin into the buffer is not handed on.
 // Returns -1, and only then, when `argv[0]` could not be run.
 func exec(anon argv: [str]) -> int64 {
-    return kod_exec(argv)
+    if len(argv) == 0 {
+        return -1
+    }
+    let c_argv = c_array(argv)
+    fflush(0)
+    execvp(unsafe.c_str(argv[0]), c_argv)
+    unsafe.free(c_argv)
+    return -1
 }
