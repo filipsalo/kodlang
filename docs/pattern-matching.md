@@ -252,6 +252,47 @@ names a type is that type's pattern, not a binding: on a field of type
 `` doesn't cover `str` ``. A let-else takes it too:
 `let str(s) = id else { return }`.
 
+### Struct patterns
+
+A type pattern with labels matches a struct field by field: each label names a
+field, and what follows it is the pattern that field must match, or the name to
+bind it to:
+
+```kod
+type Rect = struct {
+    w: int64
+    h: int64
+}
+
+match shape {
+    Rect(w: 0) -> print("flat")                 // tests a field
+    Rect(:w, :h) -> print_int(w * h)            // `:w` binds field `w` as `w`
+    Circle(radius: r) if r > 10 -> print("big") // binds field `radius` as `r`
+    Circle(c) -> print_int(c.radius)            // no label: the whole value
+}
+
+if node is Node(name: "root", parent: none) {
+    print("the root")
+}
+```
+
+- A struct pattern matches where a type pattern of its type would (on the
+  struct's own type, or a union, interface or optional that may hold it) and
+  then only when every field it names matches. The fields come in any order,
+  and the ones it doesn't name are ignored.
+- What follows a label is any pattern: a name to bind, `_`, a literal, `none`,
+  an enum variant with its payload, or another struct pattern, so
+  `Node(parent: Node(name: "root"))` tests the parent's name.
+- `:name` is short for `name: name`, as in a call. A field bound to a name
+  gives the field's value with the field's type; a
+  [weak field](structs.md#weak-fields) gives its `S?` as reading it would.
+- Every argument has a label: `Rect(r)` keeps its meaning, the whole value,
+  and `Rect(r, w: 0)` is an error.
+- Naming a field the struct doesn't have, or one twice, is an error.
+- A struct pattern with a field that can fail to match doesn't cover its type
+  for [exhaustiveness](#exhaustiveness), any more than an arm with a guard
+  does; one whose fields only bind names covers it.
+
 ### `is` test
 
 A lightweight check without destructuring:

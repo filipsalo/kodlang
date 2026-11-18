@@ -3533,7 +3533,7 @@ type Codegen = struct {
         for i, name in names {
             if i < arity {
                 for sub in self.p.pattern_subs[pattern_id] {
-                    if sub.binding == name {
+                    if sub.binding == name and len(sub.field) == 0 {
                         args[i] = sub.pattern
                     }
                 }
@@ -3677,6 +3677,20 @@ type Codegen = struct {
         }
         if subj_kind is .KStr {
             self.report_error("error: match on str must include an `else` arm", span: self.p.expr_spans[subject_id])
+        }
+        // A struct is covered by an arm that takes any value of it: its type
+        // pattern, with no field tested (arms that test one aren't here).
+        if subj_kind is .KStruct(_idx, _args) {
+            mut covered = false
+            for pid in pattern_ids {
+                if self.p.patterns[pid] is .ImplicitEnumPat(v, _b) and v.starts_with("$t") and self.type_key(self.union_pattern_kind(v)) == self.type_key(subj_kind) {
+                    covered = true
+                }
+            }
+            if not covered {
+                let shown = self.kind_display(subj_kind)
+                self.report_error(f"error: match on `{shown}` must include an `else` arm, or one that matches any `{shown}`", span: self.p.expr_spans[subject_id])
+            }
         }
     }
 
@@ -9052,14 +9066,92 @@ type Codegen = struct {
 
     // The type of the payload position a nested pattern tests.
     func sub_pattern_kind(self, anon pattern_id: int64, sub: ast.SubPattern, subject_kind: TypeKind) -> TypeKind {
-        let pattern = self.p.patterns[pattern_id]
+        mut pattern = self.p.patterns[pattern_id]
+        if len(sub.field) > 0 {
+            // A struct pattern's binding, as the pattern binds it on this
+            // subject: on an optional, the struct it holds.
+            pattern = self.subject_pattern(pattern, :subject_kind)
+        }
         let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
         for i, name in self.pattern_binding_names(pattern) {
             if name == sub.binding and i < len(kinds) {
+                if len(sub.field) > 0 {
+                    // A struct pattern's field: its type, if the value is a struct
+                    // that has it. On an optional, the pattern binds what it holds.
+                    mut holder = kinds[i]
+                    if holder is .KOptional(inner) {
+                        holder = inner
+                    }
+                    if holder is .KStruct(struct_idx, _args) and self.struct_has_field(sub.field, :struct_idx) {
+                        return self.find_field_kind(sub.field, :struct_idx)
+                    }
+                    return .KUnknown
+                }
                 return kinds[i]
             }
         }
         return .KUnknown
+    }
+
+    func struct_has_field(self, anon field_name: str, struct_idx: int64) -> bool {
+        for field in self.structs[struct_idx].fields {
+            if field.name == field_name {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Whether a pattern, or one nested in it, is a struct pattern with a field
+    // that can fail to match: such an arm doesn't cover its type.
+    func tests_a_field(self, anon pattern_id: int64) -> bool {
+        for sub in self.p.pattern_subs[pattern_id] {
+            if len(sub.field) > 0 and not (self.p.patterns[sub.pattern] is .BindPat(_b)) and not (self.p.patterns[sub.pattern] is .Wildcard) {
+                return true
+            }
+            if self.tests_a_field(sub.pattern) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // A struct pattern's fields, checked: each one the struct has, none twice.
+    func check_pattern_fields(self, anon pattern_id: int64, subject_kind: TypeKind, subject_id: int64) -> none {
+        let pattern = self.subject_pattern(self.p.patterns[pattern_id], :subject_kind)
+        let kinds = self.pattern_binding_kinds(pattern, :subject_kind)
+        mut seen: [str] = []
+        for sub in self.p.pattern_subs[pattern_id] {
+            if len(sub.field) == 0 {
+                continue
+            }
+            for i, name in self.pattern_binding_names(pattern) {
+                if name == sub.binding and i < len(kinds) {
+                    mut holder = kinds[i]
+                    if holder is .KOptional(inner) {
+                        holder = inner
+                    }
+                    if holder is .KStruct(struct_idx, _args) {
+                        if arrays.contains(seen, sub.field) {
+                            self.report_error(f"error: field `{sub.field}` is matched twice in one pattern", span: self.p.expr_spans[subject_id])
+                        } else if not self.struct_has_field(sub.field, :struct_idx) {
+                            self.report_error(self.with_suggestion(f"error: struct `{self.struct_display_name(struct_idx)}` has no field `{sub.field}`", typo: sub.field, candidates: self.field_names(struct_idx)), span: self.p.expr_spans[subject_id])
+                        }
+                        seen += [sub.field]
+                    } else if not self.kind_has_unknown(holder) {
+                        self.report_error(f"error: `{self.kind_display(holder)}` isn't a struct, so a pattern can't name its field `{sub.field}`", span: self.p.expr_spans[subject_id])
+                    }
+                }
+            }
+        }
+    }
+
+    func field_names(self, anon struct_idx: int64) -> [str] {
+        mut names: [str] = []
+        for field in self.structs[struct_idx].fields {
+            names += [field.name]
+        }
+        return names
     }
 
     // A first guess; compile time retypes them from the subject's final kind.
@@ -9110,11 +9202,62 @@ type Codegen = struct {
     }
 
     func emit_sub_patterns(self, anon pattern_id: int64, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
+        self.check_pattern_fields(pattern_id, :subject_kind, :subject_id)
         for sub in self.p.pattern_subs[pattern_id] {
             let kind = self.sub_pattern_kind(pattern_id, :sub, :subject_kind)
-            if not self.kind_has_unknown(kind) {
-                self.emit_pattern_test(sub.pattern, subject_kind: kind, subj_slot: self.find_var_offset(sub.binding), :subject_id, :skip_lbl)
+            if self.kind_has_unknown(kind) {
+                continue
             }
+            if len(sub.field) == 0 {
+                self.emit_pattern_test(sub.pattern, subject_kind: kind, subj_slot: self.find_var_offset(sub.binding), :subject_id, :skip_lbl)
+                continue
+            }
+            // A struct pattern's field: load it from the bound value, into the
+            // name it binds or a hidden slot the nested pattern tests.
+            mut struct_kind = self.find_var_kind(sub.binding)
+            if struct_kind is .KOptional(inner) {
+                struct_kind = inner
+            }
+            let .KStruct(struct_idx, _args) = struct_kind else {
+                self.report_error(f"error: compiler bug: the struct pattern's value for field `{sub.field}` isn't a struct", span: self.p.expr_spans[subject_id])
+                continue
+            }
+            let ptr = self.pool.alloc_reg()
+            self.emit_ldr(self.find_var_offset(sub.binding), reg: ptr)
+            let off = self.find_field_offset(sub.field, :struct_idx)
+            mut val = ""
+            if self.field_is_weak(sub.field, :struct_idx) {
+                self.emit(f"ldr x0, [{ptr}, #{off}]")
+                self.pool.free_reg(ptr)
+                self.emit("bl _kod_weak_get")
+                self.rc_temp("x0")
+                val = self.pool.alloc_reg()
+                self.emit(f"mov {val}, x0")
+            } else {
+                val = self.pool.alloc_reg()
+                self.emit(f"ldr {val}, [{ptr}, #{off}]")
+                self.pool.free_reg(ptr)
+            }
+            if self.p.patterns[sub.pattern] is .BindPat(name) {
+                self.update_var_kind(:name, :kind)
+                self.emit_str(self.find_var_offset(name), reg: val)
+                self.pool.free_reg(val)
+                continue
+            }
+            if self.p.patterns[sub.pattern] is .Wildcard {
+                self.pool.free_reg(val)
+                continue
+            }
+            let slot_name = f"{sub.binding}${sub.field}"
+            if not self.var_declared(slot_name) {
+                self.alloc_var(name: slot_name, :kind)
+            } else {
+                self.update_var_kind(name: slot_name, :kind)
+            }
+            let slot = self.find_var_offset(slot_name)
+            self.emit_str(slot, reg: val)
+            self.pool.free_reg(val)
+            self.emit_pattern_test(sub.pattern, subject_kind: kind, subj_slot: slot, :subject_id, :skip_lbl)
         }
     }
 
@@ -14593,7 +14736,7 @@ type Codegen = struct {
         for arm_id in arms {
             let arm = self.p.match_expr_arms[arm_id]
             expr_patterns += [arm.pattern]
-            if arm.guard == 0 {
+            if arm.guard == 0 and not self.tests_a_field(arm.pattern) {
                 unguarded += [arm.pattern]
             }
         }
@@ -18923,7 +19066,12 @@ type Codegen = struct {
                 saved += [FlatArm(id: pid, pattern: raw, subs: self.p.pattern_subs[pid])]
                 self.p.patterns[pid] = .BindPat(:binding)
                 for sub in self.p.pattern_subs[pid] {
-                    saved += self.flatten_pattern(sub.pattern, kind: written)
+                    // A struct pattern's field is tested as the field's type.
+                    mut sub_kind = written
+                    if len(sub.field) > 0 {
+                        sub_kind = self.sub_pattern_kind(pid, :sub, subject_kind: kind)
+                    }
+                    saved += self.flatten_pattern(sub.pattern, kind: sub_kind)
                 }
                 return saved
             }
@@ -19061,7 +19209,7 @@ type Codegen = struct {
         for arm_id in arms {
             let arm = self.p.match_arms[arm_id]
             stmt_patterns += [arm.pattern]
-            if arm.guard == 0 {
+            if arm.guard == 0 and not self.tests_a_field(arm.pattern) {
                 unguarded += [arm.pattern]
             }
         }

@@ -1045,6 +1045,44 @@ type Parser = struct {
 	}
 
 
+	// `Rect(w: 0, :h)`: the type pattern on `Rect` binding a hidden name, with
+	// a sub-pattern for each labelled field of the value it binds.
+	func struct_pattern(self, anon callee: int64, args: [ast.CallArg], expr_id: int64) -> int64 {
+		if self.exprs[callee] is .ImplicitVariant(_name) {
+			let start = self.expr_spans[callee].start
+			self.record_error("error: an enum payload binds by position, as in `.Branch(size)`; labels are for struct patterns", got: lexing.Token(kind: .Identifier, value: "", start: start, end: start + 1))
+			return -1
+		}
+		let whole = f"__patfields{expr_id}"
+		mut subs: [ast.SubPattern] = []
+		for arg in args {
+			if len(arg.label) == 0 {
+				self.record_error("error: a struct pattern labels every argument, as in `Rect(w: 0)`; without labels, `Rect(r)` binds the whole value", got: lexing.Token(kind: .Identifier, value: "", start: self.expr_spans[arg.value].start, end: self.expr_spans[arg.value].start + 1))
+				return -1
+			}
+			mut sub = -1
+			if self.exprs[arg.value] is .Ident(name) {
+				sub = self.field_binding(name, span: self.expr_spans[arg.value])
+			} else {
+				sub = self.pattern_of_expr(arg.value)
+			}
+			if sub < 0 {
+				return -1
+			}
+			subs += [ast.SubPattern(binding: whole, pattern: sub, field: arg.label)]
+		}
+		mut pat = -1
+		if self.exprs[callee] is .Ident(name) {
+			pat = self.named_pattern(name, binding: whole, span: self.expr_spans[callee])
+		} else {
+			pat = self.note_qualified(self.variant_pattern(callee, bindings: [whole]), :callee)
+		}
+		if pat >= 0 {
+			self.pattern_subs[pat] = subs
+		}
+		return pat
+	}
+
 	func pattern_of_expr(self, anon expr_id: int64) -> int64 {
 		let none_bindings: [str] = []
 		match self.exprs[expr_id] {
@@ -1063,12 +1101,14 @@ type Parser = struct {
 				return self.note_qualified(self.variant_pattern(expr_id, bindings: none_bindings), callee: expr_id)
 			}
 			.Call(callee, args) -> {
+				for arg in args {
+					if len(arg.label) > 0 {
+						return self.struct_pattern(callee, :args, :expr_id)
+					}
+				}
 				mut bindings: [str] = []
 				mut subs: [ast.SubPattern] = []
 				for arg in args {
-					if len(arg.label) > 0 {
-						return -1
-					}
 					if self.exprs[arg.value] is .Ident(binding) {
 						bindings += [binding]
 					} else {
@@ -1494,6 +1534,13 @@ type Parser = struct {
 			let span = self.here()
 			let name: str = self.expect_identifier()
 			let type_id = self.alloc_type(ast.TypeExpr.Named(:name), :span)
+			if self.labelled_payload_ahead() {
+				let whole = f"__patfields{span.start}"
+				let fields = self.parse_field_payload(whole)
+				let pat = self.type_pattern(type_id, binding: whole)
+				self.pattern_subs[pat] = fields
+				return pat
+			}
 			let item = self.parse_one_payload()
 			return self.with_subs(self.type_pattern(type_id, binding: item.binding), :item)
 		}
@@ -1513,6 +1560,15 @@ type Parser = struct {
 			variant_name = self.expect_identifier()
 			qualified_type = false
 		}
+		if qualified_type and self.labelled_payload_ahead() {
+			// `m.T(f: p)`: a struct pattern on a type of another module.
+			let whole = f"__patfields{second_span.start}"
+			let fields = self.parse_field_payload(whole)
+			let pat = self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, bindings: [whole]))
+			self.pattern_subs[pat] = fields
+			self.note_maybe_type(pat, slot: -1, type_id: self.alloc_type(ast.TypeExpr.Named(name: second), span: second_span, qual: first))
+			return pat
+		}
 		let items = self.parse_payload()
 		let bindings = payload_bindings(items)
 		let pat = self.with_all_subs(self.alloc_pattern(ast.Pattern.EnumPat(:enum_name, :variant_name, :bindings)), :items)
@@ -1521,6 +1577,61 @@ type Parser = struct {
 			self.note_maybe_type(pat, slot: -1, type_id: self.alloc_type(ast.TypeExpr.Named(name: second), span: second_span, qual: first))
 		}
 		return pat
+	}
+
+	// Whether a `(` with a labelled first argument comes next: a struct pattern's fields.
+	func labelled_payload_ahead(self) -> bool {
+		if not self.at(.OpenParen) {
+			return false
+		}
+		let k1 = self.peek_kind_at(1)
+		return k1 == .Colon or (k1 == .Identifier and self.peek_kind_at(2) == .Colon)
+	}
+
+	// A struct pattern's `(f: p, :g)`: a sub-pattern per field of the value
+	// bound as `whole`. `:g` binds field `g` as `g`; a name binds, `_` ignores.
+	func parse_field_payload(self, anon whole: str) -> [ast.SubPattern] {
+		mut fields: [ast.SubPattern] = []
+		self.expect(.OpenParen)
+		for self.peek_kind() != .CloseParen and self.peek_kind() != .EOF {
+			mut label = ""
+			mut sub = -1
+			if self.try_consume(.Colon) {
+				let span = self.here()
+				label = self.expect_identifier()
+				sub = self.field_binding(label, :span)
+			} else if self.at(.Identifier) and self.peek_kind_at(1) == .Colon {
+				label = self.expect_identifier()
+				self.advance()
+				if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot {
+					let span = self.here()
+					let name = self.expect_identifier()
+					sub = self.field_binding(name, :span)
+				} else {
+					sub = self.parse_pattern()
+				}
+			} else {
+				self.record_error("error: a struct pattern labels every argument, as in `Rect(w: 0)`; without labels, `Rect(r)` binds the whole value", got: self.peek())
+				self.skip_rest_of_stmt(depth: 1)
+				break
+			}
+			fields += [ast.SubPattern(binding: whole, pattern: sub, field: label)]
+			if not self.try_consume(.Comma) {
+				break
+			}
+		}
+		self.expect(.CloseParen)
+		return fields
+	}
+
+	// What a field bound to `name` in a struct pattern is: `_` ignores it.
+	func field_binding(self, anon name: str, span: ast.Span) -> int64 {
+		if name == "_" {
+			return self.alloc_pattern(ast.Pattern.Wildcard)
+		}
+		self.payload_starts += [span.start]
+		self.payload_names += [name]
+		return self.alloc_pattern(ast.Pattern.BindPat(binding: name))
 	}
 
 	// A payload position: a name, which binds, or a pattern (pattern >= 0) under a hidden name.
