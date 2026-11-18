@@ -1,8 +1,7 @@
 // Sampling profiler. `start(interval_us)` arms an ITIMER_PROF
 // timer; every `interval_us` of CPU time the kernel delivers
-// SIGPROF and the C runtime's handler walks the current fp chain
-// into a fixed-size buffer (see kod_prof_handler in
-// stdlib/runtime.c). `stop()` disarms the timer; `report()`
+// SIGPROF and `_on_sigprof`, below, walks the current fp chain
+// into a fixed-size buffer. `stop()` disarms the timer; `report()`
 // resolves the captured addresses to function names via
 // kod/inspect and prints a flat self-time summary.
 //
@@ -15,32 +14,131 @@
 
 import "kod/inspect"
 
-extern func _profiling_start(anon interval_us: int64) -> none
-extern func _profiling_stop() -> none
-extern func _profiling_n_samples() -> int64
-extern func _profiling_sample_depth(anon sample_idx: int64) -> int64
-extern func _profiling_sample_frame(anon sample_idx: int64, anon frame_idx: int64) -> int64
+import "libc"
+import "unsafe"
+
+// The deepest stack a sample keeps, and the most samples: 4096 samples of 32
+// addresses is 1 MiB, about 4 s at 1 ms sampling. Past that, ticks do nothing.
+let MAX_FRAMES: int64 = 32
+let MAX_SAMPLES: int64 = 4096
+
+// macOS values of the C constants, and offsets into its structs: a
+// ucontext_t's uc_mcontext pointer, and the fp and pc in what it points at.
+let SIGPROF: int64 = 27
+let SA_SIGINFO: int64 = 64
+let SA_RESTART: int64 = 2
+let ITIMER_PROF: int64 = 2
+let UC_MCONTEXT: int64 = 48
+let STATE_FP: int64 = 248
+let STATE_PC: int64 = 272
+
+// The samples: a count, then a depth per sample, then MAX_FRAMES addresses
+// per sample, every one 8 bytes. Allocated by the first `start` and kept.
+mut _buf: int64 = 0
+
+func _depths() -> int64 {
+    return _buf + 8
+}
+
+func _frames() -> int64 {
+    return _buf + 8 + 8 * MAX_SAMPLES
+}
+
+// The SIGPROF handler, which C calls in the middle of whatever the program
+// was doing: it may only load and store. It records the interrupted pc and
+// then the return addresses up the frame-pointer chain, as inspect's panic
+// walker does. `start` reads `_buf` before arming the timer, so its getter,
+// which works the value out on the first read, only loads by now.
+func _on_sigprof(anon sig: int64, anon info: int64, anon context: int64) -> none {
+    let count = unsafe.load64(_buf)
+    if count >= MAX_SAMPLES {
+        return none
+    }
+    let row = _frames() + 8 * MAX_FRAMES * count
+    let state = unsafe.load64(context + UC_MCONTEXT)
+    unsafe.store64(row, unsafe.load64(state + STATE_PC))
+    mut depth = 1
+    mut fp = unsafe.load64(state + STATE_FP)
+    for fp != 0 and depth < MAX_FRAMES {
+        let lr = unsafe.load64(fp + 8)
+        if lr == 0 {
+            break
+        }
+        unsafe.store64(row + 8 * depth, lr)
+        depth += 1
+        let next = unsafe.load64(fp)
+        if next == 0 or next <= fp {
+            break
+        }
+        fp = next
+    }
+    unsafe.store64(_depths() + 8 * count, depth)
+    unsafe.store64(_buf, count + 1)
+}
+
+// Arm (or, with 0, disarm) ITIMER_PROF: a struct itimerval is two struct
+// timevals of 8 bytes of seconds and an int of microseconds.
+func _set_timer(anon interval_us: int64) -> none {
+    let timer = unsafe.alloc(32)
+    for at in [0, 16] {
+        unsafe.store64(timer + at, interval_us / 1000000)
+        unsafe.store32(timer + at + 8, interval_us % 1000000)
+    }
+    libc.setitimer(ITIMER_PROF, timer, 0)
+    unsafe.free(timer)
+}
 
 // Arm SIGPROF at the given interval (in microseconds of CPU
 // time). 1 ms is a reasonable default for short benchmarks;
 // drop to 100 µs if you need finer resolution on a sub-second
 // workload. Resets the sample buffer.
 func start(interval_us: int64) -> none {
-    _profiling_start(interval_us)
+    if _buf == 0 {
+        _buf = unsafe.alloc(8 + 8 * MAX_SAMPLES + 8 * MAX_SAMPLES * MAX_FRAMES)
+    }
+    unsafe.store64(_buf, 0)
+    // A struct sigaction: the handler, an empty mask, the flags.
+    let action = unsafe.alloc(16)
+    unsafe.store64(action, unsafe.c_function(_on_sigprof))
+    unsafe.store32(action + 12, SA_SIGINFO | SA_RESTART)
+    libc.sigaction(SIGPROF, action, 0)
+    unsafe.free(action)
+    _set_timer(interval_us)
 }
 
 // Disarm the timer. Samples taken so far remain in the buffer
 // — call `report()` afterward (or pass them to `samples()` for
 // custom processing) without losing data.
 func stop() -> none {
-    _profiling_stop()
+    _set_timer(0)
+}
+
+// How many return addresses sample `sample` holds (frame 0 is where the
+// program was), or 0 for a sample there isn't.
+func depth(anon sample: int64) -> int64 {
+    if sample < 0 or sample >= n_samples() {
+        return 0
+    }
+    return unsafe.load64(_depths() + 8 * sample)
+}
+
+// Address `at` of sample `sample`: 0 is the interrupted instruction, then the
+// return addresses up the stack. 0 when there is no such address.
+func frame(anon sample: int64, at: int64) -> int64 {
+    if at < 0 or at >= depth(sample) {
+        return 0
+    }
+    return unsafe.load64(_frames() + 8 * (MAX_FRAMES * sample + at))
 }
 
 // Number of samples captured since the last `start()`. Caps at
 // the runtime buffer size (4096 today); subsequent ticks no-op
 // rather than overwrite.
 func n_samples() -> int64 {
-    return _profiling_n_samples()
+    if _buf == 0 {
+        return 0
+    }
+    return unsafe.load64(_buf)
 }
 
 // Print a self-time table: count + percentage per leaf function,
@@ -48,7 +146,7 @@ func n_samples() -> int64 {
 // (samples that landed in C runtime / libc / dyld) accumulate
 // under a single "<unresolved>" bucket so the totals add up.
 func report() -> none {
-    let total: int64 = _profiling_n_samples()
+    let total: int64 = n_samples()
     if total == 0 {
         print("profile: no samples captured")
         return none
@@ -56,7 +154,7 @@ func report() -> none {
     mut names: [str] = []
     mut counts: [int64] = []
     for i in 0..total {
-        let lr: int64 = _profiling_sample_frame(i, 0)
+        let lr: int64 = frame(i, at: 0)
         mut key: str = "<unresolved>"
         if inspect.resolve(addr: lr) is Some(frame) {
             key = f"{frame.name} ({frame.file}:{frame.line})"
