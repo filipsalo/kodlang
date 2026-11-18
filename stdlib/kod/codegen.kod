@@ -1162,6 +1162,8 @@ type Codegen = struct {
     // to iface and was observed in an upcast". One vtable per unique pair.
     prim_vtable_kinds: [TypeKind] = []
     prim_vtable_iface_idx: [int64] = []
+    // The provided methods a conversion here refers to (see emit_iface_convert).
+    conv_bodies: [str] = []
 
     // Type-alias maps: `type X = Y` adds an entry pointing X's name to
     // Y's struct/enum index. find_struct_idx / find_enum_idx consult
@@ -4903,9 +4905,36 @@ type Codegen = struct {
         self.println("	ret")
     }
 
+    // The entry a converted vtable has for a provided method the value's type
+    // doesn't declare. The converted vtable is built at run time, so no thunk
+    // knows it: dispatch passes the cell in x17, and it is `self` as it is.
+    // Each module that refers to one emits a copy.
+    func provided_conv_label(self, anon iface_idx: int64, name: str) -> str {
+        let body = self.provided_label(iface_idx, :name)
+        mut seen = false
+        for b in self.conv_bodies {
+            if b == body {
+                seen = true
+            }
+        }
+        if not seen {
+            self.conv_bodies += [body]
+        }
+        return body + "$conv"
+    }
+
     // The thunks for every vtable this module emits, for the provided methods
     // its type doesn't declare.
     func emit_provided_thunks(self) -> none {
+        for body in self.conv_bodies {
+            self.println("	.p2align 2")
+            self.println(f"	.globl {body}$conv")
+            self.println(f"	.private_extern {body}$conv")
+            self.println(f"	.weak_definition {body}$conv")
+            self.println(f"{body}$conv:")
+            self.println("	mov x0, x17")
+            self.println(f"	b {body}")
+        }
         for i, owner in self.vtable_types {
             let iface_idx = self.vtable_iface_idx[i]
             for m in self.interfaces[iface_idx].methods {
@@ -13252,12 +13281,18 @@ type Codegen = struct {
         // Stash self (data_ptr) and each compiled arg, plus the method ptr,
         // so arg compilation doesn't clobber x0..x7. Layout in the spill
         // area: [data_ptr, arg0, arg1, ..., method_ptr].
+        // A provided method also gets the cell, in x17, after the method ptr:
+        // the entry a conversion makes for it needs the converted vtable.
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        let pass_cell = self.is_provided(self.interfaces[iface_idx].methods[method_idx])
         mut n = len(args) + 1
         if len(sig_params) > n {
             n = len(sig_params)
         }
         mut padded = (n + 1) * 8
+        if pass_cell {
+            padded += 8
+        }
         if padded % 16 != 0 {
             padded = padded + 8
         }
@@ -13276,6 +13311,9 @@ type Codegen = struct {
         self.emit(f"ldr {tmp_r}, [{cell_r}, #8]")
         self.emit(f"ldr {tmp_r}, [{tmp_r}, #{method_idx * 8}]")
         self.emit(f"str {tmp_r}, [sp, #{n * 8}]")
+        if pass_cell {
+            self.emit(f"str {cell_r}, [sp, #{(n + 1) * 8}]")
+        }
         self.pool.free_reg(tmp_r)
         self.pool.free_reg(cell_r)
         mut i = 0
@@ -13309,6 +13347,9 @@ type Codegen = struct {
             k = k + 1
         }
         self.emit(f"ldr x9, [sp, #{n * 8}]")
+        if pass_cell {
+            self.emit(f"ldr x17, [sp, #{(n + 1) * 8}]")
+        }
         self.emit(f"add sp, sp, #{padded}")
         self.emit("blr x9")
         return .VReg(name: "x0")
@@ -13609,14 +13650,23 @@ type Codegen = struct {
         }
     }
 
-    // Whether interface `have` declares every method of `want`, with the same types.
+    // Whether interface `have` declares every method of `want` that has no
+    // body, with the same types. A method `have` provides can't stand in for
+    // one `want` requires: its entry may need `have`'s own vtable.
     func iface_covers(self, anon have: int64, anon want: int64) -> bool {
         for m in self.interfaces[want].methods {
             let at = self.iface_method_pos(have, name: m.name)
             if at < 0 {
+                if self.is_provided(m) {
+                    continue
+                }
                 return false
             }
-            if not self.same_kind(self.method_kind(m.sig), self.method_kind(self.interfaces[have].methods[at].sig)) {
+            let hm = self.interfaces[have].methods[at]
+            if not self.same_kind(self.method_kind(m.sig), self.method_kind(hm.sig)) {
+                return false
+            }
+            if self.is_provided(hm) and not self.is_provided(m) {
                 return false
             }
         }
@@ -13652,10 +13702,26 @@ type Codegen = struct {
         self.rc_retain(tmp)
         self.emit(f"str {tmp}, [x0]")
         self.emit(f"ldr {old_vt}, [{cell_r}, #8]")
+        // A provided method the old vtable lacks, or has as the old
+        // interface's own body, gets the new interface's body.
         mut j = 0
         for m in want {
             let at = self.iface_method_pos(from_idx, name: m.name)
-            self.emit(f"ldr {tmp}, [{old_vt}, #{8 * at}]")
+            if at < 0 {
+                self.emit_label_addr(tmp, label: self.provided_conv_label(to_idx, name: m.name))
+            } else {
+                self.emit(f"ldr {tmp}, [{old_vt}, #{8 * at}]")
+                if self.is_provided(self.interfaces[from_idx].methods[at]) {
+                    let keep_lbl = self.fresh("Lconv_keep")
+                    let old_body = self.pool.alloc_reg()
+                    self.emit_label_addr(old_body, label: self.provided_conv_label(from_idx, name: m.name))
+                    self.emit(f"cmp {tmp}, {old_body}")
+                    self.pool.free_reg(old_body)
+                    self.emit(f"bne {keep_lbl}")
+                    self.emit_label_addr(tmp, label: self.provided_conv_label(to_idx, name: m.name))
+                    self.emit_label(keep_lbl)
+                }
+            }
             self.emit(f"str {tmp}, [x0, #{vt_off + 8 * j}]")
             j += 1
         }
@@ -13669,6 +13735,12 @@ type Codegen = struct {
         let out_r = self.pool.alloc_reg()
         self.emit(f"mov {out_r}, x0")
         return out_r
+    }
+
+    // Leave the address of `label` in `reg`.
+    func emit_label_addr(self, anon reg: str, label: str) -> none {
+        self.emit(f"adrp {reg}, {label}@PAGE")
+        self.emit(f"add {reg}, {reg}, {label}@PAGEOFF")
     }
 
     // The identity word that ends every vtable of a struct: the same for all of its interfaces.
@@ -18787,7 +18859,7 @@ type Codegen = struct {
                         for method_id in methods {
                             let fd = self.p.func_decls[method_id]
                             if fd.provided and len(fd.params) > 0 and fd.params[0].name == "self" {
-                                self.compile_func(fd_id: method_id, struct_name: name, override_lbl: self.provided_label(iface_owner, name: self.p.func_decls[method_id].name), :iface_owner)
+                                self.compile_func(fd_id: method_id, struct_name: name, override_lbl: self.provided_label(iface_owner, name: fd.name), :iface_owner)
                             }
                         }
                     }

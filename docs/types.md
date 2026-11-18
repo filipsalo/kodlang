@@ -613,6 +613,15 @@ if r is File(f) {              // still the File
 }
 ```
 
+The second interface's provided methods don't have to be in the first: a
+value converted to it gets the ones the first lacks, as written in the second
+interface, even when its type declares a method of the same name, which only
+the first interface's table could have carried. A method the first interface
+has keeps what that table holds, except that a provided body the value got
+from an earlier conversion becomes the second interface's. A method the first
+interface provides can't stand in for one the second requires: that converts
+nothing, and is the usual ``expected `B`, got `A` `` error.
+
 Converting builds the new interface's method table when it runs, so it costs a
 small allocation. Arrays and optionals of interface values don't convert
 element by element: a `[ReadCloser]` is not a `[Reader]`.
