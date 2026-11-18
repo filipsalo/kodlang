@@ -333,25 +333,6 @@ int64_t kod_io_errno(void) { return g_io_errno; }
 
 void kod_io_set_errno(int64_t err) { g_io_errno = err; }
 
-// mode: 0 read, 1 create or truncate for writing, 2 create or append.
-int64_t kod_fd_open(KodStr *path, int64_t mode) {
-    int flags = O_RDONLY;
-    if (mode == 1) flags = O_WRONLY | O_CREAT | O_TRUNC;
-    if (mode == 2) flags = O_WRONLY | O_CREAT | O_APPEND;
-    int fd;
-    do {
-        fd = open(path->buf, flags | O_CLOEXEC, 0644);
-    } while (fd < 0 && errno == EINTR);
-    g_io_errno = fd < 0 ? errno : 0;
-    return fd;
-}
-
-// fcntl with a third argument, for Kod: fcntl is variadic, which an extern
-// can't call. The result, or -1 with errno set.
-int64_t kod_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
-    return fcntl((int)fd, (int)cmd, (int)arg);
-}
-
 // Append rhs to lhs, mutating lhs in place when its `cap` is large enough
 // and reallocating with exponential growth otherwise. Returns lhs.
 //
