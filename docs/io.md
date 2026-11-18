@@ -10,11 +10,11 @@ files, standard input and output and, later, sockets. Code that reads or
 writes takes a `Reader` or a `Writer` and doesn't care what is behind it.
 
 ```kod
-import "stream" { Reader, read_all }
+import "stream" { Reader }
 import "posix" { open_read }
 
 func count_bytes(anon r: Reader) -> int64 or Error {
-    let data = try read_all(r)
+    let data = try r.read_all()
     return len(data)
 }
 
@@ -85,10 +85,16 @@ runtime, so `EINTR` never reaches a caller.
 ```kod
 interface Reader {
     func read(self, anon max: int64) -> bytes or Error
+
+    func read_all(self) -> bytes or Error { ... }
+    func read_exact(self, anon n: int64) -> bytes or Error { ... }
 }
 
 interface Writer {
     func write(self, anon data: bytes) -> int64 or Error
+
+    func write_all(self, anon data: bytes) -> none or Error { ... }
+    func write_str(self, anon text: str) -> none or Error { ... }
 }
 ```
 
@@ -98,12 +104,17 @@ return, and returns an empty `bytes` at the end of the stream. With
 way to test for the end. `write` returns how many bytes it accepted, which
 may be fewer than `len(data)`; an empty `data` writes nothing and returns 0.
 
-| Function | Meaning |
-|----------|---------|
-| `read_all(r)` | read until the end of the stream; `bytes or Error` |
-| `read_exact(r, n)` | exactly `n` bytes, or an `UnexpectedEof` error; `bytes or Error` |
-| `write_all(w, data)` | write every byte, repeating `write` as needed; a `write` that accepts 0 bytes of a non-empty `data` is an `Other` error (`write returned 0`); `none or Error` |
-| `write_str(w, s)` | `write_all` of a `str` |
+A type only has to declare `read` or `write`; the rest are
+[provided methods](types.md#provided-methods) built on them, so every
+`Reader` and `Writer` has them, called on the value itself or through the
+interface:
+
+| Method | Meaning |
+|--------|---------|
+| `r.read_all()` | read until the end of the stream; `bytes or Error` |
+| `r.read_exact(n)` | exactly `n` bytes, or an `UnexpectedEof` error; `bytes or Error` |
+| `w.write_all(data)` | write every byte, repeating `write` as needed; a `write` that accepts 0 bytes of a non-empty `data` is an `Other` error (`write returned 0`); `none or Error` |
+| `w.write_str(s)` | `write_all` of a `str` |
 
 ## In-memory streams
 
@@ -126,7 +137,7 @@ let body = try br.read_exact(length)     // takes what is buffered first
 | Method | Meaning |
 |--------|---------|
 | `read(max)` | a `Reader`: the buffered bytes first, else one read of the inner stream |
-| `read_exact(n)` | exactly `n` bytes, or `UnexpectedEof` |
+| `read_exact(n)` | the `Reader`'s, so exactly `n` bytes, or `UnexpectedEof` |
 | `read_until(delim)` | the bytes up to and excluding the byte `delim`, which is consumed; `bytes?`, none at the end of the stream; the last piece comes back even without a delimiter |
 | `read_line()` | `read_until(10)` as a `str`, minus a trailing `\r` (`str?`) |
 
@@ -187,19 +198,20 @@ string or `-1` on failure, with no reason.
 ## TCP
 
 `stdlib/net/tcp.kod` opens TCP connections. A connection is an `Fd`, so it is
-a `Reader` and a `Writer` and works with `BufReader`, `read_all` and the rest.
+a `Reader` and a `Writer`: it works with `BufReader` and has `read_all`,
+`write_str` and the rest.
 A program that imports it compiles and links `stdlib/net/tcp.c`; no other
 program does.
 
 ```kod
 import "net/tcp" { connect, set_timeout }
 import "time" { Duration }
-import "stream" { BufReader, write_str }
+import "stream" { BufReader }
 
 func fetch_status_line(host: str) -> str or Error {
     let conn = try connect(host, port: 80)
     try set_timeout(conn, timeout: Duration(seconds: 5))
-    try write_str(conn, "HEAD / HTTP/1.0\r\n\r\n")
+    try conn.write_str("HEAD / HTTP/1.0\r\n\r\n")
     let br = BufReader(inner: conn)
     let line = try br.read_line()
     try conn.close()
@@ -233,11 +245,11 @@ links `-framework Security -framework CoreFoundation`; no other program does.
 
 ```kod
 import "net/tls" { connect }
-import "stream" { BufReader, write_str }
+import "stream" { BufReader }
 
 func main() -> int64 or Error {
     let conn = try connect("example.com", port: 443)
-    try write_str(conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+    try conn.write_str("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
     let br = BufReader(inner: conn)
     print((try br.read_line())? or "")
     try conn.close()

@@ -226,13 +226,12 @@ waiting for it, and returns a `process.Child` or an `Error`:
 
 ```kod
 import "process"
-import "stream" { read_all, write_str }
 
 func shout(anon text: str) -> str or Error {
     let child = try process.start(["tr", "a-z", "A-Z"], stdin: .Pipe, stdout: .Pipe)
-    try write_str(child.stdin, text)
+    try child.stdin.write_str(text)
     try child.stdin.close()                 // the child sees the end of its input
-    let out = try read_all(child.stdout)
+    let out = try child.stdout.read_all()
     try child.stdout.close()
     let status = try child.wait()           // the exit code
     if status != 0 {
