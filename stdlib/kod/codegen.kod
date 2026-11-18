@@ -1158,6 +1158,15 @@ type Codegen = struct {
     in_captures: [str] = []
     // By module path, 1 if the module has module-level variables (see has_module_vars).
     var_modules: FuncIdx = FuncIdx()
+    // Range loops (parsing.for_range) whose stop is `len(xs)` of a local
+    // that can't be reassigned: the hidden stop's name, and `xs`. And the
+    // hidden counters that start at a literal of at least 0.
+    range_stop_names: [str] = []
+    range_stop_arrays: [str] = []
+    range_counters: [str] = []
+    // In such a loop's body, its index and array: `xs[i]` is in range.
+    safe_index_names: [str] = []
+    safe_array_names: [str] = []
     // Only `p` and `path_prefix` are required at construction; every
     // other field starts empty/zero via its default, so `make_codegen`
     // is just `Codegen(:p, :path_prefix)`.
@@ -2396,7 +2405,9 @@ type Codegen = struct {
         let saved_ctx = self.enter(sig.src_p, names: [], args: [])
         let saved_owner = self.cur_owner
         self.cur_owner = owner
+        let saved_safe = self.take_safe_indexes()
         mut val = self.compile_expr(value)
+        self.give_safe_indexes(saved_safe)
         self.cur_owner = saved_owner
         self.leave(saved_ctx)
         self.vars = self.vars[0..mark]
@@ -2560,7 +2571,9 @@ type Codegen = struct {
         for stmt_id in fd.body {
             self.collect_stmt_vars(:stmt_id)
         }
+        let saved_safe = self.take_safe_indexes()
         self.compile_block(fd.body)
+        self.give_safe_indexes(saved_safe)
         self.emit_label(end_lbl)
         self.inline_depth -= 1
         self.return_kind = saved_return_kind
@@ -10247,10 +10260,12 @@ type Codegen = struct {
         }
         mut result = self.pool.alloc_reg()
         if array_like {
-            let len_r = self.pool.alloc_reg()
-            self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
-            self.emit_index_check(idx_r, len: len_r)
-            self.pool.free_reg(len_r)
+            if not self.is_safe_index(lhs, index_id: rhs) {
+                let len_r = self.pool.alloc_reg()
+                self.emit(f"ldr {len_r}, [{ptr_r}, #8]")
+                self.emit_index_check(idx_r, len: len_r)
+                self.pool.free_reg(len_r)
+            }
 
             let hdr = self.pool.alloc_reg()
             self.emit(f"ldr {hdr}, [{ptr_r}]")
@@ -14920,6 +14935,101 @@ type Codegen = struct {
     }
 
 
+    // A range loop's hidden `let`s (see parsing.for_range): a stop of
+    // `len(xs)`, with `xs` a local nothing can reassign, and a counter that
+    // starts at a literal of at least 0.
+    func note_range_bound(self, anon name: str, value: int64) -> none {
+        if name.starts_with("__for_stop_") {
+            if self.p.exprs[value] is .Call(callee, args) and self.p.exprs[callee] is .Ident(fn_name) and fn_name == "len" and len(args) == 1 and len(args[0].label) == 0 {
+                if self.p.exprs[args[0].value] is .Ident(array) and self.var_index(array) >= 0 and not self.find_var_declared_mut(array) {
+                    self.range_stop_names += [name]
+                    self.range_stop_arrays += [array]
+                }
+            }
+        } else if name.starts_with("__for_next_") {
+            if self.p.exprs[value] is .IntLit(start) and start >= 0 {
+                self.range_counters += [name]
+            }
+        }
+    }
+
+    // When `cond` and `body` are a range loop from 0 or more up to `len(xs)`,
+    // its index is in range for `xs` throughout the body: arrays only grow.
+    // Records the pair and says so.
+    func push_safe_index(self, anon cond: int64, body: [int64]) -> bool {
+        let .Binary(lhs, op, rhs) = self.p.exprs[cond] else { return false }
+        if not (op is .Lt) or len(body) == 0 {
+            return false
+        }
+        let .Ident(counter) = self.p.exprs[lhs] else { return false }
+        let .Ident(stop) = self.p.exprs[rhs] else { return false }
+        if not arrays.contains(self.range_counters, counter) {
+            return false
+        }
+        mut array = ""
+        for i, name in self.range_stop_names {
+            if name == stop {
+                array = self.range_stop_arrays[i]
+            }
+        }
+        if len(array) == 0 {
+            return false
+        }
+        let .Let(index, _typ, value, mutable) = self.p.stmts[body[0]] else { return false }
+        let .Ident(from) = self.p.exprs[value] else { return false }
+        if mutable or from != counter {
+            return false
+        }
+        // A binding of the same name later in the same block takes the name
+        // over without a rename (a nested block's would be renamed).
+        for stmt_id in body[1..len(body)] {
+            match self.p.stmts[stmt_id] {
+                .Let(name, _t, _v, _m) -> {
+                    if name == index {
+                        return false
+                    }
+                }
+                .LetElse(pattern, _v, _e) -> {
+                    if arrays.contains(self.pattern_binding_names(self.p.patterns[pattern]), index) {
+                        return false
+                    }
+                }
+                else none
+            }
+        }
+        self.safe_index_names += [index]
+        self.safe_array_names += [array]
+        return true
+    }
+
+    // The loops' index pairs, cleared for a body compiled in place of a call:
+    // its names are its own. give_safe_indexes puts them back.
+    func take_safe_indexes(self) -> [[str]] {
+        let saved = [self.safe_index_names, self.safe_array_names]
+        self.safe_index_names = []
+        self.safe_array_names = []
+        return saved
+    }
+
+    func give_safe_indexes(self, anon saved: [[str]]) -> none {
+        self.safe_index_names = saved[0]
+        self.safe_array_names = saved[1]
+    }
+
+    // Whether `array[index]` is a range loop's own, in range by construction.
+    func is_safe_index(self, anon array_id: int64, index_id: int64) -> bool {
+        let .Ident(array) = self.p.exprs[array_id] else { return false }
+        let .Ident(index) = self.p.exprs[index_id] else { return false }
+        mut k = len(self.safe_index_names) - 1
+        for k >= 0 {
+            if self.safe_index_names[k] == index {
+                return self.safe_array_names[k] == array
+            }
+            k -= 1
+        }
+        return false
+    }
+
     func compile_stmt(self, anon stmt_id: int64) -> none {
         if len(self.pool.free_regs) >= EVICT_BELOW {
             self.compile_stmt_now(stmt_id)
@@ -14963,6 +15073,7 @@ type Codegen = struct {
                     self.check_type_expr(typ)
                     self.compile_discard(value)
                 } else {
+                    self.note_range_bound(name, :value)
                     self.compile_let(:name, :typ, :value, :mutable)
                     self.bind_var(name)
                 }
@@ -14972,7 +15083,14 @@ type Codegen = struct {
             .MinusAssign(lhs, rhs) -> self.compile_minus_assign(lhs_id: lhs, rhs_id: rhs)
             .Return(value) -> self.compile_return(value)
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
-            .For(cond, body) -> self.compile_for(body, cond_id: cond)
+            .For(cond, body) -> {
+                let safe = self.push_safe_index(cond, :body)
+                self.compile_for(body, cond_id: cond)
+                if safe {
+                    self.safe_index_names = self.safe_index_names[0..len(self.safe_index_names) - 1]
+                    self.safe_array_names = self.safe_array_names[0..len(self.safe_array_names) - 1]
+                }
+            }
             .ForEach(name, iter, body) -> {
                 let share = self.share_begin(iter)
                 self.compile_foreach(body, :name, iter_id: iter)
@@ -16646,8 +16764,11 @@ type Codegen = struct {
                     self.pool.free_reg(arr_ptr_r)
                 }
                 // Without the check a `buf[oob_idx] = ...` would write
-                // into whatever memory followed the array's buf.
-                self.emit_index_check(reloaded_idx_r, len: len_r)
+                // into whatever memory followed the array's buf. A range
+                // loop's own index needs none.
+                if not self.is_safe_index(lhs, index_id: rhs) {
+                    self.emit_index_check(reloaded_idx_r, len: len_r)
+                }
                 self.pool.free_reg(len_r)
                 self.emit(f"lsl {reloaded_idx_r}, {reloaded_idx_r}, #3")
                 if self.rc_heap_kind(lhs_kind.array_elem()) {
@@ -18766,6 +18887,9 @@ type Codegen = struct {
     }
 
     func compile_func(self, fd_id: int64, struct_name: str, override_lbl: str, owner: int64 = -1, enum_owner: int64 = -1, iface_owner: int64 = -1) -> none {
+        // A loop's index pairs belong to the function it is in.
+        self.safe_index_names = []
+        self.safe_array_names = []
         let func_decl = self.p.func_decls[fd_id]
         self.in_func_literal = self.is_lambda_name(func_decl.name)
         self.in_const_body = func_decl.is_const and not func_decl.is_var

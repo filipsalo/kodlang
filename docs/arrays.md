@@ -30,8 +30,13 @@ let third: int64 = nums[2]
 ```
 
 Negative indices wrap around: `arr[-1]` is equivalent to `arr[len(arr) - 1]`.
-An index must be an `int64`: `nums["a"]`, `nums[true]` and an `int64?`
-index such as `nums[m.get(k)]` are errors.
+An index out of range either way panics. An index must be an `int64`:
+`nums["a"]`, `nums[true]` and an `int64?` index such as `nums[m.get(k)]` are
+errors.
+
+An array never shrinks, so in `for i in 0..len(xs)` (from any literal of 0 or
+more) `xs[i]` is always in range, and the compiler leaves out the check when
+`xs` is a `let` or a parameter, which nothing can point at another array.
 
 Arrays nest: an element of a `[[int64]]` is an `[int64]`, so `grid[i][j]`
 and `for row in grid { for x in row { ... } }` work, and an element of a
