@@ -131,6 +131,7 @@ print(len(m).to_str())   // 2
 | `remove(k) -> V?` | Take `k` out of the map, giving the value it had, or `none` when it wasn't there. |
 | `keys() -> [K]` / `values() -> [V]` | The keys, or the values, in the order the keys were first set, as a new array. |
 | `len(m)` | How many keys the map holds. |
+| `f"{m}"`, `str(m)`, `print(m)` | The entries in order as text, `{a: 1, b: 2}`, each key and value as an f-string shows it; `{}` when empty. The key and value types must have a text of their own. |
 
 The entries keep the order their keys were first set in: setting a key again
 changes its value but not its place, and a key that is removed and set again goes
@@ -159,7 +160,8 @@ a generic type's method names the instance whose `T` is the bad key
 method, such as a `Map[Pt, int64]` written out in `Box[Pt]`, ends with the
 instance it's compiled for, as other errors there do
 (`` (in `Box[Pt]`) ``). The same holds for the element type of a
-`Set[T]` from the `sets` module.
+`Set[T]` from the `sets` module, which shows as its elements in braces,
+`{a, b}`, in the order they were first added.
 
 ## Indexing a struct
 
