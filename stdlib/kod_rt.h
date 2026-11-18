@@ -35,8 +35,6 @@ void *rc_alloc_raw(int64_t size, int64_t mask);
 void rc_retain_c(void *p);
 void rc_release_c(void *p);
 
-// Records the OS error number that stdlib/posix.kod reports for a failed call.
-void kod_io_set_errno(int64_t err);
 
 // Prints `panic: ` and the message to stderr, with a backtrace, and exits 1.
 __attribute__((noreturn)) void kod_panic(KodStr *msg);

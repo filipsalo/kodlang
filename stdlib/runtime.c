@@ -300,15 +300,6 @@ KodStr *kod_unsafe_copy_out(int64_t addr, int64_t n) {
     return kod_str_from_bytes((const char *)addr, n < 0 ? 0 : n);
 }
 
-// File descriptor I/O for stdlib/posix.kod. The calls return their result and
-// leave the reason for a failure in `kod_io_errno()` (0 after a success),
-// which Kod reads straight after. Interrupted calls are retried here.
-static int64_t g_io_errno;
-
-int64_t kod_io_errno(void) { return g_io_errno; }
-
-void kod_io_set_errno(int64_t err) { g_io_errno = err; }
-
 // Append rhs to lhs, mutating lhs in place when its `cap` is large enough
 // and reallocating with exponential growth otherwise. Returns lhs.
 //

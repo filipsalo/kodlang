@@ -268,8 +268,10 @@ doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
 
 `stdlib/net/tls.kod` runs TLS over a TCP connection, using the system's
 SecureTransport (the Security framework), so it needs nothing installed and
-checks certificates against the macOS keychain. A program that imports it
-links `-framework Security -framework CoreFoundation`; no other program does.
+checks certificates against the macOS keychain. It is Kod throughout, calling
+the framework through [`unsafe`](unsafe.md), its I/O callbacks included. A
+program that imports it links `-framework Security -framework CoreFoundation`;
+no other program does.
 
 ```kod
 import "net/tls" { connect }
