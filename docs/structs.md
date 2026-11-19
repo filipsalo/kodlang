@@ -398,10 +398,28 @@ if total > Money(cents: 500) { ... }
 numbers. The operators keep their usual precedence, and the operands are
 evaluated left to right whichever one the method belongs to.
 
-A struct is the right operand when the left is an `int64`: `3 * price` calls
-`op_rmul` on `price` with `3` as its argument. The reflected methods are
-`op_radd`, `op_rsub`, `op_rmul`, `op_rdiv` and `op_rmod`; each is tried only
-when the left operand isn't a struct, and there is no reflected comparison.
+When the left operand has no method for the operator, the right operand's
+reflected method is called instead, with the left operand as its argument:
+`3 * price` calls `op_rmul` on `price` with `3`. The left operand can be of
+any type, such as an `int64`, a `float64` or a struct without `op_mul`:
+
+```kod
+type Vec = struct {
+    x: float64
+    y: float64
+
+    func op_rmul(self, k: float64) -> Vec {
+        return Vec(x: self.x * k, y: self.y * k)
+    }
+}
+
+let v = 2.0 * Vec(x: 1.0, y: 2.0)     // Vec(x: 2.0, y: 4.0)
+```
+
+The reflected methods are `op_radd`, `op_rsub`, `op_rmul`, `op_rdiv` and
+`op_rmod`. The left operand's own method, when it has one, always wins, even
+if it doesn't take the right operand's type; and there is no reflected
+comparison.
 
 A method that implements an operator takes `self` and one more parameter, and
 the comparison methods return `bool`; otherwise it is an error where the
