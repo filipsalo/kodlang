@@ -677,6 +677,42 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
 let PROMOTE_MAX_INSNS: int64 = 6000
 
 // The prologue's and epilogue's own uses of fp, which don't touch a slot.
+// A frame bigger than this has slots past -256, which `[fp, #off]` can't reach:
+// x28 then holds the frame's bottom and those slots are `[x28, #k]`.
+let FRAME_BASE_MIN: int64 = 256
+
+// A load or store of the slot at `offset` from fp, through x28 (the frame's bottom,
+// `frame` bytes below fp), or past the reach of `[x28, #k]` through x16.
+func frame_base_slot(store: bool, reg: str, offset: int64, frame: int64) -> [regalloc.Insn] {
+    let width = regalloc.reg_width(reg)
+    let k = frame + offset
+    if k >= 0 and k <= 4095 * width and k % width == 0 {
+        return [.Mem(load: not store, :width, :reg, base: "x28", at: .Offset(off: k))]
+    }
+    mut insns: [regalloc.Insn] = []
+    if 0 - offset <= 65535 {
+        insns += [regalloc.op(.Move, a: "x16", b: f"#{0 - offset}")]
+    } else {
+        insns += [.LoadConst(dst: "x16", value: 0 - offset)]
+    }
+    insns += [regalloc.op(.Sub, a: "x16", b: "fp", c: "x16")]
+    insns += [.Mem(load: not store, :width, :reg, base: "x16", at: .Base)]
+    return insns
+}
+
+// `body` with each slot past -256 addressed through x28 (see `frame_base_slot`).
+func frame_base_slots(anon body: [regalloc.Insn], frame: int64) -> [regalloc.Insn] {
+    mut out: [regalloc.Insn] = []
+    for insn in body {
+        if insn is .Slot(store, reg, off) and off < -256 {
+            out += frame_base_slot(:store, :reg, offset: off, :frame)
+        } else {
+            out += [insn]
+        }
+    }
+    return out
+}
+
 func is_frame_link(anon text: str) -> bool {
     return text == "\tmov sp, fp" or text == "\tmov fp, sp" or text == "\tldp fp, lr, [sp], #16" or text == "\tstp fp, lr, [sp, #-16]!" or text == "\tstp fp, lr, [sp]" or text == "\tldp fp, lr, [sp]" or text == "\tadd fp, sp, #0"
 }
@@ -1109,6 +1145,8 @@ type Codegen = struct {
     rc_stmt_temps: [int64] = []
     // The value just compiled already has its slot: a constructor's, not a call's.
     rc_ctor_mark: int64 = -1
+    // While the prologue is emitted: the frame's size when x28 points at its bottom, else 0.
+    frame_base: int64 = 0
     // Temporary slots no open statement uses.
     rc_free_temps: [int64] = []
     // A `let` that retypes its name stores with the new kind while the value reads the old.
@@ -8074,15 +8112,13 @@ type Codegen = struct {
     }
 
 
+    // A slot past -256 stays a `Slot` until the frame is sized (see `frame_base_slots`).
     func emit_ldr(self, anon offset: int64, reg: str) -> none {
-        if offset >= -256 {
-            self.push_insn(.Slot(store: false, :reg, off: offset))
+        if offset < -256 and self.frame_base > 0 {
+            self.push_all(frame_base_slot(store: false, :reg, :offset, frame: self.frame_base))
             return
         }
-        // Out of immediate range — materialise the negative offset first.
-        self.emit_load_imm("x16", value: 0 - offset)
-        self.emit_op(.Sub, a: "x16", b: "fp", c: "x16")
-        self.emit_load(reg, base: "x16")
+        self.push_insn(.Slot(store: false, :reg, off: offset))
     }
 
     func rc_heap_kind(self, anon kind: TypeKind) -> bool {
@@ -8391,13 +8427,17 @@ type Codegen = struct {
     }
 
     func emit_str_raw(self, anon offset: int64, reg: str) -> none {
-        if offset >= -256 {
-            self.push_insn(.Slot(store: true, :reg, off: offset))
+        if offset < -256 and self.frame_base > 0 {
+            self.push_all(frame_base_slot(store: true, :reg, :offset, frame: self.frame_base))
             return
         }
-        self.emit_load_imm("x16", value: 0 - offset)
-        self.emit_op(.Sub, a: "x16", b: "fp", c: "x16")
-        self.emit_store(reg, base: "x16")
+        self.push_insn(.Slot(store: true, :reg, off: offset))
+    }
+
+    func push_all(self, anon insns: [regalloc.Insn]) -> none {
+        for insn in insns {
+            self.push_insn(insn)
+        }
     }
 
 
@@ -18273,8 +18313,7 @@ type Codegen = struct {
     }
 
     // `body` with its locals in registers: each frame slot that is only
-    // loaded and stored (`ldr R, [fp, #-8]`, or past -256 the
-    // `mov x16, #K` / `sub x16, fp, x16` / `ldr R, [x16]` form) becomes a vreg,
+    // loaded and stored (a `Slot`, or `ldr R, [fp, #-8]`) becomes a vreg,
     // its loads and stores moves, and the body is register-allocated
     // (strictly). `excluded` are slots the prologue writes, outside `body`. As
     // many slots as fit, most used first: when the registers run out, half as
@@ -18315,28 +18354,12 @@ type Codegen = struct {
                     i += 1
                     continue
                 }
-                // A slot as `[fp, #-N]`, or past -256 as `x16 = N`,
-                // `x16 = fp - x16`, then the access at `[x16]`.
+                // A slot as `[fp, #-N]`.
                 if body[i] is .Mem(_load, width, mem_reg, "fp", .Offset(mem_off)) {
                     if width >= 4 and mem_off < 0 {
                         reg = mem_reg
                         off = mem_off
                         span = 1
-                    }
-                } else if body[i] is .Op(.Sub, "x16", "fp", "x16", "", _flags) and i > 0 and i + 1 < n {
-                    if body[i + 1] is .Mem(_load, width, mem_reg, "x16", .Base) and width >= 4 {
-                        if body[i - 1] is .Op(.Move, "x16", imm, "", "", _move_flags) and imm.starts_with("#") {
-                            off = 0 - parse_digits(imm[1..len(imm)])
-                            reg = mem_reg
-                            first = i - 1
-                            span = 3
-                        } else if body[i - 1] is .LoadConst("x16", _value) {
-                            // Its text read as no number, which gives up below.
-                            off = 1
-                            reg = mem_reg
-                            first = i - 1
-                            span = 3
-                        }
                     }
                 }
             }
@@ -19704,23 +19727,35 @@ type Codegen = struct {
         self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)
 
         // Round the callee-saved count up to an even number of registers
-        // (stp/ldp move pairs); the pad slot uses x28, which is never
-        // pool-allocated, so saving/restoring it is a harmless no-op.
+        // (stp/ldp move pairs); the pad is the next register in the save
+        // order, which the body doesn't use, so saving/restoring it is a
+        // harmless no-op.
         mut cs = self.pool.cs_high_water
         if cs % 2 != 0 {
             cs = cs + 1
+        }
+        // Sized only now: compiling the body allocates slots of its own (match subjects, chain operands).
+        let raw_sz = self.frame_slots * 8
+        let aligned = raw_sz + 16 - raw_sz % 16
+        let frame_base = raw_sz > FRAME_BASE_MIN
+        // x28 is saved with the others only as the pad of a ninth register.
+        let save_x28 = frame_base and cs < regalloc.save_order_len()
+        if save_x28 {
+            self.emit_pair(load: false, a: "x28", b: "xzr", base: "sp", mode: .Pre(off: -16))
         }
         mut pi = 0
         for pi < cs {
             self.emit_pair(load: false, a: regalloc.cs_reg(pi), b: regalloc.cs_reg(pi + 1), base: "sp", mode: .Pre(off: -16))
             pi = pi + 2
         }
-        // Sized only now: compiling the body allocates slots of its own (match subjects, chain operands).
-        let raw_sz = self.frame_slots * 8
-        let aligned = raw_sz + 16 - raw_sz % 16
         self.emit_pair(load: false, a: "fp", b: "lr", base: "sp", mode: .Pre(off: -16))
         self.emit_mov("fp", src: "sp")
         self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{aligned}")
+        if frame_base {
+            self.emit_mov("x28", src: "sp")
+            body_buf = frame_base_slots(body_buf, frame: aligned)
+            self.frame_base = aligned
+        }
         for slot in self.rc_slots {
             self.emit_str_raw(slot, reg: "xzr")
         }
@@ -19743,6 +19778,7 @@ type Codegen = struct {
             }
             rc_k = rc_k + 1
         }
+        self.frame_base = 0
         mut body_insns = body_buf
         if arm64.line_count(body_insns) > LONG_BODY_INSNS {
             body_insns = self.long_branches(body_insns)
@@ -19754,6 +19790,9 @@ type Codegen = struct {
         for qi > 0 {
             self.emit_pair(load: true, a: regalloc.cs_reg(qi - 2), b: regalloc.cs_reg(qi - 1), base: "sp", mode: .Post(off: 16))
             qi = qi - 2
+        }
+        if save_x28 {
+            self.emit_pair(load: true, a: "x28", b: "xzr", base: "sp", mode: .Post(off: 16))
         }
         self.emit_op(.Return)
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
