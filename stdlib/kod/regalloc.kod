@@ -42,6 +42,10 @@ type Insn = enum {
     // `op reg, [base, #off]`, or `op reg, [base]` without `has_off`: a load
     // or store (`ldr`, `str`, `ldrb`, `strb`, `ldrh`, `strh`) through a register.
     Mem(op: str, reg: str, base: str, off: int64, has_off: bool)
+    // `mn a, b, c, d` with the operands given (up to the first ""): each a
+    // register, an immediate, a condition or a symbol, never more than one
+    // token (see codegen's emit_op).
+    Op(mn: str, a: str, b: str, c: str, d: str, flags: int64)
     // `bl target`.
     Call(target: str)
     // `op target` (`b`, `beq`, `b.lo`, …), or `op reg, target` for `cbz`
@@ -60,6 +64,74 @@ func mem_text(op: str, reg: str, base: str, off: int64, has_off: bool) -> str {
 // Whether a `Mem` op writes its register (see writer_at): `ldr` and `ldrb`.
 func mem_writes(anon op: str) -> bool {
     return op == "ldr" or op == "ldrb"
+}
+
+// The asm text of an `Op` line.
+func op_text(mn: str, a: str, b: str, c: str, d: str) -> str {
+    if len(a) == 0 {
+        return f"\t{mn}"
+    }
+    if len(b) == 0 {
+        return f"\t{mn} {a}"
+    }
+    if len(c) == 0 {
+        return f"\t{mn} {a}, {b}"
+    }
+    if len(d) == 0 {
+        return f"\t{mn} {a}, {b}, {c}"
+    }
+    return f"\t{mn} {a}, {b}, {c}, {d}"
+}
+
+// Whether `mn` writes its first operand: writer_at's list.
+func writes_first(anon mn: str) -> bool {
+    let n = len(mn)
+    return n >= 3 and n <= 4 and writer_at(mn, start: 0, len: n)
+}
+
+// An `Op`, with its flags worked out once.
+func op(anon mn: str, a: str = "", b: str = "", c: str = "", d: str = "") -> Insn {
+    return .Op(:mn, :a, :b, :c, :d, flags: op_flags(:mn, :a, :b, :c, :d))
+}
+
+// The flags one operand of an `Op` adds.
+func operand_flags(anon operand: str) -> int64 {
+    if len(operand) < 2 {
+        return 0
+    }
+    if reg_clobbers(operand) {
+        return INFO_CLOBBERS
+    }
+    if operand == "fp" {
+        return INFO_FP
+    }
+    return 0
+}
+
+// line_info's flags for an `Op`.
+func op_flags(mn: str, a: str, b: str, c: str, d: str) -> int64 {
+    mut flags: int64 = 0
+    if mn == "mov" {
+        flags = MN_MOV << 8
+    } else if mn == "cset" {
+        flags = MN_CSET << 8
+    } else if mn == "add" {
+        flags = MN_ADD << 8
+    } else if mn == "sub" {
+        flags = MN_SUB << 8
+    }
+    if mn == "blr" {
+        flags = flags | INFO_CLOBBERS
+    }
+    flags = flags | operand_flags(a) | operand_flags(b) | operand_flags(c) | operand_flags(d)
+    // An immediate add or sub can't encode past 4095 (codegen's big_immediate_at).
+    if (mn == "add" or mn == "sub") and len(d) == 0 and len(c) > 1 and c[0] == '#' {
+        let value = parse_number(c[1..len(c)])
+        if value > 4095 {
+            flags = flags | INFO_BIG_IMM
+        }
+    }
+    return flags
 }
 
 // The asm text of a `Branch` line, with `reg` as its register.
@@ -374,6 +446,7 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return flags
         }
+        .Op(_mn, _a, _b, _c, _d, flags) -> return flags
         .Call(target) -> {
             // A panic never comes back, so whatever it clobbers isn't read after it.
             if never_returns(target) {
@@ -656,6 +729,16 @@ func never_returns(anon target: str) -> bool {
 
 // How many times each of the function's vregs (ids vreg_start up to
 // vreg_start + n_local) is named in `body`, as a def or a use.
+func count_operand(anon operand: str, counts: [int64], vreg_start: int64, n_local: int64) -> none {
+    if len(operand) < 2 {
+        return
+    }
+    let id = reg_vreg(operand)
+    if id >= vreg_start and id < vreg_start + n_local {
+        counts[id - vreg_start] += 1
+    }
+}
+
 func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64] {
     mut counts: [int64] = [0] * n_local
     for insn in body {
@@ -682,6 +765,13 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
+        if insn is .Op(_mn, a, b, c, d, _flags) {
+            count_operand(a, :counts, :vreg_start, :n_local)
+            count_operand(b, :counts, :vreg_start, :n_local)
+            count_operand(c, :counts, :vreg_start, :n_local)
+            count_operand(d, :counts, :vreg_start, :n_local)
+            continue
+        }
         if insn is .Mov(dst, src) {
             for reg in [dst, src] {
                 let id = reg_vreg(reg)
@@ -700,6 +790,26 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
         }
     }
     return counts
+}
+
+// An `Op` operand's part in the liveness `run` works out: first named, defined
+// (when `written`), last used.
+func note_operand(anon operand: str, written: bool, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64], first: [int64]) -> none {
+    if len(operand) < 2 {
+        return
+    }
+    let id = reg_vreg(operand)
+    if id < vreg_start or id >= vreg_start + n_local {
+        return
+    }
+    let local_id = id - vreg_start
+    if first[local_id] < 0 {
+        first[local_id] = line_idx
+    }
+    if written and def_line[local_id] == -1 {
+        def_line[local_id] = line_idx
+    }
+    last_use[local_id] = line_idx
 }
 
 // Constrained linear scan for one function's vregs. Vregs are
@@ -827,6 +937,15 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     }
                     last_use[local_id] = line_idx
                 }
+            }
+            .Op(mn, a, b, c, d, flags) -> {
+                if (flags & INFO_CLOBBERS) != 0 {
+                    clobbers = 1
+                }
+                note_operand(a, written: writes_first(mn), :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(b, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(c, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(d, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
             }
             .Call(target) -> {
                 if not never_returns(target) {
