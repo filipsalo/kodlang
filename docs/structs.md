@@ -140,8 +140,30 @@ again. A method can't call `init` itself.
 
 `init` must return the struct (`-> Port`) or a result of it (`-> Port or Error`),
 which makes `try Port(...)` and `must Port(...)` work as for any fallible
-call. It may not be a generic struct's: `init` on a `Box[T]` is an error for
-now. A struct without `init` is built from its fields as described above.
+call. A struct without `init` is built from its fields as described above.
+
+A [generic struct](#generic-structs) may declare `init` too. It returns the
+struct with its own type parameters, `Range[T]` or `Range[T] or Error`, and is
+called with the type arguments spelled out as for any construction of one:
+
+```kod
+type Range[T] = struct {
+    lo: T
+    hi: T
+
+    func init(lo: T, hi: T) -> Range[T] or Error {
+        if hi < lo {
+            throw Backwards()
+        }
+        return Range[T](:lo, :hi)
+    }
+}
+
+let r = try Range[int64](lo: 2, hi: 9)
+```
+
+Inside its own functions, any instance of the struct is built from its
+fields, so a method of `Pair[A, B]` can make a `Pair[B, A]` directly.
 
 Public fields stay assignable, so `p.number = 0` is still possible after a
 checked construction. To keep what `init` checks true for the value's whole

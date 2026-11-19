@@ -12949,7 +12949,7 @@ type Codegen = struct {
                             self.check_param_count(fd.params, what: f"`{struct_name}.{fd.name}`", span: fd.name_span)
                             self.check_param_names(fd.params)
                             if fd.name == "init" and (len(fd.params) == 0 or fd.params[0].name != "self") {
-                                self.report_error(f"error: generic struct `{struct_name}` can't declare `init` yet", span: fd.name_span)
+                                self.check_generic_init_return(fd, :struct_name, :type_params)
                             }
                         }
                     }
@@ -15129,6 +15129,10 @@ type Codegen = struct {
                                     if len(self.structs[ctor_idx].type_param_names) > 0 {
                                         return .KUnknown
                                     }
+                                    let init_idx = self.custom_init(ctor_idx)
+                                    if init_idx >= 0 {
+                                        return self.structs[ctor_idx].methods[init_idx].sig.return_kind
+                                    }
                                     return .KStruct(idx: ctor_idx, type_args: [])
                                 }
                                 if self.index_chain_fn(callee) is Some(fn_ref) {
@@ -16526,7 +16530,8 @@ type Codegen = struct {
         if len(self.structs[struct_idx].type_param_names) > 0 {
             return -1
         }
-        if self.cur_owner >= 0 and self.same_struct(self.cur_owner, struct_idx) {
+        // Any instance of the struct's own template is built from its fields there.
+        if self.cur_owner >= 0 and self.same_struct(self.struct_root(self.cur_owner), self.struct_root(struct_idx)) {
             return -1
         }
         if self.structs[struct_idx].method_idx.get("init") is Some(mi) {
@@ -16542,9 +16547,10 @@ type Codegen = struct {
     // `Name(...)` for a struct that declares `init`: an ordinary call of it.
     func compile_init_call(self, anon args: [ast.CallArg], struct_idx: int64, init_idx: int64, span: ast.Span) -> Val {
         let info = self.structs[struct_idx]
+        let shown = self.struct_display_name(struct_idx)
         let sig = info.methods[init_idx].sig
         let before = self.report_attempts
-        self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: info.name, call_span: span)
+        self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: shown, call_span: span)
         if self.report_attempts > before {
             mut by_field = false
             for arg in args {
@@ -16553,10 +16559,10 @@ type Codegen = struct {
                 }
             }
             if by_field {
-                self.report_error(f"error: `{info.name}` declares `init`, so it is built with that and not from its fields", :span)
+                self.report_error(f"error: `{shown}` declares `init`, so it is built with that and not from its fields", :span)
             }
         }
-        let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: info.name).slots
+        let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: shown).slots
         self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
         self.emit(f"bl {self.method_label(struct_idx, name: "init")}")
         return .VReg(name: "x0")
@@ -16593,6 +16599,39 @@ type Codegen = struct {
         }
         if not ok {
             self.report_error(f"error: `{name}.init` must return `{name}` or `{name} or Error`", span: func_decl.name_span)
+        }
+    }
+
+    // A generic struct's `init` makes the instance it is called on: it returns
+    // `Name[its own type parameters]`, or a result of that.
+    func check_generic_init_return(self, anon fd: ast.FuncDecl, struct_name: str, type_params: [str]) -> none {
+        mut typ = fd.return_typ
+        if self.p.type_exprs[typ] is .Generic(gname, gargs) and gname == "Result" and len(gargs) > 0 {
+            typ = gargs[0]
+        }
+        mut ok = false
+        if self.p.type_exprs[typ] is .Generic(name, args) and name == struct_name and len(args) == len(type_params) {
+            ok = true
+            for i, arg in args {
+                let .Named(arg_name) = self.p.type_exprs[arg] else {
+                    ok = false
+                    continue
+                }
+                if arg_name != type_params[i] {
+                    ok = false
+                }
+            }
+        }
+        if not ok {
+            mut spelled = ""
+            for param in type_params {
+                if len(spelled) > 0 {
+                    spelled += ", "
+                }
+                spelled += param
+            }
+            let own = f"{struct_name}[{spelled}]"
+            self.report_error(f"error: `{struct_name}.init` must return `{own}` or `{own} or Error`", span: fd.name_span)
         }
     }
 
