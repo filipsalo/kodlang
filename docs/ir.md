@@ -75,11 +75,19 @@ were.
    result (both `x0` on arm64), and that is for its lowering, which can map
    `x0` to its first argument register and move the result there after each
    call.
-3. **No text left.** The ~60 remaining text sites become operations that a target
-   lowers to several instructions: the address of a symbol (`adrp` + `add`), a
-   large constant (`mov` + `movk`), the prologue and epilogue (`stp`/`ldp`),
-   indexed memory. Directives move to a separate data model, since they're not
-   instructions. `line_info` and the text paths in the passes go.
+3. **No text left** (done). `Mem` addresses through a `MemAt` (the base, an
+   offset, an index register or a symbol's page offset); register pairs are a
+   `Pair` (offset, pre- or post-index); a constant too big for one move is a
+   `LoadConst`, which the line limits count as the four lines arm64 needs; an
+   inlined runtime function is an `Intrinsic(label)` whose lines come from the
+   arm64 table (`arm64_intrinsic`); directives and data labels are `Data`, which
+   no pass reads. Nothing makes instruction text any more: `Raw`, `line_info`
+   and the passes' text paths are gone, and an `Op` operand that isn't one
+   token is a compiler bug. Assembly text exists only at output
+   (`format_insn`, and `print_encodable` for an immediate too big to encode).
+   The symbol's page (`AddressPage` with an `@PAGE` operand) is still two
+   operations and arm64's way of addressing; one `AddressOf(symbol)` is left
+   for the second target to need.
 4. **Target-specific passes split out.** Peepholes that are arm64 idioms (`cset`
    + `cbz` into `b.cond`) move into the arm64 lowering or an arm64 pass;
    `promote_locals`, copy forwarding and register allocation stay neutral.
