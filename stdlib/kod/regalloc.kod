@@ -39,6 +39,19 @@ type Insn = enum {
     Slot(store: bool, reg: str, off: int64)
     // `mov dst, src` between registers (vregs or physical), made without text.
     Mov(dst: str, src: str)
+    // `bl target`.
+    Call(target: str)
+    // `op target` (`b`, `beq`, `b.lo`, …), or `op reg, target` for `cbz`
+    // and `cbnz`: `reg` is "" for the others.
+    Branch(op: str, reg: str, target: str)
+}
+
+// The asm text of a `Branch` line, with `reg` as its register.
+func branch_text(op: str, reg: str, target: str) -> str {
+    if len(reg) == 0 {
+        return f"\t{op} {target}"
+    }
+    return f"\t{op} {reg}, {target}"
 }
 
 // The asm text of a `Slot` line, with `reg` as the register.
@@ -326,6 +339,19 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return flags
         }
+        .Call(target) -> {
+            // A panic never comes back, so whatever it clobbers isn't read after it.
+            if never_returns(target) {
+                return 0
+            }
+            return INFO_CLOBBERS
+        }
+        .Branch(_op, reg, _target) -> {
+            if reg_clobbers(reg) {
+                return INFO_CLOBBERS
+            }
+            return 0
+        }
         .Label(_name) -> return 0
     }
 }
@@ -605,6 +631,13 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
+        if insn is .Branch(_op, reg, _target) {
+            let id = reg_vreg(reg)
+            if id >= vreg_start and id < vreg_start + n_local {
+                counts[id - vreg_start] += 1
+            }
+            continue
+        }
         if insn is .Mov(dst, src) {
             for reg in [dst, src] {
                 let id = reg_vreg(reg)
@@ -720,6 +753,24 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let r = reg_vreg(src)
                 if r >= vreg_start and r < vreg_start + n_local {
                     let local_id = r - vreg_start
+                    if first[local_id] < 0 {
+                        first[local_id] = line_idx
+                    }
+                    last_use[local_id] = line_idx
+                }
+            }
+            .Call(target) -> {
+                if not never_returns(target) {
+                    clobbers = 1
+                }
+            }
+            .Branch(_op, reg, _target) -> {
+                if reg_clobbers(reg) {
+                    clobbers = 1
+                }
+                let id = reg_vreg(reg)
+                if id >= vreg_start and id < vreg_start + n_local {
+                    let local_id = id - vreg_start
                     if first[local_id] < 0 {
                         first[local_id] = line_idx
                     }
@@ -984,6 +1035,14 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], last_use: [int64]) 
     mut tops: [int64] = []
     mut bottoms: [int64] = []
     for i, insn in body {
+        if insn is .Branch(_op, _reg, branch_to) {
+            if label_line.get(branch_to) is Some(t) {
+                if t <= i {
+                    tops += [t]
+                    bottoms += [i]
+                }
+            }
+        }
         if insn is .Raw(text, _info) {
             let target = branch_target(text)
             if len(target) > 0 {
