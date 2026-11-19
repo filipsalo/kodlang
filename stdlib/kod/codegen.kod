@@ -661,6 +661,7 @@ func insn_text(anon insn: regalloc.Insn) -> str {
     match insn {
         .Raw(text, _info) -> return text
         .Slot(store, reg, off) -> return regalloc.slot_text(:store, :reg, :off)
+        .Mov(dst, src) -> return f"\tmov {dst}, {src}"
         .Label(_name) -> return ""
     }
 }
@@ -767,6 +768,53 @@ func first_operand_read(anon op: str) -> bool {
 // - `mov A, B` with A named only there and in the next instruction, which
 //   reads it, has the next instruction read B;
 // - `str R, [M]` then `ldr D, [M]` becomes `str` then `mov D, R`.
+// `next` reading `src` instead of `dst`, which a `mov dst, src` just before it
+// copied (`dst` a vreg named nowhere else when `once`), or none when it can't:
+// `ldr dst, [dst, ...]` loads from `[src, ...]`, and an instruction that reads
+// `dst` as its only mention of it reads `src`.
+func forwarded(anon next: regalloc.Insn, dst: str, src: str, once: bool) -> regalloc.Insn? {
+    match next {
+        .Slot(store, reg, off) -> {
+            if store and reg == dst and once {
+                return .Slot(store: true, reg: src, :off)
+            }
+            return none
+        }
+        .Mov(to, from) -> {
+            if from == dst and to != dst and once {
+                return .Mov(dst: to, src: src)
+            }
+            return none
+        }
+        .Label(_name) -> return none
+        .Raw(text, _info) -> {
+            let next_text = text
+            if not next_text.starts_with("\t") or next_text.contains("!") or next_text.contains("], #") or next_text.contains("\"") {
+                return none
+            }
+            let spots = token_spots(next_text, name: dst)
+            let head = f"\tldr {dst}, [{dst}"
+            if len(spots) == 2 and next_text.starts_with(head) and len(next_text) > len(head) and (next_text[len(head)] == ']' or next_text[len(head)] == ',') {
+                return regalloc.raw(f"\tldr {dst}, [{src}{next_text[len(head)..len(next_text)]}")
+            }
+            if len(spots) == 1 and once {
+                let na = next_text.trim()
+                mut op_end: int64 = 0
+                for op_end < len(na) and lexing.is_alpha(na[op_end]) {
+                    op_end += 1
+                }
+                let op = na[0..op_end]
+                // The first operand starts after the mnemonic and a space.
+                let is_first = spots[0] == 1 + op_end + 1
+                if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
+                    return regalloc.raw(next_text[0..spots[0]] + src + next_text[spots[0] + len(dst)..len(next_text)])
+                }
+            }
+            return none
+        }
+    }
+}
+
 func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
     // `b` is the caller's to give up: the first rule rewrites it in place.
     let counts = regalloc.vreg_counts(b, :vreg_start, :n_local)
@@ -799,7 +847,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 }
                 if same and plain_reg(reg) and plain_reg(src) {
                     if reg != src {
-                        out += [regalloc.raw(f"\tmov {reg}, {src}")]
+                        out += [.Mov(dst: reg, :src)]
                     }
                     taken = true
                 }
@@ -813,54 +861,46 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
             }
             continue
         }
-        let code = regalloc.mnemonic_code(regalloc.insn_flags(b[i]))
-        if code != regalloc.MN_MOV and code != regalloc.MN_LDR and code != regalloc.MN_STR {
-            // Neither rule starts or ends at this line; the next one sees it as the one before.
+        // A copy into a vreg: the next instruction may read its source instead.
+        mut copy_dst = ""
+        mut copy_src = ""
+        if b[i] is .Mov(dst, src) {
+            copy_dst = dst
+            copy_src = src
+        } else {
+            let code = regalloc.mnemonic_code(regalloc.insn_flags(b[i]))
+            if code != regalloc.MN_MOV and code != regalloc.MN_LDR and code != regalloc.MN_STR {
+                // Neither rule starts or ends at this line; the next one sees it as the one before.
+                prev = ""
+                prev_slot = false
+                out += [b[i]]
+                continue
+            }
+            let t = insn_text(b[i])
+            if t.starts_with("\tmov v") {
+                let a = asm_parts(t)
+                if len(a) == 3 {
+                    copy_dst = a[1]
+                    copy_src = a[2]
+                }
+            }
+        }
+        if i + 1 < n and len(copy_dst) > 0 and copy_dst[0] == 'v' and plain_reg(copy_dst) and plain_reg(copy_src) and copy_dst != copy_src {
+            let id = parse_digits(copy_dst[1..len(copy_dst)]) - vreg_start
+            let once = id >= 0 and id < n_local and counts[id] == 2
+            if forwarded(b[i + 1], dst: copy_dst, src: copy_src, :once) is Some(next) {
+                b[i + 1] = next
+                continue
+            }
+        }
+        if b[i] is .Mov(_dst, _src) {
+            // Not a store, so not the line before a load the second rule looks at.
             prev = ""
             prev_slot = false
             out += [b[i]]
             continue
         }
         let t = insn_text(b[i])
-        if i + 1 < n and t.starts_with("\tmov v") {
-            let a = asm_parts(t)
-            if len(a) == 3 and plain_reg(a[1]) and a[1][0] == 'v' and plain_reg(a[2]) and a[1] != a[2] {
-                let dst = a[1]
-                let src = a[2]
-                let id = parse_digits(dst[1..len(dst)]) - vreg_start
-                if b[i + 1] is .Slot(store, reg, off) {
-                    // Its register is its only one: a store of `dst` can store `src`.
-                    if store and reg == dst and id >= 0 and id < n_local and counts[id] == 2 {
-                        b[i + 1] = .Slot(store: true, reg: src, :off)
-                        continue
-                    }
-                } else {
-                    let next = insn_text(b[i + 1])
-                    if next.starts_with("\t") and not next.contains("!") and not next.contains("], #") and not next.contains("\"") {
-                        let spots = token_spots(next, name: dst)
-                        let head = f"\tldr {dst}, [{dst}"
-                        if len(spots) == 2 and next.starts_with(head) and len(next) > len(head) and (next[len(head)] == ']' or next[len(head)] == ',') {
-                            b[i + 1] = regalloc.raw(f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
-                            continue
-                        }
-                        if len(spots) == 1 and id >= 0 and id < n_local and counts[id] == 2 {
-                            let na = next.trim()
-                            mut op_end: int64 = 0
-                            for op_end < len(na) and lexing.is_alpha(na[op_end]) {
-                                op_end += 1
-                            }
-                            let op = na[0..op_end]
-                            // The first operand starts after the mnemonic and a space.
-                            let is_first = spots[0] == 1 + op_end + 1
-                            if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
-                                b[i + 1] = regalloc.raw(next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
-                                continue
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let before = prev
         let before_slot = prev_slot
         prev = t
@@ -875,7 +915,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 let src = before_text[5..pk]
                 if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == before_text[pk..len(before_text)] {
                     if dst != src {
-                        out += [regalloc.raw(f"\tmov {dst}, {src}")]
+                        out += [.Mov(:dst, :src)]
                     }
                     continue
                 }
@@ -2436,7 +2476,7 @@ type Codegen = struct {
         self.emit(f"bl {lbl}$shared")
         self.emit(f"adrp x16, {ref}@PAGE")
         self.emit(f"str x0, [x16, {ref}@PAGEOFF]")
-        self.emit("mov x17, x0")
+        self.emit_mov("x17", src: "x0")
         self.emit("bl _rc_release_stub")
         self.emit(f"adrp x16, {ref}@PAGE")
         self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
@@ -3888,6 +3928,11 @@ type Codegen = struct {
         self.push_insn(regalloc.raw(line))
     }
 
+    // `mov dst, src` between two registers.
+    func emit_mov(self, anon dst: str, src: str) -> none {
+        self.push_insn(.Mov(:dst, :src))
+    }
+
     // Appends an instruction made without text, as println does a line.
     func push_insn(self, anon insn: regalloc.Insn) -> none {
         if self.dry_run {
@@ -3947,6 +3992,7 @@ type Codegen = struct {
         match insn {
             .Raw(text, info) -> return self.subst_vregs(text, :info)
             .Slot(store, reg, off) -> return regalloc.slot_text(:store, reg: self.phys_of(reg), :off)
+            .Mov(dst, src) -> return f"\tmov {self.phys_of(dst)}, {self.phys_of(src)}"
             .Label(name) -> return name + ":"
         }
     }
@@ -4372,7 +4418,7 @@ type Codegen = struct {
                     if keep {
                         self.rc_pending = false
                     }
-                    self.emit(f"mov {dest}, {name}")
+                    self.emit_mov(dest, src: name)
                     if keep {
                         self.rc_pending = true
                         self.rc_pending_reg = dest
@@ -6160,11 +6206,11 @@ type Codegen = struct {
     // The weak box for the `S?` value in `reg`, counted, in a new register;
     // `reg` is freed. See rc.c's kod_weak_box.
     func emit_weak_box(self, anon reg: str) -> str {
-        self.emit(f"mov x0, {reg}")
+        self.emit_mov("x0", src: reg)
         self.pool.free_reg(reg)
         self.emit("bl _kod_weak_box")
         let out = self.pool.alloc_reg()
-        self.emit(f"mov {out}, x0")
+        self.emit_mov(out, src: "x0")
         return out
     }
 
@@ -8248,7 +8294,7 @@ type Codegen = struct {
         if self.rc_take(reg) {
             return
         }
-        self.emit(f"mov x17, {reg}")
+        self.emit_mov("x17", src: reg)
         self.emit("bl _rc_retain_stub")
     }
 
@@ -9310,7 +9356,7 @@ type Codegen = struct {
                 self.emit("bl _kod_weak_get")
                 self.rc_temp("x0")
                 val = self.pool.alloc_reg()
-                self.emit(f"mov {val}, x0")
+                self.emit_mov(val, src: "x0")
             } else {
                 val = self.pool.alloc_reg()
                 self.emit(f"ldr {val}, [{ptr}, #{off}]")
@@ -10147,12 +10193,12 @@ type Codegen = struct {
         let in_reg = val is .VReg(_name)
         if val is .VReg(name) {
             // Not x16: a reload from far down a large frame goes through it.
-            self.emit(f"mov x17, {name}")
+            self.emit_mov("x17", src: name)
         }
         self.restore_live_regs(state)
         if in_reg {
             let reg = self.pool.alloc_reg()
-            self.emit(f"mov {reg}, x17")
+            self.emit_mov(reg, src: "x17")
             val = .VReg(name: reg)
         }
         return val
@@ -10195,7 +10241,7 @@ type Codegen = struct {
                 lp.sp_slot = self.alloc_var(name: self.fresh("__loop_sp"), kind: .KInt64)
             }
             self.emit_ldr(lp.sp_slot, reg: "x17")
-            self.emit("mov sp, x17")
+            self.emit_mov("sp", src: "x17")
         }
     }
 
@@ -10207,7 +10253,7 @@ type Codegen = struct {
             return
         }
         let end = len(self.out_buf)
-        self.emit("mov x17, sp")
+        self.emit_mov("x17", src: "sp")
         self.emit_str(lp.sp_slot, reg: "x17")
         self.out_buf = self.out_buf[0..lp.entry_mark] + self.out_buf[end..] + self.out_buf[lp.entry_mark..end]
     }
@@ -10616,13 +10662,13 @@ type Codegen = struct {
                         let key_spilled = self.preserve_begin(key_reg)
                         self.mov_to(self.compile_expr(lhs), dest: "x0")
                         let key_r = self.preserve_end(key_reg, spilled: key_spilled)
-                        self.emit(f"mov x1, {key_r}")
+                        self.emit_mov("x1", src: key_r)
                         self.pool.free_reg(key_r)
                     } else {
                         let parked = self.park_value(self.compile_expr(lhs))
                         let key_r = self.compile_key(rhs, kind: sig.param_kinds[1])
                         self.mov_to(.VReg(name: self.unpark_value(parked)), dest: "x0")
-                        self.emit(f"mov x1, {key_r}")
+                        self.emit_mov("x1", src: key_r)
                         self.pool.free_reg(key_r)
                     }
                     mut method_lbl = self.method_label(idx, name: "op_index")
@@ -10709,8 +10755,8 @@ type Codegen = struct {
         self.emit(f"cmp {idx}, {len}")
         self.emit(f"b.lo {ok_lbl}")
         self.emit_label(oob_lbl)
-        self.emit(f"mov x0, {idx}")
-        self.emit(f"mov x1, {len}")
+        self.emit_mov("x0", src: idx)
+        self.emit_mov("x1", src: len)
         self.emit("bl _kod_index_oob")
         self.emit_label(ok_lbl)
     }
@@ -10734,7 +10780,7 @@ type Codegen = struct {
         self.emit_label(bad_lbl)
         self.emit("cmp x1, x16")
         self.emit("csel x0, x16, x1, lo")
-        self.emit("mov x1, x16")
+        self.emit_mov("x1", src: "x16")
         self.emit("bl _kod_index_oob")
         self.emit_label(done_lbl)
     }
@@ -11227,7 +11273,7 @@ type Codegen = struct {
         if self.pool.next_is_callee_saved() {
             parked = self.pool.alloc_reg()
             if lv_r != parked {
-                self.emit(f"mov {parked}, {lv_r}")
+                self.emit_mov(parked, src: lv_r)
             }
             self.pool.free_reg(lv_r)
         } else {
@@ -11620,8 +11666,8 @@ type Codegen = struct {
         self.emit(f"cbz x2, {done_lbl}")
         self.emit(f"ldr x16, [{a}]")
         self.emit(f"ldr x17, [{b}]")
-        self.emit("mov x0, x16")
-        self.emit("mov x1, x17")
+        self.emit_mov("x0", src: "x16")
+        self.emit_mov("x1", src: "x17")
         self.emit("bl _memcmp")
         // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
         // can't be written here: `w<n>` names a virtual register.)
@@ -11641,11 +11687,11 @@ type Codegen = struct {
         }
         self.emit(f"adrp {other}, {label}@PAGE")
         self.emit(f"add {other}, {other}, {label}@PAGEOFF")
-        self.emit("mov x2, x16")
+        self.emit_mov("x2", src: "x16")
         self.emit(f"ldr x16, [{subject}]")
         self.emit(f"ldr x17, [{other}]")
-        self.emit("mov x0, x16")
-        self.emit("mov x1, x17")
+        self.emit_mov("x0", src: "x16")
+        self.emit_mov("x1", src: "x17")
         self.emit("bl _memcmp")
         // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
         // can't be written here: `w<n>` names a virtual register.)
@@ -11884,7 +11930,7 @@ type Codegen = struct {
             self.emit("add sp, sp, #16")
             return
         }
-        self.emit(f"mov x0, {reg}")
+        self.emit_mov("x0", src: reg)
         self.pool.free_reg(reg)
     }
 
@@ -11993,7 +12039,7 @@ type Codegen = struct {
         }
         // The array's reference; the C side only stores it.
         self.rc_retain_kind(elem_reg, kind: rc_elem)
-        self.emit(f"mov x1, {elem_reg}")
+        self.emit_mov("x1", src: elem_reg)
         self.pool.free_reg(elem_reg)
         self.check_value_kind(literal_id, expected: kind)
         self.unpark_lhs(parked)
@@ -13635,7 +13681,7 @@ type Codegen = struct {
         self.emit_load_imm("x0", value: (len(env.keys) + 1) * 8)
         let rc_cell = self.rc_alloc_slots(refs)
         let ptr_r = self.pool.alloc_reg()
-        self.emit(f"mov {ptr_r}, x0")
+        self.emit_mov(ptr_r, src: "x0")
         let tmp_r = self.pool.alloc_reg()
         self.emit(f"adrp {tmp_r}, {lbl}@PAGE")
         self.emit(f"add {tmp_r}, {tmp_r}, {lbl}@PAGEOFF")
@@ -13646,7 +13692,7 @@ type Codegen = struct {
             self.emit(f"str {tmp_r}, [{ptr_r}, #{(i + 1) * 8}]")
         }
         self.pool.free_reg(tmp_r)
-        self.emit(f"mov x0, {ptr_r}")
+        self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
         return .VReg(name: "x0")
@@ -13705,7 +13751,7 @@ type Codegen = struct {
             self.prepare_args_with_kinds(args, expected_kinds: param_kinds, default_exprs: no_defaults, src_p: self.p, slots: no_slots)
             self.restore_across(callee_reg, :spilled)
             self.emit(f"ldr x16, [{callee_reg}]")
-            self.emit(f"mov x17, {callee_reg}")
+            self.emit_mov("x17", src: callee_reg)
             self.emit("blr x16")
             self.pool.free_reg(callee_reg)
             return .VReg(name: "x0")
@@ -14062,7 +14108,7 @@ type Codegen = struct {
         let tmp_r = self.pool.alloc_reg()
         // Use two distinct pool regs: hard-coding x9 here would clobber
         // cell_r when alloc_reg happens to hand back x9.
-        self.emit(f"mov {cell_r}, x0")
+        self.emit_mov(cell_r, src: "x0")
         self.emit(f"ldr {tmp_r}, [{cell_r}]")
         self.emit(f"str {tmp_r}, [sp]")
         self.emit(f"ldr {tmp_r}, [{cell_r}, #8]")
@@ -14366,7 +14412,7 @@ type Codegen = struct {
         self.emit(f"str {vt_r}, [x0, #8]")
         self.pool.free_reg(vt_r)
         let cell_r = self.pool.alloc_reg()
-        self.emit(f"mov {cell_r}, x0")
+        self.emit_mov(cell_r, src: "x0")
         return cell_r
     }
 
@@ -14490,7 +14536,7 @@ type Codegen = struct {
         self.pool.free_reg(old_vt)
         self.pool.free_reg(cell_r)
         let out_r = self.pool.alloc_reg()
-        self.emit(f"mov {out_r}, x0")
+        self.emit_mov(out_r, src: "x0")
         return out_r
     }
 
@@ -14639,7 +14685,7 @@ type Codegen = struct {
         self.emit(f"str {vt_r}, [x0, #8]")
         self.pool.free_reg(vt_r)
         let cell_r = self.pool.alloc_reg()
-        self.emit(f"mov {cell_r}, x0")
+        self.emit_mov(cell_r, src: "x0")
         return cell_r
     }
 
@@ -14776,7 +14822,7 @@ type Codegen = struct {
             regs += [self.compile_into(args[order[i]].value, expected: expected_kinds[i])]
         }
         for i in 0..total {
-            self.emit(f"mov x{i}, {regs[i]}")
+            self.emit_mov(f"x{i}", src: regs[i])
             self.pool.free_reg(regs[i])
         }
         return true
@@ -15611,7 +15657,7 @@ type Codegen = struct {
             return [f"w{reg[1..len(reg)]}", ""]
         }
         let copy = self.pool.alloc_reg()
-        self.emit(f"mov {copy}, {reg}")
+        self.emit_mov(copy, src: reg)
         return [f"w{copy[1..len(copy)]}", copy]
     }
 
@@ -15647,7 +15693,7 @@ type Codegen = struct {
         // A result nothing kept.
         if self.rc_pending and self.rc_pending_slot == 0 {
             self.rc_pending = false
-            self.emit(f"mov x17, {self.rc_pending_reg}")
+            self.emit_mov("x17", src: self.rc_pending_reg)
             self.rc_release_x17()
         }
         self.rc_flush_pending()
@@ -16207,7 +16253,7 @@ type Codegen = struct {
         self.emit("mov x0, #16")
         let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(ok_kind, slot: 1))
         let ptr_reg = self.pool.alloc_reg()
-        self.emit(f"mov {ptr_reg}, x0")
+        self.emit_mov(ptr_reg, src: "x0")
         let payload = self.preserve_end(val_reg, spilled: val_spilled)
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
@@ -16309,7 +16355,7 @@ type Codegen = struct {
                 self.emit("mov x0, #8")
                 let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(inner, slot: 0))
                 let ptr_reg = self.pool.alloc_reg()
-                self.emit(f"mov {ptr_reg}, x0")
+                self.emit_mov(ptr_reg, src: "x0")
                 let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                 self.rc_retain_kind(tmp, kind: inner)
                 self.emit(f"str {tmp}, [{ptr_reg}]")
@@ -16474,7 +16520,7 @@ type Codegen = struct {
                     self.emit("mov x0, #8")
                     let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(inner, slot: 0))
                     let ptr_reg = self.pool.alloc_reg()
-                    self.emit(f"mov {ptr_reg}, x0")
+                    self.emit_mov(ptr_reg, src: "x0")
                     self.rc_mark_owned(ptr_reg, slot: rc_cell)
                     self.emit_str(dest_off, reg: ptr_reg)
                     let tmp = self.preserve_end(val_reg, spilled: val_spilled)
@@ -16671,11 +16717,11 @@ type Codegen = struct {
         }
         let lhs_r = self.unpark_value(parked)
         if oc.swap {
-            self.emit(f"mov x0, {other_r}")
-            self.emit(f"mov x1, {lhs_r}")
+            self.emit_mov("x0", src: other_r)
+            self.emit_mov("x1", src: lhs_r)
         } else {
-            self.emit(f"mov x0, {lhs_r}")
-            self.emit(f"mov x1, {other_r}")
+            self.emit_mov("x0", src: lhs_r)
+            self.emit_mov("x1", src: other_r)
         }
         self.pool.free_reg(lhs_r)
         self.pool.free_reg(other_r)
@@ -16822,7 +16868,7 @@ type Codegen = struct {
         self.emit_load_imm("x0", value: data_width)
         let rc_cell = self.rc_alloc_slots(self.rc_struct_slots(struct_idx))
         let ptr_r = self.pool.alloc_reg()
-        self.emit(f"mov {ptr_r}, x0")
+        self.emit_mov(ptr_r, src: "x0")
         mut provided: [str] = []
         mut argn = 0
         mut unlabelled = 0
@@ -16912,7 +16958,7 @@ type Codegen = struct {
             fi = fi + 1
         }
         self.leave(saved_ctx)
-        self.emit(f"mov x0, {ptr_r}")
+        self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
         self.rc_ctor_mark = len(self.out_buf)
@@ -16935,7 +16981,7 @@ type Codegen = struct {
         }
         let rc_cell = self.rc_alloc_slots(rc_refs)
         let ptr_r = self.pool.alloc_reg()
-        self.emit(f"mov {ptr_r}, x0")
+        self.emit_mov(ptr_r, src: "x0")
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: disc)
         self.emit(f"str {disc_r}, [{ptr_r}]")
@@ -16960,7 +17006,7 @@ type Codegen = struct {
                 i = i + 1
             }
         }
-        self.emit(f"mov x0, {ptr_r}")
+        self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
         self.rc_ctor_mark = len(self.out_buf)
@@ -17361,7 +17407,7 @@ type Codegen = struct {
                 let lhs_val = self.compile_expr(lhs)
                 self.mov_to(lhs_val, dest: "x0")
                 let key_r = self.preserve_end(key_reg, spilled: key_spilled)
-                self.emit(f"mov x1, {key_r}")
+                self.emit_mov("x1", src: key_r)
                 self.pool.free_reg(key_r)
                 // rhs is the third arg (x2). If it was spilled, reload from
                 // the slot; if it rode through a callee-saved register, just
@@ -17370,7 +17416,7 @@ type Codegen = struct {
                     self.emit("ldr x2, [sp]")
                     self.emit("add sp, sp, #16")
                 } else {
-                    self.emit(f"mov x2, {rhs_r}")
+                    self.emit_mov("x2", src: rhs_r)
                     self.pool.free_reg(rhs_r)
                 }
                 self.emit(f"bl {method_lbl}")
@@ -17487,9 +17533,9 @@ type Codegen = struct {
         } else {
             recv_r = self.preserve_end(recv_r, spilled: recv_spilled)
         }
-        self.emit(f"mov x0, {recv_r}")
-        self.emit(f"mov x1, {key_r}")
-        self.emit(f"mov x2, {rhs_r}")
+        self.emit_mov("x0", src: recv_r)
+        self.emit_mov("x1", src: key_r)
+        self.emit_mov("x2", src: rhs_r)
         self.pool.free_reg(recv_r)
         self.pool.free_reg(key_r)
         self.pool.free_reg(rhs_r)
@@ -17649,7 +17695,7 @@ type Codegen = struct {
         self.emit_globl(lbl)
         self.emit_label(lbl)
         self.emit("stp fp, lr, [sp, #-16]!")
-        self.emit("mov fp, sp")
+        self.emit_mov("fp", src: "sp")
         self.emit(f"adrp x16, {cell}@PAGE")
         self.emit(f"add x16, x16, {cell}@PAGEOFF")
         self.emit("ldr x17, [x16]")
@@ -17658,7 +17704,7 @@ type Codegen = struct {
         self.emit_label(ready)
         self.emit("ldr x0, [x16, #8]")
         if self.rc_heap_kind(kind) {
-            self.emit("mov x17, x0")
+            self.emit_mov("x17", src: "x0")
             self.emit("bl _rc_retain_stub")
         }
         self.emit("ldp fp, lr, [sp], #16")
@@ -17878,7 +17924,7 @@ type Codegen = struct {
             }
             if convert {
                 let reg = self.compile_value_for_kind(value_id, expected: self.return_kind)
-                self.emit(f"mov x0, {reg}")
+                self.emit_mov("x0", src: reg)
                 self.pool.free_reg(reg)
             } else {
                 let val = self.compile_expr(value_id)
@@ -18272,9 +18318,9 @@ type Codegen = struct {
         let field_kind = self.find_field_kind(field, :struct_idx)
         if self.field_is_weak(field, :struct_idx) {
             // A weak field: a new `U?` from its box, already the reader's.
-            self.emit(f"mov x0, {reg}")
+            self.emit_mov("x0", src: reg)
             self.emit("bl _kod_weak_get")
-            self.emit(f"mov {reg}, x0")
+            self.emit_mov(reg, src: "x0")
             self.emit(f"b {done_lbl}")
             self.emit_label(none_lbl)
             self.emit(f"mov {reg}, #0")
@@ -18296,7 +18342,7 @@ type Codegen = struct {
         self.emit("mov x0, #8")
         self.rc_alloc_cell(mask: self.rc_kind_mask(self.find_field_kind(field, :struct_idx), slot: 0))
         let ptr = self.pool.alloc_reg()
-        self.emit(f"mov {ptr}, x0")
+        self.emit_mov(ptr, src: "x0")
         let tmp = self.preserve_end(reg, spilled: val_spilled)
         self.rc_retain_kind(tmp, kind: self.find_field_kind(field, :struct_idx))
         self.emit(f"str {tmp}, [{ptr}]")
@@ -18357,7 +18403,8 @@ type Codegen = struct {
         mut i: int64 = 0
         for i < n {
             let code = regalloc.mnemonic_code(regalloc.insn_flags(body[i]))
-            if code != regalloc.MN_CSET and code != regalloc.MN_MOV {
+            // A register `mov` is none of these patterns: they move an immediate.
+            if (code != regalloc.MN_CSET and code != regalloc.MN_MOV) or body[i] is .Mov(_dst, _src) {
                 out += [body[i]]
                 i += 1
                 continue
@@ -18542,9 +18589,9 @@ type Codegen = struct {
                         let access = body[j + line_len[j] - 1]
                         if access is .Slot(store, slot_reg, _off) {
                             if store {
-                                out += [regalloc.raw(f"\tmov {vregs[which]}, {slot_reg}")]
+                                out += [.Mov(dst: vregs[which], src: slot_reg)]
                             } else {
-                                out += [regalloc.raw(f"\tmov {slot_reg}, {vregs[which]}")]
+                                out += [.Mov(dst: slot_reg, src: vregs[which])]
                             }
                             j += line_len[j]
                             continue
@@ -18733,23 +18780,23 @@ type Codegen = struct {
         self.emit(f"bl {method_lbl}")
         if rc_ret_kind is .KOptional(_inner) {
             // Already a `U?`, which is the result as it is: `T??` is `T?`.
-            self.emit(f"mov {result}, x0")
+            self.emit_mov(result, src: "x0")
             self.emit_label(done_lbl)
             return .VReg(name: result)
         }
         // Wrap the return value (now in x0) into a fresh Some cell.
         let ret_reg = self.pool.alloc_reg()
-        self.emit(f"mov {ret_reg}, x0")
+        self.emit_mov(ret_reg, src: "x0")
         let val_spilled = self.preserve_begin(ret_reg)
         self.emit("mov x0, #8")
         // The cell takes over the reference the call returned.
         self.rc_alloc_cell(mask: self.rc_kind_mask(rc_ret_kind, slot: 0))
         let ptr = self.pool.alloc_reg()
-        self.emit(f"mov {ptr}, x0")
+        self.emit_mov(ptr, src: "x0")
         let tmp = self.preserve_end(ret_reg, spilled: val_spilled)
         self.emit(f"str {tmp}, [{ptr}]")
         self.pool.free_reg(tmp)
-        self.emit(f"mov {result}, {ptr}")
+        self.emit_mov(result, src: ptr)
         self.pool.free_reg(ptr)
         self.emit_label(done_lbl)
         return .VReg(name: result)
@@ -19799,7 +19846,7 @@ type Codegen = struct {
             self.rc_release_x17()
         }
         // From fp: a `try` inside a pushed region branches here with sp still lowered.
-        self.emit("mov sp, fp")
+        self.emit_mov("sp", src: "fp")
         self.emit("ldp fp, lr, [sp], #16")
 
         mut body_buf = self.peephole(self.out_buf, :vreg_start)
@@ -19845,7 +19892,7 @@ type Codegen = struct {
         let raw_sz = self.frame_slots * 8
         let aligned = raw_sz + 16 - raw_sz % 16
         self.emit("stp fp, lr, [sp, #-16]!")
-        self.emit("mov fp, sp")
+        self.emit_mov("fp", src: "sp")
         self.emit(f"sub sp, sp, #{aligned}")
         for slot in self.rc_slots {
             self.emit_str_raw(slot, reg: "xzr")
