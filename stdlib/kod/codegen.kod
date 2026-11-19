@@ -658,10 +658,11 @@ func opposite_condition(anon cond: str) -> str {
 
 // The text of a Raw instruction, or "" for a label.
 func insn_text(anon insn: regalloc.Insn) -> str {
-    if insn is .Raw(text, _info) {
-        return text
+    match insn {
+        .Raw(text, _info) -> return text
+        .Slot(store, reg, off) -> return regalloc.slot_text(:store, :reg, :off)
+        .Label(_name) -> return ""
     }
-    return ""
 }
 
 // An instruction as its mnemonic and operands, split at the commas (none of
@@ -772,53 +773,107 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
     let n = len(b)
     mut out: [regalloc.Insn] = []
     // The second rule looks at the line before as the first rule left it,
-    // whether or not that line was kept.
+    // whether or not that line was kept: `prev` is its text, or "" when it is
+    // a slot store (`prev_slot`) or neither rule's.
     mut prev = ""
+    mut prev_slot = false
+    mut prev_reg = ""
+    mut prev_off: int64 = 0
     for i in 0..n {
+        if b[i] is .Slot(store, reg, off) {
+            // A load just after a store to the same slot: the stored register.
+            mut taken = false
+            if not store and (prev_slot or len(prev) > 0) {
+                mut src = prev_reg
+                mut same = prev_slot and prev_off == off
+                if not prev_slot {
+                    // A store written as text: compare as text, as for two such lines.
+                    let t = insn_text(b[i])
+                    same = false
+                    if prev.starts_with("\tstr ") and prev.ends_with("]") and not prev.contains("!") {
+                        if t.find(", [") is Some(k) and prev.find(", [") is Some(pk) {
+                            src = prev[5..pk]
+                            same = t[k..len(t)] == prev[pk..len(prev)]
+                        }
+                    }
+                }
+                if same and plain_reg(reg) and plain_reg(src) {
+                    if reg != src {
+                        out += [regalloc.raw(f"\tmov {reg}, {src}")]
+                    }
+                    taken = true
+                }
+            }
+            prev = ""
+            prev_slot = store
+            prev_reg = reg
+            prev_off = off
+            if not taken {
+                out += [b[i]]
+            }
+            continue
+        }
         let code = regalloc.mnemonic_code(regalloc.insn_flags(b[i]))
         if code != regalloc.MN_MOV and code != regalloc.MN_LDR and code != regalloc.MN_STR {
             // Neither rule starts or ends at this line; the next one sees it as the one before.
             prev = ""
+            prev_slot = false
             out += [b[i]]
             continue
         }
         let t = insn_text(b[i])
         if i + 1 < n and t.starts_with("\tmov v") {
             let a = asm_parts(t)
-            let next = insn_text(b[i + 1])
-            if len(a) == 3 and plain_reg(a[1]) and a[1][0] == 'v' and plain_reg(a[2]) and a[1] != a[2] and next.starts_with("\t") and not next.contains("!") and not next.contains("], #") and not next.contains("\"") {
+            if len(a) == 3 and plain_reg(a[1]) and a[1][0] == 'v' and plain_reg(a[2]) and a[1] != a[2] {
                 let dst = a[1]
                 let src = a[2]
-                let spots = token_spots(next, name: dst)
                 let id = parse_digits(dst[1..len(dst)]) - vreg_start
-                let head = f"\tldr {dst}, [{dst}"
-                if len(spots) == 2 and next.starts_with(head) and len(next) > len(head) and (next[len(head)] == ']' or next[len(head)] == ',') {
-                    b[i + 1] = regalloc.raw(f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
-                    continue
-                }
-                if len(spots) == 1 and id >= 0 and id < n_local and counts[id] == 2 {
-                    let na = next.trim()
-                    mut op_end: int64 = 0
-                    for op_end < len(na) and lexing.is_alpha(na[op_end]) {
-                        op_end += 1
-                    }
-                    let op = na[0..op_end]
-                    // The first operand starts after the mnemonic and a space.
-                    let is_first = spots[0] == 1 + op_end + 1
-                    if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
-                        b[i + 1] = regalloc.raw(next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
+                if b[i + 1] is .Slot(store, reg, off) {
+                    // Its register is its only one: a store of `dst` can store `src`.
+                    if store and reg == dst and id >= 0 and id < n_local and counts[id] == 2 {
+                        b[i + 1] = .Slot(store: true, reg: src, :off)
                         continue
+                    }
+                } else {
+                    let next = insn_text(b[i + 1])
+                    if next.starts_with("\t") and not next.contains("!") and not next.contains("], #") and not next.contains("\"") {
+                        let spots = token_spots(next, name: dst)
+                        let head = f"\tldr {dst}, [{dst}"
+                        if len(spots) == 2 and next.starts_with(head) and len(next) > len(head) and (next[len(head)] == ']' or next[len(head)] == ',') {
+                            b[i + 1] = regalloc.raw(f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
+                            continue
+                        }
+                        if len(spots) == 1 and id >= 0 and id < n_local and counts[id] == 2 {
+                            let na = next.trim()
+                            mut op_end: int64 = 0
+                            for op_end < len(na) and lexing.is_alpha(na[op_end]) {
+                                op_end += 1
+                            }
+                            let op = na[0..op_end]
+                            // The first operand starts after the mnemonic and a space.
+                            let is_first = spots[0] == 1 + op_end + 1
+                            if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
+                                b[i + 1] = regalloc.raw(next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
+                                continue
+                            }
+                        }
                     }
                 }
             }
         }
         let before = prev
+        let before_slot = prev_slot
         prev = t
-        if len(before) > 0 and t.starts_with("\tldr ") and t.ends_with("]") and before.starts_with("\tstr ") and before.ends_with("]") and not t.contains("!") and not before.contains("!") {
-            if t.find(", [") is Some(k) and before.find(", [") is Some(pk) {
+        prev_slot = false
+        mut before_text = before
+        if before_slot {
+            before_text = regalloc.slot_text(store: true, reg: prev_reg, off: prev_off)
+        }
+        if len(before_text) > 0 and t.starts_with("\tldr ") and t.ends_with("]") and before_text.starts_with("\tstr ") and before_text.ends_with("]") and not t.contains("!") and not before_text.contains("!") {
+            if t.find(", [") is Some(k) and before_text.find(", [") is Some(pk) {
                 let dst = t[5..k]
-                let src = before[5..pk]
-                if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == before[pk..len(before)] {
+                let src = before_text[5..pk]
+                if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == before_text[pk..len(before_text)] {
                     if dst != src {
                         out += [regalloc.raw(f"\tmov {dst}, {src}")]
                     }
@@ -3830,13 +3885,18 @@ type Codegen = struct {
     // the line in `Insn.Raw`; emitters that produce a structured `Insn`
     // value (currently just `emit_label`) push directly to `out_buf`.
     func println(self, anon line: str) -> none {
+        self.push_insn(regalloc.raw(line))
+    }
+
+    // Appends an instruction made without text, as println does a line.
+    func push_insn(self, anon insn: regalloc.Insn) -> none {
         if self.dry_run {
             return none
         }
         if self.rc_pending {
             self.rc_flush_pending()
         }
-        self.out_buf += [regalloc.raw(line)]
+        self.out_buf += [insn]
     }
 
     // Drain the buffered output to stdout, one `print` per line.
@@ -3886,6 +3946,7 @@ type Codegen = struct {
     func format_insn(self, anon insn: regalloc.Insn) -> str {
         match insn {
             .Raw(text, info) -> return self.subst_vregs(text, :info)
+            .Slot(store, reg, off) -> return regalloc.slot_text(:store, reg: self.phys_of(reg), :off)
             .Label(name) -> return name + ":"
         }
     }
@@ -3946,6 +4007,20 @@ type Codegen = struct {
     // `text[flush_start..vreg_start]` followed by the substitution and
     // advance `flush_start` past the vreg. Lines with no substitutions
     // return the original `text` unchanged.
+    // The physical register a register name stands for at output: a vreg's,
+    // `w` form for a `w` vreg, and any other name as it is.
+    func phys_of(self, anon reg: str) -> str {
+        let id = regalloc.reg_vreg(reg)
+        if id < 0 or id >= len(self.pool.vreg_phys) {
+            return reg
+        }
+        let phys = self.pool.vreg_phys[id]
+        if reg[0] == 'w' {
+            return "w" + phys[1..len(phys)]
+        }
+        return phys
+    }
+
     // `text` with each vreg it names (see regalloc.line_info) replaced by
     // the physical register it was given, `w` form for a `w` vreg.
     func subst_vregs(self, anon text: str, info: [int64]) -> str {
@@ -8131,12 +8206,8 @@ type Codegen = struct {
 
 
     func emit_ldr(self, anon offset: int64, reg: str) -> none {
-        if offset >= 0 {
-            self.emit(f"ldr {reg}, [fp]")
-            return
-        }
         if offset >= -256 {
-            self.emit(f"ldr {reg}, [fp, #{offset}]")
+            self.push_insn(.Slot(store: false, :reg, off: offset))
             return
         }
         // Out of immediate range — materialise the negative offset first.
@@ -8451,12 +8522,8 @@ type Codegen = struct {
     }
 
     func emit_str_raw(self, anon offset: int64, reg: str) -> none {
-        if offset >= 0 {
-            self.emit(f"str {reg}, [fp]")
-            return
-        }
         if offset >= -256 {
-            self.emit(f"str {reg}, [fp, #{offset}]")
+            self.push_insn(.Slot(store: true, :reg, off: offset))
             return
         }
         self.emit_load_imm("x16", value: 0 - offset)
@@ -18369,33 +18436,41 @@ type Codegen = struct {
         }
         mut i: int64 = 0
         for i < n {
-            if (regalloc.insn_flags(body[i]) & regalloc.INFO_FP) == 0 {
-                i += 1
-                continue
-            }
-            let text = insn_text(body[i])
-            if is_frame_link(text) {
-                i += 1
-                continue
-            }
             mut off: int64 = 0
             mut first: int64 = i
             mut span: int64 = 0
             mut reg = ""
-            if text.ends_with("]") and (text.starts_with("\tldr ") or text.starts_with("\tstr ")) {
-                if text.find(", [fp, #-") is Some(k) {
-                    reg = text[5..k]
-                    off = 0 - parse_digits(text[k + 9..len(text) - 1])
+            if body[i] is .Slot(_store, slot_reg, slot_off) {
+                if slot_off < 0 {
+                    reg = slot_reg
+                    off = slot_off
                     span = 1
                 }
-            } else if text == "\tsub x16, fp, x16" and i > 0 and i + 1 < n {
-                let prev = insn_text(body[i - 1])
-                let next = insn_text(body[i + 1])
-                if prev.starts_with("\tmov x16, #") and next.ends_with(", [x16]") and (next.starts_with("\tldr ") or next.starts_with("\tstr ")) {
-                    off = 0 - parse_digits(prev[11..len(prev)])
-                    reg = next[5..len(next) - 7]
-                    first = i - 1
-                    span = 3
+            } else {
+                if (regalloc.insn_flags(body[i]) & regalloc.INFO_FP) == 0 {
+                    i += 1
+                    continue
+                }
+                let text = insn_text(body[i])
+                if is_frame_link(text) {
+                    i += 1
+                    continue
+                }
+                if text.ends_with("]") and (text.starts_with("\tldr ") or text.starts_with("\tstr ")) {
+                    if text.find(", [fp, #-") is Some(k) {
+                        reg = text[5..k]
+                        off = 0 - parse_digits(text[k + 9..len(text) - 1])
+                        span = 1
+                    }
+                } else if text == "\tsub x16, fp, x16" and i > 0 and i + 1 < n {
+                    let prev = insn_text(body[i - 1])
+                    let next = insn_text(body[i + 1])
+                    if prev.starts_with("\tmov x16, #") and next.ends_with(", [x16]") and (next.starts_with("\tldr ") or next.starts_with("\tstr ")) {
+                        off = 0 - parse_digits(prev[11..len(prev)])
+                        reg = next[5..len(next) - 7]
+                        first = i - 1
+                        span = 3
+                    }
                 }
             }
             if span == 0 or off >= 0 or len(reg) == 0 or reg[0] == 'w' {
@@ -18464,7 +18539,17 @@ type Codegen = struct {
                         }
                     }
                     if which >= 0 {
-                        let last = insn_text(body[j + line_len[j] - 1])
+                        let access = body[j + line_len[j] - 1]
+                        if access is .Slot(store, slot_reg, _off) {
+                            if store {
+                                out += [regalloc.raw(f"\tmov {vregs[which]}, {slot_reg}")]
+                            } else {
+                                out += [regalloc.raw(f"\tmov {slot_reg}, {vregs[which]}")]
+                            }
+                            j += line_len[j]
+                            continue
+                        }
+                        let last = insn_text(access)
                         let reg = slot_access_reg(last)
                         if last.starts_with("\tldr ") {
                             out += [regalloc.raw(f"\tmov {reg}, {vregs[which]}")]

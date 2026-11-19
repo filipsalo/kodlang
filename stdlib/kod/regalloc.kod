@@ -33,6 +33,61 @@ import "kod/lexing"
 type Insn = enum {
     Label(name: str)
     Raw(text: str, info: [int64])
+    // `ldr reg, [fp, #off]` (`[fp]` for off 0 or more), or `str` with
+    // `store`, made without text: see `slot_text`. `reg` is a vreg (`v12`)
+    // or a physical register.
+    Slot(store: bool, reg: str, off: int64)
+}
+
+// The asm text of a `Slot` line, with `reg` as the register.
+func slot_text(store: bool, reg: str, off: int64) -> str {
+    mut op = "ldr"
+    if store {
+        op = "str"
+    }
+    if off >= 0 {
+        return f"\t{op} {reg}, [fp]"
+    }
+    return f"\t{op} {reg}, [fp, #{off}]"
+}
+
+// The vreg `reg` names (`v12` or `w12`), or -1 for a physical register.
+func reg_vreg(anon reg: str) -> int64 {
+    let n = len(reg)
+    if n < 2 or (reg[0] != 'v' and reg[0] != 'w') {
+        return -1
+    }
+    mut id: int64 = 0
+    for k in 1..n {
+        if not lexing.is_digit(reg[k]) {
+            return -1
+        }
+        id = id * 10 + reg[k] - '0'
+    }
+    return id
+}
+
+// Whether `reg` is one of x8–x15, which a line naming counts as a clobber (see line_info).
+func reg_clobbers(anon reg: str) -> bool {
+    if len(reg) < 2 or reg[0] != 'x' {
+        return false
+    }
+    let num = parse_number(reg[1..len(reg)])
+    return num >= 8 and num <= 15
+}
+
+func parse_number(anon s: str) -> int64 {
+    if len(s) == 0 {
+        return -1
+    }
+    mut v: int64 = 0
+    for k in 0..len(s) {
+        if not lexing.is_digit(s[k]) {
+            return -1
+        }
+        v = v * 10 + s[k] - '0'
+    }
+    return v
 }
 
 // A line of asm text as an `Insn`.
@@ -247,10 +302,20 @@ func line_info(anon text: str) -> [int64] {
 
 // The flags of a line, from its info (0 for a label).
 func insn_flags(anon insn: Insn) -> int64 {
-    if insn is .Raw(_text, info) {
-        return info[0]
+    match insn {
+        .Raw(_text, info) -> return info[0]
+        .Slot(store, reg, _off) -> {
+            mut flags = (MN_LDR << 8) | INFO_FP
+            if store {
+                flags = (MN_STR << 8) | INFO_FP
+            }
+            if reg_clobbers(reg) {
+                flags = flags | INFO_CLOBBERS
+            }
+            return flags
+        }
+        .Label(_name) -> return 0
     }
-    return 0
 }
 
 // Whether the `len`-letter mnemonic at `start` of `text` writes its first operand.
@@ -521,6 +586,13 @@ func never_returns(anon target: str) -> bool {
 func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64] {
     mut counts: [int64] = [0] * n_local
     for insn in body {
+        if insn is .Slot(_store, reg, _off) {
+            let id = reg_vreg(reg)
+            if id >= vreg_start and id < vreg_start + n_local {
+                counts[id - vreg_start] += 1
+            }
+            continue
+        }
         let .Raw(_text, info) = insn else { continue }
         for k in 1..len(info) {
             let id = entry_id(info[k])
@@ -589,6 +661,23 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                         }
                         last_use[local_id] = line_idx
                     }
+                }
+            }
+            .Slot(store, reg, _off) -> {
+                if reg_clobbers(reg) {
+                    clobbers = 1
+                }
+                let id = reg_vreg(reg)
+                if id >= vreg_start and id < vreg_start + n_local {
+                    let local_id = id - vreg_start
+                    if first[local_id] < 0 {
+                        first[local_id] = line_idx
+                    }
+                    // A load writes its register; a store reads it.
+                    if not store and def_line[local_id] == -1 {
+                        def_line[local_id] = line_idx
+                    }
+                    last_use[local_id] = line_idx
                 }
             }
             .Label(_name) -> {
