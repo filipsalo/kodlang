@@ -1701,3 +1701,109 @@ def test_definition_of_a_field_goes_to_its_declaration(lsp_binary):
     dotted = _definition_at(lsp_binary, FIELD_SOURCE, 7, 26)
     assert dotted is not None
     assert dotted["range"]["start"] == {"line": 1, "character": 4}
+
+
+LOCALS_SOURCE = (
+    "type Bag = struct {\n"  # 0
+    '    func size(self) -> str { return "bag" }\n'  # 1
+    "}\n"  # 2
+    "type Box = struct {\n"  # 3
+    "    n: int64\n"  # 4
+    "    func size(self) -> int64 { return self.n }\n"  # 5
+    "}\n"  # 6
+    "func main() -> int64 {\n"  # 7
+    "    let b = Box(n: 3)\n"  # 8
+    "    let total = b.size() + 1\n"  # 9
+    "    for item in [b] {\n"  # 10
+    "        print_int(item.n + total)\n"  # 11
+    "    }\n"  # 12
+    "    return total\n"  # 13
+    "}\n"  # 14
+)
+
+
+def _at(source, line, needle, nth=0):
+    """The (line, character) of the `nth` `needle` on `line` of `source`."""
+    text = source.split("\n")[line]
+    col = -1
+    for _ in range(nth + 1):
+        col = text.index(needle, col + 1)
+    return line, col
+
+
+def test_hover_on_a_local_shows_its_compiled_type(lsp_binary):
+    value, diagnostics = _hover_and_diagnostics(
+        lsp_binary, LOCALS_SOURCE, *_at(LOCALS_SOURCE, 13, "total")
+    )
+    assert diagnostics == []
+    assert value is not None and "total: int64" in value
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, LOCALS_SOURCE, *_at(LOCALS_SOURCE, 9, "b.")
+    )
+    assert value is not None and "b: Box" in value
+
+
+def test_hover_on_a_for_variable_and_its_field(lsp_binary):
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, LOCALS_SOURCE, *_at(LOCALS_SOURCE, 11, "item")
+    )
+    assert value is not None and "item: Box" in value
+    line, col = _at(LOCALS_SOURCE, 11, ".n")
+    value, _ = _hover_and_diagnostics(lsp_binary, LOCALS_SOURCE, line, col + 1)
+    assert value is not None and "Box.n: int64" in value
+
+
+def test_hover_on_a_method_uses_the_receivers_type(lsp_binary):
+    line, col = _at(LOCALS_SOURCE, 9, ".size")
+    value, _ = _hover_and_diagnostics(lsp_binary, LOCALS_SOURCE, line, col + 1)
+    assert value is not None and "Box.size" in value and "Bag" not in value
+
+
+def test_completion_on_a_receiver_whose_type_is_inferred(lsp_binary):
+    # `p` has no written type, so only the compiled type says it's a Point.
+    source = (
+        "type Point = struct {\n"
+        "  x: int64\n"
+        "  func distance(self) -> int64 { return 0 }\n"
+        "}\n"
+        "func main() -> int64 {\n"
+        "  for p in [Point(x: 1)] {\n"
+        "    print_int(p.di)\n"
+        "  }\n"
+        "  return 0\n"
+        "}\n"
+    )
+    uri = "file:///tmp/recvinferred.kod"
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                # Line 6 is `    print_int(p.di)`; column 18 is just past `di`.
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": 6, "character": 18},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "distance" in labels
+    assert "x" in labels

@@ -186,7 +186,7 @@ func compile_buffer(uri: str, text: str) -> codegen.Codegen {
     let tokens: [lexing.Token] = lxr.lex()
     let p: parsing.Parser = parsing.make_parser(tokens, path: entry_path, source: text)
     let module: ast.Module = p.parse_module()
-    return build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true)
+    return build.compile_program(entry_parser: p, entry_module: module, :entry_path, dry_run: true, record_kinds: true)
 }
 
 // Publish only the errors that came from the buffer the user is
@@ -414,14 +414,7 @@ func field_struct(cg: codegen.Codegen, source: str, offset: int64, word: str) ->
     }
     mut struct_idx = -1
     if start > 0 and source[start - 1] == '.' {
-        let receiver = qualifier_before_dot(:source, offset: start)
-        let type_expr = find_type_of(:source, offset: start, name: receiver)
-        if len(type_expr) > 0 {
-            let type_ref = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: base_type_name(expr: type_expr))
-            if type_ref >= 0 and type_ref % 4 == 0 {
-                struct_idx = type_ref / 4
-            }
-        }
+        struct_idx = receiver_struct(:cg, :source, dot: start - 1)
     } else {
         mut after = end
         for after < len(source) and source[after] == ' ' {
@@ -474,6 +467,37 @@ func field_struct(cg: codegen.Codegen, source: str, offset: int64, word: str) ->
     return -1
 }
 
+// The type the compiler gave the local that starts at `start`, if it compiled one there.
+func recorded_kind(cg: codegen.Codegen, start: int64) -> codegen.TypeKind? {
+    return cg.recorded_kinds.get(start)
+}
+
+// The struct of the receiver before the `.` at `dot`: the type the compiler
+// gave it, or else the one written where it is declared. -1 for none.
+func receiver_struct(cg: codegen.Codegen, source: str, dot: int64) -> int64 {
+    mut start = dot
+    for start > 0 and is_word_byte(source[start - 1]) {
+        start -= 1
+    }
+    if start == dot {
+        return -1
+    }
+    if recorded_kind(:cg, :start) is Some(kind) {
+        if kind is .KStruct(idx, _args) {
+            return idx
+        }
+        return -1
+    }
+    let type_expr = find_type_of(:source, offset: dot + 1, name: source[start..dot])
+    if len(type_expr) > 0 {
+        let type_ref = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: base_type_name(expr: type_expr))
+        if type_ref >= 0 and type_ref % 4 == 0 {
+            return type_ref / 4
+        }
+    }
+    return -1
+}
+
 func is_word_byte(anon c: int64) -> bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
 }
@@ -511,6 +535,30 @@ func handle_hover(id_val: json.Value, params: json.Value) -> none {
         }
         write_hover_response(:id_val, :signature, :doc)
         return none
+    }
+    mut word_start = offset
+    for word_start > 0 and is_word_byte(text[word_start - 1]) {
+        word_start -= 1
+    }
+    if recorded_kind(:cg, start: word_start) is Some(kind) {
+        write_hover_response(:id_val, signature: f"{word}: {cg.kind_display(kind)}", :doc)
+        return none
+    }
+    // A method of the receiver's struct, when its type is known.
+    if word_start > 0 and text[word_start - 1] == '.' {
+        let owner = receiver_struct(:cg, source: text, dot: word_start - 1)
+        if owner >= 0 {
+            for m in cg.structs[owner].methods {
+                if m.name == word and m.decl_id >= 0 {
+                    signature = cg.func_signature_display(name: f"{cg.structs[owner].name}.{m.name}", sig: m.sig)
+                    doc = cg.structs[owner].src_p.func_decls[m.decl_id].doc
+                }
+            }
+            if len(signature) > 0 {
+                write_hover_response(:id_val, :signature, :doc)
+                return none
+            }
+        }
     }
     mut i: int64 = 0
     for i < len(cg.func_names) {
@@ -888,10 +936,40 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
                 }
             }
         } else {
-            // Receiver method completion: find the receiver's declared
-            // type by scanning the source, then enumerate methods +
-            // fields for that type.
-            let type_expr: str = find_type_of(source: text, :offset, name: qualifier)
+            // Receiver method completion: the receiver's type as the
+            // compiler worked it out, or else as declared in the source,
+            // then its methods and fields.
+            mut dot = offset
+            for dot > 0 and is_word_byte(text[dot - 1]) {
+                dot -= 1
+            }
+            dot -= 1
+            mut recv_start = dot
+            for recv_start > 0 and is_word_byte(text[recv_start - 1]) {
+                recv_start -= 1
+            }
+            mut type_expr: str = ""
+            mut struct_idx = -1
+            if dot >= 0 and recorded_kind(:cg, start: recv_start) is Some(kind) {
+                match kind {
+                    .KStr -> type_expr = "str"
+                    .KInt64 -> type_expr = "int64"
+                    .KBool -> type_expr = "bool"
+                    .KStruct(idx, _args) -> {
+                        type_expr = cg.structs[idx].name
+                        struct_idx = idx
+                    }
+                    else none
+                }
+            } else {
+                type_expr = find_type_of(source: text, :offset, name: qualifier)
+                if len(type_expr) > 0 {
+                    let type_ref: int64 = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: base_type_name(expr: type_expr))
+                    if type_ref >= 0 and type_ref % 4 == 0 {
+                        struct_idx = type_ref / 4
+                    }
+                }
+            }
             if len(type_expr) > 0 {
                 let typename: str = base_type_name(expr: type_expr)
                 for pm in cg.prim_methods {
@@ -906,9 +984,8 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
                         items += [completion_item(label: pm.name, kind: 3)]
                     }
                 }
-                let type_ref: int64 = buffer_type(:cg, qualifier: type_qualifier(expr: type_expr), word: typename)
-                if type_ref >= 0 and type_ref % 4 == 0 {
-                    let s: codegen.StructInfo = cg.structs[type_ref / 4]
+                if struct_idx >= 0 {
+                    let s: codegen.StructInfo = cg.structs[struct_idx]
                     for m in s.methods {
                         if m.decl_id >= 0 and should_include(name: m.name, :show_internal) {
                             items += [completion_item(label: m.name, kind: 3)]

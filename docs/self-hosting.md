@@ -136,3 +136,5 @@ With `KOD_SHADOW_TYPES` set, the compiler reports on stderr two things that woul
 
 - `SHADOW <phases> file:line <first> -> <later>`: an expression whose inferred type changed within one function. The phases are `C` (reserving the function's slots, which types only function literals and, for the inliner, a callee's locals), `W` (the walk that checks whether a function returns) and `E` (compiling). Narrowing (`x is T(y)`, `x? or d`) and a generic instance's default fields are the expected `EE` cases.
 - `UNTYPED-STORE file <function number> <name>`: a store into a binding before it has a type, which counts the value as a reference whatever it is. A program that compiles should have none.
+
+`tests/shadow_types_test.py` runs this over every `.kod` file in the repo and fails on anything but an `EE` change in a file that compiles. The language server relies on it: it compiles the buffer with `record_kinds`, which keeps the type each local had where it was compiled, and shows those types on hover and uses them to complete after `x.`.
