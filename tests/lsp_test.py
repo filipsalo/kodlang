@@ -1807,3 +1807,104 @@ def test_completion_on_a_receiver_whose_type_is_inferred(lsp_binary):
     labels = _completion_labels(responses, 2)
     assert "distance" in labels
     assert "x" in labels
+
+
+CHAIN_SOURCE = (
+    "type Other = struct {\n"  # 0
+    "    v: str\n"  # 1
+    "    func twice(self) -> str { return self.v }\n"  # 2
+    "}\n"  # 3
+    "type Inner = struct {\n"  # 4
+    "    v: int64\n"  # 5
+    "    func twice(self) -> int64 { return self.v * 2 }\n"  # 6
+    "    func half(self) -> int64 { return self.v / 2 }\n"  # 7
+    "}\n"  # 8
+    "type Outer = struct {\n"  # 9
+    "    inner: Inner\n"  # 10
+    "    items: [Inner]\n"  # 11
+    "    func get(self) -> Inner { return self.inner }\n"  # 12
+    "}\n"  # 13
+    "func make() -> Outer {\n"  # 14
+    "    return Outer(inner: Inner(v: 1), items: [Inner(v: 2)])\n"  # 15
+    "}\n"  # 16
+    "// A guess from the text would take `inner` for an Other, and `twice` for Other's.\n"  # 17
+    "func misleading(inner: Other) -> str { return inner.twice() }\n"  # 18
+    "func main() -> int64 {\n"  # 19
+    "    let o = make()\n"  # 20
+    "    print_int(o.inner.v)\n"  # 21
+    "    print_int(make().inner.v)\n"  # 22
+    "    print_int(o.items[0].v)\n"  # 23
+    "    print_int(o.get().twice())\n"  # 24
+    "    return 0\n"  # 25
+    "}\n"  # 26
+)
+
+
+def _hover_after(source, line, needle):
+    """The position just past the `.` of `needle` (which starts with one) on `line`."""
+    line, col = _at(source, line, needle)
+    return line, col + 1
+
+
+def test_hover_on_a_field_of_a_field(lsp_binary):
+    value, diagnostics = _hover_and_diagnostics(
+        lsp_binary, CHAIN_SOURCE, *_hover_after(CHAIN_SOURCE, 21, ".v")
+    )
+    assert diagnostics == []
+    assert value is not None and "Inner.v: int64" in value
+
+
+def test_hover_on_a_field_of_a_call_and_of_an_element(lsp_binary):
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, CHAIN_SOURCE, *_hover_after(CHAIN_SOURCE, 22, ".v")
+    )
+    assert value is not None and "Inner.v: int64" in value
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, CHAIN_SOURCE, *_hover_after(CHAIN_SOURCE, 23, ".v")
+    )
+    assert value is not None and "Inner.v: int64" in value
+
+
+def test_hover_on_a_method_of_a_method_result(lsp_binary):
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, CHAIN_SOURCE, *_hover_after(CHAIN_SOURCE, 24, ".twice")
+    )
+    assert value is not None and "Inner.twice" in value and "Other" not in value
+
+
+def test_completion_after_a_field_of_a_field(lsp_binary):
+    source = CHAIN_SOURCE.replace("print_int(o.inner.v)", "print_int(o.inner.tw)")
+    uri = "file:///tmp/chains.kod"
+    line, col = _at(source, 21, ".tw")
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": col + 3},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "twice" in labels
+    assert "half" in labels

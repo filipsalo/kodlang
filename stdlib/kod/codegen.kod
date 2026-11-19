@@ -1135,8 +1135,10 @@ type Codegen = struct {
     shadow_fn: int64 = 0
     shadow_seen: StrMap = StrMap()
     shadow_collecting: int64 = 0
-    // For the LSP: the module whose names get their compiled types recorded
-    // in `recorded_kinds`, by the offset each name starts at ("" for none).
+    // For the LSP: the module whose expressions get their compiled types
+    // recorded in `recorded_kinds` ("" for none), keyed by an offset times 4
+    // plus what is there: 0 a local, starting at it; 1 `a.b`, at `b`; 2 a
+    // call, at the name called; 3 `xs[i]`, at `i`.
     record_path: str = ""
     recorded_kinds: Map[int64, TypeKind] = Map[int64, TypeKind]()
     // The inliner's probe of a callee's locals: collection types each `let`.
@@ -10173,7 +10175,7 @@ type Codegen = struct {
     }
 
     func compile_expr_now(self, anon expr_id: int64) -> Val {
-        if len(self.record_path) > 0 and self.p.exprs[expr_id] is .Ident(_name) {
+        if len(self.record_path) > 0 and self.p.path == self.record_path and self.recordable(expr_id) {
             self.infer_kind(expr_id)
         }
         match self.p.exprs[expr_id] {
@@ -15064,26 +15066,58 @@ type Codegen = struct {
         return kind
     }
 
-    // A local's type as compiling its own function sees it: not while slots are
-    // reserved, a function is walked or a callee probed, nor in a generic
-    // instance, whose types are its type arguments'.
+    // Whether record_kind keeps the type of an expression of this shape.
+    func recordable(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .Ident(_name) -> return true
+            .Call(_callee, _args) -> return true
+            .Binary(_lhs, op, _rhs) -> return op is .Dot or op is .Index
+            else return false
+        }
+    }
+
+    // An expression's type as compiling its own function sees it: not while
+    // slots are reserved, a function is walked or a callee probed, nor in a
+    // generic instance, whose types are its type arguments'.
     func record_kind(self, anon expr_id: int64, kind: TypeKind) -> none {
-        if self.p.path != self.record_path {
+        if self.shadow_collecting > 0 or self.inline_probe or self.inline_depth > 0 {
             return
         }
-        let .Ident(name) = self.p.exprs[expr_id] else { return }
-        let i = self.var_index(name)
-        if i < 0 or not self.vars[i].bound {
+        if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 {
             return
         }
-        if self.shadow_collecting > 0 or self.walking_fn != "" or self.inline_probe or self.inline_depth > 0 {
+        if not self.recordable(expr_id) or self.walking_fn != "" or self.p.path != self.record_path or self.kind_has_unknown(kind) {
             return
         }
-        if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 or self.kind_has_unknown(kind) {
+        mut key = -1
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> {
+                let i = self.var_index(name)
+                if i >= 0 and self.vars[i].bound {
+                    key = self.p.expr_spans[expr_id].start * 4
+                }
+            }
+            .Binary(_lhs, op, rhs) -> {
+                if op is .Dot and self.p.exprs[rhs] is .Ident(_field) {
+                    key = self.p.expr_spans[rhs].start * 4 + 1
+                } else if op is .Index {
+                    key = self.p.expr_spans[rhs].start * 4 + 3
+                }
+            }
+            .Call(callee, _args) -> {
+                if self.p.exprs[callee] is .Ident(_fn_name) {
+                    key = self.p.expr_spans[callee].start * 4 + 2
+                } else if self.p.exprs[callee] is .Binary(_recv, op, method) and op is .Dot and self.p.exprs[method] is .Ident(_m) {
+                    key = self.p.expr_spans[method].start * 4 + 2
+                }
+            }
+            else none
+        }
+        if key < 0 {
             return
         }
         let recorded = self.recorded_kinds
-        recorded.set(self.p.expr_spans[expr_id].start, kind)
+        recorded.set(key, kind)
     }
 
     func infer_kind_raw(self, anon expr_id: int64) -> TypeKind {
