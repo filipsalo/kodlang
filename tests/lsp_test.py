@@ -1908,3 +1908,80 @@ def test_completion_after_a_field_of_a_field(lsp_binary):
     labels = _completion_labels(responses, 2)
     assert "twice" in labels
     assert "half" in labels
+
+
+OPTIONAL_SOURCE = (
+    "type Decoy = struct {\n"  # 0
+    "    name: int64\n"  # 1
+    "    func label(self) -> int64 { return self.name }\n"  # 2
+    "}\n"  # 3
+    "type Node = struct {\n"  # 4
+    "    name: str\n"  # 5
+    "    next: Node? = none\n"  # 6
+    "    func label(self) -> str { return self.name }\n"  # 7
+    "    func parent(self) -> Node? { return self.next }\n"  # 8
+    "}\n"  # 9
+    "func misleading(n: Decoy) -> int64 { return n.label() }\n"  # 10
+    "func main() -> int64 {\n"  # 11
+    '    let n = Node(name: "a", next: Node(name: "b"))\n'  # 12
+    '    let first = n.next?.name? or ""\n'  # 13
+    '    let second = n.next?.next?.label()? or ""\n'  # 14
+    '    let third = n.parent()?.name? or ""\n'  # 15
+    "    print(first + second + third)\n"  # 16
+    "    return 0\n"  # 17
+    "}\n"  # 18
+)
+
+
+def test_hover_through_optional_chains(lsp_binary):
+    value, diagnostics = _hover_and_diagnostics(
+        lsp_binary, OPTIONAL_SOURCE, *_hover_after(OPTIONAL_SOURCE, 13, ".name")
+    )
+    assert diagnostics == []
+    assert value is not None and "Node.name: str" in value
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, OPTIONAL_SOURCE, *_hover_after(OPTIONAL_SOURCE, 14, ".label")
+    )
+    assert value is not None and "Node.label" in value and "Decoy" not in value
+    value, _ = _hover_and_diagnostics(
+        lsp_binary, OPTIONAL_SOURCE, *_hover_after(OPTIONAL_SOURCE, 15, ".name")
+    )
+    assert value is not None and "Node.name: str" in value
+
+
+def test_completion_after_an_optional_chain(lsp_binary):
+    source = OPTIONAL_SOURCE.replace("n.next?.next?.label()", "n.next?.next?.par")
+    uri = "file:///tmp/optchain.kod"
+    line, col = _at(source, 14, "?.par")
+    responses = drive(
+        lsp_binary,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "kod",
+                        "version": 1,
+                        "text": source,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": col + 5},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ],
+    )
+    labels = _completion_labels(responses, 2)
+    assert "parent" in labels
+    assert "next" in labels

@@ -484,13 +484,25 @@ func receiver_kind(cg: codegen.Codegen, source: str, dot: int64) -> codegen.Type
         return none
     }
     let last = source[end - 1]
+    // `x?.`: what `x` holds.
+    if last == '?' {
+        let held = receiver_kind(:cg, :source, dot: end - 1)
+        if held is Some(.KOptional(inner)) {
+            return inner
+        }
+        return held
+    }
     if is_word_byte(last) {
         mut start = end
         for start > 0 and is_word_byte(source[start - 1]) {
             start -= 1
         }
         if start > 0 and source[start - 1] == '.' {
-            return cg.recorded_kinds.get(start * 4 + 1)
+            if cg.recorded_kinds.get(start * 4 + 1) is Some(kind) {
+                return kind
+            }
+            // Not recorded, as in an optional chain: the field of what it's read from.
+            return member_kind(:cg, of: receiver_kind(:cg, :source, dot: start - 1), name: source[start..end], call: false)
         }
         return cg.recorded_kinds.get(start * 4)
     }
@@ -533,7 +545,32 @@ func receiver_kind(cg: codegen.Codegen, source: str, dot: int64) -> codegen.Type
     if name_start == i {
         return none
     }
-    return cg.recorded_kinds.get(name_start * 4 + 2)
+    if cg.recorded_kinds.get(name_start * 4 + 2) is Some(kind) {
+        return kind
+    }
+    if name_start > 0 and source[name_start - 1] == '.' {
+        return member_kind(:cg, of: receiver_kind(:cg, :source, dot: name_start - 1), name: source[name_start..i], call: true)
+    }
+    return none
+}
+
+// The type of field `name` of the struct `of` is, or of what its method
+// `name` returns, with `call`. none when `of` isn't a struct that has one.
+func member_kind(cg: codegen.Codegen, of: codegen.TypeKind?, name: str, call: bool) -> codegen.TypeKind? {
+    let .Some(kind) = of else { return none }
+    let .KStruct(idx, _args) = kind else { return none }
+    if call {
+        if cg.structs[idx].method_idx.get(name) is Some(mi) {
+            return cg.structs[idx].methods[mi].sig.return_kind
+        }
+        return none
+    }
+    for f in cg.structs[idx].fields {
+        if f.name == name {
+            return f.kind
+        }
+    }
+    return none
 }
 
 // The struct of the receiver before the `.` at `dot`: the type the compiler
@@ -986,7 +1023,13 @@ func handle_completion(id_val: json.Value, params: json.Value) -> none {
     let show_internal: bool = len(partial) > 0 and partial[0] == '_'
     let cg: codegen.Codegen = compile_or_cached(:uri)
     mut items: [json.Value] = []
-    if len(qualifier) > 0 {
+    // After any `.`: a name's, or a call's, an element's or an optional's (`).`, `].`, `?.`).
+    mut word_start = offset
+    for word_start > 0 and is_ident_char(text[word_start - 1]) {
+        word_start -= 1
+    }
+    let after_dot = word_start > 0 and text[word_start - 1] == '.'
+    if len(qualifier) > 0 or after_dot {
         mut is_module: bool = false
         for alias in cg.import_local {
             if alias == qualifier {
