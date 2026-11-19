@@ -64,9 +64,17 @@ were.
    always written `b.cond`, which assembles to the same bytes as `bcond`
    (checked with `asm_diff.py --objects`). Still strings: the condition operand
    of `SetIf`, `Select` and `CompareIf`, and the register names.
-2. **Register roles.** Physical register names in emit sites become roles
-   (`arg(0)`, `scratch(1)`, `frame`, …). The register pools in
-   `regalloc` describe a target rather than being arm64's.
+2. **Register roles** (done for the allocator). The register pools come from a
+   `regalloc.Target` (`TARGET`, `ARM64`): the caller- and callee-saved
+   temporaries, the order the prologue saves registers in, and the argument
+   registers. In codegen the registers it names itself stay spelled as arm64
+   spells them, as role names: `x0`–`x7` for arguments and the result, `x16`,
+   `x17` and `x9` as scratch (`x17` also passes a value to the reference-counting
+   stubs), `fp`, `sp`, `xzr`, and `d0`, `d1` for floats. Renaming them would
+   decide nothing yet: what a second target needs is to tell argument 0 from the
+   result (both `x0` on arm64), and that is for its lowering, which can map
+   `x0` to its first argument register and move the result there after each
+   call.
 3. **No text left.** The ~60 remaining text sites become operations that a target
    lowers to several instructions: the address of a symbol (`adrp` + `add`), a
    large constant (`mov` + `movk`), the prologue and epilogue (`stp`/`ldp`),

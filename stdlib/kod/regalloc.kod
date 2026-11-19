@@ -22,6 +22,58 @@
 import "arrays"
 import "kod/lexing"
 
+// The registers a target gives the allocator (see docs/ir.md). Everything
+// else codegen names (arguments, scratch, the frame) is a role it spells as
+// arm64 does, for a target's lowering to map.
+type Target = struct {
+    // Temporaries a call may clobber, in the order they are filled in.
+    caller_saved: [str]
+    // Temporaries a call keeps (the prologue saves them), likewise.
+    callee_saved: [str]
+    // The callee-saved registers in the order the prologue saves them, and a
+    // pad that makes their number even.
+    save_order: [str]
+    // The registers calls pass arguments and results in, never in the pool.
+    arg_regs: [str]
+    // A register for a vreg nothing names, which therefore costs nothing.
+    unused: str
+}
+
+mut ARM64: Target = Target(
+    caller_saved: ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"],
+    callee_saved: ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27"],
+    save_order: ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"],
+    arg_regs: ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+    unused: "x8",
+)
+
+// The target being compiled for.
+mut TARGET: Target = ARM64
+
+// The first callee-saved register, which a vreg made to be allocated starts as.
+func first_callee_saved() -> str {
+    return TARGET.callee_saved[0]
+}
+
+// The pool `reset` and `evict` start from: the caller-saved registers, then
+// the callee-saved ones at the tail, so `alloc_reg` (which pops the tail)
+// hands those out first.
+func full_pool() -> [str] {
+    let t = TARGET
+    mut pool: [str] = []
+    mut i = len(t.caller_saved) - 1
+    for i >= 0 {
+        pool += [t.caller_saved[i]]
+        i -= 1
+    }
+    i = len(t.callee_saved) - 1
+    for i >= 0 {
+        pool += [t.callee_saved[i]]
+        i -= 1
+    }
+    return pool
+}
+
 // One line in a function's instruction buffer. `Label` lines hold a
 // symbol, not asm, so the scan skips them; `Raw` lines hold the
 // actual asm text and are what `subst_vregs` later rewrites at flush
@@ -753,7 +805,7 @@ type RegPool = struct {
     // Reset per-function state. `vreg_phys` is intentionally left
     // alone — its ids stay valid across the whole module.
     func reset(self) -> none {
-        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+        self.free_regs = full_pool()
         self.cs_in_use = 0
         self.cs_high_water = 0
         self.live = []
@@ -766,7 +818,7 @@ type RegPool = struct {
     // after it, each pair apart only by that save, which `run` can't see.
     func evict(self) -> PoolState {
         let state = PoolState(free_regs: self.free_regs, cs_in_use: self.cs_in_use, live: self.live)
-        self.free_regs = ["x15", "x14", "x13", "x12", "x11", "x10", "x9", "x8", "x27", "x26", "x25", "x24", "x23", "x22", "x21", "x20", "x19"]
+        self.free_regs = full_pool()
         self.cs_in_use = 0
         self.live = []
         self.evicted = true
@@ -827,7 +879,7 @@ type RegPool = struct {
             }
             self.live = still_live
         }
-        if phys == "x0" or phys == "x1" or phys == "x2" or phys == "x3" or phys == "x4" or phys == "x5" or phys == "x6" or phys == "x7" {
+        if arrays.contains(TARGET.arg_regs, phys) {
             return
         }
         if self.is_callee_saved(phys) {
@@ -886,14 +938,13 @@ type RegPool = struct {
 // vreg keeps its alloc-time phys — but downstream vregs may end up
 // sharing that phys because regalloc thinks the slot is free.
 func is_callee_saved_phys(anon phys: str) -> bool {
-    return phys == "x19" or phys == "x20" or phys == "x21" or phys == "x22" or phys == "x23" or phys == "x24" or phys == "x25" or phys == "x26" or phys == "x27"
+    return arrays.contains(TARGET.callee_saved, phys)
 }
 
 // Dense callee-saved name by 0-based slot. `pack` writes back via
 // these so the prologue can save `cs_reg(0)..cs_reg(N-1)` in order.
 func cs_reg(anon n: int64) -> str {
-    let names: [str] = ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
-    return names[n]
+    return TARGET.save_order[n]
 }
 
 // Mangled labels join user names with `$` (`$main$v2`), so a
@@ -1213,13 +1264,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     // A callee-saved vreg that no call or named scratch register comes
     // between the def and the last use of can take any caller-saved one,
     // which the prologue needn't save.
-    for p in ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"] {
+    let target = TARGET
+    for p in target.caller_saved {
         if not arrays.contains(free_caller, p) {
             free_caller = [p] + free_caller
         }
     }
     if strict {
-        for p in ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27"] {
+        for p in target.callee_saved {
             if not arrays.contains(free_callee, p) {
                 free_callee = [p] + free_callee
             }
@@ -1262,7 +1314,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
             // its alloc-time phys (the safe default), unless it isn't
             // named at all, when it needn't count as a register to save.
             if last_use[local_id] == -1 {
-                new_phys[local_id] = "x8"
+                new_phys[local_id] = target.unused
             }
             continue
         }
