@@ -39,35 +39,246 @@ type Insn = enum {
     Slot(store: bool, reg: str, off: int64)
     // `mov dst, src` between registers (vregs or physical), made without text.
     Mov(dst: str, src: str)
-    // `op reg, [base, #off]`, or `op reg, [base]` without `has_off`: a load
-    // or store (`ldr`, `str`, `ldrb`, `strb`, `ldrh`, `strh`) through a register.
-    Mem(op: str, reg: str, base: str, off: int64, has_off: bool)
+    // A load into `reg` (or a store of it) of `width` bytes (1, 2, 4 or 8) at
+    // `base + off`, or at `base` without `has_off`. A 4-byte one has a `w`
+    // register, as arm64 writes it.
+    Mem(load: bool, width: int64, reg: str, base: str, off: int64, has_off: bool)
     // `mn a, b, c, d` with the operands given (up to the first ""): each a
     // register, an immediate, a condition or a symbol, never more than one
     // token (see codegen's emit_op).
-    Op(mn: str, a: str, b: str, c: str, d: str, flags: int64)
+    Op(op: Opcode, a: str, b: str, c: str, d: str, flags: int64)
     // `bl target`.
     Call(target: str)
-    // `op target` (`b`, `beq`, `b.lo`, …), or `op reg, target` for `cbz`
-    // and `cbnz`: `reg` is "" for the others.
-    Branch(op: str, reg: str, target: str)
+    // A jump to `target`, when `kind` says; `reg` is the register tested by
+    // `IfZero` and `IfNonzero`, "" for the others.
+    Branch(kind: BranchKind, reg: str, target: str)
+}
+
+// A condition on the flags a compare sets.
+type Cond = enum {
+    Eq
+    Ne
+    // Unsigned: at least, below, above, at most.
+    Hs
+    Lo
+    Hi
+    Ls
+    Mi
+    Pl
+    Vs
+    Vc
+    Ge
+    Lt
+    Gt
+    Le
+}
+
+// When a `Branch` jumps.
+type BranchKind = enum {
+    Always
+    If(cond: Cond)
+    IfZero
+    IfNonzero
+}
+
+// The arm64 name of a condition.
+func cond_name(anon c: Cond) -> str {
+    match c {
+        .Eq -> return "eq"
+        .Ne -> return "ne"
+        .Hs -> return "hs"
+        .Lo -> return "lo"
+        .Hi -> return "hi"
+        .Ls -> return "ls"
+        .Mi -> return "mi"
+        .Pl -> return "pl"
+        .Vs -> return "vs"
+        .Vc -> return "vc"
+        .Ge -> return "ge"
+        .Lt -> return "lt"
+        .Gt -> return "gt"
+        .Le -> return "le"
+    }
+}
+
+// The condition an arm64 name (or its alias `cs`, `cc`) is.
+func cond_named(anon name: str) -> Cond? {
+    match name {
+        "eq" -> return .Eq
+        "ne" -> return .Ne
+        "hs" -> return .Hs
+        "cs" -> return .Hs
+        "lo" -> return .Lo
+        "cc" -> return .Lo
+        "hi" -> return .Hi
+        "ls" -> return .Ls
+        "mi" -> return .Mi
+        "pl" -> return .Pl
+        "vs" -> return .Vs
+        "vc" -> return .Vc
+        "ge" -> return .Ge
+        "lt" -> return .Lt
+        "gt" -> return .Gt
+        "le" -> return .Le
+        else return none
+    }
+}
+
+// The arm64 mnemonic of a branch.
+func branch_mnemonic(anon kind: BranchKind) -> str {
+    match kind {
+        .Always -> return "b"
+        .If(cond) -> return f"b.{cond_name(cond)}"
+        .IfZero -> return "cbz"
+        .IfNonzero -> return "cbnz"
+    }
+}
+
+// The arm64 mnemonic for a load or store of `width` bytes.
+func mem_mnemonic(load: bool, width: int64) -> str {
+    mut op = "str"
+    if load {
+        op = "ldr"
+    }
+    if width == 1 {
+        return op + "b"
+    }
+    if width == 2 {
+        return op + "h"
+    }
+    return op
+}
+
+// The width of a 4- or 8-byte load or store of `reg`: 4 for a `w` register.
+func reg_width(anon reg: str) -> int64 {
+    if len(reg) > 0 and reg[0] == 'w' {
+        return 4
+    }
+    return 8
 }
 
 // The asm text of a `Mem` line, with `reg` and `base` as its registers.
-func mem_text(op: str, reg: str, base: str, off: int64, has_off: bool) -> str {
+func mem_text(load: bool, width: int64, reg: str, base: str, off: int64, has_off: bool) -> str {
+    let op = mem_mnemonic(:load, :width)
     if has_off {
         return f"\t{op} {reg}, [{base}, #{off}]"
     }
     return f"\t{op} {reg}, [{base}]"
 }
 
-// Whether a `Mem` op writes its register (see writer_at): `ldr` and `ldrb`.
-func mem_writes(anon op: str) -> bool {
-    return op == "ldr" or op == "ldrb"
+// Whether a `Mem` writes its register, as writer_at says for its mnemonic:
+// a load, other than of 2 bytes (`ldrh` isn't on the list).
+func mem_writes(load: bool, width: int64) -> bool {
+    return load and width != 2
+}
+
+// What an `Op` does, whatever a target calls it (see docs/ir.md).
+type Opcode = enum {
+    // A register gets an immediate (or a value given as one token).
+    Move
+    Add
+    Sub
+    Mul
+    DivSigned
+    And
+    Or
+    Xor
+    ShiftLeft
+    // Logical: zeros come in.
+    ShiftRight
+    // Sets the flags from `a - b`.
+    Compare
+    // Compares when the condition in `d` holds, else sets the flags to `c`.
+    CompareIf
+    // `a` is 1 when the condition `b` holds, else 0.
+    SetIf
+    // `a` is `b` when the condition `d` holds, else `c`.
+    Select
+    // The 4 KB page a symbol is on (with an Add of its offset in the page).
+    AddressPage
+    FloatMove
+    FloatAdd
+    FloatSub
+    FloatMul
+    FloatDiv
+    FloatNeg
+    FloatCompare
+    // Calls the address in `a`.
+    CallIndirect
+    Return
+}
+
+// The arm64 mnemonic for an opcode.
+func arm64_mnemonic(anon op: Opcode) -> str {
+    match op {
+        .Move -> return "mov"
+        .Add -> return "add"
+        .Sub -> return "sub"
+        .Mul -> return "mul"
+        .DivSigned -> return "sdiv"
+        .And -> return "and"
+        .Or -> return "orr"
+        .Xor -> return "eor"
+        .ShiftLeft -> return "lsl"
+        .ShiftRight -> return "lsr"
+        .Compare -> return "cmp"
+        .CompareIf -> return "ccmp"
+        .SetIf -> return "cset"
+        .Select -> return "csel"
+        .AddressPage -> return "adrp"
+        .FloatMove -> return "fmov"
+        .FloatAdd -> return "fadd"
+        .FloatSub -> return "fsub"
+        .FloatMul -> return "fmul"
+        .FloatDiv -> return "fdiv"
+        .FloatNeg -> return "fneg"
+        .FloatCompare -> return "fcmp"
+        .CallIndirect -> return "blr"
+        .Return -> return "ret"
+    }
+}
+
+// The opcode an arm64 mnemonic is, for the passes that still read mnemonics.
+func opcode_named(anon mn: str) -> Opcode? {
+    match mn {
+        "mov" -> return .Move
+        "add" -> return .Add
+        "sub" -> return .Sub
+        "cmp" -> return .Compare
+        "cset" -> return .SetIf
+        else return none
+    }
+}
+
+// Whether an opcode's first operand is one it writes, as writer_at says for
+// its arm64 mnemonic (the float ops other than fmov, csel and ccmp aren't).
+func writes_first_op(anon op: Opcode) -> bool {
+    match op {
+        .Move -> return true
+        .Add -> return true
+        .Sub -> return true
+        .Mul -> return true
+        .DivSigned -> return true
+        .And -> return true
+        .Or -> return true
+        .Xor -> return true
+        .ShiftLeft -> return true
+        .ShiftRight -> return true
+        .AddressPage -> return true
+        .SetIf -> return true
+        .FloatMove -> return true
+        else return false
+    }
+}
+
+// Whether an opcode reads its first operand (codegen's first_operand_read).
+func reads_first_op(anon op: Opcode) -> bool {
+    return op is .Compare
 }
 
 // The asm text of an `Op` line.
-func op_text(mn: str, a: str, b: str, c: str, d: str) -> str {
+func op_text(op: Opcode, a: str, b: str, c: str, d: str) -> str {
+    let mn = arm64_mnemonic(op)
     if len(a) == 0 {
         return f"\t{mn}"
     }
@@ -83,15 +294,10 @@ func op_text(mn: str, a: str, b: str, c: str, d: str) -> str {
     return f"\t{mn} {a}, {b}, {c}, {d}"
 }
 
-// Whether `mn` writes its first operand: writer_at's list.
-func writes_first(anon mn: str) -> bool {
-    let n = len(mn)
-    return n >= 3 and n <= 4 and writer_at(mn, start: 0, len: n)
-}
 
 // An `Op`, with its flags worked out once.
-func op(anon mn: str, a: str = "", b: str = "", c: str = "", d: str = "") -> Insn {
-    return .Op(:mn, :a, :b, :c, :d, flags: op_flags(:mn, :a, :b, :c, :d))
+func op(anon op: Opcode, a: str = "", b: str = "", c: str = "", d: str = "") -> Insn {
+    return .Op(:op, :a, :b, :c, :d, flags: op_flags(:op, :a, :b, :c, :d))
 }
 
 // The flags one operand of an `Op` adds.
@@ -109,23 +315,19 @@ func operand_flags(anon operand: str) -> int64 {
 }
 
 // line_info's flags for an `Op`.
-func op_flags(mn: str, a: str, b: str, c: str, d: str) -> int64 {
+func op_flags(op: Opcode, a: str, b: str, c: str, d: str) -> int64 {
     mut flags: int64 = 0
-    if mn == "mov" {
-        flags = MN_MOV << 8
-    } else if mn == "cset" {
-        flags = MN_CSET << 8
-    } else if mn == "add" {
-        flags = MN_ADD << 8
-    } else if mn == "sub" {
-        flags = MN_SUB << 8
-    }
-    if mn == "blr" {
-        flags = flags | INFO_CLOBBERS
+    match op {
+        .Move -> flags = MN_MOV << 8
+        .SetIf -> flags = MN_CSET << 8
+        .Add -> flags = MN_ADD << 8
+        .Sub -> flags = MN_SUB << 8
+        .CallIndirect -> flags = INFO_CLOBBERS
+        else none
     }
     flags = flags | operand_flags(a) | operand_flags(b) | operand_flags(c) | operand_flags(d)
     // An immediate add or sub can't encode past 4095 (codegen's big_immediate_at).
-    if (mn == "add" or mn == "sub") and len(d) == 0 and len(c) > 1 and c[0] == '#' {
+    if (op is .Add or op is .Sub) and len(d) == 0 and len(c) > 1 and c[0] == '#' {
         let value = parse_number(c[1..len(c)])
         if value > 4095 {
             flags = flags | INFO_BIG_IMM
@@ -135,7 +337,8 @@ func op_flags(mn: str, a: str, b: str, c: str, d: str) -> int64 {
 }
 
 // The asm text of a `Branch` line, with `reg` as its register.
-func branch_text(op: str, reg: str, target: str) -> str {
+func branch_text(kind: BranchKind, reg: str, target: str) -> str {
+    let op = branch_mnemonic(kind)
     if len(reg) == 0 {
         return f"\t{op} {target}"
     }
@@ -427,11 +630,13 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return flags
         }
-        .Mem(op, reg, base, off, has_off) -> {
+        .Mem(load, width, reg, base, off, has_off) -> {
             mut flags: int64 = 0
-            if op == "ldr" {
+            // `ldr` and `str`: a 4- or 8-byte access.
+            let word = width >= 4
+            if word and load {
                 flags = MN_LDR << 8
-            } else if op == "str" {
+            } else if word {
                 flags = MN_STR << 8
             }
             if reg_clobbers(reg) or reg_clobbers(base) {
@@ -441,12 +646,12 @@ func insn_flags(anon insn: Insn) -> int64 {
                 flags = flags | INFO_FP
             }
             // As codegen's big_immediate_at reads `[base, #off]`.
-            if has_off and (op == "ldr" or op == "str") and off > 32760 {
+            if has_off and word and off > 32760 {
                 flags = flags | INFO_BIG_IMM
             }
             return flags
         }
-        .Op(_mn, _a, _b, _c, _d, flags) -> return flags
+        .Op(_op, _a, _b, _c, _d, flags) -> return flags
         .Call(target) -> {
             // A panic never comes back, so whatever it clobbers isn't read after it.
             if never_returns(target) {
@@ -454,7 +659,7 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return INFO_CLOBBERS
         }
-        .Branch(_op, reg, _target) -> {
+        .Branch(_kind, reg, _target) -> {
             if reg_clobbers(reg) {
                 return INFO_CLOBBERS
             }
@@ -749,7 +954,7 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
-        if insn is .Mem(_op, reg, base, _off, _has_off) {
+        if insn is .Mem(_load, _width, reg, base, _off, _has_off) {
             for r in [reg, base] {
                 let id = reg_vreg(r)
                 if id >= vreg_start and id < vreg_start + n_local {
@@ -758,14 +963,14 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
-        if insn is .Branch(_op, reg, _target) {
+        if insn is .Branch(_kind, reg, _target) {
             let id = reg_vreg(reg)
             if id >= vreg_start and id < vreg_start + n_local {
                 counts[id - vreg_start] += 1
             }
             continue
         }
-        if insn is .Op(_mn, a, b, c, d, _flags) {
+        if insn is .Op(_op, a, b, c, d, _flags) {
             count_operand(a, :counts, :vreg_start, :n_local)
             count_operand(b, :counts, :vreg_start, :n_local)
             count_operand(c, :counts, :vreg_start, :n_local)
@@ -913,7 +1118,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     last_use[local_id] = line_idx
                 }
             }
-            .Mem(op, reg, base, _off, _has_off) -> {
+            .Mem(load, width, reg, base, _off, _has_off) -> {
                 if reg_clobbers(reg) or reg_clobbers(base) {
                     clobbers = 1
                 }
@@ -924,7 +1129,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     if first[local_id] < 0 {
                         first[local_id] = line_idx
                     }
-                    if mem_writes(op) and def_line[local_id] == -1 {
+                    if mem_writes(:load, :width) and def_line[local_id] == -1 {
                         def_line[local_id] = line_idx
                     }
                     last_use[local_id] = line_idx
@@ -938,11 +1143,11 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     last_use[local_id] = line_idx
                 }
             }
-            .Op(mn, a, b, c, d, flags) -> {
+            .Op(op, a, b, c, d, flags) -> {
                 if (flags & INFO_CLOBBERS) != 0 {
                     clobbers = 1
                 }
-                note_operand(a, written: writes_first(mn), :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(a, written: writes_first_op(op), :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
                 note_operand(b, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
                 note_operand(c, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
                 note_operand(d, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
@@ -952,7 +1157,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     clobbers = 1
                 }
             }
-            .Branch(_op, reg, _target) -> {
+            .Branch(_kind, reg, _target) -> {
                 if reg_clobbers(reg) {
                     clobbers = 1
                 }
@@ -1223,7 +1428,7 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], last_use: [int64]) 
     mut tops: [int64] = []
     mut bottoms: [int64] = []
     for i, insn in body {
-        if insn is .Branch(_op, _reg, branch_to) {
+        if insn is .Branch(_kind, _reg, branch_to) {
             if label_line.get(branch_to) is Some(t) {
                 if t <= i {
                     tops += [t]

@@ -124,7 +124,7 @@ make asm-diff            # compare against HEAD
 make asm-diff BASE=main  # or any other revision
 ```
 
-Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself.
+Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself. With `--objects` (`uv run python tools/asm_diff.py --objects`), a file whose assembly is only written differently, the same diagnostics and status and the same object bytes once assembled (`bne` against `b.ne`), counts as unchanged.
 
 ### Checking that types are worked out consistently
 

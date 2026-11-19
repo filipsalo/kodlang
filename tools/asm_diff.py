@@ -1,6 +1,6 @@
 """Compare sh_kodc output between a base revision and the working tree.
 
-Usage: uv run python tools/asm_diff.py [BASE]   (default: HEAD; or `make asm-diff`)
+Usage: uv run python tools/asm_diff.py [--objects] [BASE]   (default: HEAD; or `make asm-diff`)
        uv run python tools/asm_diff.py --compilers OLD NEW   (two built compilers)
 
 Builds sh_kodc at BASE (cached as build/asm-diff/<sha>/sh_kodc), then
@@ -14,6 +14,7 @@ under build/asm-diff/out/. Exits 1 if anything differs.
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -91,7 +92,34 @@ def compile_with(compiler: Path, path: str) -> str:
     return f"{r.stdout}--- stderr ---\n{r.stderr}--- exit {r.returncode} ---\n"
 
 
-def compare(base: Path, new: Path, out: Path, label: str, versus: str) -> int:
+def same_object(base_out: str, new_out: str) -> bool:
+    """Whether two outputs differ only in how the assembly is written: the
+    same diagnostics and status, and both assemble to the same bytes."""
+    base_asm, base_tail = base_out.split("--- stderr ---", 1)
+    new_asm, new_tail = new_out.split("--- stderr ---", 1)
+    if base_tail != new_tail:
+        return False
+    if not base_asm.strip() and not new_asm.strip():
+        return True
+    with tempfile.TemporaryDirectory() as d:
+        objects = []
+        for name, text in [("base", base_asm), ("new", new_asm)]:
+            source, obj = Path(d) / f"{name}.s", Path(d) / f"{name}.o"
+            source.write_text(text)
+            assembled = subprocess.run(
+                ["as", "-target", "arm64-apple-darwin", "-o", str(obj), str(source)],
+                capture_output=True,
+                check=False,
+            )
+            if assembled.returncode != 0:
+                return False
+            objects.append(obj.read_bytes())
+    return objects[0] == objects[1]
+
+
+def compare(
+    base: Path, new: Path, out: Path, label: str, versus: str, objects: bool = False
+) -> int:
     files = corpus()
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(
@@ -100,8 +128,12 @@ def compare(base: Path, new: Path, out: Path, label: str, versus: str) -> int:
 
     shutil.rmtree(out, ignore_errors=True)
     differing = []
+    respelled = 0
     for f, base_out, new_out in results:
         if base_out == new_out:
+            continue
+        if objects and same_object(base_out, new_out):
+            respelled += 1
             continue
         differing.append(f)
         stem = f.replace("/", "__")
@@ -111,6 +143,8 @@ def compare(base: Path, new: Path, out: Path, label: str, versus: str) -> int:
         print(f"differs: {f}")
 
     print(f"{label}: {len(files)} files, {len(differing)} differ {versus}")
+    if objects:
+        print(f"  {respelled} more differ only in how the assembly is written")
     if differing:
         stem = differing[0].replace("/", "__")
         rel = out.relative_to(ROOT)
@@ -126,11 +160,16 @@ def main() -> int:
         return compare(
             ROOT / old, ROOT / new, out, "compilers", f"between {old} and {new}"
         )
-    base_rev = sys.argv[1] if len(sys.argv) > 1 else "HEAD"
+    args = sys.argv[1:]
+    objects = "--objects" in args
+    args = [a for a in args if a != "--objects"]
+    base_rev = args[0] if args else "HEAD"
     base = build_base_compiler(base_rev)
     subprocess.run(["make", "-s", "stage1"], cwd=ROOT, check=True, stdout=sys.stderr)
     new = ROOT / "build" / "stage1" / "sh_kodc"
-    return compare(base, new, OUT / "out", "asm-diff", f"from {base_rev}")
+    return compare(
+        base, new, OUT / "out", "asm-diff", f"from {base_rev}", objects=objects
+    )
 
 
 if __name__ == "__main__":

@@ -56,10 +56,14 @@ Every step until the first optimisation keeps the output byte-identical, checked
 with `make asm-diff` over the whole corpus, as the structured-instructions steps
 were.
 
-1. **Neutral operations.** `Op`'s mnemonic strings, `Branch`'s ops and `Mem`'s
-   ops become enums of operations (`Add`, `Compare`, `Load(width)`,
-   `BranchIf(cond)`, …). Arm64 lowering prints the mnemonic for each.
-   Mechanical, over the ~600 structured emit sites.
+1. **Neutral operations** (done). `Op` holds a `regalloc.Opcode` (`Add`,
+   `Compare`, `SetIf`, `AddressPage`, …), `Mem` a direction and a width in
+   bytes, and `Branch` a `BranchKind` (`Always`, `If(Cond)`, `IfZero`,
+   `IfNonzero`); the arm64 lowering (`arm64_mnemonic`, `mem_mnemonic`,
+   `branch_mnemonic`) prints their mnemonics. Conditional branches are now
+   always written `b.cond`, which assembles to the same bytes as `bcond`
+   (checked with `asm_diff.py --objects`). Still strings: the condition operand
+   of `SetIf`, `Select` and `CompareIf`, and the register names.
 2. **Register roles.** Physical register names in emit sites become roles
    (`arg(0)`, `scratch(1)`, `frame`, …). The register pools in
    `regalloc` describe a target rather than being arm64's.

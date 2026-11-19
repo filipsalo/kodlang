@@ -662,10 +662,10 @@ func insn_text(anon insn: regalloc.Insn) -> str {
         .Raw(text, _info) -> return text
         .Slot(store, reg, off) -> return regalloc.slot_text(:store, :reg, :off)
         .Mov(dst, src) -> return f"\tmov {dst}, {src}"
-        .Mem(op, reg, base, off, has_off) -> return regalloc.mem_text(:op, :reg, :base, :off, :has_off)
-        .Op(mn, a, b, c, d, _flags) -> return regalloc.op_text(:mn, :a, :b, :c, :d)
+        .Mem(load, width, reg, base, off, has_off) -> return regalloc.mem_text(:load, :width, :reg, :base, :off, :has_off)
+        .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, :a, :b, :c, :d)
         .Call(target) -> return f"\tbl {target}"
-        .Branch(op, reg, target) -> return regalloc.branch_text(:op, :reg, :target)
+        .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, :reg, :target)
         .Label(_name) -> return ""
     }
 }
@@ -685,7 +685,8 @@ func one_token(anon operand: str) -> bool {
 func insn_parts(anon insn: regalloc.Insn) -> [str] {
     match insn {
         .Mov(dst, src) -> return ["mov", dst, src]
-        .Op(mn, a, b, c, d, _flags) -> {
+        .Op(op, a, b, c, d, _flags) -> {
+            let mn = regalloc.arm64_mnemonic(op)
             if len(a) == 0 {
                 return [mn]
             }
@@ -701,7 +702,8 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
             return [mn, a, b, c, d]
         }
         .Call(target) -> return ["bl", target]
-        .Branch(op, reg, target) -> {
+        .Branch(kind, reg, target) -> {
+            let op = regalloc.branch_mnemonic(kind)
             if len(reg) == 0 {
                 return [op, target]
             }
@@ -709,7 +711,7 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
         }
         // `[fp, ...]` has a bracket, which asm_parts gives no parts for.
         .Slot(_store, _reg, _off) -> return []
-        .Mem(_op, _reg, _base, _off, _has_off) -> return []
+        .Mem(_load, _width, _reg, _base, _off, _has_off) -> return []
         .Label(_name) -> return []
         .Raw(text, _info) -> return asm_parts(text)
     }
@@ -835,34 +837,34 @@ func forwarded(anon next: regalloc.Insn, dst: str, src: str, once: bool) -> rega
             }
             return none
         }
-        .Branch(op, reg, target) -> {
+        .Branch(kind, reg, target) -> {
             // `cbz dst, L` reads it as its first operand; a `b…` branch names no register.
-            if (op == "cbz" or op == "cbnz") and reg == dst and once {
-                return .Branch(:op, reg: src, :target)
+            if (kind is .IfZero or kind is .IfNonzero) and reg == dst and once {
+                return .Branch(:kind, reg: src, :target)
             }
             return none
         }
-        .Mem(op, reg, base, off, has_off) -> {
+        .Mem(load, width, reg, base, off, has_off) -> {
             // `ldr dst, [dst, ...]`: load through `src`.
-            if op == "ldr" and reg == dst and base == dst {
-                return .Mem(:op, :reg, base: src, :off, :has_off)
+            if load and width >= 4 and reg == dst and base == dst {
+                return .Mem(:load, :width, :reg, base: src, :off, :has_off)
             }
             if not once or (reg == dst and base == dst) {
                 return none
             }
             if base == dst {
-                return .Mem(:op, :reg, base: src, :off, :has_off)
+                return .Mem(:load, :width, :reg, base: src, :off, :has_off)
             }
-            // As its first operand: only an instruction that reads that one.
-            if reg == dst and first_operand_read(op) {
-                return .Mem(:op, reg: src, :base, :off, :has_off)
+            // As its first operand: only a store reads that one.
+            if reg == dst and not load {
+                return .Mem(:load, :width, reg: src, :base, :off, :has_off)
             }
             return none
         }
-        .Op(mn, a, b, c, d, _flags) -> {
+        .Op(op, a, b, c, d, _flags) -> {
             // As for its text: `dst` named once, and not as a first operand
             // the instruction writes.
-            if not once or mn.starts_with("b") or mn == "ret" {
+            if not once or op is .CallIndirect or op is .Return {
                 return none
             }
             mut operands = [a, b, c, d]
@@ -875,11 +877,11 @@ func forwarded(anon next: regalloc.Insn, dst: str, src: str, once: bool) -> rega
                     at = k
                 }
             }
-            if at < 0 or (at == 0 and not first_operand_read(mn)) {
+            if at < 0 or (at == 0 and not regalloc.reads_first_op(op)) {
                 return none
             }
             operands[at] = src
-            return regalloc.op(mn, a: operands[0], b: operands[1], c: operands[2], d: operands[3])
+            return regalloc.op(op, a: operands[0], b: operands[1], c: operands[2], d: operands[3])
         }
         .Call(_target) -> return none
         .Label(_name) -> return none
@@ -943,10 +945,10 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 off = slot_off
                 has_off = slot_off < 0
             }
-            .Mem(op, mem_reg, mem_base, mem_off, mem_has_off) -> {
-                if op == "ldr" or op == "str" {
+            .Mem(load, width, mem_reg, mem_base, mem_off, mem_has_off) -> {
+                if width >= 4 {
                     access = true
-                    store = op == "str"
+                    store = not load
                     reg = mem_reg
                     base = mem_base
                     off = mem_off
@@ -996,9 +998,9 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
         if b[i] is .Mov(dst, src) {
             copy_dst = dst
             copy_src = src
-        } else if b[i] is .Op(mn, a, op_b, op_c, _d, _flags) {
-            // Only a two-operand `mov` copies, and neither rule ends at an `Op`.
-            if mn == "mov" and len(op_c) == 0 {
+        } else if b[i] is .Op(op, a, op_b, op_c, _d, _flags) {
+            // Only a two-operand move copies, and neither rule ends at an `Op`.
+            if op is .Move and len(op_c) == 0 {
                 copy_dst = a
                 copy_src = op_b
             }
@@ -1028,7 +1030,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 continue
             }
         }
-        if b[i] is .Mov(_dst, _src) or b[i] is .Op(_mn, _a, _b, _c, _d, _flags) {
+        if b[i] is .Mov(_dst, _src) or b[i] is .Op(_op, _a, _b, _c, _d, _flags) {
             // Not a store, so not the line before a load the second rule looks at.
             prev = ""
             prev_slot = false
@@ -1042,7 +1044,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
         prev_slot = false
         mut before_text = before
         if before_slot {
-            before_text = regalloc.mem_text(op: "str", reg: prev_reg, base: prev_base, off: prev_off, has_off: prev_has_off)
+            before_text = regalloc.mem_text(load: false, width: regalloc.reg_width(prev_reg), reg: prev_reg, base: prev_base, off: prev_off, has_off: prev_has_off)
         }
         if len(before_text) > 0 and t.starts_with("\tldr ") and t.ends_with("]") and before_text.starts_with("\tstr ") and before_text.ends_with("]") and not t.contains("!") and not before_text.contains("!") {
             if t.find(", [") is Some(k) and before_text.find(", [") is Some(pk) {
@@ -1082,10 +1084,11 @@ func small_imm(anon op: str) -> bool {
 // A branch to `target` taken when condition `cond` holds, or when it
 // doesn't.
 func branch_on(anon cond: str, when_true: bool, target: str) -> regalloc.Insn {
-    if when_true {
-        return .Branch(op: f"b{cond}", reg: "", :target)
+    mut name = cond
+    if not when_true {
+        name = opposite_condition(cond)
     }
-    return .Branch(op: f"b{opposite_condition(cond)}", reg: "", :target)
+    return .Branch(kind: .If(cond: must regalloc.cond_named(name)), reg: "", :target)
 }
 
 // For a conditional branch `\tbeq L`, `\tcbz x1, L` or `\ttbz x1, #3, L`: the
@@ -2584,9 +2587,9 @@ type Codegen = struct {
     func read_extern_var(self, anon symbol: str) -> Val {
         let label = extern_label(symbol)
         let reg = self.pool.alloc_reg()
-        self.emit_op("adrp", a: reg, b: f"{label}@GOTPAGE")
+        self.emit_op(.AddressPage, a: reg, b: f"{label}@GOTPAGE")
         self.emit(f"ldr {reg}, [{reg}, {label}@GOTPAGEOFF]")
-        self.emit_mem("ldr", reg: reg, base: reg)
+        self.emit_load(reg, base: reg)
         return .VReg(name: reg)
     }
 
@@ -2605,15 +2608,15 @@ type Codegen = struct {
             self.println("\t.text")
         }
         let done = self.fresh("Lshared")
-        self.emit_op("adrp", a: "x16", b: f"{ref}@PAGE")
+        self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
         self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
-        self.emit_branch("cbnz", reg: "x0", target: done)
+        self.emit_jump_zero("x0", target: done, nonzero: true)
         self.emit_call(f"{lbl}$shared")
-        self.emit_op("adrp", a: "x16", b: f"{ref}@PAGE")
+        self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
         self.emit(f"str x0, [x16, {ref}@PAGEOFF]")
         self.emit_mov("x17", src: "x0")
         self.emit_call("_rc_release_stub")
-        self.emit_op("adrp", a: "x16", b: f"{ref}@PAGE")
+        self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
         self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
         self.emit_label(done)
         return .VReg(name: "x0")
@@ -2643,7 +2646,7 @@ type Codegen = struct {
                     self.float_labels += [lbl]
                     self.float_values += [text]
                     let reg: str = self.pool.alloc_reg()
-                    self.emit_op("adrp", a: reg, b: f"{lbl}@PAGE")
+                    self.emit_op(.AddressPage, a: reg, b: f"{lbl}@PAGE")
                     self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
                     return .VReg(name: reg)
                 }
@@ -3109,8 +3112,8 @@ type Codegen = struct {
             self.fn_cells += [lbl]
         }
         let reg: str = self.pool.alloc_reg()
-        self.emit_op("adrp", a: reg, b: f"Lfn{lbl}@PAGE")
-        self.emit_op("add", a: reg, b: reg, c: f"Lfn{lbl}@PAGEOFF")
+        self.emit_op(.AddressPage, a: reg, b: f"Lfn{lbl}@PAGE")
+        self.emit_op(.Add, a: reg, b: reg, c: f"Lfn{lbl}@PAGEOFF")
         return .VReg(name: reg)
     }
 
@@ -4027,7 +4030,7 @@ type Codegen = struct {
     // routes around that entirely.
     func emit_load_imm(self, anon dest: str, value: int64) -> none {
         if value >= -65535 and value <= 65535 {
-            self.emit_op("mov", a: dest, b: f"#{value}")
+            self.emit_op(.Move, a: dest, b: f"#{value}")
         } else {
             self.emit(f"mov {dest}, #({value} & 0xffff)")
             self.emit(f"movk {dest}, #(({value} >> 16) & 0xffff), lsl #16")
@@ -4039,12 +4042,12 @@ type Codegen = struct {
     // `cmp` takes only a 12-bit immediate, so a larger one goes through a register.
     func emit_cmp_imm(self, anon reg: str, value: int64) -> none {
         if value >= 0 and value <= 4095 {
-            self.emit_op("cmp", a: reg, b: f"#{value}")
+            self.emit_op(.Compare, a: reg, b: f"#{value}")
             return none
         }
         let tmp = self.pool.alloc_reg()
         self.emit_load_imm(tmp, :value)
-        self.emit_op("cmp", a: reg, b: tmp)
+        self.emit_op(.Compare, a: reg, b: tmp)
         self.pool.free_reg(tmp)
     }
 
@@ -4063,24 +4066,35 @@ type Codegen = struct {
         self.push_insn(regalloc.raw(line))
     }
 
-    // `op reg, [base]`, or `op reg, [base, #off]` with an `off`.
-    func emit_mem(self, anon op: str, reg: str, base: str, off: int64? = none) -> none {
+    // A load into `reg` from `base + off` (`base` without an `off`), of 4
+    // bytes for a `w` register and 8 for an `x` one.
+    func emit_load(self, anon reg: str, base: str, off: int64? = none) -> none {
+        self.emit_mem(load: true, :reg, :base, :off)
+    }
+
+    // A store of `reg` at `base + off`, as emit_load.
+    func emit_store(self, anon reg: str, base: str, off: int64? = none) -> none {
+        self.emit_mem(load: false, :reg, :base, :off)
+    }
+
+    func emit_mem(self, load: bool, reg: str, base: str, off: int64?) -> none {
+        let width = regalloc.reg_width(reg)
         if off is Some(at) {
-            self.push_insn(.Mem(:op, :reg, :base, off: at, has_off: true))
+            self.push_insn(.Mem(:load, :width, :reg, :base, off: at, has_off: true))
         } else {
-            self.push_insn(.Mem(:op, :reg, :base, off: 0, has_off: false))
+            self.push_insn(.Mem(:load, :width, :reg, :base, off: 0, has_off: false))
         }
     }
 
     // `mn a, b, c, d`, as many operands as given. Each must be one token (a
     // register, an immediate, a condition, a symbol); one that isn't, such as
     // `x1, lsl #3` passed as one, makes it a text line instead.
-    func emit_op(self, anon mn: str, a: str = "", b: str = "", c: str = "", d: str = "") -> none {
+    func emit_op(self, anon op: regalloc.Opcode, a: str = "", b: str = "", c: str = "", d: str = "") -> none {
         if not one_token(a) or not one_token(b) or not one_token(c) or not one_token(d) {
-            self.emit(regalloc.op_text(:mn, :a, :b, :c, :d)[1..])
+            self.emit(regalloc.op_text(:op, :a, :b, :c, :d)[1..])
             return
         }
-        self.push_insn(regalloc.op(mn, :a, :b, :c, :d))
+        self.push_insn(regalloc.op(op, :a, :b, :c, :d))
     }
 
     // `bl target`.
@@ -4088,9 +4102,23 @@ type Codegen = struct {
         self.push_insn(.Call(:target))
     }
 
-    // A branch to `target`: `op target`, or `op reg, target` for cbz and cbnz.
-    func emit_branch(self, anon op: str, reg: str = "", target: str) -> none {
-        self.push_insn(.Branch(:op, :reg, :target))
+    // A jump to `target`.
+    func emit_jump(self, anon target: str) -> none {
+        self.push_insn(.Branch(kind: .Always, reg: "", :target))
+    }
+
+    // A jump to `target` when `cond` holds of the flags.
+    func emit_jump_if(self, anon cond: regalloc.Cond, target: str) -> none {
+        self.push_insn(.Branch(kind: .If(:cond), reg: "", :target))
+    }
+
+    // A jump to `target` when `reg` is zero, or with `nonzero` when it isn't.
+    func emit_jump_zero(self, anon reg: str, target: str, nonzero: bool = false) -> none {
+        mut kind: regalloc.BranchKind = .IfZero
+        if nonzero {
+            kind = .IfNonzero
+        }
+        self.push_insn(.Branch(:kind, :reg, :target))
     }
 
     // `mov dst, src` between two registers.
@@ -4158,10 +4186,10 @@ type Codegen = struct {
             .Raw(text, info) -> return self.subst_vregs(text, :info)
             .Slot(store, reg, off) -> return regalloc.slot_text(:store, reg: self.phys_of(reg), :off)
             .Mov(dst, src) -> return f"\tmov {self.phys_of(dst)}, {self.phys_of(src)}"
-            .Mem(op, reg, base, off, has_off) -> return regalloc.mem_text(:op, reg: self.phys_of(reg), base: self.phys_of(base), :off, :has_off)
-            .Op(mn, a, b, c, d, _flags) -> return regalloc.op_text(:mn, a: self.phys_of(a), b: self.phys_of(b), c: self.phys_of(c), d: self.phys_of(d))
+            .Mem(load, width, reg, base, off, has_off) -> return regalloc.mem_text(:load, :width, reg: self.phys_of(reg), base: self.phys_of(base), :off, :has_off)
+            .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, a: self.phys_of(a), b: self.phys_of(b), c: self.phys_of(c), d: self.phys_of(d))
             .Call(target) -> return f"\tbl {target}"
-            .Branch(op, reg, target) -> return regalloc.branch_text(:op, reg: self.phys_of(reg), :target)
+            .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, reg: self.phys_of(reg), :target)
             .Label(name) -> return name + ":"
         }
     }
@@ -4511,15 +4539,15 @@ type Codegen = struct {
         if self.pool.is_callee_saved(reg) {
             return false
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: "#16")
-        self.emit_mem("str", reg: reg, base: "sp")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
+        self.emit_store(reg, base: "sp")
         return true
     }
 
     func restore_across(self, anon reg: str, spilled: bool) -> none {
         if spilled {
-            self.emit_mem("ldr", reg: reg, base: "sp")
-            self.emit_op("add", a: "sp", b: "sp", c: "#16")
+            self.emit_load(reg, base: "sp")
+            self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
         }
     }
 
@@ -4534,8 +4562,8 @@ type Codegen = struct {
         if self.pool.is_callee_saved(reg) {
             return false
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: "#16")
-        self.emit_mem("str", reg: reg, base: "sp")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
+        self.emit_store(reg, base: "sp")
         self.pool.free_reg(reg)
         return true
     }
@@ -4545,8 +4573,8 @@ type Codegen = struct {
             return reg
         }
         let r2 = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: r2, base: "sp")
-        self.emit_op("add", a: "sp", b: "sp", c: "#16")
+        self.emit_load(r2, base: "sp")
+        self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
         return r2
     }
 
@@ -4572,8 +4600,8 @@ type Codegen = struct {
             }
             .VStrLbl(page) -> {
                 mut reg = self.pool.alloc_reg()
-                self.emit_op("adrp", a: reg, b: f"{page}@PAGE")
-                self.emit_op("add", a: reg, b: reg, c: f"{page}@PAGEOFF")
+                self.emit_op(.AddressPage, a: reg, b: f"{page}@PAGE")
+                self.emit_op(.Add, a: reg, b: reg, c: f"{page}@PAGEOFF")
                 return reg
             }
         }
@@ -4605,8 +4633,8 @@ type Codegen = struct {
                 return dest
             }
             .VStrLbl(page) -> {
-                self.emit_op("adrp", a: dest, b: f"{page}@PAGE")
-                self.emit_op("add", a: dest, b: dest, c: f"{page}@PAGEOFF")
+                self.emit_op(.AddressPage, a: dest, b: f"{page}@PAGE")
+                self.emit_op(.Add, a: dest, b: dest, c: f"{page}@PAGEOFF")
                 return dest
             }
         }
@@ -7428,7 +7456,7 @@ type Codegen = struct {
             held = inner
         }
         let .KEnum(union_idx) = held else {
-            self.emit_branch("b", target: skip_lbl)
+            self.emit_jump(skip_lbl)
             return
         }
         mut binding = ""
@@ -7440,36 +7468,36 @@ type Codegen = struct {
         self.emit_ldr(subj_slot, reg: u_r)
         if optional {
             let some_lbl = self.fresh("Lmembers_some")
-            self.emit_branch("cbnz", reg: u_r, target: some_lbl)
+            self.emit_jump_zero(u_r, target: some_lbl, nonzero: true)
             if arrays.contains(w, "none") {
                 if len(binding) > 0 {
                     let r = self.compile_into(self.p.alloc_expr(ast.Expr.NoneLit, :span), expected: written)
                     self.emit_str(self.find_var_offset(binding), reg: r)
                     self.pool.free_reg(r)
                 }
-                self.emit_branch("b", target: done_lbl)
+                self.emit_jump(done_lbl)
             } else {
-                self.emit_branch("b", target: skip_lbl)
+                self.emit_jump(skip_lbl)
             }
             self.emit_label(some_lbl)
-            self.emit_mem("ldr", reg: u_r, base: u_r)
+            self.emit_load(u_r, base: u_r)
         }
         let d_r = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: d_r, base: u_r)
+        self.emit_load(d_r, base: u_r)
         mut hit_lbls: [str] = []
         mut hit_kinds: [TypeKind] = []
         for v in self.enums[union_idx].variants {
             if arrays.contains(w, v.name) {
                 let lbl = self.fresh("Lmembers_hit")
-                self.emit_op("cmp", a: d_r, b: f"#{v.discriminant}")
-                self.emit_branch("beq", target: lbl)
+                self.emit_op(.Compare, a: d_r, b: f"#{v.discriminant}")
+                self.emit_jump_if(.Eq, target: lbl)
                 hit_lbls += [lbl]
                 hit_kinds += [v.field_kinds[0]]
             }
         }
         self.pool.free_reg(d_r)
         self.pool.free_reg(u_r)
-        self.emit_branch("b", target: skip_lbl)
+        self.emit_jump(skip_lbl)
         for i, lbl in hit_lbls {
             self.emit_label(lbl)
             if len(binding) > 0 {
@@ -7479,16 +7507,16 @@ type Codegen = struct {
                 let p_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: p_r)
                 if optional {
-                    self.emit_mem("ldr", reg: p_r, base: p_r)
+                    self.emit_load(p_r, base: p_r)
                 }
-                self.emit_mem("ldr", reg: p_r, base: p_r, off: 8)
+                self.emit_load(p_r, base: p_r, off: 8)
                 self.emit_str(member_off, reg: p_r)
                 self.pool.free_reg(p_r)
                 let r = self.compile_into(self.p.alloc_expr(.Ident(name: member), :span), expected: written)
                 self.emit_str(self.find_var_offset(binding), reg: r)
                 self.pool.free_reg(r)
             }
-            self.emit_branch("b", target: done_lbl)
+            self.emit_jump(done_lbl)
         }
         self.emit_label(done_lbl)
     }
@@ -8321,21 +8349,21 @@ type Codegen = struct {
         if area % 16 != 0 {
             area += 8
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{area}")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{area}")
         for i, arg in args {
             let reg = self.compile_into(arg.value, expected: kinds[i])
             mut at = 8 * (i - fixed)
             if i < fixed {
                 at = 8 * (extra + i)
             }
-            self.emit_mem("str", reg: reg, base: "sp", off: at)
+            self.emit_store(reg, base: "sp", off: at)
             self.pool.free_reg(reg)
         }
         for i in 0..fixed {
             self.emit(f"ldr x{i}, [sp, #{8 * (extra + i)}]")
         }
         self.emit_call(label)
-        self.emit_op("add", a: "sp", b: "sp", c: f"#{area}")
+        self.emit_op(.Add, a: "sp", b: "sp", c: f"#{area}")
         return .VReg(name: "x0")
     }
 
@@ -8404,8 +8432,8 @@ type Codegen = struct {
             }
         }
         let reg = self.pool.alloc_reg()
-        self.emit_op("adrp", a: reg, b: f"{label}@PAGE")
-        self.emit_op("add", a: reg, b: reg, c: f"{label}@PAGEOFF")
+        self.emit_op(.AddressPage, a: reg, b: f"{label}@PAGE")
+        self.emit_op(.Add, a: reg, b: reg, c: f"{label}@PAGEOFF")
         return .VReg(name: reg)
     }
 
@@ -8427,8 +8455,8 @@ type Codegen = struct {
         }
         // Out of immediate range — materialise the negative offset first.
         self.emit_load_imm("x16", value: 0 - offset)
-        self.emit_op("sub", a: "x16", b: "fp", c: "x16")
-        self.emit_mem("ldr", reg: reg, base: "x16")
+        self.emit_op(.Sub, a: "x16", b: "fp", c: "x16")
+        self.emit_load(reg, base: "x16")
     }
 
     func rc_heap_kind(self, anon kind: TypeKind) -> bool {
@@ -8477,7 +8505,7 @@ type Codegen = struct {
     func rc_release_x17(self) -> none {
         // Most slots a function gives up are empty.
         let skip = self.fresh("Lrc")
-        self.emit_branch("cbz", reg: "x17", target: skip)
+        self.emit_jump_zero("x17", target: skip)
         self.emit_call("_rc_release_stub")
         self.emit_label(skip)
     }
@@ -8656,8 +8684,8 @@ type Codegen = struct {
         }
         let lbl = f"Lrcslots{len(self.rc_descs)}"
         self.rc_descs += [RcDesc(:lbl, :words)]
-        self.emit_op("adrp", a: "x1", b: f"{lbl}@PAGE")
-        self.emit_op("add", a: "x1", b: "x1", c: f"{lbl}@PAGEOFF")
+        self.emit_op(.AddressPage, a: "x1", b: f"{lbl}@PAGE")
+        self.emit_op(.Add, a: "x1", b: "x1", c: f"{lbl}@PAGEOFF")
         self.emit_call("_rc_alloc_big")
         return self.rc_store_temp("x0")
     }
@@ -8742,8 +8770,8 @@ type Codegen = struct {
             return
         }
         self.emit_load_imm("x16", value: 0 - offset)
-        self.emit_op("sub", a: "x16", b: "fp", c: "x16")
-        self.emit_mem("str", reg: reg, base: "x16")
+        self.emit_op(.Sub, a: "x16", b: "fp", c: "x16")
+        self.emit_store(reg, base: "x16")
     }
 
 
@@ -9489,9 +9517,9 @@ type Codegen = struct {
         let val = self.compile_expr(guard)
         self.check_bool(guard, need: "a match guard must be a `bool`", optional_hint: "; test it with `is not none`")
         let reg = self.load(val)
-        self.emit_op("cmp", a: reg, b: "#0")
+        self.emit_op(.Compare, a: reg, b: "#0")
         self.pool.free_reg(reg)
-        self.emit_branch("beq", target: skip_lbl)
+        self.emit_jump_if(.Eq, target: skip_lbl)
     }
 
     func emit_sub_patterns(self, anon pattern_id: int64, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
@@ -9520,7 +9548,7 @@ type Codegen = struct {
             let off = self.find_field_offset(sub.field, :struct_idx)
             mut val = ""
             if self.field_is_weak(sub.field, :struct_idx) {
-                self.emit_mem("ldr", reg: "x0", base: ptr, off: off)
+                self.emit_load("x0", base: ptr, off: off)
                 self.pool.free_reg(ptr)
                 self.emit_call("_kod_weak_get")
                 self.rc_temp("x0")
@@ -9528,7 +9556,7 @@ type Codegen = struct {
                 self.emit_mov(val, src: "x0")
             } else {
                 val = self.pool.alloc_reg()
-                self.emit_mem("ldr", reg: val, base: ptr, off: off)
+                self.emit_load(val, base: ptr, off: off)
                 self.pool.free_reg(ptr)
             }
             if self.p.patterns[sub.pattern] is .BindPat(name) {
@@ -9566,22 +9594,22 @@ type Codegen = struct {
         let disc_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: disc_r)
         if subject_kind is .KEnum(_idx) {
-            self.emit_mem("ldr", reg: disc_r, base: disc_r)
+            self.emit_load(disc_r, base: disc_r)
         }
         match pattern {
             .Wildcard -> none
             .BindPat(binding) -> self.bind_whole(binding, :subj_slot)
             .IntPat(value) -> {
                 self.emit_cmp_imm(disc_r, :value)
-                self.emit_branch("bne", target: skip_lbl)
+                self.emit_jump_if(.Ne, target: skip_lbl)
             }
             .BoolPat(value) -> {
                 mut lit = 0
                 if value {
                     lit = 1
                 }
-                self.emit_op("cmp", a: disc_r, b: f"#{lit}")
-                self.emit_branch("bne", target: skip_lbl)
+                self.emit_op(.Compare, a: disc_r, b: f"#{lit}")
+                self.emit_jump_if(.Ne, target: skip_lbl)
             }
             .StrPat(value) -> {
                 let slbl = self.intern_str(value)
@@ -9595,27 +9623,27 @@ type Codegen = struct {
                 self.emit_variant_test(raw, subj_enum_idx: subject_kind.enum_idx(), :disc_r, :subj_slot, :skip_lbl, :span, :subject_kind)
             }
             .NonePat -> {
-                self.emit_op("cmp", a: disc_r, b: "#0")
-                self.emit_branch("bne", target: skip_lbl)
+                self.emit_op(.Compare, a: disc_r, b: "#0")
+                self.emit_jump_if(.Ne, target: skip_lbl)
             }
             .SomePat(binding) -> {
-                self.emit_op("cmp", a: disc_r, b: "#0")
-                self.emit_branch("beq", target: skip_lbl)
+                self.emit_op(.Compare, a: disc_r, b: "#0")
+                self.emit_jump_if(.Eq, target: skip_lbl)
                 if len(binding) > 0 {
                     let val_r = self.pool.alloc_reg()
-                    self.emit_mem("ldr", reg: val_r, base: disc_r)
+                    self.emit_load(val_r, base: disc_r)
                     self.emit_str(self.find_var_offset(binding), reg: val_r)
                     self.pool.free_reg(val_r)
                 }
             }
             .OkPat(binding) -> {
-                self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                self.emit_branch("bne", target: skip_lbl)
+                self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                self.emit_jump_if(.Ne, target: skip_lbl)
                 self.bind_result_payload(binding, :subj_slot)
             }
             .ErrPat(binding) -> {
-                self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                self.emit_branch("beq", target: skip_lbl)
+                self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                self.emit_jump_if(.Eq, target: skip_lbl)
                 self.bind_result_payload(binding, :subj_slot)
             }
             .TypePat(type_name, binding) -> {
@@ -10449,7 +10477,7 @@ type Codegen = struct {
                 self.float_labels += [lbl]
                 self.float_values += [text]
                 let reg: str = self.pool.alloc_reg()
-                self.emit_op("adrp", a: reg, b: f"{lbl}@PAGE")
+                self.emit_op(.AddressPage, a: reg, b: f"{lbl}@PAGE")
                 self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
                 return .VReg(name: reg)
             }
@@ -10686,16 +10714,16 @@ type Codegen = struct {
             }
             let pair: int64 = self.p.alloc_expr(ast.Expr.Binary(:lhs, op: ops[k], :rhs), :span)
             let r: str = self.load(self.compile_expr(pair))
-            self.emit_op("cmp", a: r, b: "#0")
-            self.emit_branch("beq", target: false_lbl)
+            self.emit_op(.Compare, a: r, b: "#0")
+            self.emit_jump_if(.Eq, target: false_lbl)
             self.pool.free_reg(r)
             lhs = rhs
         }
         mut result: str = self.pool.alloc_reg()
-        self.emit_op("mov", a: result, b: "#1")
-        self.emit_branch("b", target: done_lbl)
+        self.emit_op(.Move, a: result, b: "#1")
+        self.emit_jump(done_lbl)
         self.emit_label(false_lbl)
-        self.emit_op("mov", a: result, b: "#0")
+        self.emit_op(.Move, a: result, b: "#0")
         self.emit_label(done_lbl)
         return .VReg(name: result)
     }
@@ -10783,14 +10811,14 @@ type Codegen = struct {
                 }
                 if weak {
                     // A new `S?` from the weak box, which the reader owns.
-                    self.emit_mem("ldr", reg: "x0", base: ptr_r, off: field_off)
+                    self.emit_load("x0", base: ptr_r, off: field_off)
                     self.pool.free_reg(ptr_r)
                     self.emit_call("_kod_weak_get")
                     self.rc_temp("x0")
                     return .VReg(name: "x0")
                 }
                 mut result = self.pool.alloc_reg()
-                self.emit_mem("ldr", reg: result, base: ptr_r, off: field_off)
+                self.emit_load(result, base: ptr_r, off: field_off)
                 self.pool.free_reg(ptr_r)
                 return .VReg(name: result)
             }
@@ -10877,17 +10905,17 @@ type Codegen = struct {
         if array_like {
             if not self.is_safe_index(lhs, index_id: rhs) {
                 let len_r = self.pool.alloc_reg()
-                self.emit_mem("ldr", reg: len_r, base: ptr_r, off: 8)
+                self.emit_load(len_r, base: ptr_r, off: 8)
                 self.emit_index_check(idx_r, len: len_r)
                 self.pool.free_reg(len_r)
             }
 
             let hdr = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: hdr, base: ptr_r)
+            self.emit_load(hdr, base: ptr_r)
             if self.elem_width(lhs_kind) == 1 {
                 self.emit(f"ldrb w{result[1..len(result)]}, [{hdr}, {idx_r}]")
             } else {
-                self.emit_op("lsl", a: idx_r, b: idx_r, c: "#3")
+                self.emit_op(.ShiftLeft, a: idx_r, b: idx_r, c: "#3")
                 self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
             }
             self.pool.free_reg(hdr)
@@ -10896,9 +10924,9 @@ type Codegen = struct {
             // Load buf and len, normalise negative, bounds-check, then
             // a one-byte read from buf — same shape as the array path.
             let len_r = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: len_r, base: ptr_r, off: 8)
+            self.emit_load(len_r, base: ptr_r, off: 8)
             let buf_r = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: buf_r, base: ptr_r)
+            self.emit_load(buf_r, base: ptr_r)
             self.emit_index_check(idx_r, len: len_r)
             self.pool.free_reg(len_r)
             self.emit(f"ldrb w{result[1..len(result)]}, [{buf_r}, {idx_r}]")
@@ -10916,13 +10944,13 @@ type Codegen = struct {
     func emit_index_check(self, anon idx: str, len: str) -> none {
         let ok_lbl = self.fresh("Lidx_ok")
         let oob_lbl = self.fresh("Lidx_oob")
-        self.emit_op("cmp", a: idx, b: len)
-        self.emit_branch("b.lo", target: ok_lbl)
-        self.emit_op("cmp", a: idx, b: "#0")
-        self.emit_branch("b.ge", target: oob_lbl)
-        self.emit_op("add", a: idx, b: idx, c: len)
-        self.emit_op("cmp", a: idx, b: len)
-        self.emit_branch("b.lo", target: ok_lbl)
+        self.emit_op(.Compare, a: idx, b: len)
+        self.emit_jump_if(.Lo, target: ok_lbl)
+        self.emit_op(.Compare, a: idx, b: "#0")
+        self.emit_jump_if(.Ge, target: oob_lbl)
+        self.emit_op(.Add, a: idx, b: idx, c: len)
+        self.emit_op(.Compare, a: idx, b: len)
+        self.emit_jump_if(.Lo, target: ok_lbl)
         self.emit_label(oob_lbl)
         self.emit_mov("x0", src: idx)
         self.emit_mov("x1", src: len)
@@ -10938,17 +10966,17 @@ type Codegen = struct {
     func emit_bytes_le64(self) -> none {
         let bad_lbl = self.fresh("Lle64_bad")
         let done_lbl = self.fresh("Lle64_done")
-        self.emit_mem("ldr", reg: "x16", base: "x0", off: 8)
-        self.emit_op("add", a: "x17", b: "x1", c: "#8")
-        self.emit_op("cmp", a: "x1", b: "x16")
-        self.emit_op("ccmp", a: "x17", b: "x16", c: "#2", d: "lo")
-        self.emit_branch("b.hi", target: bad_lbl)
-        self.emit_mem("ldr", reg: "x16", base: "x0")
+        self.emit_load("x16", base: "x0", off: 8)
+        self.emit_op(.Add, a: "x17", b: "x1", c: "#8")
+        self.emit_op(.Compare, a: "x1", b: "x16")
+        self.emit_op(.CompareIf, a: "x17", b: "x16", c: "#2", d: "lo")
+        self.emit_jump_if(.Hi, target: bad_lbl)
+        self.emit_load("x16", base: "x0")
         self.emit("ldr x0, [x16, x1]")
-        self.emit_branch("b", target: done_lbl)
+        self.emit_jump(done_lbl)
         self.emit_label(bad_lbl)
-        self.emit_op("cmp", a: "x1", b: "x16")
-        self.emit_op("csel", a: "x0", b: "x16", c: "x1", d: "lo")
+        self.emit_op(.Compare, a: "x1", b: "x16")
+        self.emit_op(.Select, a: "x0", b: "x16", c: "x1", d: "lo")
         self.emit_mov("x1", src: "x16")
         self.emit_call("_kod_index_oob")
         self.emit_label(done_lbl)
@@ -10961,14 +10989,14 @@ type Codegen = struct {
         mut result = self.pool.alloc_reg()
         self.check_bool(lhs, need: "`and` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(lhs_val, dest: result)
-        self.emit_op("cmp", a: result, b: "#0")
-        self.emit_op("cset", a: result, b: "ne")
-        self.emit_branch("beq", target: done)
+        self.emit_op(.Compare, a: result, b: "#0")
+        self.emit_op(.SetIf, a: result, b: "ne")
+        self.emit_jump_if(.Eq, target: done)
         let rhs_val = self.compile_expr(rhs)
         self.check_bool(rhs, need: "`and` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(rhs_val, dest: result)
-        self.emit_op("cmp", a: result, b: "#0")
-        self.emit_op("cset", a: result, b: "ne")
+        self.emit_op(.Compare, a: result, b: "#0")
+        self.emit_op(.SetIf, a: result, b: "ne")
         self.emit_label(done)
         return .VReg(name: result)
     }
@@ -10981,14 +11009,14 @@ type Codegen = struct {
         let default_hint = f"; did you mean `{self.unwrap_name(lhs)}? or default`?"
         self.check_bool(lhs, need: "`or` needs `bool` operands", optional_hint: default_hint)
         self.mov_to(lhs_val, dest: result)
-        self.emit_op("cmp", a: result, b: "#0")
-        self.emit_op("cset", a: result, b: "ne")
-        self.emit_branch("bne", target: done)
+        self.emit_op(.Compare, a: result, b: "#0")
+        self.emit_op(.SetIf, a: result, b: "ne")
+        self.emit_jump_if(.Ne, target: done)
         let rhs_val = self.compile_expr(rhs)
         self.check_bool(rhs, need: "`or` needs `bool` operands", optional_hint: "; test it with `is not none`")
         self.mov_to(rhs_val, dest: result)
-        self.emit_op("cmp", a: result, b: "#0")
-        self.emit_op("cset", a: result, b: "ne")
+        self.emit_op(.Compare, a: result, b: "#0")
+        self.emit_op(.SetIf, a: result, b: "ne")
         self.emit_label(done)
         return .VReg(name: result)
     }
@@ -11138,12 +11166,12 @@ type Codegen = struct {
             }
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
-            self.emit_mem("ldr", reg: reg, base: reg)
-            self.emit_op("cmp", a: reg, b: f"#{self.result_ok_disc()}")
+            self.emit_load(reg, base: reg)
+            self.emit_op(.Compare, a: reg, b: f"#{self.result_ok_disc()}")
             if name == "Ok" {
-                self.emit_op("cset", a: reg, b: cond_match)
+                self.emit_op(.SetIf, a: reg, b: cond_match)
             } else {
-                self.emit_op("cset", a: reg, b: cond_no_match)
+                self.emit_op(.SetIf, a: reg, b: cond_no_match)
             }
             return .VReg(name: reg)
         }
@@ -11170,9 +11198,9 @@ type Codegen = struct {
             }
             let ptr_v = self.compile_expr(lhs)
             mut reg = self.load(ptr_v)
-            self.emit_mem("ldr", reg: reg, base: reg)
-            self.emit_op("cmp", a: reg, b: f"#{self.enums[enum_idx].variants[variant_idx].discriminant}")
-            self.emit_op("cset", a: reg, b: cond_match)
+            self.emit_load(reg, base: reg)
+            self.emit_op(.Compare, a: reg, b: f"#{self.enums[enum_idx].variants[variant_idx].discriminant}")
+            self.emit_op(.SetIf, a: reg, b: cond_match)
             return .VReg(name: reg)
         }
         mut is_optional: bool = false
@@ -11196,11 +11224,11 @@ type Codegen = struct {
         }
         let ptr_v = self.compile_expr(lhs)
         mut reg = self.load(ptr_v)
-        self.emit_op("cmp", a: reg, b: "#0")
+        self.emit_op(.Compare, a: reg, b: "#0")
         if tests_none {
-            self.emit_op("cset", a: reg, b: cond_match)
+            self.emit_op(.SetIf, a: reg, b: cond_match)
         } else {
-            self.emit_op("cset", a: reg, b: cond_no_match)
+            self.emit_op(.SetIf, a: reg, b: cond_no_match)
         }
         return .VReg(name: reg)
     }
@@ -11432,7 +11460,7 @@ type Codegen = struct {
         mut lv_r = ""
         if build_lhs {
             lv_r = self.compile_value_for_kind(lhs_id, expected: lhs_kind)
-            self.emit_mem("ldr", reg: lv_r, base: lv_r)
+            self.emit_load(lv_r, base: lv_r)
         } else {
             let lhs_val = self.compile_expr(lhs_id)
             lv_r = self.load_enum_or_val(lhs_val, expr_id: lhs_id)
@@ -11451,7 +11479,7 @@ type Codegen = struct {
         mut rhs_reg = ""
         if build_rhs {
             rhs_reg = self.compile_value_for_kind(rhs_id, expected: lhs_kind)
-            self.emit_mem("ldr", reg: rhs_reg, base: rhs_reg)
+            self.emit_load(rhs_reg, base: rhs_reg)
         } else {
             let rhs_val = self.compile_expr(rhs_id)
             rhs_reg = self.load_enum_or_val(rhs_val, expr_id: rhs_id)
@@ -11466,72 +11494,72 @@ type Codegen = struct {
         }
         match op {
             .Eq -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "eq")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "eq")
             }
             .Ne -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "ne")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "ne")
             }
             .Lt -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "lt")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "lt")
             }
             .Le -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "le")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "le")
             }
             .Gt -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "gt")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "gt")
             }
             .Ge -> {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "ge")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "ge")
             }
             .Add -> {
-                self.emit_op("add", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Add, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Sub -> {
-                self.emit_op("sub", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Sub, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Mul -> {
-                self.emit_op("mul", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Mul, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Div -> {
                 self.emit_div_zero_check(rhs_reg, :rhs_id)
-                self.emit_op("sdiv", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Mod -> {
                 let tmp2 = self.pool.alloc_reg()
                 self.emit_div_zero_check(rhs_reg, :rhs_id)
-                self.emit_op("sdiv", a: result, b: lhs_reg, c: rhs_reg)
-                self.emit_op("mul", a: tmp2, b: result, c: rhs_reg)
-                self.emit_op("sub", a: result, b: lhs_reg, c: tmp2)
+                self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Mul, a: tmp2, b: result, c: rhs_reg)
+                self.emit_op(.Sub, a: result, b: lhs_reg, c: tmp2)
                 self.pool.free_reg(tmp2)
             }
             .BitAnd -> {
-                self.emit_op("and", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.And, a: result, b: lhs_reg, c: rhs_reg)
             }
             .BitOr -> {
-                self.emit_op("orr", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Or, a: result, b: lhs_reg, c: rhs_reg)
             }
             .BitXor -> {
-                self.emit_op("eor", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.Xor, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Shl -> {
-                self.emit_op("lsl", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.ShiftLeft, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Shr -> {
                 // Logical (unsigned) right shift — treats int64 as a
                 // raw bit pattern, fills with zeros. Matches the
                 // bit-twiddling idioms (CRC32, Huffman, …) where the
                 // operand is conceptually an unsigned integer.
-                self.emit_op("lsr", a: result, b: lhs_reg, c: rhs_reg)
+                self.emit_op(.ShiftRight, a: result, b: lhs_reg, c: rhs_reg)
             }
             else {
-                self.emit_op("cmp", a: lhs_reg, b: rhs_reg)
-                self.emit_op("cset", a: result, b: "eq")
+                self.emit_op(.Compare, a: lhs_reg, b: rhs_reg)
+                self.emit_op(.SetIf, a: result, b: "eq")
             }
         }
         self.pool.free_reg(lhs_reg)
@@ -11545,7 +11573,7 @@ type Codegen = struct {
             return
         }
         let ok_lbl = self.fresh("Ldiv_ok")
-        self.emit_branch("cbnz", reg: divisor_reg, target: ok_lbl)
+        self.emit_jump_zero(divisor_reg, target: ok_lbl, nonzero: true)
         self.emit_call("_kod_div_zero")
         self.emit_label(ok_lbl)
     }
@@ -11553,8 +11581,8 @@ type Codegen = struct {
     // `result = lhs op rhs` on float bit patterns: through d0 and d1, which nothing else holds.
     // An ordered comparison is false when either side is not a number.
     func emit_float_op(self, anon op: ast.Op, result: str, lhs_reg: str, rhs_reg: str) -> none {
-        self.emit_op("fmov", a: "d0", b: lhs_reg)
-        self.emit_op("fmov", a: "d1", b: rhs_reg)
+        self.emit_op(.FloatMove, a: "d0", b: lhs_reg)
+        self.emit_op(.FloatMove, a: "d1", b: rhs_reg)
         mut cond = ""
         match op {
             .Eq -> cond = "eq"
@@ -11566,27 +11594,27 @@ type Codegen = struct {
             else none
         }
         if len(cond) > 0 {
-            self.emit_op("fcmp", a: "d0", b: "d1")
-            self.emit_op("cset", a: result, b: cond)
+            self.emit_op(.FloatCompare, a: "d0", b: "d1")
+            self.emit_op(.SetIf, a: result, b: cond)
             return
         }
         match op {
-            .Add -> self.emit_op("fadd", a: "d0", b: "d0", c: "d1")
-            .Sub -> self.emit_op("fsub", a: "d0", b: "d0", c: "d1")
-            .Mul -> self.emit_op("fmul", a: "d0", b: "d0", c: "d1")
-            .Div -> self.emit_op("fdiv", a: "d0", b: "d0", c: "d1")
+            .Add -> self.emit_op(.FloatAdd, a: "d0", b: "d0", c: "d1")
+            .Sub -> self.emit_op(.FloatSub, a: "d0", b: "d0", c: "d1")
+            .Mul -> self.emit_op(.FloatMul, a: "d0", b: "d0", c: "d1")
+            .Div -> self.emit_op(.FloatDiv, a: "d0", b: "d0", c: "d1")
             else none
         }
-        self.emit_op("fmov", a: result, b: "d0")
+        self.emit_op(.FloatMove, a: result, b: "d0")
     }
 
     // `-x` on a float flips the sign bit, also of zero and not-a-number.
     func compile_float_neg(self, anon operand_id: int64) -> Val {
         let val = self.compile_expr(operand_id)
         let reg = self.load(val)
-        self.emit_op("fmov", a: "d0", b: reg)
-        self.emit_op("fneg", a: "d0", b: "d0")
-        self.emit_op("fmov", a: reg, b: "d0")
+        self.emit_op(.FloatMove, a: "d0", b: reg)
+        self.emit_op(.FloatNeg, a: "d0", b: "d0")
+        self.emit_op(.FloatMove, a: reg, b: "d0")
         return .VReg(name: reg)
     }
 
@@ -11683,7 +11711,7 @@ type Codegen = struct {
         match self.infer_kind(expr_id) {
             .KEnum(idx) -> {
                 mut reg = self.load(val)
-                self.emit_mem("ldr", reg: reg, base: reg)
+                self.emit_load(reg, base: reg)
                 return reg
             }
             else return self.load(val)
@@ -11699,7 +11727,7 @@ type Codegen = struct {
             let ptr_r = self.pool.alloc_reg()
             self.emit_ldr(subj_slot, reg: ptr_r)
             let val_r = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: val_r, base: ptr_r, off: 8)
+            self.emit_load(val_r, base: ptr_r, off: 8)
             self.emit_str(boff, reg: val_r)
             self.pool.free_reg(val_r)
             self.pool.free_reg(ptr_r)
@@ -11733,12 +11761,12 @@ type Codegen = struct {
             variant_idx = self.pattern_variant_idx(enum_idx, :variant_name, binding_count: len(bindings), :span)
         }
         if variant_idx < 0 {
-            self.emit_branch("b", target: skip_lbl)
+            self.emit_jump(skip_lbl)
             return
         }
         let vinfo = self.enums[enum_idx].variants[variant_idx]
-        self.emit_op("cmp", a: disc_r, b: f"#{vinfo.discriminant}")
-        self.emit_branch("bne", target: skip_lbl)
+        self.emit_op(.Compare, a: disc_r, b: f"#{vinfo.discriminant}")
+        self.emit_jump_if(.Ne, target: skip_lbl)
         mut key_idx = 0
         for binding in bindings {
             let foff = vinfo.field_offsets[key_idx]
@@ -11794,14 +11822,14 @@ type Codegen = struct {
         let ptr_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: ptr_r)
         let vt_r = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: vt_r, base: ptr_r, off: 8)
+        self.emit_load(vt_r, base: ptr_r, off: 8)
         self.emit_type_id_cmp(vt_r, :owner, :iface_idx)
-        self.emit_branch("bne", target: skip_lbl)
+        self.emit_jump_if(.Ne, target: skip_lbl)
         self.pool.free_reg(vt_r)
         if len(binding) > 0 {
             let boff = self.find_var_offset(binding)
             let dv_r = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: dv_r, base: ptr_r)
+            self.emit_load(dv_r, base: ptr_r)
             self.emit_str(boff, reg: dv_r)
             self.pool.free_reg(dv_r)
         }
@@ -11826,47 +11854,47 @@ type Codegen = struct {
     // different lengths aren't, and only equal nonzero lengths need memcmp.
     func emit_str_eq_flags(self, a: str, b: str) -> none {
         let done_lbl = self.fresh("Lstr_eq")
-        self.emit_op("cmp", a: a, b: b)
-        self.emit_branch("beq", target: done_lbl)
-        self.emit_mem("ldr", reg: "x2", base: a, off: 8)
-        self.emit_mem("ldr", reg: "x16", base: b, off: 8)
-        self.emit_op("cmp", a: "x2", b: "x16")
-        self.emit_branch("bne", target: done_lbl)
-        self.emit_branch("cbz", reg: "x2", target: done_lbl)
-        self.emit_mem("ldr", reg: "x16", base: a)
-        self.emit_mem("ldr", reg: "x17", base: b)
+        self.emit_op(.Compare, a: a, b: b)
+        self.emit_jump_if(.Eq, target: done_lbl)
+        self.emit_load("x2", base: a, off: 8)
+        self.emit_load("x16", base: b, off: 8)
+        self.emit_op(.Compare, a: "x2", b: "x16")
+        self.emit_jump_if(.Ne, target: done_lbl)
+        self.emit_jump_zero("x2", target: done_lbl)
+        self.emit_load("x16", base: a)
+        self.emit_load("x17", base: b)
         self.emit_mov("x0", src: "x16")
         self.emit_mov("x1", src: "x17")
         self.emit_call("_memcmp")
         // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
         // can't be written here: `w<n>` names a virtual register.)
-        self.emit_op("lsl", a: "x16", b: "x0", c: "#32")
-        self.emit_op("cmp", a: "x16", b: "#0")
+        self.emit_op(.ShiftLeft, a: "x16", b: "x0", c: "#32")
+        self.emit_op(.Compare, a: "x16", b: "#0")
         self.emit_label(done_lbl)
     }
 
     // Branches to `skip_lbl` unless the str in `subject` equals the literal
     // `value` (interned at `label`), loaded into `other` when it isn't empty.
     func emit_str_pat_test(self, anon value: str, label: str, subject: str, other: str, skip_lbl: str) -> none {
-        self.emit_mem("ldr", reg: "x16", base: subject, off: 8)
+        self.emit_load("x16", base: subject, off: 8)
         self.emit_cmp_imm("x16", value: len(value))
-        self.emit_branch("bne", target: skip_lbl)
+        self.emit_jump_if(.Ne, target: skip_lbl)
         if len(value) == 0 {
             return
         }
-        self.emit_op("adrp", a: other, b: f"{label}@PAGE")
-        self.emit_op("add", a: other, b: other, c: f"{label}@PAGEOFF")
+        self.emit_op(.AddressPage, a: other, b: f"{label}@PAGE")
+        self.emit_op(.Add, a: other, b: other, c: f"{label}@PAGEOFF")
         self.emit_mov("x2", src: "x16")
-        self.emit_mem("ldr", reg: "x16", base: subject)
-        self.emit_mem("ldr", reg: "x17", base: other)
+        self.emit_load("x16", base: subject)
+        self.emit_load("x17", base: other)
         self.emit_mov("x0", src: "x16")
         self.emit_mov("x1", src: "x17")
         self.emit_call("_memcmp")
         // memcmp returns an int: only the low 32 bits of x0 count. (`w0`
         // can't be written here: `w<n>` names a virtual register.)
-        self.emit_op("lsl", a: "x16", b: "x0", c: "#32")
-        self.emit_op("cmp", a: "x16", b: "#0")
-        self.emit_branch("bne", target: skip_lbl)
+        self.emit_op(.ShiftLeft, a: "x16", b: "x0", c: "#32")
+        self.emit_op(.Compare, a: "x16", b: "#0")
+        self.emit_jump_if(.Ne, target: skip_lbl)
     }
 
     func compile_str_cmp(self, lhs_id: int64, rhs_id: int64, cond: str) -> Val {
@@ -11878,11 +11906,11 @@ type Codegen = struct {
             }
             let reg = self.pool.alloc_reg()
             self.mov_to(self.compile_expr(other), dest: reg)
-            self.emit_mem("ldr", reg: "x16", base: reg, off: 8)
-            self.emit_op("cmp", a: "x16", b: "#0")
+            self.emit_load("x16", base: reg, off: 8)
+            self.emit_op(.Compare, a: "x16", b: "#0")
             self.pool.free_reg(reg)
             let result = self.pool.alloc_reg()
-            self.emit_op("cset", a: result, b: cond)
+            self.emit_op(.SetIf, a: result, b: cond)
             return .VReg(name: result)
         }
         self.compile_str_operands(lhs_id, :rhs_id)
@@ -11892,10 +11920,10 @@ type Codegen = struct {
             // `kod_str_cmp` takes two KodStr pointers and returns 0 / ±n
             // like memcmp.
             self.emit_call("_kod_str_cmp")
-            self.emit_op("cmp", a: "x0", b: "#0")
+            self.emit_op(.Compare, a: "x0", b: "#0")
         }
         mut result = self.pool.alloc_reg()
-        self.emit_op("cset", a: result, b: cond)
+        self.emit_op(.SetIf, a: result, b: cond)
         return .VReg(name: result)
     }
 
@@ -12040,16 +12068,16 @@ type Codegen = struct {
         let val = self.compile_expr(expr_id)
         self.mov_to(val, dest: "x0")
         let tag = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: tag, base: "x0")
+        self.emit_load(tag, base: "x0")
         let end_lbl = self.fresh("Lvariant_name")
         for variant in self.enums[enum_idx].variants {
             let next_lbl = self.fresh("Lvariant_next")
             let name_lbl = self.intern_str(variant.name)
-            self.emit_op("cmp", a: tag, b: f"#{variant.discriminant}")
-            self.emit_branch("bne", target: next_lbl)
-            self.emit_op("adrp", a: "x0", b: f"{name_lbl}@PAGE")
-            self.emit_op("add", a: "x0", b: "x0", c: f"{name_lbl}@PAGEOFF")
-            self.emit_branch("b", target: end_lbl)
+            self.emit_op(.Compare, a: tag, b: f"#{variant.discriminant}")
+            self.emit_jump_if(.Ne, target: next_lbl)
+            self.emit_op(.AddressPage, a: "x0", b: f"{name_lbl}@PAGE")
+            self.emit_op(.Add, a: "x0", b: "x0", c: f"{name_lbl}@PAGEOFF")
+            self.emit_jump(end_lbl)
             self.emit_label(next_lbl)
         }
         self.emit_label(end_lbl)
@@ -12088,15 +12116,15 @@ type Codegen = struct {
             return reg
         }
         self.mov_to(val, dest: "x0")
-        self.emit_op("sub", a: "sp", b: "sp", c: "#16")
-        self.emit_mem("str", reg: "x0", base: "sp")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
+        self.emit_store("x0", base: "sp")
         return ""
     }
 
     func unpark_lhs(self, anon reg: str) -> none {
         if len(reg) == 0 {
-            self.emit_mem("ldr", reg: "x0", base: "sp")
-            self.emit_op("add", a: "sp", b: "sp", c: "#16")
+            self.emit_load("x0", base: "sp")
+            self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
             return
         }
         self.emit_mov("x0", src: reg)
@@ -12114,8 +12142,8 @@ type Codegen = struct {
             return reg
         }
         let reg = self.load(val)
-        self.emit_op("sub", a: "sp", b: "sp", c: "#16")
-        self.emit_mem("str", reg: reg, base: "sp")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
+        self.emit_store(reg, base: "sp")
         self.pool.free_reg(reg)
         return ""
     }
@@ -12125,8 +12153,8 @@ type Codegen = struct {
             return parked
         }
         let reg = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: reg, base: "sp")
-        self.emit_op("add", a: "sp", b: "sp", c: "#16")
+        self.emit_load(reg, base: "sp")
+        self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
         return reg
     }
 
@@ -12162,7 +12190,7 @@ type Codegen = struct {
             self.mov_to(self.compile_concat_operand(rhs_id, :kind, :typed_anchor), dest: "x1")
             self.unpark_lhs(parked)
         }
-        self.emit_op("mov", a: "x2", b: f"#{self.elem_width(kind)}")
+        self.emit_op(.Move, a: "x2", b: f"#{self.elem_width(kind)}")
         if lhs_id == self.append_lhs_id and self.p.path == self.append_lhs_path {
             self.emit_call("_kod_arr_concat")
         } else {
@@ -12183,7 +12211,7 @@ type Codegen = struct {
             self.mov_to(self.compile_expr(rhs_id), dest: "x1")
             self.unpark_lhs(parked)
         }
-        self.emit_op("mov", a: "x2", b: f"#{self.elem_width(kind)}")
+        self.emit_op(.Move, a: "x2", b: f"#{self.elem_width(kind)}")
         self.emit_call("_kod_arr_repeat")
         self.rc_temp("x0")
         return .VReg(name: "x0")
@@ -12216,8 +12244,8 @@ type Codegen = struct {
         if self.rc_heap_kind(rc_elem) {
             refs = 1
         }
-        self.emit_op("mov", a: "x2", b: f"#{refs}")
-        self.emit_op("mov", a: "x3", b: f"#{self.elem_width(kind)}")
+        self.emit_op(.Move, a: "x2", b: f"#{refs}")
+        self.emit_op(.Move, a: "x3", b: f"#{self.elem_width(kind)}")
         self.emit_call("_kod_arr_push")
         return .VReg(name: "x0")
     }
@@ -12271,31 +12299,31 @@ type Codegen = struct {
             }
         }
         // Each part waits on the stack while the later ones, which may call, are computed.
-        self.emit_op("sub", a: "sp", b: "sp", c: "#32")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#32")
         let s_r = self.load(self.compile_expr(s_id))
-        self.emit_mem("str", reg: s_r, base: "sp")
+        self.emit_store(s_r, base: "sp")
         self.pool.free_reg(s_r)
         let lo_v = self.compile_expr(lo_id)
         self.check_int_operand(lo_id, what: "a slice bound")
         let lo_r = self.load(lo_v)
-        self.emit_mem("str", reg: lo_r, base: "sp", off: 8)
+        self.emit_store(lo_r, base: "sp", off: 8)
         self.pool.free_reg(lo_r)
         // The parser stores hi=0 for `s[lo..]`, which runs to the end.
         if hi_id != 0 {
             let hi_v = self.compile_expr(hi_id)
             self.check_int_operand(hi_id, what: "a slice bound")
             let hi_r = self.load(hi_v)
-            self.emit_mem("str", reg: hi_r, base: "sp", off: 16)
+            self.emit_store(hi_r, base: "sp", off: 16)
             self.pool.free_reg(hi_r)
         }
-        self.emit_mem("ldr", reg: "x0", base: "sp")
-        self.emit_mem("ldr", reg: "x1", base: "sp", off: 8)
+        self.emit_load("x0", base: "sp")
+        self.emit_load("x1", base: "sp", off: 8)
         if hi_id == 0 {
-            self.emit_mem("ldr", reg: "x2", base: "x0", off: 8)
+            self.emit_load("x2", base: "x0", off: 8)
         } else {
-            self.emit_mem("ldr", reg: "x2", base: "sp", off: 16)
+            self.emit_load("x2", base: "sp", off: 16)
         }
-        self.emit_op("add", a: "sp", b: "sp", c: "#32")
+        self.emit_op(.Add, a: "sp", b: "sp", c: "#32")
         // Dispatch to the runtime that matches the subject. Strings and
         // arrays have different cell layouts; the str routine returns
         // a KodStr while the array routine returns a KodArray.
@@ -12310,7 +12338,7 @@ type Codegen = struct {
             }
             .KUnknown -> self.report_cannot_infer(s_id, what: "this expression")
             else {
-                self.emit_op("mov", a: "x3", b: f"#{self.elem_width(self.infer_kind(s_id))}")
+                self.emit_op(.Move, a: "x3", b: f"#{self.elem_width(self.infer_kind(s_id))}")
                 self.emit_call("_kod_arr_slice")
                 self.rc_temp("x0")
             }
@@ -12412,8 +12440,8 @@ type Codegen = struct {
         // Allocate header (24 bytes) and buf, saving both pointers on
         // the stack so element compilation (which may bl) doesn't
         // clobber them via pool-register reuse.
-        self.emit_op("sub", a: "sp", b: "sp", c: "#16")
-        self.emit_op("mov", a: "x0", b: "#24")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
+        self.emit_op(.Move, a: "x0", b: "#24")
         mut rc_mask = 1 << 22
         mut rc_elem = expected_elem
         if rc_elem.is_void() and n > 0 {
@@ -12423,15 +12451,15 @@ type Codegen = struct {
             rc_mask = rc_mask | (1 << 21)
         }
         let rc_cell = self.rc_alloc_cell(mask: rc_mask)
-        self.emit_mem("str", reg: "x0", base: "sp")
+        self.emit_store("x0", base: "sp")
         mut buf_sz = n * item_sz
         if buf_sz < 8 {
             buf_sz = 8
         }
         self.emit_load_imm("x0", value: buf_sz)
-        self.emit_op("mov", a: "x1", b: "#0")
+        self.emit_op(.Move, a: "x1", b: "#0")
         self.emit_call("_rc_alloc")
-        self.emit_mem("str", reg: "x0", base: "sp", off: 8)
+        self.emit_store("x0", base: "sp", off: 8)
         let typed = self.elem_needs_conversion(expected_elem)
         // With no type to go to, the literal takes its first element's.
         mut rest_kind: TypeKind = .KVoid
@@ -12457,7 +12485,7 @@ type Codegen = struct {
             // Reload buf from stack — any bl in compile_expr above would
             // have clobbered a pool-register copy.
             let buf_r = self.pool.alloc_reg()
-            self.emit_mem("ldr", reg: buf_r, base: "sp", off: 8)
+            self.emit_load(buf_r, base: "sp", off: 8)
             mut rc_elem = expected_elem
             if rc_elem.is_void() {
                 rc_elem = self.infer_kind(elements[0])
@@ -12477,14 +12505,14 @@ type Codegen = struct {
         }
         let hdr_r = self.pool.alloc_reg()
         let buf_r = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: hdr_r, base: "sp")
-        self.emit_mem("ldr", reg: buf_r, base: "sp", off: 8)
-        self.emit_op("add", a: "sp", b: "sp", c: "#16")
-        self.emit_mem("str", reg: buf_r, base: hdr_r)
+        self.emit_load(hdr_r, base: "sp")
+        self.emit_load(buf_r, base: "sp", off: 8)
+        self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
+        self.emit_store(buf_r, base: hdr_r)
         let len_r = self.pool.alloc_reg()
         self.emit_load_imm(len_r, value: n)
-        self.emit_mem("str", reg: len_r, base: hdr_r, off: 8)
-        self.emit_mem("str", reg: len_r, base: hdr_r, off: 16)
+        self.emit_store(len_r, base: hdr_r, off: 8)
+        self.emit_store(len_r, base: hdr_r, off: 16)
         self.pool.free_reg(len_r)
         self.pool.free_reg(buf_r)
         self.rc_mark_owned(hdr_r, slot: rc_cell)
@@ -13852,9 +13880,9 @@ type Codegen = struct {
         let ptr_r = self.pool.alloc_reg()
         self.emit_mov(ptr_r, src: "x0")
         let tmp_r = self.pool.alloc_reg()
-        self.emit_op("adrp", a: tmp_r, b: f"{lbl}@PAGE")
-        self.emit_op("add", a: tmp_r, b: tmp_r, c: f"{lbl}@PAGEOFF")
-        self.emit_mem("str", reg: tmp_r, base: ptr_r)
+        self.emit_op(.AddressPage, a: tmp_r, b: f"{lbl}@PAGE")
+        self.emit_op(.Add, a: tmp_r, b: tmp_r, c: f"{lbl}@PAGEOFF")
+        self.emit_store(tmp_r, base: ptr_r)
         for i, key in env.keys {
             self.emit_ldr(self.find_var_offset(key), reg: tmp_r)
             self.rc_retain_kind(tmp_r, kind: env.kinds[i])
@@ -13919,9 +13947,9 @@ type Codegen = struct {
             let no_slots: [int64] = []
             self.prepare_args_with_kinds(args, expected_kinds: param_kinds, default_exprs: no_defaults, src_p: self.p, slots: no_slots)
             self.restore_across(callee_reg, :spilled)
-            self.emit_mem("ldr", reg: "x16", base: callee_reg)
+            self.emit_load("x16", base: callee_reg)
             self.emit_mov("x17", src: callee_reg)
-            self.emit_op("blr", a: "x16")
+            self.emit_op(.CallIndirect, a: "x16")
             self.pool.free_reg(callee_reg)
             return .VReg(name: "x0")
         }
@@ -14192,7 +14220,7 @@ type Codegen = struct {
         }
         if header_len {
             mut reg = self.load(arg_val)
-            self.emit_mem("ldr", reg: reg, base: reg, off: 8)
+            self.emit_load(reg, base: reg, off: 8)
             return .VReg(name: reg)
         }
         // Look for a `len(self) -> int64` method on the struct; if one
@@ -14268,7 +14296,7 @@ type Codegen = struct {
         if padded % 16 != 0 {
             padded = padded + 8
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
         // Load cell ptr -> x0; data_ptr -> sp[0]; vtable -> x1; method ptr -> sp[n*8].
         let recv_val = self.compile_expr(receiver_id)
         self.mov_to(recv_val, dest: "x0")
@@ -14278,9 +14306,9 @@ type Codegen = struct {
         // Use two distinct pool regs: hard-coding x9 here would clobber
         // cell_r when alloc_reg happens to hand back x9.
         self.emit_mov(cell_r, src: "x0")
-        self.emit_mem("ldr", reg: tmp_r, base: cell_r)
-        self.emit_mem("str", reg: tmp_r, base: "sp")
-        self.emit_mem("ldr", reg: tmp_r, base: cell_r, off: 8)
+        self.emit_load(tmp_r, base: cell_r)
+        self.emit_store(tmp_r, base: "sp")
+        self.emit_load(tmp_r, base: cell_r, off: 8)
         self.emit(f"ldr {tmp_r}, [{tmp_r}, #{method_idx * 8}]")
         self.emit(f"str {tmp_r}, [sp, #{n * 8}]")
         if pass_cell {
@@ -14322,8 +14350,8 @@ type Codegen = struct {
         if pass_cell {
             self.emit(f"ldr x17, [sp, #{(n + 1) * 8}]")
         }
-        self.emit_op("add", a: "sp", b: "sp", c: f"#{padded}")
-        self.emit_op("blr", a: "x9")
+        self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.CallIndirect, a: "x9")
         return .VReg(name: "x0")
     }
 
@@ -14517,11 +14545,11 @@ type Codegen = struct {
         if padded % 16 != 0 {
             padded = padded + 8
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
         let recv_val = self.compile_expr(receiver_id)
         self.mov_to(recv_val, dest: "x0")
         self.rc_hold(receiver_id, reg: "x0")
-        self.emit_mem("str", reg: "x0", base: "sp")
+        self.emit_store("x0", base: "sp")
         for i in 0..total_user {
             mut arg_reg = ""
             // Method param 0 is self; caller arg i maps to param i+1.
@@ -14550,7 +14578,7 @@ type Codegen = struct {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
-        self.emit_op("add", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
         let inline = inline_intrinsic(method_lbl)
         if len(inline) > 0 {
             for line in inline {
@@ -14569,16 +14597,16 @@ type Codegen = struct {
     func emit_iface_box(self, anon arg_reg: str, owner: TypeKind, iface_idx: int64) -> str {
         let vt_lbl = self.register_vtable(owner, iface_idx)
         let arg_spilled = self.preserve_begin(arg_reg)
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         self.rc_alloc_cell(mask: 1)
         let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.rc_retain(data_r)
-        self.emit_mem("str", reg: data_r, base: "x0")
+        self.emit_store(data_r, base: "x0")
         self.pool.free_reg(data_r)
         let vt_r = self.pool.alloc_reg()
-        self.emit_op("adrp", a: vt_r, b: f"{vt_lbl}@PAGE")
-        self.emit_op("add", a: vt_r, b: vt_r, c: f"{vt_lbl}@PAGEOFF")
-        self.emit_mem("str", reg: vt_r, base: "x0", off: 8)
+        self.emit_op(.AddressPage, a: vt_r, b: f"{vt_lbl}@PAGE")
+        self.emit_op(.Add, a: vt_r, b: vt_r, c: f"{vt_lbl}@PAGEOFF")
+        self.emit_store(vt_r, base: "x0", off: 8)
         self.pool.free_reg(vt_r)
         let cell_r = self.pool.alloc_reg()
         self.emit_mov(cell_r, src: "x0")
@@ -14665,15 +14693,15 @@ type Codegen = struct {
         let want = self.interfaces[to_idx].methods
         let vt_off = 16
         let spilled = self.preserve_begin(arg_reg)
-        self.emit_op("mov", a: "x0", b: f"#{vt_off + 8 * (len(want) + 1)}")
+        self.emit_op(.Move, a: "x0", b: f"#{vt_off + 8 * (len(want) + 1)}")
         self.rc_alloc_cell(mask: 1)
         let cell_r = self.preserve_end(arg_reg, :spilled)
         let tmp = self.pool.alloc_reg()
         let old_vt = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: tmp, base: cell_r)
+        self.emit_load(tmp, base: cell_r)
         self.rc_retain(tmp)
-        self.emit_mem("str", reg: tmp, base: "x0")
-        self.emit_mem("ldr", reg: old_vt, base: cell_r, off: 8)
+        self.emit_store(tmp, base: "x0")
+        self.emit_load(old_vt, base: cell_r, off: 8)
         // A provided method the old vtable lacks, or has as the old
         // interface's own body, gets the new interface's body.
         mut j = 0
@@ -14687,9 +14715,9 @@ type Codegen = struct {
                     let keep_lbl = self.fresh("Lconv_keep")
                     let old_body = self.pool.alloc_reg()
                     self.emit_label_addr(old_body, label: self.provided_conv_label(from_idx, name: m.name))
-                    self.emit_op("cmp", a: tmp, b: old_body)
+                    self.emit_op(.Compare, a: tmp, b: old_body)
                     self.pool.free_reg(old_body)
-                    self.emit_branch("bne", target: keep_lbl)
+                    self.emit_jump_if(.Ne, target: keep_lbl)
                     self.emit_own_or_provided(tmp, old_vt: old_vt, have_count: have_count, to_idx: to_idx, m: m)
                     self.emit_label(keep_lbl)
                 }
@@ -14699,8 +14727,8 @@ type Codegen = struct {
         }
         self.emit(f"ldr {tmp}, [{old_vt}, #{8 * have_count}]")
         self.emit(f"str {tmp}, [x0, #{vt_off + 8 * len(want)}]")
-        self.emit_op("add", a: tmp, b: "x0", c: f"#{vt_off}")
-        self.emit_mem("str", reg: tmp, base: "x0", off: 8)
+        self.emit_op(.Add, a: tmp, b: "x0", c: f"#{vt_off}")
+        self.emit_store(tmp, base: "x0", off: 8)
         self.pool.free_reg(tmp)
         self.pool.free_reg(old_vt)
         self.pool.free_reg(cell_r)
@@ -14723,21 +14751,21 @@ type Codegen = struct {
         let probe_r = self.pool.alloc_reg()
         self.emit_label_addr(dest, label: self.provided_conv_label(to_idx, name: m.name))
         self.emit(f"ldr {dir_r}, [{old_vt}, #{8 * have_count}]")
-        self.emit_branch("cbz", reg: dir_r, target: done)
-        self.emit_mem("ldr", reg: count_r, base: dir_r)
-        self.emit_op("add", a: dir_r, b: dir_r, c: "#8")
+        self.emit_jump_zero(dir_r, target: done)
+        self.emit_load(count_r, base: dir_r)
+        self.emit_op(.Add, a: dir_r, b: dir_r, c: "#8")
         self.emit_load_imm(key_r, value: self.method_key(m.name, sig: m.sig))
         self.emit_label(again)
-        self.emit_branch("cbz", reg: count_r, target: done)
-        self.emit_mem("ldr", reg: probe_r, base: dir_r)
-        self.emit_op("cmp", a: probe_r, b: key_r)
-        self.emit_branch("bne", target: next)
-        self.emit_mem("ldr", reg: dest, base: dir_r, off: 8)
-        self.emit_branch("b", target: done)
+        self.emit_jump_zero(count_r, target: done)
+        self.emit_load(probe_r, base: dir_r)
+        self.emit_op(.Compare, a: probe_r, b: key_r)
+        self.emit_jump_if(.Ne, target: next)
+        self.emit_load(dest, base: dir_r, off: 8)
+        self.emit_jump(done)
         self.emit_label(next)
-        self.emit_op("add", a: dir_r, b: dir_r, c: "#16")
-        self.emit_op("sub", a: count_r, b: count_r, c: "#1")
-        self.emit_branch("b", target: again)
+        self.emit_op(.Add, a: dir_r, b: dir_r, c: "#16")
+        self.emit_op(.Sub, a: count_r, b: count_r, c: "#1")
+        self.emit_jump(again)
         self.emit_label(done)
         self.pool.free_reg(probe_r)
         self.pool.free_reg(key_r)
@@ -14747,8 +14775,8 @@ type Codegen = struct {
 
     // Leave the address of `label` in `reg`.
     func emit_label_addr(self, anon reg: str, label: str) -> none {
-        self.emit_op("adrp", a: reg, b: f"{label}@PAGE")
-        self.emit_op("add", a: reg, b: reg, c: f"{label}@PAGEOFF")
+        self.emit_op(.AddressPage, a: reg, b: f"{label}@PAGE")
+        self.emit_op(.Add, a: reg, b: reg, c: f"{label}@PAGEOFF")
     }
 
     // The identity word that ends every vtable of a struct: the same for all of its interfaces.
@@ -14761,9 +14789,9 @@ type Codegen = struct {
         self.emit(f"ldr {vt_r}, [{vt_r}, #{8 * len(self.interfaces[iface_idx].methods)}]")
         let exp_r = self.pool.alloc_reg()
         let id_lbl = self.type_id_label(owner)
-        self.emit_op("adrp", a: exp_r, b: f"{id_lbl}@PAGE")
-        self.emit_op("add", a: exp_r, b: exp_r, c: f"{id_lbl}@PAGEOFF")
-        self.emit_op("cmp", a: vt_r, b: exp_r)
+        self.emit_op(.AddressPage, a: exp_r, b: f"{id_lbl}@PAGE")
+        self.emit_op(.Add, a: exp_r, b: exp_r, c: f"{id_lbl}@PAGEOFF")
+        self.emit_op(.Compare, a: vt_r, b: exp_r)
         self.pool.free_reg(exp_r)
     }
 
@@ -14842,16 +14870,16 @@ type Codegen = struct {
     func emit_prim_iface_box(self, anon arg_reg: str, kind: TypeKind, iface_idx: int64) -> str {
         let vt_lbl = self.register_prim_vtable(iface_idx, :kind)
         let arg_spilled = self.preserve_begin(arg_reg)
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         self.rc_alloc_cell(mask: self.rc_kind_mask(kind, slot: 0))
         let data_r = self.preserve_end(arg_reg, spilled: arg_spilled)
         self.rc_retain_kind(data_r, :kind)
-        self.emit_mem("str", reg: data_r, base: "x0")
+        self.emit_store(data_r, base: "x0")
         self.pool.free_reg(data_r)
         let vt_r = self.pool.alloc_reg()
-        self.emit_op("adrp", a: vt_r, b: f"{vt_lbl}@PAGE")
-        self.emit_op("add", a: vt_r, b: vt_r, c: f"{vt_lbl}@PAGEOFF")
-        self.emit_mem("str", reg: vt_r, base: "x0", off: 8)
+        self.emit_op(.AddressPage, a: vt_r, b: f"{vt_lbl}@PAGE")
+        self.emit_op(.Add, a: vt_r, b: vt_r, c: f"{vt_lbl}@PAGEOFF")
+        self.emit_store(vt_r, base: "x0", off: 8)
         self.pool.free_reg(vt_r)
         let cell_r = self.pool.alloc_reg()
         self.emit_mov(cell_r, src: "x0")
@@ -14924,7 +14952,7 @@ type Codegen = struct {
         if padded % 16 != 0 {
             padded = padded + 8
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
         for i in 0..total {
             mut arg_reg = ""
             // Which argument fills parameter i: with no `slots`, the i-th.
@@ -14960,7 +14988,7 @@ type Codegen = struct {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
-        self.emit_op("add", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
     }
 
     // Compiles a call's arguments straight into registers and moves them to
@@ -15073,19 +15101,19 @@ type Codegen = struct {
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                 }
                 .BindPat(binding) -> {
                     self.bind_whole(binding, :subj_slot)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .BoolPat(value) -> {
@@ -15093,10 +15121,10 @@ type Codegen = struct {
                     if value {
                         lit = 1
                     }
-                    self.emit_op("cmp", a: disc_r, b: f"#{lit}")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{lit}")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .StrPat(value) -> {
@@ -15106,70 +15134,70 @@ type Codegen = struct {
                     self.emit_ldr(subj_slot, reg: "x1")
                     self.emit_str_pat_test(value, label: slbl, subject: "x1", other: "x0", :skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .NonePat -> {
-                    self.emit_op("cmp", a: disc_r, b: "#0")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: "#0")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .SomePat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: "#0")
-                    self.emit_branch("beq", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: "#0")
+                    self.emit_jump_if(.Eq, target: skip_lbl)
                     if len(binding) > 0 {
                         let boff = self.find_var_offset(binding)
                         let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
                         let val_r = self.pool.alloc_reg()
-                        self.emit_mem("ldr", reg: val_r, base: ptr_r)
+                        self.emit_load(val_r, base: ptr_r)
                         self.emit_str(boff, reg: val_r)
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .OkPat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.bind_result_payload(binding, :subj_slot)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ErrPat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                    self.emit_branch("beq", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                    self.emit_jump_if(.Eq, target: skip_lbl)
                     self.bind_result_payload(binding, :subj_slot)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
                     self.emit_typepat_test(:type_name, :binding, subject_kind: subj_kind, span: self.p.expr_spans[subject_id], :subj_slot, :skip_lbl)
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 else {
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                 }
             }
             self.restore_pattern_bindings(arm.pattern, kinds: saved_kinds)
@@ -15984,7 +16012,7 @@ type Codegen = struct {
         self.compile_store(dest_off: off, :kind, value_id: value)
         if mutable and kind.is_array() and self.is_array_place(value) {
             self.emit_ldr(off, reg: "x0")
-            self.emit_op("mov", a: "x1", b: f"#{self.elem_width(kind)}")
+            self.emit_op(.Move, a: "x1", b: f"#{self.elem_width(kind)}")
             self.emit_call("_kod_arr_copy")
             self.rc_temp("x0")
             self.emit_str(off, reg: "x0")
@@ -16419,17 +16447,17 @@ type Codegen = struct {
         let ok_kind = self.result_inner_kind(kind)
         let val_reg = self.compile_value_for_kind(value_id, expected: ok_kind)
         let val_spilled = self.preserve_begin(val_reg)
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(ok_kind, slot: 1))
         let ptr_reg = self.pool.alloc_reg()
         self.emit_mov(ptr_reg, src: "x0")
         let payload = self.preserve_end(val_reg, spilled: val_spilled)
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
-        self.emit_mem("str", reg: disc_r, base: ptr_reg)
+        self.emit_store(disc_r, base: ptr_reg)
         self.pool.free_reg(disc_r)
         self.rc_retain_kind(payload, kind: ok_kind)
-        self.emit_mem("str", reg: payload, base: ptr_reg, off: 8)
+        self.emit_store(payload, base: ptr_reg, off: 8)
         self.pool.free_reg(payload)
         self.rc_mark_owned(ptr_reg, slot: rc_cell)
         return ptr_reg
@@ -16521,13 +16549,13 @@ type Codegen = struct {
                 }
                 let val_reg = self.compile_value_for_kind(value_id, expected: inner)
                 let val_spilled = self.preserve_begin(val_reg)
-                self.emit_op("mov", a: "x0", b: "#8")
+                self.emit_op(.Move, a: "x0", b: "#8")
                 let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(inner, slot: 0))
                 let ptr_reg = self.pool.alloc_reg()
                 self.emit_mov(ptr_reg, src: "x0")
                 let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                 self.rc_retain_kind(tmp, kind: inner)
-                self.emit_mem("str", reg: tmp, base: ptr_reg)
+                self.emit_store(tmp, base: ptr_reg)
                 self.pool.free_reg(tmp)
                 self.rc_mark_owned(ptr_reg, slot: rc_cell)
                 return ptr_reg
@@ -16686,7 +16714,7 @@ type Codegen = struct {
                 } else {
                     let val_reg = self.compile_value_for_kind(value_id, expected: inner)
                     let val_spilled = self.preserve_begin(val_reg)
-                    self.emit_op("mov", a: "x0", b: "#8")
+                    self.emit_op(.Move, a: "x0", b: "#8")
                     let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(inner, slot: 0))
                     let ptr_reg = self.pool.alloc_reg()
                     self.emit_mov(ptr_reg, src: "x0")
@@ -16694,7 +16722,7 @@ type Codegen = struct {
                     self.emit_str(dest_off, reg: ptr_reg)
                     let tmp = self.preserve_end(val_reg, spilled: val_spilled)
                     self.rc_retain_kind(tmp, kind: inner)
-                    self.emit_mem("str", reg: tmp, base: ptr_reg)
+                    self.emit_store(tmp, base: ptr_reg)
                     self.pool.free_reg(tmp)
                     self.pool.free_reg(ptr_reg)
                 }
@@ -16900,8 +16928,8 @@ type Codegen = struct {
             self.emit_call(self.method_label(oc.struct_idx, name: method.name))
         }
         if oc.negate {
-            self.emit_op("cmp", a: "x0", b: "#0")
-            self.emit_op("cset", a: "x0", b: "eq")
+            self.emit_op(.Compare, a: "x0", b: "#0")
+            self.emit_op(.SetIf, a: "x0", b: "eq")
         }
         return .VReg(name: "x0")
     }
@@ -17070,7 +17098,7 @@ type Codegen = struct {
             if not weak {
                 self.rc_retain_kind(field_reg, kind: field_kind)
             }
-            self.emit_mem("str", reg: field_reg, base: ptr_r, off: foff)
+            self.emit_store(field_reg, base: ptr_r, off: foff)
             self.pool.free_reg(field_reg)
         }
         // Completeness check, in the *consuming* module's context so
@@ -17120,7 +17148,7 @@ type Codegen = struct {
                     if not field.weak {
                         self.rc_retain_kind(dreg, kind: self.find_field_kind(field.name, :struct_idx))
                     }
-                    self.emit_mem("str", reg: dreg, base: ptr_r, off: field.offset)
+                    self.emit_store(dreg, base: ptr_r, off: field.offset)
                     self.pool.free_reg(dreg)
                 }
             }
@@ -17153,7 +17181,7 @@ type Codegen = struct {
         self.emit_mov(ptr_r, src: "x0")
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: disc)
-        self.emit_mem("str", reg: disc_r, base: ptr_r)
+        self.emit_store(disc_r, base: ptr_r)
         self.pool.free_reg(disc_r)
         if len(field_args) > 0 {
             let vinfo = self.enums[enum_idx].variants[variant_idx]
@@ -17388,11 +17416,11 @@ type Codegen = struct {
             if not weak {
                 self.rc_retain(tmp_reg)
             }
-            self.emit_mem("ldr", reg: "x17", base: ptr_reg, off: foff)
-            self.emit_mem("str", reg: tmp_reg, base: ptr_reg, off: foff)
+            self.emit_load("x17", base: ptr_reg, off: foff)
+            self.emit_store(tmp_reg, base: ptr_reg, off: foff)
             self.rc_release_x17()
         } else {
-            self.emit_mem("str", reg: tmp_reg, base: ptr_reg, off: foff)
+            self.emit_store(tmp_reg, base: ptr_reg, off: foff)
         }
         self.pool.free_reg(tmp_reg)
         self.pool.free_reg(ptr_reg)
@@ -17582,8 +17610,8 @@ type Codegen = struct {
                 // the slot; if it rode through a callee-saved register, just
                 // move it across.
                 if rhs_spilled {
-                    self.emit_mem("ldr", reg: "x2", base: "sp")
-                    self.emit_op("add", a: "sp", b: "sp", c: "#16")
+                    self.emit_load("x2", base: "sp")
+                    self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
                 } else {
                     self.emit_mov("x2", src: rhs_r)
                     self.pool.free_reg(rhs_r)
@@ -17647,13 +17675,13 @@ type Codegen = struct {
                         self.pool.free_reg(view[1])
                     }
                 } else if self.rc_heap_kind(lhs_kind.array_elem()) {
-                    self.emit_op("lsl", a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
+                    self.emit_op(.ShiftLeft, a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
                     self.rc_retain(reloaded_rhs_r)
                     self.emit(f"ldr x17, [{buf_r}, {reloaded_idx_r}]")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
                     self.rc_release_x17()
                 } else {
-                    self.emit_op("lsl", a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
+                    self.emit_op(.ShiftLeft, a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
                     self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
                 }
                 self.pool.free_reg(buf_r)
@@ -17666,9 +17694,9 @@ type Codegen = struct {
     func array_buf_len(self, anon arr_ptr_r: str, len_out: bool) -> str {
         let r = self.pool.alloc_reg()
         if len_out {
-            self.emit_mem("ldr", reg: r, base: arr_ptr_r, off: 8)
+            self.emit_load(r, base: arr_ptr_r, off: 8)
         } else {
-            self.emit_mem("ldr", reg: r, base: arr_ptr_r)
+            self.emit_load(r, base: arr_ptr_r)
         }
         return r
     }
@@ -17816,14 +17844,14 @@ type Codegen = struct {
         self.emit_ldr(self.find_var_offset(tmp), :reg)
         self.rc_retain_kind(reg, :kind)
         let cell = f"${self.path_prefix}${decl.name}$cell"
-        self.emit_op("adrp", a: "x16", b: f"{cell}@PAGE")
-        self.emit_op("add", a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
+        self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
+        self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
         if self.rc_heap_kind(kind) {
-            self.emit_mem("ldr", reg: "x17", base: "x16", off: 8)
-            self.emit_mem("str", reg: reg, base: "x16", off: 8)
+            self.emit_load("x17", base: "x16", off: 8)
+            self.emit_store(reg, base: "x16", off: 8)
             self.rc_release_x17()
         } else {
-            self.emit_mem("str", reg: reg, base: "x16", off: 8)
+            self.emit_store(reg, base: "x16", off: 8)
         }
         self.pool.free_reg(reg)
     }
@@ -17865,34 +17893,34 @@ type Codegen = struct {
         self.emit_label(lbl)
         self.emit("stp fp, lr, [sp, #-16]!")
         self.emit_mov("fp", src: "sp")
-        self.emit_op("adrp", a: "x16", b: f"{cell}@PAGE")
-        self.emit_op("add", a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
-        self.emit_mem("ldr", reg: "x17", base: "x16")
-        self.emit_op("cmp", a: "x17", b: "#1")
-        self.emit_branch("b.ne", target: init_lbl)
+        self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
+        self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
+        self.emit_load("x17", base: "x16")
+        self.emit_op(.Compare, a: "x17", b: "#1")
+        self.emit_jump_if(.Ne, target: init_lbl)
         self.emit_label(ready)
-        self.emit_mem("ldr", reg: "x0", base: "x16", off: 8)
+        self.emit_load("x0", base: "x16", off: 8)
         if self.rc_heap_kind(kind) {
             self.emit_mov("x17", src: "x0")
             self.emit_call("_rc_retain_stub")
         }
         self.emit("ldp fp, lr, [sp], #16")
-        self.emit_op("ret")
+        self.emit_op(.Return)
         self.emit_label(init_lbl)
-        self.emit_branch("cbnz", reg: "x17", target: cycle)
-        self.emit_op("mov", a: "x17", b: "#2")
-        self.emit_mem("str", reg: "x17", base: "x16")
+        self.emit_jump_zero("x17", target: cycle, nonzero: true)
+        self.emit_op(.Move, a: "x17", b: "#2")
+        self.emit_store("x17", base: "x16")
         // The initializer's reference becomes the cell's.
         self.emit_call(init)
-        self.emit_op("adrp", a: "x16", b: f"{cell}@PAGE")
-        self.emit_op("add", a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
-        self.emit_mem("str", reg: "x0", base: "x16", off: 8)
-        self.emit_op("mov", a: "x17", b: "#1")
-        self.emit_mem("str", reg: "x17", base: "x16")
-        self.emit_branch("b", target: ready)
+        self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
+        self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
+        self.emit_store("x0", base: "x16", off: 8)
+        self.emit_op(.Move, a: "x17", b: "#1")
+        self.emit_store("x17", base: "x16")
+        self.emit_jump(ready)
         self.emit_label(cycle)
-        self.emit_op("adrp", a: "x0", b: f"{msg}@PAGE")
-        self.emit_op("add", a: "x0", b: "x0", c: f"{msg}@PAGEOFF")
+        self.emit_op(.AddressPage, a: "x0", b: f"{msg}@PAGE")
+        self.emit_op(.Add, a: "x0", b: "x0", c: f"{msg}@PAGEOFF")
         self.emit_call("_kod_panic")
         self.println("\t.data")
         self.println("\t.p2align 3")
@@ -17945,10 +17973,10 @@ type Codegen = struct {
     // anyway becomes the caller's as it is, with no counting.
     func emit_ret_jump(self) -> none {
         if self.rc_heap_kind(self.return_kind) and self.rc_take("x0") {
-            self.emit_branch("b", target: f"{self.ret_lbl}_own")
+            self.emit_jump(f"{self.ret_lbl}_own")
             return
         }
-        self.emit_branch("b", target: self.ret_lbl)
+        self.emit_jump(self.ret_lbl)
     }
 
     // `return x` for a local that owns its value: the local gives it up.
@@ -17960,7 +17988,7 @@ type Codegen = struct {
         for slot in self.rc_slots {
             if slot == off {
                 self.emit_str_raw(off, reg: "xzr")
-                self.emit_branch("b", target: f"{self.ret_lbl}_own")
+                self.emit_jump(f"{self.ret_lbl}_own")
                 return true
             }
         }
@@ -17977,7 +18005,7 @@ type Codegen = struct {
                 self.emit_str(self.inline_ret_off, :reg)
                 self.pool.free_reg(reg)
             }
-            self.emit_branch("b", target: self.inline_ret_lbl)
+            self.emit_jump(self.inline_ret_lbl)
             return
         }
         if value_id == 0 {
@@ -18072,11 +18100,11 @@ type Codegen = struct {
                 reg = self.load(val)
             }
             let reg_spilled = self.preserve_begin(reg)
-            self.emit_op("mov", a: "x0", b: "#8")
+            self.emit_op(.Move, a: "x0", b: "#8")
             let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(self.return_kind.optional_inner(), slot: 0))
             let tmp = self.preserve_end(reg, spilled: reg_spilled)
             self.rc_retain_kind(tmp, kind: self.return_kind.optional_inner())
-            self.emit_mem("str", reg: tmp, base: "x0")
+            self.emit_store(tmp, base: "x0")
             self.pool.free_reg(tmp)
             self.rc_mark_owned("x0", slot: rc_cell)
         } else {
@@ -18128,16 +18156,16 @@ type Codegen = struct {
     // A `none or Error` function returns an Ok(none) cell, not the none sentinel.
     func emit_no_value_return(self) -> none {
         if not self.is_result_kind(self.return_kind) or not self.result_inner_kind(self.return_kind).is_void() {
-            self.emit_op("mov", a: "x0", b: "#0")
+            self.emit_op(.Move, a: "x0", b: "#0")
             return
         }
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         self.rc_alloc_cell(mask: 0)
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
-        self.emit_mem("str", reg: disc_r, base: "x0")
+        self.emit_store(disc_r, base: "x0")
         self.pool.free_reg(disc_r)
-        self.emit_mem("str", reg: "xzr", base: "x0", off: 8)
+        self.emit_store("xzr", base: "x0", off: 8)
     }
 
     // The caller would get the optional's cell instead of the value.
@@ -18174,15 +18202,15 @@ type Codegen = struct {
             self.mov_to(val, dest: reg)
         }
         let reg_spilled = self.preserve_begin(reg)
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         let rc_cell = self.rc_alloc_cell(mask: self.rc_kind_mask(self.result_inner_kind(self.return_kind), slot: 1))
         let payload = self.preserve_end(reg, spilled: reg_spilled)
         let disc_r = self.pool.alloc_reg()
         self.emit_load_imm(disc_r, value: self.result_ok_disc())
-        self.emit_mem("str", reg: disc_r, base: "x0")
+        self.emit_store(disc_r, base: "x0")
         self.pool.free_reg(disc_r)
         self.rc_retain_kind(payload, kind: self.result_inner_kind(self.return_kind))
-        self.emit_mem("str", reg: payload, base: "x0", off: 8)   // payload
+        self.emit_store(payload, base: "x0", off: 8)   // payload
         self.pool.free_reg(payload)
         self.rc_mark_owned("x0", slot: rc_cell)
     }
@@ -18220,13 +18248,13 @@ type Codegen = struct {
         self.check_bool(expr_id, need: "`assert` needs a `bool`", optional_hint: "; test it with `is not none`")
         mut reg = self.load(val)
         let ok_lbl = self.fresh("Lassert_ok")
-        self.emit_branch("cbnz", reg: reg, target: ok_lbl)
+        self.emit_jump_zero(reg, target: ok_lbl, nonzero: true)
         self.pool.free_reg(reg)
         let pos = self.format_position(span.start)
         let msg = f"{pos}: assertion failed: {source_text}"
         let msg_lbl = self.intern_str(msg)
-        self.emit_op("adrp", a: "x0", b: f"{msg_lbl}@PAGE")
-        self.emit_op("add", a: "x0", b: "x0", c: f"{msg_lbl}@PAGEOFF")
+        self.emit_op(.AddressPage, a: "x0", b: f"{msg_lbl}@PAGE")
+        self.emit_op(.Add, a: "x0", b: "x0", c: f"{msg_lbl}@PAGEOFF")
         if self.in_test {
             self.emit_call("$testing$fail")
         } else {
@@ -18248,13 +18276,13 @@ type Codegen = struct {
         }
         // Build the Result.Err cell.
         let reg_spilled = self.preserve_begin(reg)
-        self.emit_op("mov", a: "x0", b: "#16")
+        self.emit_op(.Move, a: "x0", b: "#16")
         let rc_cell = self.rc_alloc_cell(mask: 2)
         let payload = self.preserve_end(reg, spilled: reg_spilled)
-        self.emit_op("mov", a: "x9", b: f"#{self.result_err_disc()}")
-        self.emit_mem("str", reg: "x9", base: "x0")
+        self.emit_op(.Move, a: "x9", b: f"#{self.result_err_disc()}")
+        self.emit_store("x9", base: "x0")
         self.rc_retain(payload)
-        self.emit_mem("str", reg: payload, base: "x0", off: 8)   // error iface ptr
+        self.emit_store(payload, base: "x0", off: 8)   // error iface ptr
         self.pool.free_reg(payload)
         self.rc_mark_owned("x0", slot: rc_cell)
         self.emit_ret_jump()
@@ -18298,12 +18326,12 @@ type Codegen = struct {
         let val = self.compile_expr(inner_id)
         self.mov_to(val, dest: "x0")
         mut disc = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: disc, base: "x0")
+        self.emit_load(disc, base: "x0")
         let ok_lbl = self.fresh("Lresult_ok")
         let done_lbl = self.fresh("Lresult_done")
-        self.emit_op("cmp", a: disc, b: f"#{self.result_ok_disc()}")
+        self.emit_op(.Compare, a: disc, b: f"#{self.result_ok_disc()}")
         self.pool.free_reg(disc)
-        self.emit_branch("beq", target: ok_lbl)
+        self.emit_jump_if(.Eq, target: ok_lbl)
         // Err path.
         if is_must {
             // Load the Error interface cell, then dispatch its to_str
@@ -18311,11 +18339,11 @@ type Codegen = struct {
             //   result cell:    [disc, error_iface_ptr]
             //   error iface:    [data_ptr, vtable_ptr]
             //   vtable[0]:      to_str method (only entry on Error)
-            self.emit_mem("ldr", reg: "x0", base: "x0", off: 8)    // x0 = error iface cell ptr
-            self.emit_mem("ldr", reg: "x1", base: "x0", off: 8)    // x1 = vtable ptr
-            self.emit_mem("ldr", reg: "x9", base: "x1", off: 0)    // x9 = to_str method
-            self.emit_mem("ldr", reg: "x0", base: "x0", off: 0)    // x0 = self (data ptr)
-            self.emit_op("blr", a: "x9")              // x0 = str
+            self.emit_load("x0", base: "x0", off: 8)    // x0 = error iface cell ptr
+            self.emit_load("x1", base: "x0", off: 8)    // x1 = vtable ptr
+            self.emit_load("x9", base: "x1", off: 0)    // x9 = to_str method
+            self.emit_load("x0", base: "x0", off: 0)    // x0 = self (data ptr)
+            self.emit_op(.CallIndirect, a: "x9")              // x0 = str
             self.emit_call("_kod_panic")
         } else {
             // Propagate: the cell ptr is already in x0; just return it.
@@ -18323,7 +18351,7 @@ type Codegen = struct {
         }
         self.emit_label(ok_lbl)
         let result_r = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: result_r, base: "x0", off: 8)
+        self.emit_load(result_r, base: "x0", off: 8)
         self.emit_label(done_lbl)
         return .VReg(name: result_r)
     }
@@ -18403,14 +18431,14 @@ type Codegen = struct {
         mut reg = self.load(val)
         let some_lbl = self.fresh("Lopt_some")
         let done_lbl = self.fresh("Lopt_done")
-        self.emit_branch("cbnz", reg: reg, target: some_lbl)
+        self.emit_jump_zero(reg, target: some_lbl, nonzero: true)
         // none path
         if default_id == 0 {
             let pos = self.format_position(self.p.expr_spans[value_id].start)
             let msg = f"{pos}: {word} on none"
             let msg_lbl = self.intern_str(msg)
-            self.emit_op("adrp", a: "x0", b: f"{msg_lbl}@PAGE")
-            self.emit_op("add", a: "x0", b: "x0", c: f"{msg_lbl}@PAGEOFF")
+            self.emit_op(.AddressPage, a: "x0", b: f"{msg_lbl}@PAGE")
+            self.emit_op(.Add, a: "x0", b: "x0", c: f"{msg_lbl}@PAGEOFF")
             self.emit_call("_kod_panic")
         } else {
             let inner = value_kind.optional_inner()
@@ -18425,11 +18453,11 @@ type Codegen = struct {
             if not panics {
                 self.check_diverge_ok(default_id, expected: inner)
             }
-            self.emit_branch("b", target: done_lbl)
+            self.emit_jump(done_lbl)
         }
         self.emit_label(some_lbl)
         // Some(v) path: dereference the cell to get v.
-        self.emit_mem("ldr", reg: reg, base: reg)
+        self.emit_load(reg, base: reg)
         self.emit_label(done_lbl)
         return .VReg(name: reg)
     }
@@ -18479,46 +18507,46 @@ type Codegen = struct {
         mut reg = self.load(val)
         let none_lbl = self.fresh("Lopt_dot_none")
         let done_lbl = self.fresh("Lopt_dot_done")
-        self.emit_branch("cbz", reg: reg, target: none_lbl)
+        self.emit_jump_zero(reg, target: none_lbl)
         // Dereference the Optional cell to get the struct pointer, then
         // load the field at its known offset.
-        self.emit_mem("ldr", reg: reg, base: reg)
-        self.emit_mem("ldr", reg: reg, base: reg, off: foff)
+        self.emit_load(reg, base: reg)
+        self.emit_load(reg, base: reg, off: foff)
         let field_kind = self.find_field_kind(field, :struct_idx)
         if self.field_is_weak(field, :struct_idx) {
             // A weak field: a new `U?` from its box, already the reader's.
             self.emit_mov("x0", src: reg)
             self.emit_call("_kod_weak_get")
             self.emit_mov(reg, src: "x0")
-            self.emit_branch("b", target: done_lbl)
+            self.emit_jump(done_lbl)
             self.emit_label(none_lbl)
-            self.emit_op("mov", a: reg, b: "#0")
+            self.emit_op(.Move, a: reg, b: "#0")
             self.emit_label(done_lbl)
             return .VReg(name: reg)
         }
         if field_kind is .KOptional(_inner) {
             // Already a `U?`, which is the result as it is: `T??` is `T?`.
             self.rc_retain_kind(reg, kind: field_kind)
-            self.emit_branch("b", target: done_lbl)
+            self.emit_jump(done_lbl)
             self.emit_label(none_lbl)
-            self.emit_op("mov", a: reg, b: "#0")
+            self.emit_op(.Move, a: reg, b: "#0")
             self.emit_label(done_lbl)
             return .VReg(name: reg)
         }
         // Wrap the field value into a fresh Some cell: rc_alloc 8 +
         // store the value. Preserves the field value across `bl`.
         let val_spilled = self.preserve_begin(reg)
-        self.emit_op("mov", a: "x0", b: "#8")
+        self.emit_op(.Move, a: "x0", b: "#8")
         self.rc_alloc_cell(mask: self.rc_kind_mask(self.find_field_kind(field, :struct_idx), slot: 0))
         let ptr = self.pool.alloc_reg()
         self.emit_mov(ptr, src: "x0")
         let tmp = self.preserve_end(reg, spilled: val_spilled)
         self.rc_retain_kind(tmp, kind: self.find_field_kind(field, :struct_idx))
-        self.emit_mem("str", reg: tmp, base: ptr)
+        self.emit_store(tmp, base: ptr)
         self.pool.free_reg(tmp)
-        self.emit_branch("b", target: done_lbl)
+        self.emit_jump(done_lbl)
         self.emit_label(none_lbl)
-        self.emit_op("mov", a: ptr, b: "#0")
+        self.emit_op(.Move, a: ptr, b: "#0")
         self.emit_label(done_lbl)
         return .VReg(name: ptr)
     }
@@ -18595,8 +18623,8 @@ type Codegen = struct {
                 // cmp v, #0 then beq/bne L
                 if len(b) == 3 and b[0] == "cmp" and b[1] == a[1] and b[2] == "#0" and i + 2 < n {
                     let c = insn_parts(body[i + 2])
-                    if len(c) == 2 and (c[0] == "beq" or c[0] == "bne") {
-                        out += [branch_on(a[2], when_true: c[0] == "bne", target: c[1])]
+                    if len(c) == 2 and (c[0] == "b.eq" or c[0] == "b.ne") {
+                        out += [branch_on(a[2], when_true: c[0] == "b.ne", target: c[1])]
                         i += 3
                         continue
                     }
@@ -18606,17 +18634,17 @@ type Codegen = struct {
                 let b = insn_parts(body[i + 1])
                 let v = a[1]
                 if len(b) == 4 and (b[0] == "add" or b[0] == "sub") and b[3] == v and b[2] != v and b[2] != "xzr" {
-                    out += [regalloc.op(b[0], a: b[1], b: b[2], c: a[2])]
+                    out += [regalloc.op(must regalloc.opcode_named(b[0]), a: b[1], b: b[2], c: a[2])]
                     i += 2
                     continue
                 }
                 if len(b) == 4 and b[0] == "add" and b[2] == v and b[3] != v and b[3] != "xzr" {
-                    out += [regalloc.op("add", a: b[1], b: b[3], c: a[2])]
+                    out += [regalloc.op(.Add, a: b[1], b: b[3], c: a[2])]
                     i += 2
                     continue
                 }
                 if len(b) == 3 and b[0] == "cmp" and b[2] == v and b[1] != v and b[1] != "xzr" {
-                    out += [regalloc.op("cmp", a: b[1], b: a[2])]
+                    out += [regalloc.op(.Compare, a: b[1], b: a[2])]
                     i += 2
                     continue
                 }
@@ -18894,14 +18922,14 @@ type Codegen = struct {
         mut reg = self.load(val)
         let some_lbl = self.fresh("Lopt_call_some")
         let done_lbl = self.fresh("Lopt_call_done")
-        self.emit_branch("cbnz", reg: reg, target: some_lbl)
+        self.emit_jump_zero(reg, target: some_lbl, nonzero: true)
         // none path: result stays 0.
-        self.emit_op("mov", a: result, b: "#0")
-        self.emit_branch("b", target: done_lbl)
+        self.emit_op(.Move, a: result, b: "#0")
+        self.emit_jump(done_lbl)
         self.emit_label(some_lbl)
         // Dereference the Optional cell — reg now holds the struct pointer
         // (the method's `self`).
-        self.emit_mem("ldr", reg: reg, base: reg)
+        self.emit_load(reg, base: reg)
         // Park the struct pointer + each arg on the stack so the inner
         // bls (arg wrapping, method dispatch itself) can't clobber them.
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
@@ -18914,8 +18942,8 @@ type Codegen = struct {
         if padded % 16 != 0 {
             padded = padded + 8
         }
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{padded}")
-        self.emit_mem("str", reg: reg, base: "sp")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_store(reg, base: "sp")
         self.pool.free_reg(reg)
         for i in 0..total_user {
             mut arg_reg: str = ""
@@ -18944,7 +18972,7 @@ type Codegen = struct {
             self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
             k = k + 1
         }
-        self.emit_op("add", a: "sp", b: "sp", c: f"#{padded}")
+        self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
         self.emit_call(method_lbl)
         if rc_ret_kind is .KOptional(_inner) {
             // Already a `U?`, which is the result as it is: `T??` is `T?`.
@@ -18956,13 +18984,13 @@ type Codegen = struct {
         let ret_reg = self.pool.alloc_reg()
         self.emit_mov(ret_reg, src: "x0")
         let val_spilled = self.preserve_begin(ret_reg)
-        self.emit_op("mov", a: "x0", b: "#8")
+        self.emit_op(.Move, a: "x0", b: "#8")
         // The cell takes over the reference the call returned.
         self.rc_alloc_cell(mask: self.rc_kind_mask(rc_ret_kind, slot: 0))
         let ptr = self.pool.alloc_reg()
         self.emit_mov(ptr, src: "x0")
         let tmp = self.preserve_end(ret_reg, spilled: val_spilled)
-        self.emit_mem("str", reg: tmp, base: ptr)
+        self.emit_store(tmp, base: ptr)
         self.pool.free_reg(tmp)
         self.emit_mov(result, src: ptr)
         self.pool.free_reg(ptr)
@@ -19005,12 +19033,12 @@ type Codegen = struct {
         let cond_val = self.compile_expr(cond_id)
         self.check_bool(cond_id, :need, :optional_hint)
         let cond_reg = self.load(cond_val)
-        self.emit_op("cmp", a: cond_reg, b: "#0")
+        self.emit_op(.Compare, a: cond_reg, b: "#0")
         self.pool.free_reg(cond_reg)
         if when {
-            self.emit_branch("bne", target: to)
+            self.emit_jump_if(.Ne, target: to)
         } else {
-            self.emit_branch("beq", target: to)
+            self.emit_jump_if(.Eq, target: to)
         }
     }
 
@@ -19020,7 +19048,7 @@ type Codegen = struct {
         let end_lbl = f"{lbl}_end"
         self.compile_branch(cond_id, to: false_lbl, when: false, need: "an `if` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         self.compile_block(then_body)
-        self.emit_branch("b", target: end_lbl)
+        self.emit_jump(end_lbl)
         self.emit_label(false_lbl)
         self.compile_block(else_body)
         self.emit_label(end_lbl)
@@ -19036,7 +19064,7 @@ type Codegen = struct {
         self.emit_label(start_lbl)
         self.compile_branch(cond_id, to: end_lbl, when: false, need: "a `for` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         self.compile_block(body)
-        self.emit_branch("b", target: start_lbl)
+        self.emit_jump(start_lbl)
         self.emit_label(end_lbl)
         self.end_loop()
     }
@@ -19114,7 +19142,7 @@ type Codegen = struct {
         self.pool.free_reg(hdr_r)
 
         let idx_r = self.pool.alloc_reg()
-        self.emit_op("mov", a: idx_r, b: "#0")
+        self.emit_op(.Move, a: idx_r, b: "#0")
         self.emit_str(idx_off, reg: idx_r)
         self.pool.free_reg(idx_r)
 
@@ -19123,18 +19151,18 @@ type Codegen = struct {
         let len_reg = self.pool.alloc_reg()
         let idx_reg = self.pool.alloc_reg()
         self.emit_ldr(hdr_off, reg: hdr_reg)
-        self.emit_mem("ldr", reg: len_reg, base: hdr_reg, off: 8)
+        self.emit_load(len_reg, base: hdr_reg, off: 8)
         self.emit_ldr(idx_off, reg: idx_reg)
-        self.emit_op("cmp", a: idx_reg, b: len_reg)
-        self.emit_branch("bge", target: end_lbl)
+        self.emit_op(.Compare, a: idx_reg, b: len_reg)
+        self.emit_jump_if(.Ge, target: end_lbl)
         self.pool.free_reg(len_reg)
 
         mut elem_reg = self.pool.alloc_reg()
-        self.emit_mem("ldr", reg: elem_reg, base: hdr_reg)
+        self.emit_load(elem_reg, base: hdr_reg)
         if by_byte {
             self.emit(f"ldrb w{elem_reg[1..len(elem_reg)]}, [{elem_reg}, {idx_reg}]")
         } else {
-            self.emit_op("lsl", a: idx_reg, b: idx_reg, c: "#3")
+            self.emit_op(.ShiftLeft, a: idx_reg, b: idx_reg, c: "#3")
             self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
         }
         self.emit_str(elem_off, reg: elem_reg)
@@ -19151,10 +19179,10 @@ type Codegen = struct {
         self.emit_label(incr_lbl)
         let bump_reg = self.pool.alloc_reg()
         self.emit_ldr(idx_off, reg: bump_reg)
-        self.emit_op("add", a: bump_reg, b: bump_reg, c: "#1")
+        self.emit_op(.Add, a: bump_reg, b: bump_reg, c: "#1")
         self.emit_str(idx_off, reg: bump_reg)
         self.pool.free_reg(bump_reg)
-        self.emit_branch("b", target: start_lbl)
+        self.emit_jump(start_lbl)
         self.emit_label(end_lbl)
 
         self.end_loop()
@@ -19245,12 +19273,12 @@ type Codegen = struct {
 
     func compile_break(self) -> none {
         self.prepare_loop_jump()
-        self.emit_branch("b", target: self.loop_stack[-1].end_lbl)
+        self.emit_jump(self.loop_stack[-1].end_lbl)
     }
 
     func compile_continue(self) -> none {
         self.prepare_loop_jump()
-        self.emit_branch("b", target: self.loop_stack[-1].incr_lbl)
+        self.emit_jump(self.loop_stack[-1].incr_lbl)
     }
 
     // `T?` is a nullable cell, not an Option enum cell: `.Some`/`.None` on it mean SomePat/NonePat.
@@ -19269,9 +19297,9 @@ type Codegen = struct {
         let disc_r = self.pool.alloc_reg()
         let ptr_r = self.pool.alloc_reg()
         self.emit_ldr(subj_slot, reg: ptr_r)
-        self.emit_mem("ldr", reg: disc_r, base: ptr_r)
-        self.emit_op("cmp", a: disc_r, b: f"#{disc}")
-        self.emit_branch("bne", target: else_lbl)
+        self.emit_load(disc_r, base: ptr_r)
+        self.emit_op(.Compare, a: disc_r, b: f"#{disc}")
+        self.emit_jump_if(.Ne, target: else_lbl)
         self.pool.free_reg(disc_r)
         self.pool.free_reg(ptr_r)
         let vinfo2 = self.enums[enum_idx].variants[variant_idx]
@@ -19399,9 +19427,9 @@ type Codegen = struct {
                 let disc_r = self.pool.alloc_reg()
                 let ptr_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: ptr_r)
-                self.emit_mem("ldr", reg: disc_r, base: ptr_r)
-                self.emit_op("cmp", a: disc_r, b: f"#{disc}")
-                self.emit_branch("bne", target: else_lbl)
+                self.emit_load(disc_r, base: ptr_r)
+                self.emit_op(.Compare, a: disc_r, b: f"#{disc}")
+                self.emit_jump_if(.Ne, target: else_lbl)
                 self.pool.free_reg(disc_r)
                 self.pool.free_reg(ptr_r)
                 let vinfo = self.enums[enum_idx].variants[variant_idx]
@@ -19427,15 +19455,15 @@ type Codegen = struct {
             .SomePat(binding) -> {
                 let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
-                self.emit_op("cmp", a: disc_r, b: "#0")
-                self.emit_branch("beq", target: else_lbl)
+                self.emit_op(.Compare, a: disc_r, b: "#0")
+                self.emit_jump_if(.Eq, target: else_lbl)
                 self.pool.free_reg(disc_r)
                 if len(binding) > 0 {
                     let boff = self.find_var_offset(binding)
                     let ptr_r = self.pool.alloc_reg()
                     self.emit_ldr(subj_slot, reg: ptr_r)
                     let val_r = self.pool.alloc_reg()
-                    self.emit_mem("ldr", reg: val_r, base: ptr_r)
+                    self.emit_load(val_r, base: ptr_r)
                     self.emit_str(boff, reg: val_r)
                     self.pool.free_reg(val_r)
                     self.pool.free_reg(ptr_r)
@@ -19444,25 +19472,25 @@ type Codegen = struct {
             .NonePat -> {
                 let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
-                self.emit_op("cmp", a: disc_r, b: "#0")
-                self.emit_branch("bne", target: else_lbl)
+                self.emit_op(.Compare, a: disc_r, b: "#0")
+                self.emit_jump_if(.Ne, target: else_lbl)
                 self.pool.free_reg(disc_r)
             }
             .OkPat(binding) -> {
                 let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
-                self.emit_mem("ldr", reg: disc_r, base: disc_r)
-                self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                self.emit_branch("bne", target: else_lbl)
+                self.emit_load(disc_r, base: disc_r)
+                self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                self.emit_jump_if(.Ne, target: else_lbl)
                 self.pool.free_reg(disc_r)
                 self.bind_result_payload(binding, :subj_slot)
             }
             .ErrPat(binding) -> {
                 let disc_r = self.pool.alloc_reg()
                 self.emit_ldr(subj_slot, reg: disc_r)
-                self.emit_mem("ldr", reg: disc_r, base: disc_r)
-                self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                self.emit_branch("beq", target: else_lbl)
+                self.emit_load(disc_r, base: disc_r)
+                self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                self.emit_jump_if(.Eq, target: else_lbl)
                 self.pool.free_reg(disc_r)
                 self.bind_result_payload(binding, :subj_slot)
             }
@@ -19476,7 +19504,7 @@ type Codegen = struct {
             }
         }
         self.emit_sub_patterns(pattern_id, subject_kind: value_kind, subject_id: value_id, skip_lbl: else_lbl)
-        self.emit_branch("b", target: done_lbl)
+        self.emit_jump(done_lbl)
         self.emit_label(else_lbl)
         // A name bound again in this block still holds its old value here.
         self.restore_pattern_bindings(pattern_id, kinds: old_kinds)
@@ -19714,19 +19742,19 @@ type Codegen = struct {
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                 }
                 .BindPat(binding) -> {
                     self.bind_whole(binding, :subj_slot)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .IntPat(value) -> {
                     self.emit_cmp_imm(disc_r, :value)
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .BoolPat(value) -> {
@@ -19734,10 +19762,10 @@ type Codegen = struct {
                     if value {
                         lit = 1
                     }
-                    self.emit_op("cmp", a: disc_r, b: f"#{lit}")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{lit}")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .StrPat(value) -> {
@@ -19747,68 +19775,68 @@ type Codegen = struct {
                     self.emit_ldr(subj_slot, reg: "x0")
                     self.emit_str_pat_test(value, label: slbl, subject: "x0", other: "x1", :skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .NonePat -> {
-                    self.emit_op("cmp", a: disc_r, b: "#0")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: "#0")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .SomePat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: "#0")
-                    self.emit_branch("beq", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: "#0")
+                    self.emit_jump_if(.Eq, target: skip_lbl)
                     if len(binding) > 0 {
                         let boff = self.find_var_offset(binding)
                         let ptr_r = self.pool.alloc_reg()
                         self.emit_ldr(subj_slot, reg: ptr_r)
                         let val_r = self.pool.alloc_reg()
-                        self.emit_mem("ldr", reg: val_r, base: ptr_r)
+                        self.emit_load(val_r, base: ptr_r)
                         self.emit_str(boff, reg: val_r)
                         self.pool.free_reg(val_r)
                         self.pool.free_reg(ptr_r)
                     }
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 // Result arms: payload at offset 8; disc looked up
                 // dynamically since variant discs start at 1 (disc 0
                 // reserved as None for nullable contexts).
                 .OkPat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                    self.emit_branch("bne", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                    self.emit_jump_if(.Ne, target: skip_lbl)
                     self.bind_result_payload(binding, :subj_slot)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ErrPat(binding) -> {
-                    self.emit_op("cmp", a: disc_r, b: f"#{self.result_ok_disc()}")
-                    self.emit_branch("beq", target: skip_lbl)
+                    self.emit_op(.Compare, a: disc_r, b: f"#{self.result_ok_disc()}")
+                    self.emit_jump_if(.Eq, target: skip_lbl)
                     self.bind_result_payload(binding, :subj_slot)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .TypePat(type_name, binding) -> {
                     self.emit_typepat_test(:type_name, :binding, subject_kind: subj_kind, span: self.p.expr_spans[subject_id], :subj_slot, :skip_lbl)
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
-                    self.emit_branch("b", target: done_lbl)
+                    self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
             }
@@ -20061,7 +20089,7 @@ type Codegen = struct {
         let aligned = raw_sz + 16 - raw_sz % 16
         self.emit("stp fp, lr, [sp, #-16]!")
         self.emit_mov("fp", src: "sp")
-        self.emit_op("sub", a: "sp", b: "sp", c: f"#{aligned}")
+        self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{aligned}")
         for slot in self.rc_slots {
             self.emit_str_raw(slot, reg: "xzr")
         }
@@ -20096,7 +20124,7 @@ type Codegen = struct {
             self.emit(f"ldp {regalloc.cs_reg(qi - 2)}, {regalloc.cs_reg(qi - 1)}, [sp], #16")
             qi = qi - 2
         }
-        self.emit_op("ret")
+        self.emit_op(.Return)
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
     }
 
@@ -20283,23 +20311,23 @@ type Codegen = struct {
             let path_lbl: str = self.intern_str(self.p.path)
             self.emit_globl(run_lbl)
             self.emit_label(run_lbl)
-            self.emit_op("sub", a: "sp", b: "sp", c: "#16")
+            self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
             self.emit("stp fp, lr, [sp]")
-            self.emit_op("add", a: "fp", b: "sp", c: "#0")
-            self.emit_op("adrp", a: "x0", b: f"{path_lbl}@PAGE")
-            self.emit_op("add", a: "x0", b: "x0", c: f"{path_lbl}@PAGEOFF")
+            self.emit_op(.Add, a: "fp", b: "sp", c: "#0")
+            self.emit_op(.AddressPage, a: "x0", b: f"{path_lbl}@PAGE")
+            self.emit_op(.Add, a: "x0", b: "x0", c: f"{path_lbl}@PAGEOFF")
             self.emit_call("$testing$module_begin")
             for i, test_label in test_labels {
                 let name_lbl: str = self.intern_str(test_displays[i])
                 self.emit_call("$testing$reset")
                 self.emit_call(test_label)
-                self.emit_op("adrp", a: "x0", b: f"{name_lbl}@PAGE")
-                self.emit_op("add", a: "x0", b: "x0", c: f"{name_lbl}@PAGEOFF")
+                self.emit_op(.AddressPage, a: "x0", b: f"{name_lbl}@PAGE")
+                self.emit_op(.Add, a: "x0", b: "x0", c: f"{name_lbl}@PAGEOFF")
                 self.emit_call("$testing$report")
             }
             self.emit("ldp fp, lr, [sp]")
-            self.emit_op("add", a: "sp", b: "sp", c: "#16")
-            self.emit_op("ret")
+            self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
+            self.emit_op(.Return)
         }
 
         // A literal that captures can be compiled once what it captures has kinds, which
