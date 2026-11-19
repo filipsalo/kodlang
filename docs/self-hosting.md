@@ -125,3 +125,14 @@ make asm-diff BASE=main  # or any other revision
 ```
 
 Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself.
+
+### Checking that types are worked out consistently
+
+```shell
+KOD_SHADOW_TYPES=1 build/stage1/sh_kodc file.kod > /dev/null
+```
+
+With `KOD_SHADOW_TYPES` set, the compiler reports on stderr two things that would make a recorded type per expression unsafe:
+
+- `SHADOW <phases> file:line <first> -> <later>`: an expression whose inferred type changed within one function. The phases are `C` (reserving the function's slots, which types only function literals and, for the inliner, a callee's locals), `W` (the walk that checks whether a function returns) and `E` (compiling). Narrowing (`x is T(y)`, `x? or d`) and a generic instance's default fields are the expected `EE` cases.
+- `UNTYPED-STORE file <function number> <name>`: a store into a binding before it has a type, which counts the value as a reference whatever it is. A program that compiles should have none.

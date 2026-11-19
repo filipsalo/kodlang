@@ -1137,6 +1137,13 @@ func inline_intrinsic(anon label: str) -> [str] {
 }
 
 type Codegen = struct {
+    // KOD_SHADOW_TYPES: report an expression whose inferred type changes within one function.
+    shadow_types: bool = false
+    shadow_fn: int64 = 0
+    shadow_seen: StrMap = StrMap()
+    shadow_collecting: int64 = 0
+    // The inliner's probe of a callee's locals: collection types each `let`.
+    inline_probe: bool = false
     // Frame slots that own a reference: released when the function exits.
     rc_slots: [int64] = []
     // Slots holding the fresh results of the statement being compiled.
@@ -2628,9 +2635,13 @@ type Codegen = struct {
         let probe_ctx = self.enter(sig.src_p, names: [], args: [])
         let probe_owner = self.cur_owner
         self.cur_owner = owner
+        // Unlike a function's own collection, the probe types each `let` as it
+        // goes: only the parameters are in scope, and it needs to see the kinds.
+        self.inline_probe = true
         for stmt_id in fd.body {
             self.collect_stmt_vars(:stmt_id)
         }
+        self.inline_probe = false
         mut scalar_locals = true
         for k in len(names)..len(self.vars) {
             if not self.vars[k].kind.is_inline_scalar() {
@@ -8412,6 +8423,9 @@ type Codegen = struct {
                 if offset == self.rc_let_off {
                     rc_kind = self.rc_let_kind
                 }
+                if self.shadow_types and rc_kind is .KUnknown {
+                    kod_eprint(f"UNTYPED-STORE {self.p.path} {self.shadow_fn} {self.vars[i].name}")
+                }
                 if self.rc_heap_kind(rc_kind) or rc_kind is .KUnknown {
                     mut known = false
                     for slot in self.rc_slots {
@@ -9372,16 +9386,14 @@ type Codegen = struct {
         return false
     }
 
-    // The collect pass may have typed the bindings from a placeholder subject.
+    // The arm's bindings already have their types (see compile_match_stmt_now).
     func compile_arm_stmts(self, anon arm: ast.MatchArm, subject_kind: TypeKind, subject_id: int64, skip_lbl: str) -> none {
-        let saved = self.retype_pattern_bindings(arm.pattern, :subject_kind)
         let mark = len(self.bound_log)
         self.bind_pattern(arm.pattern)
         self.allow_reassign(self.pattern_tree_names(arm.pattern))
         self.emit_arm_tests(arm.pattern, guard: arm.guard, :subject_kind, :subject_id, :skip_lbl)
         self.compile_block(arm.body)
         self.unbind_to(mark)
-        self.restore_pattern_bindings(arm.pattern, kinds: saved)
     }
 
     // A none or optional arm makes the whole match optional.
@@ -9429,8 +9441,8 @@ type Codegen = struct {
 
     // With `ok_wrap`, an arm that isn't already a result becomes its Ok.
     func compile_arm_value(self, anon arm: ast.MatchExprArm, tests: ArmTests, expected: TypeKind, ok_wrap: bool, result_r: str) -> none {
+        // The arm's bindings already have their types (see compile_match_expr_now).
         let body = arm.body
-        let saved = self.retype_pattern_bindings(arm.pattern, subject_kind: tests.subject_kind)
         let mark = len(self.bound_log)
         self.bind_pattern(arm.pattern)
         self.emit_arm_tests(arm.pattern, guard: arm.guard, subject_kind: tests.subject_kind, subject_id: tests.subject_id, skip_lbl: tests.skip_lbl)
@@ -9471,7 +9483,6 @@ type Codegen = struct {
             }
         }
         self.unbind_to(mark)
-        self.restore_pattern_bindings(arm.pattern, kinds: saved)
     }
 
     // `panic(...)`, or a call to a function that never returns.
@@ -9868,6 +9879,12 @@ type Codegen = struct {
     // appear in nested match expressions. Without this, 'Some(x) -> x'
     // inside a match expression returns 'x' as an unknown var.
     func collect_expr_vars(self, anon expr_id: int64) -> none {
+        self.shadow_collecting += 1
+        self.collect_expr_vars_now(expr_id)
+        self.shadow_collecting -= 1
+    }
+
+    func collect_expr_vars_now(self, anon expr_id: int64) -> none {
         match self.p.exprs[expr_id] {
             .Binary(lhs, op, rhs) -> {
                 self.collect_expr_vars(lhs)
@@ -9937,26 +9954,34 @@ type Codegen = struct {
     }
 
     func collected_kind(self, anon expr_id: int64) -> TypeKind {
-        if self.naming_locals {
-            return .KUnknown
+        if self.inline_probe {
+            return self.infer_kind(expr_id)
         }
-        return self.infer_kind(expr_id)
+        return .KUnknown
     }
 
     func collect_stmt_vars(self, stmt_id: int64) -> none {
+        self.shadow_collecting += 1
+        self.collect_stmt_vars_now(:stmt_id)
+        self.shadow_collecting -= 1
+    }
+
+    func collect_stmt_vars_now(self, stmt_id: int64) -> none {
         match self.p.stmts[stmt_id] {
             .Let(name, typ, value, _mutable) -> {
                 if name != "_" and not self.var_declared(name) {
+                    // Only the slot: compile_let gives it its type, once what
+                    // the value reads is bound. A function literal's type is
+                    // its written signature, so a call before the `let` can
+                    // say so.
                     mut kind: TypeKind = .KUnknown
-                    if not self.naming_locals {
+                    if self.inline_probe {
                         kind = self.resolve_type(typ)
-                    }
-                    // No annotation: infer the kind now so downstream
-                    // collect calls (e.g. a foreach over `name.field`) can
-                    // resolve correctly. compile_let does this too, but
-                    // that only runs after collection.
-                    if typ == 0 {
-                        kind = self.collected_kind(value)
+                        if typ == 0 {
+                            kind = self.infer_kind(value)
+                        }
+                    } else if typ == 0 and self.p.exprs[value] is .FuncLit(_decl_id) and not self.naming_locals {
+                        kind = self.infer_kind(value)
                     }
                     self.alloc_var(:name, :kind)
                 }
@@ -14772,6 +14797,8 @@ type Codegen = struct {
         for i in 0..len(arms) {
             let arm = self.p.match_expr_arms[arms[i]]
             let skip_lbl = self.fresh("Lmexpr_skip")
+            // Typed before the arm's test stores into them, so the store counts a reference.
+            let saved_kinds = self.retype_pattern_bindings(arm.pattern, subject_kind: subj_kind)
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
@@ -14874,6 +14901,7 @@ type Codegen = struct {
                     self.emit(f"b {done_lbl}")
                 }
             }
+            self.restore_pattern_bindings(arm.pattern, kinds: saved_kinds)
         }
         self.emit_label(done_lbl)
         self.pool.free_reg(disc_r)
@@ -15004,6 +15032,31 @@ type Codegen = struct {
     }
 
     func infer_kind(self, anon expr_id: int64) -> TypeKind {
+        let kind = self.infer_kind_raw(expr_id)
+        if self.shadow_types {
+            let key = f"{self.shadow_fn}|{self.p.path}|{expr_id}"
+            mut phase = "E"
+            if self.walking_fn != "" {
+                phase = "W"
+            } else if self.shadow_collecting > 0 {
+                phase = "C"
+            }
+            let shown = f"{phase} {self.kind_display(kind)}"
+            let seen = self.shadow_seen
+            if seen.get(key) is Some(first) {
+                if first != shown and first[2..] != shown[2..] {
+                    let pos = self.line_of_offset(self.p.expr_spans[expr_id].start)
+                    kod_eprint(f"SHADOW {first[0..1]}{shown[0..1]} {self.p.path}:{pos} {first[2..]} -> {shown[2..]}")
+                }
+                seen.set(key, shown)
+            } else {
+                seen.set(key, shown)
+            }
+        }
+        return kind
+    }
+
+    func infer_kind_raw(self, anon expr_id: int64) -> TypeKind {
         match self.p.exprs[expr_id] {
             .IntLit(value) -> {
                 if len(self.p.bad_lits) > 0 and self.is_bad_lit(expr_id) {
@@ -15601,8 +15654,6 @@ type Codegen = struct {
         self.rc_let_off = off
         self.rc_let_kind = kind
         self.compile_store(dest_off: off, :kind, value_id: value)
-        self.rc_let_off = rc_saved_off
-        self.rc_let_kind = rc_saved_kind
         if mutable and kind.is_array() and self.is_array_place(value) {
             self.emit_ldr(off, reg: "x0")
             self.emit(f"mov x1, #{self.elem_width(kind)}")
@@ -15610,6 +15661,8 @@ type Codegen = struct {
             self.rc_temp("x0")
             self.emit_str(off, reg: "x0")
         }
+        self.rc_let_off = rc_saved_off
+        self.rc_let_kind = rc_saved_kind
         if typ == 0 {
             if kind is .KUnknown {
                 self.report_cannot_infer(value, what: f"`{self.source_name(name)}`")
@@ -19275,6 +19328,8 @@ type Codegen = struct {
         for i in 0..len(arms) {
             let arm = self.p.match_arms[arms[i]]
             let skip_lbl = self.fresh("Lmatch_skip")
+            // Typed before the arm's test stores into them, so the store counts a reference.
+            let saved_kinds = self.retype_pattern_bindings(arm.pattern, subject_kind: subj_kind)
             match self.subject_pattern(self.p.patterns[arm.pattern], subject_kind: subj_kind) {
                 .Wildcard -> {
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
@@ -19376,6 +19431,7 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
             }
+            self.restore_pattern_bindings(arm.pattern, kinds: saved_kinds)
         }
         self.emit_label(done_lbl)
         self.pool.free_reg(disc_r)
@@ -19403,6 +19459,7 @@ type Codegen = struct {
         self.safe_index_names = []
         self.safe_array_names = []
         let func_decl = self.p.func_decls[fd_id]
+        self.shadow_fn += 1
         self.in_func_literal = self.is_lambda_name(func_decl.name)
         self.in_const_body = func_decl.is_const and not func_decl.is_var
         self.lit_let_name = self.source_name(func_decl.let_name)
