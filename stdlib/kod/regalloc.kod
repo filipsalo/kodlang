@@ -39,11 +39,27 @@ type Insn = enum {
     Slot(store: bool, reg: str, off: int64)
     // `mov dst, src` between registers (vregs or physical), made without text.
     Mov(dst: str, src: str)
+    // `op reg, [base, #off]`, or `op reg, [base]` without `has_off`: a load
+    // or store (`ldr`, `str`, `ldrb`, `strb`, `ldrh`, `strh`) through a register.
+    Mem(op: str, reg: str, base: str, off: int64, has_off: bool)
     // `bl target`.
     Call(target: str)
     // `op target` (`b`, `beq`, `b.lo`, …), or `op reg, target` for `cbz`
     // and `cbnz`: `reg` is "" for the others.
     Branch(op: str, reg: str, target: str)
+}
+
+// The asm text of a `Mem` line, with `reg` and `base` as its registers.
+func mem_text(op: str, reg: str, base: str, off: int64, has_off: bool) -> str {
+    if has_off {
+        return f"\t{op} {reg}, [{base}, #{off}]"
+    }
+    return f"\t{op} {reg}, [{base}]"
+}
+
+// Whether a `Mem` op writes its register (see writer_at): `ldr` and `ldrb`.
+func mem_writes(anon op: str) -> bool {
+    return op == "ldr" or op == "ldrb"
 }
 
 // The asm text of a `Branch` line, with `reg` as its register.
@@ -339,6 +355,25 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return flags
         }
+        .Mem(op, reg, base, off, has_off) -> {
+            mut flags: int64 = 0
+            if op == "ldr" {
+                flags = MN_LDR << 8
+            } else if op == "str" {
+                flags = MN_STR << 8
+            }
+            if reg_clobbers(reg) or reg_clobbers(base) {
+                flags = flags | INFO_CLOBBERS
+            }
+            if reg == "fp" or base == "fp" {
+                flags = flags | INFO_FP
+            }
+            // As codegen's big_immediate_at reads `[base, #off]`.
+            if has_off and (op == "ldr" or op == "str") and off > 32760 {
+                flags = flags | INFO_BIG_IMM
+            }
+            return flags
+        }
         .Call(target) -> {
             // A panic never comes back, so whatever it clobbers isn't read after it.
             if never_returns(target) {
@@ -631,6 +666,15 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
+        if insn is .Mem(_op, reg, base, _off, _has_off) {
+            for r in [reg, base] {
+                let id = reg_vreg(r)
+                if id >= vreg_start and id < vreg_start + n_local {
+                    counts[id - vreg_start] += 1
+                }
+            }
+            continue
+        }
         if insn is .Branch(_op, reg, _target) {
             let id = reg_vreg(reg)
             if id >= vreg_start and id < vreg_start + n_local {
@@ -753,6 +797,31 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let r = reg_vreg(src)
                 if r >= vreg_start and r < vreg_start + n_local {
                     let local_id = r - vreg_start
+                    if first[local_id] < 0 {
+                        first[local_id] = line_idx
+                    }
+                    last_use[local_id] = line_idx
+                }
+            }
+            .Mem(op, reg, base, _off, _has_off) -> {
+                if reg_clobbers(reg) or reg_clobbers(base) {
+                    clobbers = 1
+                }
+                // As in its text: `reg` (written by a load), then `base`, read.
+                let r = reg_vreg(reg)
+                if r >= vreg_start and r < vreg_start + n_local {
+                    let local_id = r - vreg_start
+                    if first[local_id] < 0 {
+                        first[local_id] = line_idx
+                    }
+                    if mem_writes(op) and def_line[local_id] == -1 {
+                        def_line[local_id] = line_idx
+                    }
+                    last_use[local_id] = line_idx
+                }
+                let b = reg_vreg(base)
+                if b >= vreg_start and b < vreg_start + n_local {
+                    let local_id = b - vreg_start
                     if first[local_id] < 0 {
                         first[local_id] = line_idx
                     }
