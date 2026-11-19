@@ -69,6 +69,11 @@ type RegPool = struct {
     live: [str] = []
     // Whether `evict` ran in this function, so `run` must leave it alone.
     evicted: bool = false
+    // After a strict `run` that failed: the local vreg ids (from its
+    // `vreg_start`), all at or after its `droppable`, that it put back in
+    // memory to make room, and whether some vreg got no register even so.
+    dropped: [int64] = []
+    stuck: bool = false
 
     // Reset per-function state. `vreg_phys` is intentionally left
     // alone — its ids stay valid across the whole module.
@@ -206,6 +211,15 @@ type RegPool = struct {
 // vreg keeps its alloc-time phys — but downstream vregs may end up
 // sharing that phys because regalloc thinks the slot is free.
 func is_writer_mnemonic(anon mn: str) -> bool {
+    // Each of them is 3 or 4 letters and starts with one of these.
+    let n = len(mn)
+    if n < 3 or n > 4 {
+        return false
+    }
+    let c = mn[0]
+    if c != 'm' and c != 'a' and c != 's' and c != 'l' and c != 'o' and c != 'e' and c != 'c' and c != 'f' {
+        return false
+    }
     return mn == "mov" or mn == "add" or mn == "sub" or mn == "mul" or mn == "sdiv" or mn == "lsl" or mn == "lsr" or mn == "asr" or mn == "and" or mn == "orr" or mn == "eor" or mn == "adrp" or mn == "cset" or mn == "ldr" or mn == "ldrb" or mn == "fmov"
 }
 
@@ -385,7 +399,7 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
 // loop's backward branch, every register is in the pools, and running out of
 // them is a failure (false) instead of a fall back to the alloc-time
 // register, which only temporaries can share safely.
-func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = false) -> bool {
+func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = false, droppable: int64 = -1) -> bool {
     let vreg_phys: [str] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
     let n_local: int64 = vreg_end - vreg_start
@@ -470,6 +484,8 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         }
     }
     mut ok = true
+    pool.dropped = []
+    pool.stuck = false
 
     // Sort vreg indices by def_line ascending. Insertion sort; n_local
     // is typically small per function.
@@ -567,10 +583,42 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 free_caller = nfc2
             }
         }
+        if len(chosen) == 0 and strict and droppable >= 0 {
+            // Out of registers: of this vreg and the ones holding a register
+            // of its class, the droppable one used least (droppable vregs
+            // are numbered most used first) goes back to memory, and the
+            // scan goes on as if it had.
+            ok = false
+            mut victim = -1
+            if local_id >= droppable {
+                victim = local_id
+            }
+            mut victim_at = -1
+            for ai, aid in active_id {
+                if aid >= droppable and is_callee_saved_phys(active_phys[ai]) == cls_callee and aid > victim {
+                    victim = aid
+                    victim_at = ai
+                }
+            }
+            if victim >= 0 {
+                pool.dropped += [victim]
+                if victim == local_id {
+                    new_phys[local_id] = alloc_phys[local_id]
+                    continue
+                }
+                chosen = active_phys[victim_at]
+                active_id = active_id[0..victim_at] + active_id[victim_at + 1..len(active_id)]
+                active_use = active_use[0..victim_at] + active_use[victim_at + 1..len(active_use)]
+                active_phys = active_phys[0..victim_at] + active_phys[victim_at + 1..len(active_phys)]
+            }
+        }
         if len(chosen) == 0 {
             // Without `strict` this can't happen: pool size equals
             // alloc-time pressure. Fall back to the alloc-time phys.
             ok = false
+            if strict {
+                pool.stuck = true
+            }
             chosen = alloc_phys[local_id]
         }
         new_phys[local_id] = chosen
@@ -595,6 +643,10 @@ func branch_target(anon text: str) -> str {
         i += 1
     }
     let start = i
+    // Every branch starts `b`, `cb` or `tb`.
+    if start >= n or (text[start] != 'b' and text[start] != 'c' and text[start] != 't') {
+        return ""
+    }
     for i < n and (lexing.is_alpha(text[i]) or text[i] == '.') {
         i += 1
     }
@@ -649,22 +701,47 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], last_use: [int64]) 
     if len(tops) == 0 {
         return none
     }
-    mut changed = true
-    for changed {
-        changed = false
-        for k in 0..len(def_line) {
-            let d = def_line[k]
-            if d < 0 {
-                continue
-            }
-            for e in 0..len(tops) {
-                let u = last_use[k]
-                if d < tops[e] and u >= tops[e] and u < bottoms[e] {
-                    last_use[k] = bottoms[e]
-                    changed = true
-                }
+    // By top, so one pass per vreg is enough: its end only grows, and a loop
+    // it skipped for starting after its end starts after every later end too.
+    let nl = len(tops)
+    for a in 1..nl {
+        mut b = a
+        for b > 0 and tops[b - 1] > tops[b] {
+            let t = tops[b]
+            tops[b] = tops[b - 1]
+            tops[b - 1] = t
+            let bt = bottoms[b]
+            bottoms[b] = bottoms[b - 1]
+            bottoms[b - 1] = bt
+            b -= 1
+        }
+    }
+    for k in 0..len(def_line) {
+        let d = def_line[k]
+        if d < 0 {
+            continue
+        }
+        mut u = last_use[k]
+        // The first loop starting after `d`.
+        mut lo = 0
+        mut hi = nl
+        for lo < hi {
+            let mid = (lo + hi) / 2
+            if tops[mid] <= d {
+                lo = mid + 1
+            } else {
+                hi = mid
             }
         }
+        for e in lo..nl {
+            if tops[e] > u {
+                break
+            }
+            if u < bottoms[e] {
+                u = bottoms[e]
+            }
+        }
+        last_use[k] = u
     }
 }
 

@@ -777,14 +777,14 @@ func first_operand_read(anon op: str) -> bool {
 // - `mov A, B` with A named only there and in the next instruction, which
 //   reads it, has the next instruction read B;
 // - `str R, [M]` then `ldr D, [M]` becomes `str` then `mov D, R`.
-func forward_copies(anon body: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
-    let counts = regalloc.vreg_counts(body, :vreg_start, :n_local)
-    mut b: [regalloc.Insn] = []
-    for insn in body {
-        b += [insn]
-    }
+func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
+    // `b` is the caller's to give up: the first rule rewrites it in place.
+    let counts = regalloc.vreg_counts(b, :vreg_start, :n_local)
     let n = len(b)
-    mut mid: [regalloc.Insn] = []
+    mut out: [regalloc.Insn] = []
+    // The second rule looks at the line before as the first rule left it,
+    // whether or not that line was kept.
+    mut prev = ""
     for i in 0..n {
         let t = insn_text(b[i])
         if i + 1 < n and t.starts_with("\tmov v") {
@@ -816,28 +816,21 @@ func forward_copies(anon body: [regalloc.Insn], vreg_start: int64, n_local: int6
                 }
             }
         }
-        mid += [b[i]]
-    }
-    mut out: [regalloc.Insn] = []
-    let m = len(mid)
-    for i in 0..m {
-        let t = insn_text(mid[i])
-        if i > 0 and t.starts_with("\tldr ") and t.ends_with("]") and not t.contains("!") {
-            let prev = insn_text(mid[i - 1])
-            if prev.starts_with("\tstr ") and prev.ends_with("]") and not prev.contains("!") {
-                if t.find(", [") is Some(k) and prev.find(", [") is Some(pk) {
-                    let dst = t[5..k]
-                    let src = prev[5..pk]
-                    if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == prev[pk..len(prev)] {
-                        if dst != src {
-                            out += [.Raw(text: f"\tmov {dst}, {src}")]
-                        }
-                        continue
+        let before = prev
+        prev = t
+        if len(before) > 0 and t.starts_with("\tldr ") and t.ends_with("]") and before.starts_with("\tstr ") and before.ends_with("]") and not t.contains("!") and not before.contains("!") {
+            if t.find(", [") is Some(k) and before.find(", [") is Some(pk) {
+                let dst = t[5..k]
+                let src = before[5..pk]
+                if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == before[pk..len(before)] {
+                    if dst != src {
+                        out += [.Raw(text: f"\tmov {dst}, {src}")]
                     }
+                    continue
                 }
             }
         }
-        out += [mid[i]]
+        out += [b[i]]
     }
     return out
 }
@@ -18387,8 +18380,11 @@ type Codegen = struct {
             }
         }
         let saved_len = len(self.pool.vreg_phys)
-        mut count = len(cands)
-        for count > 0 {
+        // The candidates tried, most used first. A failed try drops the ones
+        // the allocator says stood in its way; halving is the fallback.
+        mut chosen = cands
+        for len(chosen) > 0 {
+            let count = len(chosen)
             mut vregs: [str] = []
             for _ in 0..count {
                 vregs += [f"v{len(self.pool.vreg_phys)}"]
@@ -18400,7 +18396,7 @@ type Codegen = struct {
                 if line_len[j] > 0 {
                     mut which = -1
                     for k in 0..count {
-                        if cands[k] == line_slot[j] {
+                        if chosen[k] == line_slot[j] {
                             which = k
                         }
                     }
@@ -18420,13 +18416,35 @@ type Codegen = struct {
                 j += 1
             }
             out = forward_copies(out, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
-            if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true) {
+            let first_promoted = saved_len - vreg_start
+            if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true, droppable: first_promoted) {
                 return out
             }
             self.pool.vreg_phys = self.pool.vreg_phys[0..saved_len]
-            count = count / 2
+            chosen = self.fewer_promoted(chosen, :first_promoted)
         }
         return []
+    }
+
+    // After a failed strict allocation of `chosen` (whose vregs are the local
+    // ids from `first_promoted`): `chosen` without the ones the allocator put
+    // back in memory. Half of `chosen` when it couldn't make room that way.
+    func fewer_promoted(self, anon chosen: [int64], first_promoted: int64) -> [int64] {
+        let count = len(chosen)
+        if self.pool.stuck or len(self.pool.dropped) == 0 {
+            return chosen[0..count / 2]
+        }
+        mut drop: [bool] = [false] * count
+        for d in self.pool.dropped {
+            drop[d - first_promoted] = true
+        }
+        mut kept: [int64] = []
+        for k, off in chosen {
+            if not drop[k] {
+                kept += [off]
+            }
+        }
+        return kept
     }
 
     // Whether `name` is one of this function's vregs, named exactly twice.
