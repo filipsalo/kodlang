@@ -92,9 +92,14 @@ type Insn = enum {
     // `mov dst, src` between registers (vregs or physical), made without text.
     Mov(dst: str, src: str)
     // A load into `reg` (or a store of it) of `width` bytes (1, 2, 4 or 8) at
-    // `base + off`, or at `base` without `has_off`. A 4-byte one has a `w`
-    // register, as arm64 writes it.
-    Mem(load: bool, width: int64, reg: str, base: str, off: int64, has_off: bool)
+    // the address `base` and `at` make. A 4-byte one has a `w` register, as
+    // arm64 writes it.
+    Mem(load: bool, width: int64, reg: str, base: str, at: MemAt)
+    // `dst` gets a constant too big for one move: on arm64 a `mov` and three
+    // `movk`s, which LOAD_CONST_LINES counts.
+    LoadConst(dst: str, value: int64)
+    // A load into (or a store of) two registers at once, at `base` per `mode`.
+    Pair(load: bool, a: str, b: str, base: str, mode: PairMode)
     // `mn a, b, c, d` with the operands given (up to the first ""): each a
     // register, an immediate, a condition or a symbol, never more than one
     // token (see codegen's emit_op).
@@ -186,6 +191,99 @@ func branch_mnemonic(anon kind: BranchKind) -> str {
     }
 }
 
+// Where a `Mem` reads or writes, from its base register.
+type MemAt = enum {
+    // At the base.
+    Base
+    // At the base plus `off`.
+    Offset(off: int64)
+    // At the base plus the register `reg`.
+    Index(reg: str)
+    // At the base plus a symbol's offset in its page (`got`: of its entry in
+    // the global offset table), with the base the page an AddressPage gave.
+    Symbol(name: str, got: bool)
+}
+
+// The lines a LoadConst takes on arm64.
+let LOAD_CONST_LINES: int64 = 4
+
+// The asm text of a `LoadConst`: its lines, joined by newlines.
+func load_const_text(dst: str, value: int64) -> str {
+    return f"\tmov {dst}, #({value} & 0xffff)\n\tmovk {dst}, #(({value} >> 16) & 0xffff), lsl #16\n\tmovk {dst}, #(({value} >> 32) & 0xffff), lsl #32\n\tmovk {dst}, #(({value} >> 48) & 0xffff), lsl #48"
+}
+
+// How many lines of asm `body` prints, which limits that count lines go by.
+func line_count(anon body: [Insn]) -> int64 {
+    mut n = len(body)
+    for insn in body {
+        if insn is .LoadConst(_dst, _value) {
+            n += LOAD_CONST_LINES - 1
+        }
+    }
+    return n
+}
+
+// Where a `Pair` reads or writes, and whether it moves its base.
+type PairMode = enum {
+    // At the base plus `off` (at the base for 0).
+    At(off: int64)
+    // At the base plus `off`, which the base then holds.
+    Pre(off: int64)
+    // At the base, which then moves on by `off`.
+    Post(off: int64)
+}
+
+// The asm text of a `Pair` line.
+func pair_text(load: bool, a: str, b: str, base: str, mode: PairMode) -> str {
+    mut op = "stp"
+    if load {
+        op = "ldp"
+    }
+    match mode {
+        .At(off) -> {
+            if off == 0 {
+                return f"\t{op} {a}, {b}, [{base}]"
+            }
+            return f"\t{op} {a}, {b}, [{base}, #{off}]"
+        }
+        .Pre(off) -> return f"\t{op} {a}, {b}, [{base}, #{off}]!"
+        .Post(off) -> return f"\t{op} {a}, {b}, [{base}], #{off}"
+    }
+}
+
+// Whether two `MemAt`s are the same place from the same base.
+func same_at(anon a: MemAt, anon b: MemAt) -> bool {
+    match a {
+        .Base -> return b is .Base
+        .Offset(off) -> {
+            if b is .Offset(other) {
+                return other == off
+            }
+            return false
+        }
+        .Index(reg) -> {
+            if b is .Index(other) {
+                return other == reg
+            }
+            return false
+        }
+        .Symbol(name, got) -> {
+            if b is .Symbol(other, other_got) {
+                return other == name and other_got == got
+            }
+            return false
+        }
+    }
+}
+
+// The index register of a `MemAt`, or "".
+func at_reg(anon at: MemAt) -> str {
+    if at is .Index(reg) {
+        return reg
+    }
+    return ""
+}
+
 // The arm64 mnemonic for a load or store of `width` bytes.
 func mem_mnemonic(load: bool, width: int64) -> str {
     mut op = "str"
@@ -209,13 +307,21 @@ func reg_width(anon reg: str) -> int64 {
     return 8
 }
 
-// The asm text of a `Mem` line, with `reg` and `base` as its registers.
-func mem_text(load: bool, width: int64, reg: str, base: str, off: int64, has_off: bool) -> str {
+// The asm text of a `Mem` line, with `reg`, `base` and an index as its
+// registers (`index` stands for the one `at` has).
+func mem_text(load: bool, width: int64, reg: str, base: str, at: MemAt, index: str = "") -> str {
     let op = mem_mnemonic(:load, :width)
-    if has_off {
-        return f"\t{op} {reg}, [{base}, #{off}]"
+    match at {
+        .Base -> return f"\t{op} {reg}, [{base}]"
+        .Offset(off) -> return f"\t{op} {reg}, [{base}, #{off}]"
+        .Index(_reg) -> return f"\t{op} {reg}, [{base}, {index}]"
+        .Symbol(name, got) -> {
+            if got {
+                return f"\t{op} {reg}, [{base}, {name}@GOTPAGEOFF]"
+            }
+            return f"\t{op} {reg}, [{base}, {name}@PAGEOFF]"
+        }
     }
-    return f"\t{op} {reg}, [{base}]"
 }
 
 // Whether a `Mem` writes its register, as writer_at says for its mnemonic:
@@ -682,7 +788,8 @@ func insn_flags(anon insn: Insn) -> int64 {
             }
             return flags
         }
-        .Mem(load, width, reg, base, off, has_off) -> {
+        .Mem(load, width, reg, base, at) -> {
+            let index = at_reg(at)
             mut flags: int64 = 0
             // `ldr` and `str`: a 4- or 8-byte access.
             let word = width >= 4
@@ -691,19 +798,36 @@ func insn_flags(anon insn: Insn) -> int64 {
             } else if word {
                 flags = MN_STR << 8
             }
-            if reg_clobbers(reg) or reg_clobbers(base) {
+            if reg_clobbers(reg) or reg_clobbers(base) or reg_clobbers(index) {
                 flags = flags | INFO_CLOBBERS
             }
-            if reg == "fp" or base == "fp" {
+            if reg == "fp" or base == "fp" or index == "fp" {
                 flags = flags | INFO_FP
             }
             // As codegen's big_immediate_at reads `[base, #off]`.
-            if has_off and word and off > 32760 {
+            if at is .Offset(off) and word and off > 32760 {
                 flags = flags | INFO_BIG_IMM
             }
             return flags
         }
         .Op(_op, _a, _b, _c, _d, flags) -> return flags
+        .LoadConst(dst, _value) -> {
+            if reg_clobbers(dst) {
+                return INFO_CLOBBERS
+            }
+            return 0
+        }
+        .Pair(_load, a, b, base, _mode) -> {
+            // Only fixed registers: the frame link and the callee-saved ones.
+            mut flags: int64 = 0
+            if reg_clobbers(a) or reg_clobbers(b) {
+                flags = INFO_CLOBBERS
+            }
+            if a == "fp" or b == "fp" or base == "fp" {
+                flags = flags | INFO_FP
+            }
+            return flags
+        }
         .Call(target) -> {
             // A panic never comes back, so whatever it clobbers isn't read after it.
             if never_returns(target) {
@@ -1005,13 +1129,17 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             }
             continue
         }
-        if insn is .Mem(_load, _width, reg, base, _off, _has_off) {
-            for r in [reg, base] {
-                let id = reg_vreg(r)
-                if id >= vreg_start and id < vreg_start + n_local {
-                    counts[id - vreg_start] += 1
-                }
+        if insn is .LoadConst(dst, _value) {
+            // Named on each of its lines, as its text has it.
+            for _ in 0..LOAD_CONST_LINES {
+                count_operand(dst, :counts, :vreg_start, :n_local)
             }
+            continue
+        }
+        if insn is .Mem(_load, _width, reg, base, at) {
+            count_operand(reg, :counts, :vreg_start, :n_local)
+            count_operand(base, :counts, :vreg_start, :n_local)
+            count_operand(at_reg(at), :counts, :vreg_start, :n_local)
             continue
         }
         if insn is .Branch(_kind, reg, _target) {
@@ -1169,8 +1297,22 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     last_use[local_id] = line_idx
                 }
             }
-            .Mem(load, width, reg, base, _off, _has_off) -> {
-                if reg_clobbers(reg) or reg_clobbers(base) {
+            .LoadConst(dst, _value) -> {
+                if reg_clobbers(dst) {
+                    clobbers = 1
+                }
+                // The `mov` writes it; the `movk`s after it read and write it.
+                note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+            }
+            .Pair(_load, a, b, _base, _mode) -> {
+                // No vregs: the frame link and the callee-saved registers.
+                if reg_clobbers(a) or reg_clobbers(b) {
+                    clobbers = 1
+                }
+            }
+            .Mem(load, width, reg, base, at) -> {
+                let index = at_reg(at)
+                if reg_clobbers(reg) or reg_clobbers(base) or reg_clobbers(index) {
                     clobbers = 1
                 }
                 // As in its text: `reg` (written by a load), then `base`, read.
@@ -1185,14 +1327,8 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     }
                     last_use[local_id] = line_idx
                 }
-                let b = reg_vreg(base)
-                if b >= vreg_start and b < vreg_start + n_local {
-                    let local_id = b - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
-                    }
-                    last_use[local_id] = line_idx
-                }
+                note_operand(base, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(index, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
             }
             .Op(op, a, b, c, d, flags) -> {
                 if (flags & INFO_CLOBBERS) != 0 {

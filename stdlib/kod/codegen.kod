@@ -662,8 +662,10 @@ func insn_text(anon insn: regalloc.Insn) -> str {
         .Raw(text, _info) -> return text
         .Slot(store, reg, off) -> return regalloc.slot_text(:store, :reg, :off)
         .Mov(dst, src) -> return f"\tmov {dst}, {src}"
-        .Mem(load, width, reg, base, off, has_off) -> return regalloc.mem_text(:load, :width, :reg, :base, :off, :has_off)
+        .Mem(load, width, reg, base, at) -> return regalloc.mem_text(:load, :width, :reg, :base, :at, index: regalloc.at_reg(at))
         .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, :a, :b, :c, :d)
+        .Pair(load, a, b, base, mode) -> return regalloc.pair_text(:load, :a, :b, :base, :mode)
+        .LoadConst(dst, value) -> return regalloc.load_const_text(:dst, :value)
         .Call(target) -> return f"\tbl {target}"
         .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, :reg, :target)
         .Label(_name) -> return ""
@@ -711,7 +713,10 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
         }
         // `[fp, ...]` has a bracket, which asm_parts gives no parts for.
         .Slot(_store, _reg, _off) -> return []
-        .Mem(_load, _width, _reg, _base, _off, _has_off) -> return []
+        .Mem(_load, _width, _reg, _base, _at) -> return []
+        .Pair(_load, _a, _b, _base, _mode) -> return []
+        // Several lines, none of them one asm_parts gives parts for that a pass wants.
+        .LoadConst(_dst, _value) -> return []
         .Label(_name) -> return []
         .Raw(text, _info) -> return asm_parts(text)
     }
@@ -844,20 +849,31 @@ func forwarded(anon next: regalloc.Insn, dst: str, src: str, once: bool) -> rega
             }
             return none
         }
-        .Mem(load, width, reg, base, off, has_off) -> {
+        .Mem(load, width, reg, base, at) -> {
+            let index = regalloc.at_reg(at)
             // `ldr dst, [dst, ...]`: load through `src`.
-            if load and width >= 4 and reg == dst and base == dst {
-                return .Mem(:load, :width, :reg, base: src, :off, :has_off)
+            if load and width >= 4 and reg == dst and base == dst and index != dst {
+                return .Mem(:load, :width, :reg, base: src, :at)
             }
-            if not once or (reg == dst and base == dst) {
+            // Otherwise `dst` named once, and not as a register a load writes.
+            mut named = 0
+            for r in [reg, base, index] {
+                if r == dst {
+                    named += 1
+                }
+            }
+            if not once or named != 1 {
                 return none
             }
             if base == dst {
-                return .Mem(:load, :width, :reg, base: src, :off, :has_off)
+                return .Mem(:load, :width, :reg, base: src, :at)
+            }
+            if index == dst {
+                return .Mem(:load, :width, :reg, :base, at: .Index(reg: src))
             }
             // As its first operand: only a store reads that one.
-            if reg == dst and not load {
-                return .Mem(:load, :width, reg: src, :base, :off, :has_off)
+            if not load {
+                return .Mem(:load, :width, reg: src, :base, :at)
             }
             return none
         }
@@ -884,6 +900,8 @@ func forwarded(anon next: regalloc.Insn, dst: str, src: str, once: bool) -> rega
             return regalloc.op(op, a: operands[0], b: operands[1], c: operands[2], d: operands[3])
         }
         .Call(_target) -> return none
+        .Pair(_load, _a, _b, _base, _mode) -> return none
+        .LoadConst(_dst, _value) -> return none
         .Label(_name) -> return none
         .Raw(text, _info) -> {
             let next_text = text
@@ -926,33 +944,31 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
     mut prev_slot = false
     mut prev_reg = ""
     mut prev_base = ""
-    mut prev_off: int64 = 0
-    mut prev_has_off = false
+    mut prev_at: regalloc.MemAt = .Base
     for i in 0..n {
         // A slot or `Mem` load or store, as its fields.
         mut access = false
         mut store = false
         mut reg = ""
         mut base = ""
-        mut off: int64 = 0
-        mut has_off = false
+        mut at: regalloc.MemAt = .Base
         match b[i] {
             .Slot(slot_store, slot_reg, slot_off) -> {
                 access = true
                 store = slot_store
                 reg = slot_reg
                 base = "fp"
-                off = slot_off
-                has_off = slot_off < 0
+                if slot_off < 0 {
+                    at = .Offset(off: slot_off)
+                }
             }
-            .Mem(load, width, mem_reg, mem_base, mem_off, mem_has_off) -> {
+            .Mem(load, width, mem_reg, mem_base, mem_at) -> {
                 if width >= 4 {
                     access = true
                     store = not load
                     reg = mem_reg
                     base = mem_base
-                    off = mem_off
-                    has_off = mem_has_off
+                    at = mem_at
                 }
             }
             else none
@@ -962,7 +978,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
             mut taken = false
             if not store and (prev_slot or len(prev) > 0) {
                 mut src = prev_reg
-                mut same = prev_slot and prev_base == base and prev_has_off == has_off and (not has_off or prev_off == off)
+                mut same = prev_slot and prev_base == base and regalloc.same_at(prev_at, at)
                 if not prev_slot {
                     // A store written as text: compare as text, as for two such lines.
                     let t = insn_text(b[i])
@@ -985,8 +1001,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
             prev_slot = store
             prev_reg = reg
             prev_base = base
-            prev_off = off
-            prev_has_off = has_off
+            prev_at = at
             if not taken {
                 out += [b[i]]
             }
@@ -1044,7 +1059,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
         prev_slot = false
         mut before_text = before
         if before_slot {
-            before_text = regalloc.mem_text(load: false, width: regalloc.reg_width(prev_reg), reg: prev_reg, base: prev_base, off: prev_off, has_off: prev_has_off)
+            before_text = regalloc.mem_text(load: false, width: regalloc.reg_width(prev_reg), reg: prev_reg, base: prev_base, at: prev_at, index: regalloc.at_reg(prev_at))
         }
         if len(before_text) > 0 and t.starts_with("\tldr ") and t.ends_with("]") and before_text.starts_with("\tstr ") and before_text.ends_with("]") and not t.contains("!") and not before_text.contains("!") {
             if t.find(", [") is Some(k) and before_text.find(", [") is Some(pk) {
@@ -2588,7 +2603,7 @@ type Codegen = struct {
         let label = extern_label(symbol)
         let reg = self.pool.alloc_reg()
         self.emit_op(.AddressPage, a: reg, b: f"{label}@GOTPAGE")
-        self.emit(f"ldr {reg}, [{reg}, {label}@GOTPAGEOFF]")
+        self.emit_symbol_mem(load: true, reg: reg, base: reg, name: label, got: true)
         self.emit_load(reg, base: reg)
         return .VReg(name: reg)
     }
@@ -2609,15 +2624,15 @@ type Codegen = struct {
         }
         let done = self.fresh("Lshared")
         self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
-        self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
+        self.emit_symbol_mem(load: true, reg: "x0", base: "x16", name: ref)
         self.emit_jump_zero("x0", target: done, nonzero: true)
         self.emit_call(f"{lbl}$shared")
         self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
-        self.emit(f"str x0, [x16, {ref}@PAGEOFF]")
+        self.emit_symbol_mem(load: false, reg: "x0", base: "x16", name: ref)
         self.emit_mov("x17", src: "x0")
         self.emit_call("_rc_release_stub")
         self.emit_op(.AddressPage, a: "x16", b: f"{ref}@PAGE")
-        self.emit(f"ldr x0, [x16, {ref}@PAGEOFF]")
+        self.emit_symbol_mem(load: true, reg: "x0", base: "x16", name: ref)
         self.emit_label(done)
         return .VReg(name: "x0")
     }
@@ -2647,7 +2662,7 @@ type Codegen = struct {
                     self.float_values += [text]
                     let reg: str = self.pool.alloc_reg()
                     self.emit_op(.AddressPage, a: reg, b: f"{lbl}@PAGE")
-                    self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
+                    self.emit_symbol_mem(load: true, reg: reg, base: reg, name: lbl)
                     return .VReg(name: reg)
                 }
             }
@@ -4032,10 +4047,7 @@ type Codegen = struct {
         if value >= -65535 and value <= 65535 {
             self.emit_op(.Move, a: dest, b: f"#{value}")
         } else {
-            self.emit(f"mov {dest}, #({value} & 0xffff)")
-            self.emit(f"movk {dest}, #(({value} >> 16) & 0xffff), lsl #16")
-            self.emit(f"movk {dest}, #(({value} >> 32) & 0xffff), lsl #32")
-            self.emit(f"movk {dest}, #(({value} >> 48) & 0xffff), lsl #48")
+            self.push_insn(.LoadConst(dst: dest, :value))
         }
     }
 
@@ -4068,22 +4080,42 @@ type Codegen = struct {
 
     // A load into `reg` from `base + off` (`base` without an `off`), of 4
     // bytes for a `w` register and 8 for an `x` one.
-    func emit_load(self, anon reg: str, base: str, off: int64? = none) -> none {
-        self.emit_mem(load: true, :reg, :base, :off)
+    func emit_load(self, anon reg: str, base: str, off: int64? = none, width: int64 = 0) -> none {
+        self.emit_mem(load: true, :reg, :base, :off, :width)
     }
 
-    // A store of `reg` at `base + off`, as emit_load.
-    func emit_store(self, anon reg: str, base: str, off: int64? = none) -> none {
-        self.emit_mem(load: false, :reg, :base, :off)
+    // A store of `reg` at `base + off`, as emit_load; `width` 1 or 2 for a
+    // byte or halfword.
+    func emit_store(self, anon reg: str, base: str, off: int64? = none, width: int64 = 0) -> none {
+        self.emit_mem(load: false, :reg, :base, :off, :width)
     }
 
-    func emit_mem(self, load: bool, reg: str, base: str, off: int64?) -> none {
-        let width = regalloc.reg_width(reg)
-        if off is Some(at) {
-            self.push_insn(.Mem(:load, :width, :reg, :base, off: at, has_off: true))
-        } else {
-            self.push_insn(.Mem(:load, :width, :reg, :base, off: 0, has_off: false))
+    func emit_mem(self, load: bool, reg: str, base: str, off: int64?, width: int64) -> none {
+        mut at: regalloc.MemAt = .Base
+        if off is Some(n) {
+            at = .Offset(off: n)
         }
+        mut w = width
+        if w == 0 {
+            w = regalloc.reg_width(reg)
+        }
+        self.push_insn(.Mem(:load, width: w, :reg, :base, :at))
+    }
+
+    // A load or store at `base` plus the register `index`, of `width` bytes
+    // (by default 4 for a `w` register, 8 for an `x` one).
+    func emit_indexed(self, load: bool, reg: str, base: str, index: str, width: int64 = 0) -> none {
+        mut w = width
+        if w == 0 {
+            w = regalloc.reg_width(reg)
+        }
+        self.push_insn(.Mem(:load, width: w, :reg, :base, at: .Index(reg: index)))
+    }
+
+    // A load or store at `base`, a page AddressPage gave, plus `name`'s offset
+    // in it (`got`: of its global offset table entry).
+    func emit_symbol_mem(self, load: bool, reg: str, base: str, name: str, got: bool = false) -> none {
+        self.push_insn(.Mem(:load, width: regalloc.reg_width(reg), :reg, :base, at: .Symbol(:name, :got)))
     }
 
     // `mn a, b, c, d`, as many operands as given. Each must be one token (a
@@ -4095,6 +4127,11 @@ type Codegen = struct {
             return
         }
         self.push_insn(regalloc.op(op, :a, :b, :c, :d))
+    }
+
+    // A load into (or store of) `a` and `b` at `base`, as `mode` says.
+    func emit_pair(self, load: bool, a: str, b: str, base: str, mode: regalloc.PairMode) -> none {
+        self.push_insn(.Pair(:load, :a, :b, :base, :mode))
     }
 
     // `bl target`.
@@ -4186,7 +4223,9 @@ type Codegen = struct {
             .Raw(text, info) -> return self.subst_vregs(text, :info)
             .Slot(store, reg, off) -> return regalloc.slot_text(:store, reg: self.phys_of(reg), :off)
             .Mov(dst, src) -> return f"\tmov {self.phys_of(dst)}, {self.phys_of(src)}"
-            .Mem(load, width, reg, base, off, has_off) -> return regalloc.mem_text(:load, :width, reg: self.phys_of(reg), base: self.phys_of(base), :off, :has_off)
+            .Mem(load, width, reg, base, at) -> return regalloc.mem_text(:load, :width, reg: self.phys_of(reg), base: self.phys_of(base), :at, index: self.phys_of(regalloc.at_reg(at)))
+            .Pair(load, a, b, base, mode) -> return regalloc.pair_text(:load, :a, :b, :base, :mode)
+            .LoadConst(dst, value) -> return regalloc.load_const_text(dst: self.phys_of(dst), :value)
             .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, a: self.phys_of(a), b: self.phys_of(b), c: self.phys_of(c), d: self.phys_of(d))
             .Call(target) -> return f"\tbl {target}"
             .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, reg: self.phys_of(reg), :target)
@@ -8360,7 +8399,7 @@ type Codegen = struct {
             self.pool.free_reg(reg)
         }
         for i in 0..fixed {
-            self.emit(f"ldr x{i}, [sp, #{8 * (extra + i)}]")
+            self.emit_load(f"x{i}", base: "sp", off: 8 * (extra + i))
         }
         self.emit_call(label)
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{area}")
@@ -10478,7 +10517,7 @@ type Codegen = struct {
                 self.float_values += [text]
                 let reg: str = self.pool.alloc_reg()
                 self.emit_op(.AddressPage, a: reg, b: f"{lbl}@PAGE")
-                self.emit(f"ldr {reg}, [{reg}, {lbl}@PAGEOFF]")
+                self.emit_symbol_mem(load: true, reg: reg, base: reg, name: lbl)
                 return .VReg(name: reg)
             }
             .BoolLit(value) -> {
@@ -10913,10 +10952,10 @@ type Codegen = struct {
             let hdr = self.pool.alloc_reg()
             self.emit_load(hdr, base: ptr_r)
             if self.elem_width(lhs_kind) == 1 {
-                self.emit(f"ldrb w{result[1..len(result)]}, [{hdr}, {idx_r}]")
+                self.emit_indexed(load: true, reg: f"w{result[1..len(result)]}", base: hdr, index: idx_r, width: 1)
             } else {
                 self.emit_op(.ShiftLeft, a: idx_r, b: idx_r, c: "#3")
-                self.emit(f"ldr {result}, [{hdr}, {idx_r}]")
+                self.emit_indexed(load: true, reg: result, base: hdr, index: idx_r)
             }
             self.pool.free_reg(hdr)
         } else {
@@ -10929,7 +10968,7 @@ type Codegen = struct {
             self.emit_load(buf_r, base: ptr_r)
             self.emit_index_check(idx_r, len: len_r)
             self.pool.free_reg(len_r)
-            self.emit(f"ldrb w{result[1..len(result)]}, [{buf_r}, {idx_r}]")
+            self.emit_indexed(load: true, reg: f"w{result[1..len(result)]}", base: buf_r, index: idx_r, width: 1)
             self.pool.free_reg(buf_r)
         }
         self.pool.free_reg(ptr_r)
@@ -10972,7 +11011,7 @@ type Codegen = struct {
         self.emit_op(.CompareIf, a: "x17", b: "x16", c: "#2", d: "lo")
         self.emit_jump_if(.Hi, target: bad_lbl)
         self.emit_load("x16", base: "x0")
-        self.emit("ldr x0, [x16, x1]")
+        self.emit_indexed(load: true, reg: "x0", base: "x16", index: "x1")
         self.emit_jump(done_lbl)
         self.emit_label(bad_lbl)
         self.emit_op(.Compare, a: "x1", b: "x16")
@@ -11774,7 +11813,7 @@ type Codegen = struct {
             let ptr_r = self.pool.alloc_reg()
             self.emit_ldr(subj_slot, reg: ptr_r)
             let fv_r = self.pool.alloc_reg()
-            self.emit(f"ldr {fv_r}, [{ptr_r}, #{8 + foff}]")
+            self.emit_load(fv_r, base: ptr_r, off: 8 + foff)
             self.emit_str(binding_off, reg: fv_r)
             self.pool.free_reg(fv_r)
             self.pool.free_reg(ptr_r)
@@ -12493,12 +12532,12 @@ type Codegen = struct {
             self.rc_retain_kind(elem_reg, kind: rc_elem)
             if item_sz == 1 {
                 let view = self.byte_view(elem_reg)
-                self.emit(f"strb {view[0]}, [{buf_r}, #{i}]")
+                self.emit_store(view[0], base: buf_r, off: i, width: 1)
                 if len(view[1]) > 0 {
                     self.pool.free_reg(view[1])
                 }
             } else {
-                self.emit(f"str {elem_reg}, [{buf_r}, #{i * item_sz}]")
+                self.emit_store(elem_reg, base: buf_r, off: i * item_sz)
             }
             self.pool.free_reg(buf_r)
             self.pool.free_reg(elem_reg)
@@ -13886,7 +13925,7 @@ type Codegen = struct {
         for i, key in env.keys {
             self.emit_ldr(self.find_var_offset(key), reg: tmp_r)
             self.rc_retain_kind(tmp_r, kind: env.kinds[i])
-            self.emit(f"str {tmp_r}, [{ptr_r}, #{(i + 1) * 8}]")
+            self.emit_store(tmp_r, base: ptr_r, off: (i + 1) * 8)
         }
         self.pool.free_reg(tmp_r)
         self.emit_mov("x0", src: ptr_r)
@@ -14309,10 +14348,10 @@ type Codegen = struct {
         self.emit_load(tmp_r, base: cell_r)
         self.emit_store(tmp_r, base: "sp")
         self.emit_load(tmp_r, base: cell_r, off: 8)
-        self.emit(f"ldr {tmp_r}, [{tmp_r}, #{method_idx * 8}]")
-        self.emit(f"str {tmp_r}, [sp, #{n * 8}]")
+        self.emit_load(tmp_r, base: tmp_r, off: method_idx * 8)
+        self.emit_store(tmp_r, base: "sp", off: n * 8)
         if pass_cell {
-            self.emit(f"str {cell_r}, [sp, #{(n + 1) * 8}]")
+            self.emit_store(cell_r, base: "sp", off: (n + 1) * 8)
         }
         self.pool.free_reg(tmp_r)
         self.pool.free_reg(cell_r)
@@ -14337,18 +14376,18 @@ type Codegen = struct {
                     arg_reg = self.load(arg_val)
                 }
             }
-            self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
+            self.emit_store(arg_reg, base: "sp", off: (i + 1) * 8)
             self.pool.free_reg(arg_reg)
             i = i + 1
         }
         mut k = 0
         for k < n and k < len(arg_regs) {
-            self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
+            self.emit_load(arg_regs[k], base: "sp", off: k * 8)
             k = k + 1
         }
-        self.emit(f"ldr x9, [sp, #{n * 8}]")
+        self.emit_load("x9", base: "sp", off: n * 8)
         if pass_cell {
-            self.emit(f"ldr x17, [sp, #{(n + 1) * 8}]")
+            self.emit_load("x17", base: "sp", off: (n + 1) * 8)
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
         self.emit_op(.CallIndirect, a: "x9")
@@ -14570,12 +14609,12 @@ type Codegen = struct {
             } else {
                 arg_reg = self.compile_default(sig_defaults[param_idx], expected: sig_params[param_idx], src_p: sig_src_p)
             }
-            self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
+            self.emit_store(arg_reg, base: "sp", off: (i + 1) * 8)
             self.pool.free_reg(arg_reg)
         }
         mut k = 0
         for k < n and k < len(arg_regs) {
-            self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
+            self.emit_load(arg_regs[k], base: "sp", off: k * 8)
             k = k + 1
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
@@ -14710,7 +14749,7 @@ type Codegen = struct {
             if at < 0 {
                 self.emit_own_or_provided(tmp, old_vt: old_vt, have_count: have_count, to_idx: to_idx, m: m)
             } else {
-                self.emit(f"ldr {tmp}, [{old_vt}, #{8 * at}]")
+                self.emit_load(tmp, base: old_vt, off: 8 * at)
                 if self.is_provided(self.interfaces[from_idx].methods[at]) {
                     let keep_lbl = self.fresh("Lconv_keep")
                     let old_body = self.pool.alloc_reg()
@@ -14722,11 +14761,11 @@ type Codegen = struct {
                     self.emit_label(keep_lbl)
                 }
             }
-            self.emit(f"str {tmp}, [x0, #{vt_off + 8 * j}]")
+            self.emit_store(tmp, base: "x0", off: vt_off + 8 * j)
             j += 1
         }
-        self.emit(f"ldr {tmp}, [{old_vt}, #{8 * have_count}]")
-        self.emit(f"str {tmp}, [x0, #{vt_off + 8 * len(want)}]")
+        self.emit_load(tmp, base: old_vt, off: 8 * have_count)
+        self.emit_store(tmp, base: "x0", off: vt_off + 8 * len(want))
         self.emit_op(.Add, a: tmp, b: "x0", c: f"#{vt_off}")
         self.emit_store(tmp, base: "x0", off: 8)
         self.pool.free_reg(tmp)
@@ -14750,7 +14789,7 @@ type Codegen = struct {
         let key_r = self.pool.alloc_reg()
         let probe_r = self.pool.alloc_reg()
         self.emit_label_addr(dest, label: self.provided_conv_label(to_idx, name: m.name))
-        self.emit(f"ldr {dir_r}, [{old_vt}, #{8 * have_count}]")
+        self.emit_load(dir_r, base: old_vt, off: 8 * have_count)
         self.emit_jump_zero(dir_r, target: done)
         self.emit_load(count_r, base: dir_r)
         self.emit_op(.Add, a: dir_r, b: dir_r, c: "#8")
@@ -14786,7 +14825,7 @@ type Codegen = struct {
 
     // Leave in `vt_r` whether the vtable it holds is the struct's, as `cond` for a following `cset`/branch.
     func emit_type_id_cmp(self, anon vt_r: str, owner: TypeKind, iface_idx: int64) -> none {
-        self.emit(f"ldr {vt_r}, [{vt_r}, #{8 * len(self.interfaces[iface_idx].methods)}]")
+        self.emit_load(vt_r, base: vt_r, off: 8 * len(self.interfaces[iface_idx].methods))
         let exp_r = self.pool.alloc_reg()
         let id_lbl = self.type_id_label(owner)
         self.emit_op(.AddressPage, a: exp_r, b: f"{id_lbl}@PAGE")
@@ -14980,12 +15019,12 @@ type Codegen = struct {
                 arg_reg = self.compile_default(default_exprs[i], expected: expected_kinds[i], :src_p)
                 self.leave(saved_ctx)
             }
-            self.emit(f"str {arg_reg}, [sp, #{i * 8}]")
+            self.emit_store(arg_reg, base: "sp", off: i * 8)
             self.pool.free_reg(arg_reg)
         }
         mut k = 0
         for k < total and k < len(arg_regs) {
-            self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
+            self.emit_load(arg_regs[k], base: "sp", off: k * 8)
             k = k + 1
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
@@ -17198,7 +17237,7 @@ type Codegen = struct {
                 let field_reg = self.compile_into(field_args[i].value, expected: field_kind)
                 self.restore_across(ptr_r, spilled: eptr_spilled)
                 self.rc_retain_kind(field_reg, kind: field_kind)
-                self.emit(f"str {field_reg}, [{ptr_r}, #{8 + foff}]")
+                self.emit_store(field_reg, base: ptr_r, off: 8 + foff)
                 self.pool.free_reg(field_reg)
                 i = i + 1
             }
@@ -17670,19 +17709,19 @@ type Codegen = struct {
                 self.pool.free_reg(len_r)
                 if self.elem_width(lhs_kind) == 1 {
                     let view = self.byte_view(reloaded_rhs_r)
-                    self.emit(f"strb {view[0]}, [{buf_r}, {reloaded_idx_r}]")
+                    self.emit_indexed(load: false, reg: view[0], base: buf_r, index: reloaded_idx_r, width: 1)
                     if len(view[1]) > 0 {
                         self.pool.free_reg(view[1])
                     }
                 } else if self.rc_heap_kind(lhs_kind.array_elem()) {
                     self.emit_op(.ShiftLeft, a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
                     self.rc_retain(reloaded_rhs_r)
-                    self.emit(f"ldr x17, [{buf_r}, {reloaded_idx_r}]")
-                    self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
+                    self.emit_indexed(load: true, reg: "x17", base: buf_r, index: reloaded_idx_r)
+                    self.emit_indexed(load: false, reg: reloaded_rhs_r, base: buf_r, index: reloaded_idx_r)
                     self.rc_release_x17()
                 } else {
                     self.emit_op(.ShiftLeft, a: reloaded_idx_r, b: reloaded_idx_r, c: "#3")
-                    self.emit(f"str {reloaded_rhs_r}, [{buf_r}, {reloaded_idx_r}]")
+                    self.emit_indexed(load: false, reg: reloaded_rhs_r, base: buf_r, index: reloaded_idx_r)
                 }
                 self.pool.free_reg(buf_r)
                 self.pool.free_reg(reloaded_idx_r)
@@ -17891,7 +17930,7 @@ type Codegen = struct {
         let msg = self.intern_str(f"`{name}` is used while its value is being worked out")
         self.emit_globl(lbl)
         self.emit_label(lbl)
-        self.emit("stp fp, lr, [sp, #-16]!")
+        self.emit_pair(load: false, a: "fp", b: "lr", base: "sp", mode: .Pre(off: -16))
         self.emit_mov("fp", src: "sp")
         self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
         self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
@@ -17904,7 +17943,7 @@ type Codegen = struct {
             self.emit_mov("x17", src: "x0")
             self.emit_call("_rc_retain_stub")
         }
-        self.emit("ldp fp, lr, [sp], #16")
+        self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
         self.emit_op(.Return)
         self.emit_label(init_lbl)
         self.emit_jump_zero("x17", target: cycle, nonzero: true)
@@ -18663,7 +18702,7 @@ type Codegen = struct {
     // many slots as fit, most used first: when the registers run out, half as
     // many. [] when none can be, and the caller allocates `body` as it was.
     func promote_locals(self, anon body: [regalloc.Insn], vreg_start: int64, excluded: [int64]) -> [regalloc.Insn] {
-        if self.pool.evicted or len(body) > PROMOTE_MAX_INSNS {
+        if self.pool.evicted or regalloc.line_count(body) > PROMOTE_MAX_INSNS {
             return []
         }
         // Each slot's offset and how often it's loaded or stored.
@@ -18964,12 +19003,12 @@ type Codegen = struct {
                     arg_reg = self.load(arg_val)
                 }
             }
-            self.emit(f"str {arg_reg}, [sp, #{(i + 1) * 8}]")
+            self.emit_store(arg_reg, base: "sp", off: (i + 1) * 8)
             self.pool.free_reg(arg_reg)
         }
         mut k: int64 = 0
         for k < n and k < len(arg_regs) {
-            self.emit(f"ldr {arg_regs[k]}, [sp, #{k * 8}]")
+            self.emit_load(arg_regs[k], base: "sp", off: k * 8)
             k = k + 1
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
@@ -19160,10 +19199,10 @@ type Codegen = struct {
         mut elem_reg = self.pool.alloc_reg()
         self.emit_load(elem_reg, base: hdr_reg)
         if by_byte {
-            self.emit(f"ldrb w{elem_reg[1..len(elem_reg)]}, [{elem_reg}, {idx_reg}]")
+            self.emit_indexed(load: true, reg: f"w{elem_reg[1..len(elem_reg)]}", base: elem_reg, index: idx_reg, width: 1)
         } else {
             self.emit_op(.ShiftLeft, a: idx_reg, b: idx_reg, c: "#3")
-            self.emit(f"ldr {elem_reg}, [{elem_reg}, {idx_reg}]")
+            self.emit_indexed(load: true, reg: elem_reg, base: elem_reg, index: idx_reg)
         }
         self.emit_str(elem_off, reg: elem_reg)
         self.pool.free_reg(elem_reg)
@@ -19309,7 +19348,7 @@ type Codegen = struct {
             let ptr_r2 = self.pool.alloc_reg()
             self.emit_ldr(subj_slot, reg: ptr_r2)
             let fv_r = self.pool.alloc_reg()
-            self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
+            self.emit_load(fv_r, base: ptr_r2, off: 8 + foff)
             self.emit_str(binding_off, reg: fv_r)
             self.pool.free_reg(fv_r)
             self.pool.free_reg(ptr_r2)
@@ -19439,7 +19478,7 @@ type Codegen = struct {
                     let ptr_r2 = self.pool.alloc_reg()
                     self.emit_ldr(subj_slot, reg: ptr_r2)
                     let fv_r = self.pool.alloc_reg()
-                    self.emit(f"ldr {fv_r}, [{ptr_r2}, #{8 + foff}]")
+                    self.emit_load(fv_r, base: ptr_r2, off: 8 + foff)
                     self.emit_str(binding_off, reg: fv_r)
                     self.pool.free_reg(fv_r)
                     self.pool.free_reg(ptr_r2)
@@ -20043,7 +20082,7 @@ type Codegen = struct {
         }
         // From fp: a `try` inside a pushed region branches here with sp still lowered.
         self.emit_mov("sp", src: "fp")
-        self.emit("ldp fp, lr, [sp], #16")
+        self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
 
         mut body_buf = self.peephole(self.out_buf, :vreg_start)
         self.out_buf = saved_buf
@@ -20081,13 +20120,13 @@ type Codegen = struct {
         }
         mut pi = 0
         for pi < cs {
-            self.emit(f"stp {regalloc.cs_reg(pi)}, {regalloc.cs_reg(pi + 1)}, [sp, #-16]!")
+            self.emit_pair(load: false, a: regalloc.cs_reg(pi), b: regalloc.cs_reg(pi + 1), base: "sp", mode: .Pre(off: -16))
             pi = pi + 2
         }
         // Sized only now: compiling the body allocates slots of its own (match subjects, chain operands).
         let raw_sz = self.frame_slots * 8
         let aligned = raw_sz + 16 - raw_sz % 16
-        self.emit("stp fp, lr, [sp, #-16]!")
+        self.emit_pair(load: false, a: "fp", b: "lr", base: "sp", mode: .Pre(off: -16))
         self.emit_mov("fp", src: "sp")
         self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{aligned}")
         for slot in self.rc_slots {
@@ -20095,7 +20134,7 @@ type Codegen = struct {
         }
         // Before anything that counts: those use x17.
         for i, off in capture_offs {
-            self.emit(f"ldr x9, [x17, #{(i + 1) * 8}]")
+            self.emit_load("x9", base: "x17", off: (i + 1) * 8)
             self.emit_str_raw(off, reg: "x9")
         }
         // A parameter the body stores to owns its value after all.
@@ -20113,7 +20152,7 @@ type Codegen = struct {
             rc_k = rc_k + 1
         }
         mut body_insns = body_buf
-        if len(body_insns) > LONG_BODY_INSNS {
+        if regalloc.line_count(body_insns) > LONG_BODY_INSNS {
             body_insns = self.long_branches(body_insns)
         }
         for line in body_insns {
@@ -20121,7 +20160,7 @@ type Codegen = struct {
         }
         mut qi = cs
         for qi > 0 {
-            self.emit(f"ldp {regalloc.cs_reg(qi - 2)}, {regalloc.cs_reg(qi - 1)}, [sp], #16")
+            self.emit_pair(load: true, a: regalloc.cs_reg(qi - 2), b: regalloc.cs_reg(qi - 1), base: "sp", mode: .Post(off: 16))
             qi = qi - 2
         }
         self.emit_op(.Return)
@@ -20312,7 +20351,7 @@ type Codegen = struct {
             self.emit_globl(run_lbl)
             self.emit_label(run_lbl)
             self.emit_op(.Sub, a: "sp", b: "sp", c: "#16")
-            self.emit("stp fp, lr, [sp]")
+            self.emit_pair(load: false, a: "fp", b: "lr", base: "sp", mode: .At(off: 0))
             self.emit_op(.Add, a: "fp", b: "sp", c: "#0")
             self.emit_op(.AddressPage, a: "x0", b: f"{path_lbl}@PAGE")
             self.emit_op(.Add, a: "x0", b: "x0", c: f"{path_lbl}@PAGEOFF")
@@ -20325,7 +20364,7 @@ type Codegen = struct {
                 self.emit_op(.Add, a: "x0", b: "x0", c: f"{name_lbl}@PAGEOFF")
                 self.emit_call("$testing$report")
             }
-            self.emit("ldp fp, lr, [sp]")
+            self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .At(off: 0))
             self.emit_op(.Add, a: "sp", b: "sp", c: "#16")
             self.emit_op(.Return)
         }
