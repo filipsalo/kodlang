@@ -658,7 +658,7 @@ func opposite_condition(anon cond: str) -> str {
 
 // The text of a Raw instruction, or "" for a label.
 func insn_text(anon insn: regalloc.Insn) -> str {
-    if insn is .Raw(text) {
+    if insn is .Raw(text, _info) {
         return text
     }
     return ""
@@ -703,17 +703,6 @@ func asm_parts(anon text: str) -> [str] {
 
 // The most instructions a body may have for promote_locals to try it.
 let PROMOTE_MAX_INSNS: int64 = 6000
-
-// Whether an instruction names the frame pointer.
-func names_fp(anon text: str) -> bool {
-    let n = len(text)
-    for k in 0..n - 1 {
-        if text[k] == 'f' and text[k + 1] == 'p' and (k == 0 or not regalloc.is_sym_char(text[k - 1])) and (k + 2 == n or not regalloc.is_sym_char(text[k + 2])) {
-            return true
-        }
-    }
-    return false
-}
 
 // The prologue's and epilogue's own uses of fp, which don't touch a slot.
 func is_frame_link(anon text: str) -> bool {
@@ -786,6 +775,13 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
     // whether or not that line was kept.
     mut prev = ""
     for i in 0..n {
+        let code = regalloc.mnemonic_code(regalloc.insn_flags(b[i]))
+        if code != regalloc.MN_MOV and code != regalloc.MN_LDR and code != regalloc.MN_STR {
+            // Neither rule starts or ends at this line; the next one sees it as the one before.
+            prev = ""
+            out += [b[i]]
+            continue
+        }
         let t = insn_text(b[i])
         if i + 1 < n and t.starts_with("\tmov v") {
             let a = asm_parts(t)
@@ -797,7 +793,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 let id = parse_digits(dst[1..len(dst)]) - vreg_start
                 let head = f"\tldr {dst}, [{dst}"
                 if len(spots) == 2 and next.starts_with(head) and len(next) > len(head) and (next[len(head)] == ']' or next[len(head)] == ',') {
-                    b[i + 1] = .Raw(text: f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
+                    b[i + 1] = regalloc.raw(f"\tldr {dst}, [{src}{next[len(head)..len(next)]}")
                     continue
                 }
                 if len(spots) == 1 and id >= 0 and id < n_local and counts[id] == 2 {
@@ -810,7 +806,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                     // The first operand starts after the mnemonic and a space.
                     let is_first = spots[0] == 1 + op_end + 1
                     if not op.starts_with("b") and op != "ret" and (not is_first or first_operand_read(op)) {
-                        b[i + 1] = .Raw(text: next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
+                        b[i + 1] = regalloc.raw(next[0..spots[0]] + src + next[spots[0] + len(dst)..len(next)])
                         continue
                     }
                 }
@@ -824,7 +820,7 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
                 let src = before[5..pk]
                 if plain_reg(dst) and plain_reg(src) and t[k..len(t)] == before[pk..len(before)] {
                     if dst != src {
-                        out += [.Raw(text: f"\tmov {dst}, {src}")]
+                        out += [regalloc.raw(f"\tmov {dst}, {src}")]
                     }
                     continue
                 }
@@ -3840,7 +3836,7 @@ type Codegen = struct {
         if self.rc_pending {
             self.rc_flush_pending()
         }
-        self.out_buf += [regalloc.Insn.Raw(text: line)]
+        self.out_buf += [regalloc.raw(line)]
     }
 
     // Drain the buffered output to stdout, one `print` per line.
@@ -3851,7 +3847,14 @@ type Codegen = struct {
     func flush_out(self) -> none {
         for insn in self.out_buf {
             let s: str = self.format_insn(insn)
-            if not self.is_self_mov(s) {
+            let flags = regalloc.insn_flags(insn)
+            // Only a `mov` can be a self-mov; only a flagged line can need splitting.
+            if regalloc.mnemonic_code(flags) == regalloc.MN_MOV and self.is_self_mov(s) {
+                continue
+            }
+            if (flags & regalloc.INFO_BIG_IMM) == 0 {
+                print(s)
+            } else {
                 self.print_encodable(s)
             }
         }
@@ -3882,7 +3885,7 @@ type Codegen = struct {
     // Format an `Insn` to its asm text.
     func format_insn(self, anon insn: regalloc.Insn) -> str {
         match insn {
-            .Raw(text) -> return self.subst_vregs(text)
+            .Raw(text, info) -> return self.subst_vregs(text, :info)
             .Label(name) -> return name + ":"
         }
     }
@@ -3943,56 +3946,35 @@ type Codegen = struct {
     // `text[flush_start..vreg_start]` followed by the substitution and
     // advance `flush_start` past the vreg. Lines with no substitutions
     // return the original `text` unchanged.
-    func subst_vregs(self, anon text: str) -> str {
-        let n: int64 = len(text)
+    // `text` with each vreg it names (see regalloc.line_info) replaced by
+    // the physical register it was given, `w` form for a `w` vreg.
+    func subst_vregs(self, anon text: str, info: [int64]) -> str {
+        if len(info) < 2 {
+            return text
+        }
         mut out: str = ""
         mut flush_start: int64 = 0
-        mut i: int64 = 0
-        for i < n {
-            let c: int64 = text[i]
-            if c == '"' {
-                i = regalloc.skip_quoted(text, start: i)
-            } else if (c == 'v' or c == 'w') and i + 1 < n and lexing.is_digit(text[i + 1]) {
-                mut boundary: bool = true
-                if i > 0 and regalloc.is_sym_char(text[i - 1]) {
-                    boundary = false
-                }
-                if not boundary {
-                    i = i + 1
-                    continue
-                }
-                mut j: int64 = i + 1
-                mut id: int64 = 0
-                for j < n and lexing.is_digit(text[j]) {
-                    id = id * 10 + text[j] - '0'
-                    j = j + 1
-                }
-                if j < n and regalloc.is_sym_char(text[j]) {
-                    i = j
-                    continue
-                }
-                if id >= len(self.pool.vreg_phys) {
-                    i = j
-                    continue
-                }
-                let phys: str = self.pool.vreg_phys[id]
-                out = out + text[flush_start..i]
-                if c == 'w' {
-                    // x-form → w-form: same number, different prefix.
-                    out = out + "w" + phys[1..len(phys)]
-                } else {
-                    out = out + phys
-                }
-                flush_start = j
-                i = j
-            } else {
-                i = i + 1
+        for k in 1..len(info) {
+            let e = info[k]
+            let id = regalloc.entry_id(e)
+            if id >= len(self.pool.vreg_phys) {
+                continue
             }
+            let pos = regalloc.entry_pos(e)
+            let phys: str = self.pool.vreg_phys[id]
+            out = out + text[flush_start..pos]
+            if regalloc.entry_is_w(e) {
+                // x-form → w-form: same number, different prefix.
+                out = out + "w" + phys[1..len(phys)]
+            } else {
+                out = out + phys
+            }
+            flush_start = pos + regalloc.entry_len(e)
         }
         if flush_start == 0 {
             return text
         }
-        return out + text[flush_start..n]
+        return out + text[flush_start..len(text)]
     }
 
     func emit(self, anon line: str) -> none {
@@ -18307,6 +18289,12 @@ type Codegen = struct {
         let n = len(body)
         mut i: int64 = 0
         for i < n {
+            let code = regalloc.mnemonic_code(regalloc.insn_flags(body[i]))
+            if code != regalloc.MN_CSET and code != regalloc.MN_MOV {
+                out += [body[i]]
+                i += 1
+                continue
+            }
             let t0 = insn_text(body[i])
             if not (t0.starts_with("\tcset ") or t0.starts_with("\tmov v")) {
                 out += [body[i]]
@@ -18318,7 +18306,7 @@ type Codegen = struct {
                 let b = asm_parts(insn_text(body[i + 1]))
                 // cbz/cbnz v, L
                 if len(b) == 3 and b[1] == a[1] and (b[0] == "cbz" or b[0] == "cbnz") {
-                    out += [.Raw(text: branch_on(a[2], when_true: b[0] == "cbnz", target: b[2]))]
+                    out += [regalloc.raw(branch_on(a[2], when_true: b[0] == "cbnz", target: b[2]))]
                     i += 2
                     continue
                 }
@@ -18326,7 +18314,7 @@ type Codegen = struct {
                 if len(b) == 3 and b[0] == "cmp" and b[1] == a[1] and b[2] == "#0" and i + 2 < n {
                     let c = asm_parts(insn_text(body[i + 2]))
                     if len(c) == 2 and (c[0] == "beq" or c[0] == "bne") {
-                        out += [.Raw(text: branch_on(a[2], when_true: c[0] == "bne", target: c[1]))]
+                        out += [regalloc.raw(branch_on(a[2], when_true: c[0] == "bne", target: c[1]))]
                         i += 3
                         continue
                     }
@@ -18336,17 +18324,17 @@ type Codegen = struct {
                 let b = asm_parts(insn_text(body[i + 1]))
                 let v = a[1]
                 if len(b) == 4 and (b[0] == "add" or b[0] == "sub") and b[3] == v and b[2] != v and b[2] != "xzr" {
-                    out += [.Raw(text: f"\t{b[0]} {b[1]}, {b[2]}, {a[2]}")]
+                    out += [regalloc.raw(f"\t{b[0]} {b[1]}, {b[2]}, {a[2]}")]
                     i += 2
                     continue
                 }
                 if len(b) == 4 and b[0] == "add" and b[2] == v and b[3] != v and b[3] != "xzr" {
-                    out += [.Raw(text: f"\tadd {b[1]}, {b[3]}, {a[2]}")]
+                    out += [regalloc.raw(f"\tadd {b[1]}, {b[3]}, {a[2]}")]
                     i += 2
                     continue
                 }
                 if len(b) == 3 and b[0] == "cmp" and b[2] == v and b[1] != v and b[1] != "xzr" {
-                    out += [.Raw(text: f"\tcmp {b[1]}, {a[2]}")]
+                    out += [regalloc.raw(f"\tcmp {b[1]}, {a[2]}")]
                     i += 2
                     continue
                 }
@@ -18381,8 +18369,12 @@ type Codegen = struct {
         }
         mut i: int64 = 0
         for i < n {
+            if (regalloc.insn_flags(body[i]) & regalloc.INFO_FP) == 0 {
+                i += 1
+                continue
+            }
             let text = insn_text(body[i])
-            if not names_fp(text) or is_frame_link(text) {
+            if is_frame_link(text) {
                 i += 1
                 continue
             }
@@ -18475,9 +18467,9 @@ type Codegen = struct {
                         let last = insn_text(body[j + line_len[j] - 1])
                         let reg = slot_access_reg(last)
                         if last.starts_with("\tldr ") {
-                            out += [.Raw(text: f"\tmov {reg}, {vregs[which]}")]
+                            out += [regalloc.raw(f"\tmov {reg}, {vregs[which]}")]
                         } else {
-                            out += [.Raw(text: f"\tmov {vregs[which]}, {reg}")]
+                            out += [regalloc.raw(f"\tmov {vregs[which]}, {reg}")]
                         }
                         j += line_len[j]
                         continue
@@ -18538,12 +18530,12 @@ type Codegen = struct {
     func long_branches(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
         mut out: [regalloc.Insn] = []
         for insn in body {
-            if insn is .Raw(text) {
+            if insn is .Raw(text, _info) {
                 let parts = split_conditional_branch(text)
                 if len(parts) == 2 {
                     let over = self.fresh("Lfar")
-                    out += [.Raw(text: parts[0] + over)]
-                    out += [.Raw(text: f"\tb {parts[1]}")]
+                    out += [regalloc.raw(parts[0] + over)]
+                    out += [regalloc.raw(f"\tb {parts[1]}")]
                     out += [.Label(name: over)]
                     continue
                 }
