@@ -1,0 +1,388 @@
+// The arm64 lowering of the compiler's IR (regalloc.Insn, see docs/ir.md):
+// how each instruction is written as arm64 assembly, the mnemonics, the
+// inlined runtime functions, and the lines arm64 needs where one instruction
+// can't do. Another target gets a module like this one.
+
+import "kod/lexing"
+import "kod/regalloc"
+
+// The arm64 name of a condition.
+func cond_name(anon c: regalloc.Cond) -> str {
+    match c {
+        .Eq -> return "eq"
+        .Ne -> return "ne"
+        .Hs -> return "hs"
+        .Lo -> return "lo"
+        .Hi -> return "hi"
+        .Ls -> return "ls"
+        .Mi -> return "mi"
+        .Pl -> return "pl"
+        .Vs -> return "vs"
+        .Vc -> return "vc"
+        .Ge -> return "ge"
+        .Lt -> return "lt"
+        .Gt -> return "gt"
+        .Le -> return "le"
+    }
+}
+
+// The arm64 mnemonic of a branch.
+func branch_mnemonic(anon kind: regalloc.BranchKind) -> str {
+    match kind {
+        .Always -> return "b"
+        .If(cond) -> return f"b.{cond_name(cond)}"
+        .IfZero -> return "cbz"
+        .IfNonzero -> return "cbnz"
+    }
+}
+
+// The arm64 mnemonic for an opcode.
+func arm64_mnemonic(anon op: regalloc.Opcode) -> str {
+    match op {
+        .Move -> return "mov"
+        .Add -> return "add"
+        .Sub -> return "sub"
+        .Mul -> return "mul"
+        .DivSigned -> return "sdiv"
+        .And -> return "and"
+        .Or -> return "orr"
+        .Xor -> return "eor"
+        .ShiftLeft -> return "lsl"
+        .ShiftRight -> return "lsr"
+        .Compare -> return "cmp"
+        .CompareIf -> return "ccmp"
+        .SetIf -> return "cset"
+        .Select -> return "csel"
+        .AddressPage -> return "adrp"
+        .FloatMove -> return "fmov"
+        .FloatAdd -> return "fadd"
+        .FloatSub -> return "fsub"
+        .FloatMul -> return "fmul"
+        .FloatDiv -> return "fdiv"
+        .FloatNeg -> return "fneg"
+        .FloatCompare -> return "fcmp"
+        .CallIndirect -> return "blr"
+        .Return -> return "ret"
+    }
+}
+
+// The opcode an arm64 mnemonic is, for the passes that still read mnemonics.
+func opcode_named(anon mn: str) -> regalloc.Opcode? {
+    match mn {
+        "mov" -> return .Move
+        "add" -> return .Add
+        "sub" -> return .Sub
+        "cmp" -> return .Compare
+        "cset" -> return .SetIf
+        else return none
+    }
+}
+
+// The arm64 mnemonic for a load or store of `width` bytes.
+func mem_mnemonic(load: bool, width: int64) -> str {
+    mut op = "str"
+    if load {
+        op = "ldr"
+    }
+    if width == 1 {
+        return op + "b"
+    }
+    if width == 2 {
+        return op + "h"
+    }
+    return op
+}
+
+// The asm text of an `Op` line.
+func op_text(op: regalloc.Opcode, a: str, b: str, c: str, d: str) -> str {
+    let mn = arm64_mnemonic(op)
+    if len(a) == 0 {
+        return f"\t{mn}"
+    }
+    if len(b) == 0 {
+        return f"\t{mn} {a}"
+    }
+    if len(c) == 0 {
+        return f"\t{mn} {a}, {b}"
+    }
+    if len(d) == 0 {
+        return f"\t{mn} {a}, {b}, {c}"
+    }
+    return f"\t{mn} {a}, {b}, {c}, {d}"
+}
+
+// The asm text of a `Mem` line, with `reg`, `base` and an index as its
+// registers (`index` stands for the one `at` has).
+func mem_text(load: bool, width: int64, reg: str, base: str, at: regalloc.MemAt, index: str = "") -> str {
+    let op = mem_mnemonic(:load, :width)
+    match at {
+        .Base -> return f"\t{op} {reg}, [{base}]"
+        .Offset(off) -> return f"\t{op} {reg}, [{base}, #{off}]"
+        .Index(_reg) -> return f"\t{op} {reg}, [{base}, {index}]"
+        .Symbol(name, got) -> {
+            if got {
+                return f"\t{op} {reg}, [{base}, {name}@GOTPAGEOFF]"
+            }
+            return f"\t{op} {reg}, [{base}, {name}@PAGEOFF]"
+        }
+    }
+}
+
+// The asm text of a `Pair` line.
+func pair_text(load: bool, a: str, b: str, base: str, mode: regalloc.PairMode) -> str {
+    mut op = "stp"
+    if load {
+        op = "ldp"
+    }
+    match mode {
+        .At(off) -> {
+            if off == 0 {
+                return f"\t{op} {a}, {b}, [{base}]"
+            }
+            return f"\t{op} {a}, {b}, [{base}, #{off}]"
+        }
+        .Pre(off) -> return f"\t{op} {a}, {b}, [{base}, #{off}]!"
+        .Post(off) -> return f"\t{op} {a}, {b}, [{base}], #{off}"
+    }
+}
+
+// The asm text of a `Slot` line, with `reg` as the register.
+func slot_text(store: bool, reg: str, off: int64) -> str {
+    mut op = "ldr"
+    if store {
+        op = "str"
+    }
+    if off >= 0 {
+        return f"\t{op} {reg}, [fp]"
+    }
+    return f"\t{op} {reg}, [fp, #{off}]"
+}
+
+// The asm text of a `Branch` line, with `reg` as its register.
+func branch_text(kind: regalloc.BranchKind, reg: str, target: str) -> str {
+    let op = branch_mnemonic(kind)
+    if len(reg) == 0 {
+        return f"\t{op} {target}"
+    }
+    return f"\t{op} {reg}, {target}"
+}
+
+// The asm text of a `LoadConst`: its lines, joined by newlines.
+func load_const_text(dst: str, value: int64) -> str {
+    return f"\tmov {dst}, #({value} & 0xffff)\n\tmovk {dst}, #(({value} >> 16) & 0xffff), lsl #16\n\tmovk {dst}, #(({value} >> 32) & 0xffff), lsl #32\n\tmovk {dst}, #(({value} >> 48) & 0xffff), lsl #48"
+}
+
+// How many lines of asm `body` prints, which limits that count lines go by.
+func line_count(anon body: [regalloc.Insn]) -> int64 {
+    mut n = len(body)
+    for insn in body {
+        if insn is .LoadConst(_dst, _value) {
+            n += regalloc.LOAD_CONST_LINES - 1
+        }
+        if insn is .Intrinsic(label) {
+            n += len(arm64_intrinsic(label)) - 1
+        }
+    }
+    return n
+}
+
+// Whether a call to `label` is an intrinsic, done without calling.
+func is_intrinsic(anon label: str) -> bool {
+    return len(arm64_intrinsic(label)) > 0
+}
+
+// The arm64 instructions that stand in for a call to `label`, with the
+// arguments in x0 and x1 and the result left in x0, or [] for an ordinary call.
+func arm64_intrinsic(anon label: str) -> [str] {
+    match label {
+        "$primitives$int64$leading_zeros" -> return ["clz x0, x0"]
+        "$primitives$int64$trailing_zeros" -> return ["rbit x0, x0", "clz x0, x0"]
+        // Count the bits of each byte, then add up the eight counts.
+        "$primitives$int64$count_ones" -> return ["fmov d0, x0", "cnt v0.8b, v0.8b", "addv b0, v0.8b", "fmov x0, d0"]
+        "$primitives$int64$mul_high" -> return ["umulh x0, x0, x1"]
+        "_kod_f64_abs" -> return ["fmov d0, x0", "fabs d0, d0", "fmov x0, d0"]
+        // Rounding toward minus infinity, plus infinity, and to nearest
+        // with ties away from zero, as C's floor, ceil and round.
+        "_kod_f64_floor" -> return ["fmov d0, x0", "frintm d0, d0", "fmov x0, d0"]
+        "_kod_f64_ceil" -> return ["fmov d0, x0", "frintp d0, d0", "fmov x0, d0"]
+        "_kod_f64_round" -> return ["fmov d0, x0", "frinta d0, d0", "fmov x0, d0"]
+        "_kod_f64_sqrt" -> return ["fmov d0, x0", "fsqrt d0, d0", "fmov x0, d0"]
+        // Only not-a-number is unordered with itself.
+        "_kod_f64_is_nan" -> return ["fmov d0, x0", "fcmp d0, d0", "cset x0, vs"]
+        // Without the sign bit, infinity is exactly the all-ones exponent.
+        "_kod_f64_is_inf" -> return ["and x0, x0, #0x7fffffffffffffff", "eor x0, x0, #0x7ff0000000000000", "cmp x0, #0", "cset x0, eq"]
+        // Truncates toward zero, saturates out of range, and gives 0 for
+        // not-a-number.
+        "_kod_f64_to_i64" -> return ["fmov d0, x0", "fcvtzs x0, d0"]
+        "_kod_i64_to_f64" -> return ["scvtf d0, x0", "fmov x0, d0"]
+        // A float64 already travels as its bits, so these change only the type.
+        "_kod_f64_bits" | "_kod_f64_from_bits" -> return ["mov x0, x0"]
+        // stdlib/unsafe.kod: raw loads and stores, a C int's sign, and the
+        // address a str or bytes value already is. `w<n>` in this text is a
+        // virtual register, so the narrow forms go through x and v0's b/s views.
+        "_kod_unsafe_load8" -> return ["ldrsb x0, [x0]", "and x0, x0, #0xff"]
+        "_kod_unsafe_load32" -> return ["ldrsw x0, [x0]"]
+        "_kod_unsafe_load64" -> return ["ldr x0, [x0]"]
+        "_kod_unsafe_store8" -> return ["fmov d0, x1", "str b0, [x0]"]
+        "_kod_unsafe_store32" -> return ["fmov d0, x1", "str s0, [x0]"]
+        "_kod_unsafe_store64" -> return ["str x1, [x0]"]
+        "_kod_unsafe_c_int" -> return ["lsl x0, x0, #32", "asr x0, x0, #32"]
+        "_kod_unsafe_str_ref" | "_kod_unsafe_bytes_ref" -> return ["mov x0, x0"]
+        else -> return []
+    }
+}
+
+// The text of a Raw instruction, or "" for a label.
+func insn_text(anon insn: regalloc.Insn) -> str {
+    match insn {
+        .Slot(store, reg, off) -> return slot_text(:store, :reg, :off)
+        .Mov(dst, src) -> return f"\tmov {dst}, {src}"
+        .Mem(load, width, reg, base, at) -> return mem_text(:load, :width, :reg, :base, :at, index: regalloc.at_reg(at))
+        .Op(op, a, b, c, d, _flags) -> return op_text(:op, :a, :b, :c, :d)
+        .Pair(load, a, b, base, mode) -> return pair_text(:load, :a, :b, :base, :mode)
+        .LoadConst(dst, value) -> return load_const_text(:dst, :value)
+        .Data(text) -> return text
+        .Intrinsic(label) -> {
+            mut text = ""
+            for line in arm64_intrinsic(label) {
+                if len(text) > 0 {
+                    text = text + "\n"
+                }
+                text = text + "\t" + line
+            }
+            return text
+        }
+        .Call(target) -> return f"\tbl {target}"
+        .Branch(kind, reg, target) -> return branch_text(:kind, :reg, :target)
+        .Label(_name) -> return ""
+    }
+}
+
+// Where `#N` starts in an `add`, `sub`, `ldr` or `str` line that can't encode N, or -1.
+func big_immediate_at(anon s: str) -> int64 {
+    if len(s) < 5 {
+        return -1
+    }
+    let op = s[0..5]
+    let is_arith = op == "\tadd " or op == "\tsub "
+    let is_mem = op == "\tldr " or op == "\tstr "
+    if not is_arith and not is_mem {
+        return -1
+    }
+    let at = s.find("#")
+    if at is Some(hash) {
+        mut end = hash + 1
+        mut value = 0
+        // Far past either limit; a longer number needn't be read in full.
+        for end < len(s) and lexing.is_digit(s[end]) {
+            if value < 1000000 {
+                value = value * 10 + s[end] - '0'
+            }
+            end += 1
+        }
+        if end == hash + 1 {
+            return -1
+        }
+        if is_arith and end == len(s) and value > 4095 {
+            return hash
+        }
+        if is_mem and s[end..] == "]" and value > 32760 {
+            return hash
+        }
+    }
+    return -1
+}
+
+// The asm lines for `s`: itself, or, for an `add`, `sub`, `ldr` or `str`
+// whose immediate is too big to encode, that immediate put in x16 first (x16
+// holds nothing between instructions of this kind).
+func encodable_lines(anon s: str) -> [str] {
+    let at = big_immediate_at(s)
+    if at < 0 {
+        return [s]
+    }
+    mut end = at + 1
+    for end < len(s) and lexing.is_digit(s[end]) {
+        end += 1
+    }
+    let value = s[at + 1..end]
+    return [
+        f"\tmov x16, #({value} & 0xffff)",
+        f"\tmovk x16, #(({value} >> 16) & 0xffff), lsl #16",
+        f"\tmovk x16, #(({value} >> 32) & 0xffff), lsl #32",
+        s[0..at] + "x16" + s[end..],
+    ]
+}
+
+// The asm text of an instruction, with each vreg its physical register in
+// `vreg_phys` (an instruction's lines joined by newlines).
+func format_insn(anon insn: regalloc.Insn, vreg_phys: [str]) -> str {
+    match insn {
+        .Slot(store, reg, off) -> return slot_text(:store, reg: phys_of(reg, :vreg_phys), :off)
+        .Mov(dst, src) -> return f"\tmov {phys_of(dst, :vreg_phys)}, {phys_of(src, :vreg_phys)}"
+        .Mem(load, width, reg, base, at) -> return mem_text(:load, :width, reg: phys_of(reg, :vreg_phys), base: phys_of(base, :vreg_phys), :at, index: phys_of(regalloc.at_reg(at), :vreg_phys))
+        .Pair(load, a, b, base, mode) -> return pair_text(:load, :a, :b, :base, :mode)
+        .LoadConst(dst, value) -> return load_const_text(dst: phys_of(dst, :vreg_phys), :value)
+        .Intrinsic(_label) -> return insn_text(insn)
+        .Data(text) -> return text
+        .Op(op, a, b, c, d, _flags) -> return op_text(:op, a: phys_of(a, :vreg_phys), b: phys_of(b, :vreg_phys), c: phys_of(c, :vreg_phys), d: phys_of(d, :vreg_phys))
+        .Call(target) -> return f"\tbl {target}"
+        .Branch(kind, reg, target) -> return branch_text(:kind, reg: phys_of(reg, :vreg_phys), :target)
+        .Label(name) -> return name + ":"
+    }
+}
+
+// The physical register a register name stands for at output: a vreg's,
+// `w` form for a `w` vreg, and any other name as it is.
+func phys_of(anon reg: str, vreg_phys: [str]) -> str {
+    let id = regalloc.reg_vreg(reg)
+    if id < 0 or id >= len(vreg_phys) {
+        return reg
+    }
+    let phys = vreg_phys[id]
+    if reg[0] == 'w' {
+        return "w" + phys[1..len(phys)]
+    }
+    return phys
+}
+
+// True if `s` is `\tmov xN, xN` for some register N — the no-op
+// pattern coalescing leaves behind once vDst and vSrc share a phys.
+func is_self_mov(anon s: str) -> bool {
+    let n: int64 = len(s)
+    if n < 8 or s[0] != '\t' or s[1] != 'm' or s[2] != 'o' or s[3] != 'v' or s[4] != ' ' {
+        return false
+    }
+    mut i: int64 = 5
+    // First operand: `xN` or `wN`.
+    if i >= n or (s[i] != 'x' and s[i] != 'w') {
+        return false
+    }
+    let start_a: int64 = i
+    i = i + 1
+    for i < n and lexing.is_digit(s[i]) {
+        i = i + 1
+    }
+    let end_a: int64 = i
+    if i >= n or s[i] != ',' {
+        return false
+    }
+    i = i + 1
+    for i < n and s[i] == ' ' {
+        i = i + 1
+    }
+    // Second operand: same prefix + digits, exact match.
+    if i >= n or (s[i] != 'x' and s[i] != 'w') {
+        return false
+    }
+    let start_b: int64 = i
+    i = i + 1
+    for i < n and lexing.is_digit(s[i]) {
+        i = i + 1
+    }
+    let end_b: int64 = i
+    if i != n {
+        return false
+    }
+    return s[start_a..end_a] == s[start_b..end_b]
+}

@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: proposed. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4 done. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -88,9 +88,15 @@ were.
    The symbol's page (`AddressPage` with an `@PAGE` operand) is still two
    operations and arm64's way of addressing; one `AddressOf(symbol)` is left
    for the second target to need.
-4. **Target-specific passes split out.** Peepholes that are arm64 idioms (`cset`
-   + `cbz` into `b.cond`) move into the arm64 lowering or an arm64 pass;
-   `promote_locals`, copy forwarding and register allocation stay neutral.
+4. **The arm64 lowering in its own module** (done). `stdlib/kod/arm64.kod`
+   holds everything that writes arm64: the mnemonics and condition names, each
+   instruction's text (`format_insn`, given the allocator's vreg-to-register
+   table), the inlined runtime functions, the `mov`/`movk` lines for a large
+   constant or an immediate too big to encode, and `line_count`. `regalloc`
+   holds the IR and the allocator and doesn't import it. Still in codegen and
+   still arm64's: `peephole` (its patterns are neutral, but the immediates it
+   folds are arm64's 12-bit ones) and `long_branches` (arm64's 1 MB branch
+   reach), to move behind the target when a second one exists.
 5. **First optimisation:** explicit `Retain(v)` and `Release(v)` operations, and
    a pass that cancels a retain and release of the same value with nothing
    between them that could free it. Reference counting is about 30% of compile

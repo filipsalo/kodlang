@@ -3,6 +3,7 @@ import "kod/ast"
 import "kod/parsing"
 import "kod/lexing"
 import "kod/regalloc"
+import "kod/arm64"
 import "primitives/format"
 
 // Concrete instantiation of the builtin Map used for string interning.
@@ -516,41 +517,6 @@ type VarSlot = struct {
 // site takes between compiling one expression and the next.
 let EVICT_BELOW: int64 = 6
 
-// Where `#N` starts in an `add`, `sub`, `ldr` or `str` line that can't encode N, or -1.
-func big_immediate_at(anon s: str) -> int64 {
-    if len(s) < 5 {
-        return -1
-    }
-    let op = s[0..5]
-    let is_arith = op == "\tadd " or op == "\tsub "
-    let is_mem = op == "\tldr " or op == "\tstr "
-    if not is_arith and not is_mem {
-        return -1
-    }
-    let at = s.find("#")
-    if at is Some(hash) {
-        mut end = hash + 1
-        mut value = 0
-        // Far past either limit; a longer number needn't be read in full.
-        for end < len(s) and lexing.is_digit(s[end]) {
-            if value < 1000000 {
-                value = value * 10 + s[end] - '0'
-            }
-            end += 1
-        }
-        if end == hash + 1 {
-            return -1
-        }
-        if is_arith and end == len(s) and value > 4095 {
-            return hash
-        }
-        if is_mem and s[end..] == "]" and value > 32760 {
-            return hash
-        }
-    }
-    return -1
-}
-
 type Val = enum {
     VReg(name: str)
     VImm(value: int64)
@@ -656,32 +622,6 @@ func opposite_condition(anon cond: str) -> str {
     }
 }
 
-// The text of a Raw instruction, or "" for a label.
-func insn_text(anon insn: regalloc.Insn) -> str {
-    match insn {
-        .Slot(store, reg, off) -> return regalloc.slot_text(:store, :reg, :off)
-        .Mov(dst, src) -> return f"\tmov {dst}, {src}"
-        .Mem(load, width, reg, base, at) -> return regalloc.mem_text(:load, :width, :reg, :base, :at, index: regalloc.at_reg(at))
-        .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, :a, :b, :c, :d)
-        .Pair(load, a, b, base, mode) -> return regalloc.pair_text(:load, :a, :b, :base, :mode)
-        .LoadConst(dst, value) -> return regalloc.load_const_text(:dst, :value)
-        .Data(text) -> return text
-        .Intrinsic(label) -> {
-            mut text = ""
-            for line in regalloc.arm64_intrinsic(label) {
-                if len(text) > 0 {
-                    text = text + "\n"
-                }
-                text = text + "\t" + line
-            }
-            return text
-        }
-        .Call(target) -> return f"\tbl {target}"
-        .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, :reg, :target)
-        .Label(_name) -> return ""
-    }
-}
-
 // Whether an operand is a single token: no comma, space, bracket or quote.
 func one_token(anon operand: str) -> bool {
     for k in 0..len(operand) {
@@ -698,7 +638,7 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
     match insn {
         .Mov(dst, src) -> return ["mov", dst, src]
         .Op(op, a, b, c, d, _flags) -> {
-            let mn = regalloc.arm64_mnemonic(op)
+            let mn = arm64.arm64_mnemonic(op)
             if len(a) == 0 {
                 return [mn]
             }
@@ -715,7 +655,7 @@ func insn_parts(anon insn: regalloc.Insn) -> [str] {
         }
         .Call(target) -> return ["bl", target]
         .Branch(kind, reg, target) -> {
-            let op = regalloc.branch_mnemonic(kind)
+            let op = arm64.branch_mnemonic(kind)
             if len(reg) == 0 {
                 return [op, target]
             }
@@ -3899,7 +3839,7 @@ type Codegen = struct {
     // register, an immediate, a condition, a symbol), not `x1, lsl #3`.
     func emit_op(self, anon op: regalloc.Opcode, a: str = "", b: str = "", c: str = "", d: str = "") -> none {
         if not one_token(a) or not one_token(b) or not one_token(c) or not one_token(d) {
-            panic(f"compiler bug: an operand of `{regalloc.op_text(:op, :a, :b, :c, :d).trim()}` isn't one token")
+            panic(f"compiler bug: an operand of `{arm64.op_text(:op, :a, :b, :c, :d).trim()}` isn't one token")
         }
         self.push_insn(regalloc.op(op, :a, :b, :c, :d))
     }
@@ -3958,135 +3898,31 @@ type Codegen = struct {
         for insn in self.out_buf {
             if insn is .Intrinsic(label) {
                 // Line by line, as a call's lines were: `mov x0, x0` is no line at all.
-                for line in regalloc.arm64_intrinsic(label) {
+                for line in arm64.arm64_intrinsic(label) {
                     let text = "\t" + line
-                    if not self.is_self_mov(text) {
+                    if not arm64.is_self_mov(text) {
                         print(text)
                     }
                 }
                 continue
             }
-            let s: str = self.format_insn(insn)
+            let s: str = arm64.format_insn(insn, vreg_phys: self.pool.vreg_phys)
             let flags = regalloc.insn_flags(insn)
             // Only a `mov` can be a self-mov; only a flagged line can need splitting.
-            if regalloc.mnemonic_code(flags) == regalloc.MN_MOV and self.is_self_mov(s) {
+            if regalloc.mnemonic_code(flags) == regalloc.MN_MOV and arm64.is_self_mov(s) {
                 continue
             }
             if (flags & regalloc.INFO_BIG_IMM) == 0 {
                 print(s)
             } else {
-                self.print_encodable(s)
+                for line in arm64.encodable_lines(s) {
+                    print(line)
+                }
             }
         }
         self.out_buf = []
         // A mark into the old buffer would match a call at that length in the new one.
         self.rc_ctor_mark = -1
-    }
-
-    // `add`, `sub`, `ldr` and `str` with an immediate too big to encode go
-    // through x16, which holds nothing between instructions of this kind.
-    func print_encodable(self, anon s: str) -> none {
-        let at = big_immediate_at(s)
-        if at < 0 {
-            print(s)
-            return
-        }
-        mut end = at + 1
-        for end < len(s) and lexing.is_digit(s[end]) {
-            end += 1
-        }
-        let value = s[at + 1..end]
-        print(f"\tmov x16, #({value} & 0xffff)")
-        print(f"\tmovk x16, #(({value} >> 16) & 0xffff), lsl #16")
-        print(f"\tmovk x16, #(({value} >> 32) & 0xffff), lsl #32")
-        print(s[0..at] + "x16" + s[end..])
-    }
-
-    // Format an `Insn` to its asm text.
-    func format_insn(self, anon insn: regalloc.Insn) -> str {
-        match insn {
-            .Slot(store, reg, off) -> return regalloc.slot_text(:store, reg: self.phys_of(reg), :off)
-            .Mov(dst, src) -> return f"\tmov {self.phys_of(dst)}, {self.phys_of(src)}"
-            .Mem(load, width, reg, base, at) -> return regalloc.mem_text(:load, :width, reg: self.phys_of(reg), base: self.phys_of(base), :at, index: self.phys_of(regalloc.at_reg(at)))
-            .Pair(load, a, b, base, mode) -> return regalloc.pair_text(:load, :a, :b, :base, :mode)
-            .LoadConst(dst, value) -> return regalloc.load_const_text(dst: self.phys_of(dst), :value)
-            .Intrinsic(_label) -> return insn_text(insn)
-            .Data(text) -> return text
-            .Op(op, a, b, c, d, _flags) -> return regalloc.op_text(:op, a: self.phys_of(a), b: self.phys_of(b), c: self.phys_of(c), d: self.phys_of(d))
-            .Call(target) -> return f"\tbl {target}"
-            .Branch(kind, reg, target) -> return regalloc.branch_text(:kind, reg: self.phys_of(reg), :target)
-            .Label(name) -> return name + ":"
-        }
-    }
-
-    // True if `s` is `\tmov xN, xN` for some register N — the no-op
-    // pattern coalescing leaves behind once vDst and vSrc share a phys.
-    func is_self_mov(self, anon s: str) -> bool {
-        let n: int64 = len(s)
-        if n < 8 or s[0] != '\t' or s[1] != 'm' or s[2] != 'o' or s[3] != 'v' or s[4] != ' ' {
-            return false
-        }
-        mut i: int64 = 5
-        // First operand: `xN` or `wN`.
-        if i >= n or (s[i] != 'x' and s[i] != 'w') {
-            return false
-        }
-        let start_a: int64 = i
-        i = i + 1
-        for i < n and lexing.is_digit(s[i]) {
-            i = i + 1
-        }
-        let end_a: int64 = i
-        if i >= n or s[i] != ',' {
-            return false
-        }
-        i = i + 1
-        for i < n and s[i] == ' ' {
-            i = i + 1
-        }
-        // Second operand: same prefix + digits, exact match.
-        if i >= n or (s[i] != 'x' and s[i] != 'w') {
-            return false
-        }
-        let start_b: int64 = i
-        i = i + 1
-        for i < n and lexing.is_digit(s[i]) {
-            i = i + 1
-        }
-        let end_b: int64 = i
-        if i != n {
-            return false
-        }
-        return s[start_a..end_a] == s[start_b..end_b]
-    }
-
-    // Walk `text` and replace every `v<digits>` (or `w<digits>`) token
-    // with the physical register recorded in `vreg_phys`. A token is a
-    // `v`/`w` followed by one or more digits, with no symbol character
-    // (`regalloc.is_sym_char`) on either side; runs that land inside a
-    // longer identifier or mangled label (`Lv1_end`, `$main$v2`) are
-    // left alone, and so is anything inside double quotes (`.asciz`
-    // string data).
-    //
-    // The output is built by concatenating verbatim chunks of `text`
-    // around the substitution sites — O(n) per line, vs the char-by-char
-    // accumulator pattern's O(n²). `flush_start` marks the beginning of
-    // the next pending chunk; whenever we replace a vreg, we append
-    // `text[flush_start..vreg_start]` followed by the substitution and
-    // advance `flush_start` past the vreg. Lines with no substitutions
-    // return the original `text` unchanged.
-    // The physical register a register name stands for at output: a vreg's,
-    // `w` form for a `w` vreg, and any other name as it is.
-    func phys_of(self, anon reg: str) -> str {
-        let id = regalloc.reg_vreg(reg)
-        if id < 0 or id >= len(self.pool.vreg_phys) {
-            return reg
-        }
-        let phys = self.pool.vreg_phys[id]
-        if reg[0] == 'w' {
-            return "w" + phys[1..len(phys)]
-        }
-        return phys
     }
 
     func emit_label(self, anon lbl: str) -> none {
@@ -13540,7 +13376,7 @@ type Codegen = struct {
                 return inlined
             }
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
-            if regalloc.is_intrinsic(ifn.label) {
+            if arm64.is_intrinsic(ifn.label) {
                 self.push_insn(.Intrinsic(label: ifn.label))
                 return .VReg(name: "x0")
             }
@@ -13854,7 +13690,7 @@ type Codegen = struct {
                         self.emit_bytes_le64()
                         return .VReg(name: "x0")
                     }
-                    if regalloc.is_intrinsic(self.fn_label(slot)) {
+                    if arm64.is_intrinsic(self.fn_label(slot)) {
                         self.push_insn(.Intrinsic(label: self.fn_label(slot)))
                         return .VReg(name: "x0")
                     }
@@ -14363,7 +14199,7 @@ type Codegen = struct {
             k = k + 1
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
-        if regalloc.is_intrinsic(method_lbl) {
+        if arm64.is_intrinsic(method_lbl) {
             self.push_insn(.Intrinsic(label: method_lbl))
             return .VReg(name: "x0")
         }
@@ -18415,7 +18251,7 @@ type Codegen = struct {
                 let b = insn_parts(body[i + 1])
                 let v = a[1]
                 if len(b) == 4 and (b[0] == "add" or b[0] == "sub") and b[3] == v and b[2] != v and b[2] != "xzr" {
-                    out += [regalloc.op(must regalloc.opcode_named(b[0]), a: b[1], b: b[2], c: a[2])]
+                    out += [regalloc.op(must arm64.opcode_named(b[0]), a: b[1], b: b[2], c: a[2])]
                     i += 2
                     continue
                 }
@@ -18444,7 +18280,7 @@ type Codegen = struct {
     // many slots as fit, most used first: when the registers run out, half as
     // many. [] when none can be, and the caller allocates `body` as it was.
     func promote_locals(self, anon body: [regalloc.Insn], vreg_start: int64, excluded: [int64]) -> [regalloc.Insn] {
-        if self.pool.evicted or regalloc.line_count(body) > PROMOTE_MAX_INSNS {
+        if self.pool.evicted or arm64.line_count(body) > PROMOTE_MAX_INSNS {
             return []
         }
         // Each slot's offset and how often it's loaded or stored.
@@ -18475,7 +18311,7 @@ type Codegen = struct {
                     i += 1
                     continue
                 }
-                if is_frame_link(insn_text(body[i])) {
+                if is_frame_link(arm64.insn_text(body[i])) {
                     i += 1
                     continue
                 }
@@ -19908,7 +19744,7 @@ type Codegen = struct {
             rc_k = rc_k + 1
         }
         mut body_insns = body_buf
-        if regalloc.line_count(body_insns) > LONG_BODY_INSNS {
+        if arm64.line_count(body_insns) > LONG_BODY_INSNS {
             body_insns = self.long_branches(body_insns)
         }
         for line in body_insns {
