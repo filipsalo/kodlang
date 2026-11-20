@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: steps 1–4 done. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -97,17 +97,50 @@ were.
    still arm64's: `peephole` (its patterns are neutral, but the immediates it
    folds are arm64's 12-bit ones) and `long_branches` (arm64's 1 MB branch
    reach), to move behind the target when a second one exists.
-5. **First optimisation:** explicit `Retain(v)` and `Release(v)` operations, and
-   a pass that cancels a retain and release of the same value with nothing
-   between them that could free it. Reference counting is about 30% of compile
-   time; the generated code for `codegen.kod` has about 5,000 retain and 14,000
-   release sites. Measured on the benchmarks before and after.
-6. **Then, as needed:** constant folding, redundant-load elimination, dead stores;
-   an x86-64 lowering (see the parked assessment: register pools, calling
-   convention, runtime stubs, symbol names).
+5. **Retain and release cancelling** (measured, dropped). The plan was explicit
+   `Retain(v)` and `Release(v)` operations and a pass cancelling a retain and a
+   release of the same value with nothing between them that could free it.
+   There are none to cancel: each retain copies a borrowed reference into a
+   place that owns it (a local's slot, 58%, or a field or element, 33%), and its
+   release comes much later, when the slot is overwritten or goes out of scope.
+   Nor would it pay much: compiling `codegen.kod` runs 46M retains and 50M
+   releases, and with both stubs reduced to a `ret` the compile is only 5%
+   faster. Most of what reference counting costs is allocating and freeing.
+6. **Measured first.** Counting how often each basic block runs, on the
+   compiler compiling `codegen.kod` and on the benchmarks, gives each candidate
+   as a share of the instructions executed (an upper bound on the time saved:
+   a 12% drop in instructions made `loop` 2% faster):
 
-Steps 1–4 are the bulk of the work and change nothing a program does; step 5 is
-the first that does, and is where the IR starts paying for itself.
+    | Candidate | compiler | sieve | qsort | inflate |
+    |---|---|---|---|---|
+    | Loads a loop can't change | 1.5–3.6% | 14% | 8.6–16% | 1.3–7.4% |
+    | Register copies | 14% | 26% | 16% | 20% |
+    | Bounds checks run | 2.3% | 4.7% | 7.6% | 3.9% |
+    | Redundant loads within a block | 1.8% | 1.4% | 0.9% | 1.0% |
+    | Dead stores, constant folding | <0.5% | 0 | 0 | 0.2% |
+
+   Done from it: a frame over 256 bytes is addressed from its bottom in x28,
+   one instruction per slot instead of three (5% of the compiler's
+   instructions), and a large constant skips the `movk` of a zero part.
+7. **Loop-invariant loads** (tried, not landed; branch `ir-hoist-loads`). After
+   register allocation, a load in an innermost loop moves to just before the
+   loop's top label when the loop is entered only there, its address doesn't
+   change in the loop (a frame slot it doesn't store to; a heap address whose
+   base it doesn't change, in a loop with no call and no heap store), a heap
+   load's base is one the loop's top already reads through (so it isn't read
+   early past a check for `none`), and the function leaves a register free for
+   it (callee-saved when the loop makes a call). The load in the loop becomes a
+   copy from that register. Done before allocation instead, the moved loads
+   took registers from promoted locals, which then went back to memory.
+   It made qsort and words about 2% faster and nothing else measurably, while
+   the pass cost 6% of compile time: the safe rules leave most of the loads
+   counted above in place (most hot loops store to the heap), and fewer
+   instructions buy less time than they suggest. Not worth it as it stands.
+   Register copies are the largest category but the least certain win (Apple's
+   cores eliminate most of them when renaming), so they wait for a timed
+   experiment.
+8. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+   pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions
 
