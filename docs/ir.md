@@ -137,8 +137,19 @@ were.
    counted above in place (most hot loops store to the heap), and fewer
    instructions buy less time than they suggest. Not worth it as it stands.
    Register copies are the largest category but the least certain win (Apple's
-   cores eliminate most of them when renaming), so they wait for a timed
-   experiment.
+   cores eliminate most of them when renaming), so they were timed first, on
+   hand-edited output of the hottest loops of sieve and qsort:
+
+    | Hand edit | sieve | qsort |
+    |---|---|---|
+    | Copies removed (4 of 13 and 2 of 13 instructions) | −0.3% | −0.8% |
+    | Bounds checks also removed (length load, compare, branch) | −6.1% | −6.2% |
+
+   Copies cost next to nothing, so coalescing them isn't worth a pass. Bounds
+   checks cost a few percent where a hot loop indexes an array, but removing
+   one needs a proof that the index is in range, which neither of these loops
+   gives (`j <= n` against a length built by appends; `i`/`j` moved by the
+   comparisons).
 8. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
