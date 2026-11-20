@@ -79,6 +79,133 @@ func full_pool() -> [str] {
     return pool
 }
 
+// A register or other operand of an instruction (docs/ir.md, step 8): 4n+1
+// is vreg n (`v12`), 4n+2 its 32-bit form (`w12`), 4n+3 the immediate `#n`,
+// and 4k the kth of NAMES. 0 is none.
+type Reg = int64
+
+let NO_REG: Reg = 0
+// x0 to x30 are names 1 to 31, then fp, lr, sp, xzr.
+let X0: Reg = 4
+let X16: Reg = 68
+let X28: Reg = 116
+let FP: Reg = 128
+let LR: Reg = 132
+let SP: Reg = 136
+let XZR: Reg = 140
+
+// The text of each named operand, by number.
+mut NAMES: [str] = first_names()
+// The number of each of NAMES.
+mut NAME_IDS: Map[str, int64] = name_ids()
+
+func first_names() -> [str] {
+    mut names: [str] = [""]
+    for n in 0..31 {
+        names += [f"x{n}"]
+    }
+    names += ["fp", "lr", "sp", "xzr"]
+    return names
+}
+
+func name_ids() -> Map[str, int64] {
+    let ids = Map[str, int64]()
+    for k, name in NAMES {
+        ids[name] = k
+    }
+    return ids
+}
+
+// Vreg `id`, and its 32-bit form.
+func vreg(anon id: int64) -> Reg {
+    return id * 4 + 1
+}
+
+func wvreg(anon id: int64) -> Reg {
+    return id * 4 + 2
+}
+
+// The immediate `#value`, for 0 <= value.
+func imm(anon value: int64) -> Reg {
+    return value * 4 + 3
+}
+
+// The Reg for an operand as codegen writes it: `v12`, `w12`, `x3`, `#8`, `fp`, `eq`, ...
+func reg_of(anon text: str) -> Reg {
+    let n = len(text)
+    if n == 0 {
+        return NO_REG
+    }
+    let c = text[0]
+    if n >= 2 and n <= 11 and (c == 'v' or c == 'w' or c == 'x' or c == '#') and (text[1] != '0' or n == 2) {
+        mut v: int64 = 0
+        mut digits = true
+        for k in 1..n {
+            let d = text[k]
+            if d < '0' or d > '9' {
+                digits = false
+                break
+            }
+            v = v * 10 + d - '0'
+        }
+        if digits {
+            if c == 'v' {
+                return v * 4 + 1
+            }
+            if c == 'w' {
+                return v * 4 + 2
+            }
+            if c == '#' {
+                return v * 4 + 3
+            }
+            if v <= 30 {
+                return (v + 1) * 4
+            }
+        }
+    }
+    if text == "fp" {
+        return FP
+    }
+    if text == "sp" {
+        return SP
+    }
+    return named(text)
+}
+
+// The number of `text` among NAMES, added if it isn't one yet.
+func named(anon text: str) -> Reg {
+    if NAME_IDS.get(text) is Some(k) {
+        return k * 4
+    }
+    let k = len(NAMES)
+    NAMES += [text]
+    NAME_IDS[text] = k
+    return k * 4
+}
+
+// An operand's text, as reg_of read it (a vreg as itself, not its register).
+func reg_text(anon r: Reg) -> str {
+    match r & 3 {
+        1 -> return f"v{r >> 2}"
+        2 -> return f"w{r >> 2}"
+        3 -> return f"#{r >> 2}"
+        else return NAMES[r >> 2]
+    }
+}
+
+// The value of an immediate operand, or -1 for any other.
+func imm_value(anon r: Reg) -> int64 {
+    if (r & 3) == 3 {
+        return r >> 2
+    }
+    return -1
+}
+
+// Whether `r` is an x vreg or one of x0 to x30.
+func is_plain(anon r: Reg) -> bool {
+    return (r & 3) == 1 or ((r & 3) == 0 and r >= X0 and r <= 124)
+}
+
 // One instruction of a function's buffer, the compiler's low-level IR (see
 // docs/ir.md): operations on vregs (`v12`, or `w12` for its 32-bit form) and
 // the registers codegen names by their arm64 roles. Codegen's arm64 lowering
@@ -88,13 +215,13 @@ type Insn = enum {
     // `ldr reg, [fp, #off]` (`[fp]` for off 0 or more), or `str` with
     // `store`, made without text: see `slot_text`. `reg` is a vreg (`v12`)
     // or a physical register.
-    Slot(store: bool, reg: str, off: int64)
+    Slot(store: bool, reg: Reg, off: int64)
     // `mov dst, src` between registers (vregs or physical), made without text.
-    Mov(dst: str, src: str)
+    Mov(dst: Reg, src: Reg)
     // A load into `reg` (or a store of it) of `width` bytes (1, 2, 4 or 8) at
     // the address `base` and `at` make. A 4-byte one has a `w` register, as
     // arm64 writes it.
-    Mem(load: bool, width: int64, reg: str, base: str, at: MemAt)
+    Mem(load: bool, width: int64, reg: Reg, base: Reg, at: MemAt)
     // A line that isn't an instruction: a directive, or a label of data.
     // Nothing reads it but the output.
     Data(text: str)
@@ -104,18 +231,18 @@ type Insn = enum {
     Intrinsic(label: str)
     // `dst` gets a constant too big for one move: on arm64 a `mov` and three
     // `movk`s, which LOAD_CONST_LINES counts.
-    LoadConst(dst: str, value: int64)
+    LoadConst(dst: Reg, value: int64)
     // A load into (or a store of) two registers at once, at `base` per `mode`.
-    Pair(load: bool, a: str, b: str, base: str, mode: PairMode)
-    // `mn a, b, c, d` with the operands given (up to the first ""): each a
+    Pair(load: bool, a: Reg, b: Reg, base: Reg, mode: PairMode)
+    // `mn a, b, c, d` with the operands given (up to the first NO_REG): each a
     // register, an immediate, a condition or a symbol, never more than one
     // token (see codegen's emit_op).
-    Op(op: Opcode, a: str, b: str, c: str, d: str, flags: int64)
+    Op(op: Opcode, a: Reg, b: Reg, c: Reg, d: Reg, flags: int64)
     // `bl target`.
     Call(target: str)
     // A jump to `target`, when `kind` says; `reg` is the register tested by
-    // `IfZero` and `IfNonzero`, "" for the others.
-    Branch(kind: BranchKind, reg: str, target: str)
+    // `IfZero` and `IfNonzero`, NO_REG for the others.
+    Branch(kind: BranchKind, reg: Reg, target: str)
 }
 
 // A condition on the flags a compare sets.
@@ -195,7 +322,7 @@ type MemAt = enum {
     // At the base plus `off`.
     Offset(off: int64)
     // At the base plus the register `reg`.
-    Index(reg: str)
+    Index(reg: Reg)
     // At the base plus a symbol's offset in its page (`got`: of its entry in
     // the global offset table), with the base the page an AddressPage gave.
     Symbol(name: str, got: bool)
@@ -244,17 +371,17 @@ func same_at(anon a: MemAt, anon b: MemAt) -> bool {
     }
 }
 
-// The index register of a `MemAt`, or "".
-func at_reg(anon at: MemAt) -> str {
+// The index register of a `MemAt`, or NO_REG.
+func at_reg(anon at: MemAt) -> Reg {
     if at is .Index(reg) {
         return reg
     }
-    return ""
+    return NO_REG
 }
 
 // The width of a 4- or 8-byte load or store of `reg`: 4 for a `w` register.
-func reg_width(anon reg: str) -> int64 {
-    if len(reg) > 0 and reg[0] == 'w' {
+func reg_width(anon reg: Reg) -> int64 {
+    if (reg & 3) == 2 or ((reg & 3) == 0 and reg > XZR and NAMES[reg >> 2][0] == 'w') {
         return 4
     }
     return 8
@@ -329,26 +456,23 @@ func reads_first_op(anon op: Opcode) -> bool {
 }
 
 // An `Op`, with its flags worked out once.
-func op(anon op: Opcode, a: str = "", b: str = "", c: str = "", d: str = "") -> Insn {
+func op(anon op: Opcode, a: Reg = NO_REG, b: Reg = NO_REG, c: Reg = NO_REG, d: Reg = NO_REG) -> Insn {
     return .Op(:op, :a, :b, :c, :d, flags: op_flags(:op, :a, :b, :c, :d))
 }
 
 // The flags one operand of an `Op` adds.
-func operand_flags(anon operand: str) -> int64 {
-    if len(operand) < 2 {
-        return 0
-    }
+func operand_flags(anon operand: Reg) -> int64 {
     if reg_clobbers(operand) {
         return INFO_CLOBBERS
     }
-    if operand == "fp" {
+    if operand == FP {
         return INFO_FP
     }
     return 0
 }
 
 // insn_flags of an `Op`.
-func op_flags(op: Opcode, a: str, b: str, c: str, d: str) -> int64 {
+func op_flags(op: Opcode, a: Reg, b: Reg, c: Reg, d: Reg) -> int64 {
     mut flags: int64 = 0
     match op {
         .Move -> flags = MN_MOV << 8
@@ -360,52 +484,24 @@ func op_flags(op: Opcode, a: str, b: str, c: str, d: str) -> int64 {
     }
     flags = flags | operand_flags(a) | operand_flags(b) | operand_flags(c) | operand_flags(d)
     // An immediate add or sub can't encode past 4095 (codegen's big_immediate_at).
-    if (op is .Add or op is .Sub) and len(d) == 0 and len(c) > 1 and c[0] == '#' {
-        let value = parse_number(c[1..len(c)])
-        if value > 4095 {
-            flags = flags | INFO_BIG_IMM
-        }
+    if (op is .Add or op is .Sub) and d == NO_REG and imm_value(c) > 4095 {
+        flags = flags | INFO_BIG_IMM
     }
     return flags
 }
 
-// The vreg `reg` names (`v12` or `w12`), or -1 for a physical register.
-func reg_vreg(anon reg: str) -> int64 {
-    let n = len(reg)
-    if n < 2 or (reg[0] != 'v' and reg[0] != 'w') {
-        return -1
+// The vreg `reg` is (`v12` or `w12`), or -1 for any other operand.
+func reg_vreg(anon reg: Reg) -> int64 {
+    let tag = reg & 3
+    if tag == 1 or tag == 2 {
+        return reg >> 2
     }
-    mut id: int64 = 0
-    for k in 1..n {
-        if not lexing.is_digit(reg[k]) {
-            return -1
-        }
-        id = id * 10 + reg[k] - '0'
-    }
-    return id
+    return -1
 }
 
 // Whether `reg` is one of x8–x15, which an instruction naming counts as a clobber.
-func reg_clobbers(anon reg: str) -> bool {
-    if len(reg) < 2 or reg[0] != 'x' {
-        return false
-    }
-    let num = parse_number(reg[1..len(reg)])
-    return num >= 8 and num <= 15
-}
-
-func parse_number(anon s: str) -> int64 {
-    if len(s) == 0 {
-        return -1
-    }
-    mut v: int64 = 0
-    for k in 0..len(s) {
-        if not lexing.is_digit(s[k]) {
-            return -1
-        }
-        v = v * 10 + s[k] - '0'
-    }
-    return v
+func reg_clobbers(anon reg: Reg) -> bool {
+    return (reg & 3) == 0 and reg >= 36 and reg <= 64
 }
 
 // insn_flags of an instruction that calls something or names a caller-saved register outright.
@@ -435,10 +531,10 @@ func mnemonic_code(anon flags: int64) -> int64 {
 func names_fp(anon insn: Insn) -> bool {
     match insn {
         .Slot(_store, _reg, _off) -> return true
-        .Mov(dst, src) -> return dst == "fp" or src == "fp"
-        .Mem(_load, _width, reg, base, at) -> return reg == "fp" or base == "fp" or at_reg(at) == "fp"
+        .Mov(dst, src) -> return dst == FP or src == FP
+        .Mem(_load, _width, reg, base, at) -> return reg == FP or base == FP or at_reg(at) == FP
         .Op(_op, _a, _b, _c, _d, flags) -> return (flags & INFO_FP) != 0
-        .Pair(_load, a, b, base, _mode) -> return a == "fp" or b == "fp" or base == "fp"
+        .Pair(_load, a, b, base, _mode) -> return a == FP or b == FP or base == FP
         .Intrinsic(label) -> return (intrinsic_flags(label) & INFO_FP) != 0
         else return false
     }
@@ -463,7 +559,7 @@ func insn_flags(anon insn: Insn) -> int64 {
             if reg_clobbers(dst) or reg_clobbers(src) {
                 flags = flags | INFO_CLOBBERS
             }
-            if dst == "fp" or src == "fp" {
+            if dst == FP or src == FP {
                 flags = flags | INFO_FP
             }
             return flags
@@ -481,7 +577,7 @@ func insn_flags(anon insn: Insn) -> int64 {
             if reg_clobbers(reg) or reg_clobbers(base) or reg_clobbers(index) {
                 flags = flags | INFO_CLOBBERS
             }
-            if reg == "fp" or base == "fp" or index == "fp" {
+            if reg == FP or base == FP or index == FP {
                 flags = flags | INFO_FP
             }
             // As codegen's big_immediate_at reads `[base, #off]`.
@@ -505,7 +601,7 @@ func insn_flags(anon insn: Insn) -> int64 {
             if reg_clobbers(a) or reg_clobbers(b) {
                 flags = INFO_CLOBBERS
             }
-            if a == "fp" or b == "fp" or base == "fp" {
+            if a == FP or b == FP or base == FP {
                 flags = flags | INFO_FP
             }
             return flags
@@ -731,10 +827,7 @@ func never_returns(anon target: str) -> bool {
 
 // How many times each of the function's vregs (ids vreg_start up to
 // vreg_start + n_local) is named in `body`, as a def or a use.
-func count_operand(anon operand: str, counts: [int64], vreg_start: int64, n_local: int64) -> none {
-    if len(operand) < 2 {
-        return
-    }
+func count_operand(anon operand: Reg, counts: [int64], vreg_start: int64, n_local: int64) -> none {
     let id = reg_vreg(operand)
     if id >= vreg_start and id < vreg_start + n_local {
         counts[id - vreg_start] += 1
@@ -776,10 +869,7 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
 
 // An `Op` operand's part in the liveness `run` works out: first named, defined
 // (when `written`), last used.
-func note_operand(anon operand: str, written: bool, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64], first: [int64]) -> none {
-    if len(operand) < 2 {
-        return
-    }
+func note_operand(anon operand: Reg, written: bool, line_idx: int64, vreg_start: int64, n_local: int64, def_line: [int64], last_use: [int64], first: [int64]) -> none {
     let id = reg_vreg(operand)
     if id < vreg_start or id >= vreg_start + n_local {
         return

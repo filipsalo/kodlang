@@ -158,7 +158,18 @@ were.
    check costs in the timed loops, removing all of them would save about 2.5%
    of the compile, and the provable fifth about 0.5%; the hot checks of the
    benchmarks are none of these. Not worth a pass for now.
-8. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+8. **Registers as numbers.** An instruction's registers and `Op` operands are a
+   `regalloc.Reg`, an int64, instead of text: `4n+1` is vreg `n` (`v12`),
+   `4n+2` its 32-bit form (`w12`), `4n+3` the immediate `#n`, and `4k` the
+   `k`th name of a table (`regalloc.NAMES`): 0 is none, `x0`–`x30`, `fp`,
+   `lr`, `sp` and `xzr` come first, and any other operand (a condition, a
+   symbol's page, a negative immediate) is added the first time it's named.
+   Codegen still names registers as text: its `emit_` functions turn each into
+   a `Reg` once (`regalloc.reg_of`), so the passes compare numbers instead of
+   parsing names, and nothing in an instruction is counted. The output turns
+   them back (`regalloc.reg_text`, `arm64.phys_of`). Labels, call targets,
+   symbols in an address and directives stay text.
+9. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions
