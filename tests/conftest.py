@@ -21,6 +21,11 @@ TEST_SUPPORT_USERS = {
     "stdlib/kod/match_exhaustiveness_test.kod",
 }
 
+# Groups and tests that take seconds, started first so that the parallel pass
+# does not end waiting on one that started late.
+SLOW_GROUPS = {"test_support", "http_client_test"}
+SLOW_TESTS = {"test_selfhost_fixed_point"}
+
 # Modules whose tests all build the same program.
 SHARED_PROGRAM = {
     "lsp_test.py": "lsp",
@@ -59,6 +64,11 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         group = build_group(item)
         if group is not None:
             item.add_marker(pytest.mark.xdist_group(group))
+    items.sort(key=lambda item: not is_slow(item))
+
+
+def is_slow(item: pytest.Item) -> bool:
+    return build_group(item) in SLOW_GROUPS or item.originalname in SLOW_TESTS
 
 
 @pytest.fixture(scope="session")
