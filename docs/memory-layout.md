@@ -176,6 +176,10 @@ two after that.
 - A function borrows its parameters: a parameter costs nothing unless the body
   assigns to it. So that what it borrows can't go away, a caller holds a value it
   read from a field or element for the length of the statement.
+- A pattern borrows what it binds from an enum's payload when the subject is a
+  variable the function never assigns to: the subject keeps the payload alive for
+  as long as the binding can be used. A binding that shares its slot with one the
+  function owns (the same name bound another way, or assigned to) is owned too.
 - A function releases its variables when it returns.
 
 `retain` and `release` are calls with the object in `x17`, to `_rc_retain_stub` and

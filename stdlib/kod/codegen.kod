@@ -499,6 +499,15 @@ type LitEnv = struct {
     kinds: [TypeKind] = []
 }
 
+// A pattern binding stored without counting (borrow_payload): its slot, the
+// register it was stored from, and the label marking the store, so that
+// settle_borrows can count it after all if something else makes the slot owned.
+type BorrowMark = struct {
+    offset: int64
+    reg: str
+    label: str
+}
+
 type VarSlot = struct {
     name: str
     offset: int64
@@ -1165,6 +1174,12 @@ type Codegen = struct {
     rc_pending_slot: int64 = 0
     // The frame offsets of this function's parameters: they hold a value on entry.
     rc_param_offs: [int64] = []
+    // The names this function assigns to (`=`, `+=`, `-=`), from collect_stmt_vars.
+    assigned_names: [str] = []
+    // Pattern bindings stored without counting, for settle_borrows.
+    borrow_marks: [BorrowMark] = []
+    // Set around an emit_variant_test whose bindings may borrow (borrow_payload).
+    borrow_bindings: bool = false
     // Slot descriptors for objects too big for the mask in their header.
     rc_descs: [RcDesc] = []
     // The functions used as values that have a cell in the data section so far.
@@ -9902,6 +9917,66 @@ type Codegen = struct {
         return .KUnknown
     }
 
+    // Notes the variable an assignment's left side names, if it is one.
+    func note_assigned(self, anon lhs: int64) -> none {
+        if self.p.exprs[lhs] is .Ident(name) and not arrays.contains(self.assigned_names, name) {
+            self.assigned_names += [name]
+        }
+    }
+
+    // Whether a pattern on `subject_id` can borrow what it binds from the
+    // payload: the subject is a variable the function never assigns to, so it
+    // keeps the payload alive while the bindings can be used.
+    func borrow_payload(self, anon subject_id: int64) -> bool {
+        if self.inline_depth > 0 or self.dry_run {
+            return false
+        }
+        if self.p.exprs[subject_id] is .Ident(name) {
+            return self.find_var_offset(name) != -9999 and not arrays.contains(self.assigned_names, name)
+        }
+        return false
+    }
+
+    // Counts each borrowed binding whose slot ended up owned after all (the
+    // same name bound another way, or assigned to), and drops the marks.
+    func settle_borrows(self) -> none {
+        if len(self.borrow_marks) == 0 {
+            return
+        }
+        mut owned: [BorrowMark] = []
+        for m in self.borrow_marks {
+            if arrays.contains(self.rc_slots, m.offset) {
+                owned += [m]
+            }
+        }
+        let body = self.out_buf
+        mut out: [regalloc.Insn] = []
+        for insn in body {
+            if insn is .Label(name) and name.starts_with("Lborrow$") {
+                for m in owned {
+                    if m.label == name {
+                        // The store before the mark, counted as emit_str counts it.
+                        out = out[0..len(out) - 1]
+                        self.out_buf = []
+                        self.emit_mov("x17", src: m.reg)
+                        self.emit_call("_rc_retain_stub")
+                        self.emit_ldr(m.offset, reg: "x17")
+                        self.emit_str_raw(m.offset, reg: m.reg)
+                        self.rc_release_x17()
+                        for counted in self.out_buf {
+                            out += [counted]
+                        }
+                    }
+                }
+                continue
+            }
+            out += [insn]
+        }
+        self.out_buf = out
+        self.rc_ctor_mark = -1
+        self.borrow_marks = []
+    }
+
     func collect_stmt_vars(self, stmt_id: int64) -> none {
         self.shadow_collecting += 1
         self.collect_stmt_vars_now(:stmt_id)
@@ -9930,14 +10005,17 @@ type Codegen = struct {
                 self.collect_expr_vars(value)
             }
             .Assign(lhs, rhs) -> {
+                self.note_assigned(lhs)
                 self.collect_expr_vars(rhs)
                 self.collect_expr_vars(lhs)
             }
             .PlusAssign(lhs, rhs) -> {
+                self.note_assigned(lhs)
                 self.collect_expr_vars(rhs)
                 self.collect_expr_vars(lhs)
             }
             .MinusAssign(lhs, rhs) -> {
+                self.note_assigned(lhs)
                 self.collect_expr_vars(rhs)
                 self.collect_expr_vars(lhs)
             }
@@ -11421,7 +11499,14 @@ type Codegen = struct {
             self.emit_ldr(subj_slot, reg: ptr_r)
             let fv_r = self.pool.alloc_reg()
             self.emit_load(fv_r, base: ptr_r, off: 8 + foff)
-            self.emit_str(binding_off, reg: fv_r)
+            if self.borrow_bindings and self.rc_heap_kind(self.find_var_kind(binding)) and not arrays.contains(self.assigned_names, binding) and not arrays.contains(self.rc_slots, binding_off) {
+                self.emit_str_raw(binding_off, reg: fv_r)
+                let mark = self.fresh("Lborrow")
+                self.out_buf += [regalloc.Insn.Label(name: mark)]
+                self.borrow_marks += [BorrowMark(offset: binding_off, reg: fv_r, label: mark)]
+            } else {
+                self.emit_str(binding_off, reg: fv_r)
+            }
             self.pool.free_reg(fv_r)
             self.pool.free_reg(ptr_r)
             key_idx = key_idx + 1
@@ -14792,13 +14877,17 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
+                    self.borrow_bindings = self.borrow_payload(subject_id)
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
+                    self.borrow_bindings = false
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
+                    self.borrow_bindings = self.borrow_payload(subject_id)
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
+                    self.borrow_bindings = false
                     self.compile_arm_value(arm, tests: ArmTests(subject_kind: subj_kind, :subject_id, :skip_lbl), :expected, :ok_wrap, :result_r)
                     self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
@@ -19429,13 +19518,17 @@ type Codegen = struct {
                     self.emit_label(skip_lbl)
                 }
                 .EnumPat(_enum_name, _variant_name, _bindings) -> {
+                    self.borrow_bindings = self.borrow_payload(subject_id)
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
+                    self.borrow_bindings = false
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
                 }
                 .ImplicitEnumPat(_variant_name, _bindings) -> {
+                    self.borrow_bindings = self.borrow_payload(subject_id)
                     self.emit_variant_test(self.p.patterns[arm.pattern], :subj_enum_idx, :disc_r, :subj_slot, :skip_lbl, span: self.p.expr_spans[subject_id], subject_kind: subj_kind)
+                    self.borrow_bindings = false
                     self.compile_arm_stmts(arm, subject_kind: subj_kind, :subject_id, :skip_lbl)
                     self.emit_jump(done_lbl)
                     self.emit_label(skip_lbl)
@@ -19572,6 +19665,8 @@ type Codegen = struct {
         self.rc_let_off = 0
         self.rc_pending = false
         self.rc_param_offs = []
+        self.assigned_names = []
+        self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
         self.evictions = []
@@ -19691,6 +19786,7 @@ type Codegen = struct {
             self.emit_ldr(slot, reg: "x17")
             self.rc_release_x17()
         }
+        self.settle_borrows()
         // From fp: a `try` inside a pushed region branches here with sp still lowered.
         self.emit_mov("sp", src: "fp")
         self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
