@@ -183,9 +183,22 @@ were.
    writes that, with the instruction as a comment; anything with a label or
    a symbol, and any form `encode` doesn't know, stays text.
    `asm_diff.py --objects` checks the result: every object file in the
-   corpus must have the same bytes as when the text is assembled. Writing
-   the object file without `as` (branches, labels, relocations, the line
-   tables) comes after, if what is left of `as` is worth it.
+   corpus must have the same bytes as when the text is assembled.
+
+   Then the object file without `as`: `kod/macho` reads the compiler's
+   output (labels, the directives it writes, `.inst` words, and the
+   instructions that name a label or a symbol) and writes a Mach-O object
+   itself, in the compiler's own process, when `link.cfg` says `AS := kod`.
+   What it writes is laid out more plainly than clang's (symbols grouped and
+   sorted, data that points at a temporary label relocated against its
+   section), so the check is by meaning, not bytes: `tools/as_diff.py`
+   assembles every file of the corpus both ways and compares each section's
+   bytes with the relocated fields cleared, each relocation's place, kind and
+   target, and the symbols. Every instruction reaches it as a word except
+   those, so the compiler writes the words of large constants and inlined
+   functions too (`arm64.encode_text` encodes an instruction given as text).
+   The Makefile keeps clang's assembler, since it runs before any compiler of
+   this tree exists.
 10. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
