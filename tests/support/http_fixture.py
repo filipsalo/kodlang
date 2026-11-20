@@ -121,12 +121,12 @@ class Handler(socketserver.StreamRequestHandler):
         return github(target, path, headers)
 
     def dribble(self) -> bytes:
-        """A 20-byte body sent a byte at a time, 50 ms apart: every read makes
-        progress, the whole takes a second."""
+        """A 20-byte body sent a byte at a time, 30 ms apart: every read makes
+        progress, the whole takes 0.6 s."""
         self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n")
         self.wfile.flush()
         for _ in range(20):
-            time.sleep(0.05)
+            time.sleep(0.03)
             self.wfile.write(b"x")
             self.wfile.flush()
         return b""
@@ -262,15 +262,15 @@ class Handler(socketserver.StreamRequestHandler):
         if path == "/to-ftp":
             return redirect("302 Found", "ftp://example.com/")
         if path == "/slow":
-            time.sleep(1.5)
+            time.sleep(0.8)
             return reply("200 OK", b"late")
         if path == "/dribble":
             return self.dribble()
         if path == "/hop1":
-            time.sleep(0.4)
+            time.sleep(0.25)
             return redirect("302 Found", "/hop2")
         if path == "/hop2":
-            time.sleep(0.4)
+            time.sleep(0.25)
             return redirect("302 Found", "/hello")
         if path == "/big":
             return reply("200 OK", b"x" * 3_000_000)
