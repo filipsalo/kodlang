@@ -68,6 +68,10 @@ include link.cfg
 -include link.local.cfg
 $(foreach n,LINK AS RUNTIME_C STAGE0_KOD,$(if $(strip $($(n))),,$(error link.cfg and link.local.cfg set no $(n))))
 
+# `AS := kod` assembles in the compiler's own process (kod/macho), which Make's
+# rules can't run: they build that compiler. They use clang's assembler then.
+MAKE_AS := $(if $(filter kod,$(AS)),clang -target arm64-apple-darwin -c -x assembler,$(AS))
+
 # Make sees that a configuration file changed by its time, but not that one is
 # gone or has lost a name. So the configuration in force is also recorded in
 # $(LINK_STAMP): when it differs from the record, the record is remade, and
@@ -110,6 +114,7 @@ COMPILER_LIB_OBJS := \
     $(STAGE0)/_parsing.o \
     $(STAGE0)/_regalloc.o \
     $(STAGE0)/_arm64.o \
+    $(STAGE0)/_macho.o \
     $(STAGE0)/_codegen.o \
     $(STAGE0)/_build.o
 
@@ -119,6 +124,7 @@ COMPILER_KOD := \
     stdlib/kod/parsing.kod \
     stdlib/kod/regalloc.kod \
     stdlib/kod/arm64.kod \
+    stdlib/kod/macho.kod \
     stdlib/kod/codegen.kod \
     stdlib/kod/build.kod \
     kodc.kod
@@ -159,14 +165,14 @@ $(KOD_APP)/_kod.s: tools/kod.kod $(COMPILER_KOD)
 	$(KODC) $< > $@
 
 $(KOD_APP)/_kod.o: $(KOD_APP)/_kod.s
-	$(AS) -o $@ $<
+	$(MAKE_AS) -o $@ $<
 
 $(KOD_APP)/runtime_main.s: tools/kod.kod
 	mkdir -p $(KOD_APP)
 	$(KODC_EMIT_MAIN) tools/kod.kod $@
 
 $(KOD_APP)/runtime_main.o: $(KOD_APP)/runtime_main.s
-	$(AS) -o $@ $<
+	$(MAKE_AS) -o $@ $<
 
 stage0: $(STAGE0_OBJS)
 
@@ -217,6 +223,10 @@ $(STAGE0)/_arm64.s: stdlib/kod/arm64.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
 
+$(STAGE0)/_macho.s: stdlib/kod/macho.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) $< > $@
+
 $(STAGE0)/_codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
@@ -229,7 +239,7 @@ $(STAGE0)/_build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 # objects (arena.o, rc.o, runtime.o) have explicit rules above and
 # don't match this (no corresponding .s).
 $(STAGE0)/%.o: $(STAGE0)/%.s
-	$(AS) -o $@ $<
+	$(MAKE_AS) -o $@ $<
 
 stage1: $(STAGE1)/sh_kodc
 
@@ -253,7 +263,7 @@ $(STAGE1)/runtime_main.s: kodc.kod
 	$(KODC_EMIT_MAIN) kodc.kod $@
 
 $(STAGE1)/%.o: $(STAGE1)/%.s
-	$(AS) -o $@ $<
+	$(MAKE_AS) -o $@ $<
 
 # Extra prerequisites for every .kod lowering above (see KOD_DEPS).
 $(patsubst %.o,%.s,$(filter $(STAGE0)/_%.o,$(STAGE0_OBJS) $(COMPILER_LIB_OBJS))) \
