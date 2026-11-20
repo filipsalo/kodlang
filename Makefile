@@ -68,9 +68,10 @@ include link.cfg
 -include link.local.cfg
 $(foreach n,LINK AS RUNTIME_C STAGE0_KOD,$(if $(strip $($(n))),,$(error link.cfg and link.local.cfg set no $(n))))
 
-# `AS := kod` assembles in the compiler's own process (kod/macho), which Make's
-# rules can't run: they build that compiler. They use clang's assembler then.
-MAKE_AS := $(if $(filter kod,$(AS)),clang -target arm64-apple-darwin -c -x assembler,$(AS))
+# Assembles $< to $@. `AS := kod` means the compiler's own process
+# (kod/macho): the rules ask $(KODC), the compiler that wrote the .s, through
+# its `_assemble` subcommand. Recursive (=), so $< and $@ are the rule's.
+ASSEMBLE = $(if $(filter kod,$(AS)),$(KODC) _assemble $< $@,$(AS) -o $@ $<)
 
 # Make sees that a configuration file changed by its time, but not that one is
 # gone or has lost a name. So the configuration in force is also recorded in
@@ -165,14 +166,14 @@ $(KOD_APP)/_kod.s: tools/kod.kod $(COMPILER_KOD)
 	$(KODC) $< > $@
 
 $(KOD_APP)/_kod.o: $(KOD_APP)/_kod.s
-	$(MAKE_AS) -o $@ $<
+	$(ASSEMBLE)
 
 $(KOD_APP)/runtime_main.s: tools/kod.kod
 	mkdir -p $(KOD_APP)
 	$(KODC_EMIT_MAIN) tools/kod.kod $@
 
 $(KOD_APP)/runtime_main.o: $(KOD_APP)/runtime_main.s
-	$(MAKE_AS) -o $@ $<
+	$(ASSEMBLE)
 
 stage0: $(STAGE0_OBJS)
 
@@ -239,7 +240,7 @@ $(STAGE0)/_build.s: stdlib/kod/build.kod $(COMPILER_KOD)
 # objects (arena.o, rc.o, runtime.o) have explicit rules above and
 # don't match this (no corresponding .s).
 $(STAGE0)/%.o: $(STAGE0)/%.s
-	$(MAKE_AS) -o $@ $<
+	$(ASSEMBLE)
 
 stage1: $(STAGE1)/sh_kodc
 
@@ -263,7 +264,7 @@ $(STAGE1)/runtime_main.s: kodc.kod
 	$(KODC_EMIT_MAIN) kodc.kod $@
 
 $(STAGE1)/%.o: $(STAGE1)/%.s
-	$(MAKE_AS) -o $@ $<
+	$(ASSEMBLE)
 
 # Extra prerequisites for every .kod lowering above (see KOD_DEPS).
 $(patsubst %.o,%.s,$(filter $(STAGE0)/_%.o,$(STAGE0_OBJS) $(COMPILER_LIB_OBJS))) \
