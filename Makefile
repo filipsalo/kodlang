@@ -51,7 +51,7 @@ KODC_EMIT_MAIN := ./$(BOOTSTRAP_SH_KODC) _emit-runtime-main
 STAGE0 := build/stage0
 STAGE1 := build/stage1
 
-# The link configuration: LINK, CC, CFLAGS, RUNTIME_C and STAGE0_KOD.
+# The link configuration: LINK, AS, CC, CFLAGS, RUNTIME_C and STAGE0_KOD.
 # link.local.cfg, if there is one, overrides single names. Every rule that
 # links, or compiles a C file, depends on the files, since they hold the
 # command and its flags.
@@ -66,7 +66,7 @@ LOCAL_NAMES := $(shell sed -n '$(CFG_NAME_SED)' link.local.cfg 2>/dev/null)
 $(foreach n,$(LOCAL_NAMES),$(if $(filter $(n),$(CFG_NAMES)),,$(error link.local.cfg sets $(n), which link.cfg does not set; it only overrides those)))
 include link.cfg
 -include link.local.cfg
-$(foreach n,LINK RUNTIME_C STAGE0_KOD,$(if $(strip $($(n))),,$(error link.cfg and link.local.cfg set no $(n))))
+$(foreach n,LINK AS RUNTIME_C STAGE0_KOD,$(if $(strip $($(n))),,$(error link.cfg and link.local.cfg set no $(n))))
 
 # Make sees that a configuration file changed by its time, but not that one is
 # gone or has lost a name. So the configuration in force is also recorded in
@@ -126,8 +126,6 @@ COMPILER_KOD := \
 STAGE1_OBJS := \
     $(STAGE1)/kodc.o \
     $(STAGE1)/runtime_main.o
-
-AS := as -target arm64-apple-darwin
 
 .PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test gates selfhost-check asm-diff clean clean-apps clean-stage1
 

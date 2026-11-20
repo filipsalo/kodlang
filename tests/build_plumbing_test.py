@@ -686,7 +686,7 @@ def test_link_cfg_obeys_the_restricted_grammar():
         if line and not line.startswith("#"):
             names.append(line.split(" ")[0])
     assert len(names) == len(set(names)), "a name is set twice"
-    assert {"LINK", "CC", "CFLAGS", "RUNTIME_C", "STAGE0_KOD"} <= set(names)
+    assert {"LINK", "AS", "CC", "CFLAGS", "RUNTIME_C", "STAGE0_KOD"} <= set(names)
 
 
 @pytest.mark.parametrize(
@@ -1220,6 +1220,7 @@ def test_the_linker_is_the_one_link_cfg_names_and_link_local_cfg_overrides_it(
             "link.local.cfg:3:1: error: STAGE0 is not set in link.cfg",
         ),
         ("LINK :=\n", "kod: link.cfg and link.local.cfg set no LINK\n"),
+        ("AS :=\n", "kod: link.cfg and link.local.cfg set no AS\n"),
         ("STAGE0_KOD :=\n", "kod: link.cfg and link.local.cfg set no STAGE0_KOD\n"),
         ("RUNTIME_C :=\n", "kod: link.cfg and link.local.cfg set no RUNTIME_C\n"),
     ],
@@ -1410,6 +1411,7 @@ def test_make_takes_the_names_link_local_cfg_overrides(make_root: Path):
         ("MAKEFLAGS := k\n", "link.local.cfg sets MAKEFLAGS, which"),
         ("CC := clang\nLNK:=clang\n", "link.local.cfg sets LNK, which"),
         ("LINK :=\n", "link.cfg and link.local.cfg set no LINK"),
+        ("AS :=\n", "link.cfg and link.local.cfg set no AS"),
         ("RUNTIME_C :=\n", "link.cfg and link.local.cfg set no RUNTIME_C"),
         ("STAGE0_KOD :=\n", "link.cfg and link.local.cfg set no STAGE0_KOD"),
         (
@@ -1516,7 +1518,13 @@ class Project:
         return self.log.read_text().splitlines() if self.log.exists() else []
 
     def compiles(self) -> list[str]:
-        return [c for c in self.clang_calls() if " -c " in f" {c} "]
+        """The C compiles: the `-c` calls other than link.cfg's `AS`, which
+        assembles each module's `.s` with clang too."""
+        return [
+            c
+            for c in self.clang_calls()
+            if " -c " in f" {c} " and " -x assembler " not in f" {c} "
+        ]
 
     def link(self) -> list[str]:
         """The arguments of the one call that is not a compile."""
@@ -1993,8 +2001,9 @@ def test_a_failing_c_compile_shows_the_compiler_names_the_file_and_links_nothing
         assert "lib.c:1:1: error:" in err
         assert err.endswith("kod: compiling lib.c failed\n")
         assert not project.exe("entry").exists()
-        # The compile was the one call: no link followed it.
-        assert len(project.clang_calls()) == 1
+        # The C compile was the one compile, and no link followed it.
+        assert len(project.compiles()) == 1
+        assert all(" -c " in f" {c} " for c in project.clang_calls())
         (project.root / "clang.log").unlink()
     (project.root / "lib.c").write_text(
         '#include "kod_rt.h"\nint64_t kod_lib_value(void) { return 6; }\n'
@@ -2008,7 +2017,9 @@ def test_a_c_file_needs_a_compiler_but_a_program_without_one_does_not(project: P
     project.write({"entry.kod": entry_of("lib")})
     status, out, err = project.run("build", "entry.kod")
     assert (status, out, err) == (1, "", "kod: link.cfg and link.local.cfg set no CC\n")
-    assert project.clang_calls() == []
+    # Only the modules were assembled: no C compile, and no link.
+    assert project.compiles() == []
+    assert all(" -x assembler " in f" {c} " for c in project.clang_calls())
     # Nothing asks for CC when no module names a C file.
     status, _, err = project.run("build", "hello.kod")
     assert (status, err) == (0, "")
