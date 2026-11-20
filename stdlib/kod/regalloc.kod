@@ -20,38 +20,46 @@
 // that many registers instead of over-saving to cover gaps.
 
 import "arrays"
-import "kod/lexing"
 
 // The registers a target gives the allocator (see docs/ir.md). Everything
 // else codegen names (arguments, scratch, the frame) is a role it spells as
 // arm64 does, for a target's lowering to map.
 type Target = struct {
     // Temporaries a call may clobber, in the order they are filled in.
-    caller_saved: [str]
+    caller_saved: [Reg]
     // Temporaries a call keeps (the prologue saves them), likewise.
-    callee_saved: [str]
+    callee_saved: [Reg]
     // The callee-saved registers in the order the prologue saves them, and a
     // pad that makes their number even.
-    save_order: [str]
+    save_order: [Reg]
     // The registers calls pass arguments and results in, never in the pool.
-    arg_regs: [str]
+    arg_regs: [Reg]
     // A register for a vreg nothing names, which therefore costs nothing.
-    unused: str
+    unused: Reg
 }
 
 mut ARM64: Target = Target(
-    caller_saved: ["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"],
-    callee_saved: ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27"],
-    save_order: ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"],
-    arg_regs: ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
-    unused: "x8",
+    caller_saved: regs(["x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"]),
+    callee_saved: regs(["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27"]),
+    save_order: regs(["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]),
+    arg_regs: regs(["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]),
+    unused: reg_of("x8"),
 )
+
+// Each of `names` as a Reg.
+func regs(anon names: [str]) -> [Reg] {
+    mut out: [Reg] = []
+    for name in names {
+        out += [reg_of(name)]
+    }
+    return out
+}
 
 // The target being compiled for.
 mut TARGET: Target = ARM64
 
 // The first callee-saved register, which a vreg made to be allocated starts as.
-func first_callee_saved() -> str {
+func first_callee_saved() -> Reg {
     return TARGET.callee_saved[0]
 }
 
@@ -63,9 +71,9 @@ func save_order_len() -> int64 {
 // The pool `reset` and `evict` start from: the caller-saved registers, then
 // the callee-saved ones at the tail, so `alloc_reg` (which pops the tail)
 // hands those out first.
-func full_pool() -> [str] {
+func full_pool() -> [Reg] {
     let t = TARGET
-    mut pool: [str] = []
+    mut pool: [Reg] = []
     mut i = len(t.caller_saved) - 1
     for i >= 0 {
         pool += [t.caller_saved[i]]
@@ -625,7 +633,7 @@ func insn_flags(anon insn: Insn) -> int64 {
 
 
 type PoolState = struct {
-    free_regs: [str]
+    free_regs: [Reg]
     cs_in_use: int64
     live: [str]
     // The frame slot each of `live` is saved in.
@@ -637,11 +645,11 @@ type RegPool = struct {
     // in a module so `subst_vregs` at flush-out time can resolve
     // any vreg consistently. NOT reset by `reset` — the ids are
     // program-global by design.
-    vreg_phys: [str] = []
+    vreg_phys: [Reg] = []
 
     // Per-function state — `reset` clears these at the start of
     // every compile_func.
-    free_regs: [str] = []
+    free_regs: [Reg] = []
     cs_in_use: int64 = 0
     cs_high_water: int64 = 0
     // The vregs handed out and not yet freed, for `evict`.
@@ -697,7 +705,7 @@ type RegPool = struct {
         }
         mut phys = self.free_regs[-1]
         self.free_regs = self.free_regs[0..n - 1]
-        if self.is_callee_saved(phys) {
+        if is_callee_saved_phys(phys) {
             self.cs_in_use = self.cs_in_use + 1
             if self.cs_in_use > self.cs_high_water {
                 self.cs_high_water = self.cs_in_use
@@ -716,9 +724,10 @@ type RegPool = struct {
     // `bl`). For the hardcoded path, x0-x7 are skipped — they hold
     // call args/results and never enter the pool.
     func free_reg(self, anon reg: str) -> none {
-        mut phys: str = reg
-        if self.is_vreg_name(reg) {
-            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        let r = reg_of(reg)
+        mut phys: Reg = r
+        if (r & 3) == 1 {
+            phys = self.vreg_phys[r >> 2]
             // In place, keeping the order (evict saves them in it), then one copy.
             let live = self.live
             mut kept = 0
@@ -735,7 +744,7 @@ type RegPool = struct {
         if arrays.contains(TARGET.arg_regs, phys) {
             return
         }
-        if self.is_callee_saved(phys) {
+        if is_callee_saved_phys(phys) {
             self.cs_in_use = self.cs_in_use - 1
         }
         self.free_regs += [phys]
@@ -750,34 +759,12 @@ type RegPool = struct {
     // Accepts vreg names too — the alloc-time class is the one
     // recorded in `vreg_phys[id]`.
     func is_callee_saved(self, anon reg: str) -> bool {
-        mut phys: str = reg
-        if self.is_vreg_name(reg) {
-            phys = self.vreg_phys[self.parse_vreg_id(reg)]
+        let r = reg_of(reg)
+        mut phys: Reg = r
+        if (r & 3) == 1 {
+            phys = self.vreg_phys[r >> 2]
         }
         return is_callee_saved_phys(phys)
-    }
-
-    // True if `s` is a vreg name (the `v<digits>` form `alloc_reg`
-    // returns). Anything else — a physical register name, an asm
-    // literal — falls through unchanged.
-    func is_vreg_name(self, anon s: str) -> bool {
-        if len(s) < 2 or s[0] != 'v' {
-            return false
-        }
-        for i in 1..len(s) {
-            if not lexing.is_digit(s[i]) {
-                return false
-            }
-        }
-        return true
-    }
-
-    func parse_vreg_id(self, anon vreg: str) -> int64 {
-        mut id: int64 = 0
-        for i in 1..len(vreg) {
-            id = id * 10 + vreg[i] - '0'
-        }
-        return id
     }
 }
 
@@ -790,25 +777,32 @@ type RegPool = struct {
 // sees the destination as a def, so the def_line stays -1 and the
 // vreg keeps its alloc-time phys — but downstream vregs may end up
 // sharing that phys because regalloc thinks the slot is free.
-func is_callee_saved_phys(anon phys: str) -> bool {
-    return CALLEE_SAVED.contains(phys)
+func is_callee_saved_phys(anon phys: Reg) -> bool {
+    let k = phys >> 2
+    return (phys & 3) == 0 and k < len(CALLEE_SAVED) and CALLEE_SAVED[k]
 }
 
-// TARGET.callee_saved as a set: the test above runs for most registers the
-// allocator touches, and nine string compares were 4% of a compile.
-mut CALLEE_SAVED: Map[str, bool] = callee_saved_set()
+// Whether each of NAMES is in TARGET.callee_saved, up to the last that is: the
+// test above runs for most registers the allocator touches.
+mut CALLEE_SAVED: [bool] = callee_saved_set()
 
-func callee_saved_set() -> Map[str, bool] {
-    let set = Map[str, bool]()
+func callee_saved_set() -> [bool] {
+    mut top: int64 = 0
     for reg in TARGET.callee_saved {
-        set[reg] = true
+        if reg >> 2 > top {
+            top = reg >> 2
+        }
+    }
+    mut set: [bool] = [false] * (top + 1)
+    for reg in TARGET.callee_saved {
+        set[reg >> 2] = true
     }
     return set
 }
 
 // Dense callee-saved name by 0-based slot. `pack` writes back via
 // these so the prologue can save `cs_reg(0)..cs_reg(N-1)` in order.
-func cs_reg(anon n: int64) -> str {
+func cs_reg(anon n: int64) -> Reg {
     return TARGET.save_order[n]
 }
 
@@ -897,7 +891,7 @@ func note_operand(anon operand: Reg, written: bool, line_idx: int64, vreg_start:
 // them is a failure (false) instead of a fall back to the alloc-time
 // register, which only temporaries can share safely.
 func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = false, droppable: int64 = -1) -> bool {
-    let vreg_phys: [str] = pool.vreg_phys
+    let vreg_phys: [Reg] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
     let n_local: int64 = vreg_end - vreg_start
     if n_local <= 0 {
@@ -1047,12 +1041,12 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 
     // Snapshot alloc-time phys per local vreg; this is also the
     // pool we draw from (deduped, partitioned by class).
-    let alloc_phys: [str] = vreg_phys[vreg_start..vreg_end]
+    let alloc_phys: [Reg] = vreg_phys[vreg_start..vreg_end]
 
-    mut free_callee: [str] = []
-    mut free_caller: [str] = []
+    mut free_callee: [Reg] = []
+    mut free_caller: [Reg] = []
     for k in 0..n_local {
-        let p: str = alloc_phys[k]
+        let p: Reg = alloc_phys[k]
         if is_callee_saved_phys(p) {
             if not arrays.contains(free_callee, p) {
                 free_callee += [p]
@@ -1108,8 +1102,8 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     // Walk vregs in def order; maintain active list (alive intervals).
     mut active_id: [int64] = []
     mut active_use: [int64] = []
-    mut active_phys: [str] = []
-    mut new_phys: [str] = vreg_phys[vreg_start..vreg_end]
+    mut active_phys: [Reg] = []
+    mut new_phys: [Reg] = vreg_phys[vreg_start..vreg_end]
 
     for oi in 0..n_local {
         let local_id: int64 = order[oi]
@@ -1141,7 +1135,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         mut kept = 0
         for ai in 0..n_active {
             if active_use[ai] <= d {
-                let ap: str = active_phys[ai]
+                let ap: Reg = active_phys[ai]
                 if is_callee_saved_phys(ap) {
                     free_callee += [ap]
                 } else {
@@ -1161,7 +1155,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         }
 
         // Pop a phys from the matching class's free pool.
-        mut chosen: str = ""
+        mut chosen: Reg = NO_REG
         if cls_callee {
             if len(free_callee) > 0 {
                 chosen = free_callee[len(free_callee) - 1]
@@ -1173,7 +1167,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 free_caller = free_caller[0..len(free_caller) - 1]
             }
         }
-        if len(chosen) == 0 and strict and droppable >= 0 {
+        if chosen == NO_REG and strict and droppable >= 0 {
             // Out of registers: of this vreg and the ones holding a register
             // of its class, the droppable one used least (droppable vregs
             // are numbered most used first) goes back to memory, and the
@@ -1202,7 +1196,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 active_phys = active_phys[0..victim_at] + active_phys[victim_at + 1..len(active_phys)]
             }
         }
-        if len(chosen) == 0 {
+        if chosen == NO_REG {
             // Without `strict` this can't happen: pool size equals
             // alloc-time pressure. Fall back to the alloc-time phys.
             ok = false
@@ -1308,17 +1302,17 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], last_use: [int64]) 
 // every site that asked `is_callee_saved(vreg)` at emit time still
 // gets the same answer, so spill_across decisions remain correct.
 func pack(pool: RegPool, vreg_start: int64) -> int64 {
-    let vreg_phys: [str] = pool.vreg_phys
+    let vreg_phys: [Reg] = pool.vreg_phys
     let vreg_end: int64 = len(vreg_phys)
-    mut used: [str] = []
+    mut used: [Reg] = []
     for i in vreg_start..vreg_end {
-        let p: str = vreg_phys[i]
+        let p: Reg = vreg_phys[i]
         if is_callee_saved_phys(p) and not arrays.contains(used, p) {
             used += [p]
         }
     }
     for i in vreg_start..vreg_end {
-        let p: str = vreg_phys[i]
+        let p: Reg = vreg_phys[i]
         if is_callee_saved_phys(p) {
             mut j: int64 = 0
             mut found: int64 = -1
