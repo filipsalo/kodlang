@@ -223,6 +223,23 @@ void kod_sb_append_byte(int64_t handle, int64_t b) {
     sb->buf[sb->len++] = (char)(b & 0xff);
 }
 
+// `n` in decimal, as int64.to_str writes it.
+void kod_sb_append_int(int64_t handle, int64_t n) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    char digits[20];
+    int len = 0;
+    // From the signed value, so the smallest int64 needs no negating.
+    int64_t rest = n;
+    do {
+        int64_t d = rest % 10;
+        digits[len++] = (char)('0' + (d < 0 ? -d : d));
+        rest /= 10;
+    } while (rest != 0);
+    kod_sb_reserve(sb, len + 1);
+    if (n < 0) sb->buf[sb->len++] = '-';
+    while (len > 0) sb->buf[sb->len++] = digits[--len];
+}
+
 int64_t kod_sb_len(int64_t handle) {
     return ((KodStrBuilder *)handle)->len;
 }

@@ -319,6 +319,7 @@ print(out.to_str())
 | `append(s: str)` | add a string |
 | `append_bytes(b: bytes)` | add raw bytes |
 | `append_byte(b: int64)` | add one byte; only the low 8 bits are used |
+| `append_int(n: int64)` | add `n` in decimal, as `n.to_str()` writes it, without making that string |
 | `len() -> int64` | bytes so far |
 | `clear()` | drop the content, keep the capacity |
 | `to_str() -> str` | a copy of the content; the builder stays usable |

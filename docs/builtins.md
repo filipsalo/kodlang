@@ -344,7 +344,7 @@ Available for re-declaration in any module if needed:
 | `_strlen` | C `strlen`. |
 | `_rc_alloc` | Allocates an object with a reference count of 1; see [Memory layout](memory-layout.md#the-heap). |
 | `_kod_str_concat`, `_kod_str_slice` | String operations the runtime exposes to codegen. |
-| `_kod_sb_new`, `_kod_sb_append`, `_kod_sb_append_byte`, `_kod_sb_len`, `_kod_sb_clear`, `_kod_sb_to_str` | The growable buffer behind `StrBuilder` and the `str` methods `join`, `repeat`, `replace`, `lower` and `upper`; a handle is typed as a `str` so that it is counted, but isn't one. |
+| `_kod_sb_new`, `_kod_sb_append`, `_kod_sb_append_byte`, `_kod_sb_append_int`, `_kod_sb_len`, `_kod_sb_clear`, `_kod_sb_to_str` | The growable buffer behind `StrBuilder` and the `str` methods `join`, `repeat`, `replace`, `lower` and `upper`; a handle is typed as a `str` so that it is counted, but isn't one. |
 | `_kod_array_concat`, `_kod_array_concat_new` | Array append in place (`+=`) and concatenation into a new array (`+`). |
 | `_kod_test_fail`, `_kod_test_summary` | Test runner internals. |
 
