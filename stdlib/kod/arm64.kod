@@ -5,6 +5,7 @@
 
 import "kod/lexing"
 import "kod/regalloc"
+import "strbuilder" { StrBuilder }
 
 // The arm64 name of a condition.
 func cond_name(anon c: regalloc.Cond) -> str {
@@ -337,6 +338,164 @@ func format_insn(anon insn: regalloc.Insn, vreg_phys: [str]) -> str {
         .Branch(kind, reg, target) -> return branch_text(:kind, reg: phys_of(reg, :vreg_phys), :target)
         .Label(name) -> return name + ":"
     }
+}
+
+// Writes the asm lines of an instruction to `out`, each ending in a newline:
+// format_insn's text, less a `mov` of a register to itself, with an immediate
+// too big to encode put in x16 first (encodable_lines). The common
+// instructions are written piece by piece, with no string made for the line.
+func write_insn(anon insn: regalloc.Insn, vreg_phys: [str], out: StrBuilder) -> none {
+    match insn {
+        .Slot(store, reg, off) -> {
+            if store {
+                out.append("\tstr ")
+            } else {
+                out.append("\tldr ")
+            }
+            out.append(phys_of(reg, :vreg_phys))
+            if off >= 0 {
+                out.append(", [fp]\n")
+            } else {
+                out.append(", [fp, #")
+                out.append(off.to_str())
+                out.append("]\n")
+            }
+        }
+        .Mov(dst, src) -> {
+            let d = phys_of(dst, :vreg_phys)
+            let s = phys_of(src, :vreg_phys)
+            if d == s and is_numbered_reg(d) {
+                return none
+            }
+            out.append("\tmov ")
+            out.append(d)
+            out.append(", ")
+            out.append(s)
+            out.append("\n")
+        }
+        .Mem(load, width, reg, base, at) -> {
+            if at is .Offset(off) and width >= 4 and off > 32760 {
+                write_text(format_insn(insn, :vreg_phys), flags: regalloc.INFO_BIG_IMM, :out)
+                return none
+            }
+            out.append("\t")
+            out.append(mem_mnemonic(:load, :width))
+            out.append(" ")
+            out.append(phys_of(reg, :vreg_phys))
+            out.append(", [")
+            out.append(phys_of(base, :vreg_phys))
+            match at {
+                .Base -> out.append("]\n")
+                .Offset(off) -> {
+                    out.append(", #")
+                    out.append(off.to_str())
+                    out.append("]\n")
+                }
+                .Index(index) -> {
+                    out.append(", ")
+                    out.append(phys_of(index, :vreg_phys))
+                    out.append("]\n")
+                }
+                .Symbol(name, got) -> {
+                    out.append(", ")
+                    out.append(name)
+                    if got {
+                        out.append("@GOTPAGEOFF]\n")
+                    } else {
+                        out.append("@PAGEOFF]\n")
+                    }
+                }
+            }
+        }
+        .Op(op, a, b, c, d, flags) -> {
+            if (flags & regalloc.INFO_BIG_IMM) != 0 {
+                write_text(format_insn(insn, :vreg_phys), :flags, :out)
+                return none
+            }
+            if op is .Move and len(c) == 0 {
+                let pa = phys_of(a, :vreg_phys)
+                if pa == phys_of(b, :vreg_phys) and is_numbered_reg(pa) {
+                    return none
+                }
+            }
+            out.append("\t")
+            out.append(arm64_mnemonic(op))
+            // The operands are a prefix of a, b, c, d: the first empty one ends them.
+            if len(a) > 0 {
+                out.append(" ")
+                out.append(phys_of(a, :vreg_phys))
+                if len(b) > 0 {
+                    out.append(", ")
+                    out.append(phys_of(b, :vreg_phys))
+                    if len(c) > 0 {
+                        out.append(", ")
+                        out.append(phys_of(c, :vreg_phys))
+                        if len(d) > 0 {
+                            out.append(", ")
+                            out.append(phys_of(d, :vreg_phys))
+                        }
+                    }
+                }
+            }
+            out.append("\n")
+        }
+        .Call(target) -> {
+            out.append("\tbl ")
+            out.append(target)
+            out.append("\n")
+        }
+        .Branch(kind, reg, target) -> {
+            out.append("\t")
+            out.append(branch_mnemonic(kind))
+            out.append(" ")
+            if len(reg) > 0 {
+                out.append(phys_of(reg, :vreg_phys))
+                out.append(", ")
+            }
+            out.append(target)
+            out.append("\n")
+        }
+        .Label(name) -> {
+            out.append(name)
+            out.append(":\n")
+        }
+        .Intrinsic(label) -> {
+            // Line by line, as a call's lines were: `mov x0, x0` is no line at all.
+            for line in arm64_intrinsic(label) {
+                let text = "\t" + line
+                if not is_self_mov(text) {
+                    out.append(text)
+                    out.append("\n")
+                }
+            }
+        }
+        else -> write_text(format_insn(insn, :vreg_phys), flags: regalloc.insn_flags(insn), :out)
+    }
+}
+
+// Writes `s`, an instruction's text with `flags` its insn_flags, as write_insn does.
+func write_text(anon s: str, flags: int64, out: StrBuilder) -> none {
+    // Only a `mov` can be a self-mov; only a flagged line can need splitting.
+    if regalloc.mnemonic_code(flags) == regalloc.MN_MOV and is_self_mov(s) {
+        return none
+    }
+    for line in encodable_lines(s) {
+        out.append(line)
+        out.append("\n")
+    }
+}
+
+// Whether `reg` is `xN` or `wN`, the registers is_self_mov looks for.
+func is_numbered_reg(anon reg: str) -> bool {
+    if len(reg) < 2 or (reg[0] != 'x' and reg[0] != 'w') {
+        return false
+    }
+    for k in 1..len(reg) {
+        if not lexing.is_digit(reg[k]) {
+            return false
+        }
+    }
+    return true
 }
 
 // The physical register a register name stands for at output: a vreg's,
