@@ -150,6 +150,14 @@ were.
    one needs a proof that the index is in range, which neither of these loops
    gives (`j <= n` against a length built by appends; `i`/`j` moved by the
    comparisons).
+
+   Nor do most checks elsewhere. Of the 66M checks run compiling `codegen.kod`,
+   about a fifth are in a `for k in a..len(x)` loop that leaves `x`'s length
+   alone, which a simple pass could prove; another fifth follow a test such as
+   `i < len(s)` and would need the conditions tracked. At the half a cycle a
+   check costs in the timed loops, removing all of them would save about 2.5%
+   of the compile, and the provable fifth about 0.5%; the hot checks of the
+   benchmarks are none of these. Not worth a pass for now.
 8. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
