@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: steps 1–4 and 8 done; steps 5 and 7 measured and not landed; step 9 in progress. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4, 8 and 9 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -172,7 +172,7 @@ were.
    call targets, symbols in an address and directives stay text. What is
    left of the text is codegen's own: `alloc_reg` still names a vreg `v12`,
    and each `emit_` reads the name back.
-9. **Machine words instead of text** (in progress). Assembling the output
+9. **Machine words instead of text** (done). Assembling the output
    costs far more than compiling it: `as` takes 3.1 s on what the compiler
    writes for `codegen.kod` in 0.22 s, and about four fifths of the gates'
    CPU time. Clang's assembler spends it matching each register operand
