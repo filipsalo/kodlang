@@ -167,8 +167,11 @@ were.
    Codegen still names registers as text: its `emit_` functions turn each into
    a `Reg` once (`regalloc.reg_of`), so the passes compare numbers instead of
    parsing names, and nothing in an instruction is counted. The output turns
-   them back (`regalloc.reg_text`, `arm64.phys_of`). Labels, call targets,
-   symbols in an address and directives stay text.
+   them back (`regalloc.reg_text`, `arm64.phys_of`). The allocator's pool,
+   the target's registers and each vreg's register are `Reg`s too. Labels,
+   call targets, symbols in an address and directives stay text. What is
+   left of the text is codegen's own: `alloc_reg` still names a vreg `v12`,
+   and each `emit_` reads the name back.
 9. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
