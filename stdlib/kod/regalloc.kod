@@ -600,11 +600,7 @@ type RegPool = struct {
             panic("compiler bug: out of registers; `compile_expr` evicts before this can happen, so a site is holding too many without compiling an expression")
         }
         mut phys = self.free_regs[-1]
-        mut new_regs: [str] = []
-        for i in 0..n - 1 {
-            new_regs += [self.free_regs[i]]
-        }
-        self.free_regs = new_regs
+        self.free_regs = self.free_regs[0..n - 1]
         if self.is_callee_saved(phys) {
             self.cs_in_use = self.cs_in_use + 1
             if self.cs_in_use > self.cs_high_water {
@@ -627,13 +623,18 @@ type RegPool = struct {
         mut phys: str = reg
         if self.is_vreg_name(reg) {
             phys = self.vreg_phys[self.parse_vreg_id(reg)]
-            mut still_live: [str] = []
-            for name in self.live {
+            // In place, keeping the order (evict saves them in it), then one copy.
+            let live = self.live
+            mut kept = 0
+            for name in live {
                 if name != reg {
-                    still_live += [name]
+                    live[kept] = name
+                    kept += 1
                 }
             }
-            self.live = still_live
+            if kept < len(live) {
+                self.live = live[0..kept]
+            }
         }
         if arrays.contains(TARGET.arg_regs, phys) {
             return
@@ -813,18 +814,13 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         return true
     }
 
-    mut def_line: [int64] = []
-    mut last_use: [int64] = []
-    mut first: [int64] = []
-    for k in 0..n_local {
-        def_line += [-1]
-        last_use += [-1]
-        first += [-1]
-    }
+    mut def_line: [int64] = [-1] * n_local
+    mut last_use: [int64] = [-1] * n_local
+    mut first: [int64] = [-1] * n_local
 
     // clobbers_before[k]: how many lines before line k call something or
     // name a caller-saved register outright.
-    mut clobbers_before: [int64] = [0]
+    mut clobbers_before: [int64] = [0] * (len(body_buf) + 1)
     mut line_idx: int64 = 0
     for insn in body_buf {
         mut clobbers = 0
@@ -944,7 +940,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 // Label lines hold a symbol, not asm — no vregs.
             }
         }
-        clobbers_before += [clobbers_before[line_idx] + clobbers]
+        clobbers_before[line_idx + 1] = clobbers_before[line_idx] + clobbers
         line_idx = line_idx + 1
     }
 
@@ -961,10 +957,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 
     // Snapshot alloc-time phys per local vreg; this is also the
     // pool we draw from (deduped, partitioned by class).
-    mut alloc_phys: [str] = []
-    for k in 0..n_local {
-        alloc_phys += [vreg_phys[vreg_start + k]]
-    }
+    let alloc_phys: [str] = vreg_phys[vreg_start..vreg_end]
 
     mut free_callee: [str] = []
     mut free_caller: [str] = []
@@ -1026,10 +1019,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     mut active_id: [int64] = []
     mut active_use: [int64] = []
     mut active_phys: [str] = []
-    mut new_phys: [str] = []
-    for k in 0..n_local {
-        new_phys += [alloc_phys[k]]
-    }
+    mut new_phys: [str] = vreg_phys[vreg_start..vreg_end]
 
     for oi in 0..n_local {
         let local_id: int64 = order[oi]
@@ -1056,10 +1046,10 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         // all sources before writing the dest, so sharing a phys
         // between dying-source and just-defined-dest on the same line
         // is well-defined for every mnemonic we emit.
-        mut na_id: [int64] = []
-        mut na_use: [int64] = []
-        mut na_phys: [str] = []
-        for ai in 0..len(active_id) {
+        // Compacted in place, in order; copied only when one expired.
+        let n_active = len(active_id)
+        mut kept = 0
+        for ai in 0..n_active {
             if active_use[ai] <= d {
                 let ap: str = active_phys[ai]
                 if is_callee_saved_phys(ap) {
@@ -1068,38 +1058,29 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     free_caller += [ap]
                 }
             } else {
-                na_id += [active_id[ai]]
-                na_use += [active_use[ai]]
-                na_phys += [active_phys[ai]]
+                active_id[kept] = active_id[ai]
+                active_use[kept] = active_use[ai]
+                active_phys[kept] = active_phys[ai]
+                kept += 1
             }
         }
-        active_id = na_id
-        active_use = na_use
-        active_phys = na_phys
+        if kept < n_active {
+            active_id = active_id[0..kept]
+            active_use = active_use[0..kept]
+            active_phys = active_phys[0..kept]
+        }
 
         // Pop a phys from the matching class's free pool.
         mut chosen: str = ""
         if cls_callee {
             if len(free_callee) > 0 {
                 chosen = free_callee[len(free_callee) - 1]
-                mut nfc: [str] = []
-                mut fi: int64 = 0
-                for fi < len(free_callee) - 1 {
-                    nfc += [free_callee[fi]]
-                    fi = fi + 1
-                }
-                free_callee = nfc
+                free_callee = free_callee[0..len(free_callee) - 1]
             }
         } else {
             if len(free_caller) > 0 {
                 chosen = free_caller[len(free_caller) - 1]
-                mut nfc2: [str] = []
-                mut fi2: int64 = 0
-                for fi2 < len(free_caller) - 1 {
-                    nfc2 += [free_caller[fi2]]
-                    fi2 = fi2 + 1
-                }
-                free_caller = nfc2
+                free_caller = free_caller[0..len(free_caller) - 1]
             }
         }
         if len(chosen) == 0 and strict and droppable >= 0 {
