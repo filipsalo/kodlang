@@ -1,0 +1,91 @@
+// arm64.encode gives the word `as` assembles each instruction's text to
+// (docs/ir.md, step 9). Each expected word is what `as` made of the text in
+// the comment beside it.
+
+import "kod/arm64"
+import "kod/regalloc"
+
+func r(anon name: str) -> regalloc.Reg {
+    return regalloc.reg_of(name)
+}
+
+// w0 is x5's 32-bit form and w1 x7's: vreg 0 lives in x5, vreg 1 in x7.
+func phys() -> [regalloc.Reg] {
+    return [r("x5"), r("x7")]
+}
+
+func word(anon insn: regalloc.Insn) -> int64 {
+    return arm64.encode(insn, vreg_phys: phys())
+}
+
+test "loads and stores" {
+    assert word(.Slot(store: false, reg: r("x1"), off: -8)) == 0xF85F83A1 // ldr x1, [fp, #-8]
+    assert word(.Slot(store: true, reg: r("x2"), off: 0)) == 0xF90003A2 // str x2, [fp]
+    assert word(.Mem(load: true, width: 8, reg: r("x3"), base: r("x4"), at: .Offset(off: 16))) == 0xF9400883 // ldr x3, [x4, #16]
+    assert word(.Mem(load: true, width: 8, reg: r("x3"), base: r("x4"), at: .Offset(off: 12))) == 0xF840C083 // ldr x3, [x4, #12]
+    assert word(.Mem(load: true, width: 4, reg: regalloc.wvreg(0), base: r("x6"), at: .Offset(off: 8))) == 0xB94008C5 // ldr w5, [x6, #8]
+    assert word(.Mem(load: true, width: 1, reg: regalloc.wvreg(0), base: r("x6"), at: .Offset(off: 3))) == 0x39400CC5 // ldrb w5, [x6, #3]
+    assert word(.Mem(load: false, width: 2, reg: regalloc.wvreg(0), base: r("x6"), at: .Base)) == 0x790000C5 // strh w5, [x6]
+    assert word(.Mem(load: true, width: 8, reg: r("x7"), base: r("x8"), at: .Index(reg: r("x9")))) == 0xF8696907 // ldr x7, [x8, x9]
+    assert word(.Mem(load: false, width: 1, reg: regalloc.wvreg(1), base: r("x8"), at: .Index(reg: r("x9")))) == 0x38296907 // strb w7, [x8, x9]
+}
+
+test "moves" {
+    assert word(.Mov(dst: r("x0"), src: r("x19"))) == 0xAA1303E0 // mov x0, x19
+    assert word(.Mov(dst: r("fp"), src: r("sp"))) == 0x910003FD // mov fp, sp
+    assert word(.Mov(dst: r("sp"), src: r("fp"))) == 0x910003BF // mov sp, fp
+    assert word(.Mov(dst: r("x0"), src: r("xzr"))) == 0xAA1F03E0 // mov x0, xzr
+    assert word(regalloc.op(.Move, a: r("x10"), b: r("#4095"))) == 0xD281FFEA // mov x10, #4095
+    assert word(regalloc.op(.Move, a: r("x10"), b: r("#-5"))) == 0x9280008A // mov x10, #-5
+}
+
+test "arithmetic, logic and shifts" {
+    assert word(regalloc.op(.Add, a: r("x1"), b: r("x2"), c: r("#8"))) == 0x91002041 // add x1, x2, #8
+    assert word(regalloc.op(.Sub, a: r("sp"), b: r("sp"), c: r("#32"))) == 0xD10083FF // sub sp, sp, #32
+    let x1 = r("x1")
+    let x2 = r("x2")
+    let x3 = r("x3")
+    assert word(regalloc.op(.Add, a: x1, b: x2, c: x3)) == 0x8B030041 // add x1, x2, x3
+    assert word(regalloc.op(.Sub, a: x1, b: x2, c: x3)) == 0xCB030041 // sub x1, x2, x3
+    assert word(regalloc.op(.Mul, a: x1, b: x2, c: x3)) == 0x9B037C41 // mul x1, x2, x3
+    assert word(regalloc.op(.DivSigned, a: x1, b: x2, c: x3)) == 0x9AC30C41 // sdiv x1, x2, x3
+    assert word(regalloc.op(.And, a: x1, b: x2, c: x3)) == 0x8A030041 // and x1, x2, x3
+    assert word(regalloc.op(.Or, a: x1, b: x2, c: x3)) == 0xAA030041 // orr x1, x2, x3
+    assert word(regalloc.op(.Xor, a: x1, b: x2, c: x3)) == 0xCA030041 // eor x1, x2, x3
+    assert word(regalloc.op(.ShiftLeft, a: x1, b: x2, c: r("#3"))) == 0xD37DF041 // lsl x1, x2, #3
+    assert word(regalloc.op(.ShiftRight, a: x1, b: x2, c: r("#3"))) == 0xD343FC41 // lsr x1, x2, #3
+    assert word(regalloc.op(.ShiftLeft, a: x1, b: x2, c: x3)) == 0x9AC32041 // lsl x1, x2, x3
+    assert word(regalloc.op(.ShiftRight, a: x1, b: x2, c: x3)) == 0x9AC32441 // lsr x1, x2, x3
+}
+
+test "compares and conditions" {
+    let x1 = r("x1")
+    assert word(regalloc.op(.Compare, a: x1, b: r("#7"))) == 0xF1001C3F // cmp x1, #7
+    assert word(regalloc.op(.Compare, a: x1, b: r("x2"))) == 0xEB02003F // cmp x1, x2
+    assert word(regalloc.op(.SetIf, a: x1, b: r("lt"))) == 0x9A9FA7E1 // cset x1, lt
+    assert word(regalloc.op(.Select, a: x1, b: r("x2"), c: r("x3"), d: r("ne"))) == 0x9A831041 // csel x1, x2, x3, ne
+}
+
+test "pairs, calls and returns" {
+    let fp = r("fp")
+    let lr = r("lr")
+    let sp = r("sp")
+    assert word(.Pair(load: false, a: fp, b: lr, base: sp, mode: .Pre(off: -16))) == 0xA9BF7BFD // stp fp, lr, [sp, #-16]!
+    assert word(.Pair(load: true, a: fp, b: lr, base: sp, mode: .Post(off: 16))) == 0xA8C17BFD // ldp fp, lr, [sp], #16
+    assert word(.Pair(load: false, a: r("x28"), b: r("xzr"), base: sp, mode: .Pre(off: -16))) == 0xA9BF7FFC // stp x28, xzr, [sp, #-16]!
+    assert word(.Pair(load: true, a: r("x19"), b: r("x20"), base: sp, mode: .At(off: 16))) == 0xA94153F3 // ldp x19, x20, [sp, #16]
+    assert word(regalloc.op(.CallIndirect, a: r("x16"))) == 0xD63F0200 // blr x16
+    assert word(regalloc.op(.Return)) == 0xD65F03C0 // ret
+}
+
+test "what has a label or a symbol, or no encoding here, stays text" {
+    assert word(.Call(target: "_f")) == -1
+    assert word(.Branch(kind: .Always, reg: regalloc.NO_REG, target: "L1")) == -1
+    assert word(.Mem(load: true, width: 8, reg: r("x1"), base: r("x2"), at: .Symbol(name: "_g", got: false))) == -1
+    // Too big for the 12-bit immediate, or too far below the base for ldur.
+    assert word(regalloc.op(.Add, a: r("x1"), b: r("x2"), c: r("#4096"))) == -1
+    assert word(.Mem(load: true, width: 8, reg: r("x1"), base: r("x2"), at: .Offset(off: -264))) == -1
+    // xzr can't be a base, nor sp a register `orr` reads.
+    assert word(.Mem(load: true, width: 8, reg: r("x1"), base: r("xzr"), at: .Base)) == -1
+    assert word(regalloc.op(.And, a: r("x1"), b: r("sp"), c: r("x2"))) == -1
+}
