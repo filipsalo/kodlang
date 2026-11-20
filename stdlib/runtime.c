@@ -129,8 +129,11 @@ void kod_eprint(KodStr *msg) {
 // Kod-side `puts` extern — len-aware, won't fool itself on embedded
 // NULs. Trailing newline matches libc puts.
 int64_t kod_puts(KodStr *s) {
-    fwrite(s->buf, 1, s->len, stdout);
-    fputc('\n', stdout);
+    // One lock for the line: fwrite and fputc would each take it.
+    flockfile(stdout);
+    for (int64_t i = 0; i < s->len; i++) putc_unlocked(s->buf[i], stdout);
+    putc_unlocked('\n', stdout);
+    funlockfile(stdout);
     return 0;
 }
 
