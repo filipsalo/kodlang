@@ -181,8 +181,11 @@ were.
    instruction's word, `.inst 0xaa0103e0` for `mov x0, x1`, assembles to the
    same bytes about 50 times faster. So `arm64.encode` gives the word of
    each instruction that names only registers and immediates, and the output
-   writes that, with the instruction as a comment; anything with a label or
-   a symbol, and any form `encode` doesn't know, stays text.
+   writes that; anything with a label or a symbol, and any form `encode`
+   doesn't know, stays text. With `KOD_ASM_TEXT` set, each word is followed
+   by its instruction as a comment (`.inst 0xaa0103e0 //	mov x0, x1`), for
+   reading the output; it is left out otherwise, since writing it and
+   skipping it again cost about a twentieth of a compile.
    `asm_diff.py --objects` checks the result: every object file in the
    corpus must have the same bytes as when the text is assembled.
 
