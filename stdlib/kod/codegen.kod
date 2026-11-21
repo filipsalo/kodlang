@@ -854,38 +854,38 @@ func written_reg(anon insn: regalloc.Insn) -> regalloc.Reg {
 }
 
 // Records `line` as where each vreg `insn` names is first named, unless it was before.
-func note_named(anon insn: regalloc.Insn, line: int64, first: Map[int64, int64]) -> none {
+func note_named(anon insn: regalloc.Insn, line: int64, mut first: Map[int64, int64]) -> none {
     match insn {
-        .Slot(_store, r, _off) -> name_at(r, :line, :first)
+        .Slot(_store, r, _off) -> name_at(r, :line, first: mut first)
         .Mov(dst, src) -> {
-            name_at(dst, :line, :first)
-            name_at(src, :line, :first)
+            name_at(dst, :line, first: mut first)
+            name_at(src, :line, first: mut first)
         }
         .Mem(_load, _width, r, base, at) -> {
-            name_at(r, :line, :first)
-            name_at(base, :line, :first)
+            name_at(r, :line, first: mut first)
+            name_at(base, :line, first: mut first)
             if at is .Index(index, _scaled) {
-                name_at(index, :line, :first)
+                name_at(index, :line, first: mut first)
             }
         }
-        .LoadConst(dst, _value) -> name_at(dst, :line, :first)
+        .LoadConst(dst, _value) -> name_at(dst, :line, first: mut first)
         .Pair(_load, a, b, base, _mode) -> {
-            name_at(a, :line, :first)
-            name_at(b, :line, :first)
-            name_at(base, :line, :first)
+            name_at(a, :line, first: mut first)
+            name_at(b, :line, first: mut first)
+            name_at(base, :line, first: mut first)
         }
         .Op(_op, a, b, c, d, _flags) -> {
-            name_at(a, :line, :first)
-            name_at(b, :line, :first)
-            name_at(c, :line, :first)
-            name_at(d, :line, :first)
+            name_at(a, :line, first: mut first)
+            name_at(b, :line, first: mut first)
+            name_at(c, :line, first: mut first)
+            name_at(d, :line, first: mut first)
         }
-        .Branch(_kind, r, _target) -> name_at(r, :line, :first)
+        .Branch(_kind, r, _target) -> name_at(r, :line, first: mut first)
         else none
     }
 }
 
-func name_at(anon r: regalloc.Reg, line: int64, first: Map[int64, int64]) -> none {
+func name_at(anon r: regalloc.Reg, line: int64, mut first: Map[int64, int64]) -> none {
     if ((r & 3) == 1 or (r & 3) == 2) and first.get(r >> 2) is none {
         first[r >> 2] = line
     }
@@ -1366,6 +1366,9 @@ type Codegen = shared struct {
     addressed_offs: [int64] = []
     // Whether hoist_loop_loads moved anything in the function it last saw.
     loads_hoisted: bool = false
+    // rc_hold's slots: those holding a call's receiver or arguments, and free ones.
+    holds: [int64] = []
+    hold_free: [int64] = []
     // See note_branches.
     branch_first: Map[str, int64] = Map[str, int64]()
     branch_last: Map[str, int64] = Map[str, int64]()
@@ -3352,12 +3355,11 @@ type Codegen = shared struct {
 
     // Default args compile per call site and generic bodies per instance.
     func is_repeat_report(self, anon msg: str, span: ast.Span) -> bool {
-        let seen = self.reported
         let key = f"{self.p.path}:{span.start}:{msg}"
-        if seen.contains(key) {
+        if self.reported.contains(key) {
             return true
         }
-        seen.set(key, 1)
+        self.reported.set(key, 1)
         // Struct instances count up from 0, function instances down from -2,
         // and enum instances down from -1000000.
         mut instance = self.body_instance
@@ -3369,10 +3371,10 @@ type Codegen = shared struct {
         }
         if instance != -1 {
             let pos_key = f"{self.p.path}:{span.start}"
-            if seen.get(pos_key) is Some(owner) {
+            if self.reported.get(pos_key) is Some(owner) {
                 return owner != instance
             }
-            seen.set(pos_key, instance)
+            self.reported.set(pos_key, instance)
         }
         return false
     }
@@ -4530,15 +4532,14 @@ type Codegen = shared struct {
         // dotted callee (`m.get(...)`) — the codegen does not currently
         // support three-part dotted call syntax like `self.interned.get`.
         // Map is a reference type so `m` shares state with `self.interned`.
-        let m = self.interned
-        if m.get(value) is Some(existing) {
+        if self.interned.get(value) is Some(existing) {
             return existing
         }
         // `l`, not `L`: the assembler keeps an `l` label as a (linker-private)
         // symbol, so `adrp`/`add` refer to the string itself. An `L` label becomes
         // an offset into the data section, and Mach-O can't encode one past 8 MB.
         let lbl = self.fresh("lstr")
-        m.set(value, lbl)
+        self.interned.set(value, lbl)
         self.str_labels += [lbl]
         self.str_values += [value]
         return lbl
@@ -5102,16 +5103,17 @@ type Codegen = shared struct {
 
     // `name` is a type the module at `path` declares, or one of its own aliases.
     func declare_type(self, anon name: str, path: str, ref: int64) -> none {
-        let own = self.type_scopes[self.type_scope_of(path)].own
-        if not own.contains(name) {
+        // The index first: finding the scope may add it.
+        let si = self.type_scope_of(path)
+        let scope = self.type_scopes[si]
+        if not scope.own.contains(name) {
             mut n = 0
             if self.type_names.get(name) is Some(k) {
                 n = k
             }
-            let names = self.type_names
-            names.set(name, n + 1)
+            self.type_names.set(name, n + 1)
         }
-        own.set(name, ref)
+        scope.own.set(name, ref)
     }
 
     // True if `idx` names the stdlib Result enum — either the template
@@ -5476,8 +5478,7 @@ type Codegen = shared struct {
         if s.template_idx >= 0 and s.method_idx.get(name) is Some(mi) {
             let key = f"{struct_idx}${name}"
             if not self.method_inst_idx.contains(key) {
-                let seen = self.method_inst_idx
-                seen.set(key, len(self.method_insts))
+                self.method_inst_idx.set(key, len(self.method_insts))
                 self.method_insts += [MethodInst(owner: struct_idx, decl_id: s.methods[mi].decl_id)]
             }
         }
@@ -5651,8 +5652,7 @@ type Codegen = shared struct {
         if self.type_scope_idx.get(path) is Some(ti) {
             return ti
         }
-        let m = self.type_scope_idx
-        m.set(path, len(self.type_scopes))
+        self.type_scope_idx.set(path, len(self.type_scopes))
         self.type_scopes += [TypeScope(:path)]
         self.cur_types_path = ""
         return len(self.type_scopes) - 1
@@ -5677,8 +5677,7 @@ type Codegen = shared struct {
         if self.scope_idx.contains(p.path) {
             return
         }
-        let m = self.scope_idx
-        m.set(p.path, len(self.scopes))
+        self.scope_idx.set(p.path, len(self.scopes))
         self.scopes += [ModuleScope(path: p.path, :prefix, :module, :p)]
     }
 
@@ -5686,16 +5685,15 @@ type Codegen = shared struct {
     func build_scope(self, anon si: int64) -> none {
         self.scopes[si].built = true
         let s = self.scopes[si]
-        let own = s.own
         mut di = 0
         for decl in s.module.decls {
             match decl {
                 .Func(decl_id) -> {
-                    own.set(s.p.func_decls[decl_id].name, di)
+                    s.own.set(s.p.func_decls[decl_id].name, di)
                     self.scopes[si].names += [s.p.func_decls[decl_id].name]
                 }
                 .Extern(name, _name_span, _params, _return_typ, _variadic) -> {
-                    own.set(name, di)
+                    s.own.set(name, di)
                     self.scopes[si].names += [name]
                 }
                 .Import(_module_name, local_name, items) -> {
@@ -5708,12 +5706,11 @@ type Codegen = shared struct {
             }
             di += 1
         }
-        // Numbered the way compile_module names them in their own module.
-        let lambdas = s.lambdas
+        // Numbered the way compile_module names them in their s.own module.
         mut k = 0
         for li in 1..len(s.p.func_decls) {
             if len(s.p.func_decls[li].name) == 0 {
-                lambdas.set(f"{li}", k)
+                s.lambdas.set(f"{li}", k)
                 k += 1
             }
         }
@@ -5744,8 +5741,7 @@ type Codegen = shared struct {
     }
 
     func push_scope_fn(self, anon si: int64, f: ImportFn) -> int64 {
-        let funcs = self.scopes[si].funcs
-        funcs.set(f.name, len(self.scope_fns))
+        self.scopes[si].funcs.set(f.name, len(self.scope_fns))
         self.scope_fns += [f]
         return len(self.scope_fns) - 1
     }
@@ -6357,8 +6353,7 @@ type Codegen = shared struct {
         if e.template_idx >= 0 and mi >= 0 {
             let key = f"e{enum_idx}${name}"
             if not self.method_inst_idx.contains(key) {
-                let seen = self.method_inst_idx
-                seen.set(key, len(self.method_insts))
+                self.method_inst_idx.set(key, len(self.method_insts))
                 self.method_insts += [MethodInst(owner: enum_idx, decl_id: e.methods[mi].decl_id, is_enum: true)]
             }
         }
@@ -6775,8 +6770,7 @@ type Codegen = shared struct {
         self.structs += [StructInfo(:body_depth, name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, field_idx: template.field_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key, shared: template.shared)]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
-        let insts = self.struct_insts
-        insts.set(key, new_idx)
+        self.struct_insts.set(key, new_idx)
         self.note_bad_key(new_idx)
         let saved_ctx = self.enter(template.src_p, names: template.type_param_names, args: type_args)
         self.inst_depth += 1
@@ -7018,8 +7012,7 @@ type Codegen = shared struct {
         let no_args: [TypeKind] = []
         let idx: int64 = len(self.enums)
         self.enums += [EnumInfo(name: f"union${idx}", :variants, data_width: 16, module_prefix: "builtins", src_p: self.p, def_path: "", def_span: ast.Span(start: 0), type_param_names: no_params, template_idx: -1, template_args: no_args, :key, is_union: true)]
-        let insts = self.enum_insts
-        insts.set(key, idx)
+        self.enum_insts.set(key, idx)
         return idx
     }
 
@@ -7521,8 +7514,7 @@ type Codegen = shared struct {
         self.enums += [EnumInfo(name: canonical, variants: template.variants, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, def_path: "", def_span: ast.Span(start: 0), type_param_names: empty_params, :template_idx, template_args: type_args, :key, methods: template.methods, :body_depth)]
         let new_idx: int64 = len(self.enums) - 1
         self.enum_idx.set(canonical, new_idx)
-        let insts = self.enum_insts
-        insts.set(key, new_idx)
+        self.enum_insts.set(key, new_idx)
         let saved_ctx = self.enter(template.src_p, names: template.type_param_names, args: type_args)
         self.inst_depth += 1
         mut new_variants: [VariantInfo] = []
@@ -7805,8 +7797,7 @@ type Codegen = shared struct {
         let label = self.decl_instance_label(f"${self.path_prefix}$inst{fn_ref.label}", args: type_args)
         self.func_insts += [FuncInst(sig: self.resolve_sig(sig.decl_id, p: sig.src_p, :type_args), :label, display: f"{name}[{", ".join(shown)}]")]
         let idx = len(self.func_insts) - 1
-        let insts = self.func_inst_idx
-        insts.set(key, idx)
+        self.func_inst_idx.set(key, idx)
         return idx
     }
 
@@ -8539,8 +8530,37 @@ type Codegen = shared struct {
         }
         if self.rc_heap_kind(self.infer_kind(expr_id)) {
             self.rc_retain(reg)
-            self.rc_temp(reg)
+            // Held in a slot of its own until the call returns (release_holds):
+            // held to the statement's end, a value in a field would have two
+            // holders while an `if`'s body changes it, and be copied.
+            mut slot = 0
+            if len(self.hold_free) > 0 {
+                slot = self.hold_free[-1]
+                self.hold_free = self.hold_free[0..len(self.hold_free) - 1]
+            } else {
+                // Empty when the function starts, and let go of at its exit
+                // if a jump out of the call's statement left it full.
+                slot = self.rc_new_slot()
+            }
+            self.emit_str_raw(slot, :reg)
+            self.holds += [slot]
         }
+    }
+
+    // Lets go of what rc_hold held since `mark`, once the call has returned.
+    func release_holds(self, anon mark: int64) -> none {
+        if len(self.holds) <= mark {
+            return
+        }
+        mut i = len(self.holds) - 1
+        for i >= mark {
+            self.emit_ldr(self.holds[i], reg: "x17")
+            self.emit_str_raw(self.holds[i], reg: "xzr")
+            self.rc_release_x17()
+            self.hold_free += [self.holds[i]]
+            i -= 1
+        }
+        self.holds = self.holds[0..mark]
     }
 
     // The 8-byte slots of a struct that hold references.
@@ -9762,8 +9782,7 @@ type Codegen = shared struct {
         }
         let key = f"{sig.src_p.path}:{sig.decl_id}:{owner}"
         self.last_nr_key = key
-        let memo = self.returns_memo
-        if memo.get(key) is Some(v) {
+        if self.returns_memo.get(key) is Some(v) {
             if v == 0 or v == 1 {
                 return v == 1
             }
@@ -9775,9 +9794,8 @@ type Codegen = shared struct {
         let depth = self.deciding_depth
         let outer_key = self.deciding_key
         let outer_rests = self.deciding_rests
-        memo.set(key, 2)
-        let heads = self.dependent_heads
-        heads.set(key, -1)
+        self.returns_memo.set(key, 2)
+        self.dependent_heads.set(key, -1)
         self.deciding_depth = depth + 1
         self.deciding_key = key
         self.deciding_rests = false
@@ -9790,14 +9808,14 @@ type Codegen = shared struct {
         self.deciding_key = outer_key
         self.deciding_rests = outer_rests
         if never {
-            memo.set(key, 1)
+            self.returns_memo.set(key, 1)
             self.drop_resting_on(key)
         } else if rests {
-            memo.set(key, -2)
+            self.returns_memo.set(key, -2)
             self.returns_pending += [key]
             self.rest_on(key)
         } else {
-            memo.set(key, 0)
+            self.returns_memo.set(key, 0)
         }
         if depth == 0 {
             self.settle_pending_returns()
@@ -9812,19 +9830,17 @@ type Codegen = shared struct {
             return
         }
         self.deciding_rests = true
-        let heads = self.dependent_heads
         mut head = -1
-        if heads.get(key) is Some(h) {
+        if self.dependent_heads.get(key) is Some(h) {
             head = h
         }
-        heads.set(key, len(self.dependent_keys))
+        self.dependent_heads.set(key, len(self.dependent_keys))
         self.dependent_keys += [caller]
         self.dependent_next += [head]
     }
 
     // What rested on `key` returning has to be decided again.
     func drop_resting_on(self, anon key: str) -> none {
-        let memo = self.returns_memo
         let heads = self.dependent_heads
         mut todo = [key]
         mut i = 0
@@ -9835,8 +9851,8 @@ type Codegen = shared struct {
             }
             for e >= 0 {
                 let dependent = self.dependent_keys[e]
-                if memo.get(dependent) is Some(v) and v == -2 {
-                    memo.set(dependent, -1)
+                if self.returns_memo.get(dependent) is Some(v) and v == -2 {
+                    self.returns_memo.set(dependent, -1)
                     todo += [dependent]
                 }
                 e = self.dependent_next[e]
@@ -9847,10 +9863,9 @@ type Codegen = shared struct {
 
     // The callers these assumed to return have all done so.
     func settle_pending_returns(self) -> none {
-        let memo = self.returns_memo
         for key in self.returns_pending {
-            if memo.get(key) is Some(v) and v == -2 {
-                memo.set(key, 0)
+            if self.returns_memo.get(key) is Some(v) and v == -2 {
+                self.returns_memo.set(key, 0)
             }
         }
         let none_pending: [str] = []
@@ -9946,11 +9961,10 @@ type Codegen = shared struct {
 
     // So a hint can name the call in a chain that was taken not to return.
     func note_trust_end(self, anon expr_id: int64) -> none {
-        let ends = self.trust_ends
-        if len(self.trust_why) == 0 and not (ends.get(self.last_nr_key) is Some(_i)) {
+        if len(self.trust_why) == 0 and not (self.trust_ends.get(self.last_nr_key) is Some(_i)) {
             return
         }
-        ends.set(self.deciding_key, len(self.trust_end_exprs))
+        self.trust_ends.set(self.deciding_key, len(self.trust_end_exprs))
         self.trust_end_exprs += [expr_id]
         self.trust_end_ps += [self.p]
         self.trust_end_fns += [self.walking_fn]
@@ -10005,13 +10019,17 @@ type Codegen = shared struct {
         if not (self.p.exprs[expr_id] is .Call(_callee, _args)) {
             return ""
         }
+        // The trusting answers stand in for the others while this runs; each
+        // map has one holder, so the answers it adds aren't copied.
         let saved = self.returns_memo
         self.returns_memo = self.trusted_memo
+        self.trusted_memo = FuncIdx()
         self.trust_locals = true
         self.last_nr_key = ""
         let never = self.is_diverging_call(expr_id)
         let key = self.last_nr_key
         self.trust_locals = false
+        self.trusted_memo = self.returns_memo
         self.returns_memo = saved
         if not never {
             return ""
@@ -10031,13 +10049,12 @@ type Codegen = shared struct {
 
     // Follows the calls functions end in to the one taken on trust, remembering the answer.
     func trust_site(self, anon start: str) -> int64 {
-        let sites = self.trust_sites
         let ends = self.trust_ends
         mut path: [str] = []
         mut key = start
         mut found = -1
         for len(path) <= len(self.trust_end_exprs) {
-            if sites.get(key) is Some(known) {
+            if self.trust_sites.get(key) is Some(known) {
                 found = known
                 break
             }
@@ -10050,7 +10067,7 @@ type Codegen = shared struct {
             key = self.trust_end_vias[i]
         }
         for k in path {
-            sites.set(k, found)
+            self.trust_sites.set(k, found)
         }
         return found
     }
@@ -10588,7 +10605,9 @@ type Codegen = shared struct {
             }
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
             .Call(callee, args) -> {
+                let hold_mark = len(self.holds)
                 let val = self.compile_call(args, callee_id: callee)
+                self.release_holds(hold_mark)
                 self.report_unchecked_mut_args(args)
                 return self.rc_call_result(expr_id, :callee, :val)
             }
@@ -13459,11 +13478,11 @@ type Codegen = shared struct {
 
     func check_duplicate_decls(self, anon module: ast.Module) -> none {
         self.check_alias_locals(module)
-        let seen = FuncIdx()
+        mut seen = FuncIdx()
         // The names an import lists before any declaration of them.
-        let listed = FuncIdx()
+        mut listed = FuncIdx()
         // Each import's alias, by the position of its path.
-        let aliases = FuncIdx()
+        mut aliases = FuncIdx()
         let path_ats = self.import_token_offsets(items: false)
         let item_ats = self.import_token_offsets(items: true)
         mut import_i = 0
@@ -13499,7 +13518,7 @@ type Codegen = shared struct {
                             self.report_error(self.with_suggestion(f"error: module `{alias_shown(local_name)}` has no function, constant or type `{item}`", typo: item, candidates: self.module_public_names(local_name)), :span)
                         }
                         if seen.contains(item) {
-                            self.check_first_name(seen, :listed, name: item, :span)
+                            self.check_first_name(mut seen, :listed, name: item, :span)
                         } else {
                             seen.set(item, span.start)
                             listed.set(item, 1)
@@ -13508,13 +13527,13 @@ type Codegen = shared struct {
                 }
                 .Func(decl_id) -> {
                     let fd = self.p.func_decls[decl_id]
-                    self.check_first_name(seen, :listed, name: fd.name, span: fd.name_span)
+                    self.check_first_name(mut seen, :listed, name: fd.name, span: fd.name_span)
                 }
                 .Struct(name, name_span, _type_params, fields, methods, _shared) -> {
-                    self.check_first_name(seen, :listed, :name, span: name_span)
-                    let seen_fields = FuncIdx()
+                    self.check_first_name(mut seen, :listed, :name, span: name_span)
+                    mut seen_fields = FuncIdx()
                     for field in fields {
-                        self.check_first_member(seen_fields, name: f"{name}.{field.name}", span: field.name_span)
+                        self.check_first_member(mut seen_fields, name: f"{name}.{field.name}", span: field.name_span)
                     }
                     for method_id in methods {
                         let md = self.p.func_decls[method_id]
@@ -13525,33 +13544,33 @@ type Codegen = shared struct {
                     self.check_duplicate_methods(name, :methods)
                 }
                 .Enum(name, name_span, _type_params, variants, methods) -> {
-                    self.check_first_name(seen, :listed, :name, span: name_span)
-                    let seen_variants = FuncIdx()
+                    self.check_first_name(mut seen, :listed, :name, span: name_span)
+                    mut seen_variants = FuncIdx()
                     for variant in variants {
-                        self.check_first_member(seen_variants, name: f"{name}.{variant.name}", span: variant.name_span)
+                        self.check_first_member(mut seen_variants, name: f"{name}.{variant.name}", span: variant.name_span)
                     }
                     self.check_duplicate_methods(name, :methods)
                 }
                 .Interface(name, name_span, methods) -> {
-                    self.check_first_name(seen, :listed, :name, span: name_span)
+                    self.check_first_name(mut seen, :listed, :name, span: name_span)
                     self.check_duplicate_methods(name, :methods)
                 }
-                .Extern(name, name_span, _params, _return_typ, _variadic) -> self.check_first_name(seen, :listed, :name, span: name_span)
-                .TypeAlias(name, _target, name_span) -> self.check_first_name(seen, :listed, :name, span: name_span)
+                .Extern(name, name_span, _params, _return_typ, _variadic) -> self.check_first_name(mut seen, :listed, :name, span: name_span)
+                .TypeAlias(name, _target, name_span) -> self.check_first_name(mut seen, :listed, :name, span: name_span)
                 else none
             }
         }
     }
 
     // A module's own name, which an earlier import may have listed already.
-    func check_first_name(self, anon seen: FuncIdx, listed: FuncIdx, name: str, span: ast.Span) -> none {
+    func check_first_name(self, anon mut seen: FuncIdx, listed: FuncIdx, name: str, span: ast.Span) -> none {
         if listed.contains(name) {
             if seen.get(name) is Some(first) {
                 self.report_error(f"error: `{name}` is already imported on line {self.line_of_offset(first)}", :span)
                 return
             }
         }
-        self.check_first_decl(seen, :name, shown: name, :span)
+        self.check_first_decl(mut seen, :name, shown: name, :span)
     }
 
     // Where each import's path starts in the module's source, or with `items`
@@ -13598,21 +13617,21 @@ type Codegen = shared struct {
     }
 
     func check_duplicate_methods(self, anon owner: str, methods: [int64]) -> none {
-        let seen = FuncIdx()
+        mut seen = FuncIdx()
         for method_id in methods {
             let fd = self.p.func_decls[method_id]
-            self.check_first_decl(seen, name: fd.name, shown: f"{owner}.{fd.name}", span: fd.name_span)
+            self.check_first_decl(mut seen, name: fd.name, shown: f"{owner}.{fd.name}", span: fd.name_span)
         }
     }
 
     // A parse error can leave a member named by the token it stopped at.
-    func check_first_member(self, anon seen: FuncIdx, name: str, span: ast.Span) -> none {
+    func check_first_member(self, anon mut seen: FuncIdx, name: str, span: ast.Span) -> none {
         if len(self.p.errors) == 0 {
-            self.check_first_decl(seen, :name, shown: name, :span)
+            self.check_first_decl(mut seen, :name, shown: name, :span)
         }
     }
 
-    func check_first_decl(self, anon seen: FuncIdx, name: str, shown: str, span: ast.Span) -> none {
+    func check_first_decl(self, anon mut seen: FuncIdx, name: str, shown: str, span: ast.Span) -> none {
         if seen.get(name) is Some(first) {
             self.report_error(f"error: `{shown}` is already declared on line {self.line_of_offset(first)}", :span)
             return
@@ -15494,15 +15513,14 @@ type Codegen = shared struct {
                 phase = "C"
             }
             let shown = f"{phase} {self.kind_display(kind)}"
-            let seen = self.shadow_seen
-            if seen.get(key) is Some(first) {
+            if self.shadow_seen.get(key) is Some(first) {
                 if first != shown and first[2..] != shown[2..] {
                     let pos = self.line_of_offset(self.p.expr_spans[expr_id].start)
                     kod_eprint(f"SHADOW {first[0..1]}{shown[0..1]} {self.p.path}:{pos} {first[2..]} -> {shown[2..]}")
                 }
-                seen.set(key, shown)
+                self.shadow_seen.set(key, shown)
             } else {
-                seen.set(key, shown)
+                self.shadow_seen.set(key, shown)
             }
         }
         return kind
@@ -15558,8 +15576,7 @@ type Codegen = shared struct {
         if key < 0 {
             return
         }
-        let recorded = self.recorded_kinds
-        recorded.set(key, kind)
+        self.recorded_kinds.set(key, kind)
     }
 
     func infer_kind_raw(self, anon expr_id: int64) -> TypeKind {
@@ -16036,7 +16053,10 @@ type Codegen = shared struct {
 
     func compile_stmt_now(self, anon stmt_id: int64) -> none {
         let rc_mark = len(self.rc_stmt_temps)
+        let hold_mark = len(self.holds)
         self.compile_stmt_body(stmt_id)
+        // Holds of calls compiled some other way than as a call expression.
+        self.release_holds(hold_mark)
         // A result nothing kept.
         if self.rc_pending and self.rc_pending_slot == 0 {
             self.rc_pending = false
@@ -19093,7 +19113,7 @@ type Codegen = shared struct {
         if not has_check {
             return body
         }
-        let label_at = Map[str, int64]()
+        mut label_at = Map[str, int64]()
         for i, insn in body {
             if insn is .Label(name) {
                 label_at[name] = i
@@ -19249,7 +19269,7 @@ type Codegen = shared struct {
     func hoist_loop_loads(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
         self.loads_hoisted = false
         // Only loops' labels (Lfor..., Lfe...): what a backward branch goes to.
-        let label_at = Map[str, int64]()
+        mut label_at = Map[str, int64]()
         mut has_loop = false
         for i, insn in body {
             if insn is .Label(name) {
@@ -19332,13 +19352,13 @@ type Codegen = shared struct {
             }
             // Per vreg in the loop: how often it's written, the last line that
             // writes it, and the first line that names it.
-            let def_count = Map[int64, int64]()
-            let def_line = Map[int64, int64]()
-            let first_named = Map[int64, int64]()
+            mut def_count = Map[int64, int64]()
+            mut def_line = Map[int64, int64]()
+            mut first_named = Map[int64, int64]()
             mut candidates = false
             for k in top + 1..back {
                 let insn = body[k]
-                note_named(insn, line: k, first: first_named)
+                note_named(insn, line: k, first: mut first_named)
                 let w = written_reg(insn)
                 if (w & 3) == 1 or (w & 3) == 2 {
                     def_count[w >> 2] = (def_count.get(w >> 2)? or 0) + 1
@@ -20827,6 +20847,8 @@ type Codegen = shared struct {
         self.assigned_names = []
         self.addressed_offs = []
         self.mut_checked = []
+        self.holds = []
+        self.hold_free = []
         self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
@@ -21154,11 +21176,10 @@ type Codegen = shared struct {
         self.check_module_types(module)
 
         for decl in module.decls {
-            let idx_m = self.func_idx
             match decl {
                 .Func(decl_id) -> {
                     let func_decl = self.p.func_decls[decl_id]
-                    idx_m.set(func_decl.name, len(self.func_names))
+                    self.func_idx.set(func_decl.name, len(self.func_names))
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${self.path_prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(decl_id, p: self.p)]
@@ -21167,7 +21188,7 @@ type Codegen = shared struct {
                     self.func_docs += [func_decl.doc]
                 }
                 .Extern(name, name_span, params, return_typ, variadic) -> {
-                    idx_m.set(name, len(self.func_names))
+                    self.func_idx.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [extern_label(name)]
                     self.func_sigs += [self.resolve_extern_sig(params, :return_typ, p: self.p, :variadic)]
@@ -21193,8 +21214,7 @@ type Codegen = shared struct {
             if len(self.p.func_decls[li].name) == 0 {
                 let synthesized: str = f"__lambda_{len(lambda_decl_ids)}"
                 self.p.func_decls[li].name = synthesized
-                let idx_m = self.func_idx
-                idx_m.set(synthesized, len(self.func_names))
+                self.func_idx.set(synthesized, len(self.func_names))
                 self.func_names += [synthesized]
                 self.func_labels += [f"${self.path_prefix}${synthesized}"]
                 self.func_sigs += [self.resolve_sig(li, p: self.p)]
@@ -21538,12 +21558,11 @@ type Codegen = shared struct {
     // Registers the builtins before compile_module and sets builtins_path.
     func register_module_funcs(self, anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
         self.builtins_path = p.path
-        let idx_m = self.func_idx
         for decl in module.decls {
             match decl {
                 .Func(decl_id) -> {
                     let func_decl = p.func_decls[decl_id]
-                    idx_m.set(func_decl.name, len(self.func_names))
+                    self.func_idx.set(func_decl.name, len(self.func_names))
                     self.func_names += [func_decl.name]
                     self.func_labels += [f"${prefix}${func_decl.name}"]
                     self.func_sigs += [self.resolve_sig(decl_id, :p)]
@@ -21552,7 +21571,7 @@ type Codegen = shared struct {
                     self.func_docs += [func_decl.doc]
                 }
                 .Extern(name, name_span, params, return_typ, variadic) -> {
-                    idx_m.set(name, len(self.func_names))
+                    self.func_idx.set(name, len(self.func_names))
                     self.func_names += [name]
                     self.func_labels += [extern_label(name)]
                     self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p, :variadic)]
@@ -21587,14 +21606,13 @@ type Codegen = shared struct {
     // For functions/externs this appends to func_names/func_labels/func_sigs.
     // Types need no entry: a module's import list names them (see TypeScope).
     func register_imported_items(self, anon items: [str], anon module: ast.Module, prefix: str, p: parsing.Parser) -> none {
-        let idx_m = self.func_idx
         for want in items {
             for decl in module.decls {
                 match decl {
                     .Func(decl_id) -> {
                         let func_decl = p.func_decls[decl_id]
                         if func_decl.name == want {
-                            idx_m.set(func_decl.name, len(self.func_names))
+                            self.func_idx.set(func_decl.name, len(self.func_names))
                             self.func_names += [func_decl.name]
                             self.func_labels += [f"${prefix}${func_decl.name}"]
                             self.func_sigs += [self.resolve_sig(decl_id, :p)]
@@ -21605,7 +21623,7 @@ type Codegen = shared struct {
                     }
                     .Extern(name, name_span, params, return_typ, variadic) -> {
                         if name == want {
-                            idx_m.set(name, len(self.func_names))
+                            self.func_idx.set(name, len(self.func_names))
                             self.func_names += [name]
                             self.func_labels += [extern_label(name)]
                             self.func_sigs += [self.resolve_extern_sig(params, :return_typ, :p, :variadic)]

@@ -112,8 +112,16 @@ that is, so the `int64` 0 and the `bool` false don't collide.
 
 A built-in generic. Open-addressing hash map (PEP 468 dense + sparse).
 
+A map is a value, like an array: `let n = m` gives `n` the map as it is, and
+`m.set(...)` afterwards changes only `m`. So `set`, `remove` and `m[k] = v`
+need a map that may be changed, a `mut` binding, a field, or a `mut`
+parameter, and a function that fills a caller's map takes it as a
+[`mut` parameter](functions.md#mut-parameters). Nothing is copied until a
+map another holder still has is changed. `Set[T]` (in `sets`) is a value the
+same way.
+
 ```kod
-let m: Map[str, int64] = Map[str, int64]()
+mut m: Map[str, int64] = Map[str, int64]()
 m.set("a", 1)
 m.set("b", 2)
 match m.get("a") {

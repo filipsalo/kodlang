@@ -54,7 +54,7 @@ For failures that aren't a boolean check, call the builtin `fail`:
 
 ```kod
 test "map lookup hits" {
-    let m: Map[str, int64] = Map[str, int64]()
+    mut m: Map[str, int64] = Map[str, int64]()
     m.set("a", 1)
     match m.get("a") {
         Some(v) -> assert v == 1

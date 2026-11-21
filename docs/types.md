@@ -166,9 +166,9 @@ out``.
 
 Another module reads a variable the way it reads a constant (`import "stats" { calls }`
 or `stats.calls`), but only the declaring module assigns it: `` `calls` can only be
-assigned in stats.kod ``. A value the variable holds can still be changed through
-its methods, fields and elements from anywhere (`stats.seen.set(...)`), as with any
-reference. A name that starts with `_` keeps the variable private to its module. A local of the same name
+assigned in stats.kod ``, and only it changes an array, map or struct the variable
+holds (`seen.set(...)`). A shared struct the variable holds can be changed through
+its fields from anywhere, as with any shared struct. A name that starts with `_` keeps the variable private to its module. A local of the same name
 hides it, and a variable, constant or function can't share a name in one module. A
 constant can't use a variable, since a constant has no side effects
 (`` a module-level constant can't use the variable `calls` ``). A variable or constant
