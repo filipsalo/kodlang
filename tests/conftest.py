@@ -9,20 +9,14 @@ import pytest
 # Tests that change what every other test uses: they rebuild or replace the
 # `kod` driver, write into the project root, or run `make` on the real tree.
 # `make test` runs them one at a time, after the rest has run in parallel.
-SERIAL_MODULES = {"build_plumbing_test.py", "launcher_test.py"}
-# Kod test files that run `make` on the real tree, serial for the same reason.
-SERIAL_KOD_TESTS = {"tests/bootstrap_test.kod"}
-
-# The tests of a serial module that run in parallel all the same: those in a
-# directory of their own (a copy of the root, or no root at all), and those
-# that build into build/apps under names no other test uses (`scratch`), which
-# share one worker, but for the ones that replace a tool or count what the
-# cache holds.
-OWN_ROOT_FIXTURES = {"driver_root", "make_root", "elsewhere"}
-SCRATCH_SERIAL = {
-    "test_a_module_compiled_before_comes_from_the_cache",
-    "test_an_entry_that_would_replace_a_tool_is_refused",
-    "test_the_source_of_a_tool_is_not_refused_however_it_is_spelled",
+SERIAL_MODULES = {"launcher_test.py"}
+# Kod test files serial for the same reasons: build_names writes probe files at
+# the root and rebuilds the `kod` and `lsp` tools; bootstrap runs `make` on the
+# real tree. (build_config only reads it, with `make -n` and `make -q`, and
+# nothing in the parallel pass rebuilds it.)
+SERIAL_KOD_TESTS = {
+    "tests/bootstrap_test.kod",
+    "tests/build_names_test.kod",
 }
 
 # Kod test files whose tests build through stdlib/kod/test_support.kod, which
@@ -41,6 +35,14 @@ TEST_SUPPORT_USERS = {
 # does not end waiting on one that started late.
 SLOW_GROUPS = {"test_support", "http_client_test"}
 SLOW_TESTS = {"test_selfhost_fixed_point", "test_unit_tests"}
+# Kod test files whose tests run one after another for several seconds.
+SLOW_KOD_TESTS = {
+    "tests/build_link_inputs_test.kod",
+    "tests/compiler_limits_test.kod",
+    "tests/build_config_test.kod",
+    "tests/stdio_test.kod",
+    "tests/lsp_test.kod",
+}
 
 # Modules whose tests all build the same program.
 SHARED_PROGRAM = {
@@ -55,8 +57,6 @@ def build_group(item: pytest.Item) -> str | None:
     module = item.path.name
     if module in SHARED_PROGRAM:
         return SHARED_PROGRAM[module]
-    if module in SERIAL_MODULES and "scratch" in getattr(item, "fixturenames", ()):
-        return "serial_module_scratch"
     callspec = getattr(item, "callspec", None)
     path = callspec.params.get("path") if callspec else None
     if path is None:
@@ -76,7 +76,7 @@ def pytest_configure(config: pytest.Config) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
-        if item.path.name in SERIAL_MODULES and not runs_in_parallel(item):
+        if item.path.name in SERIAL_MODULES:
             item.add_marker(pytest.mark.serial)
         if test_block_path(item) in SERIAL_KOD_TESTS:
             item.add_marker(pytest.mark.serial)
@@ -92,15 +92,12 @@ def test_block_path(item: pytest.Item) -> str | None:
     return None if path is None else str(path)
 
 
-def runs_in_parallel(item: pytest.Item) -> bool:
-    fixtures = set(getattr(item, "fixturenames", ()))
-    if fixtures & OWN_ROOT_FIXTURES:
-        return True
-    return "scratch" in fixtures and item.originalname not in SCRATCH_SERIAL
-
-
 def is_slow(item: pytest.Item) -> bool:
-    return build_group(item) in SLOW_GROUPS or item.originalname in SLOW_TESTS
+    return (
+        build_group(item) in SLOW_GROUPS
+        or item.originalname in SLOW_TESTS
+        or test_block_path(item) in SLOW_KOD_TESTS
+    )
 
 
 @pytest.fixture(scope="session")

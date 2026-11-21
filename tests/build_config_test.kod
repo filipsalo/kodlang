@@ -1,0 +1,1375 @@
+// The link configuration (docs/self-hosting.md, "The link configuration"):
+// `link.cfg` is read by Make and by the driver, and programs are linked the way
+// it says; `link.local.cfg` overrides single names on one machine.
+//
+// Every program runs under a bounded wait: one that does not end within
+// `WAIT_S` seconds is killed with everything it started, and the test fails.
+// What a test makes goes under build/tmp_build_config/ (a directory that the
+// driver or Make takes for the repository root included) and is removed when
+// the test ends; nothing outside build/ is changed.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "sort"
+import "strbuilder" { StrBuilder }
+import "time"
+import "time" { Duration, monotonic_ns }
+import "unsafe"
+
+extern func getcwd(anon buf: int64, anon size: int64) -> int64
+
+let SCRATCH: str = "build/tmp_build_config"
+let WAIT_S: int64 = 60
+let SIGSTOP: int64 = 17
+let SIGKILL: int64 = 9
+
+// Older than anything built: 2000-01-01, 946684800 s after the epoch.
+let LONG_AGO: str = "2000-01-01T00:00:00Z"
+
+// --- Running programs, bounded ------------------------------------------------
+
+// The repository root (where `kod test` runs), as an absolute path.
+func root() -> str {
+    let buf = unsafe.alloc(4096)
+    let got = getcwd(buf, 4096)
+    mut path = ""
+    if got != 0 {
+        path = unsafe.str_at(buf)
+    }
+    unsafe.free(buf)
+    return path
+}
+
+func kod() -> str {
+    return f"{root()}/build/apps/kod/kod"
+}
+
+type Ran = struct {
+    // The exit status, minus the signal that ended it, or -1000 when it could
+    // not be started or had to be killed.
+    status: int64
+    stdout: str
+    stderr: str
+}
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: posix.Fd, into: StrBuilder) -> none {
+    match f.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                let _ = f.close()
+            } else {
+                into.append_bytes(data)
+            }
+        }
+        Err(_) -> {
+            let _ = f.close()
+        }
+    }
+}
+
+// Run `argv` in `dir` (the root unless given), stdin /dev/null, and collect
+// its output; killed with what it started after WAIT_S seconds.
+func run(anon argv: [str], dir: str = "", env: [str]? = none, add_env: [str] = []) -> Ran {
+    let what = " ".join(argv)
+    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe, :dir, :env, :add_env) {
+        Ok(child) -> return finish(child, what: what)
+        Err(e) -> {
+            fail(f"start {what}: {e.to_str()}")
+            return Ran(status: -1000, stdout: "", stderr: "")
+        }
+    }
+}
+
+func finish(anon child: process.Child, what: str) -> Ran {
+    let deadline = monotonic_ns() + WAIT_S * 1000000000
+    let out = StrBuilder()
+    let err = StrBuilder()
+    mut expired = false
+    for child.stdout.fd >= 0 or child.stderr.fd >= 0 {
+        let left = (deadline - monotonic_ns()) / 1000000
+        if left <= 0 {
+            expired = true
+            break
+        }
+        match posix.poll(read: [child.stdout, child.stderr], timeout: Duration(ms: left)) {
+            Ok(ready) -> {
+                if ready.read[0] {
+                    take(child.stdout, into: out)
+                }
+                if ready.read[1] {
+                    take(child.stderr, into: err)
+                }
+            }
+            Err(e) -> {
+                fail(f"poll {what}: {e.to_str()}")
+                expired = true
+                break
+            }
+        }
+    }
+    mut raw = -1
+    for not expired {
+        match process.wait_status(child.pid, name: what, hang: false) {
+            Ok(status) -> raw = status
+            Err(_) -> break
+        }
+        if raw >= 0 {
+            break
+        }
+        if monotonic_ns() > deadline {
+            expired = true
+        } else {
+            time.sleep(Duration(ms: 2))
+        }
+    }
+    for f in [child.stdout, child.stderr] {
+        if f.fd >= 0 {
+            let _ = f.close()
+        }
+    }
+    if expired {
+        kill_tree(child.pid)
+        let _ = process.wait_status(child.pid, name: what, hang: true)
+        fail(f"{what}: killed, still running after {WAIT_S} s")
+        return Ran(status: -1000, stdout: out.to_str(), stderr: err.to_str())
+    }
+    mut status = -1000
+    if raw >= 0 {
+        let sig = raw & 127
+        if sig == 0 {
+            status = (raw >> 8) & 255
+        } else {
+            status = -sig
+        }
+    }
+    return Ran(:status, stdout: out.to_str(), stderr: err.to_str())
+}
+
+// --- Files --------------------------------------------------------------------
+
+// A fresh directory below build/tmp_build_config, named after `what`.
+func scratch(anon what: str) -> str {
+    let dir = f"{root()}/{SCRATCH}/{what}_{libc.getpid()}_{monotonic_ns()}"
+    run(["mkdir", "-p", dir])
+    return dir
+}
+
+// Remove `dir`, and build/tmp_build_config once nothing else is in it.
+func remove(anon dir: str) -> none {
+    run(["rm", "-rf", dir])
+    run(["rmdir", f"{root()}/{SCRATCH}"])
+}
+
+func write(anon path: str, anon text: str) -> none {
+    if io.write_file(path, text) != 0 {
+        fail(f"cannot write {path}")
+    }
+}
+
+// Write `path` and give it a time older than anything built, as a file
+// restored from a backup has, so that only its content can tell.
+func written_long_ago(anon path: str, anon text: str) -> none {
+    write(path, text)
+    run(["touch", "-d", LONG_AGO, path])
+}
+
+// The names in `dir`, sorted, dot files included.
+func listing(anon dir: str) -> [str] {
+    mut names: [str] = []
+    for name in run(["ls", "-A", dir]).stdout.split("\n") {
+        if name != "" {
+            names += [name]
+        }
+    }
+    return sort.sorted(names)
+}
+
+// --- Text ---------------------------------------------------------------------
+
+func is_space(anon c: int64) -> bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+}
+
+// `s` split on runs of whitespace, as Python's `str.split()`.
+func words(anon s: str) -> [str] {
+    mut out: [str] = []
+    mut start = -1
+    for i in 0..len(s) {
+        if is_space(s[i]) {
+            if start >= 0 {
+                out += [s[start..i]]
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+    }
+    if start >= 0 {
+        out += [s[start..len(s)]]
+    }
+    return out
+}
+
+// What comes before the first `sep` in `s` (all of `s` without one).
+func before(anon s: str, anon sep: str) -> str {
+    if s.find(sep) is int64(at) {
+        return s[0..at]
+    }
+    return s
+}
+
+// What comes after the first `sep` in `s` ("" without one).
+func after(anon s: str, anon sep: str) -> str {
+    if s.find(sep) is int64(at) {
+        return s[at + len(sep)..len(s)]
+    }
+    return ""
+}
+
+// The file name of `path` without its last suffix, as Python's `Path.stem`.
+func stem(anon path: str) -> str {
+    mut base = path
+    for i in 0..len(path) {
+        if path[i] == '/' {
+            base = path[i + 1..len(path)]
+        }
+    }
+    mut dot = -1
+    for i in 1..len(base) {
+        if base[i] == '.' {
+            dot = i
+        }
+    }
+    if dot > 0 {
+        return base[0..dot]
+    }
+    return base
+}
+
+func show(anon xs: [str]) -> str {
+    mut quoted: [str] = []
+    for x in xs {
+        quoted += [f"`{x}`"]
+    }
+    return f"[{", ".join(quoted)}]"
+}
+
+func contains(anon xs: [str], anon x: str) -> bool {
+    for y in xs {
+        if y == x {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether `want` occurs in `words` as a run of adjacent words.
+func adjacent(anon words: [str], anon want: [str]) -> bool {
+    for i in 0..len(words) - len(want) + 1 {
+        if words[i..i + len(want)] == want {
+            return true
+        }
+    }
+    return false
+}
+
+// The index of `x` in `xs`, -1 if it is not there.
+func index_of(anon xs: [str], anon x: str) -> int64 {
+    for i, y in xs {
+        if y == x {
+            return i
+        }
+    }
+    return -1
+}
+
+// xs[from..to], cut to what there is.
+func slice(anon xs: [str], anon from: int64, anon to: int64) -> [str] {
+    mut a = from
+    mut b = to
+    if b > len(xs) {
+        b = len(xs)
+    }
+    if a > b {
+        a = b
+    }
+    return xs[a..b]
+}
+
+// --- The link configuration ------------------------------------------------
+
+func link_cfg() -> str {
+    return f"{root()}/link.cfg"
+}
+
+func local_cfg() -> str {
+    return f"{root()}/link.local.cfg"
+}
+
+// The grammar of a line of link.cfg: empty, a comment, or `NAME := words`.
+// Make and the driver read a line of this shape the same way; anything else
+// is a line one of them would read differently. As a regular expression:
+//   comment  #(?:[^\t\r]*[^\t\r\\])?
+//   name     [A-Z][A-Z0-9_]*
+//   word     [A-Za-z0-9_./,=+@-]+
+//   line     (?:comment|name :=(?: word)*)?
+func cfg_line(anon line: str) -> bool {
+    if line == "" {
+        return true
+    }
+    if line[0] == '#' {
+        for c in line {
+            if c == '\t' or c == '\r' {
+                return false
+            }
+        }
+        return len(line) == 1 or line[len(line) - 1] != '\\'
+    }
+    if not (line[0] >= 'A' and line[0] <= 'Z') {
+        return false
+    }
+    mut i = 1
+    for i < len(line) and is_name_char(line[i]) {
+        i += 1
+    }
+    mut rest = line[i..len(line)]
+    if not rest.starts_with(" :=") {
+        return false
+    }
+    rest = rest[3..len(rest)]
+    for rest != "" {
+        if rest[0] != ' ' {
+            return false
+        }
+        mut j = 1
+        for j < len(rest) and is_word_char(rest[j]) {
+            j += 1
+        }
+        if j == 1 {
+            return false
+        }
+        rest = rest[j..len(rest)]
+    }
+    return true
+}
+
+func is_name_char(anon c: int64) -> bool {
+    return (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+}
+
+func is_word_char(anon c: int64) -> bool {
+    if (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') {
+        return true
+    }
+    for w in "_./,=+@-" {
+        if c == w {
+            return true
+        }
+    }
+    return false
+}
+
+// The names the files set and their words; a later file overrides an
+// earlier one, as for Make and the driver.
+func cfg_values(anon files: [str]) -> Map[str, [str]] {
+    mut values = Map[str, [str]]()
+    for path in files {
+        if io.is_file(path) {
+            for line in io.read_file(path).split("\n") {
+                if line != "" and not line.starts_with("#") {
+                    values[before(line, " :=")] = words(after(line, " :="))
+                }
+            }
+        }
+    }
+    return values
+}
+
+// The objects every program links: the C runtime, then the always-linked
+// modules, as `config` (or its `modules`) names them.
+func always_linked(anon config: Map[str, [str]], modules: [str]? = none) -> [str] {
+    mut objects: [str] = []
+    for c in config["RUNTIME_C", default: []] {
+        objects += [f"build/stage0/{stem(c)}.o"]
+    }
+    for m in modules? or config["STAGE0_KOD", default: []] {
+        objects += [f"build/stage0/_{stem(m)}.o"]
+    }
+    return objects
+}
+
+// Run `make <args>` in `dir` (the root unless given).
+func make_in(anon args: [str], dir: str = "") -> Ran {
+    return run(["make"] + args, :dir)
+}
+
+// The recipe lines `make -n -B <args>` prints, a continued line as one.
+func make_recipes(anon args: [str], dir: str = "") -> [str] {
+    let made = make_in(["-n", "-B"] + args, :dir)
+    if made.status != 0 {
+        fail(f"make -n -B {" ".join(args)}: {made.stderr}")
+    }
+    assert not made.stderr.contains("No rule to make target")
+    return made.stdout.replace("\\\n", to: " ").split("\n")
+}
+
+// What Make reads from the makefile `name` in `dir`: its variables and their
+// values, from Make's database.
+func make_variables(anon dir: str, name: str) -> Map[str, str] {
+    let made = run(["make", "-pq", "-f", name], :dir)
+    mut variables = Map[str, str]()
+    mut previous = ""
+    for line in made.stdout.split("\n") {
+        if previous.starts_with("# makefile (from ") and previous.contains(name) {
+            let var = before(line, " := ")
+            // Make's own, listed there too
+            if var != "MAKEFILE_LIST" {
+                variables[var] = after(line, " := ")
+            }
+        }
+        previous = line
+    }
+    return variables
+}
+
+func map_text(anon m: Map[str, str]) -> str {
+    mut entries: [str] = []
+    for k, v in m {
+        entries += [f"{k}=`{v}`"]
+    }
+    return "\n".join(sort.sorted(entries))
+}
+
+test "no file but the docs names the linker flags and sdk it used to" {
+    // In pieces, so that this file does not hold them.
+    let needles = ["Command" + "LineTools", "macos_" + "version", "sw_" + "vers"]
+    mut argv = ["git", "grep", "-n", "-i", "-I"]
+    for n in needles {
+        argv += [f"-e{n}"]
+    }
+    let found = run(argv + ["--", ".", ":!docs"])
+    if found.status != 1 {
+        fail(found.stdout)
+    }
+}
+
+test "link.cfg is tracked and link.local.cfg is not" {
+    let listed = run(["git", "ls-files", "--error-unmatch", "link.cfg"])
+    if listed.status != 0 {
+        fail(listed.stderr)
+    }
+    let ignored = run(["git", "check-ignore", "-q", "link.local.cfg"])
+    assert ignored.status == 0
+}
+
+test "link.cfg obeys the restricted grammar" {
+    let text = io.read_file(link_cfg())
+    assert text.ends_with("\n")
+    let lines = text.split("\n")
+    mut names: [str] = []
+    for i in 0..len(lines) - 1 {
+        let line = lines[i]
+        if not cfg_line(line) {
+            fail(f"link.cfg:{i + 1}: `{line}`")
+        }
+        if line != "" and not line.starts_with("#") {
+            names += [before(line, " ")]
+        }
+    }
+    let unique = sort.sorted(names)
+    for i in 1..len(unique) {
+        if unique[i] == unique[i - 1] {
+            fail(f"a name is set twice: {unique[i]}")
+        }
+    }
+    for name in ["LINK", "AS", "CC", "CFLAGS", "RUNTIME_C", "STAGE0_KOD"] {
+        if not contains(names, name) {
+            fail(f"link.cfg does not set {name}")
+        }
+    }
+}
+
+test "the grammar of link.cfg leaves out what make would read differently" {
+    let lines = [
+        " ",  // an empty line is empty
+        "  # indented comment",
+        "# comment ending in a backslash \\",
+        "# a\tb",
+        "# crlf\r",
+        "link := a",  // a name is capitals, digits and _
+        "1X := a",
+        "_X := a",
+        "X-Y := a",
+        "X",  // := follows the name after one space
+        "X = a",
+        "X: a",
+        "X:= a",
+        "X  := a",
+        "X ?= a",
+        "X += a",
+        "X ::= a",
+        "X :=a",  // a space follows :=
+        "X := a ",  // one space between words, none at the end
+        "X := a  b",
+        "X := ",
+        "X :=  a",
+        "\tX := a",
+        "X :=\ta",
+        "X := a\r",
+        "X := a # trailing comment",
+        "X := a#b",
+        "X := $(CC)",
+        "X := ${CC}",
+        "X := a\\",
+        "X := \"a\"",
+        "X := 'a'",
+        "X := `a`",
+        "X := a;b",
+        "X := a b|c",
+        "X := a>b",
+        "X := ~/a",
+        "X := *.c",
+        "X := %.c",
+        "X := a:b",
+        "X := café",
+    ]
+    for line in lines {
+        if cfg_line(line) {
+            fail(f"the grammar takes `{line}`")
+        }
+    }
+}
+
+test "make reads every line the grammar accepts as its words" {
+    let lines = [
+        "# a comment: := $(shell false) \\ anything",
+        "",
+        "LINK := clang -target arm64-apple-darwin -Wl,-dead_strip",
+        "EMPTY :=",
+        "FLAGS := -DKOD=1 -std=c11 +x a=b -,- @ = - . / ,",
+        "PATHS := /opt/homebrew/opt/openssl@3/lib ../a_b-c.d libc++.a",
+        "N2_X := 1",
+    ]
+    mut want = Map[str, str]()
+    for line in lines {
+        assert cfg_line(line)
+        if line != "" and not line.starts_with("#") {
+            let rest = after(line, " :=")
+            want[before(line, " :=")] = rest.strip_prefix(" ")? or rest
+        }
+    }
+    let elsewhere = scratch("elsewhere")
+    write(f"{elsewhere}/words.cfg", "\n".join(lines) + "\n")
+    let got = make_variables(elsewhere, name: "words.cfg")
+    remove(elsewhere)
+    if map_text(got) != map_text(want) {
+        fail(f"make read:\n{map_text(got)}\nwant:\n{map_text(want)}")
+    }
+}
+
+test "make keeps what the grammar leaves out" {
+    // Why the grammar is as strict as it is: Make keeps a trailing space, the
+    // space before a #, and a doubled space, and it joins a line that ends in a
+    // backslash with the next one.
+    let elsewhere = scratch("elsewhere")
+    write(f"{elsewhere}/loose.cfg", "A := a b \nB := a # note\nC := a  b\nD := d \\\nE := e\n")
+    let got = make_variables(elsewhere, name: "loose.cfg")
+    remove(elsewhere)
+    mut want = Map[str, str]()
+    want["A"] = "a b "
+    want["B"] = "a "
+    want["C"] = "a  b"
+    want["D"] = "d E := e"
+    if map_text(got) != map_text(want) {
+        fail(f"make read:\n{map_text(got)}\nwant:\n{map_text(want)}")
+    }
+}
+
+test "the lists of link.cfg are what the link lines name" {
+    let config = cfg_values([link_cfg(), local_cfg()])
+    let objects = always_linked(config)
+    for pair in [["stage1", "build/stage1/sh_kodc"], ["kod", "build/apps/kod/kod"]] {
+        let exe = pair[0]
+        let target_exe = pair[1]
+        mut links: [[str]] = []
+        for line in make_recipes([exe]) {
+            if (line + " ").contains(f" -o {target_exe} ") {
+                links += [words(line)]
+            }
+        }
+        if len(links) != 1 {
+            fail(f"{exe}: {len(links)} link lines")
+            continue
+        }
+        let ws = links[0]
+        let at = index_of(ws, "-o")
+        if at < 0 {
+            fail(f"{exe}: no -o in {show(ws)}")
+            continue
+        }
+        if ws[0..at] != config["LINK", default: []] {
+            fail(f"{exe}: links with {show(ws[0..at])}")
+        }
+        if slice(ws, at + 1, at + 2) != [target_exe] {
+            fail(f"{exe}: links {show(slice(ws, at + 1, at + 2))}")
+        }
+        if slice(ws, at + 2, at + 2 + len(objects)) != objects {
+            fail(f"{exe}: objects {show(slice(ws, at + 2, at + 2 + len(objects)))}, want {show(objects)}")
+        }
+    }
+}
+
+test "the always-linked objects have names of their own" {
+    let config = cfg_values([link_cfg(), local_cfg()])
+    let made = make_in(["-pq", "stage0"])
+    mut compiler: [str] = []
+    mut found = false
+    for line in made.stdout.split("\n") {
+        if not found and line.starts_with("COMPILER_KOD := ") {
+            compiler = words(after(line, " := "))
+            found = true
+        }
+    }
+    assert found
+    mut stage0: [str] = []
+    for m in config["STAGE0_KOD", default: []] {
+        stage0 += [stem(m)]
+    }
+    mut runtime: [str] = []
+    for c in config["RUNTIME_C", default: []] {
+        runtime += [stem(c)]
+    }
+    mut others: [str] = []
+    for m in compiler {
+        others += [stem(m)]
+    }
+    for list in [stage0, runtime] {
+        let names = sort.sorted(list)
+        for i in 1..len(names) {
+            if names[i] == names[i - 1] {
+                fail(f"{names[i]} is listed twice")
+            }
+        }
+    }
+    // build/stage0/_<name>.o and <name>.o
+    for s in stage0 {
+        if contains(others, s) {
+            fail(f"{s} is in STAGE0_KOD and COMPILER_KOD")
+        }
+        if contains(runtime, f"_{s}") {
+            fail(f"_{s} is a module's object and a C file's")
+        }
+    }
+}
+
+test "make stage0 has a rule for everything link.cfg lists" {
+    let recipes = make_recipes(["stage0"])
+    let config = cfg_values([link_cfg(), local_cfg()])
+    for module in config["STAGE0_KOD", default: []] {
+        mut ok = false
+        for line in recipes {
+            if line.contains(f" {module} >") {
+                ok = true
+            }
+        }
+        if not ok {
+            fail(module)
+        }
+    }
+    for source in config["RUNTIME_C", default: []] {
+        mut ok = false
+        for line in recipes {
+            if line.ends_with(f" {source}") {
+                ok = true
+            }
+        }
+        if not ok {
+            fail(source)
+        }
+    }
+}
+
+test "link.cfg pins the target and the flags the links rely on" {
+    let own = cfg_values([link_cfg()])
+    let link = own["LINK", default: []]
+    let cflags = own["CFLAGS", default: []]
+    assert slice(link, 0, 1) == ["clang"]
+    // The target of the link is that of the objects and of `as`; dead code and
+    // the functions only it calls are left out of an executable.
+    assert adjacent(link, ["-target", "arm64-apple-darwin"])
+    assert contains(link, "-Wl,-dead_strip")
+    assert adjacent(cflags, ["-target", "arm64-apple-darwin"])
+    // Where a companion C file finds the runtime header.
+    assert adjacent(cflags, ["-I", "stdlib"])
+}
+
+test "the C runtime is compiled with CC and CFLAGS of link.cfg" {
+    let config = cfg_values([link_cfg(), local_cfg()])
+    let cflags = " ".join(config["CFLAGS", default: []])
+    assert " ".join(cfg_values([link_cfg()])["CFLAGS", default: []]).contains("-target arm64-apple-darwin")
+    let recipes = make_recipes(["stage0"])
+    for source in config["RUNTIME_C", default: []] {
+        let want = f"{" ".join(config["CC", default: []])} {cflags} -c -o build/stage0/{stem(source)}.o {source}"
+        if not contains(recipes, want) {
+            fail(f"no recipe `{want}`")
+        }
+    }
+}
+
+test "a change of link.cfg rebuilds what it configures" {
+    // `-W` pretends the file changed, so no file's time is touched.
+    for target in ["stage0", "stage1", "kod"] {
+        let now = make_in(["-q", target]).status
+        let changed = make_in(["-q", "-W", "link.cfg", target]).status
+        if now != 0 or changed != 1 {
+            fail(f"{target}: make -q {now}, with -W link.cfg {changed}")
+        }
+    }
+}
+
+// Whether a line of `lines` compiles a C file of the runtime, for each one.
+func compiles_the_c_objects(anon lines: [str]) -> none {
+    for source in cfg_values([link_cfg(), local_cfg()])["RUNTIME_C", default: []] {
+        mut ok = false
+        for line in lines {
+            if line.contains(f"-c -o build/stage0/{stem(source)}.o {source}") {
+                ok = true
+            }
+        }
+        if not ok {
+            fail(f"{source} is not compiled again")
+        }
+    }
+}
+
+// Whether any line of `lines` contains `part`.
+func any_contains(anon lines: [str], anon part: str) -> bool {
+    for line in lines {
+        if line.contains(part) {
+            return true
+        }
+    }
+    return false
+}
+
+test "a change of link.cfg rebuilds the C objects and the links, not the modules" {
+    // `-n -W` lists what would run if the file changed, and runs nothing.
+    let made = make_in(["-n", "-W", "link.cfg", "stage1", "kod"])
+    if made.status != 0 {
+        fail(made.stderr)
+    }
+    let lines = made.stdout.replace("\\\n", to: " ").split("\n")
+    compiles_the_c_objects(lines)
+    assert any_contains(lines, " -o build/stage1/sh_kodc ")
+    assert any_contains(lines, " -o build/apps/kod/kod ")
+    // A Kod module is not compiled again.
+    assert not any_contains(lines, " > build/")
+}
+
+test "a change of a header rebuilds what includes it" {
+    // runtime.c includes stdlib/kod_rt.h, and Make is told only of the .c file
+    // (there are no dependency files), so a header is a prerequisite of its own.
+    // `-W` pretends the file changed, so no file's time is touched.
+    assert io.is_file("stdlib/kod_rt.h")
+    for target in ["stage0", "stage1", "kod"] {
+        let now = make_in(["-q", target]).status
+        let changed = make_in(["-q", "-W", "stdlib/kod_rt.h", target]).status
+        if now != 0 or changed != 1 {
+            fail(f"{target}: make -q {now}, with -W stdlib/kod_rt.h {changed}")
+        }
+    }
+}
+
+test "a change of a header rebuilds the C objects, not the modules" {
+    let made = make_in(["-n", "-W", "stdlib/kod_rt.h", "stage1", "kod"])
+    if made.status != 0 {
+        fail(made.stderr)
+    }
+    let lines = made.stdout.replace("\\\n", to: " ").split("\n")
+    compiles_the_c_objects(lines)
+    // The Kod modules are not compiled again.
+    assert not any_contains(lines, " > build/")
+}
+
+// Compile the C source text with `CC` and `CFLAGS` of link.cfg, to a
+// temporary object.
+func c_object(anon source: str, flags: [str]) -> Ran {
+    let config = cfg_values([link_cfg(), local_cfg()])
+    let dir = scratch("c")
+    write(f"{dir}/probe.c", source)
+    let compiled = run(config["CC", default: []] + config["CFLAGS", default: []] + flags + ["-c", "-o", f"{dir}/probe.o", f"{dir}/probe.c"])
+    remove(dir)
+    return compiled
+}
+
+test "the runtime header has the layout the generated code uses" {
+    // A str is {buf, len}, an array {ptr, len, cap}, each field 8 bytes.
+    let compiled = c_object(
+        "".join([
+            "#include \"kod_rt.h\"\n#include <stddef.h>\n",
+            "_Static_assert(sizeof(KodStr) == 16, \"KodStr\");\n",
+            "_Static_assert(offsetof(KodStr, buf) == 0, \"buf\");\n",
+            "_Static_assert(offsetof(KodStr, len) == 8, \"len\");\n",
+            "_Static_assert(sizeof(KodArray) == 24, \"KodArray\");\n",
+            "_Static_assert(offsetof(KodArray, ptr) == 0, \"ptr\");\n",
+            "_Static_assert(offsetof(KodArray, len) == 8, \"array len\");\n",
+            "_Static_assert(offsetof(KodArray, cap) == 16, \"cap\");\n",
+        ]),
+        flags: ["-Wall", "-Werror"],
+    )
+    if compiled.status != 0 {
+        fail(compiled.stderr)
+    }
+}
+
+test "the runtime header stands alone and unused helpers cost nothing" {
+    // Included first and twice, with every warning an unused static inline
+    // function could draw, and used the way a companion would.
+    let compiled = c_object(
+        "".join([
+            "#include \"kod_rt.h\"\n#include \"kod_rt.h\"\n",
+            "KodStr *kod_probe(KodArray *a, const char *p) {\n",
+            "    if (a->len < 0) kod_panic(kod_str_new(0));\n",
+            "    return kod_str_from_bytes(p, 3);\n",
+            "}\n",
+        ]),
+        flags: ["-Wall", "-Wextra", "-Werror", "-Wunused-function"],
+    )
+    if compiled.status != 0 {
+        fail(compiled.stderr)
+    }
+}
+
+test "runtime.o exports what it did and nothing from the header" {
+    // The header's helpers are `static inline`, so they are no symbols.
+    let defined = run(["nm", "-g", "--defined-only", f"{root()}/build/stage0/runtime.o"])
+    if defined.status != 0 {
+        fail(defined.stderr)
+    }
+    mut names: [str] = []
+    for line in defined.stdout.split("\n") {
+        let ws = words(line)
+        if len(ws) > 0 {
+            names += [ws[len(ws) - 1]]
+        }
+    }
+    for exported in ["_kod_panic", "_kod_str_from_cstr", "_kod_str_concat", "_kod_arr_concat"] {
+        if not contains(names, exported) {
+            fail(f"{exported} is not exported")
+        }
+    }
+    for local in ["_kod_str_new", "_kod_str_from_bytes", "_kod_str_alloc"] {
+        if contains(names, local) {
+            fail(f"{local} is exported")
+        }
+    }
+}
+
+// --- The driver and link.local.cfg ------------------------------------------
+
+func program(anon output: str) -> str {
+    return "func main() -> int64 {\n    print(\"" + output + "\")\n    return 0\n}\n"
+}
+
+let PASSING: str = "test \"runs\" {\n    assert 1 + 1 == 2\n}\n"
+
+let MISSING_ROOT: str = "kod: link.cfg not found; run kod from the repository root\n"
+
+// Run the driver in `dir`.
+func driver(anon argv: [str], dir: str, add_env: [str] = []) -> Ran {
+    return run([kod()] + argv, :dir, :add_env)
+}
+
+// Whether a driver run gave `status`, `stdout` and `stderr`; fails naming
+// `what` when it did not.
+func expect(anon got: Ran, what: str, status: int64, stdout: str, stderr: str) -> none {
+    if got.status != status or got.stdout != stdout or got.stderr != stderr {
+        fail(f"{what}: status {got.status}, stdout `{got.stdout}`, stderr `{got.stderr}`; want {status}, `{stdout}`, `{stderr}`")
+    }
+}
+
+// A directory the driver takes for the repository root: a copy of link.cfg,
+// the built stage0 and stage1 and the stdlib by link, and a build/apps of its
+// own, so that what it builds stays out of the real tree. A test adds a
+// link.local.cfg to change the link. "" when its path is not one a link.cfg
+// can name.
+func driver_root() -> str {
+    let path = scratch("root")
+    mut nameable = true
+    for c in path {
+        if not is_word_char(c) {
+            nameable = false
+        }
+    }
+    if not nameable {
+        remove(path)
+        print("skipped: the scratch directory is not a path a link.cfg can name")
+        return ""
+    }
+    let r = root()
+    run(["mkdir", "-p", f"{path}/build/apps"])
+    for built in ["stage0", "stage1"] {
+        run(["ln", "-s", f"{r}/build/{built}", f"{path}/build/{built}"])
+    }
+    run(["ln", "-s", f"{r}/stdlib", f"{path}/stdlib"])
+    write(f"{path}/link.cfg", io.read_file(link_cfg()))
+    write(f"{path}/hello.kod", program("linked"))
+    return path
+}
+
+test "the driver outside the repository root says where to run it" {
+    for command in ["build", "run", "test", "check"] {
+        let elsewhere = scratch("elsewhere")
+        write(f"{elsewhere}/x.kod", program("x") + PASSING)
+        let got = driver([command, "x.kod"], dir: elsewhere)
+        let left = listing(elsewhere)
+        remove(elsewhere)
+        expect(got, what: command, status: 1, stdout: "", stderr: MISSING_ROOT)
+        if left != ["x.kod"] {
+            fail(f"{command}: left {show(left)}")
+        }
+    }
+}
+
+test "the driver without a compiler says to run make" {
+    let elsewhere = scratch("elsewhere")
+    write(f"{elsewhere}/link.cfg", io.read_file(link_cfg()))
+    write(f"{elsewhere}/x.kod", program("x"))
+    let got = driver(["build", "x.kod"], dir: elsewhere)
+    remove(elsewhere)
+    expect(got, what: "build", status: 1, stdout: "", stderr: "kod: build/stage1/sh_kodc not found; run make\n")
+}
+
+test "the driver without a command prints its usage wherever it is" {
+    let elsewhere = scratch("elsewhere")
+    let got = driver([], dir: elsewhere)
+    remove(elsewhere)
+    assert got.status == 1 and got.stdout == ""
+    assert got.stderr.starts_with("usage: kod build <file>\n")
+}
+
+// Build hello.kod in `dir` with `local` as its link.local.cfg and a linker
+// that records its arguments and then links; those arguments.
+func linked_with(anon dir: str, local: str) -> [str] {
+    let link = cfg_values([f"{dir}/link.cfg"])["LINK", default: [""]]
+    let recorder = f"{dir}/linkshim"
+    write(recorder, "#!/bin/sh\nprintf \"%s\\n\" \"$@\" > \"$KOD_LINK_LOG\"\nexec \"$KOD_REAL_LINKER\" \"$@\"\n")
+    run(["chmod", "755", recorder])
+    write(f"{dir}/link.local.cfg", local.replace("RECORDER", to: recorder))
+    let log = f"{dir}/link.args"
+    let got = driver(["build", "hello.kod"], dir: dir, add_env: [f"KOD_LINK_LOG={log}", f"KOD_REAL_LINKER={link[0]}"])
+    if got.status != 0 {
+        fail(got.stderr)
+    }
+    assert got.stderr == ""
+    let lines = io.read_file(log).split("\n")
+    return lines[0..len(lines) - 1]
+}
+
+test "the driver links as link.cfg says" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    let config = cfg_values([f"{dir}/link.cfg"])
+    let link = config["LINK", default: []]
+    let flags = slice(link, 1, len(link))
+    let argv = linked_with(dir, local: f"LINK := RECORDER {" ".join(flags)}\n")
+    let ran = run([f"{dir}/build/apps/hello/hello"], :dir)
+    remove(dir)
+    let want = flags + ["-o", "build/apps/hello/hello"] + always_linked(config) + ["build/apps/hello/hello.obj/hello.kod.o", "build/apps/hello/hello.obj/hello.kod.main.o"]
+    if argv != want {
+        fail(f"linked with {show(argv)}\nwant {show(want)}")
+    }
+    assert ran.status == 0 and ran.stdout == "linked\n"
+}
+
+test "the driver links the always-linked modules in the order link.cfg gives" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    let config = cfg_values([f"{dir}/link.cfg"])
+    let link = config["LINK", default: []]
+    let flags = " ".join(slice(link, 1, len(link)))
+    let modules = config["STAGE0_KOD", default: []]
+    mut reversed: [str] = []
+    for m in modules {
+        reversed = [m] + reversed
+    }
+    let argv = linked_with(dir, local: f"LINK := RECORDER {flags}\nSTAGE0_KOD := {" ".join(reversed)}\n")
+    let ran = run([f"{dir}/build/apps/hello/hello"], :dir)
+    remove(dir)
+    let objects = always_linked(config, modules: reversed)
+    let at = index_of(argv, "-o")
+    let got = slice(argv, at + 2, at + 2 + len(objects))
+    if at < 0 or got != objects {
+        fail(f"linked {show(got)}\nwant {show(objects)}")
+    }
+    assert ran.status == 0 and ran.stdout == "linked\n"
+}
+
+test "the linker is the one link.cfg names and link.local.cfg overrides it" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    write(f"{dir}/link.local.cfg", "LINK := /no/such/linker -v\n")
+    let got = driver(["build", "hello.kod"], dir: dir)
+    remove(dir)
+    expect(got, what: "build", status: 1, stdout: "", stderr: "kod: /no/such/linker could not be run (not found, killed, or its argument list too long)\n")
+}
+
+test "the driver stops at a link configuration it cannot read" {
+    let cases = [
+        ["LINK = clang\n", "link.local.cfg:1:5: error: "],
+        ["# machine\n\nCC := clang \n", "link.local.cfg:3:"],
+        ["LINK := a\nLINK := b\n", "link.local.cfg:2:1: error: LINK is set twice"],
+        ["CFLAG := -DX\n", "link.local.cfg:1:1: error: CFLAG is not set in link.cfg"],
+        ["# machine\n\nSTAGE0 := build/s0\n", "link.local.cfg:3:1: error: STAGE0 is not set in link.cfg"],
+        ["LINK :=\n", "kod: link.cfg and link.local.cfg set no LINK\n"],
+        ["AS :=\n", "kod: link.cfg and link.local.cfg set no AS\n"],
+        ["STAGE0_KOD :=\n", "kod: link.cfg and link.local.cfg set no STAGE0_KOD\n"],
+        ["RUNTIME_C :=\n", "kod: link.cfg and link.local.cfg set no RUNTIME_C\n"],
+    ]
+    for c in cases {
+        let local = c[0]
+        let wanted = c[1]
+        let dir = driver_root()
+        if dir == "" {
+            return
+        }
+        write(f"{dir}/link.local.cfg", local)
+        let got = driver(["build", "hello.kod"], dir: dir)
+        let apps = listing(f"{dir}/build/apps")
+        remove(dir)
+        if got.status != 1 or got.stdout != "" or not got.stderr.starts_with(wanted) {
+            fail(f"`{local}`: status {got.status}, stdout `{got.stdout}`, stderr `{got.stderr}`")
+        }
+        // Nothing is compiled first.
+        if len(apps) != 0 {
+            fail(f"`{local}`: build/apps has {show(apps)}")
+        }
+    }
+}
+
+test "the driver stops at a link.cfg that is empty or cannot be read" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    write(f"{dir}/link.cfg", "")
+    let got = driver(["build", "hello.kod"], dir: dir)
+    remove(dir)
+    expect(got, what: "build", status: 1, stdout: "", stderr: "kod: link.cfg is empty or cannot be read\n")
+}
+
+test "the driver asks for make when an always-linked object is not built" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    // A module added to STAGE0_KOD, before `make` has built its object.
+    let modules = cfg_values([f"{dir}/link.cfg"])["STAGE0_KOD", default: []] + ["stdlib/zzprobe.kod"]
+    write(f"{dir}/link.local.cfg", f"STAGE0_KOD := {" ".join(modules)}\n")
+    mut got: [Ran] = []
+    for command in ["build", "run", "test"] {
+        got += [driver([command, "hello.kod"], dir: dir)]
+    }
+    let apps = listing(f"{dir}/build/apps")
+    // `check` links nothing.
+    let checked = driver(["check", "hello.kod"], dir: dir)
+    remove(dir)
+    for i, command in ["build", "run", "test"] {
+        expect(got[i], what: command, status: 1, stdout: "", stderr: "kod: build/stage0/_zzprobe.o not found; run make\n")
+    }
+    if len(apps) != 0 {
+        fail(f"build/apps has {show(apps)}")
+    }
+    expect(checked, what: "check", status: 0, stdout: "", stderr: "")
+}
+
+test "the driver stops at a malformed link.cfg for check too" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    write(f"{dir}/link.cfg", "LINK clang\n")
+    let got = driver(["check", "hello.kod"], dir: dir)
+    remove(dir)
+    assert got.status == 1
+    if not got.stderr.starts_with("link.cfg:1:5: error: ") {
+        fail(got.stderr)
+    }
+}
+
+// The numbers of a dotted version; a part that is no number counts as -1.
+func version_numbers(anon version: str) -> [int64] {
+    mut out: [int64] = []
+    for part in version.split(".") {
+        out += [part.parse_int()? or -1]
+    }
+    return out
+}
+
+// Whether version `a` is at most `b`, compared as Python compares tuples.
+func version_at_most(anon a: str, anon b: str) -> bool {
+    let x = version_numbers(a)
+    let y = version_numbers(b)
+    for i in 0..len(x) {
+        if i >= len(y) {
+            return false
+        }
+        if x[i] != y[i] {
+            return x[i] < y[i]
+        }
+    }
+    return true
+}
+
+test "a program linked by clang is a signed arm64 executable" {
+    let dir = driver_root()
+    if dir == "" {
+        return
+    }
+    let built = driver(["build", "hello.kod"], dir: dir)
+    let exe = f"{dir}/build/apps/hello/hello"
+    let verified = run(["codesign", "--verify", "--strict", exe])
+    let archs = run(["lipo", "-archs", exe])
+    // It starts from another directory with the bare environment of a script.
+    let elsewhere = scratch("cwd")
+    let ran = run([exe], dir: elsewhere, env: ["PATH=/usr/bin:/bin"])
+    remove(elsewhere)
+    // And it does not ask for more of macOS than this one has.
+    let header = run(["otool", "-l", exe]).stdout
+    remove(dir)
+    if built.status != 0 {
+        fail(built.stderr)
+    }
+    if verified.status != 0 {
+        fail(verified.stderr)
+    }
+    assert words(archs.stdout) == ["arm64"]
+    assert ran.status == 0 and ran.stdout == "linked\n"
+    mut minos = ""
+    if header.find("LC_BUILD_VERSION") is int64(at) {
+        if header.find("minos ", from: at) is int64(m) {
+            let ws = words(header[m + len("minos ")..len(header)])
+            if len(ws) > 0 {
+                minos = ws[0]
+            }
+        }
+    }
+    if minos == "" {
+        fail(header)
+        return
+    }
+    let here = run(["sysctl", "-n", "kern.osproductversion"]).stdout.trim()
+    if here != "" and env_unset("MACOSX_DEPLOYMENT_TARGET") {
+        if not version_at_most(minos, here) {
+            fail(f"minos {minos} is newer than this macOS, {here}")
+        }
+    }
+}
+
+func env_unset(anon name: str) -> bool {
+    return libc.getenv(unsafe.c_str(name)) == 0
+}
+
+test "asm_diff gives the base copy the link.local.cfg it has" {
+    let elsewhere = scratch("elsewhere")
+    let checkout = f"{elsewhere}/checkout"
+    let copy = f"{elsewhere}/base"
+    run(["mkdir", checkout, copy])
+    // tools/asm_diff.py's copy_link_local_cfg, with its ROOT at `checkout`.
+    let script = "".join([
+        "import importlib.util, sys\n",
+        "from pathlib import Path\n",
+        "spec = importlib.util.spec_from_file_location('asm_diff', sys.argv[1])\n",
+        "module = importlib.util.module_from_spec(spec)\n",
+        "spec.loader.exec_module(module)\n",
+        "module.ROOT = Path(sys.argv[2])\n",
+        "module.copy_link_local_cfg(Path(sys.argv[3]))\n",
+    ])
+    let argv = ["python3", "-I", "-c", script, f"{root()}/tools/asm_diff.py", checkout, copy]
+    // None here: nothing is copied and nothing said.
+    let first = run(argv)
+    let first_left = listing(copy)
+    write(f"{checkout}/link.local.cfg", "LINK := /usr/bin/clang\n")
+    let second = run(argv)
+    let copied = io.read_file(f"{copy}/link.local.cfg")
+    remove(elsewhere)
+    assert first.status == 0 and second.status == 0
+    assert len(first_left) == 0
+    assert first.stderr == ""
+    assert copied == "LINK := /usr/bin/clang\n"
+    assert second.stderr.contains("link.local.cfg")
+}
+
+// --- Make and the link configuration -----------------------------------------
+
+// A directory Make takes for the repository: the Makefile, link.cfg, the
+// sources and what is built, all by link, and a `build/` of its own, so that
+// a link.local.cfg and the record of the configuration (build/.link-config)
+// stay out of the real tree. Only `make -n`, `make -q` and the recipe that
+// writes the record are run in it.
+func make_root() -> str {
+    let path = scratch("make")
+    let r = root()
+    for name in ["Makefile", "link.cfg", "stdlib", "kodc.kod", "tools", "bootstrap"] {
+        run(["ln", "-s", f"{r}/{name}", f"{path}/{name}"])
+    }
+    run(["mkdir", "-p", f"{path}/build/apps"])
+    for built in ["stage0", "stage1"] {
+        run(["ln", "-s", f"{r}/build/{built}", f"{path}/build/{built}"])
+    }
+    run(["ln", "-s", f"{r}/build/apps/kod", f"{path}/build/apps/kod"])
+    return path
+}
+
+// Have Make record the configuration in force in `dir`, as a build does,
+// dated so that it is not newer than what was built.
+func record_link_config(anon dir: str) -> none {
+    let made = make_in(["-s", "build/.link-config"], :dir)
+    if made.status != 0 {
+        fail(made.stderr)
+    }
+    run(["touch", "-d", LONG_AGO, f"{dir}/build/.link-config"])
+}
+
+test "make takes the names link.local.cfg overrides" {
+    let dir = make_root()
+    write(f"{dir}/link.local.cfg", "".join([
+        "# this machine\n",
+        "LINK := clang -target arm64-apple-darwin -Wl,-probe\n",
+        "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n",
+    ]))
+    let recipes = make_recipes(["stage1", "kod"], :dir)
+    remove(dir)
+    for source in cfg_values([link_cfg()])["RUNTIME_C", default: []] {
+        let want = f"clang -target arm64-apple-darwin -I stdlib -DPROBE=1 -c -o build/stage0/{stem(source)}.o {source}"
+        if not contains(recipes, want) {
+            fail(f"no recipe `{want}`")
+        }
+    }
+    for exe in ["build/stage1/sh_kodc", "build/apps/kod/kod"] {
+        mut links: [str] = []
+        for line in recipes {
+            if (line + " ").contains(f" -o {exe} ") {
+                links += [line]
+            }
+        }
+        if len(links) != 1 {
+            fail(f"{exe}: {len(links)} link lines")
+        } else if not links[0].starts_with("clang -target arm64-apple-darwin -Wl,-probe -o ") {
+            fail(f"{exe}: {links[0]}")
+        }
+    }
+}
+
+test "make stops at a link.local.cfg it cannot use" {
+    let cases = [
+        ["CFLAG := -DX\n", "link.local.cfg sets CFLAG, which link.cfg does not set"],
+        ["# machine\nSTAGE0 := build/s0\n", "link.local.cfg sets STAGE0, which"],
+        ["  SHELL := /bin/false\n", "link.local.cfg sets SHELL, which"],
+        ["MAKEFLAGS := k\n", "link.local.cfg sets MAKEFLAGS, which"],
+        ["CC := clang\nLNK:=clang\n", "link.local.cfg sets LNK, which"],
+        ["LINK :=\n", "link.cfg and link.local.cfg set no LINK"],
+        ["AS :=\n", "link.cfg and link.local.cfg set no AS"],
+        ["RUNTIME_C :=\n", "link.cfg and link.local.cfg set no RUNTIME_C"],
+        ["STAGE0_KOD :=\n", "link.cfg and link.local.cfg set no STAGE0_KOD"],
+        ["RUNTIME_C := stdlib/arena.c stdlib/notes.txt\n", "RUNTIME_C must name only .c files"],
+        ["STAGE0_KOD := stdlib/io.kod stdlib/io.c\n", "STAGE0_KOD must name only .kod files"],
+    ]
+    for c in cases {
+        let local = c[0]
+        let wanted = c[1]
+        let dir = make_root()
+        write(f"{dir}/link.local.cfg", local)
+        let made = make_in(["-n", "stage0"], :dir)
+        remove(dir)
+        if made.status == 0 or not made.stderr.contains(wanted) or made.stdout != "" {
+            fail(f"`{local}`: status {made.status}, stdout `{made.stdout}`, stderr `{made.stderr}`")
+        }
+    }
+}
+
+// `make -q target` in `dir` gives `want`; fails naming `step` when not.
+func up_to_date(anon dir: str, target: str, want: int64, step: str) -> none {
+    let got = make_in(["-q", target], :dir).status
+    if got != want {
+        fail(f"{target}, {step}: make -q gave {got}, want {want}")
+    }
+}
+
+test "make rebuilds when link.local.cfg comes or goes" {
+    for target in ["stage0", "stage1", "kod"] {
+        let dir = make_root()
+        // Nothing below is newer than what was built, but the first time: only the
+        // record of the configuration can tell that the configuration changed.
+        record_link_config(dir)
+        up_to_date(dir, target: target, want: 0, step: "recorded")
+        let local = f"{dir}/link.local.cfg"
+        written_long_ago(local, "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n")
+        up_to_date(dir, target: target, want: 1, step: "come")
+        record_link_config(dir)
+        up_to_date(dir, target: target, want: 0, step: "come and recorded")
+        // The file as it was, but newer than what was built.
+        run(["touch", local])
+        up_to_date(dir, target: target, want: 1, step: "newer")
+        run(["touch", "-d", LONG_AGO, local])
+        up_to_date(dir, target: target, want: 0, step: "older again")
+        // Gone: what was built with it is not what the configuration says now.
+        run(["rm", local])
+        up_to_date(dir, target: target, want: 1, step: "gone")
+        record_link_config(dir)
+        up_to_date(dir, target: target, want: 0, step: "gone and recorded")
+        remove(dir)
+    }
+}
+
+test "make rebuilds when link.local.cfg loses a name" {
+    let both = "".join([
+        "CFLAGS := -target arm64-apple-darwin -I stdlib -DPROBE=1\n",
+        "LINK := clang -target arm64-apple-darwin -Wl,-dead_strip -Wl,-probe\n",
+    ])
+    for target in ["stage0", "stage1", "kod"] {
+        let dir = make_root()
+        let local = f"{dir}/link.local.cfg"
+        written_long_ago(local, both)
+        record_link_config(dir)
+        up_to_date(dir, target: target, want: 0, step: "both")
+        for kept in [both.split("\n")[0] + "\n", "# nothing now\n"] {
+            written_long_ago(local, kept)
+            up_to_date(dir, target: target, want: 1, step: f"kept `{kept}`")
+            record_link_config(dir)
+            up_to_date(dir, target: target, want: 0, step: f"kept `{kept}` and recorded")
+        }
+        remove(dir)
+    }
+}

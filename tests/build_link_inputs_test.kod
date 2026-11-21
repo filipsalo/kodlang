@@ -1,0 +1,1158 @@
+// Link inputs a module declares (docs/modules.md, "Link inputs"): the comment
+// lines at the top of a module name its C files, link arguments and required
+// files. The tests run the driver in a project of their own (`project`), whose
+// `clang` logs every call before it runs the real one.
+//
+// Every wait is bounded: a process that does not end within its time is
+// killed with everything it started, and the test fails. A project lives in a
+// directory of its own below build/ and is removed when its test ends; the body
+// of a test runs in a process of its own (`testing.run`), so that the project
+// is removed even when the body panics.
+
+import "env"
+import "io"
+import "libc"
+import "process"
+import "sort"
+import "testing"
+import "time"
+import "unsafe"
+
+extern func wait4(anon pid: int64, anon status: int64, anon options: int64, anon usage: int64) -> int64
+extern func access(anon path: int64, anon mode: int64) -> int64
+extern func getcwd(anon buf: int64, anon size: int64) -> int64
+
+let KOD: str = "build/apps/kod/kod"
+let WNOHANG: int64 = 1
+let SIGKILL: int64 = 9
+let SIGSTOP: int64 = 17
+// How long a run of the driver may take (as `running` in the old tests/stdio_test.py bounded it), and
+// a build from the repository root.
+let WAIT_MS: int64 = 60000
+let BUILD_WAIT_MS: int64 = 120000
+
+let PASSING: str = "test \"runs\" {\n    assert 1 + 1 == 2\n}\n"
+
+// Runs whose output files are taken, so that each has names of its own.
+mut runs: int64 = 0
+
+func program(anon output: str) -> str {
+    return "func main() -> int64 {\n    print(\"" + output + "\")\n    return 0\n}\n"
+}
+
+// The repository root, the directory the tests run from.
+func repo_root() -> str {
+    let buf = unsafe.alloc(4096)
+    mut out = ""
+    if getcwd(buf, 4096) != 0 {
+        out = unsafe.str_at(buf)
+    }
+    unsafe.free(buf)
+    return out
+}
+
+// The lines of `text`, without the empty one after a final newline.
+func lines_of(anon text: str) -> [str] {
+    mut out: [str] = []
+    for line in text.split("\n") {
+        out += [line]
+    }
+    if len(out) > 0 and out[len(out) - 1] == "" {
+        out = out[0..len(out) - 1]
+    }
+    return out
+}
+
+func is_space(anon c: int64) -> bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == 11 or c == 12
+}
+
+// The words of `s`, split at runs of whitespace (Python's `str.split()`).
+func words(anon s: str) -> [str] {
+    mut out: [str] = []
+    mut start = -1
+    for i in 0..len(s) {
+        if is_space(s[i]) {
+            if start >= 0 {
+                out += [s[start..i]]
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+    }
+    if start >= 0 {
+        out += [s[start..len(s)]]
+    }
+    return out
+}
+
+func shown(anon xs: [str]) -> str {
+    return "[" + ", ".join(xs) + "]"
+}
+
+func count(anon xs: [str], anon x: str) -> int64 {
+    mut n = 0
+    for y in xs {
+        if y == x {
+            n += 1
+        }
+    }
+    return n
+}
+
+func index_of(anon xs: [str], anon x: str) -> int64 {
+    for i, y in xs {
+        if y == x {
+            return i
+        }
+    }
+    return -1
+}
+
+func last(anon xs: [str], anon n: int64) -> [str] {
+    if len(xs) < n {
+        return xs
+    }
+    return xs[len(xs) - n..len(xs)]
+}
+
+// --- Bounded runs ------------------------------------------------------------
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// What a bounded run did: its exit status (minus the signal that ended it,
+// -1000 when it was killed for taking too long), what it wrote, and its
+// ru_maxrss.
+type Done = struct {
+    status: int64
+    out: str
+    err: str
+    maxrss: int64
+}
+
+// Reap `pid`, waiting no longer than `deadline`; the status as `Done` has it.
+func reap(anon pid: int64, deadline: int64, wait_ms: int64, what: str) -> Done {
+    let slot = unsafe.alloc(4)
+    // A struct rusage: two struct timevals, then ru_maxrss.
+    let usage = unsafe.alloc(144)
+    mut done = Done(status: -1000, out: "", err: "", maxrss: 0)
+    mut options = WNOHANG
+    for true {
+        let got = unsafe.c_int(wait4(pid, slot, options, usage))
+        if got > 0 {
+            let raw = unsafe.load32(slot)
+            if options == 0 {
+                // Killed for taking too long.
+            } else if (raw & 127) == 0 {
+                done.status = (raw >> 8) & 255
+            } else {
+                done.status = -(raw & 127)
+            }
+            done.maxrss = unsafe.load64(usage + 32)
+            break
+        }
+        if got < 0 and unsafe.errno() != 4 {
+            fail(f"{what}: cannot be waited for")
+            break
+        }
+        if got == 0 {
+            if time.monotonic_ns() > deadline {
+                kill_tree(pid)
+                fail(f"{what}: (killed: still running after {wait_ms / 1000} s)")
+                options = 0
+            } else {
+                time.sleep(time.Duration(ms: 2))
+            }
+        }
+    }
+    unsafe.free(slot)
+    unsafe.free(usage)
+    return done
+}
+
+// Run `argv` in `dir` with `add_env` added to the environment, its stdout and
+// stderr to files below `io` (removed afterwards); killed after `wait_ms`.
+func run_bounded(anon argv: [str], dir: str, io_dir: str, add_env: [str] = [], wait_ms: int64 = WAIT_MS) -> Done {
+    runs += 1
+    let out_path = f"{io_dir}/run{runs}.out"
+    let err_path = f"{io_dir}/run{runs}.err"
+    let script = "o=$1; e=$2; shift 2; exec \"$@\" >\"$o\" 2>\"$e\""
+    let what = " ".join(argv)
+    let started = process.start(["/bin/sh", "-c", script, "sh", out_path, err_path] + argv, stdin: .Null, :dir, :add_env)
+    match started {
+        Ok(child) -> {
+            let deadline = time.monotonic_ns() + wait_ms * 1000000
+            mut done = reap(child.pid, :deadline, :wait_ms, :what)
+            done.out = io.read_file(out_path)
+            done.err = io.read_file(err_path)
+            let _a = libc.unlink(unsafe.c_str(out_path))
+            let _b = libc.unlink(unsafe.c_str(err_path))
+            return done
+        }
+        Err(e) -> {
+            fail(f"start {what}: {e.to_str()}")
+            return Done(status: -1000, out: "", err: "", maxrss: 0)
+        }
+    }
+}
+
+// Run a command that prints nothing worth keeping, bounded, and fail if it
+// does not exit 0.
+func quiet(anon argv: [str], dir: str = "") -> none {
+    let what = " ".join(argv)
+    match process.start(argv, stdin: .Null, stdout: .Null, stderr: .Null, :dir) {
+        Ok(child) -> {
+            let done = reap(child.pid, deadline: time.monotonic_ns() + WAIT_MS * 1000000, wait_ms: WAIT_MS, :what)
+            if done.status != 0 {
+                fail(f"{what}: status {done.status}")
+            }
+        }
+        Err(e) -> fail(f"start {what}: {e.to_str()}")
+    }
+}
+
+func write(anon path: str, anon text: str) -> none {
+    if last_slash(path) is int64(at) {
+        quiet(["mkdir", "-p", path[0..at]])
+    }
+    if io.write_file(path, text) != 0 {
+        fail(f"cannot write {path}")
+    }
+}
+
+func exists(anon path: str) -> bool {
+    return unsafe.c_int(access(unsafe.c_str(path), 0)) == 0
+}
+
+// Where the last `/` of `path` is, if it has one.
+func last_slash(anon path: str) -> int64? {
+    mut i = len(path) - 1
+    for i >= 0 {
+        if path[i] == '/' {
+            return i
+        }
+        i -= 1
+    }
+    return none
+}
+
+// --- The link configuration ----------------------------------------------------
+
+// The words a name is set to in the files (a later one overrides an earlier
+// one, as for Make and the driver); none when no file sets it.
+func cfg_words(anon paths: [str], anon name: str) -> [str] {
+    mut value: [str] = []
+    for path in paths {
+        if not io.is_file(path) {
+            continue
+        }
+        for line in io.read_file(path).split("\n") {
+            if line == "" or line.starts_with("#") {
+                continue
+            }
+            if line.find(" :=") is int64(at) {
+                if line[0..at] == name {
+                    value = words(line[at + 3..len(line)])
+                }
+            } else if line == name {
+                value = []
+            }
+        }
+    }
+    return value
+}
+
+// --- Projects --------------------------------------------------------------------
+
+let CLANG_SHIM: str = "#!/bin/sh\nprintf \"%s\\n\" \"$*\" >> \"$KOD_CLANG_LOG\"\nexec /usr/bin/clang \"$@\"\n"
+
+// A file of a project: its path below the root and its text.
+type File = struct {
+    name: str
+    text: str
+}
+
+mut projects: int64 = 0
+
+// A directory the driver takes for the repository root: a copy of link.cfg,
+// the built stage0 and stage1 and the stdlib by link, and a build/apps of its
+// own, so that what it builds stays out of the real tree; `clang` (the compiler
+// and the linker alike) is a script that logs its arguments.
+type Project = struct {
+    // Holds `root` and `io`, the files of the bounded runs.
+    base: str
+    root: str
+    io: str
+    log: str
+    env: [str]
+
+    func write(self, anon files: [File]) -> none {
+        for f in files {
+            write(f"{self.root}/{f.name}", f.text)
+        }
+    }
+
+    func path(self, anon name: str) -> str {
+        return f"{self.root}/{name}"
+    }
+
+    func run(self, anon args: [str]) -> Done {
+        return run_bounded([f"{repo_root()}/{KOD}"] + args, dir: self.root, io_dir: self.io, add_env: self.env)
+    }
+
+    // The arguments of every `clang` call so far, one string each.
+    func clang_calls(self) -> [str] {
+        if not io.is_file(self.log) {
+            return []
+        }
+        return lines_of(io.read_file(self.log))
+    }
+
+    // The C compiles: the `-c` calls other than link.cfg's `AS`, which
+    // assembles each module's `.s` with clang too.
+    func compiles(self) -> [str] {
+        mut out: [str] = []
+        for c in self.clang_calls() {
+            if f" {c} ".contains(" -c ") and not f" {c} ".contains(" -x assembler ") {
+                out += [c]
+            }
+        }
+        return out
+    }
+
+    // The arguments of the one call that is not a compile.
+    func link(self) -> [str] {
+        mut links: [str] = []
+        for c in self.clang_calls() {
+            if not f" {c} ".contains(" -c ") {
+                links += [c]
+            }
+        }
+        if len(links) != 1 {
+            fail(f"not one link: {shown(self.clang_calls())}")
+            return []
+        }
+        return words(links[0])
+    }
+
+    // The names in a directory of the project, sorted.
+    func listing(self, anon dir: str, files_only: bool = false) -> [str] {
+        mut argv = ["ls", "-A"]
+        if files_only {
+            argv = ["find", ".", "-mindepth", "1", "-maxdepth", "1", "-type", "f"]
+        }
+        let done = run_bounded(argv, dir: self.path(dir), io_dir: self.io)
+        if done.status != 0 {
+            fail(f"listing {dir}: {done.err}")
+        }
+        mut out: [str] = []
+        for line in lines_of(done.out) {
+            out += [line.strip_prefix("./")? or line]
+        }
+        return sort.sorted(out)
+    }
+
+    func apps(self) -> [str] {
+        return self.listing("build/apps")
+    }
+
+    func exe(self, anon stem: str) -> str {
+        return self.path(f"build/apps/{stem}/{stem}")
+    }
+
+    func remove(self) -> none {
+        quiet(["rm", "-rf", self.base])
+    }
+}
+
+func new_project() -> Project {
+    projects += 1
+    let here = repo_root()
+    let base = f"{here}/build/link_inputs_{libc.getpid()}_{projects}"
+    let root = f"{base}/root"
+    let p = Project(:base, :root, io: f"{base}/io", log: f"{root}/clang.log", env: [])
+    quiet(["rm", "-rf", base])
+    quiet(["mkdir", "-p", p.io, f"{root}/build/apps", f"{root}/shims"])
+    for built in ["stage0", "stage1"] {
+        quiet(["ln", "-s", f"{here}/build/{built}", f"{root}/build/{built}"])
+    }
+    quiet(["ln", "-s", f"{here}/stdlib", f"{root}/stdlib"])
+    quiet(["cp", f"{here}/link.cfg", f"{root}/link.cfg"])
+    write(f"{root}/hello.kod", program("linked"))
+    write(f"{root}/shims/clang", CLANG_SHIM)
+    quiet(["chmod", "755", f"{root}/shims/clang"])
+    let path = env.get("PATH")? or ""
+    return Project(:base, :root, io: p.io, log: p.log, env: [f"PATH={root}/shims:{path}", f"KOD_CLANG_LOG={p.log}"])
+}
+
+// Fail with what a body run by `testing.run` said, if it failed.
+func relay(anon r: testing.Ran, anon what: str) -> none {
+    if r.status != 0 or r.signal != 0 {
+        mut head = ""
+        if what != "" {
+            head = f"{what}: "
+        }
+        mut how = ""
+        if r.signal != 0 {
+            how = f" (signal {r.signal})"
+        }
+        fail(f"{head}{r.stderr.trim_end()}{r.stdout.trim_end()}{how}")
+    }
+}
+
+// Run `body` on a new project in a process of its own, then remove the project.
+func in_project(anon body: func(Project) -> none, what: str = "") -> none {
+    let p = new_project()
+    let r = testing.run(func() {
+        body(p)
+    })
+    p.remove()
+    relay(r, what)
+}
+
+// Fail unless the run had this status, stdout and stderr.
+func expect(anon got: Done, anon status: int64, anon out: str, anon err: str, what: str = "") -> none {
+    if got.status != status or got.out != out or got.err != err {
+        fail(f"{what} got ({got.status}, `{got.out}`, `{got.err}`), want ({status}, `{out}`, `{err}`)")
+    }
+}
+
+func expect_list(anon got: [str], anon want: [str], what: str = "") -> none {
+    if got != want {
+        fail(f"{what} got {shown(got)}\n      want {shown(want)}")
+    }
+}
+
+// `<name>.kod` with `directives` at the top and a function `value()` that
+// calls `kod_<name>_value`, and `<name>.c`, which returns `value`.
+func cc_module(anon name: str, anon directives: str, anon value: str, extra: str = "") -> [File] {
+    mut stem = name
+    if last_slash(name) is int64(at) {
+        stem = name[at + 1..len(name)]
+    }
+    return [
+        File(name: f"{name}.kod", text: directives + "\n\nextern func kod_" + stem + "_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_" + stem + "_value()\n}\n"),
+        File(name: f"{name}.c", text: "#include \"kod_rt.h\"\n" + extra + "\n" + "int64_t kod_" + stem + "_value(void) { return " + value + "; }\n"),
+    ]
+}
+
+func base_name(anon path: str) -> str {
+    if last_slash(path) is int64(at) {
+        return path[at + 1..len(path)]
+    }
+    return path
+}
+
+// A `main` that prints `value()` of each module (`./lib` is `lib`).
+func entry_of(anon modules: [str]) -> str {
+    mut imports = ""
+    mut prints = ""
+    for i, m in modules {
+        imports = imports + "import \"./" + m + "\"\n"
+        prints = prints + f"    let v{i}: int64 = {base_name(m)}.value()\n    print(f\"" + "{" + f"v{i}" + "}\")\n"
+    }
+    return imports + "\nfunc main() -> int64 {\n" + prints + "    return 0\n}\n"
+}
+
+// The fixture of tests/link_zlib.kod, in the project.
+func copy_zlib_fixture(anon p: Project) -> none {
+    let here = repo_root()
+    quiet(["mkdir", "-p", p.path("tests")])
+    quiet(["cp", "-R", f"{here}/tests/link", p.path("tests/link")])
+    quiet(["cp", f"{here}/tests/link_zlib.kod", p.path("tests/link_zlib.kod")])
+}
+
+func root_cflags() -> str {
+    return " ".join(cfg_words([f"{repo_root()}/link.cfg"], "CFLAGS"))
+}
+
+test "a module that names a C file and a library builds and runs" {
+    in_project(func(anon p: Project) {
+        copy_zlib_fixture(p)
+        expect(p.run(["run", "tests/link_zlib.kod"]), 0, "907060870\n", "")
+        // The module and its C file are objects of their own in the tree.
+        let objects = p.path("build/apps/link_zlib/link_zlib.obj/tests/link")
+        assert io.is_file(f"{objects}/zlib_crc.kod.o")
+        assert io.is_file(f"{objects}/zlib_crc.c.o")
+        // The C file is compiled as the runtime is, then the link names it, after
+        // the modules and before the shim and the library.
+        let c_object = "build/apps/link_zlib/link_zlib.obj/tests/link/zlib_crc.c.o"
+        expect_list(p.compiles(), [f"{root_cflags()} -c -o {c_object} tests/link/zlib_crc.c"])
+        let prefix = "build/apps/link_zlib/link_zlib.obj"
+        expect_list(last(p.link(), 5), [f"{prefix}/tests/link_zlib.kod.o", f"{prefix}/tests/link/zlib_crc.kod.o", c_object, f"{prefix}/tests/link_zlib.kod.main.o", "-lz"])
+    })
+}
+
+test "the zlib fixture links the system libz" {
+    in_project(func(anon p: Project) {
+        copy_zlib_fixture(p)
+        let built = p.run(["build", "tests/link_zlib.kod"])
+        if built.status != 0 {
+            fail(built.err)
+        }
+        let shown = run_bounded(["otool", "-L", p.exe("link_zlib")], dir: p.root, io_dir: p.io)
+        mut libraries: [str] = []
+        for i, line in lines_of(shown.out) {
+            if i > 0 {
+                let w = words(line)
+                if len(w) > 0 {
+                    libraries += [w[0]]
+                }
+            }
+        }
+        assert arrays_contains(libraries, "/usr/lib/libz.1.dylib")
+        // Everything it loads is the system's, not a Homebrew or other prefix.
+        for lib in libraries {
+            if not lib.starts_with("/usr/lib/") and not lib.starts_with("/System/") {
+                fail(f"loads {lib}")
+            }
+        }
+    })
+}
+
+func arrays_contains(anon xs: [str], anon x: str) -> bool {
+    return index_of(xs, x) >= 0
+}
+
+test "a module a program reaches through another still counts" {
+    in_project(func(anon p: Project) {
+        copy_zlib_fixture(p)
+        p.write([
+            File(name: "mid.kod", text: "import \"./tests/link/zlib_crc\"\n\nfunc checksum(anon s: str) -> int64 {\n    return zlib_crc.crc32(s)\n}\n"),
+            File(name: "entry.kod", text: "import \"./mid\"\n\nfunc main() -> int64 {\n    let c: int64 = mid.checksum(\"hello\")\n    print(f\"{c}\")\n    return 0\n}\n"),
+        ])
+        expect(p.run(["run", "entry.kod"]), 0, "907060870\n", "")
+    })
+}
+
+test "a plain program runs no C compiler and one link" {
+    in_project(func(anon p: Project) {
+        let built = p.run(["build", "hello.kod"])
+        if built.status != 0 {
+            fail(built.err)
+        }
+        expect_list(p.compiles(), [])
+        let link = p.link()
+        assert len(link) > 0 and link[len(link) - 1].ends_with("/hello.kod.main.o")
+        mut libs: [str] = []
+        for w in link {
+            if w.starts_with("-l") {
+                libs += [w]
+            }
+        }
+        expect_list(libs, [])
+        // Nothing but the module, the shim and the executable is made.
+        let found = run_bounded(["find", ".", "-type", "f"], dir: p.path("build/apps"), io_dir: p.io)
+        mut made: [str] = []
+        for line in lines_of(found.out) {
+            made += [line.strip_prefix("./")? or line]
+        }
+        expect_list(sort.sorted(made), ["hello/hello", "hello/hello.obj/hello.kod.main.o", "hello/hello.obj/hello.kod.main.s", "hello/hello.obj/hello.kod.o"])
+    })
+}
+
+test "a C file and a module of one name are objects of their own" {
+    // lib.kod and lib.c: <path>.kod.o and <path>.c.o. The fixture of zlib does
+    // the same with tests/link/zlib_crc.{kod,c}.
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:cc lib.c", "7"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "7\n", "")
+        expect_list(p.listing("build/apps/entry/entry.obj", files_only: true), ["entry.kod.main.o", "entry.kod.main.s", "entry.kod.o", "lib.c.o", "lib.kod.o"])
+    })
+}
+
+let UNKNOWN: str = "lib.kod:1:1: error: unknown directive kod:linkk\n"
+
+test "a mistake in a directive stops every command before anything is made" {
+    for case in [["build", "entry.kod"], ["run", "entry.kod"], ["test", "lib_test.kod"], ["check", "entry.kod"]] {
+        let command = case[0]
+        let entry = case[1]
+        in_project(func(anon p: Project) {
+            p.write(cc_module("lib", "// kod:linkk -lz", "1"))
+            p.write([File(name: "entry.kod", text: entry_of(["lib"])), File(name: "lib_test.kod", text: "import \"./lib\"\n" + PASSING)])
+            expect(p.run([command, entry]), 1, "", UNKNOWN)
+            expect_list(p.clang_calls(), [])
+            expect_list(p.apps(), [])
+        }, what: command)
+    }
+}
+
+test "every mistake is shown with its line" {
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "lib.kod", text: "// lib\n// kod:link -lz\n// kod:cc sub/x.c\n// kod:link -L${NOPE}\n" + "// kod:require\n// kod:cc missing.c\n\nfunc f() -> int64 {\n    return 1\n}\n"),
+            File(name: "entry.kod", text: "import \"./lib\"\n\nfunc main() -> int64 {\n    return 0\n}\n"),
+        ])
+        let done = p.run(["build", "entry.kod"])
+        assert done.status == 1 and done.out == ""
+        expect_list(lines_of(done.err), [
+            "lib.kod:3:1: error: kod:cc names `sub/x.c`, which is not the name of a .c file beside the module (a bare name that ends in .c)",
+            "lib.kod:4:1: error: `${NOPE}` is not set in link.cfg or link.local.cfg",
+            "lib.kod:5:1: error: kod:require needs the file that must exist",
+            "lib.kod:6:1: error: no such file missing.c",
+        ])
+        expect_list(p.apps(), [])
+    })
+}
+
+test "a directive after the first declaration is a comment" {
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "late.kod", text: "import \"io\"\n// kod:link -lnosuchlibrary\n// kod:linkk\n" + "func f() -> int64 {\n    return 4\n}\n"),
+            File(name: "entry.kod", text: "import \"./late\"\n\nfunc main() -> int64 {\n" + "    let v: int64 = late.f()\n    print(f\"{v}\")\n    return 0\n}\n"),
+        ])
+        expect(p.run(["run", "entry.kod"]), 0, "4\n", "")
+        expect_list(p.compiles(), [])
+    })
+}
+
+test "kod check checks the lines but compiles no C and looks for no file" {
+    in_project(func(anon p: Project) {
+        let directives = "// kod:require /no/such/header.h  brew install nothing\n" + "// kod:cc lib.c\n// kod:link -lnosuchlibrary"
+        p.write(cc_module("lib", directives, "1"))
+        p.write([File(name: "lib.c", text: "this is not C\n"), File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["check", "entry.kod"]), 0, "", "")
+        expect_list(p.clang_calls(), [])
+        // A C file that is not there is a mistake in the lines, though.
+        quiet(["rm", p.path("lib.c")])
+        expect(p.run(["check", "entry.kod"]), 1, "", "lib.kod:2:1: error: no such file lib.c\n")
+        // A mistake in the Kod itself is still found, and shown with the other.
+        p.write([File(name: "lib.kod", text: "// kod:linkk\n\nfunc value() -> int64 {\n    return nope\n}\n")])
+        let done = p.run(["check", "entry.kod"])
+        assert done.status == 1
+        assert done.err.starts_with("lib.kod:1:1: error: unknown directive kod:linkk\n")
+        assert done.err.contains("unknown name `nope`")
+    })
+}
+
+test "a required file that is missing stops the build with its hint" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:require /no/such/header.h  brew install nothing\n" + "// kod:require /no/such/other.h\n" + "// kod:require hello.kod\n" + "// kod:cc lib.c", "1"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        for command in ["build", "run"] {
+            expect(p.run([command, "entry.kod"]), 1, "", "lib.kod:1:1: error: needs /no/such/header.h (brew install nothing)\n" + "lib.kod:2:1: error: needs /no/such/other.h\n", what: command)
+            // Before anything is compiled, and nothing is made.
+            expect_list(p.clang_calls(), [], what: command)
+            expect_list(p.apps(), [], what: command)
+        }
+    })
+}
+
+test "a required file that is there lets the build go on" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:require hello.kod  nothing to install\n// kod:cc lib.c", "5"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "5\n", "")
+    })
+}
+
+test "a required file can be named through a name of link.cfg" {
+    in_project(func(anon p: Project) {
+        let cfg = p.path("link.cfg")
+        write(cfg, io.read_file(cfg) + f"PROBE_ROOT := {p.root}\n")
+        p.write(cc_module("lib", "// kod:require ${PROBE_ROOT}/lib.c  mkdir it\n// kod:cc lib.c", "8"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "8\n", "")
+        write(p.path("link.local.cfg"), "PROBE_ROOT := /no/such/root\n")
+        let done = p.run(["build", "entry.kod"])
+        assert done.status == 1
+        assert done.err == "lib.kod:1:1: error: needs /no/such/root/lib.c (mkdir it)\n"
+    })
+}
+
+test "a C file gets the flags and names the module gives it" {
+    in_project(func(anon p: Project) {
+        let cfg = p.path("link.cfg")
+        write(cfg, io.read_file(cfg) + f"PROBE_INC := {p.root}/inc\n")
+        p.write([
+            File(name: "inc/probe_value.h", text: "#define PROBE_VALUE 37\n"),
+            File(name: "second/second.h", text: "#define SECOND 100\n"),
+            File(name: "lib/probe.kod", text: "// kod:cc probe.c -I${PROBE_INC} -Isecond -DEXTRA=5\n\n" + "extern func kod_probe_value() -> int64\n" + "extern func kod_probe_bytes() -> str\n\n" + "func value() -> int64 {\n    return kod_probe_value()\n}\n\n" + "func bytes() -> str {\n    return kod_probe_bytes()\n}\n"),
+            File(name: "lib/probe.c", text: "#include \"kod_rt.h\"\n#include \"probe_value.h\"\n#include \"second.h\"\n" + "int64_t kod_probe_value(void) { return PROBE_VALUE + EXTRA + SECOND; }\n" + "KodStr *kod_probe_bytes(void) { return kod_str_from_bytes(\"a\\0b\", 3); }\n"),
+            File(name: "entry.kod", text: "import \"./lib/probe\"\n\nfunc main() -> int64 {\n" + "    let v: int64 = probe.value()\n    let b: str = probe.bytes()\n" + "    let n: int64 = len(b)\n    let b0: int64 = b[0]\n" + "    let b1: int64 = b[1]\n    let b2: int64 = b[2]\n" + "    print(f\"{v} {n} {b0} {b1} {b2}\")\n    return 0\n}\n"),
+        ])
+        // `-I second` is relative to the repository root, the cwd of the compile;
+        // the string with a NUL in it has all three bytes, and they are the ones given.
+        expect(p.run(["run", "entry.kod"]), 0, "142 3 97 0 98\n", "")
+        expect_list(p.compiles(), [f"{root_cflags()} -I{p.root}/inc -Isecond -DEXTRA=5 -c -o " + "build/apps/entry/entry.obj/lib/probe.c.o lib/probe.c"])
+    })
+}
+
+test "a name that link.cfg does not set or sets to several words is an error" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:link -L${NOPE}/lib\n// kod:cc lib.c", "1"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        let first = p.run(["build", "entry.kod"])
+        assert first.status == 1
+        assert first.err == "lib.kod:1:1: error: `${NOPE}` is not set in link.cfg or link.local.cfg\n"
+        p.write(cc_module("lib", "// kod:link ${LINK}\n// kod:cc lib.c", "1"))
+        let second = p.run(["build", "entry.kod"])
+        assert second.status == 1
+        assert second.err == "lib.kod:1:1: error: `${LINK}` must be one word to be used in a directive\n"
+        expect_list(p.clang_calls(), [])
+    })
+}
+
+func shared_module(anon flags: str) -> str {
+    return "// kod:cc shared.c" + flags + "\n\nextern func kod_shared_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_shared_value()\n}\n"
+}
+
+let SHARED_C: str = "#include \"kod_rt.h\"\nint64_t kod_shared_value(void) { return 3; }\n"
+
+test "a C file that two modules name is compiled and linked once" {
+    in_project(func(anon p: Project) {
+        p.write([File(name: "shared.c", text: SHARED_C), File(name: "m1.kod", text: shared_module("")), File(name: "m2.kod", text: shared_module(""))])
+        p.write([File(name: "entry.kod", text: entry_of(["m1", "m2"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "3\n3\n", "")
+        assert len(p.compiles()) == 1
+        assert count(p.link(), "build/apps/entry/entry.obj/shared.c.o") == 1
+    })
+}
+
+test "one C file named with other flags by two modules is an error" {
+    in_project(func(anon p: Project) {
+        p.write([File(name: "shared.c", text: SHARED_C), File(name: "m1.kod", text: shared_module("")), File(name: "m2.kod", text: shared_module(" -DX=1"))])
+        p.write([File(name: "entry.kod", text: entry_of(["m1", "m2"]))])
+        let done = p.run(["build", "entry.kod"])
+        assert done.status == 1
+        assert done.err == "m2.kod:1:1: error: shared.c is also compiled by the kod:cc line at m1.kod:1, with other flags\n"
+        expect_list(p.clang_calls(), [])
+    })
+}
+
+test "C files of one name in two directories are two objects" {
+    // Two modules `lib`, each with a lib.c, reached through different importers.
+    // (C symbols share one namespace, so the functions differ.)
+    in_project(func(anon p: Project) {
+        for i, side in ["a", "b"] {
+            p.write([
+                File(name: f"{side}/lib.kod", text: "// kod:cc lib.c\n\n" + f"extern func kod_{side}_lib_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_" + side + "_lib_value()\n}\n"),
+                File(name: f"{side}/lib.c", text: "#include \"kod_rt.h\"\n" + f"int64_t kod_{side}_lib_value(void) " + "{ return " + str(i + 1) + "; }\n"),
+                File(name: f"{side}/use_{side}.kod", text: "import \"./lib\"\n\nfunc value() -> int64 {\n" + "    return lib.value()\n}\n"),
+            ])
+        }
+        p.write([File(name: "entry.kod", text: entry_of(["a/use_a", "b/use_b"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "1\n2\n", "")
+        let objects = p.path("build/apps/entry/entry.obj")
+        assert io.is_file(f"{objects}/a/lib.c.o")
+        assert io.is_file(f"{objects}/b/lib.c.o")
+        assert len(p.compiles()) == 2
+    })
+}
+
+test "a C file whose name starts with a dash is not taken for an option" {
+    // In the root of the project the path of the C file is its bare name.
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "dash.kod", text: "// kod:cc -x.c\n\nextern func kod_dash_value() -> int64\n\n" + "func main() -> int64 {\n    print(f\"{kod_dash_value()}\")\n" + "    return 0\n}\n"),
+            File(name: "-x.c", text: "#include \"kod_rt.h\"\nint64_t kod_dash_value(void) { return 42; }\n"),
+        ])
+        expect(p.run(["run", "dash.kod"]), 0, "42\n", "")
+        assert io.is_file(p.path("build/apps/dash/dash.obj/-x.c.o"))
+        mut lasts: [str] = []
+        for c in p.compiles() {
+            let w = words(c)
+            lasts += [w[len(w) - 1]]
+        }
+        expect_list(lasts, ["./-x.c"])
+    })
+}
+
+test "link arguments are passed in order and a library once" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("a", "// kod:link -lz -framework Foundation\n// kod:cc a.c", "1"))
+        p.write(cc_module("b", "// kod:link -framework Foundation -lz -lm\n// kod:cc b.c", "2"))
+        p.write(cc_module("c", "// kod:cc c.c\n// kod:link -lm -L/usr/lib -lz -lc++", "3"))
+        p.write([File(name: "entry.kod", text: entry_of(["a", "b", "c"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "1\n2\n3\n", "")
+        let link = p.link()
+        let shim = index_of(link, "build/apps/entry/entry.obj/entry.kod.main.o")
+        assert shim >= 0
+        if shim >= 0 {
+            expect_list(link[shim + 1..len(link)], ["-lz", "-framework", "Foundation", "-framework", "Foundation", "-lm", "-L/usr/lib", "-lc++"])
+        }
+    })
+}
+
+test "a failing C compile shows the compiler, names the file and links nothing" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:cc lib.c", "1"))
+        p.write([File(name: "lib.c", text: "this is not C\n"), File(name: "entry.kod", text: entry_of(["lib"]))])
+        for command in ["build", "run"] {
+            let done = p.run([command, "entry.kod"])
+            assert done.status == 1 and done.out == ""
+            assert done.err.contains("lib.c:1:1: error:")
+            assert done.err.ends_with("kod: compiling lib.c failed\n")
+            assert not exists(p.exe("entry"))
+            // The C compile was the one compile, and no link followed it.
+            assert len(p.compiles()) == 1
+            for c in p.clang_calls() {
+                assert f" {c} ".contains(" -c ")
+            }
+            quiet(["rm", p.log])
+        }
+        p.write([File(name: "lib.c", text: "#include \"kod_rt.h\"\nint64_t kod_lib_value(void) { return 6; }\n")])
+        expect(p.run(["run", "entry.kod"]), 0, "6\n", "")
+    })
+}
+
+test "a C file needs a compiler but a program without one does not" {
+    in_project(func(anon p: Project) {
+        write(p.path("link.local.cfg"), "CC :=\n")
+        p.write(cc_module("lib", "// kod:cc lib.c", "1"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["build", "entry.kod"]), 1, "", "kod: link.cfg and link.local.cfg set no CC\n")
+        // Only the modules were assembled: no C compile, and no link.
+        expect_list(p.compiles(), [])
+        for c in p.clang_calls() {
+            assert f" {c} ".contains(" -x assembler ")
+        }
+        // Nothing asks for CC when no module names a C file.
+        let done = p.run(["build", "hello.kod"])
+        assert done.status == 0 and done.err == ""
+    })
+}
+
+test "a failing C compile in a test program stops kod test" {
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "// kod:cc lib.c", "1"))
+        p.write([File(name: "lib.c", text: "this is not C\n"), File(name: "lib_test.kod", text: "import \"./lib\"\n" + PASSING)])
+        let done = p.run(["test", "lib_test.kod"])
+        assert done.status == 1 and done.out == ""
+        assert done.err.ends_with("kod: compiling lib.c failed\n")
+    })
+}
+
+test "a C file is compiled again when it or its header or the flags change" {
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "lib.kod", text: "// kod:cc lib.c\n\nextern func kod_lib_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_lib_value()\n}\n"),
+            File(name: "lib.h", text: "#define BASE 10\n"),
+            File(name: "lib.c", text: "#include \"kod_rt.h\"\n#include \"lib.h\"\n" + "int64_t kod_lib_value(void) { return BASE + WHO; }\n"),
+            File(name: "entry.kod", text: entry_of(["lib"])),
+        ])
+        let flags = root_cflags()
+        let local = p.path("link.local.cfg")
+        write(local, f"CFLAGS := {flags} -DWHO=1\n")
+        expect(p.run(["run", "entry.kod"]), 0, "11\n", "")
+        p.write([File(name: "lib.h", text: "#define BASE 20\n")])
+        expect(p.run(["run", "entry.kod"]), 0, "21\n", "")
+        p.write([File(name: "lib.c", text: "#include \"kod_rt.h\"\n#include \"lib.h\"\n" + "int64_t kod_lib_value(void) { return BASE + WHO + 100; }\n")])
+        expect(p.run(["run", "entry.kod"]), 0, "121\n", "")
+        write(local, f"CFLAGS := {flags} -DWHO=2\n")
+        expect(p.run(["run", "entry.kod"]), 0, "122\n", "")
+        // Every build compiled it: four builds, four compiles.
+        assert len(p.compiles()) == 4
+    })
+}
+
+test "an always-linked module cannot declare link inputs" {
+    in_project(func(anon p: Project) {
+        let modules = cfg_words([p.path("link.cfg")], "STAGE0_KOD")
+        // Named `time`, so that the object `make` built for stdlib/time.kod is the
+        // one the configuration expects; nothing is linked here.
+        p.write([
+            File(name: "hello_test.kod", text: PASSING),
+            File(name: "zzmod/time.kod", text: "// This module is linked into every program.\n" + "// kod:link -lz\n\nfunc stamp() -> int64 {\n    return 1\n}\n"),
+        ])
+        write(p.path("link.local.cfg"), "STAGE0_KOD := " + " ".join(modules) + " zzmod/time.kod\n")
+        let wanted = "zzmod/time.kod:2:1: error: a module in STAGE0_KOD cannot declare link inputs; " + "make builds it without reading them\n"
+        for command in ["build", "run", "test", "check"] {
+            mut entry = "hello.kod"
+            if command == "test" {
+                entry = "hello_test.kod"
+            }
+            expect(p.run([command, entry]), 1, "", wanted, what: command)
+        }
+        expect_list(p.clang_calls(), [])
+        expect_list(p.apps(), [])
+    })
+}
+
+test "a module only a test file imports gives its inputs to kod test" {
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "lib.kod", text: "// kod:cc lib.c\n// kod:link -lz\n\nextern func kod_lib_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_lib_value()\n}\n"),
+            File(name: "lib.c", text: "#include \"kod_rt.h\"\nint64_t kod_lib_value(void) { return 9; }\n"),
+            File(name: "lib_test.kod", text: "import \"./lib\"\n\ntest \"the C file is linked in\" {\n" + "    assert lib.value() == 9\n}\n"),
+        ])
+        let done = p.run(["test", "lib_test.kod"])
+        if done.status != 0 {
+            fail(done.err)
+        }
+        assert done.out.contains("1/1 passed")
+        assert len(p.compiles()) == 1
+        expect_list(last(p.link(), 1), ["-lz"])
+    })
+}
+
+test "kod test of a directory compiles a C file once for all its test files" {
+    in_project(func(anon p: Project) {
+        mut files = [File(name: "t/shared.c", text: SHARED_C)]
+        for name in ["m1", "m2"] {
+            files += [
+                File(name: f"t/{name}.kod", text: "// kod:cc shared.c\n// kod:link -lz\n\nextern func kod_shared_value() -> int64\n\n" + "func value() -> int64 {\n    return kod_shared_value()\n}\n"),
+                File(name: f"t/{name}_test.kod", text: f"import \"./{name}\"\n\ntest \"{name} sees the C file\" " + "{\n" + f"    assert {name}.value() == 3\n" + "}\n"),
+            ]
+        }
+        files += [File(name: "t/plain_test.kod", text: PASSING)]
+        p.write(files)
+        let done = p.run(["test", "t"])
+        if done.status != 0 {
+            fail(done.err)
+        }
+        assert done.out.contains("3/3 passed")
+        assert len(p.compiles()) == 1
+        assert count(p.link(), "-lz") == 1
+    })
+}
+
+test "a directory of tests stops at a required file that is missing" {
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "t/needs.kod", text: "// kod:require /no/such/thing  install it\n\nfunc f() -> int64 {\n    return 1\n}\n"),
+            File(name: "t/a_test.kod", text: "import \"./needs\"\n" + PASSING),
+            File(name: "t/b_test.kod", text: PASSING),
+        ])
+        expect(p.run(["test", "t"]), 1, "", "t/needs.kod:1:1: error: needs /no/such/thing (install it)\n")
+        expect_list(p.apps(), [])
+    })
+}
+
+test "a byte order mark does not hide the directives" {
+    // The lexer skips the mark, so such a module compiles; its lines count too.
+    in_project(func(anon p: Project) {
+        p.write(cc_module("lib", "\u{feff}// kod:cc lib.c", "21"))
+        p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+        expect(p.run(["run", "entry.kod"]), 0, "21\n", "")
+        assert len(p.compiles()) == 1
+        p.write(cc_module("lib", "\u{feff}// kod:linkk", "21"))
+        expect(p.run(["check", "entry.kod"]), 1, "", UNKNOWN)
+    })
+}
+
+let SLIP: str = "lib.kod:1:1: error: a directive is written `// kod:name`, in lower case, " + "with one space after the slashes and none before the colon\n"
+
+test "a directive with a slip in its spelling is an error, not a comment" {
+    for first in ["//kod:cc lib.c", "//  kod:cc lib.c", "// Kod:cc lib.c", "// kod :cc lib.c"] {
+        in_project(func(anon p: Project) {
+            p.write(cc_module("lib", first, "1"))
+            p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+            for command in ["check", "build"] {
+                expect(p.run([command, "entry.kod"]), 1, "", SLIP, what: command)
+            }
+            expect_list(p.clang_calls(), [])
+            expect_list(p.apps(), [])
+        }, what: f"`{first}`")
+    }
+}
+
+test "a tab in a directive line is an error at that line" {
+    for line in ["// kod:link -lz \t", "// kod:link\t-lz", "// kod:cc lib.c\t"] {
+        in_project(func(anon p: Project) {
+            p.write(cc_module("lib", line, "1"))
+            p.write([File(name: "entry.kod", text: entry_of(["lib"]))])
+            let wanted = "lib.kod:1:1: error: a tab or another control character in a directive " + "line; its words are separated by spaces\n"
+            for command in ["check", "build"] {
+                expect(p.run([command, "entry.kod"]), 1, "", wanted, what: command)
+            }
+            expect_list(p.clang_calls(), [])
+        }, what: f"`{line}`")
+    }
+}
+
+// More than a directive of this size needs, with room for the program itself.
+let RSS_LIMIT: int64 = 64 * 1048576
+
+test "a very long word or hint costs memory in proportion" {
+    // Put together a byte or a word at a time, these cost about 1.4 GB.
+    in_project(func(anon p: Project) {
+        p.write([
+            File(name: "long.kod", text: "// kod:link -L" + "a".repeat(40000) + "\n" + "// kod:link " + "${CC}".repeat(5000) + "\n" + "// kod:require /no/such " + "hint ".repeat(10000) + "\n\n" + "func f() -> int64 {\n    return 1\n}\n"),
+            File(name: "entry.kod", text: "import \"./long\"\n" + program("x")),
+        ])
+        let done = p.run(["check", "entry.kod"])
+        assert done.status == 0 and done.err == ""
+        // Bytes on macOS.
+        if done.maxrss >= RSS_LIMIT {
+            fail(f"ru_maxrss {done.maxrss / 1048576} MiB")
+        }
+    })
+}
+
+// Whether a stripped line is `//\s*kod\s*:`, in any case.
+func looks_like_a_directive(anon text: str) -> bool {
+    if not text.starts_with("//") {
+        return false
+    }
+    mut i = 2
+    for i < len(text) and is_space(text[i]) {
+        i += 1
+    }
+    if i + 3 > len(text) or text[i..i + 3].lower() != "kod" {
+        return false
+    }
+    i += 3
+    for i < len(text) and is_space(text[i]) {
+        i += 1
+    }
+    return i < len(text) and text[i] == ':'
+}
+
+test "no module make builds declares link inputs" {
+    // Make builds the always-linked modules, the compiler library and the two
+    // compiler entries without reading `// kod:` lines (docs/modules.md, "Link
+    // inputs"). The driver refuses lines in an always-linked module; for the
+    // others, which it would read, this test is the guard.
+    let here = repo_root()
+    let scratch = f"{here}/build/link_inputs_{libc.getpid()}_make"
+    quiet(["mkdir", "-p", scratch])
+    let made = run_bounded(["make", "-pq", "-f", "Makefile"], dir: here, io_dir: scratch)
+    quiet(["rm", "-rf", scratch])
+    // What Make reads from the Makefile: COMPILER_KOD, from Make's database.
+    mut compiler: [str] = []
+    mut previous = ""
+    for line in made.out.split("\n") {
+        if previous.starts_with("# makefile (from ") and previous.contains("Makefile") {
+            if line.find(" := ") is int64(at) {
+                if line[0..at] == "COMPILER_KOD" {
+                    compiler = words(line[at + 4..len(line)])
+                }
+            }
+        }
+        previous = line
+    }
+    let modules = cfg_words([f"{here}/link.cfg", f"{here}/link.local.cfg"], "STAGE0_KOD") + compiler + ["kodc.kod", "tools/kod.kod"]
+    assert len(modules) > 14
+    for module in modules {
+        for line in io.read_file(f"{here}/{module}").split("\n") {
+            let text = line.trim()
+            if text != "" and not text.starts_with("//") {
+                break
+            }
+            if looks_like_a_directive(text) {
+                fail(f"{module}: {line}")
+            }
+        }
+    }
+}
+
+// --- Labels that paths spell alike ---------------------------------------------
+
+// A directory below build/ for the modules of a test, and the program name
+// its entry gets: `main` in the Python original, here one of its own, so that
+// the program does not share build/apps/main with the tests that build through
+// stdlib/kod/test_support.kod.
+type Labels = struct {
+    // Relative to the repository root.
+    here: str
+    stem: str
+}
+
+func labels() -> Labels {
+    let token = f"vt{libc.getpid()}"
+    let l = Labels(here: f"build/{token}", stem: f"main_{token}")
+    quiet(["rm", "-rf", l.here])
+    quiet(["mkdir", "-p", l.here])
+    return l
+}
+
+func remove_labels(anon l: Labels) -> none {
+    quiet(["rm", "-rf", l.here, f"build/apps/{l.stem}"])
+}
+
+func write_modules(anon l: Labels, anon files: [File]) -> none {
+    for f in files {
+        write(f"{l.here}/{f.name}", f.text)
+    }
+}
+
+// `kod run` of the entry from the repository root; the lines it printed.
+func run_from_root(anon l: Labels) -> [str] {
+    let here = repo_root()
+    let done = run_bounded([f"{here}/{KOD}", "run", f"{l.here}/{l.stem}.kod"], dir: here, io_dir: l.here, wait_ms: BUILD_WAIT_MS)
+    if done.status != 0 {
+        fail(done.err)
+    }
+    return lines_of(done.out)
+}
+
+func who_s(anon name: str) -> str {
+    return "type S = shared struct {\n    n: int64\n    func who(self) -> str {\n        return \"" + name + "\"\n    }\n}\n"
+}
+
+func who_interface(anon name: str) -> str {
+    return "interface " + name + " {\n    func who(self) -> str\n}\n"
+}
+
+test "two vtables whose paths spell one label stay apart" {
+    // `$<dir>$a$I$for$<dir>$b$for$<dir>$c$S$vtable` used to be both of these.
+    let l = labels()
+    let here = l.here
+    write_modules(l, [
+        File(name: "a.kod", text: who_interface("I")),
+        File(name: f"a/I/for/{here}.kod", text: who_interface("b")),
+        File(name: f"b/for/{here}/c.kod", text: who_s("first S")),
+        File(name: "c.kod", text: who_s("second S")),
+        File(name: "m1.kod", text: f"import \"./a\"\nimport \"./b/for/{here}/c\"\n" + "func make() -> a.I {\n    return c.S(n: 1)\n}\n"),
+        File(name: "m2.kod", text: f"import \"./a/I/for/{here}\" " + "{ b }\nimport \"./c\"\n" + "func make() -> b {\n    return c.S(n: 2)\n}\n"),
+        File(name: f"{l.stem}.kod", text: "import \"./m1\"\nimport \"./m2\"\n" + "func main() -> int64 {\n" + "    print(m1.make().who())\n" + "    print(m2.make().who())\n" + "    return 0\n}\n"),
+    ])
+    let got = run_from_root(l)
+    remove_labels(l)
+    expect_list(got, ["first S", "second S"])
+}
+
+test "a method and a function whose paths spell one label stay apart" {
+    // `T.m` in `x.kod` and `m` in `x/T.kod` were both `$<dir>$x$T$m`.
+    let l = labels()
+    write_modules(l, [
+        File(name: "x.kod", text: "type T = shared struct {\n    v: int64\n" + "    func m(self) -> int64 {\n        return self.v\n    }\n}\n"),
+        File(name: "x/T.kod", text: "func m() -> int64 {\n    return 7\n}\n"),
+        File(name: f"{l.stem}.kod", text: "import \"./x\"\nimport \"./x/T\"\n" + "func main() -> int64 {\n" + "    print(f\"{x.T(v: 1).m()} {T.m()}\")\n" + "    return 0\n}\n"),
+    ])
+    let got = run_from_root(l)
+    remove_labels(l)
+    expect_list(got, ["1 7"])
+}
+
+test "an instance and a type whose paths spell one label stay apart" {
+    // `Box[x.S]` and the `S` of a directory path that spells it had one
+    // identity word, so `is` took one for the other.
+    let l = labels()
+    let here = l.here
+    write_modules(l, [
+        File(name: "i.kod", text: who_interface("I")),
+        File(name: "x.kod", text: who_s("plain S")),
+        File(name: "l.kod", text: "type Box[T] = shared struct {\n    v: T\n" + "    func who(self) -> str {\n        return \"box\"\n    }\n}\n"),
+        File(name: f"l/Box/{here}/x.kod", text: who_s("deep S")),
+        File(name: "m1.kod", text: "import \"./i\"\nimport \"./l\"\nimport \"./x\"\n" + "func make() -> i.I {\n" + "    return l.Box[x.S](v: x.S(n: 1))\n}\n"),
+        File(name: "m2.kod", text: f"import \"./i\"\nimport \"./l/Box/{here}/x\"\n" + "func make() -> i.I {\n    return x.S(n: 2)\n}\n"),
+        File(name: f"{l.stem}.kod", text: "import \"./m1\"\nimport \"./m2\"\n" + f"import \"./l/Box/{here}/x\"\n" + "func main() -> int64 {\n" + "    let one = m1.make()\n" + "    let two = m2.make()\n" + "    print(one.who())\n" + "    print(two.who())\n" + "    print(one is x.S)\n" + "    print(two is x.S)\n" + "    return 0\n}\n"),
+    ])
+    let got = run_from_root(l)
+    remove_labels(l)
+    expect_list(got, ["box", "deep S", "false", "true"])
+}

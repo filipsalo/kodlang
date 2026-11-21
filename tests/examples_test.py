@@ -62,6 +62,9 @@ def generate_tests() -> Generator[_pytest.mark.structures.ParameterSet, None, No
     """Generate tests from example files."""
     test_dir = Path(__file__).parent.relative_to(Path.cwd())
     for path in sorted(test_dir.glob("**/*.kod")):
+        # Test files are run by test_kod_test_blocks and test_unit_tests.
+        if path.name.endswith("_test.kod"):
+            continue
         _, expects = parse_example(path)
         mode = expects.get("mode", "both").strip()
         if mode == "skip":

@@ -2,6 +2,8 @@
 tool, and when there is none it says so instead of building something else."""
 
 import os
+import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -70,3 +72,31 @@ def test_the_test_command_it_lists_takes_a_path_as_the_native_tool_does(sh_kodc)
     assert "kod test <path>" in launcher.__doc__
     with pytest.raises(SystemExit):
         launcher._make_parser().parse_args(["test"])
+
+
+def test_a_program_run_through_the_launcher_dies_of_a_closed_pipe():
+    # Python ignores SIGPIPE, and exec keeps an ignored signal ignored, so
+    # unless the launcher resets it `uv run kod run prog | head` is a program
+    # that writes to a pipe nobody reads and carries on.
+    stem = f"huge_launcher_{os.getpid()}"
+    source = ROOT / "build" / f"{stem}.kod"
+    source.write_bytes((ROOT / "tests" / "stdio" / "huge.kod").read_bytes())
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "kod", "run", str(source.relative_to(ROOT))],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.read(1) == b"0"
+        proc.stdout.close()
+        assert proc.wait(timeout=120) == -signal.SIGPIPE
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        source.unlink(missing_ok=True)
+        shutil.rmtree(ROOT / "build" / "apps" / stem, ignore_errors=True)

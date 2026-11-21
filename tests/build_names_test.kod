@@ -1,0 +1,851 @@
+// Names and objects (docs/modules.md, "Symbol and object names"): a path of
+// any shape builds, modules with the same name link, and each object is named
+// after its source path. Everything goes through the native `kod` tool.
+//
+// Every run is bounded: a process that does not end in time is killed with
+// everything it started, which fails the test. Each test removes what it made
+// (a scratch directory below build/, the programs it built) before it checks.
+//
+// Some tests write outside build/ or replace what other tests run: the root
+// probes (files at the repository root), the directory `-dash_probe` at the
+// root, and the tests that build `kod` and `lsp` (and put them back). Run
+// this file on its own, not next to other tests.
+
+import "io"
+import "libc"
+import "process"
+import "sort"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+let KOD: str = "build/apps/kod/kod"
+let SH_KODC: str = "build/stage1/sh_kodc"
+let SIGSTOP: int64 = 17
+let SIGKILL: int64 = 9
+
+func program(anon output: str) -> str {
+    return "func main() -> int64 {\n    print(\"" + output + "\")\n    return 0\n}\n"
+}
+
+// --- Running a process, bounded -------------------------------------------
+
+type Ran = struct {
+    status: int64
+    stdout: str
+    stderr: str
+}
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// Run `argv` from the repository root, stdin /dev/null and stdout and stderr
+// captured. After `limit` seconds it is killed with everything it started,
+// which fails the test. The status is -1 when a signal ended it.
+func run(anon argv: [str], limit: int64 = 120, add_env: [str] = [], env: [str]? = none) -> Ran {
+    let dir = f"build/names_run_{libc.getpid()}_{monotonic_ns()}"
+    process.run(["mkdir", "-p", dir])
+    let script = "o=$1; e=$2; shift 2; exec \"$@\" >\"$o\" 2>\"$e\""
+    let started = process.start(["/bin/sh", "-c", script, "sh", f"{dir}/out", f"{dir}/err"] + argv, stdin: .Null, :env, :add_env)
+    mut status = -1
+    match started {
+        Ok(child) -> {
+            let deadline = monotonic_ns() + limit * 1000000000
+            for true {
+                match child.try_wait() {
+                    Ok(code) -> {
+                        if code is int64(c) {
+                            status = c
+                            break
+                        }
+                    }
+                    Err(_) -> break
+                }
+                if monotonic_ns() > deadline {
+                    kill_tree(child.pid)
+                    let _reaped = child.wait()
+                    fail(f"{" ".join(argv)}: still running after {limit} s; killed")
+                    break
+                }
+                time.sleep(Duration(ms: 2))
+            }
+        }
+        Err(e) -> fail(f"start {" ".join(argv)}: {e.to_str()}")
+    }
+    let out = io.read_file(f"{dir}/out")
+    let err = io.read_file(f"{dir}/err")
+    process.run(["rm", "-rf", "--", dir])
+    return Ran(:status, stdout: out, stderr: err)
+}
+
+func kod_build(anon entry: str, add_env: [str] = []) -> Ran {
+    return run([KOD, "build", entry], :add_env)
+}
+
+func kod_test(anon target: str) -> Ran {
+    return run([KOD, "test", target])
+}
+
+// Build `entry` with the native tool, run `build/apps/<stem>/<stem>` and
+// return what it printed; a failure fails the test.
+func build_and_run(anon entry: str, anon stem: str, add_env: [str] = []) -> str {
+    let built = kod_build(entry, :add_env)
+    if built.status != 0 {
+        fail(f"kod build {entry}: status {built.status}\n{built.stderr}")
+        return "(not built)"
+    }
+    let ran = run([f"build/apps/{stem}/{stem}"], limit: 5)
+    if ran.status != 0 {
+        fail(f"{stem}: status {ran.status}\n{ran.stderr}")
+    }
+    return ran.stdout
+}
+
+// --- Files ----------------------------------------------------------------
+
+func exists(anon path: str) -> bool {
+    return process.run(["test", "-e", path]).status == 0
+}
+
+func is_file(anon path: str) -> bool {
+    return process.run(["test", "-f", path]).status == 0
+}
+
+func is_dir(anon path: str) -> bool {
+    return process.run(["test", "-d", path]).status == 0
+}
+
+func mkdir(anon path: str) -> none {
+    if process.run(["mkdir", "-p", "--", path]).status != 0 {
+        fail(f"cannot make {path}")
+    }
+}
+
+func write(anon path: str, anon text: str) -> none {
+    if io.write_file(path, text) != 0 {
+        fail(f"cannot write {path}")
+    }
+}
+
+func symlink(anon target: str, anon path: str) -> none {
+    if process.run(["ln", "-s", "--", target, path]).status != 0 {
+        fail(f"cannot link {path}")
+    }
+}
+
+func remove(anon path: str) -> none {
+    process.run(["rm", "-rf", "--", path])
+}
+
+// The lines of `text`, without the empty ones, sorted.
+func sorted_lines(anon text: str) -> [str] {
+    mut out: [str] = []
+    for line in text.split("\n") {
+        if line != "" {
+            out += [line]
+        }
+    }
+    return sort.sorted(out)
+}
+
+// The repository root, the directory the tests run in.
+func root() -> str {
+    return process.run(["pwd", "-P"]).stdout.trim()
+}
+
+// A fresh directory below build/, as a path from the root.
+func scratch() -> str {
+    process.run(["mkdir", "-p", "build"])
+    let made = process.run(["mktemp", "-d", "build/names_XXXXXXXX"])
+    if made.status != 0 {
+        fail("cannot make a scratch directory")
+    }
+    return made.stdout.trim()
+}
+
+// `path`, a file or a directory, removed by `undo` unless it was there
+// before.
+type Cleaned = struct {
+    path: str
+    existed: bool
+
+    func undo(self) -> none {
+        if not self.existed {
+            remove(self.path)
+        }
+    }
+}
+
+func cleaned(anon path: str) -> Cleaned {
+    return Cleaned(:path, existed: exists(path))
+}
+
+// `build/apps/<stem>`, removed afterwards unless it was there before.
+func app_dir(anon stem: str) -> Cleaned {
+    return cleaned(f"build/apps/{stem}")
+}
+
+// The file `path` put back as it was (or removed, if it was not there) by
+// `undo` when it was changed. The copy of what it was is kept in `backup`.
+type Preserved = struct {
+    path: str
+    backup: str
+    had: bool
+
+    // Whether the file is what it was.
+    func same(self) -> bool {
+        return process.run(["cmp", "-s", self.backup, self.path]).status == 0
+    }
+
+    func undo(self) -> none {
+        if not self.had {
+            process.run(["rm", "-f", "--", self.path])
+        } else if not exists(self.path) or not self.same() {
+            // A new file, not a rewrite: macOS kills an executable that was
+            // changed in place after it ran.
+            let fresh = f"{self.path}.restore"
+            process.run(["cp", "-p", self.backup, fresh])
+            process.run(["chmod", "755", fresh])
+            process.run(["mv", "-f", fresh, self.path])
+        }
+    }
+}
+
+func preserved(anon path: str, backup: str) -> Preserved {
+    let had = exists(path)
+    if had and process.run(["cp", "-p", path, backup]).status != 0 {
+        fail(f"cannot copy {path}")
+    }
+    return Preserved(:path, :backup, :had)
+}
+
+// `text` in quotes, its newlines shown as `\n`.
+func quoted(anon text: str) -> str {
+    return "\"" + text.replace("\n", to: "\\n") + "\""
+}
+
+func is_name_char(anon c: int64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-'
+}
+
+// `text` with every character but [A-Za-z0-9_-] made `_`.
+func name_chars(anon text: str) -> str {
+    mut out = ""
+    for i in 0..len(text) {
+        if is_name_char(text[i]) {
+            out += text[i..i + 1]
+        } else {
+            out += "_"
+        }
+    }
+    return out
+}
+
+// The program name `kod test <directory>` gives: the directory as it is
+// spelled, without what a file name should not hold (its last 200 bytes
+// at most), and `_tests`.
+func program_for_tests(anon directory: str) -> str {
+    let name = name_chars(directory)
+    mut from = 0
+    if len(name) > 200 {
+        from = len(name) - 200
+    }
+    return name[from..len(name)] + "_tests"
+}
+
+// --- Paths of any shape ---------------------------------------------------
+
+test "a bench program named like a stdlib module builds" {
+    for stem in ["deflate", "sort"] {
+        let app = app_dir(stem)
+        let built = kod_build(f"bench/{stem}.kod")
+        app.undo()
+        if built.status != 0 {
+            fail(f"{stem}: status {built.status}\n{built.stderr}")
+        }
+    }
+}
+
+test "dollar and slash in a path are different modules" {
+    let s = scratch()
+    mkdir(f"{s}/p")
+    write(f"{s}/p$q.kod", "func f() -> int64 {\n    return 1\n}\n")
+    write(f"{s}/p/q.kod", "func f() -> int64 {\n    return 2\n}\n")
+    let entry = f"{s}/dollar_probe.kod"
+    write(entry, "import \"./p$q\"\nimport \"./p/q\"\n\nfunc main() -> int64 {\n    print(f\"{q.f()}\")\n    return 0\n}\n")
+    let app = app_dir("dollar_probe")
+    let out = build_and_run(entry, "dollar_probe")
+    app.undo()
+    remove(s)
+    assert out == "2\n"
+}
+
+test "an entry in a directory with a very long name builds" {
+    let s = scratch()
+    let deep = f"{root()}/{s}/{"-".repeat(230)}"
+    mkdir(deep)
+    let entry = f"{deep}/far_away.kod"
+    write(entry, program("far away"))
+    let app = app_dir("far_away")
+    let out = build_and_run(entry, "far_away")
+    app.undo()
+    remove(s)
+    assert len(entry) > 240
+    assert out == "far away\n"
+}
+
+test "an entry named obj has its executable and objects apart" {
+    let s = scratch()
+    let entry = f"{s}/obj.kod"
+    write(entry, program("obj"))
+    let app = app_dir("obj")
+    let out = build_and_run(entry, "obj")
+    let exe_is_file = is_file(f"{app.path}/obj")
+    let objects_are_dir = is_dir(f"{app.path}/obj.obj")
+    app.undo()
+    remove(s)
+    assert out == "obj\n"
+    assert exe_is_file
+    assert objects_are_dir
+}
+
+test "objects are named after their source in a tree" {
+    let s = scratch()
+    mkdir(f"{s}/lib")
+    write(f"{s}/lib/helper.kod", "func name() -> str {\n    return \"helper\"\n}\n")
+    let source = f"{s}/layout_probe.kod"
+    write(source, "import \"json\"\nimport \"./lib/helper\"\n\nfunc main() -> int64 {\n    let rendered: str = (must json.parse(\"[]\")).emit()\n    print(f\"{helper.name()} {rendered}\")\n    return 0\n}\n")
+    let app = app_dir("layout_probe")
+    let out = build_and_run(source, "layout_probe")
+    let entries = sorted_lines(process.run(["ls", "-A", app.path]).stdout)
+    let objects = f"{app.path}/layout_probe.obj"
+    mut found: [str] = []
+    for line in sorted_lines(process.run(["find", objects, "-type", "f"]).stdout) {
+        found += [line.strip_prefix(f"{objects}/")? or line]
+    }
+    app.undo()
+    remove(s)
+    assert out == "helper []\n"
+    assert entries == ["layout_probe", "layout_probe.obj"]
+    let modules = ["stdlib/json", f"{s}/layout_probe", f"{s}/lib/helper"]
+    // A module goes straight to its object; only the shim is assembly.
+    mut objs: [str] = []
+    for m in modules {
+        objs += [f"{m}.kod.o"]
+    }
+    objs += [f"{source}.main.o"]
+    mut found_o: [str] = []
+    mut found_s: [str] = []
+    for f in found {
+        if f.ends_with(".o") {
+            found_o += [f]
+        }
+        if f.ends_with(".s") {
+            found_s += [f]
+        }
+    }
+    assert sort.sorted(found_o) == sort.sorted(objs)
+    assert found_s == [f"{source}.main.s"]
+}
+
+test "a module compiled before comes from the cache" {
+    // With its text, a module's `.s` tells a compiled module from a cached one.
+    let asm_text = ["KOD_ASM_TEXT=1"]
+    let s = scratch()
+    write(f"{s}/helper.kod", "func n() -> int64 {\n    return 1\n}\n")
+    for name in ["cache_a", "cache_b"] {
+        write(f"{s}/{name}.kod", "import \"./helper\"\n\nfunc main() -> int64 {\n    print_int(helper.n())\n    return 0\n}\n")
+    }
+    let helper_s = f"{s}/helper.kod.s"
+    let a = app_dir("cache_a")
+    let b = app_dir("cache_b")
+    let source_a = f"{s}/cache_a.kod"
+    let source_b = f"{s}/cache_b.kod"
+    let first_a = build_and_run(source_a, "cache_a", add_env: asm_text)
+    // Another program with the same helper takes its object from the cache.
+    let first_b = build_and_run(source_b, "cache_b", add_env: asm_text)
+    let b_compiled_helper = exists(f"{b.path}/cache_b.obj/{helper_s}")
+    // Its own entry has a path of its own, so it was compiled.
+    let b_compiled_entry = exists(f"{b.path}/cache_b.obj/{source_b}.s")
+    // A changed import is compiled again, and so is what imports it.
+    write(f"{s}/helper.kod", "func n() -> int64 {\n    return 2\n}\n")
+    let changed_a = build_and_run(source_a, "cache_a", add_env: asm_text)
+    let a_compiled_changed = exists(f"{a.path}/cache_a.obj/{helper_s}")
+    // Back as it was: both objects are the first build's again.
+    write(f"{s}/helper.kod", "func n() -> int64 {\n    return 1\n}\n")
+    let back_a = build_and_run(source_a, "cache_a", add_env: asm_text)
+    let a_compiled_back = exists(f"{a.path}/cache_a.obj/{helper_s}")
+    a.undo()
+    b.undo()
+    remove(s)
+    assert first_a == "1\n"
+    assert first_b == "1\n"
+    assert not b_compiled_helper
+    assert b_compiled_entry
+    assert changed_a == "2\n"
+    assert a_compiled_changed
+    assert back_a == "1\n"
+    assert not a_compiled_back
+}
+
+// Shapes that only occur at the repository root: a module named like a
+// stdlib module, and a path that starts with a digit. The files are written
+// there for the length of one test.
+type Probe = struct {
+    name: str
+    source: str
+}
+
+func root_probes() -> [Probe] {
+    return [
+        Probe(name: "io.kod", source: "import \"io\"\n\nfunc is_file(anon path: str) -> bool {\n    return false\n}\n\nfunc main() -> int64 {\n    let ours: bool = is_file(\"kodc.kod\")\n    let theirs: bool = io.is_file(\"kodc.kod\")\n    print(f\"{ours} {theirs}\")\n    return 0\n}\n"),
+        Probe(name: "00_probe.kod", source: program("probe")),
+        Probe(name: "00e_probe.kod", source: program("probe e")),
+        Probe(name: "00_probe_dir/report.kod", source: program("report")),
+    ]
+}
+
+type RootCase = struct {
+    entry: str
+    stem: str
+    output: str
+}
+
+test "a root module with a stdlib twin or a digit builds" {
+    let probes = root_probes()
+    let directory = "00_probe_dir"
+    mut already: [str] = []
+    for p in probes {
+        if exists(p.name) {
+            already += [f"{root()}/{p.name}"]
+        }
+    }
+    if exists(directory) {
+        already += [f"{root()}/{directory}"]
+    }
+    if len(already) > 0 {
+        // Not ours to delete; a killed run may have left them.
+        mut verb = "exist"
+        if len(already) == 1 {
+            verb = "exists"
+        }
+        fail(f"{", ".join(already)} {verb} already; delete them and run again")
+        return
+    }
+    mkdir(directory)
+    for p in probes {
+        write(p.name, p.source)
+    }
+    let cases = [
+        RootCase(entry: "io.kod", stem: "io", output: "false true\n"),
+        RootCase(entry: "00_probe.kod", stem: "00_probe", output: "probe\n"),
+        RootCase(entry: "00e_probe.kod", stem: "00e_probe", output: "probe e\n"),
+        RootCase(entry: "00_probe_dir/report.kod", stem: "report", output: "report\n"),
+    ]
+    mut outs: [str] = []
+    for c in cases {
+        let app = app_dir(c.stem)
+        outs += [build_and_run(c.entry, c.stem)]
+        app.undo()
+    }
+    for p in probes {
+        process.run(["rm", "-f", "--", p.name])
+    }
+    process.run(["rmdir", directory])
+    for i in 0..len(cases) {
+        if outs[i] != cases[i].output {
+            fail(f"{cases[i].entry}: printed {quoted(outs[i])}, want {quoted(cases[i].output)}")
+        }
+    }
+}
+
+// --- kod test of a directory ----------------------------------------------
+
+let FAILING: str = "test \"must not run\" {\n    fail(\"this test is not part of the run\")\n}\n"
+let PASSING: str = "test \"runs\" {\n    assert 1 + 1 == 2\n}\n"
+
+test "kod test of a directory skips dot paths and a build directory" {
+    let s = scratch()
+    mkdir(f"{s}/.wt")
+    mkdir(f"{s}/build")
+    write(f"{s}/ok_test.kod", PASSING)
+    write(f"{s}/.wt/b_test.kod", FAILING)
+    write(f"{s}/.stray_test.kod", FAILING)
+    write(f"{s}/build/c_test.kod", FAILING)
+    // What is left out is not looked at, a link to nothing included.
+    symlink("nowhere.kod", f"{s}/.wt/dangling_test.kod")
+    let directory = s
+    let stem = program_for_tests(directory)
+    let app = app_dir(stem)
+    let result = kod_test(directory)
+    // One program for the directory, named after it.
+    let program_is_file = is_file(f"{app.path}/{stem}_test")
+    let testmains = process.run(["find", f"{app.path}/{stem}.obj", "-name", "*.testmain.o"]).stdout
+    app.undo()
+    // A file is taken whatever its path.
+    let named_app = app_dir("b_test")
+    let named = kod_test(f"{directory}/.wt/b_test.kod")
+    named_app.undo()
+    remove(s)
+    assert result.status == 0
+    if result.status != 0 {
+        fail(result.stdout + result.stderr)
+    }
+    assert result.stdout.contains("1/1 passed")
+    assert program_is_file
+    assert testmains != ""
+    assert named.status == 1
+    assert named.stdout.contains("0/1 passed")
+}
+
+func runner_modules() -> [str] {
+    return sorted_lines(process.run(["find", ".", "-maxdepth", "1", "-name", ".kod_test_runner*"]).stdout)
+}
+
+test "kod test of a directory takes two test files of one name" {
+    let s = scratch()
+    for name in ["x", "y"] {
+        mut answer = 1
+        if name == "y" {
+            answer = 2
+        }
+        mkdir(f"{s}/{name}")
+        write(f"{s}/{name}/helper.kod", "func answer() -> int64 {\n    return " + str(answer) + "\n}\n")
+        write(f"{s}/{name}/dup_test.kod", "import \"./helper\"\n\ntest \"" + name + " answers\" {\n    assert helper.answer() == " + str(answer) + "\n}\n")
+    }
+    let directory = s
+    let stem = program_for_tests(directory)
+    let scratch_modules = runner_modules()
+    let app = app_dir(stem)
+    let result = kod_test(directory)
+    app.undo()
+    let after = runner_modules()
+    remove(s)
+    assert result.status == 0
+    if result.status != 0 {
+        fail(result.stdout + result.stderr)
+    }
+    assert result.stdout.contains("2/2 passed")
+    // No temporary module is left (or was made) at the project root.
+    assert after == scratch_modules
+}
+
+test "kod test of a directory does not run a directory named like a test file" {
+    let s = scratch()
+    mkdir(f"{s}/dirnamed_test.kod")
+    write(f"{s}/dirnamed_test.kod/inner_test.kod", PASSING)
+    mkdir(f"{s}/real")
+    write(f"{s}/real/r_test.kod", PASSING)
+    let directory = s
+    let app = app_dir(program_for_tests(directory))
+    let result = kod_test(directory)
+    app.undo()
+    remove(s)
+    assert result.status == 0
+    if result.status != 0 {
+        fail(result.stdout + result.stderr)
+    }
+    assert result.stdout.contains("2/2 passed")
+}
+
+test "kod test of a directory runs a test file with a newline in its path" {
+    for name in ["a\nb_test.kod", "\nb_test.kod", "a\nb/c_test.kod", "a\n/\nc_test.kod"] {
+        let s = scratch()
+        write(f"{s}/ok_test.kod", PASSING)
+        let path = f"{s}/{name}"
+        mut parent = s
+        if path.find("/", from: len(s) + 1) is int64(_) {
+            mut last = 0
+            for i in 0..len(path) {
+                if path[i] == '/' {
+                    last = i
+                }
+            }
+            parent = path[0..last]
+        }
+        mkdir(parent)
+        write(path, FAILING)
+        let directory = s
+        let app = app_dir(program_for_tests(directory))
+        let result = kod_test(directory)
+        app.undo()
+        remove(s)
+        // `find` ends a name at a NUL byte; a newline is part of it.
+        if result.status != 1 or not result.stdout.contains("1/2 passed") {
+            fail(f"{quoted(name)}: status {result.status}, want 1 and 1/2 passed\n{result.stdout}{result.stderr}")
+        }
+    }
+}
+
+test "kod test of a directory stops at a test file it cannot read" {
+    let s = scratch()
+    write(f"{s}/ok_test.kod", PASSING)
+    symlink("nowhere.kod", f"{s}/dangling_test.kod")
+    let directory = s
+    let app = app_dir(program_for_tests(directory))
+    let result = kod_test(directory)
+    app.undo()
+    remove(s)
+    assert result.status == 1
+    assert result.stderr == f"kod test: cannot read {directory}/dangling_test.kod\n"
+    assert result.stdout == ""
+}
+
+// A directory at the project root whose name starts with `-`, removed
+// afterwards. (Unlike the Python fixture, nothing removes it when the test
+// process is killed by a signal.)
+test "kod test takes a directory whose name starts with a dash" {
+    let name = "-dash_probe"
+    let path = f"./{name}"
+    if exists(path) {
+        // Not ours to delete; a killed run may have left it.
+        fail(f"{root()}/{name} exists already; delete it and run again")
+        return
+    }
+    mkdir(path)
+    write(f"{path}/ok_test.kod", PASSING)
+    let app = app_dir(program_for_tests(name))
+    let result = kod_test(name)
+    app.undo()
+    remove(path)
+    assert result.status == 0
+    if result.status != 0 {
+        fail(result.stdout + result.stderr)
+    }
+    assert result.stdout.contains("1/1 passed")
+}
+
+test "kod test of a directory with a very long absolute name" {
+    let s = scratch()
+    let deep = f"{root()}/{s}/{"d".repeat(200)}/{"e".repeat(200)}"
+    mkdir(deep)
+    write(f"{deep}/ok_test.kod", PASSING)
+    let app = app_dir(program_for_tests(deep))
+    let result = kod_test(deep)
+    app.undo()
+    remove(s)
+    assert len(deep) > 300
+    assert result.status == 0
+    if result.status != 0 {
+        fail(result.stdout + result.stderr)
+    }
+    assert result.stdout.contains("1/1 passed")
+}
+
+// --- Refused names --------------------------------------------------------
+
+test "a file that leaves no name for a program is refused" {
+    for name in [".kod", "..kod", "...kod"] {
+        let s = scratch()
+        let source = f"{s}/{name}"
+        write(source, PASSING + program("nameless"))
+        let wanted = f"kod: cannot name a program after {source}; rename the file\n"
+        let built = kod_build(source)
+        let tested = kod_test(source)
+        remove(s)
+        if built.status != 1 or built.stderr != wanted {
+            fail(f"kod build {name}: status {built.status}, stderr {quoted(built.stderr)}")
+        }
+        if tested.status != 1 or tested.stderr != wanted {
+            fail(f"kod test {name}: status {tested.status}, stderr {quoted(tested.stderr)}")
+        }
+    }
+}
+
+// What `bl $<name>$__run_tests` calls in `text` name, in order.
+func run_tests_calls(anon text: str) -> [str] {
+    let marker = "$__run_tests"
+    mut out: [str] = []
+    mut from = 0
+    for text.find("bl $", from: from) is int64(at) {
+        let start = at + 4
+        mut end = start
+        for end < len(text) and text[end] != ' ' and text[end] != '\n' and text[end] != '\t' and text[end] != '\r' {
+            end += 1
+        }
+        let token = text[start..end]
+        // The last `$__run_tests` in the word, as a greedy match takes it.
+        mut last = -1
+        mut look = 0
+        for token.find(marker, from: look) is int64(m) {
+            last = m
+            look = m + 1
+        }
+        if last > 0 {
+            out += [token[0..last]]
+            from = start + last + len(marker)
+        } else {
+            from = start
+        }
+    }
+    return out
+}
+
+test "the test shim calls a module once however often it is named" {
+    let s = scratch()
+    for name in ["a_test.kod", "b_test.kod"] {
+        write(f"{s}/{name}", PASSING)
+    }
+    let a = f"{s}/a_test.kod"
+    let b = f"{s}/b_test.kod"
+    let shim = f"{s}/shim.s"
+    let made = run([SH_KODC, "_emit-test-runtime-main", a, shim, a, f"./{a}", b, a], limit: 60)
+    let calls = run_tests_calls(io.read_file(shim))
+    remove(s)
+    assert made.status == 0
+    if made.status != 0 {
+        fail(made.stderr)
+    }
+    let want = [f"{s}/a_test".replace("/", to: "$"), f"{s}/b_test".replace("/", to: "$")]
+    if calls != want {
+        fail(f"calls [{", ".join(calls)}], want [{", ".join(want)}]")
+    }
+}
+
+test "a tool that cannot be started is named" {
+    let s = scratch()
+    let entry = f"{s}/no_path.kod"
+    write(entry, program("never built"))
+    mut env: [str] = []
+    for v in process.current_environment() {
+        if not v.starts_with("PATH=") {
+            env += [v]
+        }
+    }
+    env += ["PATH="]
+    let app = app_dir("no_path")
+    let result = run([KOD, "build", entry], limit: 60, :env)
+    app.undo()
+    remove(s)
+    assert result.status == 1
+    assert result.stderr == "kod: mkdir could not be run (not found, killed, or its argument list too long)\n"
+}
+
+func tool_is_up_to_date() -> bool {
+    return run(["make", "-s", "-q", "kod"], limit: 60).status == 0
+}
+
+type ToolCase = struct {
+    spelling: str
+    name: str
+    what: str
+}
+
+test "an entry that would replace a tool is refused" {
+    let cases = [
+        ToolCase(spelling: "kod", name: "kod", what: "the build tool"),
+        ToolCase(spelling: "lsp", name: "lsp", what: "the language server"),
+        // What a case-insensitive volume takes for the tool's directory
+        // (U+212A, the Kelvin sign, is a k to it).
+        ToolCase(spelling: "KOD", name: "kod", what: "the build tool"),
+        ToolCase(spelling: "Kod", name: "kod", what: "the build tool"),
+        ToolCase(spelling: "\u{212A}od", name: "kod", what: "the build tool"),
+        ToolCase(spelling: "Lsp", name: "lsp", what: "the language server"),
+    ]
+    for c in cases {
+        let s = scratch()
+        let entry = f"{s}/{c.spelling}.kod"
+        write(entry, program("not the tool"))
+        let apps = f"build/apps/{c.name}"
+        let tool = f"{apps}/{c.name}"
+        // Without the guard the build replaces the tool, so put it back.
+        let parent = cleaned(apps)
+        let objects = cleaned(f"{apps}/{c.spelling}.obj")
+        let kept = preserved(tool, backup: f"{s}/before")
+        mkdir(apps)
+        if not exists(f"build/apps/{c.spelling}") {
+            // This volume tells that name from the tool's: skipped.
+            kept.undo()
+            objects.undo()
+            parent.undo()
+            remove(s)
+            continue
+        }
+        let fresh_before = tool_is_up_to_date()
+        let result = kod_build(entry)
+        let there = exists(tool)
+        let unchanged = not kept.had or kept.same()
+        let fresh_after = tool_is_up_to_date()
+        kept.undo()
+        objects.undo()
+        parent.undo()
+        remove(s)
+        let wanted = f"kod: an entry named {c.spelling} would replace {c.what}\n"
+        mut wrong: [str] = []
+        if not fresh_before {
+            wrong += ["the tool was not up to date before"]
+        }
+        if result.status != 1 {
+            wrong += [f"status {result.status}"]
+        }
+        if result.stderr != wanted {
+            wrong += [f"stderr {quoted(result.stderr)}"]
+        }
+        if result.stdout != "" {
+            wrong += [f"stdout {quoted(result.stdout)}"]
+        }
+        if there != kept.had {
+            wrong += [f"the tool is there: {there}, was: {kept.had}"]
+        }
+        if not unchanged {
+            wrong += ["the tool was changed"]
+        }
+        if not fresh_after {
+            wrong += ["the tool is not up to date after"]
+        }
+        if len(wrong) > 0 {
+            fail(f"{c.spelling}: {"; ".join(wrong)}")
+        }
+    }
+}
+
+type SourceCase = struct {
+    tool: str
+    spelling: str
+}
+
+test "the source of a tool is not refused however it is spelled" {
+    let cases = [
+        SourceCase(tool: "kod", spelling: "tools/kod.kod"),
+        SourceCase(tool: "kod", spelling: f"{root()}/tools/kod.kod"),
+        SourceCase(tool: "kod", spelling: "./tools/../tools/kod.kod"),
+        SourceCase(tool: "lsp", spelling: f"{root()}/tools/lsp.kod"),
+    ]
+    for c in cases {
+        let s = scratch()
+        // The build replaces the tool, so run a copy of it.
+        let copy = f"{s}/kod_copy"
+        process.run(["cp", "-p", KOD, copy])
+        let apps = f"build/apps/{c.tool}"
+        let exe = f"{apps}/{c.tool}"
+        let parent = cleaned(apps)
+        let objects = cleaned(f"{apps}/{c.tool}.obj")
+        let kept = preserved(exe, backup: f"{s}/before")
+        let result = run([copy, "build", c.spelling])
+        kept.undo()
+        objects.undo()
+        parent.undo()
+        remove(s)
+        if result.status != 0 {
+            fail(f"{c.spelling}: status {result.status}\n{result.stderr}")
+        }
+    }
+}
