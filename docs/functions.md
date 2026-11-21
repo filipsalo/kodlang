@@ -231,8 +231,8 @@ Inside the function, a `mut` parameter is used like a local. The caller's
 variable gets the parameter's value when the function returns, however it
 returns, including through `try`. A function with a `mut` parameter is
 called by name: it can't be used as a function value, and an interface
-method can't have one. `self` can't be `mut`, since a struct's fields can be
-assigned through any `self`.
+method can't have one. A method that changes its struct declares `mut self`
+(see [Methods](structs.md#methods)).
 
 ## Return values
 

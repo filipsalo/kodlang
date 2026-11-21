@@ -326,7 +326,7 @@ def test_hover_renders_struct_decl(lsp_binary):
     hover = next(r for r in responses if r.get("id") == 2)
     assert hover["result"] is not None
     value = hover["result"]["contents"]["value"]
-    assert "type Box = struct" in value
+    assert "type Box = shared struct" in value
     assert "x: int64" in value
     assert "name: str" in value
 
@@ -1676,7 +1676,7 @@ def test_hover_on_a_struct_shows_its_weak_fields(lsp_binary):
     value, diagnostics = _hover_and_diagnostics(lsp_binary, FIELD_SOURCE, 11, 16)
     assert diagnostics == []
     assert value is not None
-    assert "type Node = struct { name: str, weak up: Node? }" in value
+    assert "type Node = shared struct { name: str, weak up: Node? }" in value
 
 
 def test_hover_on_a_field_after_a_dot(lsp_binary):

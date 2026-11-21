@@ -4,7 +4,17 @@ icon: lucide/box
 
 # Structs
 
-Structs are named product types — a fixed set of named fields.
+Structs are named product types — a fixed set of named fields. They come in
+two kinds:
+
+- A `struct` is a value, like an `int64` or an array: assigning it, passing
+  it or storing it gives the other place the struct as it is, and changing a
+  field later changes only the struct where it was changed (see
+  [Field mutation](#field-mutation)).
+- A `shared struct` is one object that everything holding it shares: a
+  field assigned through any of them shows through all of them. It is for
+  things with state of their own, such as a parser, a log or a node in a
+  graph.
 
 ## Declaration
 
@@ -28,9 +38,7 @@ type Rect = struct {
 }
 ```
 
-A struct is shared: every name, field and element that holds one holds the
-same struct, and a field assigned through any of them shows through all of
-them. `shared struct` says so, and declares the same kind of struct:
+A shared struct is declared the same way, with `shared` before `struct`:
 
 ```kod
 type Parser = shared struct {
@@ -259,7 +267,7 @@ reference back up a tree or across a graph, which would otherwise make a
 [cycle](memory-layout.md#reclaiming-memory) that is never freed:
 
 ```kod
-type Node = struct {
+type Node = shared struct {
     name: str
     children: [Node] = []
     weak parent: Node?           // starts as none
@@ -274,7 +282,9 @@ if leaf.parent is Node(p) {
 }
 ```
 
-- A weak field's type is an optional struct, `S?`. It starts as `none`
+- Only a shared struct has weak fields, and a weak field's type is an
+  optional shared struct, `S?`: a value has no identity to refer back to.
+  It starts as `none`
   unless it has a default or the construction gives it a value.
 - Assigning to it, or giving it a value in a construction, doesn't count as
   a reference: when nothing else refers to the struct, it is freed, and from
@@ -301,6 +311,30 @@ print_int(p.y)
 p.x = p.x + 1
 ```
 
+A field of a struct is assigned only through a name that could be assigned:
+a `mut` binding or a `mut` parameter, or a field or element of something
+that may itself be changed. On a `let` struct, a parameter not declared
+`mut` or a `for` variable, `p.x = 1` is an error
+(`` cannot change `p`, an immutable binding; declare it with `mut` ``), and
+so is changing an array in one of its fields. Each place has a struct of its
+own, so a change shows only there:
+
+```kod
+mut a = Point(x: 1, y: 2)
+let b = a
+a.x = 10                     // a.x is 10, b.x is still 1
+
+mut line = Line(from: a, to: b)
+line.from.y = 5              // line.from.y is 5, a.y is still 2
+```
+
+As with arrays, nothing is copied until it has to be: assigning or passing a
+struct shares it, and its fields are copied the first time one holder
+changes it while another still has it.
+
+A shared struct's fields are assigned through any name that holds it, `mut`
+or not, and every holder sees the change.
+
 Reading or assigning a field the struct doesn't declare is an error, with
 a did-you-mean hint when the name is close to a real field. So is `.field`
 on a value that isn't a struct, such as an interface or an optional; for a
@@ -319,7 +353,7 @@ type Point = struct {
         return self.x * self.x + self.y * self.y
     }
 
-    func translate(self, dx: int64, dy: int64) -> none {
+    func translate(mut self, dx: int64, dy: int64) -> none {
         self.x = self.x + dx
         self.y = self.y + dy
     }
@@ -329,11 +363,21 @@ type Point = struct {
 Call methods with dot notation:
 
 ```kod
-let p: Point = Point(x: 3, y: 4)
+mut p: Point = Point(x: 3, y: 4)
 print_int(p.distance_sq())   // 25
 p.translate(dx: 1, dy: 0)
 print_int(p.x)               // 4
 ```
+
+A method that changes its struct declares `mut self`, like a
+[`mut` parameter](functions.md#mut-parameters): the receiver is the
+caller's struct, which must be one the caller could change (`p` is `mut`
+above), and has the method's changes when it returns. The call needs no
+`mut`. Other methods can't assign to `self`'s fields
+(`` cannot change `self`; declare the method with `mut self` ``). A
+`mut self` method isn't one an interface can call, so it doesn't make the
+struct satisfy an interface. A shared struct's methods change it through
+any `self`, and can't declare `mut self`.
 
 Methods can also be invoked on non-`Ident` receivers — `0.to_str()`,
 `p.field.method()`, `f().bar()`, etc.
@@ -474,4 +518,8 @@ Struct fields are laid out sequentially, each taking 8 bytes, allocated on the [
 ...
 ```
 
-Struct variables hold a pointer to the allocation.
+Struct variables hold a pointer to the allocation. The allocation is
+counted like any other object; before a struct (not a shared one) is
+changed, generated code checks that the count is 1, and otherwise
+`_kod_obj_unique` copies it, retaining what its fields refer to, stores the
+copy where the struct was, and lets go of the original.

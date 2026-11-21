@@ -395,6 +395,8 @@ type MethodDirectory = shared struct {
 type StructInfo = shared struct {
     // How many instances' bodies led to this instance.
     body_depth: int64 = 0
+    // Declared `shared struct`; otherwise a value, copied on write.
+    shared: bool = false
     name: str
     fields: [FieldInfo]
     methods: [MethodInfo]
@@ -6268,9 +6270,25 @@ type Codegen = shared struct {
     }
 
     // A `weak` field holds a weak box, which only a struct has: its type is `S?`.
+    // A struct declared without `shared`: a value, copied on write.
+    func is_value_struct(self, anon kind: TypeKind) -> bool {
+        if kind is .KStruct(idx, _args) {
+            return idx >= 0 and idx < len(self.structs) and not self.structs[idx].shared
+        }
+        return false
+    }
+
+    // A value changed where it's kept: an array or a value struct.
+    func is_cow_kind(self, anon kind: TypeKind) -> bool {
+        return kind.is_array() or self.is_value_struct(kind)
+    }
+
     func check_weak_field(self, anon field: ast.StructField) -> none {
         let kind = self.resolve_type(field.typ)
-        if kind is .KOptional(inner) and inner is .KStruct(_idx, _args) {
+        if kind is .KOptional(inner) and inner is .KStruct(idx, _args) {
+            if not self.structs[idx].shared {
+                self.report_error(f"error: a `weak` field must hold a shared struct; `{self.struct_display_name(idx)}` is a value", span: field.name_span)
+            }
             return
         }
         mut hint = ""
@@ -6537,7 +6555,11 @@ type Codegen = shared struct {
         mut s: StructInfo = self.structs[idx]
         // Concatenate the `{` rather than embed in an f-string —
         // Kod's f-string parser has no brace escape today.
-        mut result: str = f"type {s.name} = struct " + "{"
+        mut kind_word = "struct"
+        if s.shared {
+            kind_word = "shared struct"
+        }
+        mut result: str = f"type {s.name} = {kind_word} " + "{"
         for i, field in s.fields {
             if i == 0 {
                 result = result + " "
@@ -6750,7 +6772,7 @@ type Codegen = shared struct {
         }
         let empty_params: [str] = []
         // Registered before its fields and sigs resolve, so a self-reference finds it.
-        self.structs += [StructInfo(:body_depth, name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, field_idx: template.field_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key)]
+        self.structs += [StructInfo(:body_depth, name: canonical, fields: template.fields, methods: template.methods, method_idx: template.method_idx, field_idx: template.field_idx, data_width: template.data_width, module_prefix: self.path_prefix, src_p: template.src_p, type_param_names: empty_params, :template_idx, template_args: type_args, def_path: "", def_span: ast.Span(start: 0), :key, shared: template.shared)]
         let new_idx: int64 = len(self.structs) - 1
         self.struct_idx.set(canonical, new_idx)
         let insts = self.struct_insts
@@ -7562,7 +7584,7 @@ type Codegen = shared struct {
         mut param_default_exprs: [int64] = []
         mut param_mut: [bool] = []
         for param in func_decl.params {
-            param_mut += [param.mutable and param.name != "self"]
+            param_mut += [param.mutable]
             param_kinds += [self.resolve_type(param.typ)]
             if param.anonymous {
                 param_labels += [""]
@@ -8755,7 +8777,7 @@ type Codegen = shared struct {
 
     func register_struct(self, anon decl: ast.Decl, prefix: str, p: parsing.Parser) -> none {
         match decl {
-            .Struct(name, name_span, type_params, fields, methods) -> {
+            .Struct(name, name_span, type_params, fields, methods, shared) -> {
                 self.check_builtin_type_name(name, :p, span: name_span)
                 mut field_infos: [FieldInfo] = []
                 mut offset = 0
@@ -8791,7 +8813,7 @@ type Codegen = shared struct {
                     }
                 }
                 let no_template_args: [TypeKind] = []
-                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, :field_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span, key: f"{p.path}:{name}")]
+                self.structs += [StructInfo(:name, fields: field_infos, methods: method_infos, :method_idx, :field_idx, data_width: offset, module_prefix: prefix, src_p: p, type_param_names: type_params, template_idx: -1, template_args: no_template_args, def_path: p.path, def_span: name_span, key: f"{p.path}:{name}", :shared)]
                 self.struct_idx.set(name, len(self.structs) - 1)
                 self.declare_type(name, path: p.path, ref: (len(self.structs) - 1) * 4)
             }
@@ -13153,7 +13175,7 @@ type Codegen = shared struct {
                     self.subst_names = saved_names
                 }
                 .Extern(_name, _name_span, params, return_typ, _variadic) -> self.check_sig_types(params, :return_typ)
-                .Struct(_name, _name_span, type_params, fields, methods) -> {
+                .Struct(_name, _name_span, type_params, fields, methods, _shared) -> {
                     self.subst_names = type_params
                     for field in fields {
                         self.check_type_expr(field.typ)
@@ -13240,11 +13262,13 @@ type Codegen = shared struct {
                         self.subst_names = saved_names
                     }
                 }
-                .Struct(struct_name, _name_span, type_params, fields, methods) -> {
+                .Struct(struct_name, _name_span, type_params, fields, methods, shared) -> {
                     self.subst_names = type_params
                     for field in fields {
                         self.check_type_expr(field.typ)
-                        if field.weak and len(type_params) == 0 {
+                        if field.weak and not shared {
+                            self.report_error("error: only a shared struct has weak fields", span: field.name_span)
+                        } else if field.weak and len(type_params) == 0 {
                             self.check_weak_field(field)
                         }
                     }
@@ -13486,7 +13510,7 @@ type Codegen = shared struct {
                     let fd = self.p.func_decls[decl_id]
                     self.check_first_name(seen, :listed, name: fd.name, span: fd.name_span)
                 }
-                .Struct(name, name_span, _type_params, fields, methods) -> {
+                .Struct(name, name_span, _type_params, fields, methods, _shared) -> {
                     self.check_first_name(seen, :listed, :name, span: name_span)
                     let seen_fields = FuncIdx()
                     for field in fields {
@@ -14502,6 +14526,14 @@ type Codegen = shared struct {
         self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name, call_span: span)
         let call_slots = self.plan_call(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name).slots
         self.check_mut_args(args, slots: call_slots, param_mut: sig_mut, param_names: sig_names, param_kinds: sig_params, skip: 1, call_name: method_name)
+        // `mut self`: the receiver is the caller's struct, passed by its place.
+        let mut_self = len(sig_mut) > 0 and sig_mut[0]
+        if mut_self and not self.array_changeable(receiver_id) {
+            for arg in args {
+                self.compile_discard(arg.value)
+            }
+            return .VImm(value: 0)
+        }
         if inline_owner >= 0 {
             if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
                 return inlined
@@ -14537,10 +14569,22 @@ type Codegen = shared struct {
             padded = padded + 8
         }
         self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
-        let recv_val = self.compile_expr(receiver_id)
-        self.mov_to(recv_val, dest: "x0")
-        self.rc_hold(receiver_id, reg: "x0")
-        self.emit_store("x0", base: "sp")
+        mut recv_place = ""
+        if mut_self {
+            recv_place = self.array_place(receiver_id)
+            if len(recv_place) == 0 {
+                self.report_error("error: a `mut self` method changes its receiver where it's kept; assign it to a `mut` local first", span: self.p.expr_spans[receiver_id])
+            }
+        }
+        if len(recv_place) > 0 {
+            self.emit_store(recv_place, base: "sp")
+            self.pool.free_reg(recv_place)
+        } else {
+            let recv_val = self.compile_expr(receiver_id)
+            self.mov_to(recv_val, dest: "x0")
+            self.rc_hold(receiver_id, reg: "x0")
+            self.emit_store("x0", base: "sp")
+        }
         for i in 0..total_user {
             mut arg_reg = ""
             // Method param 0 is self; caller arg i maps to param i+1.
@@ -17476,11 +17520,17 @@ type Codegen = shared struct {
                 weak = self.field_is_weak(field_name, :struct_idx)
             }
         }
+        // A value struct: changed only where it may be, after being made its own there.
+        let value = self.is_value_struct(lhs_kind)
+        if value and not self.array_changeable(lhs) {
+            self.compile_discard(rhs_id)
+            return
+        }
         let recv_first = not self.commutes(lhs, rhs_id)
         mut ptr_reg = ""
         mut ptr_spilled = false
         if recv_first {
-            ptr_reg = self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
+            ptr_reg = self.field_store_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct, :value)
             ptr_spilled = self.preserve_begin(ptr_reg)
         }
         // Kind-aware, so an int assigned to an optional field gets wrapped.
@@ -17493,7 +17543,7 @@ type Codegen = shared struct {
         }
         let rhs_spilled = self.preserve_begin(rhs_reg)
         if not recv_first {
-            ptr_reg = self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
+            ptr_reg = self.field_store_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct, :value)
         }
         if lhs_is_struct and not weak {
             self.check_value_kind(rhs_id, expected: field_kind)
@@ -17515,6 +17565,18 @@ type Codegen = shared struct {
         }
         self.pool.free_reg(tmp_reg)
         self.pool.free_reg(ptr_reg)
+    }
+
+    // The struct whose field a store assigns: a value struct made its own
+    // where it's kept (see array_place).
+    func field_store_base(self, anon lhs: int64, field_name: str, rhs: int64, lhs_kind: TypeKind, lhs_is_struct: bool, value: bool) -> str {
+        if value {
+            let ptr = self.unique_array(lhs)
+            if len(ptr) > 0 {
+                return ptr
+            }
+        }
+        return self.compile_field_base(lhs, :field_name, :rhs, :lhs_kind, :lhs_is_struct)
     }
 
     func compile_field_base(self, anon lhs: int64, field_name: str, rhs: int64, lhs_kind: TypeKind, lhs_is_struct: bool) -> str {
@@ -17794,7 +17856,7 @@ type Codegen = shared struct {
     // left alone. Reports and gives false when the name can't be.
     func array_changeable(self, anon arr_id: int64) -> bool {
         mut root = arr_id
-        for self.p.exprs[root] is .Binary(base, op, _index) and op is .Index and self.infer_kind(base).is_array() {
+        for self.p.exprs[root] is .Binary(base, op, _index) and ((op is .Index and self.infer_kind(base).is_array()) or (op is .Dot and self.is_value_struct(self.infer_kind(base)))) {
             root = base
         }
         if self.var_signature(root) is Some(sig) {
@@ -17819,7 +17881,11 @@ type Codegen = shared struct {
             return false
         }
         if not self.find_var_declared_mut(name) {
-            self.report_error(f"error: cannot change `{self.source_name(name)}`, an immutable binding; declare it with `mut`", span: self.p.expr_spans[root])
+            if name == "self" {
+                self.report_error("error: cannot change `self`; declare the method with `mut self`", span: self.p.expr_spans[root])
+            } else {
+                self.report_error(f"error: cannot change `{self.source_name(name)}`, an immutable binding; declare it with `mut`", span: self.p.expr_spans[root])
+            }
             return false
         }
         return true
@@ -17861,7 +17927,16 @@ type Codegen = shared struct {
                 if op is .Dot {
                     let .KStruct(struct_idx, _type_args) = self.infer_kind(base) else { return "" }
                     let .Ident(field_name) = self.p.exprs[rhs] else { return "" }
-                    let ptr = self.load(self.compile_expr(base))
+                    // A value struct is made its own first; a shared one is changed where it is.
+                    mut ptr = ""
+                    if self.is_value_struct(self.infer_kind(base)) {
+                        ptr = self.unique_array(base)
+                        if len(ptr) == 0 {
+                            return ""
+                        }
+                    } else {
+                        ptr = self.load(self.compile_expr(base))
+                    }
                     let r = self.pool.alloc_reg()
                     self.emit_op(.Add, a: r, b: ptr, c: f"#{self.find_field_offset(field_name, :struct_idx)}")
                     self.pool.free_reg(ptr)
@@ -17904,7 +17979,7 @@ type Codegen = shared struct {
             }
             let arr = self.pool.alloc_reg()
             self.emit_ldr(off, reg: arr)
-            self.emit_unique(arr, place: f"#{-off}", width: self.elem_width(self.infer_kind(arr_id)))
+            self.emit_unique(arr, place: f"#{-off}", width: self.cow_width(self.infer_kind(arr_id)))
             return arr
         }
         let place = self.array_place(arr_id)
@@ -17913,13 +17988,23 @@ type Codegen = shared struct {
         }
         let arr = self.pool.alloc_reg()
         self.emit_load(arr, base: place)
-        self.emit_unique(arr, :place, width: self.elem_width(self.infer_kind(arr_id)))
+        self.emit_unique(arr, :place, width: self.cow_width(self.infer_kind(arr_id)))
         self.pool.free_reg(place)
         return arr
     }
 
+    // What emit_unique takes as `width`: an array's element width, or -1 for
+    // a value struct.
+    func cow_width(self, anon kind: TypeKind) -> int64 {
+        if kind.is_array() {
+            return self.elem_width(kind)
+        }
+        return -1
+    }
+
     // `arr`, loaded from `place`: copied there first unless its count is 1.
-    // `place` is a register, or `#n` for the frame slot at fp - n.
+    // `place` is a register, or `#n` for the frame slot at fp - n; `width` is
+    // an array's element width, or -1 for a value struct.
     func emit_unique(self, anon arr: str, place: str, width: int64) -> none {
         let ok = self.fresh("Luniq")
         let count = self.pool.alloc_reg()
@@ -17934,8 +18019,12 @@ type Codegen = shared struct {
         } else {
             self.emit_mov("x16", src: place)
         }
-        self.emit_op(.Move, a: "x17", b: f"#{width}")
-        self.emit_call("_kod_arr_unique_stub")
+        if width < 0 {
+            self.emit_call("_kod_obj_unique_stub")
+        } else {
+            self.emit_op(.Move, a: "x17", b: f"#{width}")
+            self.emit_call("_kod_arr_unique_stub")
+        }
         self.emit_mov(arr, src: "x17")
         self.emit_label(ok)
     }
@@ -18006,7 +18095,7 @@ type Codegen = shared struct {
         mut new_recv = recv
         mut new_rhs = rhs
         if not self.is_stable(recv) {
-            if index and self.infer_kind(recv).is_array() {
+            if (index and self.infer_kind(recv).is_array()) or (not index and self.is_value_struct(self.infer_kind(recv))) {
                 new_recv = self.stash_place(recv)
             } else {
                 new_recv = self.stash_chain_operand(recv)
@@ -18029,6 +18118,14 @@ type Codegen = shared struct {
             if op is .Dot and self.infer_kind(base) is .KStruct(_idx, _args) {
                 if self.is_stable(base) {
                     return arr_id
+                }
+                // A value struct's own place, not a copy of it.
+                if self.is_value_struct(self.infer_kind(base)) {
+                    let new_base = self.stash_place(base)
+                    if new_base == base {
+                        return arr_id
+                    }
+                    return self.p.alloc_expr(ast.Expr.Binary(lhs: new_base, :op, :rhs), span: self.p.expr_spans[arr_id])
                 }
                 return self.p.alloc_expr(ast.Expr.Binary(lhs: self.stash_chain_operand(base), :op, :rhs), span: self.p.expr_spans[arr_id])
             }
@@ -18263,7 +18360,7 @@ type Codegen = shared struct {
                     return self.infer_kind(base) is .KStruct(_idx, _args)
                 }
                 if op is .Index and self.infer_kind(base).is_array() {
-                    return self.array_changeable(base)
+                    return true
                 }
                 return false
             }
@@ -18275,6 +18372,10 @@ type Codegen = shared struct {
     // receiver and index are stashed already), then the place, made its own
     // by the runtime, which appends in place.
     func compile_append(self, anon target: int64, rhs_id: int64) -> none {
+        if not (self.p.exprs[target] is .Ident(_name)) and not self.array_changeable(target) {
+            self.compile_discard(rhs_id)
+            return
+        }
         let kind = self.infer_kind(target)
         mut push = false
         mut elem_id = 0
@@ -20742,7 +20843,11 @@ type Codegen = shared struct {
             self.vars[-1].declared_mut = param.mutable
             self.vars[-1].bound = true
             if param.mutable and param.name == "self" {
-                self.report_error("error: `self` can't be `mut`; a struct's fields can be assigned through any `self`", span: func_decl.name_span)
+                if owner >= 0 and self.structs[owner].shared {
+                    self.report_error("error: a shared struct's methods change it through any `self`; remove the `mut`", span: func_decl.name_span)
+                } else if owner < 0 {
+                    self.report_error("error: only a struct's method can take `mut self`", span: func_decl.name_span)
+                }
             }
         }
         // A `mut` parameter arrives as the address of the caller's slot, kept
@@ -20751,7 +20856,7 @@ type Codegen = shared struct {
         mut by_ref_params: [str] = []
         mut by_ref_offs: [int64] = []
         for param in func_decl.params {
-            if param.mutable and param.name != "self" {
+            if param.mutable and (param.name != "self" or (owner >= 0 and not self.structs[owner].shared)) {
                 by_ref_params += [param.name]
                 by_ref_offs += [self.alloc_var(name: f"__ref_{param.name}", kind: .KInt64)]
                 self.vars[-1].bound = true
@@ -21126,7 +21231,7 @@ type Codegen = shared struct {
                         }
                     }
                 }
-                .Struct(name, _name_span, struct_type_params, fields, methods) -> {
+                .Struct(name, _name_span, struct_type_params, fields, methods, _shared) -> {
                     // A generic template's methods only compile per instance.
                     if len(struct_type_params) == 0 {
                         // The later copy of a type an import cycle registers twice is this module's own.

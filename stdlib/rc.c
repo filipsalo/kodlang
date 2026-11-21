@@ -251,6 +251,75 @@ __attribute__((naked)) void rc_free_stub(void) {
         "ret\n");
 }
 
+/* Copy on write for a struct that is a value: the object at `*place`, made the
+ * place's own first. One another place also holds (its count isn't 1) is
+ * copied word for word into a block of its size class, with what its fields
+ * refer to retained; the copy goes to `*place` and the original loses the
+ * place's reference. */
+void *kod_obj_unique(void **place) {
+    void *p = *place;
+    if (!rc_is_counted(p)) return p;
+    RcHdr *h = (RcHdr *)p - 1;
+    if (h->count == 1) return p;
+    int64_t payload = rc_class_size((int)(h->info & RC_CLASS_MASK)) - 8;
+    uint32_t mask = h->info >> 8;
+    void **c = (void **)rc_alloc_raw(payload, mask);
+    memcpy(c, p, (size_t)payload);
+    if (mask & RC_BIG_BIT) {
+        const int64_t *desc = *(const int64_t **)((char *)h + payload);
+        for (int64_t w = 0; w < desc[0]; w++) {
+            uint64_t bits = (uint64_t)desc[w + 1];
+            for (int i = 0; bits; i++, bits >>= 1) {
+                if (bits & 1) rc_retain_c(c[w * 64 + i]);
+            }
+        }
+    } else {
+        for (int i = 0; i < 21; i++) {
+            if (mask & (1u << i)) rc_retain_c(c[i]);
+        }
+    }
+    *place = c;
+    rc_release_c(p);
+    return c;
+}
+
+/* As kod_arr_unique_stub, for kod_obj_unique: x16 is the place; the object
+ * comes back in x17. */
+__attribute__((naked)) void kod_obj_unique_stub(void) {
+    __asm__(
+        "stp x0, x1, [sp, #-16]!\n"
+        "stp x2, x3, [sp, #-16]!\n"
+        "stp x4, x5, [sp, #-16]!\n"
+        "stp x6, x7, [sp, #-16]!\n"
+        "stp x8, x9, [sp, #-16]!\n"
+        "stp x10, x11, [sp, #-16]!\n"
+        "stp x12, x13, [sp, #-16]!\n"
+        "stp x14, x15, [sp, #-16]!\n"
+        "stp q0, q1, [sp, #-32]!\n"
+        "stp q2, q3, [sp, #-32]!\n"
+        "stp q4, q5, [sp, #-32]!\n"
+        "stp q6, q7, [sp, #-32]!\n"
+        "stp fp, lr, [sp, #-16]!\n"
+        "mov fp, sp\n"
+        "mov x0, x16\n"
+        "bl _kod_obj_unique\n"
+        "mov x17, x0\n"
+        "ldp fp, lr, [sp], #16\n"
+        "ldp q6, q7, [sp], #32\n"
+        "ldp q4, q5, [sp], #32\n"
+        "ldp q2, q3, [sp], #32\n"
+        "ldp q0, q1, [sp], #32\n"
+        "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n"
+        "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n"
+        "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n"
+        "ldp x2, x3, [sp], #16\n"
+        "ldp x0, x1, [sp], #16\n"
+        "ret\n");
+}
+
 /* Copy on write from generated code: x16 is the address of the word that
  * holds the array, x17 its element width; the array, now the place's own,
  * comes back in x17. Everything but x16, x17, lr and the flags survives. */

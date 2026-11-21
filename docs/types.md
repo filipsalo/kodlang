@@ -94,11 +94,9 @@ mut n = 1
 bump(mut n)       // n is 2
 ```
 
-Struct fields stay mutable. Because structs are reference values (see
-[Memory layout](memory-layout.md)), a struct's *fields* can be assigned
-through any parameter or `self` (`p.field = v`), `mut` or not. An array is
-changed only through a `mut` name or a field (see
-[Indexing](arrays.md#indexing)).
+A struct's fields are assigned only through a `mut` name, as an array's
+elements are; a shared struct's fields through any name that holds it (see
+[Field mutation](structs.md#field-mutation)).
 
 
 ## Module-level constants
