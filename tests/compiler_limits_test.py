@@ -14,7 +14,7 @@ KOD = ROOT / "build" / "apps" / "kod" / "kod"
 pytestmark = pytest.mark.usefixtures("sh_kodc")
 
 HELPERS = """
-type P = struct {
+type P = shared struct {
     v: int64
 }
 
@@ -30,7 +30,7 @@ func works(anon a: int64) -> int64 or Error {
     return a
 }
 
-type Oops = struct {
+type Oops = shared struct {
     n: int64
 
     func to_str(self) -> str {
@@ -329,7 +329,7 @@ def test_large_structs_and_payloads(tmp_path, count):
     args = ", ".join(f"f{i}: {i}" for i in range(count))
     params = ", ".join(f"f{i}: int64" for i in range(count))
     binds = ", ".join(f"b{i}" for i in range(count))
-    decls = f"type S = struct {{\n{fields}\n}}\ntype E = enum {{\n    V({params})\n}}\n"
+    decls = f"type S = shared struct {{\n{fields}\n}}\ntype E = enum {{\n    V({params})\n}}\n"
     body = f"""    let s = S({args})
     print_int(s.f{count - 1})
     let e: E = .V({args})

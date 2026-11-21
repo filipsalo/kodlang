@@ -266,7 +266,7 @@ def test_let_else_checks_keep_memory_linear(sh_kodc, tmp_path):
 
 def test_scope_hints_keep_memory_linear(sh_kodc, tmp_path):
     """Each function is decided once for the hints of 1000 errors along a chain."""
-    lines = ["type Hard = struct {", "    tag: str"]
+    lines = ["type Hard = shared struct {", "    tag: str"]
     lines += ["    func fail(self, anon msg: str) -> none {", "        panic(msg)"]
     lines += ["    }", "}"]
     lines += ["interface Failer {", "    func fail(self, anon msg: str) -> none", "}"]

@@ -236,9 +236,9 @@ def test_hover_renders_signature(lsp_binary):
 
 def test_definition_resolves_struct_type(lsp_binary):
     # Cursor on `Box` in `let b: Box = ...` should jump to the
-    # `type Box = struct { ... }` decl.
+    # `type Box = shared struct { ... }` decl.
     source = (
-        "type Box = struct { x: int64 }\n"
+        "type Box = shared struct { x: int64 }\n"
         "func main() -> int64 {\n"
         "  let b: Box = Box(x: 5)\n"
         "  return b.x\n"
@@ -283,7 +283,7 @@ def test_definition_resolves_struct_type(lsp_binary):
 
 def test_hover_renders_struct_decl(lsp_binary):
     source = (
-        "type Box = struct {\n"
+        "type Box = shared struct {\n"
         "  x: int64\n"
         "  name: str\n"
         "}\n"
@@ -379,7 +379,7 @@ def test_definition_resolves_method(lsp_binary):
     # Cursor on `bump` in `c.bump()` should jump to the
     # `func bump(self) -> none` decl on the Counter struct.
     source = (
-        "type Counter = struct {\n"
+        "type Counter = shared struct {\n"
         "  value: int64\n"
         "  func bump(self) -> none {\n"
         "    self.value = self.value + 1\n"
@@ -430,7 +430,7 @@ def test_definition_resolves_method(lsp_binary):
 
 def test_hover_renders_method_signature(lsp_binary):
     source = (
-        "type Counter = struct {\n"
+        "type Counter = shared struct {\n"
         "  value: int64\n"
         "  func bump(self, anon by: int64) -> int64 {\n"
         "    self.value = self.value + by\n"
@@ -857,7 +857,7 @@ def test_completion_offers_globals_at_bare_identifier(lsp_binary):
         "func helper() -> int64 {\n"
         "  return 0\n"
         "}\n"
-        "type Widget = struct {\n"
+        "type Widget = shared struct {\n"
         "  size: int64\n"
         "}\n"
         "func main() -> int64 {\n"
@@ -996,7 +996,7 @@ def test_completion_struct_methods_and_fields_on_typed_variable(lsp_binary):
     # After `p.` where `p: Point`, completions include the struct's
     # methods (distance) and fields (x, y).
     source = (
-        "type Point = struct {\n"
+        "type Point = shared struct {\n"
         "  x: int64\n"
         "  y: int64\n"
         "  func distance(self) -> int64 { return 0 }\n"
@@ -1220,11 +1220,11 @@ def test_hover_includes_leading_doc_comment(lsp_binary):
 def _same_named_types(tmp_path):
     """Two modules that each declare a struct `Pt`, and the buffer's file name."""
     (tmp_path / "pa.kod").write_text(
-        "type Pt = struct {\n  x: int64\n  func size(self) -> int64 { return 1 }\n}\n"
+        "type Pt = shared struct {\n  x: int64\n  func size(self) -> int64 { return 1 }\n}\n"
         "func make() -> Pt {\n  return Pt(x: 1)\n}\n"
     )
     (tmp_path / "pb.kod").write_text(
-        "type Pt = struct {\n  y: int64\n  func area(self) -> int64 { return 2 }\n}\n"
+        "type Pt = shared struct {\n  y: int64\n  func area(self) -> int64 { return 2 }\n}\n"
         "func make() -> Pt {\n  return Pt(y: 2)\n}\n"
     )
     return f"file://{tmp_path}/main.kod"
@@ -1302,7 +1302,7 @@ def test_definition_finds_a_bare_type_in_the_buffer_over_an_imported_one(
     uri = _same_named_types(tmp_path)
     source = (
         'import "./pa"\n'
-        "type Pt = struct {\n  z: int64\n}\n"
+        "type Pt = shared struct {\n  z: int64\n}\n"
         "func main() -> int64 {\n"
         "  let c: Pt = Pt(z: 3)\n"
         "  let a: pa.Pt = pa.make()\n"
@@ -1332,7 +1332,7 @@ def test_completion_offers_the_members_of_the_type_the_buffer_means(
     source = (
         'import "./pa"\n'
         'import "./pb"\n'
-        "type Pt = struct {\n  z: int64\n}\n"
+        "type Pt = shared struct {\n  z: int64\n}\n"
         "func main() -> int64 {\n"
         "  let b: pb.Pt = pb.make()\n"
         "  b.\n"
@@ -1551,7 +1551,7 @@ INTERFACE_SOURCE = (
     "        return self.next() * n\n"  # 5
     "    }\n"  # 6
     "}\n"  # 7
-    "type Steps = struct {\n"  # 8
+    "type Steps = shared struct {\n"  # 8
     "    func next(self) -> int64 {\n"  # 9
     "        return 1\n"  # 10
     "    }\n"  # 11
@@ -1593,7 +1593,7 @@ def test_hover_on_an_enum_method(lsp_binary):
 
 def test_hover_shows_a_struct_methods_doc_but_not_a_trailing_comment(lsp_binary):
     source = (
-        "type Box = struct {\n"  # 0
+        "type Box = shared struct {\n"  # 0
         "    x: int64 // not a doc\n"  # 1
         "    func plain(self) -> int64 {\n"  # 2
         "        return self.x\n"  # 3
@@ -1620,7 +1620,7 @@ def test_hover_shows_a_struct_methods_doc_but_not_a_trailing_comment(lsp_binary)
 
 
 FIELD_SOURCE = (
-    "type Node = struct {\n"  # 0
+    "type Node = shared struct {\n"  # 0
     "    name: str\n"  # 1
     "    weak up: Node?\n"  # 2
     "}\n"  # 3
@@ -1704,10 +1704,10 @@ def test_definition_of_a_field_goes_to_its_declaration(lsp_binary):
 
 
 LOCALS_SOURCE = (
-    "type Bag = struct {\n"  # 0
+    "type Bag = shared struct {\n"  # 0
     '    func size(self) -> str { return "bag" }\n'  # 1
     "}\n"  # 2
-    "type Box = struct {\n"  # 3
+    "type Box = shared struct {\n"  # 3
     "    n: int64\n"  # 4
     "    func size(self) -> int64 { return self.n }\n"  # 5
     "}\n"  # 6
@@ -1762,7 +1762,7 @@ def test_hover_on_a_method_uses_the_receivers_type(lsp_binary):
 def test_completion_on_a_receiver_whose_type_is_inferred(lsp_binary):
     # `p` has no written type, so only the compiled type says it's a Point.
     source = (
-        "type Point = struct {\n"
+        "type Point = shared struct {\n"
         "  x: int64\n"
         "  func distance(self) -> int64 { return 0 }\n"
         "}\n"
@@ -1810,16 +1810,16 @@ def test_completion_on_a_receiver_whose_type_is_inferred(lsp_binary):
 
 
 CHAIN_SOURCE = (
-    "type Other = struct {\n"  # 0
+    "type Other = shared struct {\n"  # 0
     "    v: str\n"  # 1
     "    func twice(self) -> str { return self.v }\n"  # 2
     "}\n"  # 3
-    "type Inner = struct {\n"  # 4
+    "type Inner = shared struct {\n"  # 4
     "    v: int64\n"  # 5
     "    func twice(self) -> int64 { return self.v * 2 }\n"  # 6
     "    func half(self) -> int64 { return self.v / 2 }\n"  # 7
     "}\n"  # 8
-    "type Outer = struct {\n"  # 9
+    "type Outer = shared struct {\n"  # 9
     "    inner: Inner\n"  # 10
     "    items: [Inner]\n"  # 11
     "    func get(self) -> Inner { return self.inner }\n"  # 12
@@ -1911,11 +1911,11 @@ def test_completion_after_a_field_of_a_field(lsp_binary):
 
 
 OPTIONAL_SOURCE = (
-    "type Decoy = struct {\n"  # 0
+    "type Decoy = shared struct {\n"  # 0
     "    name: int64\n"  # 1
     "    func label(self) -> int64 { return self.name }\n"  # 2
     "}\n"  # 3
-    "type Node = struct {\n"  # 4
+    "type Node = shared struct {\n"  # 4
     "    name: str\n"  # 5
     "    next: Node? = none\n"  # 6
     "    func label(self) -> str { return self.name }\n"  # 7

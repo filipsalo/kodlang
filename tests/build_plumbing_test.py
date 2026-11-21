@@ -2324,7 +2324,7 @@ def run_from_root(entry: Path) -> list[str]:
     return done.stdout.splitlines()
 
 
-WHO_S = """type S = struct {{
+WHO_S = """type S = shared struct {{
     n: int64
     func who(self) -> str {{
         return "{name}"
@@ -2369,7 +2369,7 @@ def test_a_method_and_a_function_whose_paths_spell_one_label_stay_apart():
         write_modules(
             root,
             {
-                "x.kod": "type T = struct {\n    v: int64\n"
+                "x.kod": "type T = shared struct {\n    v: int64\n"
                 "    func m(self) -> int64 {\n        return self.v\n    }\n}\n",
                 "x/T.kod": "func m() -> int64 {\n    return 7\n}\n",
                 "main.kod": 'import "./x"\nimport "./x/T"\n'
@@ -2393,7 +2393,7 @@ def test_an_instance_and_a_type_whose_paths_spell_one_label_stay_apart():
             {
                 "i.kod": WHO_INTERFACE.format(name="I"),
                 "x.kod": WHO_S.format(name="plain S"),
-                "l.kod": "type Box[T] = struct {\n    v: T\n"
+                "l.kod": "type Box[T] = shared struct {\n    v: T\n"
                 '    func who(self) -> str {\n        return "box"\n    }\n}\n',
                 f"l/Box/{here}/x.kod": WHO_S.format(name="deep S"),
                 "m1.kod": 'import "./i"\nimport "./l"\nimport "./x"\n'
