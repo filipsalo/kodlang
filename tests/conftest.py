@@ -9,7 +9,9 @@ import pytest
 # Tests that change what every other test uses: they rebuild or replace the
 # `kod` driver, write into the project root, or run `make` on the real tree.
 # `make test` runs them one at a time, after the rest has run in parallel.
-SERIAL_MODULES = {"build_plumbing_test.py", "bootstrap_test.py", "launcher_test.py"}
+SERIAL_MODULES = {"build_plumbing_test.py", "launcher_test.py"}
+# Kod test files that run `make` on the real tree, serial for the same reason.
+SERIAL_KOD_TESTS = {"tests/bootstrap_test.kod"}
 
 # The tests of a serial module that run in parallel all the same: those in a
 # directory of their own (a copy of the root, or no root at all), and those
@@ -77,10 +79,18 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if item.path.name in SERIAL_MODULES and not runs_in_parallel(item):
             item.add_marker(pytest.mark.serial)
+        if test_block_path(item) in SERIAL_KOD_TESTS:
+            item.add_marker(pytest.mark.serial)
         group = build_group(item)
         if group is not None:
             item.add_marker(pytest.mark.xdist_group(group))
     items.sort(key=lambda item: not is_slow(item))
+
+
+def test_block_path(item: pytest.Item) -> str | None:
+    callspec = getattr(item, "callspec", None)
+    path = callspec.params.get("path") if callspec else None
+    return None if path is None else str(path)
 
 
 def runs_in_parallel(item: pytest.Item) -> bool:

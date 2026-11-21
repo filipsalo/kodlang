@@ -1,0 +1,557 @@
+// The `kod` code blocks in docs/*.md compile.
+//
+// Each block is compiled on its own, as a program: its top-level declarations
+// (types, functions, imports, constants) as they are, and its other lines as the
+// body of a `main`. A block that declares `main` is a program already.
+//
+// - Declarations from earlier blocks of the same page are there too, so a block
+//   can use the types and functions the page has shown, unless it declares a
+//   name of its own again.
+// - A line whose comment says `error` shows what the compiler rejects, and is
+//   left out.
+// - An HTML comment right before a block, which the page doesn't show, can give
+//   it setup code: `<!-- kod: let nums = [1, 2, 3] -->` (one or more lines), or
+//   leave it out: `<!-- no-check -->`. Setup declarations of new names are
+//   carried to later blocks too.
+// - A fragment that uses `try` runs in a function returning `int64 or Error`.
+// - Beside a `func`, `mut name: T = ...` at the left margin is a module variable.
+// - A block that only shows signatures (a `func` line with no body) or uses `...`
+//   or `<name>` as a placeholder is left out.
+
+import "io"
+import "process"
+import "sort"
+import "kod/test_support"
+
+// A block as the page has it: where its code starts, the code, and the HTML
+// comment right before it, if any.
+type Block = struct {
+    line: int64
+    code: str
+    no_check: bool
+    setup: str
+}
+
+// One program to compile, and the page and line of the block it comes from.
+type Example = struct {
+    where: str
+    src: str
+}
+
+// Which left-margin lines start a declaration.
+type Rules = enum {
+    // A fragment: types, functions, imports and `let NAME` constants.
+    Fragment
+    // A fragment that declares a function: a typed `mut x: T` is a module
+    // variable too.
+    WithFuncs
+    // A block with `func main`: every left-margin `let` and `mut` too.
+    Program
+}
+
+type Split = struct {
+    decls: [[str]]
+    stmts: [str]
+}
+
+// Python's `\s`, for ASCII.
+func is_ws(anon b: int64) -> bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 11 or b == 12
+}
+
+func is_word(anon b: int64) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_'
+}
+
+func is_upper(anon b: int64) -> bool {
+    return b >= 'A' and b <= 'Z'
+}
+
+func is_ident_start(anon b: int64) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or b == '_'
+}
+
+func all_ws(anon s: str) -> bool {
+    for i in 0..len(s) {
+        if not is_ws(s[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+func skip_ws(anon s: str, from: int64) -> int64 {
+    mut k = from
+    for k < len(s) and is_ws(s[k]) {
+        k += 1
+    }
+    return k
+}
+
+// Python's `s.strip()`.
+func strip_ws(anon s: str) -> str {
+    let start = skip_ws(s, from: 0)
+    mut end = len(s)
+    for end > start and is_ws(s[end - 1]) {
+        end -= 1
+    }
+    return s[start..end]
+}
+
+// Python's `s.strip("\n")`.
+func strip_newlines(anon s: str) -> str {
+    mut start = 0
+    for start < len(s) and s[start] == '\n' {
+        start += 1
+    }
+    mut end = len(s)
+    for end > start and s[end - 1] == '\n' {
+        end -= 1
+    }
+    return s[start..end]
+}
+
+func at(anon s: str, anon i: int64, anon needle: str) -> bool {
+    return i >= 0 and i + len(needle) <= len(s) and s[i..i + len(needle)] == needle
+}
+
+// Whether `word` occurs in `s` at or after `from` as a whole word (`\bword\b`).
+func has_word(anon s: str, anon word: str, from: int64) -> bool {
+    mut k = from
+    for k + len(word) <= len(s) {
+        if at(s, k, word) {
+            let before_ok = k == 0 or not is_word(s[k - 1])
+            let end = k + len(word)
+            let after_ok = end == len(s) or not is_word(s[end])
+            if before_ok and after_ok {
+                return true
+            }
+        }
+        k += 1
+    }
+    return false
+}
+
+// Whether a line of `s` starts with `prefix` (`re.search("^prefix", s, re.M)`).
+func has_line_starting(anon s: str, anon prefix: str) -> bool {
+    return s.starts_with(prefix) or s.contains("\n" + prefix)
+}
+
+// The fence "```kod\n" at `w`: the block it opens, its code up to the next
+// "```", or a block with line -1 when there is none.
+func fence_at(anon text: str, w: int64, no_check: bool, setup: str) -> Block {
+    if not at(text, w, "```kod\n") {
+        return Block(line: -1, code: "", :no_check, :setup)
+    }
+    let start = w + 7
+    let end = text.find("```", from: start)? or -1
+    if end < 0 {
+        return Block(line: -1, code: "", :no_check, :setup)
+    }
+    return Block(line: start, code: text[start..end], :no_check, :setup)
+}
+
+// The comment's "-->" ends at `p`: a fence must follow after whitespace that
+// ends with a newline (`-->\s*\n```kod`).
+func fence_after(anon text: str, p: int64, no_check: bool, setup: str) -> Block {
+    let w = skip_ws(text, from: p)
+    if w == p or text[w - 1] != '\n' {
+        return Block(line: -1, code: "", :no_check, :setup)
+    }
+    return fence_at(text, w: w, :no_check, :setup)
+}
+
+// A block whose HTML comment starts at `i` (`<!--\s*(no-check|kod:(.*?))\s*-->`),
+// or line -1.
+func commented_block_at(anon text: str, anon i: int64) -> Block {
+    let none_found = Block(line: -1, code: "", no_check: false, setup: "")
+    let j = skip_ws(text, from: i + 4)
+    if at(text, j, "no-check") {
+        let k = skip_ws(text, from: j + 8)
+        if at(text, k, "-->") {
+            return fence_after(text, p: k + 3, no_check: true, setup: "")
+        }
+        return none_found
+    }
+    if not at(text, j, "kod:") {
+        return none_found
+    }
+    // The setup is as short as it can be: up to the first "-->" a fence
+    // follows, without the whitespace before it.
+    let s = j + 4
+    mut from = s
+    for true {
+        let p = text.find("-->", :from)? or -1
+        if p < 0 {
+            return none_found
+        }
+        mut g = p
+        for g > s and is_ws(text[g - 1]) {
+            g -= 1
+        }
+        let b = fence_after(text, p: p + 3, no_check: false, setup: text[s..g])
+        if b.line >= 0 {
+            return b
+        }
+        from = p + 1
+    }
+    return none_found
+}
+
+func count_newlines(anon s: str, upto: int64) -> int64 {
+    mut n = 0
+    for i in 0..upto {
+        if s[i] == '\n' {
+            n += 1
+        }
+    }
+    return n
+}
+
+// The blocks of a page, in order, each with the line its code starts on.
+func blocks(anon text: str) -> [Block] {
+    mut out: [Block] = []
+    mut i = 0
+    for i < len(text) {
+        mut b = Block(line: -1, code: "", no_check: false, setup: "")
+        if at(text, i, "<!--") {
+            b = commented_block_at(text, i)
+        } else if text[i] == '`' {
+            b = fence_at(text, w: i, no_check: false, setup: "")
+        }
+        if b.line < 0 {
+            i += 1
+            continue
+        }
+        let start = b.line
+        i = start + len(b.code) + 3
+        out += [Block(line: count_newlines(text, upto: start) + 1, code: b.code, no_check: b.no_check, setup: b.setup)]
+    }
+    return out
+}
+
+// `^\s*func [^{]*\)( -> [^{]+)?\s*$`: a `func` line with no body.
+func is_signature(anon line: str) -> bool {
+    if line.contains("{") {
+        return false
+    }
+    let k = skip_ws(line, from: 0)
+    if not at(line, k, "func ") {
+        return false
+    }
+    for c in k + 5..len(line) {
+        if line[c] == ')' {
+            let after = line[c + 1..len(line)]
+            if all_ws(after) or (after.starts_with(" -> ") and len(after) > 4) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// `<[a-z][a-z ]*>` somewhere in the line.
+func has_placeholder(anon line: str) -> bool {
+    for k in 0..len(line) {
+        if line[k] == '<' and k + 1 < len(line) and line[k + 1] >= 'a' and line[k + 1] <= 'z' {
+            mut e = k + 2
+            for e < len(line) and ((line[e] >= 'a' and line[e] <= 'z') or line[e] == ' ') {
+                e += 1
+            }
+            if e < len(line) and line[e] == '>' {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func shape_skipped(anon code: str) -> bool {
+    for line in code.split("\n") {
+        if line.contains("extern") {
+            continue
+        }
+        if is_signature(line) {
+            return true
+        }
+        if line.contains("...") or has_placeholder(line) {
+            return true
+        }
+    }
+    return false
+}
+
+// `//.*\berror\b`: the line's comment says `error`.
+func comment_says_error(anon line: str) -> bool {
+    let d = line.find("//")? or -1
+    return d >= 0 and has_word(line, "error", from: d + 2)
+}
+
+// Whether a left-margin line starts a declaration under `rules`.
+func is_decl(anon line: str, rules: Rules) -> bool {
+    if rules == .Program {
+        for p in ["type ", "shared ", "func ", "interface ", "import ", "extern ", "test ", "let ", "mut "] {
+            if line.starts_with(p) {
+                return true
+            }
+        }
+        return false
+    }
+    for p in ["type ", "shared ", "func ", "interface ", "import ", "extern ", "test "] {
+        if line.starts_with(p) {
+            return true
+        }
+    }
+    // `let [A-Z][A-Z_0-9]*[:\s]`: a constant.
+    if line.starts_with("let ") and len(line) > 4 and is_upper(line[4]) {
+        mut k = 5
+        for k < len(line) and (is_upper(line[k]) or line[k] == '_' or (line[k] >= '0' and line[k] <= '9')) {
+            k += 1
+        }
+        if k < len(line) and (line[k] == ':' or is_ws(line[k])) {
+            return true
+        }
+    }
+    // `mut [A-Za-z_][A-Za-z_0-9]*:`: beside functions, a module variable.
+    if rules == .WithFuncs and line.starts_with("mut ") and len(line) > 4 and is_ident_start(line[4]) {
+        mut k = 5
+        for k < len(line) and is_word(line[k]) {
+            k += 1
+        }
+        if k < len(line) and line[k] == ':' {
+            return true
+        }
+    }
+    return false
+}
+
+// The top-level declarations of a block, each as its lines, and the rest.
+func split(anon code: str, program: bool) -> Split {
+    mut rules = Rules.Fragment
+    if program {
+        rules = .Program
+    } else if has_line_starting(code, "func ") {
+        rules = .WithFuncs
+    }
+    mut decls: [[str]] = []
+    mut cur: [str] = []
+    mut have_cur = false
+    mut stmts: [str] = []
+    mut in_decl = false
+    for line in code.split("\n") {
+        if comment_says_error(line) {
+            continue
+        }
+        if not all_ws(line) and not (line.starts_with(" ") or line.starts_with("\t") or line.starts_with("}")) {
+            in_decl = is_decl(line, :rules)
+            if in_decl {
+                if have_cur {
+                    decls += [cur]
+                }
+                cur = []
+                have_cur = true
+            }
+        }
+        if in_decl {
+            cur += [line]
+        } else {
+            stmts += [line]
+        }
+    }
+    if have_cur {
+        decls += [cur]
+    }
+    return Split(:decls, :stmts)
+}
+
+func ident_end(anon line: str, from: int64) -> int64 {
+    mut k = from
+    for k < len(line) and is_word(line[k]) {
+        k += 1
+    }
+    return k
+}
+
+// The name a declaration declares: its name, an import's path, else its
+// first line.
+func decl_name(anon lines: [str]) -> str {
+    let line = lines[0]
+    for kw in ["extern func", "func", "type", "interface", "let", "mut"] {
+        if line.starts_with(kw) {
+            let k = skip_ws(line, from: len(kw))
+            if k > len(kw) and k < len(line) and is_ident_start(line[k]) {
+                return line[k..ident_end(line, from: k + 1)]
+            }
+        }
+    }
+    if line.starts_with("import") {
+        let k = skip_ws(line, from: 6)
+        if k > 6 and k < len(line) and line[k] == '"' {
+            let close = line.find("\"", from: k + 1)? or -1
+            if close >= 0 {
+                if at(line, close + 1, " {") {
+                    return line[k..close + 3]
+                }
+                return line[k..close + 1]
+            }
+        }
+    }
+    return line
+}
+
+func join_decls(anon decls: [[str]], sep: str) -> str {
+    mut parts: [str] = []
+    for d in decls {
+        parts += ["\n".join(d)]
+    }
+    return sep.join(parts)
+}
+
+func index_of(anon names: [str], anon name: str) -> int64 {
+    for i in 0..len(names) {
+        if names[i] == name {
+            return i
+        }
+    }
+    return -1
+}
+
+// The programs a page's blocks make.
+func page_examples(anon page: str, text: str) -> [Example] {
+    mut out: [Example] = []
+    // The declarations carried to later blocks, by name, in the order the
+    // names first came.
+    mut carried_names: [str] = []
+    mut carried: [[str]] = []
+    for b in blocks(text) {
+        if b.no_check or shape_skipped(b.code) {
+            continue
+        }
+        let where = f"{page}:{b.line}"
+        let program = has_line_starting(b.code, "func main(")
+        mut setup = strip_ws(b.setup)
+        if setup.contains("\n") {
+            setup = strip_newlines(b.setup)
+        }
+        let s = split(setup, :program)
+        let c = split(b.code, :program)
+        mut own: [[str]] = []
+        for d in s.decls {
+            own += [d]
+        }
+        for d in c.decls {
+            own += [d]
+        }
+        if program {
+            out += [Example(:where, src: join_decls(own, sep: "\n") + "\n")]
+        } else {
+            mut names: [str] = []
+            for d in own {
+                names += [decl_name(d)]
+            }
+            mut all: [[str]] = []
+            for i in 0..len(carried) {
+                if index_of(names, carried_names[i]) < 0 {
+                    all += [carried[i]]
+                }
+            }
+            for d in own {
+                all += [d]
+            }
+            mut body_lines: [str] = []
+            for st in s.stmts {
+                body_lines += [st]
+            }
+            for st in c.stmts {
+                body_lines += [st]
+            }
+            mut indented: [str] = []
+            for st in body_lines {
+                if all_ws(st) {
+                    indented += [st]
+                } else {
+                    indented += ["    " + st]
+                }
+            }
+            let body = "\n".join(indented)
+            let src = join_decls(all, sep: "\n\n")
+            mut main = ""
+            if has_word("\n".join(c.stmts), "try", from: 0) {
+                // `try` needs a function that can return an error.
+                main = "func example() -> int64 or Error {\n" + body + "\n    return 0\n}\n\nfunc main() -> int64 {\n    return must example()\n}\n"
+            } else {
+                main = "func main() -> int64 {\n" + body + "\n    return 0\n}\n"
+            }
+            out += [Example(:where, src: src + "\n\n" + main)]
+        }
+        // A setup that stands in for one of the page's declarations isn't
+        // carried; its other declarations are.
+        for d in s.decls {
+            let n = decl_name(d)
+            if index_of(carried_names, n) < 0 {
+                carried_names += [n]
+                carried += [d]
+            }
+        }
+        for d in c.decls {
+            let n = decl_name(d)
+            if n != "main" {
+                let i = index_of(carried_names, n)
+                if i < 0 {
+                    carried_names += [n]
+                    carried += [d]
+                } else {
+                    carried[i] = d
+                }
+            }
+        }
+    }
+    return out
+}
+
+func examples() -> [Example] {
+    let r = process.run(["ls", "docs"])
+    assert r.status == 0
+    mut pages: [str] = []
+    for name in r.stdout.split("\n") {
+        if name.ends_with(".md") {
+            pages += [name]
+        }
+    }
+    mut out: [Example] = []
+    for page in sort.sorted(pages) {
+        for ex in page_examples(page, text: io.read_file(f"docs/{page}")) {
+            out += [ex]
+        }
+    }
+    return out
+}
+
+// The messages of the first three errors of `errs` (as file_errors gives
+// them), joined with "; ".
+func first_errors(anon errs: str) -> str {
+    mut msgs: [str] = []
+    for line in errs.split("\n") {
+        let k = line.find(": error: ")? or -1
+        if k >= 0 and len(msgs) < 3 {
+            msgs += [line[k + 9..len(line)]]
+        }
+    }
+    return "; ".join(msgs)
+}
+
+test "the kod blocks in docs/*.md compile" {
+    let dir = "build/tmp_docs_examples"
+    process.run(["mkdir", "-p", dir])
+    let path = f"{dir}/example.kod"
+    let exs = examples()
+    assert len(exs) > 0
+    for ex in exs {
+        io.write_file(path, ex.src)
+        let errs = test_support.file_errors(path)
+        if errs != "" {
+            fail(f"docs/{ex.where}: {first_errors(errs)}\n--- as compiled:\n{ex.src}")
+        }
+    }
+    process.run(["rm", "-rf", dir])
+}

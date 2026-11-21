@@ -1,0 +1,88 @@
+// The snapshot is the only way to build the compiler: `make` says how to get
+// one back when it is gone, and refreshing one can't lose the old one.
+
+import "io"
+import "process"
+
+let SCRATCH: str = "build/tmp_bootstrap"
+
+func make(anon args: [str]) -> process.ProcessResult {
+    return process.run(["make"] + args)
+}
+
+test "without a snapshot make says how to restore it" {
+    process.run(["rm", "-rf", SCRATCH])
+    process.run(["mkdir", "-p", SCRATCH])
+    let missing = f"{SCRATCH}/sh_kodc"
+    let result = make([
+        "-s",
+        "stage1",
+        f"BOOTSTRAP_SH_KODC={missing}",
+        f"KODC={missing}",
+        f"STAGE0={SCRATCH}/stage0",
+        f"STAGE1={SCRATCH}/stage1",
+    ])
+    process.run(["rm", "-rf", SCRATCH])
+    assert result.status != 0
+    if not result.stderr.contains(f"{missing} not found; restore it with: git checkout") {
+        fail(f"stderr: {result.stderr}")
+    }
+}
+
+// `target`'s prerequisites, then its recipe lines, as the Makefile has them.
+func recipe(anon target: str) -> [str] {
+    let lines = io.read_file("Makefile").split("\n")
+    mut body: [str] = []
+    mut found = false
+    for line in lines {
+        if not found {
+            if line.starts_with(f"{target}:") {
+                found = true
+                let colon = must line.find(":")
+                body += [line[colon + 1..len(line)].trim()]
+            }
+        } else if line.starts_with("\t") {
+            body += [line.trim()]
+        } else {
+            break
+        }
+    }
+    if not found {
+        fail(f"no target {target} in the Makefile")
+    }
+    return body
+}
+
+// The checks are a prerequisite. They aren't dry-run: under `make -n` a
+// recursive `$(MAKE)` still runs, and stage 3 would need a stage-2 compiler
+// that a dry run never builds.
+test "a refresh replaces the snapshot only after the checks" {
+    mut prereq = false
+    for w in recipe("bootstrap-snapshot")[0].replace("\t", to: " ").split(" ") {
+        if w == "selfhost-check" {
+            prereq = true
+        }
+    }
+    assert prereq
+    mut asm_diff = false
+    for line in recipe("selfhost-check") {
+        if line.contains("tools/asm_diff.py --compilers") {
+            asm_diff = true
+        }
+    }
+    assert asm_diff
+    let dry = make(["-n", "-o", "selfhost-check", "bootstrap-snapshot"])
+    if dry.status != 0 {
+        fail(f"make -n failed: {dry.stderr}")
+        return
+    }
+    let out = dry.stdout
+    assert not out.contains("rm -f bootstrap/sh_kodc")
+    assert out.contains("cp build/selfhost/stage2/stage1/sh_kodc bootstrap/sh_kodc.new")
+    let replace = out.find("mv bootstrap/sh_kodc.new bootstrap/sh_kodc")
+    let check = out.find("cmp build/selfhost/stage2/stage1/sh_kodc")
+    assert replace is int64 and check is int64
+    if replace is int64(r) and check is int64(c) {
+        assert c < r
+    }
+}

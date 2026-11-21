@@ -1,0 +1,100 @@
+// Types are worked out once: with KOD_SHADOW_TYPES set, sh_kodc reports an
+// expression whose inferred type changes within a function, and a store into a
+// binding that has no type yet (docs/self-hosting.md). For a file that compiles,
+// only a change while compiling (`EE`, which narrowing makes) is allowed.
+
+import "io"
+import "process"
+import "sort"
+import "time"
+
+let SCRATCH: str = "build/tmp_shadow_types"
+let WORKERS: int64 = 8
+
+// Every .kod file under tests, stdlib, tools and examples, sorted.
+func corpus() -> [str] {
+    let r = process.run(["find", "tests", "stdlib", "tools", "examples", "-name", "*.kod", "-type", "f"])
+    mut files: [str] = []
+    for line in r.stdout.split("\n") {
+        if line != "" {
+            files += [line]
+        }
+    }
+    return sort.sorted(files)
+}
+
+// sh_kodc on `path`, its stderr to `err`; stdout goes nowhere.
+func start(anon path: str, err: str) -> process.Child or Error {
+    let script = "exec build/stage1/sh_kodc \"$1\" >/dev/null 2>\"$2\""
+    return try process.start(["sh", "-c", script, "sh", path, err], add_env: ["KOD_SHADOW_TYPES=1"])
+}
+
+// The lines of a compile's stderr that say a type was worked out twice.
+func bad_lines(anon stderr: str) -> [str] {
+    mut bad: [str] = []
+    for line in stderr.split("\n") {
+        if line.starts_with("UNTYPED-STORE") or (line.starts_with("SHADOW") and not line.starts_with("SHADOW EE")) {
+            bad += [line]
+        }
+    }
+    return bad
+}
+
+type Running = struct {
+    path: str
+    err: str
+    child: process.Child
+}
+
+// What a finished compile says: nothing when it is fine.
+func check(anon path: str, err: str, status: int64) -> none {
+    let stderr = io.read_file(err)
+    process.run(["rm", "-f", err])
+    // A file that doesn't compile can't be checked.
+    if status != 0 {
+        return
+    }
+    let bad = bad_lines(stderr)
+    if len(bad) > 0 {
+        fail(f"{path}:\n{"\n".join(bad)}")
+    }
+}
+
+test "types are worked out once in every file" {
+    process.run(["rm", "-rf", SCRATCH])
+    process.run(["mkdir", "-p", SCRATCH])
+    let files = corpus()
+    assert len(files) > 100
+    mut running: [Running] = []
+    mut next = 0
+    for next < len(files) or len(running) > 0 {
+        for next < len(files) and len(running) < WORKERS {
+            let path = files[next]
+            let err = f"{SCRATCH}/{next}.err"
+            next += 1
+            match start(path, err: err) {
+                Ok(child) -> running += [Running(:path, :err, :child)]
+                Err(e) -> fail(f"{path}: {e.to_str()}")
+            }
+        }
+        mut still: [Running] = []
+        for r in running {
+            match r.child.try_wait() {
+                Ok(code) -> {
+                    if code is int64(status) {
+                        check(r.path, err: r.err, status: status)
+                    } else {
+                        still += [r]
+                    }
+                }
+                // Killed by a signal: it didn't compile.
+                Err(_) -> process.run(["rm", "-f", r.err])
+            }
+        }
+        if len(still) == len(running) {
+            time.sleep(time.Duration(ms: 1))
+        }
+        running = still
+    }
+    process.run(["rm", "-rf", SCRATCH])
+}

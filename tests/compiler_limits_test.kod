@@ -1,0 +1,511 @@
+// Programs too deep or too large for the machine's registers and immediates
+// still compile and give the right answer. The sources are generated, because
+// what matters is their size, and each answer is worked out here.
+//
+// Each test builds and runs its programs several at a time, each under a name
+// of its own (`limits_<case>`), from build/tmp_compiler_limits.
+
+import "io"
+import "process"
+import "time"
+
+let SCRATCH: str = "build/tmp_compiler_limits"
+let WORKERS: int64 = 8
+
+let HELPERS: str = "\n" + """
+    type P = shared struct {
+        v: int64
+    }
+
+    func id(anon a: int64) -> int64 {
+        return a
+    }
+
+    func fails(anon a: int64) -> int64 or Error {
+        throw Oops(n: a)
+    }
+
+    func works(anon a: int64) -> int64 or Error {
+        return a
+    }
+
+    type Oops = shared struct {
+        n: int64
+
+        func to_str(self) -> str {
+            return f"oops {self.n}"
+        }
+    }
+    """
+
+let ADD: str = "\n" + """
+    func add(anon a: int64, anon b: int64) -> int64 {
+        return a + b
+    }
+    """
+
+// How a program's output is compared with what it should print.
+type Compare = enum {
+    // The output without the whitespace around it is `want[0]`.
+    Whole
+    // The output's words (split on whitespace) are `want`.
+    Words
+    // The lines of the output without the whitespace around it are `want`.
+    Lines
+}
+
+type Case = struct {
+    // Also the program's name, after `limits_`.
+    name: str
+    body: str
+    decls: str
+    want: [str]
+    compare: Compare
+}
+
+func whole(anon name: str, body: str, want: int64, decls: str = "") -> Case {
+    return Case(:name, :body, :decls, want: [str(want)], compare: .Whole)
+}
+
+func is_space(anon c: int64) -> bool {
+    return c == ' ' or c == '\n' or c == '\t' or c == '\r'
+}
+
+func words(anon s: str) -> [str] {
+    mut out: [str] = []
+    mut start = -1
+    for i in 0..len(s) {
+        if is_space(s[i]) {
+            if start >= 0 {
+                out += [s[start..i]]
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+    }
+    if start >= 0 {
+        out += [s[start..len(s)]]
+    }
+    return out
+}
+
+func got(anon c: Case, anon stdout: str) -> [str] {
+    match c.compare {
+        .Whole -> return [stdout.trim()]
+        .Words -> return words(stdout)
+        .Lines -> return stdout.trim().split("\n")
+    }
+}
+
+type Running = struct {
+    case: Case
+    stem: str
+    child: process.Child
+}
+
+// Checks what a finished program printed, and removes its files.
+func finish(anon r: Running, status: int64) -> none {
+    let base = f"{SCRATCH}/{r.stem}"
+    let out = io.read_file(f"{base}.out")
+    let err = io.read_file(f"{base}.err")
+    process.run(["rm", "-f", f"{base}.kod", f"{base}.out", f"{base}.err"])
+    process.run(["rm", "-rf", f"build/apps/{r.stem}"])
+    if status != 0 {
+        fail(f"{r.case.name}: status {status}\n{out}{err}")
+        return
+    }
+    let have = got(r.case, out)
+    if have != r.case.want {
+        fail(f"{r.case.name}: got [{", ".join(have)}], want [{", ".join(r.case.want)}]")
+    }
+}
+
+// Builds and runs each case's program with `kod run`, WORKERS at a time, and
+// fails for each that doesn't exit 0 or doesn't print what it should.
+func run_cases(anon cases: [Case]) -> none {
+    process.run(["mkdir", "-p", SCRATCH])
+    mut running: [Running] = []
+    mut next = 0
+    for next < len(cases) or len(running) > 0 {
+        for next < len(cases) and len(running) < WORKERS {
+            let c = cases[next]
+            next += 1
+            let stem = f"limits_{c.name}"
+            let base = f"{SCRATCH}/{stem}"
+            let source = HELPERS + c.decls + "\nfunc main() -> int64 {\n" + c.body + "\n    return 0\n}\n"
+            if io.write_file(f"{base}.kod", source) != 0 {
+                fail(f"{c.name}: cannot write {base}.kod")
+                continue
+            }
+            let script = "exec build/apps/kod/kod run \"$1.kod\" >\"$1.out\" 2>\"$1.err\""
+            match process.start(["sh", "-c", script, "sh", base]) {
+                Ok(child) -> running += [Running(case: c, :stem, :child)]
+                Err(e) -> fail(f"{c.name}: {e.to_str()}")
+            }
+        }
+        mut still: [Running] = []
+        for r in running {
+            match r.child.try_wait() {
+                Ok(code) -> {
+                    if code is int64(status) {
+                        finish(r, status: status)
+                    } else {
+                        still += [r]
+                    }
+                }
+                Err(e) -> {
+                    fail(f"{r.case.name}: {e.to_str()}")
+                    finish(r, status: -1)
+                }
+            }
+        }
+        if len(still) == len(running) {
+            time.sleep(time.Duration(ms: 1))
+        }
+        running = still
+    }
+    process.run(["rmdir", SCRATCH])
+}
+
+func sum_range(anon start: int64, anon end: int64, step: int64 = 1) -> int64 {
+    mut total = 0
+    mut i = start
+    for i < end {
+        total += i
+        i += step
+    }
+    return total
+}
+
+let DEPTHS: [int64] = [4, 8, 16, 17, 18, 30, 100]
+
+func nest_matches(anon inner: str, anon depth: int64) -> str {
+    mut expr = inner
+    for _ in 0..depth {
+        expr = "(1 + match a { 1 -> " + expr + " else -> 0 })"
+    }
+    return expr
+}
+
+test "nested match expressions" {
+    mut cases: [Case] = []
+    for depth in DEPTHS {
+        let expr = nest_matches("1", depth)
+        cases += [whole(f"nested_match_expressions_{depth}", body: f"    let a = id(1)\n    print_int({expr})", want: depth + 1)]
+    }
+    run_cases(cases)
+}
+
+test "nested and/or" {
+    mut cases: [Case] = []
+    for depth in DEPTHS {
+        mut ands = "a"
+        mut ors = "b"
+        for _ in 0..depth {
+            ands = f"(a and {ands})"
+            ors = f"(b or {ors})"
+        }
+        mut false_at_bottom = "b"
+        for _ in 0..depth {
+            false_at_bottom = f"(a and {false_at_bottom})"
+        }
+        let body = f"    let a = id(1) == 1\n    let b = id(1) == 2\n    print({ands})\n    print({ors})\n    print({false_at_bottom})"
+        cases += [Case(name: f"nested_and_or_{depth}", :body, decls: "", want: ["true", "false", "false"], compare: .Words)]
+    }
+    run_cases(cases)
+}
+
+test "nested constructors" {
+    mut cases: [Case] = []
+    for depth in DEPTHS {
+        mut expr = "P(v: 1)"
+        for _ in 0..depth {
+            expr = f"P(v: {expr}.v + 1)"
+        }
+        cases += [whole(f"nested_constructors_{depth}", body: f"    print_int({expr}.v)", want: depth + 1)]
+    }
+    run_cases(cases)
+}
+
+test "nested match statements" {
+    mut cases: [Case] = []
+    for depth in DEPTHS {
+        mut lines = [f"    print_int(n + {depth})"]
+        for _ in 0..depth {
+            lines = ["    match id(n) {", "    1 -> {"] + lines + ["    }", "    else -> print(0)", "    }"]
+        }
+        let body = "    let n = id(1)\n" + "\n".join(lines)
+        cases += [whole(f"nested_match_statements_{depth}", :body, want: depth + 1)]
+    }
+    run_cases(cases)
+}
+
+// Wraps `expr` in levels that each hold a different value in a register
+// while the next is compiled; gives the source and what it adds up to.
+type Held = struct {
+    expr: str
+    want: int64
+}
+
+func hold_values(anon expr: str, anon value: int64, depth: int64) -> Held {
+    mut e = expr
+    mut want = value
+    for i in 2..depth + 2 {
+        e = f"(id({i}) * 2 + match id({i}) " + "{ " + f"{i} -> {e} else -> 0 " + "})"
+        want = i * 2 + want
+    }
+    return Held(expr: e, :want)
+}
+
+// Each level holds a different value in a register while the next is compiled.
+test "values held across nesting survive" {
+    mut cases: [Case] = []
+    for depth in DEPTHS {
+        let held = hold_values("1", 1, depth: depth)
+        cases += [whole(f"values_held_across_nesting_{depth}", body: f"    print_int({held.expr})", want: held.want)]
+    }
+    run_cases(cases)
+}
+
+test "try leaves from deep inside" {
+    mut cases: [Case] = []
+    for depth in [18, 40] {
+        let ok = nest_matches("try works(5)", depth)
+        let bad = nest_matches("try fails(7)", depth)
+        let decls = "\nfunc deep(anon a: int64, ok: bool) -> int64 or Error {\n    if ok {\n        return " + ok + "\n    }\n    return " + bad + "\n}\n"
+        let body = """
+                print_int(must deep(1, ok: true))
+                let failed = deep(1, ok: false)
+                match failed {
+                    Ok(n) -> print_int(n)
+                    Err(e) -> print(e.to_str())
+                }
+            """
+        cases += [Case(name: f"try_leaves_from_deep_inside_{depth}", body: body.trim_end(), :decls, want: [str(depth + 5), "oops 7"], compare: .Lines)]
+    }
+    run_cases(cases)
+}
+
+let SKIP_AND_STOP: str = "{\n            if i == 2 {\n                continue\n            }\n            if i == 5 {\n                break\n            }\n            i\n        }"
+
+test "break and continue from deep inside" {
+    mut cases: [Case] = []
+    for depth in [18, 40] {
+        let inner = nest_matches("match a { 1 -> " + SKIP_AND_STOP + " else -> 0 }", depth)
+        let body = "    let a = id(1)\n    mut total = 0\n    for i in 0..9 {\n        total += " + inner + "\n    }\n    print_int(total)"
+        // i = 0, 1, 3 and 4 each add depth + i.
+        cases += [whole(f"break_and_continue_from_deep_inside_{depth}", :body, want: 4 * depth + 8)]
+    }
+    run_cases(cases)
+}
+
+// The loop runs deep inside held values, and its jumps skip the restores
+// of what was evicted within it.
+test "values held around a loop survive its jumps" {
+    mut cases: [Case] = []
+    for depth in [12, 18, 40] {
+        let inner = nest_matches("match a { 1 -> " + SKIP_AND_STOP + " else -> 0 }", depth)
+        let loop = "{\n        mut total = 0\n        for i in 0..9 {\n            total += " + inner + "\n        }\n        total\n    }"
+        let held = hold_values("match a { 1 -> " + loop + " else -> 0 }", 4 * depth + 8, depth: depth)
+        cases += [whole(f"values_held_around_a_loop_{depth}", body: f"    let a = id(1)\n    print_int({held.expr})", want: held.want)]
+    }
+    run_cases(cases)
+}
+
+test "a jump out of call arguments leaks no stack" {
+    let body = """
+            let a = id(1)
+            mut total = 0
+            for i in 0..3000000 {
+                total += add(0, match a { 1 -> {
+                    if i % 2 == 0 {
+                        continue
+                    }
+                    i
+                } else -> 0 })
+            }
+            print_int(total)
+        """
+    run_cases([whole("jump_out_of_call_arguments", body: body.trim_end(), want: sum_range(1, 3000000, step: 2), decls: ADD)])
+}
+
+// Not deep at all: the `continue` used to skip the inner call's stack
+// cleanup, so the outer call read its first argument from the wrong slot.
+test "a jump inside call arguments inside call arguments" {
+    let body = """
+            let a = id(1)
+            let r = add(7, match a {
+                1 -> {
+                    mut t = 0
+                    for i in 0..3 {
+                        t += add(1, match a {
+                            1 -> {
+                                if i == 1 {
+                                    continue
+                                }
+                                i
+                            }
+                            else -> 0
+                        })
+                    }
+                    t
+                }
+                else -> 0
+            })
+            print_int(r)
+        """
+    run_cases([whole("jump_inside_call_arguments", body: body.trim_end(), want: 11, decls: ADD)])
+}
+
+test "long and/or chains" {
+    mut names: [str] = []
+    mut positives: [str] = []
+    for i in 0..40 {
+        names += [f"n == {i}"]
+        positives += ["n > 0"]
+    }
+    let body = f"    let n = id(39)\n    print({" or ".join(names)})\n    print({" and ".join(positives)})"
+    run_cases([Case(name: "long_and_or_chains", :body, decls: "", want: ["true", "true"], compare: .Words)])
+}
+
+test "nested loops each keep their own stack" {
+    let body = """
+            let a = id(1)
+            mut total = 0
+            for i in 0..4 {
+                total += add(100, match a { 1 -> {
+                    mut sub = 0
+                    for j in 0..6 {
+                        sub += add(10, match a { 1 -> {
+                            if j == 1 {
+                                continue
+                            }
+                            if j == 4 {
+                                break
+                            }
+                            j
+                        } else -> 0 })
+                    }
+                    if i == 2 {
+                        continue
+                    }
+                    sub
+                } else -> 0 })
+            }
+            print_int(total)
+        """
+    // Per outer pass the inner adds (10 + 0) + (10 + 2) + (10 + 3) = 35; i = 2 is skipped.
+    run_cases([whole("nested_loops_own_stack", body: body.trim_end(), want: 3 * 135, decls: ADD)])
+}
+
+// Three million iterations would overflow an 8 MB stack at 16 bytes each.
+test "jumps out of deep code leak no stack" {
+    let skip = "{\n            if i % 2 == 0 {\n                continue\n            }\n            i\n        }"
+    let inner = nest_matches("match a { 1 -> " + skip + " else -> 0 }", 18)
+    let body = "    let a = id(1)\n    mut total = 0\n    for i in 0..3000000 {\n        total += " + inner + " - 18\n    }\n    print_int(total)"
+    run_cases([whole("jumps_out_of_deep_code", :body, want: sum_range(1, 3000000, step: 2))])
+}
+
+test "large frames" {
+    mut cases: [Case] = []
+    for count in [500, 520, 600, 1000, 5000] {
+        mut lets: [str] = []
+        mut adds: [str] = []
+        for i in 0..count {
+            lets += [f"    let v{i} = id({i})"]
+            adds += [f"    t += v{i}"]
+        }
+        let body = "\n".join(lets) + "\n    mut t = 0\n" + "\n".join(adds) + "\n    print_int(t)"
+        cases += [whole(f"large_frames_{count}", :body, want: sum_range(0, count))]
+    }
+    run_cases(cases)
+}
+
+test "large array literals" {
+    mut cases: [Case] = []
+    for count in [4095, 4096, 4097, 5000, 40000] {
+        mut items: [str] = []
+        for i in 0..count {
+            items += [str(i)]
+        }
+        let body = f"    let xs: [int64] = [{", ".join(items)}]\n    print_int(xs[{count - 1}] + xs[0] + len(xs))"
+        cases += [whole(f"large_array_literals_{count}", :body, want: count - 1 + count)]
+    }
+    run_cases(cases)
+}
+
+test "large structs and payloads" {
+    mut cases: [Case] = []
+    for count in [4095, 4096, 5000] {
+        mut fields: [str] = []
+        mut args: [str] = []
+        mut params: [str] = []
+        mut binds: [str] = []
+        for i in 0..count {
+            fields += [f"    f{i}: int64"]
+            args += [f"f{i}: {i}"]
+            params += [f"f{i}: int64"]
+            binds += [f"b{i}"]
+        }
+        let a = ", ".join(args)
+        let decls = "type S = shared struct {\n" + "\n".join(fields) + "\n}\ntype E = enum {\n    V(" + ", ".join(params) + ")\n}\n"
+        let body = f"    let s = S({a})\n    print_int(s.f{count - 1})\n    let e: E = .V({a})\n    match e " + "{\n" + f"        .V({", ".join(binds)}) -> print_int(b{count - 1} + b0)\n    " + "}"
+        cases += [Case(name: f"large_structs_and_payloads_{count}", :body, :decls, want: [str(count - 1), str(count - 1)], compare: .Words)]
+    }
+    run_cases(cases)
+}
+
+test "a deep expression in a large frame" {
+    mut lets: [str] = []
+    for i in 0..1000 {
+        lets += [f"    let v{i} = id({i})"]
+    }
+    mut expr = "v999"
+    for i in 0..30 {
+        expr = f"(v{i} + match a " + "{ 1 -> " + expr + " else -> 0 })"
+    }
+    let body = "    let a = id(1)\n" + "\n".join(lets) + f"\n    print_int({expr})"
+    run_cases([whole("deep_expression_in_large_frame", :body, want: 999 + sum_range(0, 30))])
+}
+
+// More string data than Mach-O can address as an offset into one section,
+// with escapes, and fast: unescaping and emitting a literal is linear.
+test "string literals past 8 MB" {
+    let letters = "abcdefghi"
+    mut lines: [str] = []
+    for i in 0..9 {
+        lines += ["    n += len(\"" + letters[i..i + 1].repeat(1000000) + "\\n\\t\\\"\\\\\")"]
+    }
+    let body = "    mut n = 0\n" + "\n".join(lines) + "\n    print_int(n)"
+    run_cases([whole("string_literals_past_8_mb", :body, want: 9 * 1000004)])
+}
+
+// A conditional branch reaches 1 MB; each `t += id(i)` is about 20 bytes,
+// so 60,000 of them put the branch's target out of its reach.
+test "jumps over more than a megabyte" {
+    let count = 60000
+    mut lines: [str] = []
+    for i in 0..count {
+        lines += [f"        t += id({i})"]
+    }
+    let adds = "\n".join(lines)
+    let total = sum_range(0, count)
+    mut cases: [Case] = []
+    for shape in ["if", "for", "match", "and"] {
+        mut body = ""
+        mut want = total
+        if shape == "if" {
+            body = "    if a == 1 {\n" + adds + "\n    }"
+        } else if shape == "for" {
+            body = "    mut k = 0\n    for k < 2 {\n        k += 1\n" + adds + "\n    }"
+            want = total * 2
+        } else if shape == "match" {
+            body = "    match a {\n        1 -> {\n" + adds + "\n        }\n        else none\n    }"
+        } else {
+            body = "    if a == 1 and t == 0 {\n" + adds + "\n    }"
+        }
+        cases += [whole(f"jumps_over_a_megabyte_{shape}", body: "    let a = id(1)\n    mut t = 0\n" + body + "\n    print_int(t)", :want)]
+    }
+    run_cases(cases)
+}
