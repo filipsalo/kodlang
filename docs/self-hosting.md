@@ -94,7 +94,7 @@ The fixed-point check shows that a compiler reproduces itself, not that it is ri
 ## What's still Python
 
 - `kod/__main__.py`: `uv run kod build|run|test|check`, run from the repository root, refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`. If `make` fails, it prints make's errors and `kod: failed to rebuild the toolchain` and stops with make's status; from any other directory, or when `make` is not installed and the tool is not built, it says that the tool is missing.
-- `tests/` and `tools/asm_diff.py`: the test harness and the assembly comparison.
+- `tests/support/http_fixture.py` and `tools/as_diff.py`: a test's HTTP stand-in and the assembler comparison.
 
 Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool install .` is not supported: the wheel contains no stdlib.
 
@@ -126,7 +126,7 @@ make asm-diff            # compare against HEAD
 make asm-diff BASE=main  # or any other revision
 ```
 
-Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself. With `--objects` (`uv run python tools/asm_diff.py --objects`), a file whose assembly is only written differently, the same diagnostics and status and the same object bytes once assembled (`bne` against `b.ne`), counts as unchanged.
+Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.kod` file in the repo with both that compiler and the working tree's, and reports each file whose assembly, diagnostics or exit status differ. A pure refactor should report no differences. Both compilers read the working tree's `stdlib/`, so the comparison isolates changes to the compiler itself. The comparison is `tools/asm_diff.kod`, built to `build/apps/asm_diff/asm_diff`, which `make asm-diff` runs from the repository root. With `--objects` (`build/apps/asm_diff/asm_diff --objects [BASE]`), a file whose assembly is only written differently, the same diagnostics and status and the same object bytes once assembled (`bne` against `b.ne`), counts as unchanged.
 
 ### Reading the assembly
 

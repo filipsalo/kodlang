@@ -41,8 +41,6 @@
 #   build/stage1/         kodc.{s,o}, runtime_main.{s,o}, sh_kodc
 #   build/apps/<stem>/    the final executable, and its objects in <stem>.obj/
 
-PY := uv run python
-
 # Compiler used to lower stage1 sources to .s.
 BOOTSTRAP_SH_KODC := bootstrap/sh_kodc
 KODC := ./$(BOOTSTRAP_SH_KODC)
@@ -307,7 +305,7 @@ gates:
 # rebuilds must emit byte-identical assembly.
 # Stage1 and stage2 must also agree on the corpus: the snapshot can miscompile new code.
 SELFHOST := build/selfhost
-selfhost-check: stage1
+selfhost-check: stage1 kod
 	rm -rf $(SELFHOST)
 	$(MAKE) -s stage1 STAGE0=$(SELFHOST)/stage2/stage0 STAGE1=$(SELFHOST)/stage2/stage1 \
 	    KODC=./$(STAGE1)/sh_kodc KODC_EMIT_MAIN="./$(STAGE1)/sh_kodc _emit-runtime-main"
@@ -316,11 +314,13 @@ selfhost-check: stage1
 	@diff -r -x '*.o' -x sh_kodc $(SELFHOST)/stage2 $(SELFHOST)/stage3 \
 	    || { echo "selfhost-check: stage2 and stage3 assembly differ (see diff above)"; exit 1; }
 	@echo "selfhost-check: stage2 == stage3"
-	@$(PY) tools/asm_diff.py --compilers $(STAGE1)/sh_kodc $(SELFHOST)/stage2/stage1/sh_kodc
+	@$(KOD_APP)/kod build tools/asm_diff.kod
+	@build/apps/asm_diff/asm_diff --compilers $(STAGE1)/sh_kodc $(SELFHOST)/stage2/stage1/sh_kodc
 
 BASE ?= HEAD
-asm-diff:
-	$(PY) tools/asm_diff.py $(BASE)
+asm-diff: kod
+	$(KOD_APP)/kod build tools/asm_diff.kod
+	build/apps/asm_diff/asm_diff $(BASE)
 
 clean-apps:
 	rm -rf build/apps build/cache

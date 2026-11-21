@@ -1,0 +1,547 @@
+// Compare sh_kodc output between a base revision and the working tree.
+//
+//   asm_diff [--objects] [BASE]     (default: HEAD; or `make asm-diff`)
+//   asm_diff --compilers OLD NEW    (two built compilers; `make selfhost-check`)
+//
+// Builds sh_kodc at BASE (cached as build/asm-diff/<sha>/sh_kodc), then
+// compiles every .kod file in the working tree with both that compiler and
+// build/stage1/sh_kodc. Both run from the repo root, so both read the
+// working tree's stdlib and only compiler changes show up. Reports each file
+// whose assembly, diagnostics or exit status differ and writes both outputs
+// under build/asm-diff/out/. Exits 1 if anything differs.
+//
+// With --objects, a file whose output differs only in how the assembly is
+// written (the same diagnostics and status, and both assemble to the same
+// bytes) counts as unchanged.
+//
+// The repo root is the top of the git checkout the tool runs in. Build it
+// with `build/apps/kod/kod build tools/asm_diff.kod`.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "sort"
+import "strbuilder" { StrBuilder }
+import "time"
+import "time" { Duration, monotonic_ns }
+
+// Compiles run at once, as many as the Python version's thread pool had.
+let WORKERS: int64 = 8
+// A compile still running after this long is killed and reported as timed out.
+let COMPILE_WAIT_S: int64 = 60
+let SIGKILL: int64 = 9
+
+// --- Running programs ---------------------------------------------------------
+
+// Something went wrong that ends the run (status 1).
+type Failed = struct {
+    message: str
+
+    func to_str(self) -> str {
+        return self.message
+    }
+}
+
+// Run `argv` in `dir` to the end, collecting stdout and stderr.
+func output(anon argv: [str], dir: str) -> process.Output or Error {
+    return try process.output(argv, :dir)
+}
+
+// Run `argv` in `dir` with stdin from /dev/null and stdout and stderr this
+// process's; fail unless it exits 0.
+func check(anon argv: [str], dir: str) -> none or Error {
+    let child = try process.start(argv, stdin: .Null, :dir)
+    let code = try child.wait()
+    if code != 0 {
+        throw Failed(message: f"asm-diff: `{" ".join(argv)}` exited with status {code}")
+    }
+}
+
+// As `check`, with the program's stdout sent to this process's stderr.
+func check_to_stderr(anon argv: [str], dir: str) -> none or Error {
+    let child = try process.start(argv, stdin: .Null, stdout: .Pipe, :dir)
+    for child.stdout.fd >= 0 {
+        let piece = try child.stdout.read(65536)
+        if len(piece) == 0 {
+            try child.stdout.close()
+        } else {
+            io.write_stderr(str(piece))
+        }
+    }
+    let code = try child.wait()
+    if code != 0 {
+        throw Failed(message: f"asm-diff: `{" ".join(argv)}` exited with status {code}")
+    }
+}
+
+func git(anon args: [str], root: str) -> str or Error {
+    let r = try output(["git"] + args, dir: root)
+    if r.status != 0 {
+        throw Failed(message: f"asm-diff: `git {" ".join(args)}` exited with status {r.status}: {r.stderr}")
+    }
+    return r.stdout
+}
+
+func exists(anon path: str) -> bool {
+    return process.run(["test", "-e", path]).status == 0
+}
+
+// --- The base compiler --------------------------------------------------------
+
+// link.local.cfg is not tracked, so a `git archive` copy lacks it, and a
+// machine that needs it (a `clang` that does not find the SDK) could not
+// build the base compiler there. Give the copy this checkout's.
+func copy_link_local_cfg(anon dest: str, root: str) -> none or Error {
+    let local = f"{root}/link.local.cfg"
+    if io.is_file(local) {
+        try check(["cp", "-p", local, f"{dest}/link.local.cfg"], dir: root)
+        io.write_stderr("asm-diff: copied link.local.cfg into the base copy\n")
+    }
+}
+
+// The path of sh_kodc built at `rev`, building it unless cached.
+func build_base_compiler(anon rev: str, root: str) -> str or Error {
+    let r = try output(["git", "rev-parse", "--verify", "--quiet", rev + "^{commit}"], dir: root)
+    if r.status != 0 {
+        throw Failed(message: f"asm-diff: unknown revision `{rev}`")
+    }
+    let sha = r.stdout.trim()
+    let out = f"{root}/build/asm-diff"
+    let cached = f"{out}/{sha}/sh_kodc"
+    if exists(cached) {
+        return cached
+    }
+    let src = f"{out}/{sha}/src"
+    try check(["rm", "-rf", src], dir: root)
+    try check(["mkdir", "-p", src], dir: root)
+    io.write_stderr(f"asm-diff: building sh_kodc at {rev} ({sha[0..10]})\n")
+    let archive = f"{out}/{sha}/src.tar"
+    try check(["git", "archive", "-o", archive, sha], dir: root)
+    try check(["tar", "-x", "-C", src, "-f", archive], dir: root)
+    try check(["rm", "-f", archive], dir: root)
+    try copy_link_local_cfg(src, :root)
+    if not exists(f"{src}/bootstrap/sh_kodc") {
+        io.write_stderr(f"asm-diff: {rev} has no bootstrap snapshot; building it through the Python interpreter (minutes)\n")
+    }
+    try check_to_stderr(["make", "-s", "stage1"], dir: src)
+    try check(["cp", "-p", f"{src}/build/stage1/sh_kodc", cached], dir: root)
+    try check(["rm", "-rf", src], dir: root)
+    return cached
+}
+
+// --- The corpus ---------------------------------------------------------------
+
+// Every .kod file in the working tree, tracked or not (unless ignored),
+// sorted. Dot-paths are worktrees under .claude/ and scratch files.
+func corpus(root: str) -> [str] or Error {
+    let listed = try git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "*.kod"], :root)
+    mut files: [str] = []
+    for f in sort.sorted(listed.split("\n")) {
+        if f == "" or f.starts_with(".") or (len(files) > 0 and files[len(files) - 1] == f) {
+            continue
+        }
+        if io.is_file(f"{root}/{f}") {
+            files += [f]
+        }
+    }
+    return files
+}
+
+// --- Compiling, several at once -----------------------------------------------
+
+// One compile running with its stdout and stderr piped here.
+type Proc = shared struct {
+    child: process.Child
+    deadline: int64
+    out: StrBuilder
+    err: StrBuilder
+    // The raw wait status once it has ended, -1 before.
+    raw: int64
+    expired: bool
+}
+
+func is_done(anon p: Proc) -> bool {
+    return p.raw >= 0 and p.child.stdout.fd < 0 and p.child.stderr.fd < 0
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: posix.Fd, into: StrBuilder) -> none {
+    match f.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                let _ = f.close()
+            } else {
+                into.append_bytes(data)
+            }
+        }
+        Err(_) -> {
+            let _ = f.close()
+        }
+    }
+}
+
+// Text as Python reads it from a pipe as UTF-8 with errors="replace": each
+// maximal ill-formed part becomes U+FFFD, and "\r\n" and a lone "\r" become
+// "\n".
+func as_text(anon s: str) -> str {
+    mut t = s
+    for c in s {
+        if c >= 128 {
+            t = replace_invalid(s)
+            break
+        }
+    }
+    if not t.contains("\r") {
+        return t
+    }
+    return t.replace("\r\n", to: "\n").replace("\r", to: "\n")
+}
+
+let REPLACEMENT: str = "\u{FFFD}"
+
+// The range the second byte of a sequence led by `lead` must be in, and how
+// many bytes after the lead it has (0 for a byte that leads none).
+func lead_info(anon lead: int64) -> [int64] {
+    if lead >= 0xC2 and lead <= 0xDF {
+        return [0x80, 0xBF, 1]
+    }
+    if lead == 0xE0 {
+        return [0xA0, 0xBF, 2]
+    }
+    if lead == 0xED {
+        return [0x80, 0x9F, 2]
+    }
+    if lead >= 0xE1 and lead <= 0xEF {
+        return [0x80, 0xBF, 2]
+    }
+    if lead == 0xF0 {
+        return [0x90, 0xBF, 3]
+    }
+    if lead >= 0xF1 and lead <= 0xF3 {
+        return [0x80, 0xBF, 3]
+    }
+    if lead == 0xF4 {
+        return [0x80, 0x8F, 3]
+    }
+    return [0, 0, 0]
+}
+
+func replace_invalid(anon s: str) -> str {
+    let out = StrBuilder()
+    mut i = 0
+    mut kept = 0
+    let n = len(s)
+    for i < n {
+        let c = s[i]
+        if c < 128 {
+            i += 1
+            continue
+        }
+        let info = lead_info(c)
+        mut good = 0
+        if info[2] > 0 {
+            good = 1
+            for k in 1..info[2] + 1 {
+                if i + k >= n {
+                    break
+                }
+                let b = s[i + k]
+                mut lo = 0x80
+                mut hi = 0xBF
+                if k == 1 {
+                    lo = info[0]
+                    hi = info[1]
+                }
+                if b < lo or b > hi {
+                    break
+                }
+                good += 1
+            }
+        }
+        if good == info[2] + 1 and info[2] > 0 {
+            i += good
+            continue
+        }
+        out.append(s[kept..i])
+        out.append(REPLACEMENT)
+        if good == 0 {
+            good = 1
+        }
+        i += good
+        kept = i
+    }
+    if kept == 0 {
+        return s
+    }
+    out.append(s[kept..n])
+    return out.to_str()
+}
+
+// What a compile wrote and how it ended, in the form the outputs compare in.
+func result_of(anon p: Proc) -> str {
+    if p.expired {
+        return "--- timed out ---\n"
+    }
+    mut code = (p.raw >> 8) & 255
+    let sig = p.raw & 127
+    if sig != 0 {
+        code = -sig
+    }
+    let out = as_text(p.out.to_str())
+    let err = as_text(p.err.to_str())
+    return f"{out}--- stderr ---\n{err}--- exit {code} ---\n"
+}
+
+// Start `compiler path` in `root`.
+func begin(anon compiler: str, path: str, root: str) -> Proc or Error {
+    let child = try process.start([compiler, path], stdin: .Null, stdout: .Pipe, stderr: .Pipe, dir: root)
+    return Proc(:child, deadline: monotonic_ns() + COMPILE_WAIT_S * 1000000000, out: StrBuilder(), err: StrBuilder(), raw: -1, expired: false)
+}
+
+// Wait up to `ms` for output from any of `procs`, take it, and see which have
+// ended; one past its deadline is killed.
+func step(anon procs: [Proc], ms: int64) -> none {
+    mut fds: [posix.Fd] = []
+    mut into: [StrBuilder] = []
+    for p in procs {
+        if p.child.stdout.fd >= 0 {
+            fds += [p.child.stdout]
+            into += [p.out]
+        }
+        if p.child.stderr.fd >= 0 {
+            fds += [p.child.stderr]
+            into += [p.err]
+        }
+    }
+    if len(fds) > 0 {
+        if posix.poll(read: fds, timeout: Duration(:ms)) is Ok(ready) {
+            for i, f in fds {
+                if ready.read[i] {
+                    take(f, into: into[i])
+                }
+            }
+        }
+    } else {
+        time.sleep(Duration(ms: 1))
+    }
+    let now = monotonic_ns()
+    for p in procs {
+        if p.raw < 0 {
+            if process.wait_status(p.child.pid, name: p.child.name, hang: false) is Ok(int64(raw)) {
+                p.raw = raw
+            }
+        }
+        if not is_done(p) and now > p.deadline {
+            if p.raw < 0 {
+                let _killed = libc.kill(p.child.pid, SIGKILL)
+            }
+            for f in [p.child.stdout, p.child.stderr] {
+                if f.fd >= 0 {
+                    let _ = f.close()
+                }
+            }
+            if p.raw < 0 {
+                if process.wait_status(p.child.pid, name: p.child.name, hang: true) is Ok(int64(raw)) {
+                    p.raw = raw
+                }
+            }
+            if p.raw < 0 {
+                p.raw = 0
+            }
+            p.expired = true
+        }
+    }
+}
+
+// A worker's file: it compiles with the base compiler, then the new one.
+type Slot = struct {
+    index: int64
+    // 0 while the base compiler runs, 1 while the new one does.
+    phase: int64
+    proc: Proc
+}
+
+// Each file's output from `base` and from `new`, at most WORKERS files at a
+// time, each with the base compiler and then the new one.
+func compile_all(anon files: [str], base: str, new: str, root: str) -> [[str]] or Error {
+    mut results: [[str]] = []
+    for _ in files {
+        results += [["", ""]]
+    }
+    mut next = 0
+    mut running: [Slot] = []
+    for next < len(files) or len(running) > 0 {
+        for len(running) < WORKERS and next < len(files) {
+            running += [Slot(index: next, phase: 0, proc: try begin(base, path: files[next], :root))]
+            next += 1
+        }
+        mut procs: [Proc] = []
+        for s in running {
+            procs += [s.proc]
+        }
+        step(procs, ms: 100)
+        mut still: [Slot] = []
+        for s in running {
+            if not is_done(s.proc) {
+                still += [s]
+                continue
+            }
+            results[s.index][s.phase] = result_of(s.proc)
+            if s.phase == 0 {
+                still += [Slot(index: s.index, phase: 1, proc: try begin(new, path: files[s.index], :root))]
+            }
+        }
+        running = still
+    }
+    return results
+}
+
+// --- Comparing ----------------------------------------------------------------
+
+// `s` split at the first "--- stderr ---": what comes before and after.
+func split_tail(anon s: str) -> [str]? {
+    let sep = "--- stderr ---"
+    let Some(at) = s.find(sep) else {
+        return none
+    }
+    return [s[0..at], s[at + len(sep)..len(s)]]
+}
+
+// Whether two outputs differ only in how the assembly is written: the same
+// diagnostics and status, and both assemble to the same bytes.
+func same_object(anon base_out: str, anon new_out: str) -> bool or Error {
+    // A timed-out compile has no assembly to compare.
+    let Some(b) = split_tail(base_out) else {
+        return false
+    }
+    let Some(n) = split_tail(new_out) else {
+        return false
+    }
+    if b[1] != n[1] {
+        return false
+    }
+    if b[0].trim() == "" and n[0].trim() == "" {
+        return true
+    }
+    let made = try output(["mktemp", "-d"], dir: "")
+    let d = made.stdout.trim()
+    if made.status != 0 or d == "" {
+        throw Failed(message: f"asm-diff: mktemp -d failed: {made.stderr}")
+    }
+    mut objects: [str] = []
+    mut assembled_all = true
+    for pair in [["base", b[0]], ["new", n[0]]] {
+        let name = pair[0]
+        let text = pair[1]
+        let source = f"{d}/{name}.s"
+        let obj = f"{d}/{name}.o"
+        if io.write_file(source, text) != 0 {
+            throw Failed(message: f"asm-diff: cannot write {source}")
+        }
+        let assembled = try output(["as", "-target", "arm64-apple-darwin", "-o", obj, source], dir: "")
+        if assembled.status != 0 {
+            assembled_all = false
+            break
+        }
+        objects += [io.read_file(obj)]
+    }
+    let _ = output(["rm", "-rf", d], dir: "")
+    return assembled_all and objects[0] == objects[1]
+}
+
+func compare(anon base: str, new: str, out: str, label: str, versus: str, objects: bool, root: str) -> int64 or Error {
+    let files = try corpus(:root)
+    let results = try compile_all(files, :base, :new, :root)
+
+    try check(["rm", "-rf", out], dir: root)
+    mut differing: [str] = []
+    mut respelled = 0
+    for i, f in files {
+        let base_out = results[i][0]
+        let new_out = results[i][1]
+        if base_out == new_out {
+            continue
+        }
+        if objects and try same_object(base_out, new_out) {
+            respelled += 1
+            continue
+        }
+        differing += [f]
+        let stem = f.replace("/", to: "__")
+        try check(["mkdir", "-p", out], dir: root)
+        for pair in [["base", base_out], ["new", new_out]] {
+            let which = pair[0]
+            let text = pair[1]
+            if io.write_file(f"{out}/{stem}.{which}", text) != 0 {
+                throw Failed(message: f"asm-diff: cannot write {out}/{stem}.{which}")
+            }
+        }
+        print(f"differs: {f}")
+    }
+
+    print(f"{label}: {len(files)} files, {len(differing)} differ {versus}")
+    if objects {
+        print(f"  {respelled} more differ only in how the assembly is written")
+    }
+    if len(differing) > 0 {
+        let stem = differing[0].replace("/", to: "__")
+        let rel = out.strip_prefix(f"{root}/")? or out
+        print(f"  e.g. diff {rel}/{stem}.base {rel}/{stem}.new")
+        return 1
+    }
+    return 0
+}
+
+// `path` as a path from `root` would be taken: itself when absolute.
+func under(anon root: str, anon path: str) -> str {
+    if path.starts_with("/") {
+        return path
+    }
+    return f"{root}/{path}"
+}
+
+func run(anon argv: [str]) -> int64 or Error {
+    let top = try output(["git", "rev-parse", "--show-toplevel"], dir: "")
+    if top.status != 0 {
+        throw Failed(message: f"asm-diff: not in a git checkout: {top.stderr.trim()}")
+    }
+    let root = top.stdout.trim()
+    if len(argv) == 4 and argv[1] == "--compilers" {
+        let old = argv[2]
+        let new = argv[3]
+        let out = f"{root}/build/selfhost/corpus-diff"
+        return try compare(under(root, old), new: under(root, new), :out, label: "compilers", versus: f"between {old} and {new}", objects: false, :root)
+    }
+    mut args: [str] = []
+    mut objects = false
+    for a in argv[1..len(argv)] {
+        if a == "--objects" {
+            objects = true
+        } else {
+            args += [a]
+        }
+    }
+    mut base_rev = "HEAD"
+    if len(args) > 0 {
+        base_rev = args[0]
+    }
+    let base = try build_base_compiler(base_rev, :root)
+    try check_to_stderr(["make", "-s", "stage1"], dir: root)
+    let new = f"{root}/build/stage1/sh_kodc"
+    return try compare(base, :new, out: f"{root}/build/asm-diff/out", label: "asm-diff", versus: f"from {base_rev}", :objects, :root)
+}
+
+func main(argv: [str]) -> int64 {
+    match run(argv) {
+        Ok(code) -> {
+            io.flush_stdout()
+            return code
+        }
+        Err(e) -> {
+            io.flush_stdout()
+            io.write_stderr(f"{e.to_str()}\n")
+            return 1
+        }
+    }
+}

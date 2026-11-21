@@ -62,7 +62,7 @@ were.
    `IfNonzero`); the arm64 lowering (`arm64_mnemonic`, `mem_mnemonic`,
    `branch_mnemonic`) prints their mnemonics. Conditional branches are now
    always written `b.cond`, which assembles to the same bytes as `bcond`
-   (checked with `asm_diff.py --objects`). Still strings: the condition operand
+   (checked with `asm_diff --objects`). Still strings: the condition operand
    of `SetIf`, `Select` and `CompareIf`, and the register names.
 2. **Register roles** (done for the allocator). The register pools come from a
    `regalloc.Target` (`TARGET`, `ARM64`): the caller- and callee-saved
@@ -186,8 +186,9 @@ were.
    by its instruction as a comment (`.inst 0xaa0103e0 //	mov x0, x1`), for
    reading the output; it is left out otherwise, since writing it and
    skipping it again cost about a twentieth of a compile.
-   `asm_diff.py --objects` checks the result: every object file in the
-   corpus must have the same bytes as when the text is assembled.
+   `asm_diff --objects` (`tools/asm_diff.kod`) checks the result: every
+   object file in the corpus must have the same bytes as when the text is
+   assembled.
 
    Then the object file without `as`: `kod/macho` reads the compiler's
    output (labels, the directives it writes, `.inst` words, and the
