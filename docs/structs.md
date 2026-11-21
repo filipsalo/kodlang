@@ -28,6 +28,19 @@ type Rect = struct {
 }
 ```
 
+A struct is shared: every name, field and element that holds one holds the
+same struct, and a field assigned through any of them shows through all of
+them. `shared struct` says so, and declares the same kind of struct:
+
+```kod
+type Parser = shared struct {
+    pos: int64
+}
+```
+
+`shared` is a word only before `struct`; it can still name a variable or a
+field.
+
 A field's type can name the struct itself:
 
 ```kod
