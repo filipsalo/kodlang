@@ -58,6 +58,14 @@ an `op_index` method (`Map` does). Element assignment needs an array or a
 struct with `op_index_set`, slicing needs an array, `str` or `bytes`, and
 `for … in` needs an array. Anything else is a compile error.
 
+An array can be changed, by assigning an element or appending, only through
+a name that could be assigned: a `mut` binding or a `mut` parameter. On a
+`let` array, a parameter not declared `mut`, a `for` variable or a pattern
+binding, `xs[0] = 1` and `grid[i][j] = 1` are errors
+(`` cannot change `xs`, an immutable binding; declare it with `mut` ``),
+as `xs += [1]` is. An array kept in a field is changed through the field,
+so `self.xs[i] = v` and `p.items += [x]` work however `self` or `p` is bound.
+
 An assigned element must have the array's element type, with the same
 conversions as a `let`: `names[0] = 5` on a `[str]` is an error, while
 `xs[0] = 42` on an `[int64?]` and `pets[0] = Cat()` on a `[Pet]` wrap and
