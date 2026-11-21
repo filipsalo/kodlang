@@ -11,6 +11,18 @@ import pytest
 # `make test` runs them one at a time, after the rest has run in parallel.
 SERIAL_MODULES = {"build_plumbing_test.py", "bootstrap_test.py", "launcher_test.py"}
 
+# The tests of a serial module that run in parallel all the same: those in a
+# directory of their own (a copy of the root, or no root at all), and those
+# that build into build/apps under names no other test uses (`scratch`), which
+# share one worker, but for the ones that replace a tool or count what the
+# cache holds.
+OWN_ROOT_FIXTURES = {"driver_root", "make_root", "elsewhere"}
+SCRATCH_SERIAL = {
+    "test_a_module_compiled_before_comes_from_the_cache",
+    "test_an_entry_that_would_replace_a_tool_is_refused",
+    "test_the_source_of_a_tool_is_not_refused_however_it_is_spelled",
+}
+
 # Kod test files whose tests build through stdlib/kod/test_support.kod, which
 # writes to fixed scratch paths (`.kod_test_build_dir`, `build/apps/main`, ...).
 TEST_SUPPORT_USERS = {
@@ -40,6 +52,8 @@ def build_group(item: pytest.Item) -> str | None:
     module = item.path.name
     if module in SHARED_PROGRAM:
         return SHARED_PROGRAM[module]
+    if module in SERIAL_MODULES and "scratch" in getattr(item, "fixturenames", ()):
+        return "serial_module_scratch"
     callspec = getattr(item, "callspec", None)
     path = callspec.params.get("path") if callspec else None
     if path is None:
@@ -59,12 +73,19 @@ def pytest_configure(config: pytest.Config) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
-        if item.path.name in SERIAL_MODULES:
+        if item.path.name in SERIAL_MODULES and not runs_in_parallel(item):
             item.add_marker(pytest.mark.serial)
         group = build_group(item)
         if group is not None:
             item.add_marker(pytest.mark.xdist_group(group))
     items.sort(key=lambda item: not is_slow(item))
+
+
+def runs_in_parallel(item: pytest.Item) -> bool:
+    fixtures = set(getattr(item, "fixturenames", ()))
+    if fixtures & OWN_ROOT_FIXTURES:
+        return True
+    return "scratch" in fixtures and item.originalname not in SCRATCH_SERIAL
 
 
 def is_slow(item: pytest.Item) -> bool:
