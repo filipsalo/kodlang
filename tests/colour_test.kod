@@ -1,0 +1,180 @@
+// On a terminal, `kod` colours errors and the test report; on a pipe, or with
+// NO_COLOR or TERM=dumb, it doesn't. The terminal is a pseudo-terminal.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "time" { Duration, monotonic_ns }
+import "unsafe"
+
+extern func openpty(anon controller: int64, anon terminal: int64, anon name: int64, anon termios: int64, anon winsize: int64) -> int64
+extern func ttyname(anon fd: int64) -> int64
+
+let KOD: str = "build/apps/kod/kod"
+let ESC: str = "\u{1b}["
+let F_SETFD: int64 = 2
+let FD_CLOEXEC: int64 = 1
+// How long one run may take before it is killed and the test fails.
+let WAIT_NS: int64 = 60000000000
+
+// What `argv` writes to a terminal, stdout and stderr together: run with
+// NO_COLOR unset, TERM=xterm and then `env`, on a new pseudo-terminal. A run
+// that takes longer than WAIT_NS is killed and fails the test.
+func on_terminal(anon argv: [str], env: [str] = []) -> str {
+    let fds = unsafe.alloc(8)
+    let made = unsafe.c_int(openpty(fds, fds + 4, 0, 0, 0))
+    let controller = unsafe.c_int(unsafe.load32(fds))
+    let terminal = unsafe.c_int(unsafe.load32(fds + 4))
+    unsafe.free(fds)
+    if made < 0 {
+        fail("no pseudo-terminal could be made")
+        return ""
+    }
+    libc.fcntl(controller, F_SETFD, FD_CLOEXEC)
+    libc.fcntl(terminal, F_SETFD, FD_CLOEXEC)
+    let tty = unsafe.str_at(ttyname(terminal))
+    mut full: [str] = []
+    for entry in process.current_environment() {
+        if not entry.starts_with("NO_COLOR=") and not entry.starts_with("TERM=") {
+            full += [entry]
+        }
+    }
+    full += ["TERM=xterm"]
+    // A later entry for a name wins, as in the Python dict update.
+    for entry in env {
+        let name = entry[0..entry.find("=")? or len(entry)]
+        mut kept: [str] = []
+        for have in full {
+            if not have.starts_with(name + "=") {
+                kept += [have]
+            }
+        }
+        full = kept + [entry]
+    }
+    // The program opens the terminal by its path for stdin, stdout and stderr.
+    let script = "exec \"$@\" <\"$TTY_PATH\" >\"$TTY_PATH\" 2>\"$TTY_PATH\""
+    let started = process.start(["sh", "-c", script, "sh"] + argv, env: full + [f"TTY_PATH={tty}"])
+    mut out = ""
+    let reader = posix.Fd(fd: controller)
+    if started is process.Child(child) {
+        let deadline = monotonic_ns() + WAIT_NS
+        mut exited = false
+        for true {
+            mut got = false
+            if posix.poll(read: [reader], timeout: Duration(ms: 20)) is posix.Ready(ready) and ready.read[0] {
+                if reader.read(65536) is bytes(data) and len(data) > 0 {
+                    out += kod_bytes_to_str(data)
+                    got = true
+                }
+            }
+            if got {
+                continue
+            }
+            // Done once the program has ended and the terminal holds nothing more.
+            if exited {
+                break
+            }
+            if child.try_wait() is int64(_status) {
+                exited = true
+                continue
+            }
+            if monotonic_ns() > deadline {
+                let _killed = child.kill(signal: .Kill)
+                let _reaped = child.wait()
+                fail(f"killed: {argv} still running after 60 s\n{out}")
+                break
+            }
+        }
+    } else {
+        fail(f"could not start {argv}")
+    }
+    libc.close(controller)
+    libc.close(terminal)
+    return out
+}
+
+// A scratch directory under build/, removed by the test that made it.
+func scratch(anon name: str) -> str {
+    let dir = f"build/tmp_colour_{name}_{libc.getpid()}"
+    let _made = process.run(["mkdir", "-p", dir])
+    return dir
+}
+
+func remove(anon dir: str) -> none {
+    let _gone = process.run(["rm", "-rf", dir])
+}
+
+func bad_file(anon dir: str) -> str {
+    let path = f"{dir}/bad.kod"
+    io.write_file(path, "func main() { let x: int64 = \"a\" }\n")
+    return path
+}
+
+func mixed_file(anon dir: str) -> str {
+    let path = f"{dir}/mixed_test.kod"
+    io.write_file(path, "test \"good\" {\n    assert 1 == 1\n}\n\ntest \"bad\" {\n    assert 1 == 2\n}\n")
+    return path
+}
+
+test "errors are coloured on a terminal" {
+    let dir = scratch("errors")
+    let bad = bad_file(dir)
+    let out = on_terminal([KOD, "check", bad])
+    remove(dir)
+    let bold = f"{ESC}1m"
+    let red = f"{ESC}31m"
+    let reset = f"{ESC}0m"
+    assert out.contains(f"{bold}{bad}:1:30:{reset} {bold}{red}error:{reset} {bold}expected `int64`, got `str`{reset}")
+    mut indent = ""
+    for _ in 0..29 {
+        indent += " "
+    }
+    assert out.contains(f"{bold}{red}{indent}^{reset}")
+    // The source line is left as it is.
+    assert out.contains("\r\nfunc main() { let x: int64 = \"a\" }\r\n")
+}
+
+test "errors are plain when colour is off" {
+    for env in [["NO_COLOR=1"], ["TERM=dumb"]] {
+        let dir = scratch("plain")
+        let bad = bad_file(dir)
+        let out = on_terminal([KOD, "check", bad], :env)
+        remove(dir)
+        if not out.contains(f"{bad}:1:30: error: expected `int64`, got `str`") {
+            fail(f"{env}: no plain error in\n{out}")
+        }
+        if out.contains(ESC) {
+            fail(f"{env}: colour in\n{out}")
+        }
+    }
+}
+
+test "an empty NO_COLOR leaves colour on" {
+    let dir = scratch("empty")
+    let bad = bad_file(dir)
+    let out = on_terminal([KOD, "check", bad], env: ["NO_COLOR="])
+    remove(dir)
+    assert out.contains(ESC)
+}
+
+test "the test report is coloured on a terminal" {
+    let dir = scratch("report")
+    let mixed = mixed_file(dir)
+    let out = on_terminal([KOD, "test", mixed])
+    remove(dir)
+    let _app = process.run(["rm", "-rf", "build/apps/mixed_test"])
+    assert out.contains(f"  {ESC}32mok  {ESC}0m good {ESC}2m(")
+    assert out.contains(f"  {ESC}31m{ESC}1mFAIL{ESC}0m{ESC}0m bad {ESC}2m(")
+    assert out.contains(f"{ESC}31m{ESC}1m1/2 passed in ")
+}
+
+test "the test report is plain with NO_COLOR" {
+    let dir = scratch("report_plain")
+    let mixed = mixed_file(dir)
+    let out = on_terminal([KOD, "test", mixed], env: ["NO_COLOR=1"])
+    remove(dir)
+    let _app = process.run(["rm", "-rf", "build/apps/mixed_test"])
+    assert out.contains("  ok   good (")
+    assert not out.contains(ESC)
+}
