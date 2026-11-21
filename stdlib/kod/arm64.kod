@@ -112,6 +112,18 @@ func op_text(op: regalloc.Opcode, a: str, b: str, c: str, d: str) -> str {
     return f"\t{mn} {a}, {b}, {c}, {d}"
 }
 
+// log2 of an access width of 1, 2, 4 or 8 bytes: the shift a scaled index takes.
+func width_shift(anon width: int64) -> int64 {
+    if width == 8 {
+        return 3
+    } else if width == 4 {
+        return 2
+    } else if width == 2 {
+        return 1
+    }
+    return 0
+}
+
 // The asm text of a `Mem` line, with `reg`, `base` and an index as its
 // registers (`index` stands for the one `at` has).
 func mem_text(load: bool, width: int64, reg: str, base: str, at: regalloc.MemAt, index: str = "") -> str {
@@ -119,7 +131,12 @@ func mem_text(load: bool, width: int64, reg: str, base: str, at: regalloc.MemAt,
     match at {
         .Base -> return f"\t{op} {reg}, [{base}]"
         .Offset(off) -> return f"\t{op} {reg}, [{base}, #{off}]"
-        .Index(_reg) -> return f"\t{op} {reg}, [{base}, {index}]"
+        .Index(_reg, scaled) -> {
+            if scaled {
+                return f"\t{op} {reg}, [{base}, {index}, lsl #{width_shift(width)}]"
+            }
+            return f"\t{op} {reg}, [{base}, {index}]"
+        }
         .Symbol(name, got) -> {
             if got {
                 return f"\t{op} {reg}, [{base}, {name}@GOTPAGEOFF]"
@@ -394,9 +411,13 @@ func write_insn(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg], out: StrBui
                     out.append_int(off)
                     out.append("]\n")
                 }
-                .Index(index) -> {
+                .Index(index, scaled) -> {
                     out.append(", ")
                     write_reg(index, :vreg_phys, :out)
+                    if scaled {
+                        out.append(", lsl #")
+                        out.append_int(width_shift(width))
+                    }
                     out.append("]\n")
                 }
                 .Symbol(name, got) -> {
@@ -821,13 +842,18 @@ func mem_word(load: bool, width: int64, reg: regalloc.Reg, base: regalloc.Reg, a
     match at {
         .Base -> off = 0
         .Offset(o) -> off = o
-        .Index(index) -> {
+        .Index(index, scaled) -> {
             let m = zr_num(index, :vreg_phys)
             if m < 0 or m == 31 {
                 return -1
             }
-            // `[n, m]`: the register form, LSL #0.
-            return 0x38206800 | head | m << 16
+            // `[n, m]`: the register form, LSL #0, or with S set, shifted
+            // by the access size.
+            mut s = 0
+            if scaled and width > 1 {
+                s = 0x1000
+            }
+            return 0x38206800 | head | m << 16 | s
         }
         .Symbol(_name, _got) -> return -1
     }
@@ -1309,7 +1335,7 @@ func load_store_text(anon mn: str, ops: [str]) -> int64 {
     }
     mut at: regalloc.MemAt = .Offset(:off)
     if len(index_text) > 0 {
-        at = .Index(reg: regalloc.reg_of(index_text))
+        at = .Index(reg: regalloc.reg_of(index_text), scaled: false)
     }
     let word = mem_word(:load, :width, :reg, :base, :at, vreg_phys: none_phys)
     if shifted and word >= 0 {

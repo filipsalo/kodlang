@@ -76,7 +76,8 @@ were.
    `x0` to its first argument register and move the result there after each
    call.
 3. **No text left** (done). `Mem` addresses through a `MemAt` (the base, an
-   offset, an index register or a symbol's page offset); register pairs are a
+   offset, an index register, scaled by the access size or not, or a symbol's
+   page offset); register pairs are a
    `Pair` (offset, pre- or post-index); a constant too big for one move is a
    `LoadConst`, which the line limits count as the four lines arm64 needs; an
    inlined runtime function is an `Intrinsic(label)` whose lines come from the
