@@ -2255,52 +2255,6 @@ def test_no_module_make_builds_declares_link_inputs():
             assert not re.match(r"//\s*kod\s*:", text, re.IGNORECASE), (module, line)
 
 
-def test_a_signal_during_the_build_of_the_lsp_server_stops_what_it_started():
-    # The LSP tests build the server before they run. A signal to pytest then
-    # must not leave `kod` and the compilers it started running.
-    code = (
-        "import sys\n"
-        "from pathlib import Path\n"
-        "sys.path.insert(0, sys.argv[1])\n"
-        "from lsp_test import build_lsp\n"
-        "build_lsp(Path(sys.argv[2]))\n"
-    )
-    with temp_dir("kod_lspbuild_") as path:
-        pidfile = path / "pid"
-        stand_in = path / "kod"
-        stand_in.write_text(
-            f"#!/bin/sh\nsleep 60 &\necho $! > '{pidfile}.tmp'\n"
-            f"mv '{pidfile}.tmp' '{pidfile}'\nwait\n"
-        )
-        stand_in.chmod(0o755)
-        sleeper = 0
-        gone = False
-        argv = [sys.executable, "-c", code, ROOT / "tests", stand_in]
-        try:
-            with running(argv) as build:
-                for _ in range(600):
-                    if pidfile.exists():
-                        break
-                    time.sleep(0.05)
-                else:
-                    pytest.fail("the build never started its program")
-                sleeper = int(pidfile.read_text())
-                build.send_signal(signal.SIGTERM)
-                assert build.wait(timeout=30) == -signal.SIGTERM
-                for _ in range(100):  # init reaps it once its parent is gone
-                    try:
-                        os.kill(sleeper, 0)
-                    except ProcessLookupError:
-                        gone = True
-                        break
-                    time.sleep(0.05)
-                assert gone, "the program the build started is still running"
-        finally:
-            if sleeper and not gone:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(sleeper, signal.SIGKILL)
-
-
 def write_modules(root: Path, modules: dict[str, str]) -> None:
     for name, source in modules.items():
         path = root / name

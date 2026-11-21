@@ -1,7 +1,7 @@
-"""`kod run` and `kod test` replace themselves with the program (docs/cli.md):
-output streams as it is written, stdin is the caller's, and the exit status or
-signal is the program's own. The test reporter flushes around its lines, so the
-order survives a pipe. The programs are the fixtures in tests/stdio/.
+"""The harness that runs a process with every wait bounded (`running`), which
+build_plumbing_test.py uses too, its own tests, and the test of
+the Python launcher's SIGPIPE. What `kod run` and `kod test` do with stdin,
+stdout, stderr and signals is checked in tests/stdio_test.kod.
 
 Every wait is bounded: a process that does not answer within `WAIT` seconds is
 killed with everything it started, so a regression fails the test instead of
@@ -12,9 +12,6 @@ ignored files there)."""
 
 import contextlib
 import os
-import pty
-import re
-import select
 import shutil
 import signal
 import subprocess
@@ -30,7 +27,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 KOD = ROOT / "build" / "apps" / "kod" / "kod"
 FIXTURES = ROOT / "tests" / "stdio"
-CANARY = ROOT / "tests" / "test_block_canary.kod"
 
 # Seconds any one run may take, build included (about 1 s on an idle machine).
 WAIT = float(os.environ.get("STDIO_TEST_WAIT", "60"))
@@ -202,257 +198,6 @@ def stderr_text(proc: subprocess.Popen) -> str:
         return ""
     errors.seek(0)
     return errors.read().decode(errors="replace")
-
-
-def test_a_program_gets_stdin_and_its_output_arrives_while_it_waits(scratch):
-    # `ready` can only be read now if `kod run` is not holding the output back,
-    # and the line below can only reach the program if stdin is ours.
-    with running(
-        [KOD, "run", scratch.program("stream_stdin")], stdin=subprocess.PIPE
-    ) as p:
-        first = p.stdout.readline()
-        assert first == b"ready\n", stderr_text(p)
-        p.stdin.write(b"hello\n")
-        p.stdin.flush()
-        rest = p.stdout.read()
-        status = p.wait()
-        assert (rest, status) == (b"got hello\n", 3), stderr_text(p)
-
-
-def test_b_stdout_and_stderr_keep_their_order_in_one_pipe(scratch):
-    with running(
-        [KOD, "run", scratch.program("interleave")], stderr=subprocess.STDOUT
-    ) as p:
-        out = p.stdout.read()
-        status = p.wait()
-    assert out == b"out1\nerr1\nout2\nerr2\nout3\n"
-    assert status == 0
-
-
-def test_c_the_exit_status_is_the_programs(scratch):
-    with running([KOD, "run", scratch.program("exit7")]) as p:
-        assert p.stdout.read() == b""
-        assert p.wait() == 7, stderr_text(p)
-
-
-def test_d_a_signal_ends_the_program_and_nothing_is_left_behind(scratch):
-    with running([KOD, "run", scratch.program("sigterm")], stdin=subprocess.PIPE) as p:
-        assert p.stdout.readline() == b"ready\n", stderr_text(p)
-        p.send_signal(signal.SIGTERM)
-        status = p.wait()
-        assert status == -signal.SIGTERM, stderr_text(p)
-        # `p` was the program: no process of its session survives it.
-        with pytest.raises(ProcessLookupError):
-            os.killpg(p.pid, 0)
-
-
-# 203 MiB of output; `kod run` used to hold it all, as 664-697 MB.
-HUGE_BYTES = 203 * 2**20
-HUGE_RSS_LIMIT = 100 * 2**20
-
-
-def test_e_a_lot_of_output_is_not_held_in_memory(scratch):
-    total = lines = 0
-    with running([KOD, "run", scratch.program("huge")]) as p:
-        fd = p.stdout.fileno()
-        while chunk := os.read(fd, 1 << 20):
-            total += len(chunk)
-            lines += chunk.count(b"\n")
-        _, wait_status, usage = os.wait4(p.pid, 0)
-        p.returncode = os.waitstatus_to_exitcode(wait_status)
-        assert p.returncode == 0, stderr_text(p)
-    assert (total, lines) == (HUGE_BYTES, HUGE_BYTES // 16)
-    # The largest process of the run, `kod` before it became the program
-    # included (bytes on macOS).
-    assert usage.ru_maxrss < HUGE_RSS_LIMIT, usage.ru_maxrss / 2**20
-
-
-CANARY_ORDER = [
-    r"^\S*test_block_canary\w*\.kod$",
-    r"^\s+ok\s+canary: this test passes",
-    r"^\s+\S*test_block_canary\w*\.kod:\d+:\d+: assertion failed: 1 \+ 1 == 3$",
-    r"^\s+FAIL\s+canary: this test fails",
-    r"^1/2 passed",
-]
-
-
-def assert_in_order(text: str, patterns: list[str]) -> None:
-    """Every pattern matches a line, and the first matches come in the order of
-    the patterns."""
-    lines = text.replace("\r\n", "\n").splitlines()
-    at = -1
-    for pattern in patterns:
-        found = [i for i, line in enumerate(lines) if re.search(pattern, line)]
-        assert found, f"no line matches {pattern!r} in:\n{text}"
-        assert found[0] > at, f"{pattern!r} is out of order in:\n{text}"
-        at = found[0]
-
-
-def read_pty(master: int) -> str:
-    """Everything written to the other end of a pty until it is closed (the
-    process is killed after `WAIT` seconds if that does not happen)."""
-    out = b""
-    while True:
-        select.select([master], [], [])
-        try:
-            data = os.read(master, 4096)
-        except OSError:  # the other end is closed
-            break
-        if not data:
-            break
-        out += data
-    return out.decode(errors="replace")
-
-
-def test_f_on_a_terminal_a_failure_shows_its_detail_before_its_result(scratch):
-    try:
-        master, slave = pty.openpty()
-    except OSError as e:
-        pytest.skip(f"no pty can be allocated: {e}")
-    canary = scratch.copy(CANARY, f"test_block_canary_{scratch.token}.kod")
-    try:
-        with running(
-            [KOD, "test", canary],
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            # The order is what is checked here; colour_test.py has the colours.
-            env={**os.environ, "NO_COLOR": "1"},
-        ) as p:
-            os.close(slave)
-            slave = -1
-            text = read_pty(master)
-            assert p.wait() == 1, text
-        # Up to the failure's result line: the summary is written as the
-        # process exits, and a terminal may not hand on what is still
-        # unread when its other end closes.
-        assert_in_order(text, CANARY_ORDER[:-1])
-    finally:
-        for fd in (master, slave):
-            if fd >= 0:
-                os.close(fd)
-
-
-@pytest.mark.parametrize("target", ["file", "directory"])
-def test_g_in_one_pipe_the_test_output_keeps_its_order(scratch, target):
-    # The CI-log case: stdout and stderr are one pipe.
-    if target == "file":
-        canary = scratch.copy(CANARY, f"test_block_canary_{scratch.token}.kod")
-    else:
-        walked = scratch.dir / "walked"
-        canary = str(walked.relative_to(ROOT))
-        scratch.copy(CANARY, "test_block_canary_test.kod", into=walked)
-    with running([KOD, "test", canary], stderr=subprocess.STDOUT) as p:
-        text = p.stdout.read().decode()
-        status = p.wait()
-    assert status == 1, text
-    assert_in_order(text, CANARY_ORDER)
-
-
-def test_h_kod_run_says_so_and_exits_127_when_the_program_cannot_be_executed(
-    scratch,
-):
-    if os.geteuid() == 0:
-        pytest.skip("root can execute a file without an execute bit")
-    prog = scratch.program("exit7")
-    name = Path(prog).stem
-    # Built once the usual way, so that its directories exist; the run below
-    # relinks it under a umask that leaves the executable without execute bits.
-    with running([KOD, "build", prog]) as p:
-        p.stdout.read()
-        assert p.wait() == 0, stderr_text(p)
-    argv = ["sh", "-c", 'umask 0111 && exec "$@"', "sh", KOD, "run", prog]
-    with running(argv) as p:
-        assert p.stdout.read() == b""
-        status = p.wait()
-        message = stderr_text(p)
-    assert status == 127, message
-    assert message == f"kod: cannot execute build/apps/{name}/{name}\n"
-
-
-@pytest.mark.parametrize(
-    "args,output,status",
-    [
-        (["echo", "hi"], b"before\nhi\n", 0),
-        (["/nonexistent/program"], b"before\nexec returned -1\n", 9),
-        ([], b"before\nexec returned -1\n", 9),  # nothing to run
-    ],
-)
-def test_i_process_exec_flushes_first_and_returns_only_when_it_fails(
-    scratch, args, output, status
-):
-    # stdout is a pipe, so "before" is still buffered when exec is called.
-    with running([KOD, "run", scratch.program("exec_program"), *args]) as p:
-        out = p.stdout.read()
-        assert (out, p.wait()) == (output, status), stderr_text(p)
-
-
-REPORT_ORDER = [
-    r"^\S*report_order\w*\.kod$",
-    r"^stderr in first$",
-    r"^printed in first$",
-    r"^\s+ok\s+first\b",
-    r"^stderr in second$",
-    r"^printed in second$",
-    r"^\s+\S*report_order\w*\.kod:\d+:\d+: assertion failed: 1 \+ 1 == 3$",
-    r"^\s+FAIL\s+second\b",
-    r"^third read \[\]$",
-    r"^\s+ok\s+third\b",
-    r"^2/3 passed",
-]
-
-
-def test_j_each_flush_of_the_reporter_keeps_its_place_in_one_pipe(scratch):
-    # What each block writes to stderr (unbuffered) lands between the lines the
-    # reporter writes to stdout: after the file header (flushed when it is
-    # written), after the `ok` line of the block before (flushed with it), and
-    # after what the failing block printed (flushed before its detail).
-    report = scratch.copy(
-        FIXTURES / "report_order.kod", f"report_order_{scratch.token}.kod"
-    )
-    with running(
-        [KOD, "test", report], stdin=subprocess.DEVNULL, stderr=subprocess.STDOUT
-    ) as p:
-        text = p.stdout.read().decode()
-        status = p.wait()
-    assert status == 1, text
-    assert_in_order(text, REPORT_ORDER)
-
-
-def test_k_each_result_arrives_while_the_next_test_runs(scratch):
-    # The third block waits for a line on stdin: the result lines of the two
-    # before it have to be readable now, not when the binary exits.
-    report = scratch.copy(
-        FIXTURES / "report_order.kod", f"report_order_{scratch.token}.kod"
-    )
-    with running([KOD, "test", report], stdin=subprocess.PIPE) as p:
-        seen = []
-        while not any(re.match(r"\s+FAIL\s+second\b", line) for line in seen):
-            line = p.stdout.readline().decode()
-            assert line, f"output ended after {seen}\n{stderr_text(p)}"
-            seen.append(line)
-        assert any(re.match(r"\s+ok\s+first\b", line) for line in seen), seen
-        assert p.poll() is None
-        p.stdin.write(b"go\n")
-        p.stdin.close()
-        rest = p.stdout.read().decode()
-        status = p.wait()
-    assert status == 1, stderr_text(p)
-    assert "third read [go]\n" in rest, rest
-    assert re.search(r"^2/3 passed", rest, re.MULTILINE), rest
-
-
-@pytest.mark.parametrize("how", ["index", "panic"])
-def test_l_a_panic_comes_after_what_the_program_printed(scratch, how):
-    # stdout is a pipe, so "before the panic" is still buffered when the panic
-    # message goes to stderr, which is the same pipe.
-    with running(
-        [KOD, "run", scratch.program("panics"), how], stderr=subprocess.STDOUT
-    ) as p:
-        text = p.stdout.read().decode()
-        status = p.wait()
-    assert status == 1, text
-    assert_in_order(text, [r"^before the panic$", r"^panic: "])
 
 
 # A process that makes a scratch directory and a program directory, starts a

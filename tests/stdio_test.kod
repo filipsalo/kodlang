@@ -1,0 +1,905 @@
+// `kod run` and `kod test` replace themselves with the program (docs/cli.md):
+// output streams as it is written, stdin is the caller's, and the exit status or
+// signal is the program's own. The test reporter flushes around its lines, so the
+// order survives a pipe. The programs are the fixtures in tests/stdio/.
+//
+// Every wait is bounded: a process that does not answer within `WAIT` seconds is
+// killed with everything it started, so a regression fails the test instead of
+// hanging it. Everything a test starts is stopped and everything it makes under
+// `build/` is removed when it ends.
+
+import "env"
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "time"
+import "time" { Duration, monotonic_ns }
+import "unsafe"
+
+extern func wait4(anon pid: int64, anon status: int64, anon options: int64, anon usage: int64) -> int64
+extern func openpty(anon controller: int64, anon terminal: int64, anon name: int64, anon termios: int64, anon winsize: int64) -> int64
+extern func ttyname(anon fd: int64) -> int64
+
+let KOD: str = "build/apps/kod/kod"
+let FIXTURES: str = "tests/stdio"
+let CANARY: str = "tests/test_block_canary.kod"
+let WNOHANG: int64 = 1
+let SIGTERM: int64 = 15
+let SIGKILL: int64 = 9
+let SIGSTOP: int64 = 17
+let F_SETFD: int64 = 2
+let FD_CLOEXEC: int64 = 1
+
+// Milliseconds any one run may take, build included (about 1 s on an idle
+// machine): STDIO_TEST_WAIT seconds, 60 unless set.
+func wait_ms() -> int64 {
+    if env.get("STDIO_TEST_WAIT") is str(text) {
+        if text.parse_float() is float64(seconds) {
+            return (seconds * 1000.0).to_int64()
+        }
+    }
+    return 60000
+}
+
+func seconds_text(anon ms: int64) -> str {
+    if ms % 1000 == 0 {
+        return str(ms / 1000)
+    }
+    return str(ms.to_float64() / 1000.0)
+}
+
+// A directory `build/stdio_s<pid>/` for the copies of the fixtures. A copy is
+// named `<name>_s<pid>.kod`, so its program name is one no other run uses
+// (`kod` builds into `build/apps/<name>`).
+type Scratch = shared struct {
+    dir: str
+    token: str
+
+    // Copy `source` to `filename` in `into` (a directory below the scratch
+    // directory) or in the scratch directory; the path of the copy.
+    func copy(self, anon source: str, anon filename: str, into: str = "") -> str {
+        mut dir = self.dir
+        if into != "" {
+            dir = f"{self.dir}/{into}"
+            process.run(["mkdir", "-p", dir])
+        }
+        let target = f"{dir}/{filename}"
+        if io.write_file(target, io.read_file(source)) != 0 {
+            fail(f"cannot write {target}")
+        }
+        return target
+    }
+
+    // A private copy of tests/stdio/<fixture>.kod.
+    func program(self, anon fixture: str) -> str {
+        return self.copy(f"{FIXTURES}/{fixture}.kod", f"{fixture}_{self.token}.kod")
+    }
+
+    func remove(self) -> none {
+        process.run(["rm", "-rf", self.dir])
+        // What was built from the copies (a program named after the file, or
+        // after the directory for `kod test <directory>`).
+        let apps = f"build/apps/*_{self.token} build/apps/*stdio_{self.token}_*"
+        process.run(["sh", "-c", f"rm -rf {apps}"])
+    }
+}
+
+func scratch() -> Scratch {
+    let token = f"s{libc.getpid()}"
+    let s = Scratch(dir: f"build/stdio_{token}", :token)
+    process.run(["mkdir", "-p", s.dir])
+    return s
+}
+
+// Where a process's stderr goes.
+type Errors = enum {
+    // A file `stderr_text` reads.
+    File
+    // The stdout pipe.
+    Stdout
+    // The pseudo-terminal of `Running.tty`.
+    Tty
+}
+
+// A process `running` started, with stdout a pipe. After `WAIT` it is killed,
+// with everything it started, which ends any read or wait it is in.
+type Running = shared struct {
+    child: process.Child
+    err: str
+    deadline: int64
+    // What was read from stdout and not yet handed out.
+    pending: str
+    // The exit status (or minus the signal) once it is reaped.
+    status: int64?
+    // ru_maxrss of the reaped process.
+    maxrss: int64
+    expired: bool
+}
+
+// Start `argv` with stdout a pipe (or the terminal `tty`) and stderr as
+// `errors` says, stdin a pipe if `stdin_pipe`, else this process's.
+func running(anon argv: [str], s: Scratch, stdin_pipe: bool = false, errors: Errors = .File, tty: str = "", add_env: [str] = []) -> Running? {
+    let err = f"{s.dir}/stderr_{monotonic_ns()}"
+    mut script = "f=$1; shift; exec \"$@\" 2>\"$f\""
+    mut out_mode: process.Stdio = .Pipe
+    mut in_mode: process.Stdio = .Inherit
+    if stdin_pipe {
+        in_mode = .Pipe
+    }
+    match errors {
+        .File -> none
+        .Stdout -> script = "shift; exec \"$@\" 2>&1"
+        .Tty -> {
+            script = "t=$1; shift; exec \"$@\" <\"$t\" >\"$t\" 2>&1"
+            out_mode = .Null
+        }
+    }
+    mut first = err
+    if errors is .Tty {
+        first = tty
+    }
+    let started = process.start(["sh", "-c", script, "sh", first] + argv, stdin: in_mode, stdout: out_mode, add_env: add_env)
+    match started {
+        Ok(child) -> return Running(:child, :err, deadline: monotonic_ns() + wait_ms() * 1000000, pending: "", status: none, maxrss: 0, expired: false)
+        Err(e) -> {
+            fail(f"start {" ".join(argv)}: {e.to_str()}")
+            return none
+        }
+    }
+}
+
+// What `p` wrote to stderr so far.
+func stderr_text(anon p: Running) -> str {
+    return io.read_file(p.err)
+}
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+func remaining_ms(anon p: Running) -> int64 {
+    let left = (p.deadline - monotonic_ns() + 999999) / 1000000
+    if left < 0 {
+        return 0
+    }
+    return left
+}
+
+// Kill `p` because the time is up, once, failing the test.
+func expire(anon p: Running) -> none {
+    if not p.expired {
+        p.expired = true
+        kill_tree(p.child.pid)
+        fail(f"(killed: still running after {seconds_text(wait_ms())} s)")
+    }
+}
+
+// Reap `p` if it has ended, waiting no longer than `hang` says.
+func reap(anon p: Running, hang: bool) -> bool {
+    if p.status is int64(_) {
+        return true
+    }
+    mut options = WNOHANG
+    if hang {
+        options = 0
+    }
+    let slot = unsafe.alloc(4)
+    // A struct rusage: two struct timevals, then ru_maxrss.
+    let usage = unsafe.alloc(144)
+    mut done = false
+    for true {
+        let got = unsafe.c_int(wait4(p.child.pid, slot, options, usage))
+        if got > 0 {
+            let raw = unsafe.load32(slot)
+            if (raw & 127) == 0 {
+                p.status = (raw >> 8) & 255
+            } else {
+                p.status = -(raw & 127)
+            }
+            p.maxrss = unsafe.load64(usage + 32)
+            done = true
+            break
+        }
+        if got == 0 or unsafe.errno() != 4 {
+            break
+        }
+    }
+    unsafe.free(slot)
+    unsafe.free(usage)
+    return done
+}
+
+// The exit status of `p` (minus the signal that ended it), waiting until the
+// deadline; -1000 when it had to be killed.
+func wait(anon p: Running) -> int64 {
+    for not reap(p, hang: false) {
+        if remaining_ms(p) == 0 {
+            expire(p)
+            reap(p, hang: true)
+            return -1000
+        }
+        time.sleep(Duration(ms: 2))
+    }
+    if p.expired {
+        return -1000
+    }
+    return p.status? or -1000
+}
+
+// Whether the process is still running.
+func alive(anon p: Running) -> bool {
+    return not reap(p, hang: false)
+}
+
+// Read once from `fd` into `p.pending`, waiting until the deadline; false at
+// the end of the stream, or when the time is up.
+func fill(anon p: Running, anon fd: posix.Fd) -> bool {
+    if p.expired or fd.fd < 0 {
+        return false
+    }
+    match posix.poll(read: [fd], timeout: Duration(ms: remaining_ms(p))) {
+        Ok(ready) -> {
+            if not ready.read[0] {
+                expire(p)
+                return false
+            }
+        }
+        Err(e) -> {
+            fail(f"poll: {e.to_str()}")
+            return false
+        }
+    }
+    match fd.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                return false
+            }
+            p.pending = p.pending + kod_bytes_to_str(data)
+            return true
+        }
+        // A terminal whose other end is closed.
+        Err(_) -> return false
+    }
+}
+
+// The next line of stdout with its newline, or what is left at the end ("" at
+// the end of the stream).
+func read_line(anon p: Running) -> str {
+    for true {
+        if p.pending.find("\n") is int64(at) {
+            let line = p.pending[0..at + 1]
+            p.pending = p.pending[at + 1..len(p.pending)]
+            return line
+        }
+        if not fill(p, p.child.stdout) {
+            break
+        }
+    }
+    let rest = p.pending
+    p.pending = ""
+    return rest
+}
+
+// Everything left on stdout.
+func read_all(anon p: Running) -> str {
+    for fill(p, p.child.stdout) {
+    }
+    let rest = p.pending
+    p.pending = ""
+    return rest
+}
+
+// Kill `p` with everything it started, reap it, close its pipes and remove its
+// stderr file.
+func stop(anon p: Running) -> none {
+    if not reap(p, hang: false) {
+        kill_tree(p.child.pid)
+        reap(p, hang: true)
+    }
+    for f in [p.child.stdin, p.child.stdout] {
+        if f.fd >= 0 {
+            let _closed = f.close()
+        }
+    }
+    process.run(["rm", "-f", p.err])
+}
+
+// What a line of output must be.
+type Line = enum {
+    // The whole line.
+    Exact(text: str)
+    // The start of the line.
+    Prefix(text: str)
+    // `^\S*<stem>\w*\.kod$`: the header of a test file.
+    File(stem: str)
+    // `^\s+<word>\s+<name>`, and with `whole` no word character after it.
+    Result(word: str, name: str, whole: bool)
+    // `^\s+\S*<stem>\w*\.kod:\d+:\d+: assertion failed: 1 \+ 1 == 3$`.
+    Assertion(stem: str)
+
+    func to_str(self) -> str {
+        match self {
+            .Exact(text) -> return f"`{text}`"
+            .Prefix(text) -> return f"`{text}...`"
+            .File(stem) -> return f"the file {stem}*.kod"
+            .Result(word, name, _) -> return f"`{word} {name}`"
+            .Assertion(stem) -> return f"the failed assertion in {stem}*.kod"
+        }
+    }
+}
+
+func is_space(anon c: int64) -> bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == 11 or c == 12
+}
+
+func is_word(anon c: int64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+}
+
+func is_digit(anon c: int64) -> bool {
+    return c >= '0' and c <= '9'
+}
+
+// How many characters from `at` on satisfy `ok`.
+func run_of_spaces(anon s: str, anon at: int64) -> int64 {
+    mut i = at
+    for i < len(s) and is_space(s[i]) {
+        i += 1
+    }
+    return i - at
+}
+
+func run_of_digits(anon s: str, anon at: int64) -> int64 {
+    mut i = at
+    for i < len(s) and is_digit(s[i]) {
+        i += 1
+    }
+    return i - at
+}
+
+// Whether `token` (no whitespace in it) is `\S*<stem>\w*\.kod`.
+func is_kod_file(anon token: str, anon stem: str) -> bool {
+    for c in token {
+        if is_space(c) {
+            return false
+        }
+    }
+    let base = token.strip_suffix(".kod")? or ""
+    if base == "" {
+        return false
+    }
+    // Some occurrence of the stem with only word characters after it.
+    mut from = 0
+    for base.find(stem, from: from) is int64(at) {
+        mut all_word = true
+        for c in base[at + len(stem)..len(base)] {
+            if not is_word(c) {
+                all_word = false
+            }
+        }
+        if all_word {
+            return true
+        }
+        from = at + 1
+    }
+    return false
+}
+
+func matches(anon want: Line, anon line: str) -> bool {
+    match want {
+        .Exact(text) -> return line == text
+        .Prefix(text) -> return line.starts_with(text)
+        .File(stem) -> return is_kod_file(line, stem)
+        .Result(word, name, whole) -> {
+            let lead = run_of_spaces(line, 0)
+            if lead == 0 or not line[lead..len(line)].starts_with(word) {
+                return false
+            }
+            let gap_at = lead + len(word)
+            let gap = run_of_spaces(line, gap_at)
+            let rest = line[gap_at + gap..len(line)]
+            if gap == 0 or not rest.starts_with(name) {
+                return false
+            }
+            return not whole or len(rest) == len(name) or not is_word(rest[len(name)])
+        }
+        .Assertion(stem) -> {
+            let lead = run_of_spaces(line, 0)
+            let tail = ": assertion failed: 1 + 1 == 3"
+            let body = line.strip_suffix(tail)? or ""
+            if lead == 0 or body == "" {
+                return false
+            }
+            // `<file>.kod:<line>:<column>`
+            let place = body[lead..len(body)]
+            let at = place.find(".kod:")? or -1
+            if at < 0 {
+                return false
+            }
+            let line_digits = run_of_digits(place, at + 5)
+            let col_at = at + 5 + line_digits + 1
+            if line_digits == 0 or col_at > len(place) or place[col_at - 1] != ':' {
+                return false
+            }
+            return is_kod_file(place[0..at + 4], stem) and run_of_digits(place, col_at) == len(place) - col_at and col_at < len(place)
+        }
+    }
+}
+
+// Every pattern matches a line, and the first matches come in the order of
+// the patterns.
+func assert_in_order(anon text: str, anon patterns: [Line]) -> none {
+    let lines = text.replace("\r\n", to: "\n").split("\n")
+    mut at = -1
+    for want in patterns {
+        mut found = -1
+        for i, line in lines {
+            if found < 0 and matches(want, line) {
+                found = i
+            }
+        }
+        if found < 0 {
+            fail(f"no line matches {want.to_str()} in:\n{text}")
+            return
+        }
+        if found <= at {
+            fail(f"{want.to_str()} is out of order in:\n{text}")
+            return
+        }
+        at = found
+    }
+}
+
+func canary_order() -> [Line] {
+    return [
+        .File(stem: "test_block_canary"),
+        .Result(word: "ok", name: "canary: this test passes", whole: false),
+        .Assertion(stem: "test_block_canary"),
+        .Result(word: "FAIL", name: "canary: this test fails", whole: false),
+        .Prefix(text: "1/2 passed"),
+    ]
+}
+
+func report_order() -> [Line] {
+    return [
+        .File(stem: "report_order"),
+        .Exact(text: "stderr in first"),
+        .Exact(text: "printed in first"),
+        .Result(word: "ok", name: "first", whole: true),
+        .Exact(text: "stderr in second"),
+        .Exact(text: "printed in second"),
+        .Assertion(stem: "report_order"),
+        .Result(word: "FAIL", name: "second", whole: true),
+        .Exact(text: "third read []"),
+        .Result(word: "ok", name: "third", whole: true),
+        .Prefix(text: "2/3 passed"),
+    ]
+}
+
+test "a program gets stdin and its output arrives while it waits" {
+    // `ready` can only be read now if `kod run` is not holding the output back,
+    // and the line below can only reach the program if stdin is ours.
+    let s = scratch()
+    if running([KOD, "run", s.program("stream_stdin")], :s, stdin_pipe: true) is Running(p) {
+        let first = read_line(p)
+        assert first == "ready\n"
+        if first == "ready\n" {
+            if p.child.stdin.write_str("hello\n") is Err(e) {
+                fail(e.to_str())
+            }
+            let rest = read_all(p)
+            let status = wait(p)
+            if rest != "got hello\n" or status != 3 {
+                fail(f"got {rest} and {status}, want `got hello` and 3\n{stderr_text(p)}")
+            }
+        } else {
+            fail(stderr_text(p))
+        }
+        stop(p)
+    }
+    s.remove()
+}
+
+test "stdout and stderr keep their order in one pipe" {
+    let s = scratch()
+    if running([KOD, "run", s.program("interleave")], :s, errors: .Stdout) is Running(p) {
+        let out = read_all(p)
+        let status = wait(p)
+        stop(p)
+        assert out == "out1\nerr1\nout2\nerr2\nout3\n"
+        assert status == 0
+    }
+    s.remove()
+}
+
+test "the exit status is the program's" {
+    let s = scratch()
+    if running([KOD, "run", s.program("exit7")], :s) is Running(p) {
+        assert read_all(p) == ""
+        let status = wait(p)
+        if status != 7 {
+            fail(f"status {status}\n{stderr_text(p)}")
+        }
+        stop(p)
+    }
+    s.remove()
+}
+
+test "a signal ends the program and nothing is left behind" {
+    let s = scratch()
+    if running([KOD, "run", s.program("sigterm")], :s, stdin_pipe: true) is Running(p) {
+        let first = read_line(p)
+        if first != "ready\n" {
+            fail(f"read {first}\n{stderr_text(p)}")
+        } else {
+            // What runs below the process now: nothing, if it is the program
+            // itself rather than `kod` waiting for it.
+            let r = process.run(["pgrep", "-P", str(p.child.pid)])
+            let below = r.stdout.trim()
+            assert below == ""
+            assert libc.kill(p.child.pid, SIGTERM) == 0
+            let status = wait(p)
+            if status != -SIGTERM {
+                fail(f"status {status}\n{stderr_text(p)}")
+            }
+            // No process it started survives it.
+            for line in below.split("\n") {
+                if line.parse_int() is int64(pid) {
+                    mut gone = false
+                    for _ in 0..100 {
+                        if unsafe.c_int(libc.kill(pid, 0)) < 0 {
+                            gone = true
+                            break
+                        }
+                        time.sleep(Duration(ms: 50))
+                    }
+                    if not gone {
+                        fail(f"process {pid} is still there")
+                        let _killed = libc.kill(pid, SIGKILL)
+                    }
+                }
+            }
+        }
+        stop(p)
+    }
+    s.remove()
+}
+
+// 203 MiB of output; `kod run` used to hold it all, as 664-697 MB.
+let HUGE_BYTES: int64 = 203 * 1048576
+let HUGE_RSS_LIMIT: int64 = 100 * 1048576
+
+test "a lot of output is not held in memory" {
+    let s = scratch()
+    if running([KOD, "run", s.program("huge")], :s) is Running(p) {
+        mut total = 0
+        mut lines = 0
+        let fd = p.child.stdout
+        for not p.expired {
+            match posix.poll(read: [fd], timeout: Duration(ms: remaining_ms(p))) {
+                Ok(ready) -> {
+                    if not ready.read[0] {
+                        expire(p)
+                    }
+                }
+                Err(e) -> {
+                    fail(f"poll: {e.to_str()}")
+                    break
+                }
+            }
+            if p.expired {
+                break
+            }
+            match fd.read(1048576) {
+                Ok(chunk) -> {
+                    if len(chunk) == 0 {
+                        break
+                    }
+                    total += len(chunk)
+                    for c in chunk {
+                        if c == '\n' {
+                            lines += 1
+                        }
+                    }
+                }
+                Err(e) -> {
+                    fail(f"read: {e.to_str()}")
+                    break
+                }
+            }
+        }
+        let status = wait(p)
+        if status != 0 {
+            fail(f"status {status}\n{stderr_text(p)}")
+        }
+        assert total == HUGE_BYTES
+        assert lines == HUGE_BYTES / 16
+        // The largest process of the run, `kod` before it became the program
+        // included (bytes on macOS).
+        if p.maxrss >= HUGE_RSS_LIMIT {
+            fail(f"ru_maxrss {p.maxrss / 1048576} MiB")
+        }
+        stop(p)
+    }
+    s.remove()
+}
+
+// A new pseudo-terminal: its controller and its terminal, both closed on exec,
+// and the terminal's path.
+type Pty = struct {
+    controller: posix.Fd
+    terminal: posix.Fd
+    name: str
+}
+
+func open_pty() -> Pty? {
+    let fds = unsafe.alloc(8)
+    let made = unsafe.c_int(openpty(fds, fds + 4, 0, 0, 0))
+    let controller = unsafe.c_int(unsafe.load32(fds))
+    let terminal = unsafe.c_int(unsafe.load32(fds + 4))
+    unsafe.free(fds)
+    if made < 0 {
+        return none
+    }
+    libc.fcntl(controller, F_SETFD, FD_CLOEXEC)
+    libc.fcntl(terminal, F_SETFD, FD_CLOEXEC)
+    let name = ttyname(terminal)
+    if name == 0 {
+        libc.close(controller)
+        libc.close(terminal)
+        return none
+    }
+    return Pty(controller: posix.Fd(fd: controller), terminal: posix.Fd(fd: terminal), name: unsafe.str_at(name))
+}
+
+test "on a terminal a failure shows its detail before its result" {
+    let pty = open_pty()
+    if pty is none {
+        // As the Python version skipped: no pty can be allocated.
+        return
+    }
+    let t = pty
+    let s = scratch()
+    let canary = s.copy(CANARY, f"test_block_canary_{s.token}.kod")
+    // The order is what is checked here; colour_test.py has the colours.
+    if running([KOD, "test", canary], :s, errors: .Tty, tty: t.name, add_env: ["NO_COLOR=1"]) is Running(p) {
+        // This side keeps the terminal open while the program runs, so that
+        // it is open from when the program opens it until all it wrote has
+        // been read.
+        mut text = ""
+        for not p.expired {
+            match posix.poll(read: [t.controller], timeout: Duration(ms: 5)) {
+                Ok(ready) -> {
+                    if ready.read[0] {
+                        if t.controller.read(65536) is bytes(data) {
+                            text += kod_bytes_to_str(data)
+                        }
+                        continue
+                    }
+                }
+                Err(e) -> {
+                    fail(f"poll: {e.to_str()}")
+                    break
+                }
+            }
+            if not alive(p) {
+                break
+            }
+            if remaining_ms(p) == 0 {
+                expire(p)
+            }
+        }
+        let status = wait(p)
+        if status != 1 {
+            fail(f"status {status}\n{text}")
+        }
+        // Up to the failure's result line, as the Python version checked.
+        let order = canary_order()
+        assert_in_order(text, order[0..len(order) - 1])
+        stop(p)
+    }
+    let _c = t.controller.close()
+    let _t = t.terminal.close()
+    s.remove()
+}
+
+// The CI-log case: stdout and stderr are one pipe.
+func canary_in_one_pipe(anon s: Scratch, anon target: str) -> none {
+    if running([KOD, "test", target], :s, errors: .Stdout) is Running(p) {
+        let text = read_all(p)
+        let status = wait(p)
+        stop(p)
+        if status != 1 {
+            fail(f"status {status}\n{text}")
+        }
+        assert_in_order(text, canary_order())
+    }
+}
+
+test "in one pipe the test output keeps its order (file)" {
+    let s = scratch()
+    canary_in_one_pipe(s, s.copy(CANARY, f"test_block_canary_{s.token}.kod"))
+    s.remove()
+}
+
+test "in one pipe the test output keeps its order (directory)" {
+    let s = scratch()
+    s.copy(CANARY, "test_block_canary_test.kod", into: "walked")
+    canary_in_one_pipe(s, f"{s.dir}/walked")
+    s.remove()
+}
+
+test "kod run says so and exits 127 when the program cannot be executed" {
+    if process.run(["id", "-u"]).stdout.trim() == "0" {
+        // Root can execute a file without an execute bit.
+        return
+    }
+    let s = scratch()
+    let prog = s.program("exit7")
+    let name = f"exit7_{s.token}"
+    // Built once the usual way, so that its directories exist; the run below
+    // relinks it under a umask that leaves the executable without execute bits.
+    if running([KOD, "build", prog], :s) is Running(p) {
+        read_all(p)
+        let status = wait(p)
+        if status != 0 {
+            fail(f"build: status {status}\n{stderr_text(p)}")
+        }
+        stop(p)
+    }
+    if running(["sh", "-c", "umask 0111 && exec \"$@\"", "sh", KOD, "run", prog], :s) is Running(p) {
+        assert read_all(p) == ""
+        let status = wait(p)
+        let message = stderr_text(p)
+        stop(p)
+        if status != 127 {
+            fail(f"status {status}\n{message}")
+        }
+        assert message == f"kod: cannot execute build/apps/{name}/{name}\n"
+    }
+    s.remove()
+}
+
+type ExecCase = struct {
+    args: [str]
+    output: str
+    status: int64
+}
+
+test "process.exec flushes first and returns only when it fails" {
+    // stdout is a pipe, so "before" is still buffered when exec is called.
+    let s = scratch()
+    let prog = s.program("exec_program")
+    let cases = [
+        ExecCase(args: ["echo", "hi"], output: "before\nhi\n", status: 0),
+        ExecCase(args: ["/nonexistent/program"], output: "before\nexec returned -1\n", status: 9),
+        ExecCase(args: [], output: "before\nexec returned -1\n", status: 9),  // nothing to run
+    ]
+    for c in cases {
+        if running([KOD, "run", prog] + c.args, :s) is Running(p) {
+            let out = read_all(p)
+            let status = wait(p)
+            if out != c.output or status != c.status {
+                fail(f"{c.args}: got {out} and {status}, want {c.output} and {c.status}\n{stderr_text(p)}")
+            }
+            stop(p)
+        }
+    }
+    s.remove()
+}
+
+test "each flush of the reporter keeps its place in one pipe" {
+    // What each block writes to stderr (unbuffered) lands between the lines the
+    // reporter writes to stdout: after the file header (flushed when it is
+    // written), after the `ok` line of the block before (flushed with it), and
+    // after what the failing block printed (flushed before its detail).
+    let s = scratch()
+    let report = s.copy(f"{FIXTURES}/report_order.kod", f"report_order_{s.token}.kod")
+    if running(["sh", "-c", "exec \"$@\" </dev/null", "sh", KOD, "test", report], :s, errors: .Stdout) is Running(p) {
+        let text = read_all(p)
+        let status = wait(p)
+        stop(p)
+        if status != 1 {
+            fail(f"status {status}\n{text}")
+        }
+        assert_in_order(text, report_order())
+    }
+    s.remove()
+}
+
+func is_result(anon line: str, word: str, name: str) -> bool {
+    return matches(.Result(:word, :name, whole: true), line.trim_end())
+}
+
+test "each result arrives while the next test runs" {
+    // The third block waits for a line on stdin: the result lines of the two
+    // before it have to be readable now, not when the binary exits.
+    let s = scratch()
+    let report = s.copy(f"{FIXTURES}/report_order.kod", f"report_order_{s.token}.kod")
+    if running([KOD, "test", report], :s, stdin_pipe: true) is Running(p) {
+        mut seen: [str] = []
+        mut failed_second = false
+        for not failed_second {
+            let line = read_line(p)
+            if line == "" {
+                fail(f"output ended after {seen}\n{stderr_text(p)}")
+                break
+            }
+            seen += [line]
+            failed_second = is_result(line, word: "FAIL", name: "second")
+        }
+        if failed_second {
+            mut ok_first = false
+            for line in seen {
+                if is_result(line, word: "ok", name: "first") {
+                    ok_first = true
+                }
+            }
+            if not ok_first {
+                fail(f"no `ok first` in {seen}")
+            }
+            assert alive(p)
+            if p.child.stdin.write_str("go\n") is Err(e) {
+                fail(e.to_str())
+            }
+            let _closed = p.child.stdin.close()
+            let rest = read_all(p)
+            let status = wait(p)
+            if status != 1 {
+                fail(f"status {status}\n{stderr_text(p)}")
+            }
+            if not rest.contains("third read [go]\n") {
+                fail(rest)
+            }
+            mut summary = false
+            for line in rest.split("\n") {
+                if line.starts_with("2/3 passed") {
+                    summary = true
+                }
+            }
+            if not summary {
+                fail(rest)
+            }
+        }
+        stop(p)
+    }
+    s.remove()
+}
+
+test "a panic comes after what the program printed" {
+    // stdout is a pipe, so "before the panic" is still buffered when the panic
+    // message goes to stderr, which is the same pipe.
+    let s = scratch()
+    let prog = s.program("panics")
+    for how in ["index", "panic"] {
+        if running([KOD, "run", prog, how], :s, errors: .Stdout) is Running(p) {
+            let text = read_all(p)
+            let status = wait(p)
+            stop(p)
+            if status != 1 {
+                fail(f"{how}: status {status}\n{text}")
+            }
+            assert_in_order(text, [.Exact(text: "before the panic"), .Prefix(text: "panic: ")])
+        }
+    }
+    s.remove()
+}

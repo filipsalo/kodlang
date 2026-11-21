@@ -1,0 +1,1589 @@
+// Drive the kod LSP server end-to-end: send a real LSP session over
+// stdin, read the framed responses, and check we get the expected shape
+// on each one. Builds the binary via `kod build` on first run.
+//
+// The first test builds tools/lsp.kod into build/apps/lsp/lsp; the tests
+// after it run that binary, so they come after it in this file. Every run is
+// bounded: a build that takes longer than BUILD_WAIT_MS, or a session longer
+// than SESSION_WAIT_MS, is killed with what it started and the test fails.
+// Each session's input, output and stderr are files under
+// build/tmp_lsp_<pid>, removed when it ends.
+
+import "io"
+import "json"
+import "libc"
+import "posix"
+import "process"
+import "time"
+
+let SERVER: str = "build/apps/lsp/lsp"
+let BUILD_WAIT_MS: int64 = 60000
+let SESSION_WAIT_MS: int64 = 30000
+
+// ── Processes ─────────────────────────────────────────────────────────────────
+
+// The scratch directory of this test's process.
+func scratch() -> str {
+    return f"build/tmp_lsp_{libc.getpid()}"
+}
+
+// Stop `pid` and everything it started, children first stopped so that they
+// start nothing more, then all killed.
+func kill_tree(anon pid: str) -> none {
+    process.run(["kill", "-STOP", pid])
+    for kid in process.run(["pgrep", "-P", pid]).stdout.split("\n") {
+        if kid != "" {
+            kill_tree(kid)
+        }
+    }
+    process.run(["kill", "-KILL", pid])
+}
+
+// The exit status of `child`, waiting at most `ms`; after that it is killed
+// with what it started, and the test fails (-1). A child a signal ended
+// fails the test too.
+func wait_bounded(anon child: process.Child, ms: int64, what: str) -> int64 {
+    let deadline = time.monotonic_ns() + ms * 1000000
+    for true {
+        match child.try_wait() {
+            Ok(code) -> {
+                if code is int64(status) {
+                    return status
+                }
+            }
+            Err(e) -> {
+                fail(f"{what}: {e.to_str()}")
+                return -1
+            }
+        }
+        if time.monotonic_ns() > deadline {
+            kill_tree(str(child.pid))
+            let _ = child.wait()
+            fail(f"{what}: killed, still running after {ms / 1000} s")
+            return -1
+        }
+        time.sleep(time.Duration(ms: 2))
+    }
+    return -1
+}
+
+// Write all of `data` to `fd`, waiting at most until `deadline` (monotonic
+// ns) for room in the pipe. False, after failing the test, if it can't.
+func write_bounded(anon fd: posix.Fd, anon data: str, deadline: int64) -> bool {
+    let b = kod_str_to_bytes(data)
+    mut sent = 0
+    for sent < len(b) {
+        let left = deadline - time.monotonic_ns()
+        if left <= 0 {
+            fail("the server did not read its input in time")
+            return false
+        }
+        match posix.poll(read: [], write: [fd], timeout: time.Duration(ns: left)) {
+            Ok(ready) -> {
+                if ready.write[0] {
+                    // At most what poll promises room for, so the write
+                    // doesn't block.
+                    mut end = sent + 512
+                    if end > len(b) {
+                        end = len(b)
+                    }
+                    match fd.write(b[sent..end]) {
+                        Ok(n) -> sent += n
+                        Err(e) -> {
+                            fail(f"writing to the server: {e.to_str()}")
+                            return false
+                        }
+                    }
+                }
+            }
+            Err(e) -> {
+                fail(f"waiting on the server: {e.to_str()}")
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// What the server writes to stdout when it reads `input`, none (and the test
+// fails) if it doesn't exit 0 within SESSION_WAIT_MS.
+func run_server(anon input: str) -> str? {
+    let base = scratch()
+    process.run(["mkdir", "-p", base])
+    if io.write_file(f"{base}/in", input) != 0 {
+        fail(f"cannot write {base}/in")
+        process.run(["rm", "-rf", base])
+        return none
+    }
+    let script = "exec \"$1\" <\"$2/in\" >\"$2/out\" 2>\"$2/err\""
+    mut status = -1
+    match process.start(["sh", "-c", script, "sh", SERVER, base]) {
+        Ok(child) -> status = wait_bounded(child, ms: SESSION_WAIT_MS, what: "the server")
+        Err(e) -> fail(f"start {SERVER}: {e.to_str()}")
+    }
+    let out = io.read_file(f"{base}/out")
+    let err = io.read_file(f"{base}/err")
+    process.run(["rm", "-rf", base])
+    if status != 0 {
+        fail(f"the server's status is {status}\n{err}")
+        return none
+    }
+    return out
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+
+func jstr(anon s: str) -> json.Value {
+    return json.str_value(s)
+}
+
+func jint(anon n: int64) -> json.Value {
+    return json.int_value(n)
+}
+
+func obj(anon keys: [str], anon values: [json.Value]) -> json.Value {
+    let b = json.ObjectBuilder()
+    for i, k in keys {
+        b.put(k, values[i])
+    }
+    return b.build()
+}
+
+func empty() -> json.Value {
+    let none_: [json.Value] = []
+    return obj([], none_)
+}
+
+func request(anon id: int64, anon method: str, params: json.Value) -> json.Value {
+    return obj(["jsonrpc", "id", "method", "params"], [jstr("2.0"), jint(id), jstr(method), params])
+}
+
+func notification(anon method: str, params: json.Value) -> json.Value {
+    return obj(["jsonrpc", "method", "params"], [jstr("2.0"), jstr(method), params])
+}
+
+func initialize() -> json.Value {
+    return request(1, "initialize", params: empty())
+}
+
+func shutdown(anon id: int64) -> json.Value {
+    return request(id, "shutdown", params: .Null)
+}
+
+func exit_message() -> json.Value {
+    return notification("exit", params: .Null)
+}
+
+func did_open(anon uri: str, text: str) -> json.Value {
+    let doc = obj(["uri", "languageId", "version", "text"], [jstr(uri), jstr("kod"), jint(1), jstr(text)])
+    return notification("textDocument/didOpen", params: obj(["textDocument"], [doc]))
+}
+
+func did_change(anon uri: str, version: int64, text: str) -> json.Value {
+    let doc = obj(["uri", "version"], [jstr(uri), jint(version)])
+    let change = obj(["text"], [jstr(text)])
+    let changes = json.array_of([change])
+    return notification("textDocument/didChange", params: obj(["textDocument", "contentChanges"], [doc, changes]))
+}
+
+func did_close(anon uri: str) -> json.Value {
+    return notification("textDocument/didClose", params: obj(["textDocument"], [obj(["uri"], [jstr(uri)])]))
+}
+
+func position(anon line: int64, anon character: int64) -> json.Value {
+    return obj(["line", "character"], [jint(line), jint(character)])
+}
+
+// `{"textDocument": {"uri": uri}, "position": ...}`
+func at_position(anon uri: str, line: int64, character: int64) -> json.Value {
+    return obj(["textDocument", "position"], [obj(["uri"], [jstr(uri)]), position(line, character)])
+}
+
+func frame(anon body: json.Value) -> str {
+    let s = body.emit()
+    return f"Content-Length: {len(s)}\r\n\r\n{s}"
+}
+
+func frames(anon messages: [json.Value]) -> str {
+    mut out = ""
+    for m in messages {
+        out += frame(m)
+    }
+    return out
+}
+
+func is_digit(anon c: int64) -> bool {
+    return c >= '0' and c <= '9'
+}
+
+// Split the server's framed stdout back into JSON messages: each
+// `Content-Length: <n>\r\n\r\n` and the n bytes after it.
+func parse_frames(anon raw: str) -> [json.Value] {
+    let header = "Content-Length: "
+    mut out: [json.Value] = []
+    mut pos = 0
+    mut from = 0
+    for pos < len(raw) {
+        let found = raw.find(header, from: from)
+        if found is int64(at) {
+            mut end = at + len(header)
+            for end < len(raw) and is_digit(raw[end]) {
+                end += 1
+            }
+            let digits = raw[at + len(header)..end]
+            if len(digits) == 0 or not raw[end..len(raw)].starts_with("\r\n\r\n") {
+                from = at + 1
+                continue
+            }
+            let length = must digits.parse_int()
+            let body_start = end + 4
+            mut body_end = body_start + length
+            if body_end > len(raw) {
+                body_end = len(raw)
+            }
+            match json.parse(raw[body_start..body_end]) {
+                Ok(v) -> out += [v]
+                Err(e) -> {
+                    fail(f"a response is not JSON: {e.to_str()}")
+                    return out
+                }
+            }
+            pos = body_start + length
+            from = pos
+        } else {
+            break
+        }
+    }
+    return out
+}
+
+// Run the server on `messages` and give back what it answered.
+func drive(anon messages: [json.Value]) -> [json.Value] {
+    let raw = run_server(frames(messages))
+    if raw is str(out) {
+        return parse_frames(out)
+    }
+    let nothing: [json.Value] = []
+    return nothing
+}
+
+// ── Responses ─────────────────────────────────────────────────────────────────
+
+// The response with `id`; Null, and the test fails, when there is none.
+func response(anon responses: [json.Value], anon id: int64) -> json.Value {
+    for r in responses {
+        if same(r.get("id"), jint(id)) {
+            return r
+        }
+    }
+    fail(f"no response with id {id}")
+    return .Null
+}
+
+// The publishDiagnostics notifications among `responses`.
+func published(anon responses: [json.Value]) -> [json.Value] {
+    mut out: [json.Value] = []
+    for r in responses {
+        if same(r.get("method"), jstr("textDocument/publishDiagnostics")) {
+            out += [r]
+        }
+    }
+    return out
+}
+
+func items(anon v: json.Value) -> [json.Value] {
+    match v {
+        .Array(xs) -> return xs
+        else -> {}
+    }
+    fail(f"not an array: {v.emit()}")
+    let nothing: [json.Value] = []
+    return nothing
+}
+
+// A string value's text; "" (and the test fails) for anything else.
+func text(anon v: json.Value) -> str {
+    if v.as_str() is str(s) {
+        return s
+    }
+    fail(f"not a string: {v.emit()}")
+    return ""
+}
+
+func is_true(anon v: json.Value) -> bool {
+    match v {
+        .Bool(b) -> return b
+        else -> return false
+    }
+}
+
+// Whether `a` and `b` are the same JSON value, as Python compares the
+// parsed dicts and lists: an object's keys in any order.
+func same(anon a: json.Value, anon b: json.Value) -> bool {
+    match a {
+        .Null -> return b is .Null
+        .Bool(x) -> {
+            match b {
+                .Bool(y) -> return x == y
+                else -> return false
+            }
+        }
+        .Number(x) -> {
+            match b {
+                .Number(y) -> return x == y
+                else -> return false
+            }
+        }
+        .Decimal(x) -> {
+            match b {
+                .Decimal(y) -> return x == y
+                else -> return false
+            }
+        }
+        .Str(x) -> {
+            match b {
+                .Str(y) -> return x == y
+                else -> return false
+            }
+        }
+        .Array(xs) -> {
+            match b {
+                .Array(ys) -> {
+                    if len(xs) != len(ys) {
+                        return false
+                    }
+                    for i, x in xs {
+                        if not same(x, ys[i]) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+                else -> return false
+            }
+        }
+        .Object(keys, values) -> {
+            match b {
+                .Object(other_keys, _) -> {
+                    if len(keys) != len(other_keys) {
+                        return false
+                    }
+                    for i, k in keys {
+                        if not has(other_keys, k) or not same(values[i], b.get(k)) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+                else -> return false
+            }
+        }
+    }
+}
+
+func has(anon xs: [str], anon x: str) -> bool {
+    for s in xs {
+        if s == x {
+            return true
+        }
+    }
+    return false
+}
+
+func count(anon xs: [str], anon x: str) -> int64 {
+    mut n = 0
+    for s in xs {
+        if s == x {
+            n += 1
+        }
+    }
+    return n
+}
+
+// The labels of a completion response.
+func labels(anon resp: json.Value) -> [str] {
+    let result = resp.get("result")
+    if result.is_null() {
+        fail(f"expected a CompletionList, got null: {resp.emit()}")
+    }
+    mut out: [str] = []
+    for item in items(result.get("items")) {
+        out += [text(item.get("label"))]
+    }
+    return out
+}
+
+func show(anon xs: [str]) -> str {
+    return "[" + ", ".join(xs) + "]"
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
+
+// The lines of a source file, each ended by a newline.
+func lines(anon ls: [str]) -> str {
+    mut out = ""
+    for l in ls {
+        out += l + "\n"
+    }
+    return out
+}
+
+// initialize, open `source` at `uri`, then the request `method` at
+// `line`/`character` with id 2, shutdown (3), exit: all the responses.
+func session(anon uri: str, source: str, method: str, line: int64, character: int64) -> [json.Value] {
+    return drive([
+        initialize(),
+        did_open(uri, text: source),
+        request(2, method, params: at_position(uri, :line, :character)),
+        shutdown(3),
+        exit_message(),
+    ])
+}
+
+// The response to the request of `session`.
+func ask(anon uri: str, source: str, method: str, line: int64, character: int64) -> json.Value {
+    return response(session(uri, :source, :method, :line, :character), 2)
+}
+
+// The labels a completion at `line`/`character` offers.
+func complete(anon uri: str, source: str, line: int64, character: int64) -> [str] {
+    return labels(ask(uri, :source, method: "textDocument/completion", :line, :character))
+}
+
+// The diagnostics published for `source`, opened alone and shut down.
+func open_alone(anon uri: str, source: str) -> [json.Value] {
+    return published(drive([initialize(), did_open(uri, text: source), shutdown(2), exit_message()]))
+}
+
+type Hovered = struct {
+    // The hover's contents; none when there is no hover.
+    value: str?
+    // Every diagnostic published.
+    diagnostics: [json.Value]
+}
+
+// The hover contents and the diagnostics published for `source`, with the
+// cursor at `line`, `character`.
+func hover_and_diagnostics(anon source: str, line: int64, character: int64) -> Hovered {
+    let responses = session("file:///tmp/directives.kod", :source, method: "textDocument/hover", :line, :character)
+    let hover = response(responses, 2).get("result")
+    mut diagnostics: [json.Value] = []
+    for p in published(responses) {
+        diagnostics += items(p.get("params").get("diagnostics"))
+    }
+    mut value: str? = none
+    if not hover.is_null() {
+        value = text(hover.get("contents").get("value"))
+    }
+    return Hovered(:value, :diagnostics)
+}
+
+func hover_at(anon source: str, anon pos: Pos) -> Hovered {
+    return hover_and_diagnostics(source, line: pos.line, character: pos.character)
+}
+
+func hover_text(anon h: Hovered) -> str {
+    return h.value? or ""
+}
+
+func no_diagnostics(anon diagnostics: [json.Value]) -> bool {
+    if len(diagnostics) == 0 {
+        return true
+    }
+    fail(f"unexpected diagnostics: {json.array_of(diagnostics).emit()}")
+    return false
+}
+
+type Pos = struct {
+    line: int64
+    character: int64
+}
+
+// The position of the `nth` `needle` on `line` of `source`.
+func at(anon source: str, anon line: int64, anon needle: str, nth: int64 = 0) -> Pos {
+    let t = source.split("\n")[line]
+    mut col = -1
+    for _ in 0..nth + 1 {
+        let found = t.find(needle, from: col + 1)
+        if found is int64(c) {
+            col = c
+        } else {
+            fail(f"no `{needle}` on line {line}: {t}")
+            return Pos(:line, character: 0)
+        }
+    }
+    return Pos(:line, character: col)
+}
+
+// The position just past the `.` of `needle` (which starts with one) on `line`.
+func after_dot(anon source: str, anon line: int64, anon needle: str) -> Pos {
+    let p = at(source, line, needle)
+    return Pos(:line, character: p.character + 1)
+}
+
+func definition_at(anon source: str, anon line: int64, anon character: int64) -> json.Value {
+    return ask("file:///tmp/fields.kod", :source, method: "textDocument/definition", :line, :character).get("result")
+}
+
+// Two modules that each declare a struct `Pt`, in a directory of their own
+// under build/; `dir` is its absolute path, the buffer is `main.kod` there.
+type Modules = struct {
+    dir: str
+
+    func uri(self) -> str {
+        return f"file://{self.dir}/main.kod"
+    }
+
+    func remove(self) -> none {
+        process.run(["rm", "-rf", self.dir])
+    }
+}
+
+func same_named_types() -> Modules {
+    let root = process.run(["pwd"]).stdout.trim()
+    let dir = f"{root}/build/tmp_lsp_modules_{libc.getpid()}"
+    process.run(["mkdir", "-p", dir])
+    io.write_file(f"{dir}/pa.kod", lines([
+        "type Pt = shared struct {",
+        "  x: int64",
+        "  func size(self) -> int64 { return 1 }",
+        "}",
+        "func make() -> Pt {",
+        "  return Pt(x: 1)",
+        "}",
+    ]))
+    io.write_file(f"{dir}/pb.kod", lines([
+        "type Pt = shared struct {",
+        "  y: int64",
+        "  func area(self) -> int64 { return 2 }",
+        "}",
+        "func make() -> Pt {",
+        "  return Pt(y: 2)",
+        "}",
+    ]))
+    return Modules(:dir)
+}
+
+// ── The build ─────────────────────────────────────────────────────────────────
+
+test "the server builds" {
+    let base = scratch()
+    process.run(["mkdir", "-p", base])
+    let script = "exec build/apps/kod/kod build tools/lsp.kod >\"$1/build\" 2>&1"
+    mut status = -1
+    match process.start(["sh", "-c", script, "sh", base]) {
+        Ok(child) -> status = wait_bounded(child, ms: BUILD_WAIT_MS, what: "kod build tools/lsp.kod")
+        Err(e) -> fail(f"start kod build: {e.to_str()}")
+    }
+    let built = io.read_file(f"{base}/build")
+    process.run(["rm", "-rf", base])
+    if status != 0 {
+        fail(f"kod build tools/lsp.kod: status {status}\n{built}")
+    }
+    assert io.is_file(SERVER)
+}
+
+// ── The session ───────────────────────────────────────────────────────────────
+
+test "initialize then shutdown" {
+    let responses = drive([initialize(), notification("initialized", params: empty()), shutdown(2), exit_message()])
+    assert len(responses) == 2
+    if len(responses) == 2 {
+        let init = responses[0]
+        let down = responses[1]
+        assert same(init.get("id"), jint(1))
+        assert same(init.get("result").get("capabilities").get("textDocumentSync"), jint(1))
+        assert same(init.get("result").get("serverInfo").get("name"), jstr("kod-lsp"))
+        assert same(down.get("id"), jint(2))
+        assert down.get("result") is .Null
+    }
+}
+
+test "a message that is not JSON is skipped" {
+    // Bad JSON used to panic the server; now it is dropped and the session
+    // goes on.
+    let junk = "Content-Length: 9\r\n\r\n{\"a\": 1,]"
+    let truncated = "Content-Length: 5\r\n\r\n[1, 2"
+    let raw = run_server(frame(initialize()) + junk + truncated + frame(shutdown(2)) + frame(exit_message()))
+    if raw is str(out) {
+        mut ids: [json.Value] = []
+        for r in parse_frames(out) {
+            ids += [r.get("id")]
+        }
+        assert same(json.array_of(ids), json.array_of([jint(1), jint(2)]))
+    }
+}
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+
+test "didOpen with an error emits a diagnostic" {
+    let bad = "func main() -> int64 {\n  does_not_exist()\n  return 0\n}\n"
+    let msgs = open_alone("file:///tmp/sample.kod", source: bad)
+    assert len(msgs) == 1
+    if len(msgs) == 1 {
+        let diags = items(msgs[0].get("params").get("diagnostics"))
+        assert len(diags) >= 1
+        if len(diags) >= 1 {
+            let d = diags[0]
+            assert text(d.get("message")).contains("does_not_exist")
+            assert same(d.get("severity"), jint(1))
+            assert same(d.get("source"), jstr("kod"))
+            // The error is on line 2 of the source, indented by two spaces.
+            // LSP positions are 0-indexed, so that's line=1, character=2.
+            assert same(d.get("range").get("start").get("line"), jint(1))
+            assert same(d.get("range").get("start").get("character"), jint(2))
+        }
+    }
+}
+
+test "unknown identifier diagnostic" {
+    // Typo'd identifier — the most common "broken while typing" mistake.
+    // Used to slip past the compiler silently (just emitted 0); the LSP
+    // would then publish an empty diagnostics list and the editor would
+    // show nothing.
+    let bad = "func main() -> int64 {\n  let x: int64 = 0\n  return xy\n}\n"
+    let msgs = open_alone("file:///tmp/typo.kod", source: bad)
+    assert len(msgs) == 1
+    if len(msgs) == 1 {
+        mut found = false
+        for d in items(msgs[0].get("params").get("diagnostics")) {
+            if not found and text(d.get("message")).contains("unknown name `xy`") {
+                found = true
+                // Range widens to the full identifier (was always one-character wide).
+                assert same(d.get("range").get("start"), position(2, 9))
+                assert same(d.get("range").get("end"), position(2, 11))
+            }
+        }
+        assert found
+    }
+}
+
+test "a parse error emits a diagnostic" {
+    // The self-hosted parser used to advance silently past unexpected
+    // tokens, so syntactically bad input fed a garbage AST to codegen
+    // and the LSP either reported nothing or some confusing downstream
+    // error. With the structured ParseError path, `expect()` records
+    // `expected X, got Y` and the LSP publishes it as a diagnostic.
+    let bad = "func main() -> int64 {\n  print(\"hi\"\n  return 0\n}\n"
+    let msgs = open_alone("file:///tmp/parse.kod", source: bad)
+    assert len(msgs) == 1
+    if len(msgs) == 1 {
+        let diags = items(msgs[0].get("params").get("diagnostics"))
+        mut found = false
+        for d in diags {
+            if text(d.get("message")).contains("expected `)`") {
+                found = true
+            }
+        }
+        if not found {
+            fail(f"no `expected )` in diags: {json.array_of(diags).emit()}")
+        }
+    }
+}
+
+test "a cross-module import resolves" {
+    // Buffer that pulls in stdlib `io` and uses io.read_file should
+    // compile cleanly. The previous LSP only loaded builtins +
+    // primitives, so any `io.foo()` reference was reported as
+    // `unknown name`. With the import walk, names from imported
+    // modules resolve and we emit no diagnostics.
+    let source = lines([
+        "import \"io\"",
+        "func main() -> int64 {",
+        "  let s: str = io.read_file(\"/dev/null\")",
+        "  return 0",
+        "}",
+    ])
+    let msgs = open_alone("file:///tmp/cross.kod", :source)
+    assert len(msgs) == 1
+    if len(msgs) == 1 {
+        assert no_diagnostics(items(msgs[0].get("params").get("diagnostics")))
+    }
+}
+
+test "debounce coalesces a typing burst" {
+    // 30 rapid didChange notifications followed by a 350ms idle period
+    // (> the 250ms debounce window). The LSP should compile + publish
+    // exactly once after the burst settles, not once per change.
+    let uri = "file:///tmp/burst.kod"
+    mut msgs = [initialize(), did_open(uri, text: "func main() -> int64 { return 0 }\n")]
+    for i in 0..30 {
+        msgs += [did_change(uri, version: i + 2, text: "func main() -> int64 { return " + str(i) + " }\n")]
+    }
+    let base = scratch()
+    process.run(["mkdir", "-p", base])
+    let script = "exec \"$1\" >\"$2/out\" 2>\"$2/err\""
+    mut status = -1
+    match process.start(["sh", "-c", script, "sh", SERVER, base], stdin: .Pipe) {
+        Ok(child) -> {
+            let deadline = time.monotonic_ns() + 10000 * 1000000
+            mut wrote = write_bounded(child.stdin, frames(msgs), :deadline)
+            // > debounce_ms (250). Lets the LSP idle out.
+            time.sleep(time.Duration(ms: 350))
+            wrote = wrote and write_bounded(child.stdin, frames([shutdown(2), exit_message()]), :deadline)
+            let _ = child.stdin.close()
+            status = wait_bounded(child, ms: 10000, what: "the server")
+        }
+        Err(e) -> fail(f"start {SERVER}: {e.to_str()}")
+    }
+    let out = io.read_file(f"{base}/out")
+    process.run(["rm", "-rf", base])
+    assert status == 0
+    let diag_msgs = published(parse_frames(out))
+    // Debounce coalesces. We're tolerant of small fragmentation in
+    // the pipe buffer between the test process and the LSP — what we
+    // really want to assert is "many fewer compiles than didChanges."
+    // 30 didChanges should produce a small handful of publishes at
+    // most, never 30. Each one carries the final empty diagnostics.
+    assert len(diag_msgs) >= 1 and len(diag_msgs) <= 5
+    for d in diag_msgs {
+        assert len(items(d.get("params").get("diagnostics"))) == 0
+    }
+}
+
+test "didChange republishes diagnostics" {
+    let uri = "file:///tmp/edit.kod"
+    let responses = drive([
+        initialize(),
+        did_open(uri, text: "func main() -> int64 { return 0 }\n"),
+        did_change(uri, version: 2, text: "func main() -> int64 {\n  oops()\n  return 0\n}\n"),
+        shutdown(2),
+        exit_message(),
+    ])
+    // Debounce coalesces the didOpen + didChange burst into a single
+    // publish for the final buffer state. The test pipes both
+    // notifications back-to-back, so the LSP never sees an idle gap;
+    // the shutdown handler flushes the still-pending publish on the
+    // way out, which is what we observe here.
+    let msgs = published(responses)
+    assert len(msgs) == 1
+    if len(msgs) == 1 {
+        mut found = false
+        for d in items(msgs[0].get("params").get("diagnostics")) {
+            if text(d.get("message")).contains("oops") {
+                found = true
+            }
+        }
+        assert found
+    }
+}
+
+test "didClose forgets the document" {
+    let uri = "file:///tmp/closing.kod"
+    let source = "func helper() -> int64 { return 1 }\nfunc main() -> int64 { return helper() }\n"
+    let hover = at_position(uri, line: 1, character: 31)
+    let responses = drive([
+        initialize(),
+        did_open(uri, text: source),
+        // The second hover reuses the first one's compile.
+        request(2, "textDocument/hover", params: hover),
+        request(3, "textDocument/hover", params: hover),
+        did_close(uri),
+        request(4, "textDocument/hover", params: hover),
+        shutdown(5),
+        exit_message(),
+    ])
+    let first = response(responses, 2).get("result")
+    assert not first.is_null()
+    assert first.emit().contains("helper")
+    assert same(response(responses, 3).get("result"), first)
+    // Closed, the document is gone: nothing to hover over.
+    assert response(responses, 4).get("result") is .Null
+    // The open's diagnostics (none), published with the first compile, then
+    // the close's empty list.
+    mut params: [json.Value] = []
+    for p in published(responses) {
+        params += [p.get("params")]
+    }
+    let none_: [json.Value] = []
+    let cleared = obj(["uri", "diagnostics"], [jstr(uri), json.array_of(none_)])
+    assert same(json.array_of(params), json.array_of([cleared, cleared]))
+}
+
+// ── Link directives ───────────────────────────────────────────────────────────
+
+test "the link directives of a module are comments to the language server" {
+    // tests/link/zlib_crc.kod: a block of `// kod:` lines, a blank line, then
+    // the declarations. The block is no doc comment and no diagnostic.
+    let source = io.read_file("tests/link/zlib_crc.kod")
+    mut line = -1
+    for i, t in source.split("\n") {
+        if line < 0 and t.starts_with("func crc32") {
+            line = i
+        }
+    }
+    assert line >= 0
+    let h = hover_and_diagnostics(source, :line, character: 7)
+    assert h.value is not none and hover_text(h).contains("func crc32")
+    assert not hover_text(h).contains("kod:")
+    assert no_diagnostics(h.diagnostics)
+}
+
+test "a directive block with no blank line after it is the first declaration's doc" {
+    // What docs/modules.md warns of: the parser takes the comment block above a
+    // declaration as its doc comment. Nothing breaks; the hover shows the lines.
+    let source = lines([
+        "// kod:cc zlib_crc.c",
+        "// kod:link -lz",
+        "func crc(anon n: int64) -> int64 {",
+        "  return n",
+        "}",
+        "func main() -> int64 {",
+        "  return crc(1)",
+        "}",
+    ])
+    let h = hover_and_diagnostics(source, line: 6, character: 10)
+    assert h.value is not none and hover_text(h).contains("func crc")
+    assert hover_text(h).contains("kod:link -lz")
+    assert no_diagnostics(h.diagnostics)
+}
+
+// ── Definitions ───────────────────────────────────────────────────────────────
+
+test "definition resolves a struct type" {
+    // Cursor on `Box` in `let b: Box = ...` should jump to the
+    // `type Box = shared struct { ... }` decl.
+    let source = lines([
+        "type Box = shared struct { x: int64 }",
+        "func main() -> int64 {",
+        "  let b: Box = Box(x: 5)",
+        "  return b.x",
+        "}",
+    ])
+    // Cursor on the `Box` in the type annotation on line 2.
+    let loc = ask("file:///tmp/structdef.kod", :source, method: "textDocument/definition", line: 2, character: 10).get("result")
+    assert not loc.is_null()
+    // `type Box = ...` — name `Box` is at column 5 of line 0.
+    assert same(loc.get("range").get("start"), position(0, 5))
+}
+
+test "definition resolves an enum type" {
+    let source = lines([
+        "type Color = enum { Red, Green, Blue }",
+        "func main() -> int64 {",
+        "  let c: Color = Color.Red",
+        "  return 0",
+        "}",
+    ])
+    let loc = ask("file:///tmp/enumdef.kod", :source, method: "textDocument/definition", line: 2, character: 10).get("result")
+    assert not loc.is_null()
+    // `type Color = ...` — name at column 5 of line 0.
+    assert same(loc.get("range").get("start"), position(0, 5))
+}
+
+test "definition resolves a method" {
+    // Cursor on `bump` in `c.bump()` should jump to the
+    // `func bump(self) -> none` decl on the Counter struct.
+    let source = lines([
+        "type Counter = shared struct {",
+        "  value: int64",
+        "  func bump(self) -> none {",
+        "    self.value = self.value + 1",
+        "  }",
+        "}",
+        "func main() -> int64 {",
+        "  let c: Counter = Counter(value: 0)",
+        "  c.bump()",
+        "  return c.value",
+        "}",
+    ])
+    // Cursor on `bump` in `c.bump()` — line 8 (0-indexed), char 4.
+    let loc = ask("file:///tmp/method.kod", :source, method: "textDocument/definition", line: 8, character: 4).get("result")
+    assert not loc.is_null()
+    // `func bump(self)` is on line 2, name `bump` starts at column 7.
+    assert same(loc.get("range").get("start"), position(2, 7))
+}
+
+test "definition resolves a same-module function" {
+    // A call site `helper()` should resolve to its `func helper(...)`
+    // decl in the same buffer. Exercises the cg.func_idx path rather
+    // than the cross-module import_fns one.
+    let source = lines([
+        "func helper() -> int64 {",
+        "  return 42",
+        "}",
+        "func main() -> int64 {",
+        "  return helper()",
+        "}",
+    ])
+    // Line 4 (0-indexed), character 11 lands inside `helper()`.
+    let loc = ask("file:///tmp/same.kod", :source, method: "textDocument/definition", line: 4, character: 11).get("result")
+    assert not loc.is_null()
+    assert text(loc.get("uri")).ends_with("/tmp/same.kod")
+    // `func helper()` decl is on line 0, name identifier starts at col 5.
+    assert same(loc.get("range").get("start"), position(0, 5))
+}
+
+test "definition resolves a cross-module function" {
+    // `io.read_file(...)` should resolve to `func read_file(...)` in
+    // stdlib/io.kod. The LSP compiles the buffer, looks up `read_file`
+    // in cg.import_fns, and returns a Location pointing at the decl.
+    let source = lines([
+        "import \"io\"",
+        "func main() -> int64 {",
+        "  let s: str = io.read_file(\"/dev/null\")",
+        "  return 0",
+        "}",
+    ])
+    // Cursor in the middle of `read_file` on line 2 (0-indexed),
+    // character 20 lands inside the identifier.
+    let responses = session("file:///tmp/gtd.kod", :source, method: "textDocument/definition", line: 2, character: 20)
+    assert is_true(response(responses, 1).get("result").get("capabilities").get("definitionProvider"))
+    let loc = response(responses, 2).get("result")
+    if loc.is_null() {
+        fail("expected a Location, got null")
+    }
+    let uri = text(loc.get("uri"))
+    if not uri.ends_with("stdlib/io.kod") {
+        fail(uri)
+    }
+    // io.kod's `func read_file(...)` is on a known line; the LSP returns
+    // the span of the name identifier so we expect a non-zero column.
+    assert (loc.get("range").get("start").get("character").as_int()? or 0) > 0
+}
+
+test "definition and hover find a type through its module" {
+    // `pa.Pt` and `pb.Pt` are different types of one name: the cursor on
+    // `Pt` goes to the declaration in the module written before the dot.
+    let m = same_named_types()
+    let uri = m.uri()
+    let source = lines([
+        "import \"./pa\"",
+        "import \"./pb\"",
+        "func main() -> int64 {",
+        "  let a: pa.Pt = pa.make()",
+        "  let b: pb.Pt = pb.make()",
+        "  return 0",
+        "}",
+    ])
+    for line, module in ["pa", "pb"] {
+        let field = ["x", "y"][line]
+        let other = ["y", "x"][line]
+        let defn = ask(uri, :source, method: "textDocument/definition", line: line + 3, character: 13)
+        let result = defn.get("result")
+        if not text(result.get("uri")).ends_with(f"/{module}.kod") {
+            fail(defn.emit())
+        }
+        assert same(result.get("range").get("start"), position(0, 5))
+        let hover = ask(uri, :source, method: "textDocument/hover", line: line + 3, character: 13)
+        let value = text(hover.get("result").get("contents").get("value"))
+        if not value.contains(f"{field}: int64") or value.contains(f"{other}: int64") {
+            fail(f"{module}: {value}")
+        }
+    }
+    m.remove()
+}
+
+test "definition finds a bare type in the buffer over an imported one" {
+    // The buffer declares its own `Pt` too; a bare `Pt` is that one.
+    let m = same_named_types()
+    let source = lines([
+        "import \"./pa\"",
+        "type Pt = shared struct {",
+        "  z: int64",
+        "}",
+        "func main() -> int64 {",
+        "  let c: Pt = Pt(z: 3)",
+        "  let a: pa.Pt = pa.make()",
+        "  return c.z",
+        "}",
+    ])
+    let defn = ask(m.uri(), :source, method: "textDocument/definition", line: 5, character: 9)
+    if not text(defn.get("result").get("uri")).ends_with("/main.kod") {
+        fail(defn.emit())
+    }
+    assert same(defn.get("result").get("range").get("start"), position(1, 5))
+    m.remove()
+}
+
+func field_source() -> str {
+    return lines([
+        "type Node = shared struct {",               // 0
+        "    name: str",                             // 1
+        "    weak up: Node?",                        // 2
+        "}",                                         // 3
+        "func label(anon n: Node) -> str {",         // 4
+        "    match n {",                             // 5
+        "        Node(up: Node(:name)) -> return name", // 6
+        "        else -> return n.name",             // 7
+        "    }",                                     // 8
+        "}",                                         // 9
+        "func main() -> int64 {",                    // 10
+        "    let root = Node(name: \"root\")",       // 11
+        "    print(label(root))",                    // 12
+        "    return 0",                              // 13
+        "}",                                         // 14
+    ])
+}
+
+test "definition of a field goes to its declaration" {
+    let loc = definition_at(field_source(), 6, 14)
+    assert not loc.is_null()
+    assert same(loc.get("range").get("start"), position(2, 9))
+    let dotted = definition_at(field_source(), 7, 26)
+    assert not dotted.is_null()
+    assert same(dotted.get("range").get("start"), position(1, 4))
+}
+
+// ── Hover ─────────────────────────────────────────────────────────────────────
+
+test "hover renders a signature" {
+    // Cursor on `read_file` in `io.read_file(...)` should yield a Hover
+    // with the function's signature in a Kod-fenced code block. Same
+    // lookup as go-to-def; just renders SigInfo instead of a Location.
+    let source = lines([
+        "import \"io\"",
+        "func main() -> int64 {",
+        "  let s: str = io.read_file(\"/dev/null\")",
+        "  return 0",
+        "}",
+    ])
+    let responses = session("file:///tmp/hover.kod", :source, method: "textDocument/hover", line: 2, character: 20)
+    assert is_true(response(responses, 1).get("result").get("capabilities").get("hoverProvider"))
+    let hover = response(responses, 2).get("result")
+    if hover.is_null() {
+        fail("expected a Hover, got null")
+    }
+    let value = text(hover.get("contents").get("value"))
+    // io.read_file: extern func read_file(anon path: str) -> str
+    // The anon param's binding name (`path`) should be in the hover so
+    // the user can tell what each positional argument represents.
+    assert value.contains("io.read_file")
+    assert value.contains("anon path: str")
+}
+
+test "hover renders a struct declaration" {
+    let source = lines([
+        "type Box = shared struct {",
+        "  x: int64",
+        "  name: str",
+        "}",
+        "func main() -> int64 {",
+        "  let b: Box = Box(x: 5, name: \"a\")",
+        "  return b.x",
+        "}",
+    ])
+    // `let b: Box` is now on line 5 (after the multi-line struct decl). Box
+    // starts at col 9.
+    let hover = ask("file:///tmp/structhover.kod", :source, method: "textDocument/hover", line: 5, character: 10).get("result")
+    assert not hover.is_null()
+    let value = text(hover.get("contents").get("value"))
+    assert value.contains("type Box = shared struct")
+    assert value.contains("x: int64")
+    assert value.contains("name: str")
+}
+
+test "hover renders a method signature" {
+    let source = lines([
+        "type Counter = shared struct {",
+        "  value: int64",
+        "  func bump(self, anon by: int64) -> int64 {",
+        "    self.value = self.value + by",
+        "    return self.value",
+        "  }",
+        "}",
+        "func main() -> int64 {",
+        "  let c: Counter = Counter(value: 0)",
+        "  return c.bump(3)",
+        "}",
+    ])
+    let hover = ask("file:///tmp/methodhover.kod", :source, method: "textDocument/hover", line: 9, character: 11).get("result")
+    assert not hover.is_null()
+    let value = text(hover.get("contents").get("value"))
+    assert value.contains("Counter.bump")
+    assert value.contains("int64")
+}
+
+test "hover includes the leading doc comment" {
+    // `func helper` has a leading `//` comment block — the hover
+    // response should render those lines as a markdown paragraph
+    // above the fenced signature.
+    let source = lines([
+        "// Helper that returns the answer.",
+        "// Spans two lines on purpose.",
+        "func helper() -> int64 { return 42 }",
+        "func main() -> int64 {",
+        "  return helper()",
+        "}",
+    ])
+    // `helper` on line 4: index 0 = `func`, …, 9 = `h`.
+    let hover = ask("file:///tmp/dochover.kod", :source, method: "textDocument/hover", line: 4, character: 11)
+    let value = text(hover.get("result").get("contents").get("value"))
+    assert value.contains("Helper that returns the answer.")
+    assert value.contains("Spans two lines on purpose.")
+    assert value.contains("```kod")
+    assert value.contains("func helper()")
+}
+
+func interface_source() -> str {
+    return lines([
+        "interface Counter {",                       // 0
+        "    func next(self) -> int64",              // 1
+        "",                                          // 2
+        "    // Add up the next n values.",          // 3
+        "    func sum(self, anon n: int64) -> int64 {", // 4
+        "        return self.next() * n",            // 5
+        "    }",                                     // 6
+        "}",                                         // 7
+        "type Steps = shared struct {",              // 8
+        "    func next(self) -> int64 {",            // 9
+        "        return 1",                          // 10
+        "    }",                                     // 11
+        "}",                                         // 12
+        "type Dice = enum {",                        // 13
+        "    Six",                                   // 14
+        "    func roll(self) -> int64 {",            // 15
+        "        return 6",                          // 16
+        "    }",                                     // 17
+        "}",                                         // 18
+        "func main() -> int64 {",                    // 19
+        "    let c: Counter = Steps()",              // 20
+        "    return c.sum(2) + Dice.Six.roll()",     // 21
+        "}",                                         // 22
+    ])
+}
+
+test "hover on an interface name lists its methods" {
+    let h = hover_and_diagnostics(interface_source(), line: 20, character: 12)
+    assert no_diagnostics(h.diagnostics)
+    assert h.value is not none
+    let value = hover_text(h)
+    assert value.contains("interface Counter {")
+    assert value.contains("func next() -> int64")
+    assert value.contains("func sum(anon n: int64) -> int64 { ... }")
+}
+
+test "hover on an interface method shows it and its doc" {
+    let h = hover_and_diagnostics(interface_source(), line: 21, character: 14)
+    assert h.value is not none
+    assert hover_text(h).contains("func Counter.sum(")
+    assert hover_text(h).contains("Add up the next n values.")
+}
+
+test "hover on an enum method" {
+    let h = hover_and_diagnostics(interface_source(), line: 21, character: 32)
+    assert h.value is not none
+    assert hover_text(h).contains("func Dice.roll(")
+}
+
+test "hover shows a struct method's doc but not a trailing comment" {
+    let source = lines([
+        "type Box = shared struct {",                // 0
+        "    x: int64 // not a doc",                 // 1
+        "    func plain(self) -> int64 {",           // 2
+        "        return self.x",                     // 3
+        "    }",                                     // 4
+        "",                                          // 5
+        "    // Twice x.",                           // 6
+        "    // Never negative for a positive x.",   // 7
+        "    func double(self) -> int64 {",          // 8
+        "        return self.x * 2",                 // 9
+        "    }",                                     // 10
+        "}",                                         // 11
+        "func main() -> int64 {",                    // 12
+        "    let b = Box(x: 1)",                     // 13
+        "    return b.plain() + b.double()",         // 14
+        "}",                                         // 15
+    ])
+    let plain = hover_and_diagnostics(source, line: 14, character: 14)
+    assert no_diagnostics(plain.diagnostics)
+    assert plain.value is not none and hover_text(plain).contains("func Box.plain(self) -> int64")
+    assert not hover_text(plain).contains("not a doc")
+    let double = hover_and_diagnostics(source, line: 14, character: 26)
+    assert double.value is not none
+    assert hover_text(double).contains("Twice x.\nNever negative for a positive x.")
+}
+
+test "hover on a struct shows its weak fields" {
+    let h = hover_and_diagnostics(field_source(), line: 11, character: 16)
+    assert no_diagnostics(h.diagnostics)
+    assert h.value is not none
+    assert hover_text(h).contains("type Node = shared struct { name: str, weak up: Node? }")
+}
+
+test "hover on a field after a dot" {
+    let h = hover_and_diagnostics(field_source(), line: 7, character: 26)
+    assert h.value is not none
+    assert hover_text(h).contains("Node.name: str")
+}
+
+test "hover on a field label in a construction and a pattern" {
+    let built = hover_and_diagnostics(field_source(), line: 11, character: 21)
+    assert built.value is not none and hover_text(built).contains("Node.name: str")
+    let weak = hover_and_diagnostics(field_source(), line: 6, character: 14)
+    assert weak.value is not none and hover_text(weak).contains("weak Node.up: Node?")
+    let short = hover_and_diagnostics(field_source(), line: 6, character: 24)
+    assert short.value is not none and hover_text(short).contains("Node.name: str")
+}
+
+func locals_source() -> str {
+    return lines([
+        "type Bag = shared struct {",                // 0
+        "    func size(self) -> str { return \"bag\" }", // 1
+        "}",                                         // 2
+        "type Box = shared struct {",                // 3
+        "    n: int64",                              // 4
+        "    func size(self) -> int64 { return self.n }", // 5
+        "}",                                         // 6
+        "func main() -> int64 {",                    // 7
+        "    let b = Box(n: 3)",                     // 8
+        "    let total = b.size() + 1",              // 9
+        "    for item in [b] {",                     // 10
+        "        print_int(item.n + total)",         // 11
+        "    }",                                     // 12
+        "    return total",                          // 13
+        "}",                                         // 14
+    ])
+}
+
+test "hover on a local shows its compiled type" {
+    let total = hover_at(locals_source(), at(locals_source(), 13, "total"))
+    assert no_diagnostics(total.diagnostics)
+    assert total.value is not none and hover_text(total).contains("total: int64")
+    let b = hover_at(locals_source(), at(locals_source(), 9, "b."))
+    assert b.value is not none and hover_text(b).contains("b: Box")
+}
+
+test "hover on a for variable and its field" {
+    let item = hover_at(locals_source(), at(locals_source(), 11, "item"))
+    assert item.value is not none and hover_text(item).contains("item: Box")
+    let field = hover_at(locals_source(), after_dot(locals_source(), 11, ".n"))
+    assert field.value is not none and hover_text(field).contains("Box.n: int64")
+}
+
+test "hover on a method uses the receiver's type" {
+    let h = hover_at(locals_source(), after_dot(locals_source(), 9, ".size"))
+    assert h.value is not none and hover_text(h).contains("Box.size") and not hover_text(h).contains("Bag")
+}
+
+func chain_source() -> str {
+    return lines([
+        "type Other = shared struct {",              // 0
+        "    v: str",                                // 1
+        "    func twice(self) -> str { return self.v }", // 2
+        "}",                                         // 3
+        "type Inner = shared struct {",              // 4
+        "    v: int64",                              // 5
+        "    func twice(self) -> int64 { return self.v * 2 }", // 6
+        "    func half(self) -> int64 { return self.v / 2 }", // 7
+        "}",                                         // 8
+        "type Outer = shared struct {",              // 9
+        "    inner: Inner",                          // 10
+        "    items: [Inner]",                        // 11
+        "    func get(self) -> Inner { return self.inner }", // 12
+        "}",                                         // 13
+        "func make() -> Outer {",                    // 14
+        "    return Outer(inner: Inner(v: 1), items: [Inner(v: 2)])", // 15
+        "}",                                         // 16
+        "// A guess from the text would take `inner` for an Other, and `twice` for Other's.", // 17
+        "func misleading(inner: Other) -> str { return inner.twice() }", // 18
+        "func main() -> int64 {",                    // 19
+        "    let o = make()",                        // 20
+        "    print_int(o.inner.v)",                  // 21
+        "    print_int(make().inner.v)",             // 22
+        "    print_int(o.items[0].v)",               // 23
+        "    print_int(o.get().twice())",            // 24
+        "    return 0",                              // 25
+        "}",                                         // 26
+    ])
+}
+
+test "hover on a field of a field" {
+    let h = hover_at(chain_source(), after_dot(chain_source(), 21, ".v"))
+    assert no_diagnostics(h.diagnostics)
+    assert h.value is not none and hover_text(h).contains("Inner.v: int64")
+}
+
+test "hover on a field of a call and of an element" {
+    let call = hover_at(chain_source(), after_dot(chain_source(), 22, ".v"))
+    assert call.value is not none and hover_text(call).contains("Inner.v: int64")
+    let element = hover_at(chain_source(), after_dot(chain_source(), 23, ".v"))
+    assert element.value is not none and hover_text(element).contains("Inner.v: int64")
+}
+
+test "hover on a method of a method result" {
+    let h = hover_at(chain_source(), after_dot(chain_source(), 24, ".twice"))
+    assert h.value is not none and hover_text(h).contains("Inner.twice") and not hover_text(h).contains("Other")
+}
+
+func optional_source() -> str {
+    return lines([
+        "type Decoy = shared struct {",              // 0
+        "    name: int64",                           // 1
+        "    func label(self) -> int64 { return self.name }", // 2
+        "}",                                         // 3
+        "type Node = shared struct {",               // 4
+        "    name: str",                             // 5
+        "    next: Node? = none",                    // 6
+        "    func label(self) -> str { return self.name }", // 7
+        "    func parent(self) -> Node? { return self.next }", // 8
+        "}",                                         // 9
+        "func misleading(n: Decoy) -> int64 { return n.label() }", // 10
+        "func main() -> int64 {",                    // 11
+        "    let n = Node(name: \"a\", next: Node(name: \"b\"))", // 12
+        "    let first = n.next?.name? or \"\"",     // 13
+        "    let second = n.next?.next?.label()? or \"\"", // 14
+        "    let third = n.parent()?.name? or \"\"", // 15
+        "    print(first + second + third)",         // 16
+        "    return 0",                              // 17
+        "}",                                         // 18
+    ])
+}
+
+test "hover through optional chains" {
+    let first = hover_at(optional_source(), after_dot(optional_source(), 13, ".name"))
+    assert no_diagnostics(first.diagnostics)
+    assert first.value is not none and hover_text(first).contains("Node.name: str")
+    let second = hover_at(optional_source(), after_dot(optional_source(), 14, ".label"))
+    assert second.value is not none and hover_text(second).contains("Node.label") and not hover_text(second).contains("Decoy")
+    let third = hover_at(optional_source(), after_dot(optional_source(), 15, ".name"))
+    assert third.value is not none and hover_text(third).contains("Node.name: str")
+}
+
+// ── Completion ────────────────────────────────────────────────────────────────
+
+test "completion offers globals at a bare identifier" {
+    // Cursor on the blank line inside main() — globals, imports, types
+    // should all be present in the offered completions.
+    let source = lines([
+        "import \"io\"",
+        "func helper() -> int64 {",
+        "  return 0",
+        "}",
+        "type Widget = shared struct {",
+        "  size: int64",
+        "}",
+        "func main() -> int64 {",
+        "  ",
+        "  return 0",
+        "}",
+    ])
+    // Line 7 is the blank line inside main(); col 2 is after the 2-space
+    // indent.
+    let responses = session("file:///tmp/comp.kod", :source, method: "textDocument/completion", line: 7, character: 2)
+    if response(responses, 1).get("result").get("capabilities").get("completionProvider").is_null() {
+        fail("completionProvider not advertised")
+    }
+    let got = labels(response(responses, 2))
+    assert has(got, "helper") // free function
+    assert has(got, "io") // import alias
+    assert has(got, "Widget") // struct type name
+}
+
+test "completion after a module returns its exports" {
+    // After `io.`, completions should be io's exported functions.
+    let source = "import \"io\"\nfunc main() -> int64 {\n  io.\n  return 0\n}\n"
+    // Position immediately after the `.` on line 2.
+    let got = complete("file:///tmp/compdot.kod", :source, line: 2, character: 5)
+    // io.kod exports these (externs are still functions from the
+    // caller's perspective).
+    assert has(got, "read_file")
+    assert has(got, "write_file")
+    // `helper` is a global free function — not exported by `io`.
+    assert not has(got, "helper")
+}
+
+test "completion offers str methods on a typed variable" {
+    // After `s.`, where `s: str` was declared above, completions should
+    // include the methods registered on str (to_str, hash, code_points,
+    // char_at, contains, …).
+    let source = "func main() -> int64 {\n  let s: str = \"hello\"\n  s.\n  return 0\n}\n"
+    // Line 2 is `  s.`; column 4 is just past the dot.
+    let got = complete("file:///tmp/recvstr.kod", :source, line: 2, character: 4)
+    assert has(got, "to_str")
+    assert has(got, "hash")
+    assert has(got, "contains")
+    assert has(got, "char_at")
+}
+
+test "completion offers a struct's methods and fields on a typed variable" {
+    // After `p.` where `p: Point`, completions include the struct's
+    // methods (distance) and fields (x, y).
+    let source = lines([
+        "type Point = shared struct {",
+        "  x: int64",
+        "  y: int64",
+        "  func distance(self) -> int64 { return 0 }",
+        "}",
+        "func main() -> int64 {",
+        "  let p: Point = Point(x: 1, y: 2)",
+        "  p.",
+        "  return 0",
+        "}",
+    ])
+    // Line 7 is `  p.`; column 4 is just past the dot.
+    let got = complete("file:///tmp/recvstruct.kod", :source, line: 7, character: 4)
+    assert has(got, "distance")
+    assert has(got, "x")
+    assert has(got, "y")
+}
+
+test "completion on a receiver typed by a function parameter" {
+    // The receiver's type can also come from a function parameter
+    // annotation, not just a `let`. After `s.`, get str methods.
+    let source = "func helper(s: str) -> int64 {\n  s.\n  return 0\n}\n"
+    let got = complete("file:///tmp/recvparam.kod", :source, line: 1, character: 4)
+    assert has(got, "to_str")
+    assert has(got, "char_at")
+}
+
+test "completion hides underscore methods by default" {
+    // After `s.`, internal helpers (names starting with `_`) should
+    // NOT appear in the offered completions.
+    let source = "func main() -> int64 {\n  let s: str = \"hi\"\n  s.\n  return 0\n}\n"
+    let got = complete("file:///tmp/hideund.kod", :source, line: 2, character: 4)
+    // Public methods still present
+    assert has(got, "to_str")
+    assert has(got, "char_at")
+    // Internal helpers omitted
+    assert not has(got, "_utf8_width_at")
+    assert not has(got, "_utf8_value_at")
+}
+
+test "completion shows underscore methods when the partial starts with an underscore" {
+    // If the user has typed `s._`, they are explicitly looking at
+    // internal names — show them.
+    let source = "func main() -> int64 {\n  let s: str = \"hi\"\n  s._\n  return 0\n}\n"
+    // Position right after `s._`
+    let got = complete("file:///tmp/showund.kod", :source, line: 2, character: 5)
+    // Public methods still appear too (the client filters)
+    assert has(got, "to_str")
+    // Internal helpers now visible
+    assert has(got, "_utf8_width_at")
+    assert has(got, "_utf8_value_at")
+}
+
+test "completion offers the members of the type the buffer means" {
+    let m = same_named_types()
+    let uri = m.uri()
+    let source = lines([
+        "import \"./pa\"",
+        "import \"./pb\"",
+        "type Pt = shared struct {",
+        "  z: int64",
+        "}",
+        "func main() -> int64 {",
+        "  let b: pb.Pt = pb.make()",
+        "  b.",
+        "  return 0",
+        "}",
+    ])
+    let got = complete(uri, :source, line: 7, character: 4)
+    if not (has(got, "y") and has(got, "area")) {
+        fail(show(got))
+    }
+    if has(got, "x") or has(got, "size") or has(got, "z") {
+        fail(show(got))
+    }
+    // A bare completion offers the one `Pt` the buffer can write.
+    let bare = complete(uri, source: source.replace("  b.\n", to: "  \n"), line: 7, character: 2)
+    if count(bare, "Pt") != 1 {
+        fail(show(bare))
+    }
+    m.remove()
+}
+
+test "completion after a block that hid the receiver" {
+    // An inner `let v` hides the outer one until its block ends; the
+    // members offered are those of the `v` in force at the cursor.
+    let m = same_named_types()
+    let uri = m.uri()
+    let source = lines([
+        "import \"./pa\"",
+        "import \"./pb\"",
+        "func main(p: pb.Pt) -> int64 {",
+        "  let v: pa.Pt = pa.make()",
+        "  if true {",
+        "    let v: pb.Pt = pb.make()",
+        "    print_int(v.y)",
+        "    p.",
+        "  }",
+        "  v.",
+        "  return 0",
+        "}",
+    ])
+    let after = complete(uri, :source, line: 9, character: 4)
+    if not (has(after, "x") and has(after, "size")) or has(after, "y") or has(after, "area") {
+        fail(f"after: {show(after)}")
+    }
+    let inside = complete(uri, source: source.replace("    p.\n", to: "    v.\n"), line: 7, character: 6)
+    if not (has(inside, "y") and has(inside, "area")) or has(inside, "x") or has(inside, "size") {
+        fail(f"inside: {show(inside)}")
+    }
+    // A parameter hidden in an inner block is back after it.
+    let hidden = source.replace("  let v: pa.Pt = pa.make()\n", to: "").replace("main(p: pb.Pt)", to: "main(v: pa.Pt)")
+    let after_param = complete(uri, source: hidden, line: 8, character: 4)
+    if not has(after_param, "x") or has(after_param, "y") {
+        fail(f"after the parameter: {show(after_param)}")
+    }
+    m.remove()
+}
+
+// The labels a completion after `v.` offers, with `between` the lines
+// between `let v: pa.Pt` and it.
+func labels_after(anon m: Modules, anon between: [str]) -> [str] {
+    mut source = "import \"./pa\"\nimport \"./pb\"\nfunc main() -> int64 {\n  let v: pa.Pt = pa.make()\n"
+    for l in between {
+        source += "  " + l + "\n"
+    }
+    let line = len(source.split("\n")) - 1
+    source += "  v.\n  return 0\n}\n"
+    return complete(m.uri(), :source, :line, character: 4)
+}
+
+test "completion ignores braces in strings, chars and comments" {
+    // Only braces the lexer reads as braces open or close a block: a `}`
+    // in a string, a char literal or a comment between the `let` and the
+    // cursor leaves the receiver's block open, and a `{` there leaves a
+    // closed inner block closed.
+    let m = same_named_types()
+    for l in ["print(\"}\")", "print('}')", "// close } here", "print(f\"\\}\")", "print(\"\"\"}\"\"\")"] {
+        let got = labels_after(m, [l])
+        if not (has(got, "x") and has(got, "size")) {
+            fail(f"{l}: {show(got)}")
+        }
+    }
+    // A `{` in a string does not keep an ended block open: the `v` of the
+    // block is not the one in force after it.
+    let got = labels_after(m, ["if true {", "  let v: pb.Pt = pb.make()", "  print(v.y)", "}", "print(\"{\")"])
+    if not has(got, "x") or has(got, "y") {
+        fail(show(got))
+    }
+    m.remove()
+}
+
+test "completion on a receiver whose type is inferred" {
+    // `p` has no written type, so only the compiled type says it's a Point.
+    let source = lines([
+        "type Point = shared struct {",
+        "  x: int64",
+        "  func distance(self) -> int64 { return 0 }",
+        "}",
+        "func main() -> int64 {",
+        "  for p in [Point(x: 1)] {",
+        "    print_int(p.di)",
+        "  }",
+        "  return 0",
+        "}",
+    ])
+    // Line 6 is `    print_int(p.di)`; column 18 is just past `di`.
+    let got = complete("file:///tmp/recvinferred.kod", :source, line: 6, character: 18)
+    assert has(got, "distance")
+    assert has(got, "x")
+}
+
+test "completion after a field of a field" {
+    let source = chain_source().replace("print_int(o.inner.v)", to: "print_int(o.inner.tw)")
+    let p = at(source, 21, ".tw")
+    let got = complete("file:///tmp/chains.kod", :source, line: p.line, character: p.character + 3)
+    assert has(got, "twice")
+    assert has(got, "half")
+}
+
+test "completion after an optional chain" {
+    let source = optional_source().replace("n.next?.next?.label()", to: "n.next?.next?.par")
+    let p = at(source, 14, "?.par")
+    let got = complete("file:///tmp/optchain.kod", :source, line: p.line, character: p.character + 5)
+    assert has(got, "parent")
+    assert has(got, "next")
+}

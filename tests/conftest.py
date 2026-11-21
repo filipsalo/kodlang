@@ -44,7 +44,6 @@ SLOW_TESTS = {"test_selfhost_fixed_point", "test_unit_tests"}
 
 # Modules whose tests all build the same program.
 SHARED_PROGRAM = {
-    "lsp_test.py": "lsp",
     "api_example_test.py": "api_example",
     "colour_test.py": "colour",
 }
