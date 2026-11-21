@@ -1,0 +1,785 @@
+// Compare kod/macho's objects with clang's, by what they mean.
+//
+//   as_diff [FILE.kod ...]     (default: every .kod in git)
+//
+// Run it as `./kod run tools/as_diff.kod [FILE.kod ...]` from the repository
+// root. Compiles each file with build/stage1/sh_kodc, assembles the assembly
+// twice (clang's assembler, and `sh_kodc _assemble`, which is kod/macho), and
+// compares the two objects. The layouts differ on purpose (docs/ir.md, step
+// 9), so the comparison is by meaning:
+//
+// - each section: its name, flags, address and bytes, with every field a
+//   relocation fills cleared;
+// - each relocation: its section, address, kind and target, the target an
+//   undefined symbol's name or an address (a defined symbol's, or a
+//   section's, plus the addend);
+// - the symbols other than temporary ones (L..., ltmp...): name, kind,
+//   section, value, and weak or not; the undefined ones by name;
+// - the header flags and the minimum OS version.
+//
+// Files are named from the repository root (the top of the git checkout the
+// tool runs in), and a file sh_kodc does not compile is left out. Prints each
+// file that differs and the first difference; exits 1 if any did. A program
+// still running after STEP_WAIT_S seconds is killed, and the file counts as
+// differing.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "sort"
+import "strbuilder" { StrBuilder }
+import "time"
+import "time" { Duration, monotonic_ns }
+import "unsafe"
+
+let SH_KODC: str = "build/stage1/sh_kodc"
+let CLANG_AS: [str] = ["clang", "-target", "arm64-apple-darwin", "-c", "-x", "assembler"]
+// A compile or an assembly still running after this long is killed.
+let STEP_WAIT_S: int64 = 60
+// git, mktemp, sysctl and rm.
+let TOOL_WAIT_S: int64 = 60
+let SIGKILL: int64 = 9
+
+// Relocation kinds (r_type).
+let UNSIGNED: int64 = 0
+let BRANCH26: int64 = 2
+let PAGE21: int64 = 3
+let GOT_PAGE21: int64 = 5
+let ADDEND: int64 = 10
+
+// The name a relocation kind is shown by; the number for one not named.
+func kind_name(anon kind: int64) -> str {
+    match kind {
+        0 -> return "'UNSIGNED'"
+        2 -> return "'BRANCH26'"
+        3 -> return "'PAGE21'"
+        4 -> return "'PAGEOFF12'"
+        5 -> return "'GOT_LOAD_PAGE21'"
+        6 -> return "'GOT_LOAD_PAGEOFF12'"
+        else -> return f"{kind}"
+    }
+}
+
+// Something went wrong that ends the run (status 1).
+type Failed = struct {
+    message: str
+
+    func to_str(self) -> str {
+        return self.message
+    }
+}
+
+// --- Running programs ---------------------------------------------------------
+
+// One program running with its stdout and stderr piped here.
+type Proc = shared struct {
+    child: process.Child
+    deadline: int64
+    out: StrBuilder
+    err: StrBuilder
+    // The raw wait status once it has ended, -1 before.
+    raw: int64
+    expired: bool
+}
+
+func begin(anon argv: [str], dir: str, wait_s: int64) -> Proc or Error {
+    let child = try process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe, :dir)
+    return Proc(:child, deadline: monotonic_ns() + wait_s * 1000000000, out: StrBuilder(), err: StrBuilder(), raw: -1, expired: false)
+}
+
+func is_done(anon p: Proc) -> bool {
+    return p.raw >= 0 and p.child.stdout.fd < 0 and p.child.stderr.fd < 0
+}
+
+// Whether it ran to the end and exited 0.
+func succeeded(anon p: Proc) -> bool {
+    return not p.expired and p.raw == 0
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: posix.Fd, into: StrBuilder) -> none {
+    match f.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                let _ = f.close()
+            } else {
+                into.append_bytes(data)
+            }
+        }
+        Err(_) -> {
+            let _ = f.close()
+        }
+    }
+}
+
+// Wait up to `ms` for output from any of `procs`, take it, and see which have
+// ended; one past its deadline is killed.
+func step(anon procs: [Proc], ms: int64) -> none {
+    mut fds: [posix.Fd] = []
+    mut into: [StrBuilder] = []
+    for p in procs {
+        if p.child.stdout.fd >= 0 {
+            fds += [p.child.stdout]
+            into += [p.out]
+        }
+        if p.child.stderr.fd >= 0 {
+            fds += [p.child.stderr]
+            into += [p.err]
+        }
+    }
+    if len(fds) > 0 {
+        if posix.poll(read: fds, timeout: Duration(:ms)) is Ok(ready) {
+            for i, f in fds {
+                if ready.read[i] {
+                    take(f, into: into[i])
+                }
+            }
+        }
+    } else {
+        time.sleep(Duration(ms: 1))
+    }
+    let now = monotonic_ns()
+    for p in procs {
+        if p.raw < 0 {
+            if process.wait_status(p.child.pid, name: p.child.name, hang: false) is Ok(int64(raw)) {
+                p.raw = raw
+            }
+        }
+        if not is_done(p) and now > p.deadline {
+            if p.raw < 0 {
+                let _killed = libc.kill(p.child.pid, SIGKILL)
+            }
+            for f in [p.child.stdout, p.child.stderr] {
+                if f.fd >= 0 {
+                    let _ = f.close()
+                }
+            }
+            if p.raw < 0 {
+                if process.wait_status(p.child.pid, name: p.child.name, hang: true) is Ok(int64(raw)) {
+                    p.raw = raw
+                }
+            }
+            if p.raw < 0 {
+                p.raw = 0
+            }
+            p.expired = true
+        }
+    }
+}
+
+// Run `argv` in `dir` to the end, or until `wait_s` has passed.
+func run_one(anon argv: [str], dir: str) -> Proc or Error {
+    let p = try begin(argv, :dir, wait_s: TOOL_WAIT_S)
+    for not is_done(p) {
+        step([p], ms: 100)
+    }
+    return p
+}
+
+// The stdout of `argv` run in `dir`; failing unless it exits 0.
+func capture(anon argv: [str], dir: str) -> str or Error {
+    let p = try run_one(argv, :dir)
+    if p.expired {
+        throw Failed(message: f"as-diff: `{" ".join(argv)}` timed out after {TOOL_WAIT_S} s")
+    }
+    if p.raw != 0 {
+        throw Failed(message: f"as-diff: `{" ".join(argv)}` failed: {p.err.to_str().trim()}")
+    }
+    return p.out.to_str()
+}
+
+// --- Reading an object ----------------------------------------------------------
+
+func u16(anon d: str, anon at: int64) -> int64 {
+    return d[at] | (d[at + 1] << 8)
+}
+
+func u32(anon d: str, anon at: int64) -> int64 {
+    return d[at] | (d[at + 1] << 8) | (d[at + 2] << 16) | (d[at + 3] << 24)
+}
+
+func u64(anon d: str, anon at: int64) -> int64 {
+    return u32(d, at) | (u32(d, at + 4) << 32)
+}
+
+// `s` without the NULs at its end.
+func strip_nuls(anon s: str) -> str {
+    mut n = len(s)
+    for n > 0 and s[n - 1] == 0 {
+        n -= 1
+    }
+    return s[0..n]
+}
+
+// d[from..to], cut to what `d` has.
+func clipped(anon d: str, anon from: int64, anon to: int64) -> str {
+    let a = clamp(from, len(d))
+    let b = clamp(to, len(d))
+    if b <= a {
+        return ""
+    }
+    return d[a..b]
+}
+
+func clamp(anon x: int64, anon top: int64) -> int64 {
+    if x < 0 {
+        return 0
+    }
+    if x > top {
+        return top
+    }
+    return x
+}
+
+type Section = struct {
+    // "segment,section".
+    name: str
+    addr: int64
+    bytes: str
+    reloff: int64
+    nreloc: int64
+    flags: int64
+}
+
+type Symbol = struct {
+    name: str
+    ntype: int64
+    nsect: int64
+    desc: int64
+    value: int64
+}
+
+type Object = struct {
+    flags: int64
+    sections: [Section]
+    symbols: [Symbol]
+    // From LC_BUILD_VERSION; none without one.
+    minos: int64?
+    data: str
+}
+
+func read_object(anon data: str) -> Object or Error {
+    if len(data) < 32 {
+        throw Failed(message: f"as-diff: an object of {len(data)} bytes")
+    }
+    let ncmds = u32(data, 16)
+    let flags = u32(data, 24)
+    mut off = 32
+    mut sections: [Section] = []
+    mut symbols: [Symbol] = []
+    mut minos: int64? = none
+    for _ in 0..ncmds {
+        let cmd = u32(data, off)
+        let size = u32(data, off + 4)
+        if cmd == 0x19 {
+            let nsects = u32(data, off + 64)
+            for i in 0..nsects {
+                let at = off + 72 + 80 * i
+                let sectname = strip_nuls(data[at..at + 16])
+                let segname = strip_nuls(data[at + 16..at + 32])
+                let addr = u64(data, at + 32)
+                let length = u64(data, at + 40)
+                let offset = u32(data, at + 48)
+                sections += [Section(
+                    name: f"{segname},{sectname}",
+                    :addr,
+                    bytes: clipped(data, offset, offset + length),
+                    reloff: u32(data, at + 56),
+                    nreloc: u32(data, at + 60),
+                    flags: u32(data, at + 64),
+                )]
+            }
+        } else if cmd == 0x2 {
+            let symoff = u32(data, off + 8)
+            let nsyms = u32(data, off + 12)
+            let stroff = u32(data, off + 16)
+            for i in 0..nsyms {
+                let at = symoff + 16 * i
+                let start = stroff + u32(data, at)
+                mut end = start
+                for end < len(data) and data[end] != 0 {
+                    end += 1
+                }
+                if end >= len(data) {
+                    throw Failed(message: f"as-diff: a symbol name at {start:#x} with no end")
+                }
+                symbols += [Symbol(name: data[start..end], ntype: data[at + 4], nsect: data[at + 5], desc: u16(data, at + 6), value: u64(data, at + 8))]
+            }
+        } else if cmd == 0x32 {
+            minos = u32(data, off + 12)
+        }
+        off += size
+    }
+    return Object(:flags, :sections, :symbols, :minos, :data)
+}
+
+// --- What an object means ---------------------------------------------------------
+
+// A section's bytes, writable, for clearing relocated fields in.
+type Buffer = shared struct {
+    addr: int64
+    size: int64
+
+    // The `n` bytes at `at` as a little-endian number, sign-extended when
+    // `signed`; the bytes past the end read as missing.
+    func get(self, anon at: int64, anon n: int64, signed: bool) -> int64 {
+        mut value = 0
+        mut got = 0
+        for k in 0..n {
+            if at + k < 0 or at + k >= self.size {
+                break
+            }
+            value = value | unsafe.load8(self.addr + at + k) << (8 * k)
+            got += 1
+        }
+        if signed and got > 0 and got < 8 and ((value >> (8 * got - 1)) & 1) == 1 {
+            value -= 1 << (8 * got)
+        }
+        return value
+    }
+
+    func put(self, anon at: int64, anon n: int64, anon value: int64) -> none {
+        for k in 0..n {
+            if at + k >= 0 and at + k < self.size {
+                unsafe.store8(self.addr + at + k, (value >> (8 * k)) & 255)
+            }
+        }
+    }
+}
+
+// Clears the field a relocation fills; gives what was there.
+func clear(anon b: Buffer, anon at: int64, anon kind: int64, anon length: int64) -> int64 {
+    if kind == UNSIGNED {
+        let size = 1 << length
+        let value = b.get(at, size, signed: true)
+        b.put(at, size, 0)
+        return value
+    }
+    mut word = b.get(at, 4, signed: false)
+    if kind == BRANCH26 {
+        word = word & (0xFFFFFFFF - 0x3FFFFFF)
+    } else if kind == PAGE21 or kind == GOT_PAGE21 {
+        word = word & (0xFFFFFFFF - ((0x7FFFF << 5) | (3 << 29)))
+    } else {
+        word = word & (0xFFFFFFFF - (0xFFF << 10))
+    }
+    b.put(at, 4, word)
+    return 0
+}
+
+type Meaning = struct {
+    flags: int64
+    minos: int64?
+    // Each section's name, flags and address, as shown, and its cleared bytes.
+    heads: [str]
+    names: [str]
+    bytes: [str]
+    // Sets, sorted and without repeats: relocations and defined symbols as
+    // shown, undefined symbols by name.
+    relocs: [str]
+    defined: [str]
+    undefined: [str]
+}
+
+// `xs` sorted, each once.
+func as_set(anon xs: [str]) -> [str] {
+    mut out: [str] = []
+    for x in sort.sorted(xs) {
+        if len(out) == 0 or out[len(out) - 1] != x {
+            out += [x]
+        }
+    }
+    return out
+}
+
+func meaning(anon obj: Object) -> Meaning {
+    let symbols = obj.symbols
+    let sections = obj.sections
+    mut relocs: [str] = []
+    mut heads: [str] = []
+    mut names: [str] = []
+    mut cleared: [str] = []
+    for s in sections {
+        let buf = Buffer(addr: unsafe.alloc(len(s.bytes) + 1), size: len(s.bytes))
+        unsafe.copy_in(buf.addr, kod_str_to_bytes(s.bytes))
+        mut addend = 0
+        for i in 0..s.nreloc {
+            let at = s.reloff + 8 * i
+            mut address = u32(obj.data, at)
+            if address >= 0x80000000 {
+                address -= 0x100000000
+            }
+            let info = u32(obj.data, at + 4)
+            let num = info & 0xFFFFFF
+            let pcrel = (info >> 24) & 1
+            let length = (info >> 25) & 3
+            let is_extern = (info >> 27) & 1
+            let kind = info >> 28
+            if kind == ADDEND {
+                addend = num
+                if num >= 0x800000 {
+                    addend = num - 0x1000000
+                }
+                continue
+            }
+            let held = clear(buf, address, kind, length)
+            mut target = ""
+            if is_extern != 0 {
+                let sym = symbols[num]
+                if (sym.ntype & 0xE) == 0 {
+                    target = f"('symbol', {py_repr(sym.name)}, {addend + held})"
+                } else {
+                    target = f"('address', {sym.value + addend + held})"
+                }
+            } else {
+                // Against a section: an UNSIGNED field holds the address itself.
+                target = f"('address', {held + addend})"
+            }
+            relocs += [f"({py_repr(s.name)}, {address}, {kind_name(kind)}, {pcrel}, {length}, {target})"]
+            addend = 0
+        }
+        heads += [f"({py_repr(s.name)}, {s.flags}, {s.addr})"]
+        names += [s.name]
+        cleared += [str(unsafe.copy_out(buf.addr, buf.size))]
+        unsafe.free(buf.addr)
+    }
+    mut defined: [str] = []
+    mut undefined: [str] = []
+    for sym in symbols {
+        if sym.name.starts_with("L") or sym.name.starts_with("ltmp") {
+            continue
+        }
+        if (sym.ntype & 0xE) == 0 {
+            undefined += [sym.name]
+        } else {
+            // As Python indexes: section 0 (none) is the last one.
+            mut k = sym.nsect - 1
+            if k < 0 {
+                k += len(sections)
+            }
+            defined += [f"({py_repr(sym.name)}, {sym.ntype}, {py_repr(sections[k].name)}, {sym.value}, {sym.desc & 0x80})"]
+        }
+    }
+    return Meaning(flags: obj.flags, minos: obj.minos, :heads, :names, bytes: cleared, relocs: as_set(relocs), defined: as_set(defined), undefined: as_set(undefined))
+}
+
+// --- Showing values as the Python version did -------------------------------------
+
+let HEX: str = "0123456789abcdef"
+
+// `s` as Python's repr shows a str.
+func py_repr(anon s: str) -> str {
+    mut quote = '\''
+    if s.contains("'") and not s.contains("\"") {
+        quote = '"'
+    }
+    let out = StrBuilder()
+    out.append_byte(quote)
+    for c in s {
+        if c == quote or c == '\\' {
+            out.append_byte('\\')
+            out.append_byte(c)
+        } else if c == '\n' {
+            out.append("\\n")
+        } else if c == '\r' {
+            out.append("\\r")
+        } else if c == '\t' {
+            out.append("\\t")
+        } else if c < 0x20 or c == 0x7F {
+            out.append("\\x")
+            out.append_byte(HEX[c >> 4])
+            out.append_byte(HEX[c & 15])
+        } else {
+            out.append_byte(c)
+        }
+    }
+    out.append_byte(quote)
+    return out.to_str()
+}
+
+// A list as Python shows one, of items already shown.
+func py_list(anon items: [str]) -> str {
+    return "[" + ", ".join(items) + "]"
+}
+
+// Python's `{n:#x}`.
+func hex(anon n: int64) -> str {
+    if n < 0 {
+        return f"-{-n:#x}"
+    }
+    return f"{n:#x}"
+}
+
+func hex_or_none(anon n: int64?) -> str {
+    let Some(v) = n else {
+        return "None"
+    }
+    return hex(v)
+}
+
+// bytes.hex() of s[from..to], cut to what `s` has.
+func bytes_hex(anon s: str, anon from: int64, anon to: int64) -> str {
+    let out = StrBuilder()
+    for c in clipped(s, from, to) {
+        out.append_byte(HEX[c >> 4])
+        out.append_byte(HEX[c & 15])
+    }
+    return out.to_str()
+}
+
+// The first `n` characters of `s` (UTF-8), as Python's s[:n].
+func first_chars(anon s: str, anon n: int64) -> str {
+    mut count = 0
+    for i in 0..len(s) {
+        if (s[i] & 0xC0) != 0x80 {
+            if count == n {
+                return s[0..i]
+            }
+            count += 1
+        }
+    }
+    return s
+}
+
+// The members of `a` not in `b`, both sorted: at most 3, as shown.
+func only_in(anon a: [str], anon b: [str], names: bool) -> str {
+    mut shown: [str] = []
+    mut j = 0
+    for x in a {
+        if len(shown) == 3 {
+            break
+        }
+        for j < len(b) and b[j] < x {
+            j += 1
+        }
+        if j < len(b) and b[j] == x {
+            continue
+        }
+        if names {
+            shown += [py_repr(x)]
+        } else {
+            shown += [x]
+        }
+    }
+    return py_list(shown)
+}
+
+func same_int(anon a: int64?, anon b: int64?) -> bool {
+    if a is int64(x) {
+        if b is int64(y) {
+            return x == y
+        }
+        return false
+    }
+    return b is none
+}
+
+func first_difference(anon a: Meaning, anon b: Meaning) -> str {
+    if a.flags != b.flags {
+        return f"flags: clang {hex(a.flags)}, kod {hex(b.flags)}"
+    }
+    if not same_int(a.minos, b.minos) {
+        return f"minos: clang {hex_or_none(a.minos)}, kod {hex_or_none(b.minos)}"
+    }
+    if a.heads != b.heads {
+        return f"sections: clang {py_list(a.heads)}, kod {py_list(b.heads)}"
+    }
+    for i, x in a.bytes {
+        let y = b.bytes[i]
+        if x == y {
+            continue
+        }
+        mut at = len(x)
+        if len(y) < at {
+            at = len(y)
+        }
+        for k in 0..at {
+            if x[k] != y[k] {
+                at = k
+                break
+            }
+        }
+        return f"{a.names[i]} differs at {hex(at)} (sizes {hex(len(x))}, {hex(len(y))}): clang {bytes_hex(x, at, at + 8)}, kod {bytes_hex(y, at, at + 8)}"
+    }
+    if a.relocs != b.relocs {
+        return f"relocs: only clang {only_in(a.relocs, b.relocs, names: false)}, only kod {only_in(b.relocs, a.relocs, names: false)}"
+    }
+    if a.defined != b.defined {
+        return f"defined: only clang {only_in(a.defined, b.defined, names: false)}, only kod {only_in(b.defined, a.defined, names: false)}"
+    }
+    if a.undefined != b.undefined {
+        return f"undefined: only clang {only_in(a.undefined, b.undefined, names: true)}, only kod {only_in(b.undefined, a.undefined, names: true)}"
+    }
+    return ""
+}
+
+// --- Comparing, several files at once ------------------------------------------
+
+// A file on its way: compiling (phase 0), assembled by clang (1), by kod (2).
+type Slot = struct {
+    index: int64
+    phase: int64
+    proc: Proc
+}
+
+// What came of a file: left out (not compiled), or its first difference ("" for
+// none).
+type Outcome = struct {
+    compared: bool
+    difference: str
+}
+
+func compare_objects(anon clang_o: str, anon kod_o: str) -> str or Error {
+    let a = try read_object(io.read_file(clang_o))
+    let b = try read_object(io.read_file(kod_o))
+    return first_difference(meaning(a), meaning(b))
+}
+
+// What comes after a phase: the next one, or the file's outcome.
+type Next = struct {
+    slot: Slot?
+    outcome: Outcome
+}
+
+// What comes after slot `s`, which has ended.
+func advance(anon s: Slot, files: [str], scratch: str, root: str) -> Next or Error {
+    let path = files[s.index]
+    let stem = path.replace("/", to: "__")
+    let asm = f"{scratch}/{stem}.s"
+    let clang_o = f"{scratch}/{stem}.clang.o"
+    let kod_o = f"{scratch}/{stem}.kod.o"
+    let p = s.proc
+    if s.phase == 0 {
+        if p.expired {
+            return Next(slot: none, outcome: Outcome(compared: true, difference: f"sh_kodc: timed out after {STEP_WAIT_S} s"))
+        }
+        if p.raw != 0 {
+            return Next(slot: none, outcome: Outcome(compared: false, difference: ""))
+        }
+        if io.write_file(asm, p.out.to_str()) != 0 {
+            throw Failed(message: f"as-diff: cannot write {asm}")
+        }
+        return Next(slot: Slot(index: s.index, phase: 1, proc: try begin(CLANG_AS + ["-o", clang_o, asm], dir: root, wait_s: STEP_WAIT_S)), outcome: Outcome(compared: false, difference: ""))
+    }
+    if s.phase == 1 {
+        if p.expired {
+            return Next(slot: none, outcome: Outcome(compared: true, difference: f"clang: timed out after {STEP_WAIT_S} s"))
+        }
+        if p.raw != 0 {
+            return Next(slot: none, outcome: Outcome(compared: true, difference: f"clang: {first_chars(p.err.to_str(), 200)}"))
+        }
+        return Next(slot: Slot(index: s.index, phase: 2, proc: try begin([f"{root}/{SH_KODC}", "_assemble", asm, kod_o], dir: root, wait_s: STEP_WAIT_S)), outcome: Outcome(compared: false, difference: ""))
+    }
+    if p.expired {
+        return Next(slot: none, outcome: Outcome(compared: true, difference: f"kod: timed out after {STEP_WAIT_S} s"))
+    }
+    if p.raw != 0 {
+        return Next(slot: none, outcome: Outcome(compared: true, difference: f"kod: {first_chars(p.err.to_str(), 300)}"))
+    }
+    return Next(slot: none, outcome: Outcome(compared: true, difference: try compare_objects(clang_o, kod_o)))
+}
+
+func compare_all(anon files: [str], width: int64, scratch: str, root: str) -> [Outcome] or Error {
+    mut outcomes: [Outcome] = []
+    for _ in files {
+        outcomes += [Outcome(compared: false, difference: "")]
+    }
+    mut next = 0
+    mut running: [Slot] = []
+    for next < len(files) or len(running) > 0 {
+        for len(running) < width and next < len(files) {
+            running += [Slot(index: next, phase: 0, proc: try begin([f"{root}/{SH_KODC}", files[next]], dir: root, wait_s: STEP_WAIT_S))]
+            next += 1
+        }
+        mut procs: [Proc] = []
+        for s in running {
+            procs += [s.proc]
+        }
+        step(procs, ms: 100)
+        mut still: [Slot] = []
+        for s in running {
+            if not is_done(s.proc) {
+                still += [s]
+            } else {
+                let n = try advance(s, :files, :scratch, :root)
+                if n.slot is Slot(more) {
+                    still += [more]
+                } else {
+                    outcomes[s.index] = n.outcome
+                }
+            }
+        }
+        running = still
+    }
+    return outcomes
+}
+
+// As many at once as Python's thread pool ran: min(32, cores + 4).
+func width() -> int64 {
+    mut cores = 1
+    if capture(["sysctl", "-n", "hw.ncpu"], dir: "") is str(text) {
+        if text.trim().parse_int() is int64(n) {
+            if n > 0 {
+                cores = n
+            }
+        }
+    }
+    if cores + 4 > 32 {
+        return 32
+    }
+    return cores + 4
+}
+
+func run(anon argv: [str]) -> int64 or Error {
+    let root = (try capture(["git", "rev-parse", "--show-toplevel"], dir: "")).trim()
+    mut files: [str] = []
+    if len(argv) > 1 {
+        files = argv[1..len(argv)]
+    } else {
+        for f in (try capture(["git", "ls-files", "*.kod"], dir: root)).split("\n") {
+            let name = f.trim()
+            if name != "" {
+                files += [name]
+            }
+        }
+    }
+    let scratch = (try capture(["mktemp", "-d"], dir: "")).trim()
+    if scratch == "" {
+        throw Failed(message: "as-diff: mktemp -d gave no directory")
+    }
+    let done = compare_all(files, width: width(), :scratch, :root)
+    let _ = run_one(["rm", "-rf", scratch], dir: "")
+    let outcomes = try done
+    mut compared = 0
+    mut differing = 0
+    for i, o in outcomes {
+        if not o.compared {
+            continue
+        }
+        compared += 1
+        if o.difference != "" {
+            differing += 1
+            print(f"differs: {files[i]}\n  {o.difference}")
+        }
+    }
+    print(f"as-diff: {compared} files, {differing} differ")
+    if differing > 0 {
+        return 1
+    }
+    return 0
+}
+
+func main(argv: [str]) -> int64 {
+    match run(argv) {
+        Ok(code) -> {
+            io.flush_stdout()
+            return code
+        }
+        Err(e) -> {
+            io.flush_stdout()
+            io.write_stderr(f"{e.to_str()}\n")
+            return 1
+        }
+    }
+}

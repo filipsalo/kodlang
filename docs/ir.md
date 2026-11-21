@@ -196,7 +196,7 @@ were.
    itself, in the compiler's own process, when `link.cfg` says `AS := kod`.
    What it writes is laid out more plainly than clang's (symbols grouped and
    sorted, data that points at a temporary label relocated against its
-   section), so the check is by meaning, not bytes: `tools/as_diff.py`
+   section), so the check is by meaning, not bytes: `tools/as_diff.kod`
    assembles every file of the corpus both ways and compares each section's
    bytes with the relocated fields cleared, each relocation's place, kind and
    target, and the symbols. Every instruction reaches it as a word except

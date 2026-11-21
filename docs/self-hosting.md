@@ -61,7 +61,7 @@ There is no other way in: without the snapshot, `make` stops and says how to res
 | Name | Meaning |
 |---|---|
 | `LINK` | command that links an executable: `clang -target arm64-apple-darwin -Wl,-dead_strip`. `clang` finds the SDK and the macOS version. |
-| `AS` | what assembles a `.s` file. `kod` (the default) writes the object in the compiler's own process, with `stdlib/kod/macho.kod`: no assembler is started, and a module compiled by `kod build` goes from the compiler's instructions to its object without being written as text at all. Any other value is a command run as `AS -o file.o file.s`, such as `clang -target arm64-apple-darwin -c -x assembler`, clang's own assembler (what `as` runs, minus an `xcrun` shim and a script). The Makefile's own rules read `kod` as the compiler that wrote the `.s` (the snapshot, or the stage being checked), run as `sh_kodc _assemble file.s file.o`. `tools/as_diff.py` checks that the two agree, by meaning, over every file of the corpus. |
+| `AS` | what assembles a `.s` file. `kod` (the default) writes the object in the compiler's own process, with `stdlib/kod/macho.kod`: no assembler is started, and a module compiled by `kod build` goes from the compiler's instructions to its object without being written as text at all. Any other value is a command run as `AS -o file.o file.s`, such as `clang -target arm64-apple-darwin -c -x assembler`, clang's own assembler (what `as` runs, minus an `xcrun` shim and a script). The Makefile's own rules read `kod` as the compiler that wrote the `.s` (the snapshot, or the stage being checked), run as `sh_kodc _assemble file.s file.o`. `tools/as_diff.kod` (`./kod run tools/as_diff.kod`) checks that the two agree, by meaning, over every file of the corpus. |
 | `CC`, `CFLAGS` | compile a C file: `clang`, `-target arm64-apple-darwin -I stdlib -O2`. The target is pinned as in `LINK` (and `as`), so a `clang` that follows the architecture of the shell it runs in (one under Rosetta) does not produce x86_64 objects that the arm64 link rejects. |
 | `RUNTIME_C` | C files linked into every program; built to `build/stage0/<name>.o` |
 | `STAGE0_KOD` | Kod modules linked into every program, in link order; prebuilt by the snapshot compiler to `build/stage0/_<basename>.o`, so their basenames must be unique |
@@ -93,9 +93,7 @@ The fixed-point check shows that a compiler reproduces itself, not that it is ri
 
 ## What's still Python
 
-- `tests/support/http_fixture.py` and `tools/as_diff.py`: a test's HTTP stand-in and the assembler comparison.
-
-Nothing in the build path is Python: `./kod`, the link at the repository root, starts the native tool, which refreshes the toolchain with `make` itself. Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly.
+Nothing. `./kod`, the link at the repository root, starts the native tool, which refreshes the toolchain with `make` itself. Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly, and the stand-in servers some of them start (`tests/support/github_api.kod`, `tests/support/http_fixture.kod`) are Kod programs they build.
 
 ## Codegen design
 

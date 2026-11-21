@@ -3,11 +3,56 @@ import "net/tcp"
 import "stream" { IoError, IoKind }
 import "process"
 import "io"
+import "libc"
 import "time"
-import "time" { Duration }
+import "time" { Duration, monotonic_ns }
 
-// These tests talk to tests/support/http_fixture.py, a scripted local server,
-// and (for https) to `openssl s_server`.
+// These tests talk to tests/support/http_fixture.kod, a scripted local server
+// that the first test builds, and (for https) to `openssl s_server`. Each
+// test runs in a process of its own, so a test run on its own builds the
+// fixture only when there is none.
+
+let KOD: str = "build/apps/kod/kod"
+let FIXTURE_SOURCE: str = "tests/support/http_fixture.kod"
+let FIXTURE: str = "build/apps/http_fixture/http_fixture"
+let BUILD_WAIT_MS: int64 = 120000
+
+// Build the fixture. A build still running after BUILD_WAIT_MS is killed
+// and the test fails.
+func build_fixture() -> none {
+    let log = f"build/tmp_http_fixture_build_{libc.getpid()}"
+    let script = "exec \"$1\" build \"$2\" >\"$3\" 2>&1"
+    let started = process.start(["sh", "-c", script, "sh", KOD, FIXTURE_SOURCE, log], stdin: .Null)
+    if started is Err(e) {
+        fail(f"start kod build: {e.to_str()}")
+        return
+    }
+    let deadline = monotonic_ns() + BUILD_WAIT_MS * 1000000
+    mut status: int64 = -1
+    for true {
+        let done = started.try_wait()
+        if done is Ok(int64(code)) {
+            status = code
+            break
+        }
+        if done is Err(_) or monotonic_ns() > deadline {
+            let _ = started.kill(signal: .Kill)
+            let _ = started.wait()
+            break
+        }
+        time.sleep(Duration(ms: 10))
+    }
+    let built = io.read_file(log)
+    process.run(["rm", "-f", log])
+    if status != 0 {
+        fail(f"kod build {FIXTURE_SOURCE}: status {status}\n{built}")
+    }
+}
+
+test "the fixture builds" {
+    build_fixture()
+    assert io.is_file(FIXTURE)
+}
 
 type Server = shared struct {
     pid: int64
@@ -23,7 +68,10 @@ func start_fixture_with(anon extra: [str]) -> Server {
     let l = must tcp.listen("127.0.0.1", port: 0)
     let port = l.port()
     must l.close()
-    let pid = process.spawn(["python3", "tests/support/http_fixture.py", f"{port}"] + extra)
+    if not io.is_file(FIXTURE) {
+        build_fixture()
+    }
+    let pid = process.spawn([FIXTURE, f"{port}"] + extra)
     assert pid > 0
     mut tries: int64 = 0
     for tries < 500 {

@@ -7,7 +7,6 @@ icon: lucide/download
 ## Requirements
 
 - macOS on Apple Silicon (AArch64)
-- Python 3.13+ and [uv](https://docs.astral.sh/uv/), only for development: an HTTP test's stand-in server and `tools/as_diff.py` (building and running Kod needs neither)
 - Xcode Command Line Tools (`xcode-select --install`) — provides `as` and `clang`, which compiles the C runtime and links every program
 
 ## From source
@@ -15,7 +14,6 @@ icon: lucide/download
 ```shell
 git clone https://codeberg.org/filipsalo/kod
 cd kod
-uv sync    # only for the development tools
 ```
 
 ## Building the self-hosted compiler
