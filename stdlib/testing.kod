@@ -107,6 +107,100 @@ func end_case() -> none {
     libc.exit(code)
 }
 
+// What a function did in a process of its own (`run`).
+type Ran = struct {
+    // 0 when the function returned, 1 when it panicked (a failed `assert`
+    // in it too), 2 when it called `fail`; -1 when a signal ended it.
+    status: int64
+    // The signal that ended it, else 0.
+    signal: int64
+    stdout: str
+    stderr: str
+}
+
+mut _runs: int64 = 0
+
+// Runs `body` in a child process with `stdin` as its standard input, and gives
+// back its exit status and everything it wrote. The child's output goes to
+// files, not pipes, so it can write any amount without waiting for this side.
+func run(anon body: func() -> none, stdin: str = "") -> Ran {
+    _runs += 1
+    mut dir = "/tmp"
+    if env_text("TMPDIR") is str(t) and len(t) > 0 {
+        dir = t
+        if dir.ends_with("/") {
+            dir = dir[0..len(dir) - 1]
+        }
+    }
+    let base = f"{dir}/kod-run-{libc.getpid()}-{_runs}"
+    let in_path = base + ".in"
+    let out_path = base + ".out"
+    let err_path = base + ".err"
+    if io.write_file(in_path, stdin) != 0 {
+        return Ran(status: -1, signal: 0, stdout: "", stderr: f"testing.run: cannot write {in_path}")
+    }
+    // What either side buffered so far would otherwise come out twice.
+    io.flush_stdout()
+    let _flushed = libc.fflush(0)
+    let pid = unsafe.c_int(libc.fork())
+    if pid == 0 {
+        _redirect(in_path, to: 0, write: false)
+        _redirect(out_path, to: 1, write: true)
+        _redirect(err_path, to: 2, write: true)
+        _failed = false
+        _in_child = false
+        body()
+        io.flush_stdout()
+        mut code = 0
+        if _failed {
+            code = 2
+        }
+        libc.exit(code)
+    }
+    mut ran = Ran(status: -1, signal: 0, stdout: "", stderr: "testing.run: cannot start a process")
+    if pid > 0 {
+        mut status = -1
+        if process.wait_status(pid, name: "run", hang: true) is int64(got) {
+            status = got
+        }
+        ran.stdout = io.read_file(out_path)
+        ran.stderr = io.read_file(err_path)
+        let sig = status & 127
+        if status >= 0 and sig == 0 {
+            ran.status = (status >> 8) & 255
+        } else if status >= 0 {
+            ran.signal = sig
+        }
+    }
+    for path in [in_path, out_path, err_path] {
+        let _gone = libc.unlink(unsafe.c_str(path))
+    }
+    return ran
+}
+
+// In run's child: `path` as descriptor `to`, or the child ends saying why.
+func _redirect(anon path: str, to: int64, write: bool) -> none {
+    mut flags = 0
+    if write {
+        flags = 1537
+    }
+    // O_WRONLY | O_CREAT | O_TRUNC, mode 0644.
+    let fd = unsafe.c_int(libc.open(unsafe.c_str(path), flags, 420))
+    if fd < 0 or unsafe.c_int(libc.dup2(fd, to)) < 0 {
+        kod_eprint(f"testing.run: cannot open {path}")
+        libc.exit(3)
+    }
+    let _closed = libc.close(fd)
+}
+
+func env_text(anon name: str) -> str? {
+    let value = libc.getenv(unsafe.c_str(name))
+    if value == 0 {
+        return none
+    }
+    return unsafe.str_at(value)
+}
+
 // Marks the current test failed and prints `msg` under it. The test goes on,
 // so one run shows every failure.
 func fail(anon msg: str) -> none {

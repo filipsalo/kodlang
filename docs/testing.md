@@ -98,6 +98,49 @@ backtrace:
 A backtrace names a test's frame `test "<its name>"` and ends there. Starting
 the process costs about a millisecond, which the time shown includes.
 
+## Running code in a process of its own
+
+`testing.run(body)` runs the function `body` in a child process and gives back
+what that process did, so a test can check what a program prints, reads or
+exits with, and that something panics:
+
+```kod
+import "io"
+import "testing"
+
+test "indexing past the end panics" {
+    let r = testing.run(func() {
+        let xs = [1]
+        print_int(xs[5])
+    })
+    assert r.status == 1
+    assert r.stderr.contains("panic: index 5 out of bounds for array of length 1")
+}
+
+test "print ends the line" {
+    let r = testing.run(func() { print("hi") })
+    assert r.stdout == "hi\n"
+}
+
+test "read_stdin_line reads one line" {
+    let r = testing.run(func() { print(io.read_stdin_line()) }, stdin: "a\nb\n")
+    assert r.stdout == "a\n"
+}
+```
+
+The result is a `testing.Ran`:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | the exit status: 0 when `body` returned, 1 when it panicked, 2 when it called `fail`; -1 when a signal ended it. `body` is a function, not a `test` block, so an `assert` in it panics when it fails |
+| `signal` | the number of the signal that ended it (`SIGSEGV` is 11), else 0 |
+| `stdout`, `stderr` | everything it wrote to them, through `print` or C's `putchar` alike |
+
+`stdin:` is what the child reads from standard input (nothing by default). The
+child starts from the state of the test at the call, and what it changes
+(variables it captured, module variables) stays in the child. Its output goes
+to files rather than pipes, so it can write any amount.
+
 ## Output
 
 `kod test` replaces itself with the test binary, so the output appears as the tests run, and the exit code is the binary's. The reporter flushes stdout around every `ok`/`FAIL` line and the file header, and before a failure's detail goes to stderr, so the lines stay in order when stdout and stderr are the same pipe or log. What a test prints with `print` is flushed with them, so it comes out before that test's result line. A panic (an index out of bounds, a failed `must`) flushes stdout before its message too.
