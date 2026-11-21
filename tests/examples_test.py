@@ -120,6 +120,9 @@ def find_test_block_files() -> Generator[Path, None, None]:
             for d in dirnames
             if not d.startswith(".") and not (rel_dir == Path(".") and d == "build")
         )
+        # tests/unit runs as one program (test_unit_tests).
+        if rel_dir == UNIT:
+            continue
         for name in sorted(filenames):
             if not name.endswith("_test.kod"):
                 continue
@@ -140,6 +143,23 @@ def test_kod_test_blocks(path: Path, sh_kodc):
     passed, total = int(summary[1]), int(summary[2])
     assert passed == total, output
     assert total >= len(TEST_BLOCK.findall((ROOT / path).read_text())), output
+
+
+UNIT = Path("tests/unit")
+
+
+def test_unit_tests(sh_kodc):
+    """tests/unit: programs that print what they compute turned into `test`
+    blocks, a file each, built into one test program and run at once."""
+    result = run_kod_test(UNIT)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, output
+    summary = TEST_SUMMARY.search(result.stdout)
+    assert summary, output
+    blocks = sum(
+        len(TEST_BLOCK.findall(p.read_text())) for p in (ROOT / UNIT).glob("*_test.kod")
+    )
+    assert int(summary[1]) == int(summary[2]) >= blocks, output
 
 
 @pytest.mark.xdist_group("test_block_canary")

@@ -36,7 +36,7 @@ TEST_SUPPORT_USERS = {
 # Groups and tests that take seconds, started first so that the parallel pass
 # does not end waiting on one that started late.
 SLOW_GROUPS = {"test_support", "http_client_test"}
-SLOW_TESTS = {"test_selfhost_fixed_point"}
+SLOW_TESTS = {"test_selfhost_fixed_point", "test_unit_tests"}
 
 # Modules whose tests all build the same program.
 SHARED_PROGRAM = {
