@@ -59,6 +59,15 @@ type IoError = struct {
 `to_str` gives `open data.bin: No such file or directory`. Recover the kind
 with a downcast:
 
+<!-- kod:
+import "stream"
+import "stream" { Reader }
+import "posix"
+import "posix" { open_read }
+type IoError = stream.IoError
+func use(anon f: posix.Fd) -> none {}
+let path = "data.bin"
+-->
 ```kod
 match open_read(path) {
     Ok(f) -> use(f)
@@ -128,6 +137,11 @@ Neither can fail.
 `BufReader` wraps any `Reader` with a buffer, for protocols that mix lines
 and counted bodies such as HTTP:
 
+<!-- kod:
+import "stream" { BufReader, MemReader, Reader }
+let conn = MemReader(data: kod_str_to_bytes("HTTP/1.0 200 OK\r\n\r\nhi"), pos: 0)
+let length = 2
+-->
 ```kod
 let br = BufReader(inner: conn)
 let status = try br.read_line()          // str?, none at the end of the stream
@@ -170,6 +184,13 @@ A `BufReader` doesn't close its inner stream.
 is ready, and says which, so a program can serve several pipes or
 connections without blocking on any one of them:
 
+<!-- kod:
+import "posix"
+import "time" { Duration }
+let out = posix.stdin()
+let err = posix.stdin()
+let input = posix.stdout()
+-->
 ```kod
 let ready = try posix.poll(read: [out, err], write: [input], timeout: Duration(seconds: 5))
 if ready.read[0] {
@@ -231,6 +252,9 @@ a `Reader` and a `Writer`: it works with `BufReader` and has `read_all`,
 `write_str` and the rest. It is Kod throughout, calling the C library's socket
 functions through [`unsafe`](unsafe.md).
 
+<!-- kod:
+import "stream" { Reader }
+-->
 ```kod
 import "net/tcp" { connect, set_timeout }
 import "time" { Duration }

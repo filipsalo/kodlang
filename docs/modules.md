@@ -10,6 +10,7 @@ Each `.kod` file is a module. Imports name either a file relative to the importi
 
 Two forms:
 
+<!-- no-check -->
 ```kod
 import "./utils"        // relative — utils.kod next to the importing file
 import "./math/vec"     // relative — math/vec.kod below the importing file's directory
@@ -21,6 +22,7 @@ Paths beginning with `./` resolve against the directory of the importing file, n
 
 The imported module's public names are accessible via the import alias, which is the last path component:
 
+<!-- no-check -->
 ```kod
 import "./math/vec"
 
@@ -41,6 +43,7 @@ declared too, `vec()` calls the function and `vec.make(1)` the module's.
 
 To use some names unqualified instead, list them after the path:
 
+<!-- no-check -->
 ```kod
 import "./math/vec" { Vec2, dot }
 
@@ -71,6 +74,7 @@ Each listed name must be a function, extern, constant, variable or type the modu
 
 Parameter defaults, struct field defaults and the method bodies of a generic type resolve function names, type names and import aliases in the module that wrote them, even though they run as part of the caller's code. A default in `util.kod` that calls `helper()` calls util's own `helper`, a function util imports with `{ helper }`, or the builtin of that name, never one that belongs to the caller. Likewise `rng.seed()` in that default means util's own `import "./rng"`, whether or not the caller imports a module named `rng`:
 
+<!-- no-check -->
 ```kod
 // util.kod
 func helper() -> int64 {
@@ -151,6 +155,7 @@ recovers a struct from an interface value whichever side boxed it.
 
 Top-level functions, externs, constants and types are visible to importing modules, except those whose name starts with `_`. Those are private to the module that declares them, which uses them like any other name:
 
+<!-- no-check -->
 ```kod
 // lib.kod
 let _LIMIT: int64 = 3

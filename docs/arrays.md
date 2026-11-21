@@ -27,6 +27,7 @@ error suggests when the module has an interface both implement.
 
 ## Indexing
 
+<!-- kod: let nums: [int64] = [1, 2, 3, 4, 5] -->
 ```kod
 let first: int64 = nums[0]
 let last: int64 = nums[-1]    // negative index counts from end
@@ -60,7 +61,9 @@ variants even when another enum declares variants of those names, and in a
 Arrays, `str` and `bytes` can be indexed, and so can a struct that declares
 an `op_index` method (`Map` does). Element assignment needs an array or a
 struct with `op_index_set`, slicing needs an array, `str` or `bytes`, and
-`for … in` needs an array. Anything else is a compile error.
+`for … in` needs an array, `str`, `bytes`, `Map`, `Set` or `a..b` (see
+[Control flow](control-flow.md#for-in-foreach)). Anything else is a compile
+error.
 
 An array can be changed, by assigning an element or appending, only through
 a name that could be assigned: a `mut` binding or a `mut` parameter. On a
@@ -88,12 +91,14 @@ Indexing a struct calls its `op_index`, so it counts as a call too:
 
 ## Length
 
+<!-- kod: let nums: [int64] = [1, 2, 3, 4, 5] -->
 ```kod
 let n: int64 = len(nums)
 ```
 
 ## Slicing
 
+<!-- kod: let nums: [int64] = [1, 2, 3, 4, 5] -->
 ```kod
 let sub: [int64] = nums[1..4]   // elements 1, 2, 3
 let prefix: [int64] = nums[..3]  // first three
@@ -117,6 +122,7 @@ a += [3, 4]          // a is now [1, 2, 3, 4]
 
 Or `+` to produce a new array; neither operand is modified:
 
+<!-- kod: let a: [int64] = [1, 2, 3, 4] -->
 ```kod
 let b: [int64] = [5]
 let c: [int64] = a + b   // [1, 2, 3, 4, 5]; a and b are unchanged
@@ -167,6 +173,7 @@ doesn't reach it.
 `*` with an `int64` repeats an array, in a new array, which is the way to make
 one of a given size:
 
+<!-- kod: let n = 10 -->
 ```kod
 mut seen = [false] * 1000      // 1000 times false
 let zeros: [int64] = [0] * n
@@ -212,8 +219,9 @@ text of their own: an array of structs without `to_str` can't be shown.
 
 **Index-based:**
 
+<!-- kod: let nums: [int64] = [1, 2, 3, 4, 5] -->
 ```kod
-let i: int64 = 0
+mut i: int64 = 0
 for i < len(nums) {
     print_int(nums[i])
     i = i + 1
@@ -222,6 +230,7 @@ for i < len(nums) {
 
 **Foreach:**
 
+<!-- kod: let nums: [int64] = [1, 2, 3, 4, 5] -->
 ```kod
 for n in nums {
     print_int(n)
@@ -283,6 +292,14 @@ sort.sorted(["b", "a"])      // ["a", "b"]
 declare [`op_lt`](structs.md#operators). `sorted_by` takes the order as a
 function that says whether its first argument goes before its second:
 
+<!-- kod:
+import "sort"
+type Person = struct {
+    name: str
+    age: int64
+}
+let people = [Person(name: "ann", age: 41), Person(name: "bo", age: 29)]
+-->
 ```kod
 sort.sorted_by(people, less: func(a: Person, b: Person) -> bool {
     return a.age < b.age

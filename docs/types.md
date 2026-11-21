@@ -104,6 +104,12 @@ elements are; a shared struct's fields through any name that holds it (see
 A `let` at the top level of a module names a constant. It needs a type, and `mut`
 isn't allowed there:
 
+<!-- kod:
+type Mode = enum {
+    Fast
+    Small
+}
+-->
 ```kod
 let MAX_BLOCK: int64 = 65535
 let SECONDS_PER_DAY: int64 = 24 * 60 * 60
@@ -125,7 +131,7 @@ module. A constant can't be assigned, and neither can its elements
 (`` `PRIMES` is a constant and can't be assigned; a module-level `mut` can be ``).
 
 Each use of an array constant is an array of its own, so changing one changes nothing
-else: after `let p = PRIMES` and `p[0] = 1`, `PRIMES[0]` is still 2. A use that can't
+else: after `mut p = PRIMES` and `p[0] = 1`, `PRIMES[0]` is still 2. A use that can't
 change the array, indexing it, `len` of it or a `for` over it, reads one copy that the
 program builds the first time and keeps, so a lookup table read in a loop allocates
 nothing. Indexing an array of arrays still makes a new array, since the element read
@@ -339,6 +345,10 @@ empty one when there is none.
 
 Test with `is` and destructure with `Some(binding)`:
 
+<!-- kod:
+let x: int64? = none
+let y: int64? = 42
+-->
 ```kod
 if x is none {
     print("nothing")
@@ -366,6 +376,7 @@ when `a` is false. `Some(_)` or `Some(_v)` binds nothing and works anywhere.
 
 Or peel off the `Some` with `let .Some(v) = y else { ... }`:
 
+<!-- kod: let y: int64? = 42 -->
 ```kod
 let .Some(v) = y else { return -1 }
 // v is in scope and has type int64
@@ -385,7 +396,7 @@ is `none`. `must x` evaluates to `T`, and stops the program on `none` with the
 position of the value, as it stops on a failed `T or Error`:
 
 ```kod
-let n: int64? = find("hello", 'l')
+let n: int64? = "hello".find("l")
 let idx: int64  = n? or -1     // -1 if none
 let idx2: int64 = must n       // stops if none
 ```
@@ -432,8 +443,10 @@ method call: arguments it leaves out take the method's
 when `x` is `none`. A `T?` doesn't stand in for a `T`: returning `t?.name`
 from a function declared `-> str` or `-> str or Error` is an error, so
 unwrap it first with `t?.name?` or `t?.name? or ""`, or declare the
-function `-> str?`. `t?.name = v` isn't an assignment; unwrap first, as in
-`if t is Some(u) { u.name = v }`.
+function `-> str?`. `t?.name = v` isn't an assignment; unwrap first. For a
+shared struct that is `if t is Some(u) { u.name = v }`; a struct is a value,
+so change a `mut` copy and store it back: `mut u = must t`, `u.name = v`,
+`t = u`.
 
 ## Arrays
 
@@ -781,6 +794,10 @@ its error isn't an `Error` to report or pass on; match it instead.
 A call whose result is a `T or Error` can't be used as a statement on its own, because
 that would drop an error without a word:
 
+<!-- kod:
+import "posix"
+let file = posix.stdout()
+-->
 ```kod
 file.close()               // error: the `none or Error` result of this call is dropped
 try file.close()           // propagate it
@@ -795,6 +812,11 @@ the rest of the block: it is `let r = try r`, so `r` is the `T` from there on.
 of the block assigns to `r`, and after the block `r` has its declared type
 again:
 
+<!-- kod:
+func file_size(anon path: str) -> int64 or Error {
+    return 3
+}
+-->
 ```kod
 func size_plus(anon path: str) -> int64 or Error {
     let size = file_size(path)
@@ -817,6 +839,11 @@ A `T` goes where a `T or Error` is declared as its `Ok`, the way a `T` goes into
 a struct field, an array element, and an arm of a `match` whose value goes to
 one of them:
 
+<!-- kod:
+func read_size(anon path: str) -> int64 or Error {
+    return 0
+}
+-->
 ```kod
 let r: int64 or Error = 3                // Ok(3)
 let rs: [int64 or Error] = [1, read_size("a.txt")]
@@ -868,6 +895,16 @@ A [type pattern](pattern-matching.md#type-patterns) on a result tests what it
 holds when it succeeded, so a result matches like the value it carries.
 `Error(e)` is another way to write `Err(e)`:
 
+<!-- kod:
+func parse(anon s: str) -> int64 | str or Error {
+    return 0
+}
+func use(anon n: int64) -> none {
+}
+func show(anon t: str) -> none {
+}
+let s = "42"
+-->
 ```kod
 match parse(s) {                         // -> int64 | str or Error
     int64(n) -> use(n)
@@ -898,6 +935,15 @@ if r is Err(e) { print(e.to_str()) }
 on a `T?`. Each takes the success value, and on a failure gives up the error
 right there, where the code says so:
 
+<!-- kod:
+type Config = struct {
+    name: str
+}
+func load(anon path: str) -> Config or Error {
+    return Config(name: path)
+}
+let path = "app.cfg"
+-->
 ```kod
 let n = read_size("a.txt")? or 0
 let name = load(path)?.name? or "?"
@@ -914,6 +960,15 @@ write `must r`, which prints the error's message.
 struct, downcast with `is StructType(binding)` — a general interface downcast
 that tests the boxed type and, on a match, binds the typed value:
 
+<!-- kod:
+type NotFound = struct {
+    path: str
+    func to_str(self) -> str { return f"not found: {self.path}" }
+}
+func use(anon n: int64) -> none {
+}
+let path = "a.txt"
+-->
 ```kod
 match read_size(path) {
     Ok(n)  -> use(n)

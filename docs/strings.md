@@ -56,10 +56,15 @@ print(f"the answer is {n}")       // the answer is 42
 Anything inside `{ }` is a Kod expression, string literals and nested
 f-strings included (`f"[{f"<{n}>"}]"`, `f"{"}" + s}"`). Non-`str` values are auto-converted via their `to_str` method:
 
+<!-- kod:
+let a = 1
+let b = 2
+let items = [1, 2, 3]
+-->
 ```kod
 print(f"{a} + {b} = {a + b}")
 print(f"flag={true}")             // flag=true
-print(f"items: {items.len()}")    // any type with to_str works
+print(f"items: {len(items)}")    // any type with to_str works
 ```
 
 Interpolations are evaluated left to right, as are the operands of an
@@ -134,6 +139,7 @@ The same specs are also methods: `n.format("05")`, `x.format(".2")` and
 
 Use `+` to concatenate strings, or `+=` to append in place:
 
+<!-- kod: let name = "world" -->
 ```kod
 let greeting: str = "hello" + ", " + name + "!"
 
@@ -176,6 +182,7 @@ _main:
 
 Combine with `f` for interpolation:
 
+<!-- kod: let mangled = "_kod" -->
 ```kod
 let asm: str = f"""
     bl ${mangled}$main
@@ -189,6 +196,7 @@ Each content line must be indented at least as far as the closing
 
 ## Length
 
+<!-- kod: let s = "hello" -->
 ```kod
 let n: int64 = len(s)
 ```
@@ -197,12 +205,14 @@ let n: int64 = len(s)
 
 Index into a string to get the ASCII value of a character (as `int64`):
 
+<!-- kod: let s = "hello" -->
 ```kod
 let c: int64 = s[0]   // 'h' → 104
 ```
 
 Negative indices count from the end:
 
+<!-- kod: let s = "hello" -->
 ```kod
 let last: int64 = s[-1]
 ```
@@ -210,11 +220,12 @@ let last: int64 = s[-1]
 The index must be an `int64`, so `s["a"]` is an error.
 
 Strings are immutable, so assigning to an element (`s[0] = 'H'`) is an
-error. A `str` can't be iterated with `for … in` either; iterate over
-`s.code_points()` instead.
+error. `for … in` over a `str` gives its bytes, as `s[i]` does; for text,
+iterate over `s.code_points()` instead.
 
 ## Slicing
 
+<!-- kod: let s = "hello" -->
 ```kod
 let sub: str = s[2..5]   // bytes at positions 2, 3, 4
 ```
@@ -228,6 +239,7 @@ bounds must be `int64`. `bytes` slices follow the same rules.
 
 ## Comparison
 
+<!-- kod: let s = "hello" -->
 ```kod
 if s == "hello" {
     print("match")
@@ -303,6 +315,7 @@ for a value outside the `int64` range.
 `+=` copies the whole string every time, so a loop that appends thousands of
 pieces does quadratic work. Use a `StrBuilder` for that:
 
+<!-- kod: let body = b"<html></html>" -->
 ```kod
 import "strbuilder" { StrBuilder }
 

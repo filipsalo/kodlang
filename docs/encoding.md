@@ -48,6 +48,10 @@ Errors are `IoError`s of kind `InvalidInput`, with `op` `base64 decode` and a
 `stdlib/compress/deflate.kod` compresses into the three formats that
 [`compress/inflate`](#decompression) reads, written in Kod like it.
 
+<!-- kod:
+let text = "to be or not to be, that is the question"
+let data = kod_str_to_bytes(text)
+-->
 ```kod
 import "compress/deflate"
 
@@ -74,6 +78,7 @@ every 16 KB.
 `stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data. It is
 written in Kod, like [compressing](#compression), so it links no C library.
 
+<!-- kod: let data = deflate.gzip(kod_str_to_bytes("hello, hello")) -->
 ```kod
 import "compress/inflate"
 

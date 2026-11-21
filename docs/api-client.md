@@ -41,6 +41,12 @@ as `github.repo(name)` and `github.open_issues(name, limit: 3)`. One `Client` se
 both requests, which keeps the connection from the first and uses it for the second
 ([HTTP client](http.md)).
 
+<!-- kod:
+import "net/http" { Client }
+import "time" { Duration }
+let token = "secret"
+let url = "https://api.github.com/repos/kod/kod"
+-->
 ```kod
 let client = Client(deadline: Duration(seconds: 15))
 client.headers.add("Accept", "application/vnd.github+json")
@@ -57,6 +63,10 @@ URL.
 **Query strings.** Build them with `Query`, which encodes names and values, rather
 than by joining strings:
 
+<!-- kod:
+import "net/http" { Query, with_query }
+let name = "anthropics/anthropic-sdk-python"
+-->
 ```kod
 let query = Query()
 query.add("state", "open")
@@ -67,6 +77,9 @@ let url = with_query("/repos/" + name + "/issues", query)
 **Reading JSON.** `json.parse` returns `Value or Error`. The accessors never fail,
 so a missing or null field is a fallback, not a crash:
 
+<!-- kod:
+import "json"
+-->
 ```kod
 func text_of(anon v: json.Value, key: str, fallback: str) -> str {
     return v.get(key).as_str()? or fallback

@@ -8,6 +8,10 @@ icon: lucide/gauge
 spends its time. It stops the program at a fixed interval of CPU time, notes
 where it was, and at the end prints which functions it was caught in most:
 
+<!-- kod:
+func run_the_slow_part() -> none {
+}
+-->
 ```kod
 import "kod/profiling"
 
@@ -50,15 +54,18 @@ runtime or the system's libraries.
   `frame` and resolve them with `kod/inspect`, which gives `none` for an
   address outside Kod code, such as `main`'s caller:
 
-  ```kod
-  import "kod/inspect"
+<!-- kod:
+import "kod/profiling"
+-->
+```kod
+import "kod/inspect"
 
-  for i in 0..profiling.n_samples() {
-      if inspect.resolve(addr: profiling.frame(i, at: 1)) is Some(f) {
-          print(f.name)                     // who called the function sampled
-      }
-  }
-  ```
+for i in 0..profiling.n_samples() {
+    if inspect.resolve(addr: profiling.frame(i, at: 1)) is Some(f) {
+        print(f.name)                     // who called the function sampled
+    }
+}
+```
 
 - **Inlined functions.** A small function the compiler compiles into its
   caller shows as the caller.

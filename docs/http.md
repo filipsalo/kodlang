@@ -30,6 +30,10 @@ cookies and no proxy support.
 A `Client` carries the settings that describe the service you talk to (its
 headers, its certificate roots, its deadline) and makes the requests:
 
+<!-- kod:
+let token = "secret"
+let payload = kod_str_to_bytes("{}")
+-->
 ```kod
 import "net/http" { Client }
 import "time" { Duration }
@@ -75,6 +79,11 @@ one that you leave out means the `Client`'s value:
 | `body` | the request body (`bytes`); empty by default |
 | `trust_file`, `timeout`, `deadline`, `max_redirects`, `accept_gzip`, `limits` | replace the client's for this request, including with `0` or `false` |
 
+<!-- kod:
+import "net/http" { Client, Options }
+let client = Client()
+let url = "https://api.example.com/users/1"
+-->
 ```kod
 let r = try client.get(url, options: Options(deadline: Duration(seconds: 2)))   // this one is quicker
 let q = try client.get(url, options: Options(deadline: Duration()))              // and this one has none
@@ -252,7 +261,7 @@ bytes, so UTF-8 passes through unchanged. A `user` containing `:` is an
 `InvalidInput` error, because the colon is what separates the two.
 
 ```kod
-import "net/http" { basic_auth }
+import "net/http" { basic_auth, Options }
 
 let options = Options()
 options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))

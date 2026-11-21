@@ -53,6 +53,7 @@ conversions as a [function argument](functions.md#argument-types):
 
 Inside a `match` arm, the enum name can be omitted when the type is unambiguous:
 
+<!-- kod: let d: Direction = .North -->
 ```kod
 match d {
     .North -> print("north")
@@ -99,9 +100,8 @@ type Shape = enum {
     Rect(w: int64, h: int64)
 }
 
-let s = .Circle(r: 2)
-// error: `.Circle` is ambiguous: `Figure` and `Shape` both declare it;
-// write `Shape.Circle` or give the value a type
+let s = .Circle(r: 2)    // error: `.Circle` is ambiguous: `Figure` and `Shape`
+                         // both declare it; write `Shape.Circle` or give the value a type
 ```
 
 `let s: Shape = .Circle(r: 2)` and `Shape.Circle(r: 2)` both work. The
@@ -279,6 +279,7 @@ types: on an `Either[int64, str]`, `Either.Left(n)` binds an `int64`.
 
 ## Pattern matching
 
+<!-- kod: let m: Message = .Text(content: "hi") -->
 ```kod
 match m {
     Message.Quit -> print("quit")
@@ -339,6 +340,7 @@ other side's enum doesn't declare.
 A match can produce a value when every arm has a value: an expression, or a
 [block ending in one](pattern-matching.md#arms-with-several-statements):
 
+<!-- kod: let d: Direction = .West -->
 ```kod
 let label: str = match d {
     .North -> "north"
@@ -350,6 +352,7 @@ let label: str = match d {
 
 Payload bindings are in scope in the arm's expression:
 
+<!-- kod: let m: Message = .Move(x: 1, y: 2) -->
 ```kod
 let dist: int64 = match m {
     .Move(x, y) -> x + y

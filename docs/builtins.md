@@ -190,13 +190,14 @@ arguments. `m[k] = v` evaluates `m`, then `k`, then `v` before the call.
 `m[k, default: d]` is `k`'s value, or `d` when there is none, through the
 struct's `op_index_or`; for a `Map` it is a `V`, not a `V?`:
 
+<!-- kod: let words = ["to", "be", "or", "not", "to", "be"] -->
 ```kod
 mut counts = Map[str, int64]()
+mut groups = Map[int64, [str]]()
 for word in words {
     counts[word, default: 0] += 1
+    groups[len(word), default: []] += [word]
 }
-mut groups = Map[int64, [str]]()
-groups[len(word), default: []] += [word]
 ```
 
 A change to an entry, such as `m[k] += v`, `m[k][i] = v`, `m[k].x = v` or
@@ -359,7 +360,7 @@ import "env"
 func main() -> int64 {
     let token = env.get("API_TOKEN")
     print(token? or "no token")
-    env.set("MODE", "test")
+    must env.set("MODE", "test")
     env.unset("API_TOKEN")
     return 0
 }

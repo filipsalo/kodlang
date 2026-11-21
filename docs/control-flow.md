@@ -6,6 +6,7 @@ icon: lucide/git-branch
 
 ## `if` / `else`
 
+<!-- kod: let x = 5 -->
 ```kod
 if x > 0 {
     print("positive")
@@ -39,6 +40,20 @@ The condition can bind names as an `if` condition does, alone or joined by
 `and`. The loop ends when a pattern fails, and the names are new each time
 round:
 
+<!-- kod:
+type LineReader = shared struct {
+    lines: [str]
+    pos: int64
+    func next_line(self) -> str? {
+        if self.pos >= len(self.lines) {
+            return none
+        }
+        self.pos += 1
+        return self.lines[self.pos - 1]
+    }
+}
+let reader = LineReader(lines: ["a", "b", ""], pos: 0)
+-->
 ```kod
 for reader.next_line() is Some(line) and len(line) > 0 {
     print(line)
@@ -60,6 +75,7 @@ The loop variable is declared implicitly — no `let` needed.
 
 `for i, x in xs` also numbers the elements from 0:
 
+<!-- kod: let names: [str] = ["alice", "bob", "carol"] -->
 ```kod
 for i, name in names {
     print(f"{i}: {name}")
@@ -96,6 +112,10 @@ A `Map` is iterated in the order its keys were first set: `for k in m` gives the
 keys and `for k, v in m` each key with its value. The loop goes over the entries
 the map had when it started, so the body may set and remove entries freely.
 
+<!-- kod:
+mut ages = Map[str, int64]()
+ages.set("alice", 30)
+-->
 ```kod
 for name, age in ages {
     print(f"{name} is {age}")
@@ -113,7 +133,7 @@ of value is an error.
 Works inside both loop forms:
 
 ```kod
-let i: int64 = 0
+mut i: int64 = 0
 for i < 100 {
     if i == 5 {
         break
@@ -122,6 +142,13 @@ for i < 100 {
 }
 ```
 
+<!-- kod:
+func process(anon x: int64) -> none {
+    print_int(x)
+}
+let items = [1, 2, 3]
+let skip_value = 2
+-->
 ```kod
 for x in items {
     if x == skip_value {
@@ -135,6 +162,14 @@ for x in items {
 
 Pattern matching on enums, integers, and strings. See [Pattern matching](pattern-matching.md).
 
+<!-- kod:
+type Direction = enum {
+    North
+    South
+    East
+}
+let direction = Direction.North
+-->
 ```kod
 match direction {
     Direction.North -> print("north")
@@ -163,6 +198,16 @@ and reading or assigning the name there means the new one. When that
 block, arm or loop ends, the old binding is back with its own value,
 type and mutability:
 
+<!-- kod:
+type A = struct {
+    x: int64
+    func show(self) -> str { return "A" }
+}
+type B = struct {
+    x: int64
+    func show(self) -> str { return "B" }
+}
+-->
 ```kod
 func show(anon item: A, anon flag: bool) -> str {
     if flag {
@@ -173,6 +218,9 @@ func show(anon item: A, anon flag: bool) -> str {
 }
 ```
 
+<!-- kod:
+let xs = [1, 2, 3]
+-->
 ```kod
 mut total = 0
 for x in xs {
@@ -197,6 +245,13 @@ type differs: `let x = x + 1`, `let x = f"#{x}"`, `for x in x`,
 match, so there the name still has the binding it had before the
 let-else:
 
+<!-- kod:
+func parse_num(anon s: str) -> int64? {
+    return s.parse_int()
+}
+let args = ["1", "x", "3"]
+mut total = 0
+-->
 ```kod
 for arg in args {
     let .Some(arg) = parse_num(arg) else {
@@ -223,6 +278,9 @@ import (`{ Mode }`) ``), as with no local at all. Assigning the name
 still gives the errors above. Declare a name before the block to use it
 after the block:
 
+<!-- kod:
+let n = 5
+-->
 ```kod
 mut label = "other"
 if n > 0 {

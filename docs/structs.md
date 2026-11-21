@@ -72,9 +72,8 @@ The values are computed in the order they're written. Every value needs
 its label, so `Point(10, 20)` is an error at each value:
 
 ```kod
-let p: Point = Point(10, 20)
-// error: argument 1 of `Point` needs a field label (`x:`)
-// error: argument 2 of `Point` needs a field label (`y:`)
+let p: Point = Point(10, 20)   // error: argument 1 of `Point` needs a field label (`x:`)
+                               // error: argument 2 of `Point` needs a field label (`y:`)
 ```
 
 Each unlabelled value is offered the next field, in declaration order,
@@ -133,6 +132,14 @@ let m: Map[str, int64] = Map[str, int64]()
 A struct may declare its own constructor, a function named `init` inside the
 body with no `self`:
 
+<!-- kod:
+type BadPort = struct {
+    number: int64
+    func to_str(self) -> str {
+        return f"bad port {self.number}"
+    }
+}
+-->
 ```kod
 type Port = struct {
     number: int64
@@ -167,6 +174,13 @@ A [generic struct](#generic-structs) may declare `init` too. It returns the
 struct with its own type parameters, `Range[T]` or `Range[T] or Error`, and is
 called with the type arguments spelled out as for any construction of one:
 
+<!-- kod:
+type Backwards = struct {
+    func to_str(self) -> str {
+        return "backwards"
+    }
+}
+-->
 ```kod
 type Range[T] = struct {
     lo: T
@@ -236,6 +250,10 @@ A method whose name starts with `_` is private in the same way: only the
 struct's own functions can call it, as `self._name(...)` or on another value
 of the struct.
 
+<!-- kod:
+let ds: [Duration] = []
+let d = ds[0]
+-->
 ```kod
 type Duration = struct {
     _ns: int64
@@ -300,6 +318,7 @@ name.
 
 ## Field access
 
+<!-- kod: let p = Point(x: 1, y: 2) -->
 ```kod
 print_int(p.x)
 print_int(p.y)
@@ -307,6 +326,7 @@ print_int(p.y)
 
 ## Field mutation
 
+<!-- kod: mut p = Point(x: 1, y: 2) -->
 ```kod
 p.x = p.x + 1
 ```
@@ -319,6 +339,12 @@ that may itself be changed. On a `let` struct, a parameter not declared
 so is changing an array in one of its fields. Each place has a struct of its
 own, so a change shows only there:
 
+<!-- kod:
+type Line = struct {
+    from: Point
+    to: Point
+}
+-->
 ```kod
 mut a = Point(x: 1, y: 2)
 let b = a

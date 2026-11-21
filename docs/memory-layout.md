@@ -125,7 +125,7 @@ doesn't form: a `weak` field doesn't keep its value alive, and reads as `none`
 once the value is freed.
 
 ```kod
-type Node = struct {
+type Node = shared struct {
     name: str
     weak other: Node?
 }

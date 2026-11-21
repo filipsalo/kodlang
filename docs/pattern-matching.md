@@ -26,6 +26,7 @@ Arms are tested top-to-bottom. The first matching arm executes.
 `else` matches any value the other arms didn't cover. It must be the
 last arm. The arrow is optional after `else`:
 
+<!-- kod: let x = 3 -->
 ```kod
 match x {
     1    -> print("one")
@@ -41,6 +42,7 @@ match x {
 
 ### Integer literal
 
+<!-- kod: let n = -1 -->
 ```kod
 match n {
     0    -> print("zero")
@@ -56,6 +58,7 @@ literal can be a pattern, so `-n` is not one.
 
 ### String literal
 
+<!-- kod: let s = "hello" -->
 ```kod
 match s {
     "hello" -> print("greeting")
@@ -66,6 +69,7 @@ match s {
 
 ### Bool
 
+<!-- kod: let b = true -->
 ```kod
 match b {
     true  -> print("yes")
@@ -79,6 +83,7 @@ against `3` is an error. On an optional it tests the value inside (see
 
 ### Enum variant (explicit)
 
+<!-- kod: let c: Color = .Green -->
 ```kod
 type Color = enum {
     Red
@@ -97,6 +102,7 @@ match c {
 
 When the type is clear from context, the enum name can be omitted:
 
+<!-- kod: let c: Color = .Blue -->
 ```kod
 match c {
     .Red   -> print("red")
@@ -109,6 +115,7 @@ match c {
 
 Bind the payload fields:
 
+<!-- kod: let shape: Shape = .Circle(radius: 2) -->
 ```kod
 type Shape = enum {
     Circle(radius: int64)
@@ -130,6 +137,7 @@ implicit `.Variant` that no enum declares.
 Each binding takes the type of the field it binds, so different arms can
 reuse a name for payloads of different types:
 
+<!-- kod: let v: Value = .I(value: 1) -->
 ```kod
 type Value = enum {
     I(value: int64)
@@ -144,6 +152,7 @@ match v {
 
 ### Optional
 
+<!-- kod: let maybe_n: int64? = 5 -->
 ```kod
 match maybe_n {
     Some(n) -> print_int(n)
@@ -156,6 +165,12 @@ the value inside, so it needs no `Some`. `_`, and a name in a payload position,
 match the optional itself, `none` included, so `Some(n)` is how to bind what's
 inside:
 
+<!-- kod:
+type Color = enum {
+    Red
+    Rgb(value: int64)
+}
+-->
 ```kod
 let color: Color? = .Red
 match color {
@@ -217,6 +232,7 @@ On a `T or Error`, a type pattern tests the value of an `Ok`, and `Error(e)` is
 On an interface, `T` is a struct or enum that implements it, and the pattern
 is a downcast, so a `match` still needs an `else`:
 
+<!-- no-check -->
 ```kod
 func describe(anon s: Shape) -> str {
     match s {
@@ -258,6 +274,17 @@ A type pattern with labels matches a struct field by field: each label names a
 field, and what follows it is the pattern that field must match, or the name to
 bind it to:
 
+<!-- kod:
+type Circle = struct {
+    radius: int64
+}
+type Node = shared struct {
+    name: str
+    weak parent: Node?
+}
+let shape: Rect | Circle = Rect(w: 2, h: 3)
+let node = Node(name: "root")
+-->
 ```kod
 type Rect = struct {
     w: int64
@@ -297,6 +324,7 @@ if node is Node(name: "root", parent: none) {
 
 A lightweight check without destructuring:
 
+<!-- kod: let x: int64? = none -->
 ```kod
 if x is none {
     print("empty")
@@ -311,6 +339,7 @@ if x is not none {
 After an `if` tests a name, the name has the type the test proves inside the
 block that runs, with no new name to bind:
 
+<!-- no-check -->
 ```kod
 func describe(anon shape: Shape, anon id: int64 | str | none) -> none {
     if shape is Circle {
@@ -399,6 +428,12 @@ way, under the same rules: see [`T or Error`](types.md#fallible-types-t-or-error
 A payload position can hold a pattern instead of a name. The arm matches only
 when every nested pattern does, and a failed test moves on to the next arm:
 
+<!-- kod:
+let shape: Shape = .Rect(w: 3, h: 0)
+func find_best() -> Shape? {
+    return .Circle(radius: 1)
+}
+-->
 ```kod
 type Shape = enum {
     Circle(radius: int64)
@@ -438,6 +473,7 @@ An arm's pattern can be followed by `if` and a condition. The arm runs only
 when the pattern matches and the condition is true; otherwise the next arm is
 tried. The pattern's bindings are in scope in the guard:
 
+<!-- kod: let shape: Shape = .Circle(radius: 120) -->
 ```kod
 match shape {
     .Circle(r) if r > 100 -> print("big circle")
@@ -458,6 +494,17 @@ guard. A guard can't bind names itself; put the pattern in the arm instead:
 
 Patterns joined with `|` share an arm, in a `match` statement or expression:
 
+<!-- kod:
+type Token = enum {
+    Plus
+    Minus
+    Star
+    Slash
+    Num(value: int64)
+}
+let token: Token = .Star
+let n = 2
+-->
 ```kod
 match token {
     .Plus | .Minus -> print("additive")
@@ -480,6 +527,15 @@ line of its own.
 
 A `match` produces a value when every arm has a value, in the simplest case a single expression:
 
+<!-- kod:
+type Direction = enum {
+    North
+    South
+    East
+    West
+}
+let direction: Direction = .East
+-->
 ```kod
 let label: str = match direction {
     .North -> "north"
@@ -494,6 +550,7 @@ arm's expression, just as in the statement form. They may hide a local of
 the same name, which is back after the arm (see
 [Blocks and bindings](control-flow.md#blocks-and-bindings)):
 
+<!-- kod: let shape: Shape = .Rect(w: 2, h: 3) -->
 ```kod
 let area: int64 = match shape {
     Shape.Circle(r)  -> 3 * r * r
@@ -504,6 +561,7 @@ let area: int64 = match shape {
 Without an annotation, the match takes the type of its first arm that
 isn't `none`, and each arm's bindings have that arm's payload types:
 
+<!-- kod: let w: Value = .S(value: "x") -->
 ```kod
 let name = match w {
     .S(value) -> value          // value: str
@@ -536,6 +594,7 @@ An arm of a match expression may be a block. Its last statement must be an
 expression, and that expression is the arm's value; the statements before it
 run first, and what they bind is gone after the arm:
 
+<!-- kod: let shape: Shape = .Circle(radius: 2) -->
 ```kod
 let size: int64 = match shape {
     Shape.Circle(r) -> {
@@ -558,6 +617,17 @@ arms are blocks already.
 When you want a one-arm match with bindings in scope for the body, the
 `if`/`is` sugar is shorter than a full `match`:
 
+<!-- kod:
+type Decl = enum {
+    Func(id: int64)
+    Other
+}
+type Module = struct {
+    decls: [Decl]
+}
+let module = Module(decls: [.Func(id: 7)])
+let i = 0
+-->
 ```kod
 if module.decls[i] is .Func(decl_id) {
     // decl_id is in scope here
@@ -594,6 +664,16 @@ A pattern with bindings can also be one of the operands an `if` condition
 joins with `and`. Its names are in scope in the operands after it and in
 the body, as if each `is` were its own `if` nested inside the one before:
 
+<!-- kod:
+type Decl = enum {
+    Import(path: str, alias: str, items: [str])
+    Other
+}
+let decl: Decl = .Import(path: "fs", alias: "f", items: [])
+mut aliases: [str] = []
+let a: int64? = 1
+let b: int64? = 1
+-->
 ```kod
 if decl is .Import(_path, alias, _items) and not alias.starts_with("#") {
     aliases += [alias]
@@ -611,6 +691,7 @@ bindings. A `for` condition can bind the same way (see
 under `or` or `not`, not with `is not` inside an `and` chain, not in a `let`
 value. There the `is` is only a test, and `.Circle(r)` is an error.
 
+<!-- kod: let v: int64? = 3 -->
 ```kod
 if v is .Some(x) {
     print_int(x)
@@ -630,6 +711,11 @@ rules as the end of a function (see
 or a `match` whose every branch exits, in a `for true` loop it can't
 `break` out of, or in a call that never returns, as for match arms above:
 
+<!-- kod:
+mut m = Map[str, int64]()
+m["a"] = 1
+let key = "a"
+-->
 ```kod
 let .Some(v) = m.get(key) else { return -1 }
 // v is in scope here
@@ -646,6 +732,12 @@ On a `T or Error` value, `.Ok(v)` binds the value and `.Err(e)` the
 error. On an enum value, the variant is looked up in that value's
 enum, even when another enum declares a variant of the same name:
 
+<!-- kod:
+func read_text(anon path: str) -> str or Error {
+    return f"contents of {path}"
+}
+let path = "notes.txt"
+-->
 ```kod
 let .Ok(text) = read_text(path) else { return 1 }
 print(f"{text}!")    // text is a str
@@ -659,6 +751,7 @@ wildcard arm is present. An arm naming a variant the enum doesn't declare
 is reported instead, since it's usually a misspelling of the missing one,
 and its bindings don't cause further errors in the arm.
 
+<!-- no-check -->
 ```kod
 type Color = enum {
     Red
@@ -667,7 +760,7 @@ type Color = enum {
 }
 
 let c: Color = .Red
-// error: match on Color doesn't cover variant Blue
+// error: match on `Color` doesn't cover variant `Blue`
 match c {
     .Red -> print("red")
     .Green -> print("green")
@@ -680,6 +773,7 @@ some other arm has to handle that variant too.
 Nested patterns are checked all the way down. These arms cover every `Shape?`,
 so no `else` is needed:
 
+<!-- kod: let best: Shape? = .Rect(w: 2, h: 3) -->
 ```kod
 match best {
     Some(.Circle(_))  -> print("circle")
@@ -695,6 +789,7 @@ for the same variant.
 
 Add the missing arm or an `else` catch-all:
 
+<!-- kod: let c: Color = .Blue -->
 ```kod
 match c {
     .Red -> print("red")

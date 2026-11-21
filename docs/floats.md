@@ -87,6 +87,10 @@ A JSON number that is not a whole `int64` keeps its text in a
 [`Decimal`](json.md), so reading one as a float is `parse_float` on that text,
 and writing one is `to_str`:
 
+<!-- kod:
+import "json"
+let item = must json.parse("{\"price\": 9.95}")
+-->
 ```kod
 let text = must item.get("price").as_number_text()
 let price = must text.parse_float()

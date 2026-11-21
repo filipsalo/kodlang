@@ -27,7 +27,7 @@ them in a struct.
 ## Calling
 
 ```kod
-let result: int64 = add(1, 2)
+let result: int64 = add(a: 1, b: 2)
 ```
 
 The arguments are worked out left to right, each once, before the body runs.
@@ -325,6 +325,7 @@ with `panic(...)`.
 
 Every executable must define `main`. It can take no arguments or receive the command-line argument list:
 
+<!-- no-check -->
 ```kod
 // no args
 func main() -> int64 {
@@ -350,7 +351,7 @@ Functions inside a `struct` type declaration are methods. The first parameter mu
 type Counter = struct {
     value: int64
 
-    func increment(self) -> none {
+    func increment(mut self) -> none {
         self.value = self.value + 1
     }
 
@@ -363,7 +364,7 @@ type Counter = struct {
 Call with dot notation:
 
 ```kod
-let c: Counter = Counter(value: 0)
+mut c: Counter = Counter(value: 0)
 c.increment()
 print_int(c.get())
 ```
@@ -542,6 +543,7 @@ from the arguments:
 
 Type arguments can be written after the function's name, all of them or none:
 
+<!-- no-check -->
 ```kod
 let xs = empty[int64]()
 let c = util.first[str](names)
@@ -605,6 +607,12 @@ extern func putchar(anon c: int64) -> int64
 A C function that takes a variable number of arguments, such as `fcntl`,
 `open` or `printf`, ends its parameters with `...`:
 
+<!-- kod:
+let F_SETFL: int64 = 4
+let O_NONBLOCK: int64 = 4
+let fd = 0
+let flags = 0
+-->
 ```kod
 extern func fcntl(anon fd: int64, anon cmd: int64, ...) -> int64
 extern func snprintf(anon buf: int64, anon size: int64, anon format: int64, ...) -> int64
@@ -624,6 +632,9 @@ fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 A C global variable of 8 bytes, such as a pointer or a `long`, is an
 `extern let`:
 
+<!-- kod:
+extern func fflush(anon file: int64) -> int64
+-->
 ```kod
 extern let __stdoutp: int64     // C's `stdout`, a FILE *
 
@@ -641,7 +652,7 @@ An `extern func` is a C symbol, resolved at link time against the C runtime and 
 Mutual recursion between functions is supported as long as all functions are declared in the same module.
 
 ```kod
-func fib(n: int64) -> int64 {
+func fib(anon n: int64) -> int64 {
     if n <= 1 {
         return n
     }

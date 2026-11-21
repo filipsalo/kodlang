@@ -100,6 +100,13 @@ call that failed: anything else in between, a `print` too, may change it.
 `c_function(f)` is the address of the top-level function `f`, for a C
 function that calls back, such as `qsort`'s comparison:
 
+<!-- kod:
+let nums = unsafe.alloc(24)
+unsafe.store64(nums, 3)
+unsafe.store64(nums + 8, 1)
+unsafe.store64(nums + 16, 2)
+let count = 3
+-->
 ```kod
 extern func qsort(anon base: int64, anon count: int64, anon size: int64, anon compare: int64) -> none
 
