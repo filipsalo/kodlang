@@ -10,12 +10,17 @@
 // streams then keep their order when they end up in one place (and what a
 // test printed itself comes out with them).
 import "io"
+import "libc"
 import "posix"
+import "process"
 import "term"
 import "time"
+import "unsafe"
 
 
 mut _failed: bool = false
+// Whether this process is a test's child (begin_case).
+mut _in_child: bool = false
 mut _total: int64 = 0
 mut _failures: int64 = 0
 // When the first test started (for the summary) and when this one did; -1
@@ -48,7 +53,7 @@ func module_begin(anon path: str) -> none {
     io.flush_stdout()
 }
 
-// Called before each test.
+// Starts a test's clock and its result.
 func reset() -> none {
     let now = time.monotonic_ns()
     if _start_ns < 0 {
@@ -56,6 +61,50 @@ func reset() -> none {
     }
     _case_start_ns = now
     _failed = false
+}
+
+// Called before each test, which runs in a child process so that a panic or a
+// crash fails only that test. True in the child, which runs the test and then
+// `end_case`; false here, once the child has ended and its result is noted.
+// Without a child (fork failed), true, and the test runs here.
+func begin_case() -> bool {
+    reset()
+    io.flush_stdout()
+    let pid = unsafe.c_int(libc.fork())
+    if pid <= 0 {
+        _in_child = pid == 0
+        return true
+    }
+    mut status = -1
+    if process.wait_status(pid, name: "test", hang: true) is int64(got) {
+        status = got
+    }
+    let sig = status & 127
+    if status < 0 {
+        _failed = true
+        fail("the test's process could not be waited for")
+    } else if sig != 0 {
+        _failed = true
+        fail(f"killed by {process.signal_name(sig)}")
+    } else if ((status >> 8) & 255) != 0 {
+        // 2 from end_case: its failures are printed; else it panicked, and said so.
+        _failed = true
+    }
+    return false
+}
+
+// Called after a test in its child: ends the child, telling begin_case whether
+// the test failed.
+func end_case() -> none {
+    if not _in_child {
+        return none
+    }
+    io.flush_stdout()
+    mut code = 0
+    if _failed {
+        code = 2
+    }
+    libc.exit(code)
 }
 
 // Marks the current test failed and prints `msg` under it. The test goes on,

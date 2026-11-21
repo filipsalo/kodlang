@@ -74,6 +74,30 @@ test "map lookup hits" {
 
 The aggregate exit code is 0 if every test passed, non-zero otherwise.
 
+## Each test in a process of its own
+
+Each test runs in a child process of the test binary, made with `fork` just
+before it, so a test that panics or crashes fails alone: its panic message (and
+backtrace) or the signal that killed it is printed under it, it reports `FAIL`,
+and the tests after it run as usual. A test starts from the state the program
+had before the first test, not where the test before it left it: what one test
+stores in a module-level variable, the next one doesn't see.
+
+```
+stdlib/foo_test.kod
+  ok   one (1.20 ms)
+panic: index 5 out of bounds for array of length 1
+backtrace:
+  #0  test "boom" (stdlib/foo_test.kod:7)
+  FAIL boom (1.35 ms)
+      killed by SIGSEGV
+  FAIL bad pointer (985 μs)
+  ok   three (1.30 ms)
+```
+
+A backtrace names a test's frame `test "<its name>"` and ends there. Starting
+the process costs about a millisecond, which the time shown includes.
+
 ## Output
 
 `kod test` replaces itself with the test binary, so the output appears as the tests run, and the exit code is the binary's. The reporter flushes stdout around every `ok`/`FAIL` line and the file header, and before a failure's detail goes to stderr, so the lines stay in order when stdout and stderr are the same pipe or log. What a test prints with `print` is flushed with them, so it comes out before that test's result line. A panic (an index out of bounds, a failed `must`) flushes stdout before its message too.
