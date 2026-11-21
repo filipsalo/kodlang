@@ -201,6 +201,39 @@ An array value is never converted element by element. With
 calls through a function value, and to the arguments of a method, an
 interface method and `x?.method(...)`.
 
+## `mut` parameters
+
+A parameter declared `mut` is the caller's variable: the function can assign
+it, change its elements or append to it, and the caller's variable has the
+new value when the call returns. The argument says so with `mut`, which
+takes a `mut` local or another `mut` parameter of the calling function:
+
+```kod
+func count(anon s: str, mut seen: [str]) -> int64 {
+    seen += [s]
+    return len(seen)
+}
+
+mut names: [str] = []
+count("a", seen: mut names)     // names is ["a"]
+```
+
+Writing the `mut` at the call site is required, and only there: passing
+`names` without it to a `mut` parameter is an error
+(`` `seen` is a `mut` parameter of `count`: pass `mut names` ``), and so is
+`mut` before an argument whose parameter isn't `mut`. The argument must be a
+name the caller could assign, a `mut` local or a `mut` parameter, and one
+name can't go to two `mut` parameters of one call. A field, an element, a
+`let`, or a `mut` a function literal captures is an error; copy it into a
+`mut` local and assign it back after the call.
+
+Inside the function, a `mut` parameter is used like a local. The caller's
+variable gets the parameter's value when the function returns, however it
+returns, including through `try`. A function with a `mut` parameter is
+called by name: it can't be used as a function value, and an interface
+method can't have one. `self` can't be `mut`, since a struct's fields can be
+assigned through any `self`.
+
 ## Return values
 
 A returned value must have the function's return type, with the same

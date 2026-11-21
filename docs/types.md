@@ -81,22 +81,24 @@ so `m.set(5, 1)` on a `Map[str, int64]` is an error. So are element stores
 (`xs[i] = v`, `m[k] = v`, see [Indexing](arrays.md#indexing)) and `return`
 values (see [Return values](functions.md#return-values)).
 
-Parameters are immutable too — `mut` makes one reassignable inside the
-body (`mut self` for a method receiver). This is **callee-local**: params
-are passed by value, so reassigning one never affects the caller, and the
-call site needs no annotation.
+Parameters are immutable too. A `mut` parameter is the caller's variable,
+passed with `mut` at the call site, and the caller sees what the function
+assigns to it (see [`mut` parameters](functions.md#mut-parameters)):
 
 ```kod
-func bump(anon mut x: int64) -> int64 {
-    x = x + 1     // ok — local to bump; the caller's value is unchanged
-    return x
+func bump(anon mut x: int64) -> none {
+    x = x + 1
 }
+
+mut n = 1
+bump(mut n)       // n is 2
 ```
 
-Struct fields stay mutable. And because structs and arrays are reference
-values (see [Memory layout](memory-layout.md)), mutating a struct's *fields*
-through a parameter or `self` (`p.field = v`) is still allowed regardless of
-whether the binding is `mut` — `mut` governs only reassigning the name.
+Struct fields stay mutable. Because structs are reference values (see
+[Memory layout](memory-layout.md)), a struct's *fields* can be assigned
+through any parameter or `self` (`p.field = v`), `mut` or not. An array is
+changed only through a `mut` name or a field (see
+[Indexing](arrays.md#indexing)).
 
 
 ## Module-level constants

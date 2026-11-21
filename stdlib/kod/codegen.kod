@@ -194,6 +194,14 @@ type SigInfo = struct {
     type_args: [TypeKind] = []
     // An extern whose parameters end in `...`: a call may pass more.
     variadic: bool = false
+    // Parallel to param_kinds: a `mut` parameter, passed by address.
+    param_mut: [bool] = []
+}
+
+// The type arguments the arguments of a generic call settle, one per type
+// parameter, filled in by settle_type_params.
+type SettledArgs = struct {
+    kinds: [TypeKind]
 }
 
 // A saved shared_const_id and its path; see Codegen.share_begin.
@@ -787,8 +795,7 @@ func forwarded(anon next: regalloc.Insn, dst: regalloc.Reg, src: regalloc.Reg, o
     }
 }
 
-func forward_copies(anon mut b: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
-    // `b` is the caller's to give up: the first rule rewrites it in place.
+func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
     let counts = regalloc.vreg_counts(b, :vreg_start, :n_local)
     let n = len(b)
     mut out: [regalloc.Insn] = []
@@ -799,14 +806,21 @@ func forward_copies(anon mut b: [regalloc.Insn], vreg_start: int64, n_local: int
     mut prev_reg = regalloc.NO_REG
     mut prev_base = regalloc.NO_REG
     mut prev_at: regalloc.MemAt = .Base
+    // What the second rule made of the instruction after a copy it dropped.
+    mut replaced: regalloc.Insn? = none
     for i in 0..n {
+        mut cur = b[i]
+        if replaced is Some(r) {
+            cur = r
+            replaced = none
+        }
         // A slot or 4- or 8-byte `Mem` load or store, as its fields.
         mut access = false
         mut store = false
         mut reg = regalloc.NO_REG
         mut base = regalloc.NO_REG
         mut at: regalloc.MemAt = .Base
-        match b[i] {
+        match cur {
             .Slot(slot_store, slot_reg, slot_off) -> {
                 access = true
                 store = slot_store
@@ -841,7 +855,7 @@ func forward_copies(anon mut b: [regalloc.Insn], vreg_start: int64, n_local: int
             prev_base = base
             prev_at = at
             if not taken {
-                out += [b[i]]
+                out += [cur]
             }
             continue
         }
@@ -849,10 +863,10 @@ func forward_copies(anon mut b: [regalloc.Insn], vreg_start: int64, n_local: int
         // and the copy goes, leaving the instruction before it as the one before.
         mut copy_dst = regalloc.NO_REG
         mut copy_src = regalloc.NO_REG
-        if b[i] is .Mov(dst, src) {
+        if cur is .Mov(dst, src) {
             copy_dst = dst
             copy_src = src
-        } else if b[i] is .Op(op, a, op_b, op_c, _d, _flags) {
+        } else if cur is .Op(op, a, op_b, op_c, _d, _flags) {
             if op is .Move and op_c == regalloc.NO_REG {
                 copy_dst = a
                 copy_src = op_b
@@ -863,13 +877,13 @@ func forward_copies(anon mut b: [regalloc.Insn], vreg_start: int64, n_local: int
             let id = regalloc.reg_vreg(copy_dst) - vreg_start
             let once = id >= 0 and id < n_local and counts[id] == 2
             if forwarded(b[i + 1], dst: copy_dst, src: copy_src, :once) is Some(next) {
-                b[i + 1] = next
+                replaced = next
                 continue
             }
         }
         // Anything else that stays isn't the store before a load.
         prev_store = false
-        out += [b[i]]
+        out += [cur]
     }
     return out
 }
@@ -1111,6 +1125,10 @@ type Codegen = struct {
     rc_param_offs: [int64] = []
     // The names this function assigns to (`=`, `+=`, `-=`), from collect_stmt_vars.
     assigned_names: [str] = []
+    // Slots whose address a `mut` argument passes: never promoted to registers.
+    addressed_offs: [int64] = []
+    // `mut` arguments a call checked against its parameters (their value ids).
+    mut_checked: [int64] = []
     // Pattern bindings stored without counting, for settle_borrows.
     borrow_marks: [BorrowMark] = []
     // Set around an emit_variant_test whose bindings may borrow (borrow_payload).
@@ -2407,6 +2425,9 @@ type Codegen = struct {
 
     // Whether the body of `sig` may be compiled into the function being compiled.
     func can_inline_from(self, anon sig: SigInfo) -> bool {
+        if arrays.contains(sig.param_mut, true) {
+            return false
+        }
         return sig.src_p.path == self.p.path or not self.has_module_vars(sig.src_p)
     }
 
@@ -2828,6 +2849,20 @@ type Codegen = struct {
 
     func fn_address(self, anon slot: int64) -> Val {
         return self.fn_value(self.fn_label(slot))
+    }
+
+    // A function with a `mut` parameter is called by name only: reports and
+    // gives true when `sig` has one.
+    func mut_fn_value(self, anon sig: SigInfo, name: str, span: ast.Span) -> bool {
+        if not arrays.contains(sig.param_mut, true) {
+            return false
+        }
+        if len(name) == 0 {
+            self.report_error("error: a function literal can't have a `mut` parameter, since it's only called as a value", :span)
+        } else {
+            self.report_error(f"error: `{name}` has a `mut` parameter, so it can only be called by name", :span)
+        }
+        return true
     }
 
     // The function value of what's at `lbl`: its cell in the data section.
@@ -7285,7 +7320,9 @@ type Codegen = struct {
         mut param_labels: [str] = []
         mut param_names: [str] = []
         mut param_default_exprs: [int64] = []
+        mut param_mut: [bool] = []
         for param in func_decl.params {
+            param_mut += [param.mutable and param.name != "self"]
             param_kinds += [self.resolve_type(param.typ)]
             if param.anonymous {
                 param_labels += [""]
@@ -7297,7 +7334,7 @@ type Codegen = struct {
         }
         let return_kind = self.resolve_type(func_decl.return_typ)
         self.leave(saved_ctx)
-        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :decl_id, type_params: func_decl.type_params, :type_args)
+        return SigInfo(:param_kinds, :param_labels, :param_names, :return_kind, :param_default_exprs, src_p: p, :decl_id, type_params: func_decl.type_params, :type_args, :param_mut)
     }
 
     // Leaves the substitution alone for a function that isn't generic.
@@ -7338,7 +7375,7 @@ type Codegen = struct {
 
     // Matches parameter type `type_id` against an argument's kind. A parameter
     // already settled stays as it is; the argument is checked against it later.
-    func settle_type_params(self, anon type_id: int64, kind: TypeKind, sig: SigInfo, mut bound: [TypeKind]) -> none {
+    func settle_type_params(self, anon type_id: int64, kind: TypeKind, sig: SigInfo, bound: SettledArgs) -> none {
         if kind is .KUnknown or kind is .KVoid {
             return
         }
@@ -7346,8 +7383,8 @@ type Codegen = struct {
             .Named(name) -> {
                 for i, type_param in sig.type_params {
                     if type_param == name {
-                        if bound[i] is .KUnknown and not self.kind_has_unknown(kind) and not self.kind_has_void(kind) {
-                            bound[i] = kind
+                        if bound.kinds[i] is .KUnknown and not self.kind_has_unknown(kind) and not self.kind_has_void(kind) {
+                            bound.kinds[i] = kind
                         }
                         return
                     }
@@ -7389,7 +7426,7 @@ type Codegen = struct {
 
     // A union parameter with one bare type parameter among members that name
     // none: the parameter is what the argument holds besides those members.
-    func settle_union_param(self, anon members: [int64], kind: TypeKind, sig: SigInfo, mut bound: [TypeKind]) -> none {
+    func settle_union_param(self, anon members: [int64], kind: TypeKind, sig: SigInfo, bound: SettledArgs) -> none {
         let no_args: [TypeKind] = []
         let saved_ctx = self.enter(sig.src_p, names: sig.type_params, args: no_args)
         mut open = 0
@@ -7477,9 +7514,9 @@ type Codegen = struct {
     func settled_type_args(self, anon fn_ref: FnRef, args: [ast.CallArg]) -> [TypeKind] {
         let sig = fn_ref.sig
         let plan = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: fn_ref.name)
-        mut bound: [TypeKind] = []
+        let bound = SettledArgs(kinds: [])
         for _type_param in sig.type_params {
-            bound += [.KUnknown]
+            bound.kinds += [.KUnknown]
         }
         for i, param in sig.src_p.func_decls[sig.decl_id].params {
             let ai = plan.slots[i]
@@ -7487,7 +7524,7 @@ type Codegen = struct {
                 self.settle_type_params(param.typ, kind: self.infer_kind(args[ai].value), :sig, :bound)
             }
         }
-        return bound
+        return bound.kinds
     }
 
     // The instance of the function for `type_args`, which may not be queued yet.
@@ -7591,6 +7628,7 @@ type Codegen = struct {
         self.queue_func_instance(idx, :span)
         let inst_sig = self.func_insts[idx].sig
         let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: fn_ref.name).slots
+        self.check_mut_args(args, slots: call_slots, param_mut: inst_sig.param_mut, param_names: inst_sig.param_names, param_kinds: inst_sig.param_kinds, skip: 0, call_name: fn_ref.name)
         self.prepare_args_with_kinds(args, expected_kinds: inst_sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots, type_params: inst_sig.type_params, :type_args)
         self.emit_call(self.func_insts[idx].label)
         return .VReg(name: "x0")
@@ -10182,6 +10220,9 @@ type Codegen = struct {
                             self.report_generic_value(name, span: self.p.expr_spans[expr_id])
                             return .VImm(value: 0)
                         }
+                        if self.mut_fn_value(self.fn_sig(slot), :name, span: self.p.expr_spans[expr_id]) {
+                            return .VImm(value: 0)
+                        }
                         return self.fn_address(slot)
                     }
                     // Candidates for the typo hint: in-scope variables
@@ -10259,6 +10300,9 @@ type Codegen = struct {
                             self.report_generic_value(self.import_fn_at(slot).name, span: self.p.expr_spans[expr_id])
                             return .VImm(value: 0)
                         }
+                        if self.mut_fn_value(self.import_fn_at(slot).sig, name: self.import_fn_at(slot).name, span: self.p.expr_spans[expr_id]) {
+                            return .VImm(value: 0)
+                        }
                         return self.fn_value(self.import_fn_at(slot).label)
                     }
                     if self.p.exprs[lhs] is .Ident(alias) and self.p.exprs[rhs] is .Ident(member) and self.is_import_alias(alias) and self.qualified_type_ref(alias, name: member) < 0 {
@@ -10275,7 +10319,11 @@ type Codegen = struct {
                 return self.compile_binary(:lhs, :op, :rhs)
             }
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
-            .Call(callee, args) -> return self.rc_call_result(expr_id, :callee, val: self.compile_call(args, callee_id: callee))
+            .Call(callee, args) -> {
+                let val = self.compile_call(args, callee_id: callee)
+                self.report_unchecked_mut_args(args)
+                return self.rc_call_result(expr_id, :callee, :val)
+            }
             .ArrayLit(elements) -> return self.compile_array_lit(elements)
             .MatchExpr(subject, arms) -> return self.compile_match_expr(arms, subject_id: subject)
             .Slice(s, lo, hi) -> return self.compile_slice(s_id: s, lo_id: lo, hi_id: hi)
@@ -10301,6 +10349,9 @@ type Codegen = struct {
                 // and label during compile_module.
                 let slot = self.lookup_lambda(decl_id)
                 if slot != -1 {
+                    if self.mut_fn_value(self.fn_sig(slot), name: "", span: self.p.expr_spans[expr_id]) {
+                        return .VImm(value: 0)
+                    }
                     if len(self.p.func_decls[decl_id].captures) > 0 {
                         return self.compile_closure(decl_id, lbl: self.fn_label(slot))
                     }
@@ -13430,6 +13481,7 @@ type Codegen = struct {
             }
             self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: f"{mod_or_obj}.{method_name}", call_span: self.p.expr_spans[callee_lhs])
             let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: method_name).slots
+            self.check_mut_args(args, slots: call_slots, param_mut: sig.param_mut, param_names: sig.param_names, param_kinds: sig.param_kinds, skip: 0, call_name: f"{mod_or_obj}.{method_name}")
             if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
                 return inlined
             }
@@ -13740,6 +13792,7 @@ type Codegen = struct {
                     }
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots
+                    self.check_mut_args(args, slots: call_slots, param_mut: sig.param_mut, param_names: sig.param_names, param_kinds: sig.param_kinds, skip: 0, call_name: name)
                     if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
                         return inlined
                     }
@@ -14079,6 +14132,8 @@ type Codegen = struct {
         mut sig_labels: [str] = []
         mut sig_defaults: [int64] = []
         mut sig_src_p: parsing.Parser = self.p
+        mut sig_mut: [bool] = []
+        mut sig_names: [str] = []
         mut inline_owner: int64 = -1
         mut inline_mi: int64 = -1
         match recv_kind {
@@ -14094,6 +14149,8 @@ type Codegen = struct {
                     sig_labels = self.structs[idx].methods[mi].sig.param_labels
                     sig_defaults = self.structs[idx].methods[mi].sig.param_default_exprs
                     sig_src_p = self.structs[idx].methods[mi].sig.src_p
+                    sig_mut = self.structs[idx].methods[mi].sig.param_mut
+                    sig_names = self.structs[idx].methods[mi].sig.param_names
                 }
             }
             .KEnum(idx) -> {
@@ -14106,6 +14163,8 @@ type Codegen = struct {
                     sig_labels = sig.param_labels
                     sig_defaults = sig.param_default_exprs
                     sig_src_p = sig.src_p
+                    sig_mut = sig.param_mut
+                    sig_names = sig.param_names
                 }
             }
             else none
@@ -14124,6 +14183,8 @@ type Codegen = struct {
                 sig_labels = pm.sig.param_labels
                 sig_defaults = pm.sig.param_default_exprs
                 sig_src_p = pm.sig.src_p
+                sig_mut = pm.sig.param_mut
+                sig_names = pm.sig.param_names
             }
         }
         if len(method_lbl) == 0 {
@@ -14144,6 +14205,8 @@ type Codegen = struct {
                         sig_labels = m.sig.param_labels
                         sig_defaults = m.sig.param_default_exprs
                         sig_src_p = m.sig.src_p
+                        sig_mut = m.sig.param_mut
+                        sig_names = m.sig.param_names
                     }
                 }
             }
@@ -14192,6 +14255,7 @@ type Codegen = struct {
         }
         self.check_call_args(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name, call_span: span)
         let call_slots = self.plan_call(args, param_labels: sig_labels, param_defaults: sig_defaults, skip: 1, call_name: method_name).slots
+        self.check_mut_args(args, slots: call_slots, param_mut: sig_mut, param_names: sig_names, param_kinds: sig_params, skip: 1, call_name: method_name)
         if inline_owner >= 0 {
             if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
                 return inlined
@@ -14242,7 +14306,10 @@ type Codegen = struct {
                 ai = i
             }
             if ai >= 0 {
-                if param_idx < len(sig_params) {
+                arg_reg = self.mut_arg_address(args[ai])
+                if len(arg_reg) > 0 {
+                    // The callee takes the value over from the slot and puts it back.
+                } else if param_idx < len(sig_params) {
                     arg_reg = self.compile_into(args[ai].value, expected: sig_params[param_idx])
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
@@ -14604,6 +14671,112 @@ type Codegen = struct {
     }
 
     // `type_params` and `type_args` are a generic instance's, for its defaults.
+    // A call's arguments against its `mut` parameters: `slots[i]` is the
+    // argument for parameter `i + skip`. A `mut` parameter takes `mut name`
+    // with `name` a `mut` local or parameter, once per call, of its type.
+    func check_mut_args(self, anon args: [ast.CallArg], slots: [int64], param_mut: [bool], param_names: [str], param_kinds: [TypeKind], skip: int64, call_name: str) -> none {
+        mut passed: [str] = []
+        for i, ai in slots {
+            if ai < 0 {
+                continue
+            }
+            let arg = args[ai]
+            let pi = i + skip
+            self.mut_checked += [arg.value]
+            let is_mut = pi < len(param_mut) and param_mut[pi]
+            mut pname = ""
+            if pi < len(param_names) {
+                pname = param_names[pi]
+            }
+            let span = self.p.expr_spans[arg.value]
+            if not is_mut {
+                if arg.by_ref {
+                    self.report_error(f"error: `{pname}` isn't a `mut` parameter of `{call_name}`; remove the `mut`", :span)
+                }
+                continue
+            }
+            if not arg.by_ref {
+                self.report_error(f"error: `{pname}` is a `mut` parameter of `{call_name}`: pass `mut {self.mut_arg_text(arg.value)}`", :span)
+                continue
+            }
+            let .Ident(name) = self.p.exprs[arg.value] else {
+                self.report_error(f"error: only a `mut` local or parameter can be passed as `mut`; copy `{self.mut_arg_text(arg.value)}` into a `mut` local and assign it back", :span)
+                continue
+            }
+            if not self.var_declared(name) {
+                continue
+            }
+            let shown = self.source_name(name)
+            if arrays.contains(self.in_captures, name) {
+                self.report_error(f"error: a function literal can't pass `{shown}`, which it captures, as `mut`", :span)
+                continue
+            }
+            if not self.find_var_declared_mut(name) {
+                self.report_error(f"error: cannot pass `{shown}` as `mut`: it's an immutable binding; declare it with `mut`", :span)
+                continue
+            }
+            if arrays.contains(passed, name) {
+                self.report_error(f"error: `{shown}` is passed as `mut` twice in this call", :span)
+                continue
+            }
+            passed += [name]
+            if pi < len(param_kinds) {
+                let want = self.kind_display(param_kinds[pi])
+                let have = self.kind_display(self.find_var_kind(name))
+                if want != have and not self.kind_has_unknown(param_kinds[pi]) and not self.kind_has_unknown(self.find_var_kind(name)) {
+                    self.report_error(f"error: expected `{want}`, got `{have}`; a `mut` argument has its parameter's type exactly", :span)
+                }
+            }
+        }
+    }
+
+    // How a `mut` argument is written, for a message.
+    func mut_arg_text(self, anon expr_id: int64) -> str {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> return self.source_name(name)
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    return f"{self.mut_arg_text(lhs)}.{self.mut_arg_text(rhs)}"
+                }
+                if op is .Index {
+                    return f"{self.mut_arg_text(lhs)}[...]"
+                }
+                return "..."
+            }
+            else return "..."
+        }
+    }
+
+    // The register holding the address of a `mut` argument's slot, or "" when
+    // the argument isn't one (it was reported, and is compiled as a value).
+    func mut_arg_address(self, anon arg: ast.CallArg) -> str {
+        if not arg.by_ref {
+            return ""
+        }
+        let .Ident(name) = self.p.exprs[arg.value] else { return "" }
+        if not self.var_declared(name) {
+            return ""
+        }
+        let off = self.find_var_offset(name)
+        if not arrays.contains(self.addressed_offs, off) {
+            self.addressed_offs += [off]
+        }
+        let r = self.pool.alloc_reg()
+        self.emit_op(.Sub, a: r, b: "fp", c: f"#{-off}")
+        return r
+    }
+
+    // A `mut` before an argument no call checked: one to a function value,
+    // a builtin or a constructor.
+    func report_unchecked_mut_args(self, anon args: [ast.CallArg]) -> none {
+        for arg in args {
+            if arg.by_ref and not arrays.contains(self.mut_checked, arg.value) {
+                self.mut_checked += [arg.value]
+                self.report_error("error: `mut` goes only before an argument to a `mut` parameter of a function or method called by name", span: self.p.expr_spans[arg.value])
+            }
+        }
+    }
+
     func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser, slots: [int64], type_params: [str] = [], type_args: [TypeKind] = []) -> none {
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         // When the call has fewer args than the function declares,
@@ -14645,13 +14818,17 @@ type Codegen = struct {
                 ai = i
             }
             if ai >= 0 {
-                if i < len(expected_kinds) {
+                arg_reg = self.mut_arg_address(args[ai])
+                if len(arg_reg) > 0 {
+                    // The callee takes the value over from the slot and puts it back.
+                } else if i < len(expected_kinds) {
                     arg_reg = self.compile_into(args[ai].value, expected: expected_kinds[i])
+                    self.rc_hold(args[ai].value, reg: arg_reg)
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
+                    self.rc_hold(args[ai].value, reg: arg_reg)
                 }
-                self.rc_hold(args[ai].value, reg: arg_reg)
             } else {
                 let saved_ctx = self.context()
                 self.bind_func_type_params(type_params, :type_args)
@@ -14687,7 +14864,7 @@ type Codegen = struct {
             } else if i < len(slots) {
                 ai = slots[i]
             }
-            if ai < 0 or not expected_kinds[i].is_inline_scalar() or not self.simple_arg(args[ai].value) {
+            if ai < 0 or args[ai].by_ref or not expected_kinds[i].is_inline_scalar() or not self.simple_arg(args[ai].value) {
                 return false
             }
             order += [ai]
@@ -16652,6 +16829,7 @@ type Codegen = struct {
             }
         }
         let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: shown).slots
+        self.check_mut_args(args, slots: call_slots, param_mut: sig.param_mut, param_names: sig.param_names, param_kinds: sig.param_kinds, skip: 0, call_name: shown)
         self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
         self.emit_call(self.method_label(struct_idx, name: "init"))
         return .VReg(name: "x0")
@@ -18395,6 +18573,11 @@ type Codegen = struct {
                     i += 1
                     continue
                 }
+                // A `mut` argument's address: its slot stays in memory.
+                if body[i] is .Op(addr_op, _addr_dst, addr_base, addr_imm, _addr_d, _addr_flags) and addr_op is .Sub and addr_base == regalloc.FP and (addr_imm & 3) == 3 and arrays.contains(excluded, -(addr_imm >> 2)) {
+                    i += 1
+                    continue
+                }
                 if is_frame_link(arm64.insn_text(body[i])) {
                     i += 1
                     continue
@@ -19619,6 +19802,8 @@ type Codegen = struct {
         self.rc_pending = false
         self.rc_param_offs = []
         self.assigned_names = []
+        self.addressed_offs = []
+        self.mut_checked = []
         self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
@@ -19647,12 +19832,27 @@ type Codegen = struct {
                 self.check_default(param.default_expr, expected: kind)
             }
             self.alloc_var(name: param.name, :kind)
-            // Parameters are immutable by default; `mut x` (or `mut self`)
-            // opts the binding into reassignment. The slot otherwise defaults
-            // mutable, so only params need this explicit set.
+            // Parameters are immutable by default; a `mut` one is the
+            // caller's variable (see by_ref_params). The slot otherwise
+            // defaults mutable, so only params need this explicit set.
             self.vars[-1].mutable = param.mutable
             self.vars[-1].declared_mut = param.mutable
             self.vars[-1].bound = true
+            if param.mutable and param.name == "self" {
+                self.report_error("error: `self` can't be `mut`; a struct's fields can be assigned through any `self`", span: func_decl.name_span)
+            }
+        }
+        // A `mut` parameter arrives as the address of the caller's slot, kept
+        // in a hidden slot: the value is taken over on entry and put back on
+        // the way out (copy-in, copy-out).
+        mut by_ref_params: [str] = []
+        mut by_ref_offs: [int64] = []
+        for param in func_decl.params {
+            if param.mutable and param.name != "self" {
+                by_ref_params += [param.name]
+                by_ref_offs += [self.alloc_var(name: f"__ref_{param.name}", kind: .KInt64)]
+                self.vars[-1].bound = true
+            }
         }
         mut param_kinds: [TypeKind] = []
         for v in self.vars {
@@ -19713,8 +19913,27 @@ type Codegen = struct {
         mut k = 0
         for param in func_decl.params {
             if k < len(arg_regs) {
-                self.rc_param_offs += [self.find_var_offset(param.name)]
-                self.emit_str_raw(self.find_var_offset(param.name), reg: arg_regs[k])
+                let param_off = self.find_var_offset(param.name)
+                self.rc_param_offs += [param_off]
+                mut ri = -1
+                for bi, bname in by_ref_params {
+                    if bname == param.name {
+                        ri = bi
+                    }
+                }
+                if ri >= 0 {
+                    self.emit_str_raw(by_ref_offs[ri], reg: arg_regs[k])
+                    let v = self.pool.alloc_reg()
+                    self.emit_load(v, base: arg_regs[k])
+                    self.emit_str_raw(param_off, reg: v)
+                    self.pool.free_reg(v)
+                    // The slot owns what the caller's did, without counting it again.
+                    if self.rc_heap_kind(self.find_var_kind(param.name)) and not arrays.contains(self.rc_slots, param_off) {
+                        self.rc_slots += [param_off]
+                    }
+                } else {
+                    self.emit_str_raw(param_off, reg: arg_regs[k])
+                }
             }
             k = k + 1
         }
@@ -19734,6 +19953,17 @@ type Codegen = struct {
         self.rc_retain_kind("x0", kind: self.return_kind)
         if self.rc_heap_kind(self.return_kind) {
             self.emit_label(f"{self.ret_lbl}_own")
+        }
+        // Each `mut` parameter's value goes back to the caller's slot, which
+        // takes its reference over: the slot is emptied so it isn't released.
+        for ri, name in by_ref_params {
+            let off = self.find_var_offset(name)
+            self.emit_ldr(off, reg: "x17")
+            self.emit_ldr(by_ref_offs[ri], reg: "x16")
+            self.emit_store("x17", base: "x16")
+            if arrays.contains(self.rc_slots, off) {
+                self.emit_str_raw(off, reg: "xzr")
+            }
         }
         for slot in self.rc_slots {
             self.emit_ldr(slot, reg: "x17")
@@ -19761,6 +19991,9 @@ type Codegen = struct {
             excluded += [off]
         }
         for off in capture_offs {
+            excluded += [off]
+        }
+        for off in self.addressed_offs {
             excluded += [off]
         }
         let promoted = self.promote_locals(body_buf, :vreg_start, :excluded)

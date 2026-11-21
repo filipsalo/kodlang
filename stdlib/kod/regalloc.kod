@@ -823,15 +823,20 @@ func never_returns(anon target: str) -> bool {
 
 // How many times each of the function's vregs (ids vreg_start up to
 // vreg_start + n_local) is named in `body`, as a def or a use.
-func count_operand(anon operand: Reg, mut counts: [int64], vreg_start: int64, n_local: int64) -> none {
+// Each vreg's count, as vreg_counts gathers them.
+type VregCounts = struct {
+    n: [int64]
+}
+
+func count_operand(anon operand: Reg, counts: VregCounts, vreg_start: int64, n_local: int64) -> none {
     let id = reg_vreg(operand)
     if id >= vreg_start and id < vreg_start + n_local {
-        counts[id - vreg_start] += 1
+        counts.n[id - vreg_start] += 1
     }
 }
 
 func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64] {
-    mut counts: [int64] = [0] * n_local
+    let counts = VregCounts(n: [0] * n_local)
     for insn in body {
         match insn {
             .Slot(_store, reg, _off) -> count_operand(reg, :counts, :vreg_start, :n_local)
@@ -860,24 +865,32 @@ func vreg_counts(anon body: [Insn], vreg_start: int64, n_local: int64) -> [int64
             else none
         }
     }
-    return counts
+    return counts.n
 }
 
 // An `Op` operand's part in the liveness `run` works out: first named, defined
 // (when `written`), last used.
-func note_operand(anon operand: Reg, written: bool, line_idx: int64, vreg_start: int64, n_local: int64, mut def_line: [int64], mut last_use: [int64], mut first: [int64]) -> none {
+// Each local vreg's lines, as `run` works them out: where it's defined, last
+// used and first named, -1 for none.
+type Liveness = struct {
+    def_line: [int64]
+    last_use: [int64]
+    first: [int64]
+}
+
+func note_operand(anon operand: Reg, written: bool, line_idx: int64, vreg_start: int64, n_local: int64, lv: Liveness) -> none {
     let id = reg_vreg(operand)
     if id < vreg_start or id >= vreg_start + n_local {
         return
     }
     let local_id = id - vreg_start
-    if first[local_id] < 0 {
-        first[local_id] = line_idx
+    if lv.first[local_id] < 0 {
+        lv.first[local_id] = line_idx
     }
-    if written and def_line[local_id] == -1 {
-        def_line[local_id] = line_idx
+    if written and lv.def_line[local_id] == -1 {
+        lv.def_line[local_id] = line_idx
     }
-    last_use[local_id] = line_idx
+    lv.last_use[local_id] = line_idx
 }
 
 // Constrained linear scan for one function's vregs. Vregs are
@@ -900,9 +913,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         return true
     }
 
-    mut def_line: [int64] = [-1] * n_local
-    mut last_use: [int64] = [-1] * n_local
-    mut first: [int64] = [-1] * n_local
+    let lv = Liveness(def_line: [-1] * n_local, last_use: [-1] * n_local, first: [-1] * n_local)
 
     // clobbers_before[k]: how many lines before line k call something or
     // name a caller-saved register outright.
@@ -918,14 +929,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let id = reg_vreg(reg)
                 if id >= vreg_start and id < vreg_start + n_local {
                     let local_id = id - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
+                    if lv.first[local_id] < 0 {
+                        lv.first[local_id] = line_idx
                     }
                     // A load writes its register; a store reads it.
-                    if not store and def_line[local_id] == -1 {
-                        def_line[local_id] = line_idx
+                    if not store and lv.def_line[local_id] == -1 {
+                        lv.def_line[local_id] = line_idx
                     }
-                    last_use[local_id] = line_idx
+                    lv.last_use[local_id] = line_idx
                 }
             }
             .Mov(dst, src) -> {
@@ -936,21 +947,21 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let d = reg_vreg(dst)
                 if d >= vreg_start and d < vreg_start + n_local {
                     let local_id = d - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
+                    if lv.first[local_id] < 0 {
+                        lv.first[local_id] = line_idx
                     }
-                    if def_line[local_id] == -1 {
-                        def_line[local_id] = line_idx
+                    if lv.def_line[local_id] == -1 {
+                        lv.def_line[local_id] = line_idx
                     }
-                    last_use[local_id] = line_idx
+                    lv.last_use[local_id] = line_idx
                 }
                 let r = reg_vreg(src)
                 if r >= vreg_start and r < vreg_start + n_local {
                     let local_id = r - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
+                    if lv.first[local_id] < 0 {
+                        lv.first[local_id] = line_idx
                     }
-                    last_use[local_id] = line_idx
+                    lv.last_use[local_id] = line_idx
                 }
             }
             .Data(_text) -> {
@@ -967,7 +978,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     clobbers = 1
                 }
                 // The `mov` writes it; the `movk`s after it read and write it.
-                note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :lv)
             }
             .Pair(_load, a, b, _base, _mode) -> {
                 // No vregs: the frame link and the callee-saved registers.
@@ -984,25 +995,25 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let r = reg_vreg(reg)
                 if r >= vreg_start and r < vreg_start + n_local {
                     let local_id = r - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
+                    if lv.first[local_id] < 0 {
+                        lv.first[local_id] = line_idx
                     }
-                    if mem_writes(:load, :width) and def_line[local_id] == -1 {
-                        def_line[local_id] = line_idx
+                    if mem_writes(:load, :width) and lv.def_line[local_id] == -1 {
+                        lv.def_line[local_id] = line_idx
                     }
-                    last_use[local_id] = line_idx
+                    lv.last_use[local_id] = line_idx
                 }
-                note_operand(base, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
-                note_operand(index, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(base, written: false, :line_idx, :vreg_start, :n_local, :lv)
+                note_operand(index, written: false, :line_idx, :vreg_start, :n_local, :lv)
             }
             .Op(op, a, b, c, d, flags) -> {
                 if (flags & INFO_CLOBBERS) != 0 {
                     clobbers = 1
                 }
-                note_operand(a, written: writes_first_op(op), :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
-                note_operand(b, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
-                note_operand(c, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
-                note_operand(d, written: false, :line_idx, :vreg_start, :n_local, :def_line, :last_use, :first)
+                note_operand(a, written: writes_first_op(op), :line_idx, :vreg_start, :n_local, :lv)
+                note_operand(b, written: false, :line_idx, :vreg_start, :n_local, :lv)
+                note_operand(c, written: false, :line_idx, :vreg_start, :n_local, :lv)
+                note_operand(d, written: false, :line_idx, :vreg_start, :n_local, :lv)
             }
             .Call(target) -> {
                 if not never_returns(target) {
@@ -1016,10 +1027,10 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 let id = reg_vreg(reg)
                 if id >= vreg_start and id < vreg_start + n_local {
                     let local_id = id - vreg_start
-                    if first[local_id] < 0 {
-                        first[local_id] = line_idx
+                    if lv.first[local_id] < 0 {
+                        lv.first[local_id] = line_idx
                     }
-                    last_use[local_id] = line_idx
+                    lv.last_use[local_id] = line_idx
                 }
             }
             .Label(_name) -> {
@@ -1034,11 +1045,11 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         // A vreg named before its first def (a loop reading what the
         // previous time round set) is live from there.
         for k in 0..n_local {
-            if first[k] >= 0 and (def_line[k] < 0 or first[k] < def_line[k]) {
-                def_line[k] = first[k]
+            if lv.first[k] >= 0 and (lv.def_line[k] < 0 or lv.first[k] < lv.def_line[k]) {
+                lv.def_line[k] = lv.first[k]
             }
         }
-        extend_over_loops(body_buf, :def_line, :last_use)
+        extend_over_loops(body_buf, :lv)
     }
 
     // Snapshot alloc-time phys per local vreg; this is also the
@@ -1082,13 +1093,13 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     // Vreg indices by def_line ascending, equal ones in index order. A
     // counting sort: def_line is -1 or a line index.
     mut top: int64 = 0
-    for line in def_line {
+    for line in lv.def_line {
         if line > top {
             top = line
         }
     }
     mut next: [int64] = [0] * (top + 3)
-    for line in def_line {
+    for line in lv.def_line {
         next[line + 2] += 1
     }
     for b in 1..top + 3 {
@@ -1096,7 +1107,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     }
     mut order: [int64] = [0] * n_local
     for k in 0..n_local {
-        let b = def_line[k] + 1
+        let b = lv.def_line[k] + 1
         order[next[b]] = k
         next[b] += 1
     }
@@ -1109,18 +1120,18 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 
     for oi in 0..n_local {
         let local_id: int64 = order[oi]
-        let d: int64 = def_line[local_id]
+        let d: int64 = lv.def_line[local_id]
         if d == -1 {
             // Allocated but never defined in the emitted body — keep
             // its alloc-time phys (the safe default), unless it isn't
             // named at all, when it needn't count as a register to save.
-            if last_use[local_id] == -1 {
+            if lv.last_use[local_id] == -1 {
                 new_phys[local_id] = target.unused
             }
             continue
         }
         mut cls_callee: bool = is_callee_saved_phys(alloc_phys[local_id])
-        let u: int64 = last_use[local_id]
+        let u: int64 = lv.last_use[local_id]
         if cls_callee and u > d and clobbers_before[u] - clobbers_before[d + 1] == 0 {
             cls_callee = false
         }
@@ -1209,7 +1220,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         }
         new_phys[local_id] = chosen
         active_id += [local_id]
-        active_use += [last_use[local_id]]
+        active_use += [lv.last_use[local_id]]
         active_phys += [chosen]
     }
 
@@ -1223,7 +1234,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 // A vreg live at a loop's top label, set before the loop, stays live to
 // the loop's backward branch, which takes its value round again: the
 // textual interval alone would end at its last use inside the loop.
-func extend_over_loops(anon body: [Insn], def_line: [int64], mut last_use: [int64]) -> none {
+func extend_over_loops(anon body: [Insn], lv: Liveness) -> none {
     let label_line = Map[str, int64]()
     for i, insn in body {
         if insn is .Label(name) {
@@ -1260,12 +1271,12 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], mut last_use: [int6
             b -= 1
         }
     }
-    for k in 0..len(def_line) {
-        let d = def_line[k]
+    for k in 0..len(lv.def_line) {
+        let d = lv.def_line[k]
         if d < 0 {
             continue
         }
-        mut u = last_use[k]
+        mut u = lv.last_use[k]
         // The first loop starting after `d`.
         mut lo = 0
         mut hi = nl
@@ -1285,7 +1296,7 @@ func extend_over_loops(anon body: [Insn], def_line: [int64], mut last_use: [int6
                 u = bottoms[e]
             }
         }
-        last_use[k] = u
+        lv.last_use[k] = u
     }
 }
 

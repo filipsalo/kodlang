@@ -135,8 +135,8 @@ end of `xs`.
 `+=` appends to the array itself, not to a copy, so everything that holds
 the same array sees the new elements: after `let a = xs` and `xs += [3]`,
 `a` ends in 3 too. That holds for an array kept in a field or in another
-array (`rows[0] += [4]`) as well, and for an array passed to a function that
-appends to its parameter. A `for x in xs` loop also reaches the elements
+array (`rows[0] += [4]`) as well. A function changes the caller's array
+through a [`mut` parameter](functions.md#mut-parameters). A `for x in xs` loop also reaches the elements
 appended to `xs` while it runs.
 
 The one exception is a `mut` binding that starts from an existing array, a
