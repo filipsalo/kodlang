@@ -198,6 +198,11 @@ type SigInfo = struct {
     param_mut: [bool] = []
 }
 
+// Instructions set aside while another buffer is filled.
+type InsnList = struct {
+    insns: [regalloc.Insn]
+}
+
 // The type arguments the arguments of a generic call settle, one per type
 // parameter, filled in by settle_type_params.
 type SettledArgs = struct {
@@ -15876,13 +15881,6 @@ type Codegen = struct {
         self.rc_let_off = off
         self.rc_let_kind = kind
         self.compile_store(dest_off: off, :kind, value_id: value)
-        if mutable and kind.is_array() and self.is_array_place(value) {
-            self.emit_ldr(off, reg: "x0")
-            self.emit_op(.Move, a: "x1", b: f"#{self.elem_width(kind)}")
-            self.emit_call("_kod_arr_copy")
-            self.rc_temp("x0")
-            self.emit_str(off, reg: "x0")
-        }
         self.rc_let_off = rc_saved_off
         self.rc_let_kind = rc_saved_kind
         if typ == 0 {
@@ -15909,15 +15907,6 @@ type Codegen = struct {
         }
         if typ == 0 and self.report_attempts > mark {
             self.update_var_kind(:name, kind: .KUnknown)
-        }
-    }
-
-    // A variable, a field or an element: an array that something else holds too.
-    func is_array_place(self, anon value_id: int64) -> bool {
-        match self.p.exprs[value_id] {
-            .Ident(_name) -> return true
-            .Binary(_lhs, op, _rhs) -> return op is .Dot or op is .Index
-            else return false
         }
     }
 
@@ -17493,11 +17482,12 @@ type Codegen = struct {
                     return
                 }
                 let recv_late = self.commutes(lhs, rhs) and self.commutes(lhs, rhs_id)
+                let width = self.elem_width(lhs_kind)
+                // Early, only the place: the array is made its own just before the store.
                 mut early_r = ""
                 mut early_spilled = false
                 if not recv_late {
-                    early_r = self.pool.alloc_reg()
-                    self.mov_to(self.compile_expr(lhs), dest: early_r)
+                    early_r = self.array_place(lhs)
                     early_spilled = self.preserve_begin(early_r)
                 }
                 let idx_v = self.compile_expr(rhs)
@@ -17519,9 +17509,7 @@ type Codegen = struct {
                 mut buf_r = ""
                 mut len_r = ""
                 if recv_late {
-                    let arr_val = self.compile_expr(lhs)
-                    let arr_ptr_r = self.pool.alloc_reg()
-                    self.mov_to(arr_val, dest: arr_ptr_r)
+                    let arr_ptr_r = self.unique_array(lhs)
                     buf_r = self.array_buf_len(arr_ptr_r, len_out: false)
                     len_r = self.array_buf_len(arr_ptr_r, len_out: true)
                     self.pool.free_reg(arr_ptr_r)
@@ -17529,7 +17517,11 @@ type Codegen = struct {
                 let reloaded_rhs_r = self.preserve_end(rhs_r, spilled: rhs_spilled)
                 let reloaded_idx_r = self.preserve_end(idx_r, spilled: idx_spilled)
                 if not recv_late {
-                    let arr_ptr_r = self.preserve_end(early_r, spilled: early_spilled)
+                    let place = self.preserve_end(early_r, spilled: early_spilled)
+                    let arr_ptr_r = self.pool.alloc_reg()
+                    self.emit_load(arr_ptr_r, base: place)
+                    self.emit_unique(arr_ptr_r, :place, :width)
+                    self.pool.free_reg(place)
                     buf_r = self.array_buf_len(arr_ptr_r, len_out: false)
                     len_r = self.array_buf_len(arr_ptr_r, len_out: true)
                     self.pool.free_reg(arr_ptr_r)
@@ -17570,7 +17562,20 @@ type Codegen = struct {
         for self.p.exprs[root] is .Binary(base, op, _index) and op is .Index and self.infer_kind(base).is_array() {
             root = base
         }
-        let .Ident(name) = self.p.exprs[root] else { return true }
+        if self.var_signature(root) is Some(sig) {
+            if sig.src_p.path != self.p.path {
+                self.report_error(f"error: `{sig.src_p.func_decls[sig.decl_id].name}` can only be changed in {sig.src_p.path}", span: self.p.expr_spans[root])
+                return false
+            }
+            return true
+        }
+        if self.p.exprs[root] is .Binary(base, op, _field) and op is .Dot and self.infer_kind(base) is .KStruct(_idx, _args) {
+            return true
+        }
+        let .Ident(name) = self.p.exprs[root] else {
+            self.report_error("error: cannot change an element of an array that isn't kept in a variable or field; assign it to a `mut` local first", span: self.p.expr_spans[root])
+            return false
+        }
         if not self.var_declared(name) or name.starts_with("__") or not self.enforce_immutability() {
             return true
         }
@@ -17583,6 +17588,121 @@ type Codegen = struct {
             return false
         }
         return true
+    }
+
+    // Copy on write. The register holding the address of the word that holds
+    // the array `arr_id` names: a local's slot, a module variable's cell, a
+    // struct's field, or an element of an array, which is made its own first.
+    // "" when the array isn't kept anywhere (a call's result): nothing to change.
+    func array_place(self, anon arr_id: int64) -> str {
+        if self.var_signature(arr_id) is Some(sig) {
+            let decl = sig.src_p.func_decls[sig.decl_id]
+            // The getter runs the initializer the first time; what it gives back
+            // is let go of at once, so the cell is the array's only holder.
+            self.emit_call(f"${self.path_prefix}${decl.name}")
+            self.emit_mov("x17", src: "x0")
+            self.rc_release_x17()
+            let cell = f"${self.path_prefix}${decl.name}$cell"
+            let r = self.pool.alloc_reg()
+            self.emit_op(.AddressPage, a: r, b: f"{cell}@PAGE")
+            self.emit_op(.Add, a: r, b: r, c: f"{cell}@PAGEOFF")
+            self.emit_op(.Add, a: r, b: r, c: "#8")
+            return r
+        }
+        match self.p.exprs[arr_id] {
+            .Ident(name) -> {
+                if not self.var_declared(name) {
+                    return ""
+                }
+                let off = self.find_var_offset(name)
+                if not arrays.contains(self.addressed_offs, off) {
+                    self.addressed_offs += [off]
+                }
+                let r = self.pool.alloc_reg()
+                self.emit_op(.Sub, a: r, b: "fp", c: f"#{-off}")
+                return r
+            }
+            .Binary(base, op, rhs) -> {
+                if op is .Dot {
+                    let .KStruct(struct_idx, _type_args) = self.infer_kind(base) else { return "" }
+                    let .Ident(field_name) = self.p.exprs[rhs] else { return "" }
+                    let ptr = self.load(self.compile_expr(base))
+                    let r = self.pool.alloc_reg()
+                    self.emit_op(.Add, a: r, b: ptr, c: f"#{self.find_field_offset(field_name, :struct_idx)}")
+                    self.pool.free_reg(ptr)
+                    return r
+                }
+                if op is .Index and self.infer_kind(base).is_array() {
+                    let arr = self.unique_array(base)
+                    if len(arr) == 0 {
+                        return ""
+                    }
+                    let parked = self.preserve_begin(arr)
+                    let idx = self.load(self.compile_expr(rhs))
+                    let arr_r = self.preserve_end(arr, spilled: parked)
+                    let len_r = self.pool.alloc_reg()
+                    self.emit_load(len_r, base: arr_r, off: 8)
+                    self.emit_index_check(idx, len: len_r)
+                    self.pool.free_reg(len_r)
+                    let r = self.pool.alloc_reg()
+                    self.emit_load(r, base: arr_r)
+                    self.emit_op(.ShiftLeft, a: idx, b: idx, c: "#3")
+                    self.emit_op(.Add, a: r, b: r, c: idx)
+                    self.pool.free_reg(idx)
+                    self.pool.free_reg(arr_r)
+                    return r
+                }
+                return ""
+            }
+            else return ""
+        }
+    }
+
+    // The array `arr_id` names, made its place's own (see array_place), in a
+    // register; "" when it isn't kept anywhere.
+    func unique_array(self, anon arr_id: int64) -> str {
+        // A local: loaded from its slot, whose address only the copy needs.
+        if self.var_signature(arr_id) is none and self.p.exprs[arr_id] is .Ident(name) and self.var_declared(name) {
+            let off = self.find_var_offset(name)
+            if not arrays.contains(self.addressed_offs, off) {
+                self.addressed_offs += [off]
+            }
+            let arr = self.pool.alloc_reg()
+            self.emit_ldr(off, reg: arr)
+            self.emit_unique(arr, place: f"#{-off}", width: self.elem_width(self.infer_kind(arr_id)))
+            return arr
+        }
+        let place = self.array_place(arr_id)
+        if len(place) == 0 {
+            return ""
+        }
+        let arr = self.pool.alloc_reg()
+        self.emit_load(arr, base: place)
+        self.emit_unique(arr, :place, width: self.elem_width(self.infer_kind(arr_id)))
+        self.pool.free_reg(place)
+        return arr
+    }
+
+    // `arr`, loaded from `place`: copied there first unless its count is 1.
+    // `place` is a register, or `#n` for the frame slot at fp - n.
+    func emit_unique(self, anon arr: str, place: str, width: int64) -> none {
+        let ok = self.fresh("Luniq")
+        let count = self.pool.alloc_reg()
+        let count_w = f"w{count[1..len(count)]}"
+        // The 32-bit count; the load clears the top half.
+        self.emit_load(count_w, base: arr, off: -8)
+        self.emit_op(.Compare, a: count, b: "#1")
+        self.pool.free_reg(count)
+        self.emit_jump_if(.Eq, target: ok)
+        if place.starts_with("#") {
+            self.emit_op(.Sub, a: "x16", b: "fp", c: place)
+        } else {
+            self.emit_mov("x16", src: place)
+        }
+        self.emit_op(.Move, a: "x17", b: f"#{width}")
+        self.emit_call("_kod_arr_unique_stub")
+        self.emit_mov(arr, src: "x17")
+        self.emit_label(ok)
     }
 
     func array_buf_len(self, anon arr_ptr_r: str, len_out: bool) -> str {
@@ -17651,7 +17771,11 @@ type Codegen = struct {
         mut new_recv = recv
         mut new_rhs = rhs
         if not self.is_stable(recv) {
-            new_recv = self.stash_chain_operand(recv)
+            if index and self.infer_kind(recv).is_array() {
+                new_recv = self.stash_place(recv)
+            } else {
+                new_recv = self.stash_chain_operand(recv)
+            }
         }
         if index and not self.is_stable(rhs) {
             new_rhs = self.stash_chain_operand(rhs)
@@ -17660,6 +17784,35 @@ type Codegen = struct {
             return lhs_id
         }
         return self.p.alloc_expr(ast.Expr.Binary(lhs: new_recv, :op, rhs: new_rhs), span: self.p.expr_spans[lhs_id])
+    }
+
+    // An array expression with what has effects in it stashed, keeping it a
+    // place (see array_place): for `a.b[i]` the struct `a` and the index `i`,
+    // not the array, whose copy would be what the store then changed.
+    func stash_place(self, anon arr_id: int64) -> int64 {
+        if self.p.exprs[arr_id] is .Binary(base, op, rhs) {
+            if op is .Dot and self.infer_kind(base) is .KStruct(_idx, _args) {
+                if self.is_stable(base) {
+                    return arr_id
+                }
+                return self.p.alloc_expr(ast.Expr.Binary(lhs: self.stash_chain_operand(base), :op, :rhs), span: self.p.expr_spans[arr_id])
+            }
+            if op is .Index and self.infer_kind(base).is_array() {
+                let new_base = self.stash_place(base)
+                mut new_index = rhs
+                if not self.is_stable(rhs) {
+                    new_index = self.stash_chain_operand(rhs)
+                }
+                if new_base == base and new_index == rhs {
+                    return arr_id
+                }
+                return self.p.alloc_expr(ast.Expr.Binary(lhs: new_base, :op, rhs: new_index), span: self.p.expr_spans[arr_id])
+            }
+        }
+        if self.is_stable(arr_id) {
+            return arr_id
+        }
+        return self.stash_chain_operand(arr_id)
     }
 
     func compile_assign(self, lhs_id: int64, rhs_id: int64) -> none {
@@ -17840,15 +17993,100 @@ type Codegen = struct {
     // once beforehand, so the load and the store share it.
     func compile_plus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         let target = self.stash_store_target(lhs_id, value: rhs_id)
+        if self.infer_kind(target).is_array() and self.appends_at_place(target) {
+            self.compile_append(target, :rhs_id)
+            return
+        }
+        // Anything else, such as `m[k] += [x]` on a Map, is `m[k] = m[k] + [x]`:
+        // for an array a new one, which the store puts back.
         let span = self.p.expr_spans[target]
         let sum_id = self.p.alloc_expr(ast.Expr.Binary(lhs: target, op: .Add, rhs: rhs_id), :span)
         let saved_append = self.append_lhs_id
         let saved_append_path = self.append_lhs_path
-        self.append_lhs_id = target
-        self.append_lhs_path = self.p.path
+        if not self.infer_kind(target).is_array() {
+            self.append_lhs_id = target
+            self.append_lhs_path = self.p.path
+        }
         self.compile_assign(lhs_id: target, rhs_id: sum_id)
         self.append_lhs_id = saved_append
         self.append_lhs_path = saved_append_path
+    }
+
+    // Whether `xs += ...` appends to `target` where it's kept (see array_place):
+    // a name that may be assigned, a module variable of this module, a field,
+    // or an element of one of those. Reports what can't be changed.
+    func appends_at_place(self, anon target: int64) -> bool {
+        if self.var_signature(target) is Some(sig) {
+            return sig.src_p.path == self.p.path
+        }
+        match self.p.exprs[target] {
+            .Ident(name) -> {
+                return self.var_declared(name) and self.var_bound(name) and not arrays.contains(self.in_captures, name) and self.find_var_mutable(name)
+            }
+            .Binary(base, op, _rhs) -> {
+                if op is .Dot {
+                    return self.infer_kind(base) is .KStruct(_idx, _args)
+                }
+                if op is .Index and self.infer_kind(base).is_array() {
+                    return self.array_changeable(base)
+                }
+                return false
+            }
+            else return false
+        }
+    }
+
+    // `target += rhs` on an array kept at a place: the value first (the
+    // receiver and index are stashed already), then the place, made its own
+    // by the runtime, which appends in place.
+    func compile_append(self, anon target: int64, rhs_id: int64) -> none {
+        let kind = self.infer_kind(target)
+        mut push = false
+        mut elem_id = 0
+        if self.p.exprs[rhs_id] is .ArrayLit(elements) and len(elements) == 1 and self.pushes(rhs_id, :kind) {
+            push = true
+            elem_id = elements[0]
+        }
+        mut refs = 0
+        mut parked = ""
+        if push {
+            let expected_elem = kind.array_elem()
+            mut elem_reg = ""
+            if self.elem_needs_conversion(expected_elem) {
+                elem_reg = self.compile_value_for_kind(elem_id, expected: expected_elem)
+            } else {
+                let elem_val = self.compile_expr(elem_id)
+                self.report_if_unknown(elem_id)
+                elem_reg = self.load(elem_val)
+            }
+            mut rc_elem = expected_elem
+            if rc_elem.is_void() {
+                rc_elem = self.infer_kind(elem_id)
+            }
+            // The array's reference; the C side only stores it.
+            self.rc_retain_kind(elem_reg, kind: rc_elem)
+            self.check_value_kind(rhs_id, expected: kind)
+            if self.rc_heap_kind(rc_elem) {
+                refs = 1
+            }
+            parked = self.park_value(.VReg(name: elem_reg))
+        } else {
+            parked = self.park_value(self.compile_concat_operand(rhs_id, :kind, typed_anchor: 0))
+        }
+        let place = self.array_place(target)
+        let value = self.unpark_value(parked)
+        self.emit_mov("x1", src: value)
+        self.pool.free_reg(value)
+        self.emit_mov("x0", src: place)
+        self.pool.free_reg(place)
+        if push {
+            self.emit_op(.Move, a: "x2", b: f"#{refs}")
+            self.emit_op(.Move, a: "x3", b: f"#{self.elem_width(kind)}")
+            self.emit_call("_kod_arr_push_at")
+        } else {
+            self.emit_op(.Move, a: "x2", b: f"#{self.elem_width(kind)}")
+            self.emit_call("_kod_arr_concat_at")
+        }
     }
 
     // `lhs -= rhs` desugars to `lhs = lhs - rhs`. Same shape as
@@ -19068,6 +19306,13 @@ type Codegen = struct {
         self.pool.free_reg(bump_reg)
         self.emit_jump(start_lbl)
         self.emit_label(end_lbl)
+        // The loop's hold on the array ends with it, so changing the array after
+        // the loop doesn't copy it.
+        if arrays.contains(self.rc_slots, hdr_off) {
+            self.emit_ldr(hdr_off, reg: "x17")
+            self.emit_str_raw(hdr_off, reg: "xzr")
+            self.rc_release_x17()
+        }
 
         self.end_loop()
     }
@@ -19913,7 +20158,8 @@ type Codegen = struct {
         // and the frame prologue, pops go just before `ret`. The pushes
         // live *outside* the existing frame, so every fp-relative local
         // and sp-relative spill in the body keeps its exact offset.
-        let saved_buf = self.out_buf
+        // Held in a struct so it can let go of the buffer once it's back.
+        let saved = InsnList(insns: self.out_buf)
         let vreg_start: int64 = len(self.pool.vreg_phys)
         self.out_buf = []
         self.rc_ctor_mark = -1
@@ -19984,7 +20230,8 @@ type Codegen = struct {
         self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
 
         mut body_buf = self.peephole(self.out_buf, :vreg_start)
-        self.out_buf = saved_buf
+        self.out_buf = saved.insns
+        saved.insns = []
         self.rc_ctor_mark = -1
 
         // Run linear-scan regalloc over the function's vregs, reusing

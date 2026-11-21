@@ -251,6 +251,46 @@ __attribute__((naked)) void rc_free_stub(void) {
         "ret\n");
 }
 
+/* Copy on write from generated code: x16 is the address of the word that
+ * holds the array, x17 its element width; the array, now the place's own,
+ * comes back in x17. Everything but x16, x17, lr and the flags survives. */
+void *kod_arr_unique(void **place, int64_t width);
+__attribute__((naked)) void kod_arr_unique_stub(void) {
+    __asm__(
+        "stp x0, x1, [sp, #-16]!\n"
+        "stp x2, x3, [sp, #-16]!\n"
+        "stp x4, x5, [sp, #-16]!\n"
+        "stp x6, x7, [sp, #-16]!\n"
+        "stp x8, x9, [sp, #-16]!\n"
+        "stp x10, x11, [sp, #-16]!\n"
+        "stp x12, x13, [sp, #-16]!\n"
+        "stp x14, x15, [sp, #-16]!\n"
+        "stp q0, q1, [sp, #-32]!\n"
+        "stp q2, q3, [sp, #-32]!\n"
+        "stp q4, q5, [sp, #-32]!\n"
+        "stp q6, q7, [sp, #-32]!\n"
+        "stp fp, lr, [sp, #-16]!\n"
+        "mov fp, sp\n"
+        "mov x0, x16\n"
+        "mov x1, x17\n"
+        "bl _kod_arr_unique\n"
+        "mov x17, x0\n"
+        "ldp fp, lr, [sp], #16\n"
+        "ldp q6, q7, [sp], #32\n"
+        "ldp q4, q5, [sp], #32\n"
+        "ldp q2, q3, [sp], #32\n"
+        "ldp q0, q1, [sp], #32\n"
+        "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n"
+        "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n"
+        "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n"
+        "ldp x2, x3, [sp], #16\n"
+        "ldp x0, x1, [sp], #16\n"
+        "ret\n");
+}
+
 /* What generated code calls, with the object in x17. Only x16, x17 and lr
  * change, and no flags, until an object is freed. */
 __attribute__((naked)) void rc_retain_stub(void) {

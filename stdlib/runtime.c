@@ -494,6 +494,36 @@ void *kod_arr_repeat(void *arr_raw, int64_t n, int64_t width) {
     return out;
 }
 
+// Copy on write: the array at `*place`, made the place's own first. An array
+// another place also holds (its count isn't 1), or one outside the counted
+// heap, is copied; the copy goes to `*place` and the original loses the
+// place's reference.
+void *kod_arr_unique(void **place, int64_t width) {
+    KodArray *a = (KodArray *)*place;
+    if (rc_arr_counted(a) && ((uint32_t *)a)[-2] == 1) return a;
+    KodArray *c = (KodArray *)kod_arr_slice(a, 0, a->len, width);
+    *place = c;
+    rc_release_c(a);
+    return c;
+}
+
+// `xs += [x]` and `xs += ys` on the array at `*place`, made its own first.
+void kod_arr_push_at(void **place, int64_t value, int64_t refs, int64_t width) {
+    kod_arr_push(kod_arr_unique(place, width), value, refs, width);
+}
+
+void kod_arr_concat_at(void **place, void *rhs_raw, int64_t width) {
+    // Appending an array to itself reads the elements before they're copied.
+    KodArray *rhs = (KodArray *)rhs_raw;
+    if (rhs == *place && !(rc_arr_counted(rhs) && ((uint32_t *)rhs)[-2] == 1)) {
+        rc_retain_c(rhs);
+        kod_arr_concat(kod_arr_unique(place, width), rhs, width);
+        rc_release_c(rhs);
+        return;
+    }
+    kod_arr_concat(kod_arr_unique(place, width), rhs, width);
+}
+
 void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
     KodArray *lhs = (KodArray *)lhs_raw;
     KodArray *rhs = (KodArray *)rhs_raw;

@@ -6,6 +6,10 @@ icon: lucide/list
 
 Arrays in Kod are resizable, homogeneous sequences. The type is `[T]` where `T` is the element type.
 
+An array is a value, like an `int64` or a `str`: assigning it, passing it or
+storing it in a field gives the other place the array as it is, and changing
+one of them later leaves the others alone (see [Arrays are values](#arrays-are-values)).
+
 ## Literals
 
 ```kod
@@ -94,7 +98,7 @@ let n: int64 = len(nums)
 let sub: [int64] = nums[1..4]   // elements 1, 2, 3
 let prefix: [int64] = nums[..3]  // first three
 let suffix: [int64] = nums[3..]  // from index 3 onward
-let copy: [int64] = nums[..]     // shallow copy
+let all: [int64] = nums[..]      // all of it
 ```
 
 Both endpoints clamp to `[0, len]`: a negative bound becomes 0 and a bound past
@@ -132,27 +136,31 @@ amortized O(1) per element. `+` always copies both operands, so
 with one element builds no array for the literal: `x` goes straight onto the
 end of `xs`.
 
-`+=` appends to the array itself, not to a copy, so everything that holds
-the same array sees the new elements: after `let a = xs` and `xs += [3]`,
-`a` ends in 3 too. That holds for an array kept in a field or in another
-array (`rows[0] += [4]`) as well. A function changes the caller's array
-through a [`mut` parameter](functions.md#mut-parameters). A `for x in xs` loop also reaches the elements
-appended to `xs` while it runs.
+## Arrays are values
 
-The one exception is a `mut` binding that starts from an existing array, a
-variable, a field or an element: it gets a copy of its own, so appending to
-it leaves the original alone.
+Each name, field and element holds an array of its own. After `let a = xs`,
+`xs += [3]` leaves `a` as it was, and so does `xs[0] = 9`; the same goes for
+an array stored in a field or in another array, or passed to a function:
 
 ```kod
-mut ys = xs            // a copy of xs
-ys += [4]              // xs is unchanged
+mut xs = [1, 2]
+let a = xs
+xs += [3]              // xs is [1, 2, 3], a is still [1, 2]
+
+mut grid = [[0, 0], [0, 0]]
+let row = grid[0]
+grid[0][1] = 5         // grid is [[0, 5], [0, 0]], row is still [0, 0]
 ```
 
-A `mut` binding that starts from a call, a literal or an expression such as
-`xs + []` already holds an array nobody else has, so nothing is copied.
-To keep the old contents in any other case, copy the array first with
-`xs + []` or `xs[..]`. All of these copies are shallow: the inner arrays of a
-`[[T]]` are still shared.
+None of this copies anything until it has to: assigning or passing an array
+shares its elements, and they are copied the first time one holder changes
+them while another still has them. An array nobody else holds is changed in
+place, so appending in a loop stays amortized O(1). A function changes its
+caller's array only through a [`mut` parameter](functions.md#mut-parameters).
+
+A `for x in xs` loop goes over `xs` as it was when the loop started: what
+the body appends or assigns to `xs` is in `xs` afterwards, but the loop
+doesn't reach it.
 
 ## Repetition
 
@@ -166,10 +174,9 @@ let ab = [1, 2] * 3            // [1, 2, 1, 2, 1, 2]
 ```
 
 The count comes second, and zero or less gives an empty array. It is one
-allocation and a copy, much faster than appending in a loop. Like the other
-copies, it is shallow: `[[0]] * 3` holds the same inner array three times, so
-`+=` on one of them shows in all three; build each row on its own when they
-must differ.
+allocation and a copy, much faster than appending in a loop. Each element is
+a value of its own, so the rows of `mut grid = [[0] * 3] * 3` can be changed
+one at a time.
 
 ## Comparing
 
@@ -233,6 +240,11 @@ The `ptr` field points to a block of elements, each 8 bytes wide except in a
 `[bool]`, whose elements are a byte each (a 1000-element `[bool]` takes 1000
 bytes, not 8000). `len` is the number of live elements; `cap` is the
 allocated capacity, in elements.
+
+The header is counted like any other object, and the count says how many
+places hold the array. Before changing an array, generated code checks that
+the count is 1; if it isn't, `_kod_arr_unique` copies the header and the
+elements, stores the copy where the array was, and lets go of the original.
 
 Appending (`+=`) goes through `_kod_arr_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity
