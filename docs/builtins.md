@@ -136,6 +136,7 @@ print(len(m).to_str())   // 2
 | `set(k, v)` | Add `k` with value `v`, or replace the value `k` has. `m[k] = v` is the same. |
 | `get(k) -> V?` | `k`'s value, or `none` when `k` isn't in the map. `m[k]` is the same. |
 | `m[k, default: d]` | `k`'s value, or `d` when `k` isn't in the map; `m[k, default: d] += v` changes it in place (see [Indexing a struct](#indexing-a-struct)). |
+| `get_or_set(k, v) -> V` | `k`'s value; when `k` isn't in the map, `v`, which becomes `k`'s value. One search either way, as for numbering names: `ids.get_or_set(name, len(ids))`. |
 | `contains(k) -> bool` | Whether `k` is in the map. |
 | `remove(k) -> V?` | Take `k` out of the map, giving the value it had, or `none` when it wasn't there. |
 | `keys() -> [K]` / `values() -> [V]` | The keys, or the values, in the order the keys were first set, as a new array. |
