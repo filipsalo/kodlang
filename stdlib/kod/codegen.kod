@@ -835,6 +835,24 @@ func entered_only_at_top(anon body: [regalloc.Insn], top: int64, back: int64) ->
     return true
 }
 
+// `k` when `expr_id` is the literal 2^k with 1 <= k <= 62, else 0.
+func pow2_exponent(anon p: parsing.Parser, anon expr_id: int64) -> int64 {
+    let .IntLit(v) = p.exprs[expr_id] else { return 0 }
+    if v < 2 or (v & (v - 1)) != 0 {
+        return 0
+    }
+    mut k = 0
+    mut x = v
+    for x > 1 {
+        x = x >> 1
+        k += 1
+    }
+    if k > 62 {
+        return 0
+    }
+    return k
+}
+
 // The register `insn` writes (the first of a pair), or NO_REG.
 func written_reg(anon insn: regalloc.Insn) -> regalloc.Reg {
     match insn {
@@ -11615,10 +11633,37 @@ type Codegen = shared struct {
                 self.emit_op(.Mul, a: result, b: lhs_reg, c: rhs_reg)
             }
             .Div -> {
-                self.emit_div_zero_check(rhs_reg, :rhs_id)
-                self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
+                let k = pow2_exponent(self.p, rhs_id)
+                if k > 0 {
+                    // Rounds toward zero, as sdiv does: a negative dividend is
+                    // raised by 2^k - 1 first.
+                    let t = self.pool.alloc_reg()
+                    self.emit_op(.ShiftRightSigned, a: t, b: lhs_reg, c: "#63")
+                    self.emit_op(.ShiftRight, a: t, b: t, c: f"#{64 - k}")
+                    self.emit_op(.Add, a: t, b: lhs_reg, c: t)
+                    self.emit_op(.ShiftRightSigned, a: result, b: t, c: f"#{k}")
+                    self.pool.free_reg(t)
+                } else {
+                    self.emit_div_zero_check(rhs_reg, :rhs_id)
+                    self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
+                }
             }
             .Mod -> {
+                let k = pow2_exponent(self.p, rhs_id)
+                if k > 0 {
+                    // x - (x / 2^k) * 2^k, the quotient as `/` works it out.
+                    let t = self.pool.alloc_reg()
+                    self.emit_op(.ShiftRightSigned, a: t, b: lhs_reg, c: "#63")
+                    self.emit_op(.ShiftRight, a: t, b: t, c: f"#{64 - k}")
+                    self.emit_op(.Add, a: t, b: lhs_reg, c: t)
+                    self.emit_op(.ShiftRightSigned, a: t, b: t, c: f"#{k}")
+                    self.emit_op(.ShiftLeft, a: t, b: t, c: f"#{k}")
+                    self.emit_op(.Sub, a: result, b: lhs_reg, c: t)
+                    self.pool.free_reg(t)
+                    self.pool.free_reg(lhs_reg)
+                    self.pool.free_reg(rhs_reg)
+                    return .VReg(name: result)
+                }
                 let tmp2 = self.pool.alloc_reg()
                 self.emit_div_zero_check(rhs_reg, :rhs_id)
                 self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
