@@ -1057,11 +1057,29 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
     mut prev_at: regalloc.MemAt = .Base
     // What the second rule made of the instruction after a copy it dropped.
     mut replaced: regalloc.Insn? = none
+    // The third rule has folded the next instruction, a copy, into this one.
+    mut skip_next = false
     for i in 0..n {
+        if skip_next {
+            skip_next = false
+            continue
+        }
         mut cur = b[i]
         if replaced is Some(r) {
             cur = r
             replaced = none
+        }
+        // An operation into a vreg named nowhere else, then a copy of it into
+        // another vreg: the operation writes that one (`i = i + 1` as
+        // `add t, i, #1; mov i, t` is `add i, i, #1`).
+        if i + 1 < n and cur is .Op(fold_op, fold_a, fold_b, fold_c, fold_d, _fold_flags) and regalloc.writes_first_op(fold_op) and not (fold_op is .Move) and (fold_a & 3) == 1 {
+            if b[i + 1] is .Mov(fold_dst, fold_src) and fold_src == fold_a and (fold_dst & 3) == 1 {
+                let fold_id = regalloc.reg_vreg(fold_a) - vreg_start
+                if fold_id >= 0 and fold_id < n_local and counts[fold_id] == 2 {
+                    cur = regalloc.op(fold_op, a: fold_dst, b: fold_b, c: fold_c, d: fold_d)
+                    skip_next = true
+                }
+            }
         }
         // A slot or 4- or 8-byte `Mem` load or store, as its fields.
         mut access = false
@@ -19336,7 +19354,7 @@ type Codegen = shared struct {
     // writes the loaded register only there and reads it nowhere before, and
     // the loop's first block reads through the base (so it's a live object
     // whenever the loop is entered).
-    func hoist_loop_loads(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
+    func hoist_loop_loads(self, anon body: [regalloc.Insn], vreg_start: int64) -> [regalloc.Insn] {
         self.loads_hoisted = false
         // Only loops' labels (Lfor..., Lfe...): what a backward branch goes to.
         mut label_at = Map[str, int64]()
@@ -19519,6 +19537,24 @@ type Codegen = shared struct {
             return body
         }
         self.loads_hoisted = true
+        // A slot's load that only moved loads read is dropped (they read it
+        // again before the loop).
+        let n_local = len(self.pool.vreg_phys) - vreg_start
+        let counts = regalloc.vreg_counts(body, :vreg_start, :n_local)
+        mut moved_reads = Map[int64, int64]()
+        for j, other in body {
+            if moved[j] and other is .Mem(_l, _w, _r, base, _at) and (base & 3) == 1 {
+                moved_reads[base >> 2] = (moved_reads.get(base >> 2)? or 0) + 1
+            }
+        }
+        for k, insn in body {
+            if not moved[k] and insn is .Slot(store, dst, _off) and not store and (dst & 3) == 1 {
+                let id = regalloc.reg_vreg(dst) - vreg_start
+                if id >= 0 and id < n_local and counts[id] - 1 == (moved_reads.get(dst >> 2)? or 0) {
+                    moved[k] = true
+                }
+            }
+        }
         // The moved lines, by the line they go before, in order.
         mut tops: [int64] = []
         mut lines: [int64] = []
@@ -21117,7 +21153,7 @@ type Codegen = shared struct {
         body_buf = self.hoist_unique_checks(body_buf)
         // Loads out of loops live across them, which only the strict allocation
         // of promoted locals keeps apart: used only when that succeeds.
-        let hoisted = self.hoist_loop_loads(body_buf)
+        let hoisted = self.hoist_loop_loads(body_buf, :vreg_start)
         self.rc_ctor_mark = -1
 
         // Run linear-scan regalloc over the function's vregs, reusing
