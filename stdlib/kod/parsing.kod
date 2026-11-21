@@ -480,6 +480,9 @@ type Parser = shared struct {
 	type_quals: [str] = []
 	// How many bindings got a name of their own (`x#1`) because they hide one in force.
 	renames: int64 = 0
+	// Per statement, the `let` locals of its block it uses last (the Renamer
+	// works it out), for codegen to release after it.
+	release_after: Map[int64, [str]] = Map[int64, [str]]()
 	// Match expressions parsed so far, so a FuncDecl can tell whether its body has one.
 	binding_exprs: int64 = 0
 	// Whether the parameter list parse_param_list read last ended in `...`.
@@ -3761,6 +3764,18 @@ type Renamer = shared struct {
 	mut_read_keys: [str] = []
 	mut_lets: [int64] = []
 	shared: [str] = []
+	// For releasing locals after their last use (Parser.release_after): the
+	// statements being walked, outermost first, and for each binding in force
+	// the depth in them of the `let` that bound it (-1 for any other
+	// binding), the statement at that depth that last used it, whether a
+	// function literal captured it, and the binding a `let-else` binding
+	// borrows from (-1 for none).
+	cur_stmts: [int64] = []
+	lets: [int64] = []
+	lasts: [int64] = []
+	caps: [bool] = []
+	parents: [int64] = []
+	live_lets: int64 = 0
 
 	func run(self, anon decls: [ast.Decl]) -> none {
 		// Last first: a literal's id is below the function it's in, so it's walked in place.
@@ -3775,6 +3790,7 @@ type Renamer = shared struct {
 			self.top = 0
 			self.renamed = 0
 			self.live_muts = 0
+			self.live_lets = 0
 			self.expr_binds = fd.expr_binds
 			self.depth = 1
 			for param in fd.params {
@@ -3808,6 +3824,7 @@ type Renamer = shared struct {
 		self.top = 0
 		self.renamed = 0
 		self.live_muts = 0
+		self.live_lets = 0
 		self.expr_binds = true
 		self.depth = 1
 		self.expr(expr_id)
@@ -3876,6 +3893,13 @@ type Renamer = shared struct {
 
 	// The binding at `i` is read: a capture of each literal younger than it.
 	func note_capture(self, anon i: int64, expr_id: int64) -> none {
+		if len(self.lit_marks) > 0 and i < self.lit_marks[len(self.lit_marks) - 1] {
+			mut k = i
+			for k >= 0 {
+				self.caps[k] = true
+				k = self.parents[k]
+			}
+		}
 		if self.muts[i] and len(self.lit_marks) > 0 and i < self.lit_marks[len(self.lit_marks) - 1] and not arrays.contains(self.shared, self.keys[i]) {
 			self.shared += [self.keys[i]]
 		}
@@ -3929,12 +3953,20 @@ type Renamer = shared struct {
 			self.depths[self.top] = self.depth
 			self.levels[self.top] = level
 			self.muts[self.top] = mutable
+			self.lets[self.top] = -1
+			self.lasts[self.top] = -1
+			self.caps[self.top] = false
+			self.parents[self.top] = -1
 		} else {
 			self.names += [name]
 			self.keys += [key]
 			self.depths += [self.depth]
 			self.levels += [level]
 			self.muts += [mutable]
+			self.lets += [-1]
+			self.lasts += [-1]
+			self.caps += [false]
+			self.parents += [-1]
 		}
 		if mutable {
 			self.live_muts += 1
@@ -3949,6 +3981,15 @@ type Renamer = shared struct {
 	func end_scope(self, anon mark: int64) -> none {
 		for self.top > mark {
 			self.top -= 1
+			if self.lets[self.top] >= 0 {
+				self.live_lets -= 1
+				let last = self.lasts[self.top]
+				if not self.caps[self.top] and last > 0 {
+					mut after = self.p.release_after.get(last)? or []
+					after += [self.keys[self.top]]
+					self.p.release_after[last] = after
+				}
+			}
 			if self.levels[self.top] > 0 {
 				self.renamed -= 1
 			}
@@ -4039,15 +4080,33 @@ type Renamer = shared struct {
 	}
 
 	func stmt(self, anon stmt_id: int64) -> none {
+		self.cur_stmts += [stmt_id]
+		self.stmt_now(stmt_id)
+		self.cur_stmts = self.cur_stmts[0..len(self.cur_stmts) - 1]
+	}
+
+	func stmt_now(self, anon stmt_id: int64) -> none {
 		match self.p.stmts[stmt_id] {
 			.Let(name, typ, value, mutable) -> {
 				if self.p.exprs[value] is .FuncLit(decl_id) {
 					self.p.func_decls[decl_id].let_name = name
 				}
 				self.expr(value)
+				// Rebound in the same block, it shares its name and slot with the
+				// new binding, so only the newest is released early.
+				let prev = self.find(name)
+				if prev >= 0 and self.depths[prev] == self.depth and self.lets[prev] >= 0 {
+					self.lets[prev] = -1
+					self.live_lets -= 1
+				}
 				let key = self.bind(name, mutable: mutable and self.expr_binds)
 				if key != name {
 					self.p.stmts[stmt_id] = ast.Stmt.Let(name: key, :typ, :value, :mutable)
+				}
+				if len(name) > 0 {
+					self.lets[self.top - 1] = len(self.cur_stmts)
+					self.lasts[self.top - 1] = stmt_id
+					self.live_lets += 1
 				}
 				if mutable and self.expr_binds {
 					self.mut_lets += [stmt_id]
@@ -4102,19 +4161,38 @@ type Renamer = shared struct {
 			.LetElse(pattern, value, else_body) -> {
 				self.expr(value)
 				self.block(else_body)
+				let mark = self.top
 				self.bind_pattern(pattern)
+				// What it binds may borrow from the local it unpacks.
+				if self.p.exprs[value] is .Ident(subject) {
+					let j = self.find(subject)
+					if j >= 0 and j < mark {
+						for b in mark..self.top {
+							self.parents[b] = j
+						}
+					}
+				}
 			}
 			else none
 		}
 	}
 
 	func read(self, anon expr_id: int64, name: str) -> none {
-		if self.renamed == 0 and len(self.lit_marks) == 0 and self.live_muts == 0 {
+		if self.renamed == 0 and len(self.lit_marks) == 0 and self.live_muts == 0 and self.live_lets == 0 {
 			return
 		}
 		let i = self.find(name)
 		if i < 0 {
 			return
+		}
+		// The statement of each `let` it is or borrows from that uses it now.
+		mut k = i
+		for k >= 0 {
+			let at = self.lets[k]
+			if at > 0 and at <= len(self.cur_stmts) {
+				self.lasts[k] = self.cur_stmts[at - 1]
+			}
+			k = self.parents[k]
 		}
 		if self.muts[i] {
 			self.mut_reads += [expr_id]
@@ -4133,7 +4211,7 @@ type Renamer = shared struct {
 	}
 
 	func expr(self, anon expr_id: int64) -> none {
-		if expr_id == 0 or (self.renamed == 0 and not self.expr_binds) {
+		if expr_id == 0 or (self.renamed == 0 and not self.expr_binds and self.live_lets == 0) {
 			return
 		}
 		match self.p.exprs[expr_id] {

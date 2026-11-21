@@ -183,7 +183,13 @@ two after that.
   variable the function never assigns to: the subject keeps the payload alive for
   as long as the binding can be used. A binding that shares its slot with one the
   function owns (the same name bound another way, or assigned to) is owned too.
-- A function releases its variables when it returns.
+- A function releases its variables when it returns, except that a `let` or
+  `mut` local holding an array or a struct that isn't shared (a map or set
+  too) is released after the last statement of its block that uses it; a
+  use inside a loop or a nested block counts for the whole statement. What
+  it shared is then the other holder's alone, and changing it doesn't copy
+  it. A local that a function literal captures, or that a `let-else` binding
+  borrows from, lives as long as that does.
 
 `retain` and `release` are calls with the object in `x17`, to `_rc_retain_stub` and
 `_rc_release_stub`. They change only `x16`, `x17` and `lr`, and no flags, until an
