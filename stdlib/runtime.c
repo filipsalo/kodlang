@@ -224,9 +224,9 @@ void kod_sb_append_byte(int64_t handle, int64_t b) {
 }
 
 // `n` in decimal, as int64.to_str writes it.
-void kod_sb_append_int(int64_t handle, int64_t n) {
-    KodStrBuilder *sb = (KodStrBuilder *)handle;
-    char digits[20];
+// Writes the decimal digits of n, last first, into digits (20 bytes) and
+// gives how many there are; the sign is the caller's.
+static int kod_digits_reversed(int64_t n, char *digits) {
     int len = 0;
     // From the signed value, so the smallest int64 needs no negating.
     int64_t rest = n;
@@ -235,9 +235,27 @@ void kod_sb_append_int(int64_t handle, int64_t n) {
         digits[len++] = (char)('0' + (d < 0 ? -d : d));
         rest /= 10;
     } while (rest != 0);
+    return len;
+}
+
+void kod_sb_append_int(int64_t handle, int64_t n) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    char digits[20];
+    int len = kod_digits_reversed(n, digits);
     kod_sb_reserve(sb, len + 1);
     if (n < 0) sb->buf[sb->len++] = '-';
     while (len > 0) sb->buf[sb->len++] = digits[--len];
+}
+
+// n in decimal, in one allocation (int64's to_str).
+KodStr *kod_int64_to_str(int64_t n) {
+    char digits[20];
+    int len = kod_digits_reversed(n, digits);
+    int sign = n < 0;
+    KodStr *s = kod_str_new(len + sign);
+    if (sign) s->buf[0] = '-';
+    for (int i = 0; i < len; i++) s->buf[sign + i] = digits[len - 1 - i];
+    return s;
 }
 
 int64_t kod_sb_len(int64_t handle) {
