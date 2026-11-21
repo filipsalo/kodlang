@@ -776,6 +776,126 @@ func field_check_place(anon body: [regalloc.Insn], k: int64) -> regalloc.Reg {
     return place
 }
 
+// No call in the loop from `top` to `back` but to a panic, a release or the
+// copy, no inlined runtime function, and no loop inside it.
+func loop_calls_ok(anon body: [regalloc.Insn], top: int64, back: int64, label_at: Map[str, int64]) -> bool {
+    for k in top + 1..back {
+        match body[k] {
+            .Call(target) -> {
+                if not regalloc.never_returns(target) and target != "_rc_release_stub" and target != "_kod_arr_unique_stub" {
+                    return false
+                }
+            }
+            .Intrinsic(_label) -> return false
+            .Branch(kind, _reg, target) -> {
+                let at = label_at.get(target)? or -1
+                if kind is .Always and at >= top and at < k {
+                    return false
+                }
+            }
+            else none
+        }
+    }
+    return true
+}
+
+// No branch from outside the loop from `top` to `back` goes into it.
+func entered_only_at_top(anon body: [regalloc.Insn], top: int64, back: int64) -> bool {
+    mut inside: [str] = []
+    for k in top + 1..back + 1 {
+        if body[k] is .Label(name) {
+            inside += [name]
+        }
+    }
+    if len(inside) == 0 {
+        return true
+    }
+    for k, insn in body {
+        if k >= top and k <= back {
+            continue
+        }
+        if insn is .Branch(_kind, _reg, target) and arrays.contains(inside, target) {
+            return false
+        }
+    }
+    return true
+}
+
+// The register `insn` writes (the first of a pair), or NO_REG.
+func written_reg(anon insn: regalloc.Insn) -> regalloc.Reg {
+    match insn {
+        .Slot(store, r, _off) -> {
+            if not store {
+                return r
+            }
+        }
+        .Mov(dst, _src) -> return dst
+        .Mem(load, _width, r, _base, _at) -> {
+            if load {
+                return r
+            }
+        }
+        .LoadConst(dst, _value) -> return dst
+        .Pair(load, a, _b, _base, _mode) -> {
+            if load {
+                return a
+            }
+        }
+        .Op(op, a, _b, _c, _d, _flags) -> {
+            if regalloc.writes_first_op(op) {
+                return a
+            }
+        }
+        else none
+    }
+    return regalloc.NO_REG
+}
+
+// Records `line` as where each vreg `insn` names is first named, unless it was before.
+func note_named(anon insn: regalloc.Insn, line: int64, first: Map[int64, int64]) -> none {
+    match insn {
+        .Slot(_store, r, _off) -> name_at(r, :line, :first)
+        .Mov(dst, src) -> {
+            name_at(dst, :line, :first)
+            name_at(src, :line, :first)
+        }
+        .Mem(_load, _width, r, base, at) -> {
+            name_at(r, :line, :first)
+            name_at(base, :line, :first)
+            if at is .Index(index, _scaled) {
+                name_at(index, :line, :first)
+            }
+        }
+        .LoadConst(dst, _value) -> name_at(dst, :line, :first)
+        .Pair(_load, a, b, base, _mode) -> {
+            name_at(a, :line, :first)
+            name_at(b, :line, :first)
+            name_at(base, :line, :first)
+        }
+        .Op(_op, a, b, c, d, _flags) -> {
+            name_at(a, :line, :first)
+            name_at(b, :line, :first)
+            name_at(c, :line, :first)
+            name_at(d, :line, :first)
+        }
+        .Branch(_kind, r, _target) -> name_at(r, :line, :first)
+        else none
+    }
+}
+
+func name_at(anon r: regalloc.Reg, line: int64, first: Map[int64, int64]) -> none {
+    if ((r & 3) == 1 or (r & 3) == 2) and first.get(r >> 2) is none {
+        first[r >> 2] = line
+    }
+}
+
+// Whether, in the loop these maps describe, `reg` is written only at `at`
+// and named nowhere before it.
+func only_def_at(anon reg: regalloc.Reg, at: int64, def_count: Map[int64, int64], def_line: Map[int64, int64], first_named: Map[int64, int64]) -> bool {
+    let id = reg >> 2
+    return (def_count.get(id)? or 0) == 1 and (def_line.get(id)? or -1) == at and (first_named.get(id)? or at) == at
+}
+
 // Whether a line from `from` to `to` writes `reg`.
 func writes_in(anon body: [regalloc.Insn], reg: regalloc.Reg, from: int64, to: int64) -> bool {
     for k in from..to + 1 {
@@ -1242,6 +1362,11 @@ type Codegen = struct {
     assigned_names: [str] = []
     // Slots whose address a `mut` argument passes: never promoted to registers.
     addressed_offs: [int64] = []
+    // Whether hoist_loop_loads moved anything in the function it last saw.
+    loads_hoisted: bool = false
+    // See note_branches.
+    branch_first: Map[str, int64] = Map[str, int64]()
+    branch_last: Map[str, int64] = Map[str, int64]()
     // `mut` arguments a call checked against its parameters (their value ids).
     mut_checked: [int64] = []
     // Pattern bindings stored without counting, for settle_borrows.
@@ -18854,6 +18979,7 @@ type Codegen = struct {
                 label_at[name] = i
             }
         }
+        self.note_branches(body)
         mut drop: [bool] = [false] * len(body)
         // Per loop top, the checks to put before it: a slot (`off` > 0, as in
         // `fp - off`) or a field (`base` + `foff`).
@@ -18991,40 +19117,255 @@ type Codegen = struct {
         return out
     }
 
+    // Arrays are values, so in an innermost loop that calls nothing but panics
+    // and releases, what holds an array (a field) and an array's header (its
+    // buffer and length) don't change: they change only through a call. Such
+    // a loop's loads of a field or a header word are made once before it, when
+    // the address doesn't change in the loop (its base is kept or is itself
+    // such a load), nothing in the loop stores at that offset, the loop
+    // writes the loaded register only there and reads it nowhere before, and
+    // the loop's first block reads through the base (so it's a live object
+    // whenever the loop is entered).
+    func hoist_loop_loads(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
+        self.loads_hoisted = false
+        // Only loops' labels (Lfor..., Lfe...): what a backward branch goes to.
+        let label_at = Map[str, int64]()
+        mut has_loop = false
+        for i, insn in body {
+            if insn is .Label(name) {
+                if name.starts_with("Lf") {
+                    label_at[name] = i
+                }
+            } else if insn is .Branch(kind, _reg, target) and kind is .Always and target.starts_with("Lf") and label_at.get(target) is Some(_t) {
+                has_loop = true
+            }
+        }
+        if not has_loop {
+            return body
+        }
+        mut moved: [bool] = [false] * len(body)
+        mut moved_to: [int64] = [-1] * len(body)
+        // A moved load whose base is reloaded before the loop: the new base.
+        mut moved_base: [regalloc.Reg] = [regalloc.NO_REG] * len(body)
+        mut moved_base_slot: [int64] = [0] * len(body)
+        mut any = false
+        for back, insn in body {
+            let .Branch(kind, _reg, target) = insn else { continue }
+            if not (kind is .Always) {
+                continue
+            }
+            if not target.starts_with("Lf") {
+                continue
+            }
+            let top = label_at.get(target)? or -1
+            if top < 0 or top >= back or not loop_calls_ok(body, :top, :back, :label_at) {
+                continue
+            }
+            mut calls_copy = false
+            mut pair_store = false
+            mut stored_offs: [int64] = []
+            mut stored_slots: [int64] = []
+            mut header_end = back
+            for k in top + 1..back {
+                match body[k] {
+                    .Call(callee) -> {
+                        if callee == "_kod_arr_unique_stub" {
+                            calls_copy = true
+                        }
+                    }
+                    .Mem(load, _width, _r, _base, at) -> {
+                        if not load {
+                            match at {
+                                .Base -> stored_offs += [0]
+                                .Offset(off) -> stored_offs += [off]
+                                else none
+                            }
+                        }
+                    }
+                    .Pair(load, _a, _b, _base, _mode) -> {
+                        if not load {
+                            pair_store = true
+                        }
+                    }
+                    .Slot(store, _sr, soff) -> {
+                        if store {
+                            stored_slots += [soff]
+                        }
+                    }
+                    .Branch(_bkind, _breg, _btarget) -> {
+                        if header_end == back {
+                            header_end = k
+                        }
+                    }
+                    else none
+                }
+            }
+            if calls_copy or pair_store {
+                continue
+            }
+            // The bases the first block reads through.
+            mut header_bases: [regalloc.Reg] = []
+            for k in top + 1..header_end {
+                if body[k] is .Mem(_load, _width, _r, base, _at) {
+                    header_bases += [base]
+                }
+            }
+            // Per vreg in the loop: how often it's written, the last line that
+            // writes it, and the first line that names it.
+            let def_count = Map[int64, int64]()
+            let def_line = Map[int64, int64]()
+            let first_named = Map[int64, int64]()
+            mut candidates = false
+            for k in top + 1..back {
+                let insn = body[k]
+                note_named(insn, line: k, first: first_named)
+                let w = written_reg(insn)
+                if (w & 3) == 1 or (w & 3) == 2 {
+                    def_count[w >> 2] = (def_count.get(w >> 2)? or 0) + 1
+                    def_line[w >> 2] = k
+                }
+                if insn is .Pair(load, pa, pb, _pbase, _pmode) and load {
+                    def_count[pa >> 2] = 2
+                    def_count[pb >> 2] = 2
+                }
+                if insn is .Mem(load, width, _d, _b, _at) and load and width == 8 {
+                    candidates = true
+                }
+            }
+            if not candidates or not entered_only_at_top(body, :top, :back) {
+                continue
+            }
+            mut hoisted: [regalloc.Reg] = []
+            mut progress = true
+            for progress {
+                progress = false
+                for k in top + 1..back {
+                    if moved[k] {
+                        continue
+                    }
+                    let .Mem(load, width, dst, base, at) = body[k] else { continue }
+                    if not load or width != 8 or (dst & 3) != 1 or (base & 3) != 1 {
+                        continue
+                    }
+                    mut off = -1
+                    match at {
+                        .Base -> off = 0
+                        .Offset(o) -> off = o
+                        else none
+                    }
+                    if off < 0 or arrays.contains(stored_offs, off) {
+                        continue
+                    }
+                    mut base_known = false
+                    for h in hoisted {
+                        if same_reg(h, base) {
+                            base_known = true
+                        }
+                    }
+                    // A base the loop loads from a slot it doesn't store to is
+                    // loaded again before the loop, into a register of its own.
+                    mut from_slot = 0
+                    if not base_known and (def_count.get(base >> 2)? or 0) > 0 {
+                        let j = def_line.get(base >> 2)? or -1
+                        if j >= 0 and body[j] is .Slot(store, _sr, soff) and not store and not arrays.contains(stored_slots, soff) and only_def_at(base, at: j, :def_count, :def_line, :first_named) {
+                            from_slot = soff
+                        }
+                        if from_slot == 0 {
+                            continue
+                        }
+                    }
+                    mut base_read = false
+                    for hb in header_bases {
+                        if same_reg(hb, base) {
+                            base_read = true
+                        }
+                    }
+                    if not base_read {
+                        continue
+                    }
+                    if not only_def_at(dst, at: k, :def_count, :def_line, :first_named) {
+                        continue
+                    }
+                    moved[k] = true
+                    moved_to[k] = top
+                    if from_slot != 0 {
+                        let fresh = regalloc.reg_of(self.pool.alloc_reg())
+                        moved_base[k] = fresh
+                        moved_base_slot[k] = from_slot
+                        self.pool.free_reg(regalloc.reg_text(fresh))
+                    }
+                    hoisted += [dst]
+                    progress = true
+                    any = true
+                }
+            }
+        }
+        if not any {
+            return body
+        }
+        self.loads_hoisted = true
+        // The moved lines, by the line they go before, in order.
+        mut tops: [int64] = []
+        mut lines: [int64] = []
+        for k, to in moved_to {
+            if to >= 0 {
+                tops += [to]
+                lines += [k]
+            }
+        }
+        mut out: [regalloc.Insn] = []
+        for i, insn in body {
+            for m, to in tops {
+                let k = lines[m]
+                if to == i {
+                    if moved_base[k] != regalloc.NO_REG and body[k] is .Mem(load, width, dst, _base, at) {
+                        out += [.Slot(store: false, reg: moved_base[k], off: moved_base_slot[k])]
+                        out += [.Mem(:load, :width, reg: dst, base: moved_base[k], :at)]
+                    } else {
+                        out += [body[k]]
+                    }
+                }
+            }
+            if not moved[i] {
+                out += [insn]
+            }
+        }
+        return out
+    }
+
     // The loop from the label at `top` to its backward branch at `back`: no
     // other loop inside it, no way in but its top, and no call but to a panic,
     // a release or the copy.
     func hoistable_loop(self, anon body: [regalloc.Insn], top: int64, back: int64, label_at: Map[str, int64]) -> bool {
-        for k in top + 1..back {
-            match body[k] {
-                .Call(target) -> {
-                    if not regalloc.never_returns(target) and target != "_rc_release_stub" and target != "_kod_arr_unique_stub" {
-                        return false
-                    }
-                }
-                .Intrinsic(_label) -> return false
-                .Branch(kind, _reg, target) -> {
-                    let at = label_at.get(target)? or -1
-                    if kind is .Always and at >= top and at < k {
-                        return false
-                    }
-                }
-                else none
-            }
+        if not loop_calls_ok(body, :top, :back, :label_at) {
+            return false
         }
         // Nothing outside jumps into it.
-        for k, insn in body {
-            if k >= top and k <= back {
-                continue
-            }
-            if insn is .Branch(_kind, _reg, target) {
-                let at = label_at.get(target)? or -1
-                if at >= top and at <= back {
+        for k in top + 1..back + 1 {
+            if body[k] is .Label(name) {
+                let first = self.branch_first.get(name)? or top
+                let last = self.branch_last.get(name)? or top
+                if first < top or last > back {
                     return false
                 }
             }
         }
         return true
+    }
+
+    // For each label, the first and last line that branches to it, in
+    // branch_first and branch_last, for hoistable_loop.
+    func note_branches(self, anon body: [regalloc.Insn]) -> none {
+        self.branch_first = Map[str, int64]()
+        self.branch_last = Map[str, int64]()
+        for i, insn in body {
+            if insn is .Branch(_kind, _reg, target) {
+                if self.branch_first.get(target) is none {
+                    self.branch_first[target] = i
+                }
+                self.branch_last[target] = i
+            }
+        }
     }
 
     func peephole(self, anon body: [regalloc.Insn], vreg_start: int64) -> [regalloc.Insn] {
@@ -20541,6 +20882,9 @@ type Codegen = struct {
         self.out_buf = saved.insns
         saved.insns = []
         body_buf = self.hoist_unique_checks(body_buf)
+        // Loads out of loops live across them, which only the strict allocation
+        // of promoted locals keeps apart: used only when that succeeds.
+        let hoisted = self.hoist_loop_loads(body_buf)
         self.rc_ctor_mark = -1
 
         // Run linear-scan regalloc over the function's vregs, reusing
@@ -20561,7 +20905,13 @@ type Codegen = struct {
         for off in self.addressed_offs {
             excluded += [off]
         }
-        let promoted = self.promote_locals(body_buf, :vreg_start, :excluded)
+        mut promoted: [regalloc.Insn] = []
+        if self.loads_hoisted {
+            promoted = self.promote_locals(hoisted, :vreg_start, :excluded)
+        }
+        if len(promoted) == 0 {
+            promoted = self.promote_locals(body_buf, :vreg_start, :excluded)
+        }
         if len(promoted) > 0 {
             body_buf = promoted
         } else if not self.pool.evicted {

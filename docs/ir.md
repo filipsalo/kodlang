@@ -210,6 +210,17 @@ were.
    register the loop doesn't write or a slot it doesn't store to, and checks
    once before the loop instead. Dropping a check that repeats one in
    straight-line code (qsort's swap) was tried and gained nothing measurable.
+
+   The same reasoning moves loads: in such a loop (with the copy's check
+   gone too), a field and an array's header change only through a call, so
+   `hoist_loop_loads` loads them once before the loop when the base doesn't
+   change in it (or is reloaded before it from a slot the loop doesn't store
+   to), nothing in the loop stores at that offset, the loop writes the loaded
+   register only there, and the loop's first block reads through the base.
+   The values then live across the loop, which only the strict allocation of
+   promoted locals keeps apart, so the moved body is used only when that
+   succeeds. qsort is 6% faster, compiling 1% slower; unlike step 7 it moves
+   nothing in loops that call, and a store to the heap doesn't stop it.
 11. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
