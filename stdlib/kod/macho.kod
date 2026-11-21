@@ -13,6 +13,7 @@
 import "unsafe"
 import "kod/arm64"
 import "kod/regalloc"
+import "strbuilder" { StrBuilder }
 
 extern func kod_f64_bits(anon x: float64) -> int64
 extern func uname(anon buf: int64) -> int64
@@ -176,6 +177,63 @@ type Assembler = shared struct {
                 s.atom_offsets += [sym.offset]
                 s.atom_symbols += [k]
             }
+        }
+    }
+
+    // An instruction from the compiler as it is, without its text: a label
+    // defined, a word encoded, and anything else read as the line the output
+    // would have had (branches, calls, data, directives).
+    func insn(self, anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg]) -> none {
+        self.line_no += 1
+        if insn is .Label(name) {
+            self.define(name)
+            return none
+        }
+        let word = arm64.insn_word(insn, :vreg_phys)
+        if word >= 0 {
+            self.emit_word(word)
+            return none
+        }
+        match insn {
+            .Call(target) -> {
+                self.emit_fixup(0x94000000, kind: FIX_BRANCH26, name: target)
+                return none
+            }
+            .Branch(kind, reg, target) -> {
+                match kind {
+                    .Always -> {
+                        self.emit_fixup(0x14000000, kind: FIX_BRANCH26, name: target)
+                        return none
+                    }
+                    .If(cond) -> {
+                        self.emit_fixup(0x54000000 | arm64.cond_code(cond), kind: FIX_BRANCH19, name: target)
+                        return none
+                    }
+                    else {
+                        let t = arm64.zr_num(reg, :vreg_phys)
+                        if t >= 0 and t < 31 and regalloc.reg_width(arm64.phys_reg(reg, :vreg_phys)) == 8 {
+                            mut op = 0xB4000000
+                            if kind is .IfNonzero {
+                                op = 0xB5000000
+                            }
+                            self.emit_fixup(op | t, kind: FIX_BRANCH19, name: target)
+                            return none
+                        }
+                    }
+                }
+            }
+            .Data(text) -> {
+                if not text.contains("\n") {
+                    self.line(text.trim())
+                    return none
+                }
+            }
+            else none
+        }
+        let out = StrBuilder()
+        arm64.write_insn(insn, :vreg_phys, :out)
+        for text in out.to_str().split("\n") {
+            self.line(text.trim())
         }
     }
 
@@ -612,7 +670,7 @@ func is_temporary(anon name: str) -> bool {
 
 // The object file for `text`, the assembly the compiler wrote.
 func assemble(anon text: str) -> bytes or Error {
-    let a = Assembler(by_name: Map[str, int64]())
+    let a = new_assembler()
     mut start = 0
     let n = len(text)
     for start < n {
@@ -646,6 +704,19 @@ func assemble(anon text: str) -> bytes or Error {
             throw MachoError(message: a.error)
         }
         start = end + 1
+    }
+    return finish(a)
+}
+
+// An assembler for `Assembler.insn` and `line` to fill.
+func new_assembler() -> Assembler {
+    return Assembler(by_name: Map[str, int64]())
+}
+
+// The object file of what `a` was given, once its labels are resolved.
+func finish(anon a: Assembler) -> bytes or Error {
+    if len(a.error) > 0 {
+        throw MachoError(message: a.error)
     }
     a.resolve()
     if len(a.error) > 0 {

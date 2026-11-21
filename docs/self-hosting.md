@@ -61,7 +61,7 @@ There is no other way in: without the snapshot, `make` stops and says how to res
 | Name | Meaning |
 |---|---|
 | `LINK` | command that links an executable: `clang -target arm64-apple-darwin -Wl,-dead_strip`. `clang` finds the SDK and the macOS version. |
-| `AS` | what assembles a `.s` file. `kod` (the default) writes the object in the compiler's own process, with `stdlib/kod/macho.kod`: no assembler is started, and it reads the compiler's output about twice as fast as clang. Any other value is a command run as `AS -o file.o file.s`, such as `clang -target arm64-apple-darwin -c -x assembler`, clang's own assembler (what `as` runs, minus an `xcrun` shim and a script). The Makefile's own rules read `kod` as the compiler that wrote the `.s` (the snapshot, or the stage being checked), run as `sh_kodc _assemble file.s file.o`. `tools/as_diff.py` checks that the two agree, by meaning, over every file of the corpus. |
+| `AS` | what assembles a `.s` file. `kod` (the default) writes the object in the compiler's own process, with `stdlib/kod/macho.kod`: no assembler is started, and a module compiled by `kod build` goes from the compiler's instructions to its object without being written as text at all. Any other value is a command run as `AS -o file.o file.s`, such as `clang -target arm64-apple-darwin -c -x assembler`, clang's own assembler (what `as` runs, minus an `xcrun` shim and a script). The Makefile's own rules read `kod` as the compiler that wrote the `.s` (the snapshot, or the stage being checked), run as `sh_kodc _assemble file.s file.o`. `tools/as_diff.py` checks that the two agree, by meaning, over every file of the corpus. |
 | `CC`, `CFLAGS` | compile a C file: `clang`, `-target arm64-apple-darwin -I stdlib -O2`. The target is pinned as in `LINK` (and `as`), so a `clang` that follows the architecture of the shell it runs in (one under Rosetta) does not produce x86_64 objects that the arm64 link rejects. |
 | `RUNTIME_C` | C files linked into every program; built to `build/stage0/<name>.o` |
 | `STAGE0_KOD` | Kod modules linked into every program, in link order; prebuilt by the snapshot compiler to `build/stage0/_<basename>.o`, so their basenames must be unique |
@@ -130,8 +130,11 @@ Builds `sh_kodc` at `BASE` (cached under `build/asm-diff/`), compiles every `.ko
 
 ### Reading the assembly
 
-Most instructions reach the output only as their machine word (`.inst 0xaa0103e0`).
-To see each one's text as well, as a comment after the word, set `KOD_ASM_TEXT`:
+`kod build` doesn't write a module's assembly: the instructions go straight
+into its object. With `KOD_ASM_TEXT` set it does, as `<module>.kod.s` beside
+the `.o`, and each instruction written as its machine word (`.inst 0xaa0103e0`)
+has its text as a comment after the word. `sh_kodc file.kod` prints the
+assembly, with the comments only when `KOD_ASM_TEXT` is set:
 
 ```shell
 KOD_ASM_TEXT=1 build/stage1/sh_kodc file.kod > file.s

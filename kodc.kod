@@ -5,6 +5,10 @@ import "kod/parsing"
 import "kod/ast"
 import "kod/codegen"
 import "kod/build"
+import "kod/macho"
+import "kod/arm64"
+import "libc"
+import "unsafe"
 
 // Build the runtime _main shim for an entry module whose main has the
 // given signature shape.
@@ -205,12 +209,12 @@ mut KEPT_CODEGEN: codegen.Codegen? = none
 // `program` is the rest of the program, when the driver gives it. Only a failed
 // compile reads those modules: it runs again, with no output, for hints that
 // name them. What it parses and compiles stays alive until the process exits.
-func run_codegen(anon path: str, program: [str]) -> int64 {
+func run_codegen(anon path: str, program: [str], asm: macho.Assembler? = none) -> int64 {
     let p: parsing.Parser = build.parse_file(path)
     KEPT_PARSER = p
     let module: ast.Module = p.parse_module()
     KEPT_MODULE = module
-    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, entry_path: path, dry_run: false)
+    let cg: codegen.Codegen = build.compile_program(entry_parser: p, entry_module: module, entry_path: path, dry_run: false, :asm)
     KEPT_CODEGEN = cg
     if not cg.had_errors() {
         return 0
@@ -234,16 +238,29 @@ func normalized(anon paths: [str]) -> [str] {
     return result
 }
 
-// `sh_kodc _compile <entry.kod> <out.o> [program modules...]` — composes the assembly to
-// a sibling .s file (derived by swapping the .o suffix) and assembles it
-// with link.cfg's `AS` to produce the .o. Removes one round-trip the driver
-// otherwise has to do (capture stdout, write .s, spawn as).
+// `sh_kodc _compile <entry.kod> <out.o> [program modules...]` — the module's
+// object. With link.cfg's `AS := kod` the instructions go straight into it;
+// with another `AS`, or with KOD_ASM_TEXT set, the assembly is written to a
+// sibling .s file (the .o suffix swapped) and assembled from there.
 func emit_obj(entry_path: str, out_obj_path: str, program: [str]) -> int64 {
     if len(out_obj_path) < 2 {
         kod_eprint(f"_compile: output path must end in .o ({out_obj_path})")
         return 1
     }
     let asm_path: str = out_obj_path[0..len(out_obj_path)-2] + ".s"
+    let cfg = build.LinkVars(items: [])
+    let cfg_error = build.read_link_config(into: cfg)
+    if len(cfg_error) > 0 {
+        kod_eprint(cfg_error)
+        return 1
+    }
+    if build.link_value(cfg, name: "AS") == "kod" and not arm64.ASM_TEXT {
+        // A `.s` beside it would be from an older compile.
+        if io.is_file(asm_path) {
+            let _gone = libc.unlink(unsafe.c_str(asm_path))
+        }
+        return emit_obj_direct(:entry_path, :out_obj_path, :program)
+    }
     if io.redirect_stdout(asm_path) != 0 {
         kod_eprint(f"_compile: failed to open {asm_path} for writing")
         return 1
@@ -253,16 +270,31 @@ func emit_obj(entry_path: str, out_obj_path: str, program: [str]) -> int64 {
     if rc != 0 {
         return rc
     }
-    let cfg = build.LinkVars(items: [])
-    let cfg_error = build.read_link_config(into: cfg)
-    if len(cfg_error) > 0 {
-        kod_eprint(cfg_error)
-        return 1
-    }
     let error = build.assemble(cfg, :asm_path, obj_path: out_obj_path)
     if len(error) > 0 {
         kod_eprint(error)
         return 1
+    }
+    return 0
+}
+
+func emit_obj_direct(entry_path: str, out_obj_path: str, program: [str]) -> int64 {
+    let a = macho.new_assembler()
+    let rc: int64 = run_codegen(entry_path, :program, asm: a)
+    if rc != 0 {
+        return rc
+    }
+    match macho.finish(a) {
+        Ok(obj) -> {
+            if io.write_file(out_obj_path, kod_bytes_to_str(obj)) != 0 {
+                kod_eprint(f"kod: cannot write {out_obj_path}")
+                return 1
+            }
+        }
+        Err(e) -> {
+            kod_eprint(f"{out_obj_path}: {e.to_str()}")
+            return 1
+        }
     }
     return 0
 }

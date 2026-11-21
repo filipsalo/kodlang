@@ -157,15 +157,15 @@ def test_objects_are_named_after_their_source_in_a_tree(scratch: Path):
             str(source.with_suffix("")),
             str(scratch.relative_to(ROOT) / "lib" / "helper"),
         ]
-        # A module's `.s` is there when it was compiled, not taken from the cache.
+        # A module goes straight to its object; only the shim is assembly.
         objs = [f"{m}.kod.o" for m in modules] + [f"{source}.main.o"]
-        sources = [f"{m}.kod.s" for m in modules] + [f"{source}.main.s"]
         assert sorted(f for f in found if f.endswith(".o")) == sorted(objs)
-        assert set(f for f in found if f.endswith(".s")) <= set(sources)
-        assert f"{source}.main.s" in found
+        assert [f for f in found if f.endswith(".s")] == [f"{source}.main.s"]
 
 
-def test_a_module_compiled_before_comes_from_the_cache(scratch: Path):
+def test_a_module_compiled_before_comes_from_the_cache(scratch: Path, monkeypatch):
+    # With its text, a module's `.s` tells a compiled module from a cached one.
+    monkeypatch.setenv("KOD_ASM_TEXT", "1")
     (scratch / "helper.kod").write_text("func n() -> int64 {\n    return 1\n}\n")
     for name in ["cache_a", "cache_b"]:
         (scratch / f"{name}.kod").write_text(
@@ -1654,7 +1654,6 @@ def test_a_plain_program_runs_no_c_compiler_and_one_link(project: Project):
         "hello/hello.obj/hello.kod.main.o",
         "hello/hello.obj/hello.kod.main.s",
         "hello/hello.obj/hello.kod.o",
-        "hello/hello.obj/hello.kod.s",
     ]
 
 
@@ -1669,10 +1668,8 @@ def test_a_c_file_and_a_module_of_one_name_are_objects_of_their_own(project: Pro
         "entry.kod.main.o",
         "entry.kod.main.s",
         "entry.kod.o",
-        "entry.kod.s",
         "lib.c.o",
         "lib.kod.o",
-        "lib.kod.s",
     ]
 
 

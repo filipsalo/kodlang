@@ -201,6 +201,13 @@ were.
    target, and the symbols. Every instruction reaches it as a word except
    those, so the compiler writes the words of large constants and inlined
    functions too (`arm64.encode_text` encodes an instruction given as text).
+
+   Then no text at all: with `AS := kod`, `sh_kodc _compile` (what `kod build`
+   runs for each module) hands each instruction to `macho.Assembler.insn`
+   instead of writing it out. A word goes into the section, a call or branch
+   becomes a fixup, a label is defined, and only data and directives are still
+   read as lines. Compiling and assembling `codegen.kod` went from 348 to 298 ms,
+   and the object has the same bytes as through the text.
    The Makefile keeps clang's assembler, since it runs before any compiler of
    this tree exists.
 10. **Copy-on-write checks out of loops** (done). Arrays are values: before
