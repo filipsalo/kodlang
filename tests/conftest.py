@@ -31,6 +31,8 @@ TEST_SUPPORT_USERS = {
     "stdlib/panic_test.kod",
     "stdlib/kod/compiler_errors_test.kod",
     "stdlib/kod/match_exhaustiveness_test.kod",
+    "tests/compile_errors_test.kod",
+    "tests/compile_snippets_test.kod",
 }
 
 # Groups and tests that take seconds, started first so that the parallel pass
