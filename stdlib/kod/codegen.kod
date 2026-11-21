@@ -745,6 +745,85 @@ func unique_check_at(anon body: [regalloc.Insn], k: int64) -> int64 {
     return -off
 }
 
+// The place register of emit_unique's check at `k` on a place in a register,
+// or NO_REG: the array's load from it, the count's load, compare, branch,
+// the place into x16, width, call, copy back, label.
+func field_check_place(anon body: [regalloc.Insn], k: int64) -> regalloc.Reg {
+    if k + 8 >= len(body) {
+        return regalloc.NO_REG
+    }
+    let .Mem(load, width, arr, place, at) = body[k] else { return regalloc.NO_REG }
+    if not load or width != 8 or not (at is .Base) {
+        return regalloc.NO_REG
+    }
+    let .Mem(count_load, count_width, _count, count_base, _count_at) = body[k + 1] else { return regalloc.NO_REG }
+    if not count_load or count_width != 4 or count_base != arr {
+        return regalloc.NO_REG
+    }
+    let .Branch(_kind, _reg, target) = body[k + 3] else { return regalloc.NO_REG }
+    let .Label(name) = body[k + 8] else { return regalloc.NO_REG }
+    if name != target or not name.starts_with("Luniq") {
+        return regalloc.NO_REG
+    }
+    let .Call(callee) = body[k + 6] else { return regalloc.NO_REG }
+    if callee != "_kod_arr_unique_stub" {
+        return regalloc.NO_REG
+    }
+    let .Mov(dst, src) = body[k + 4] else { return regalloc.NO_REG }
+    if src != place or dst != regalloc.reg_of("x16") {
+        return regalloc.NO_REG
+    }
+    return place
+}
+
+// Whether a line from `from` to `to` writes `reg`.
+func writes_in(anon body: [regalloc.Insn], reg: regalloc.Reg, from: int64, to: int64) -> bool {
+    for k in from..to + 1 {
+        mut written = regalloc.NO_REG
+        mut second = regalloc.NO_REG
+        match body[k] {
+            .Slot(store, r, _off) -> {
+                if not store {
+                    written = r
+                }
+            }
+            .Mov(dst, _src) -> written = dst
+            .Mem(load, _width, r, _base, _at) -> {
+                if load {
+                    written = r
+                }
+            }
+            .LoadConst(dst, _value) -> written = dst
+            .Pair(load, a, b, _base, _mode) -> {
+                if load {
+                    written = a
+                    second = b
+                }
+            }
+            .Op(op, a, _b, _c, _d, _flags) -> {
+                if regalloc.writes_first_op(op) {
+                    written = a
+                }
+            }
+            else {}
+        }
+        if same_reg(written, reg) or same_reg(second, reg) {
+            return true
+        }
+    }
+    return false
+}
+
+// The same register, or the same vreg in its x or w form.
+func same_reg(anon a: regalloc.Reg, anon b: regalloc.Reg) -> bool {
+    if a == b {
+        return true
+    }
+    let a_vreg = (a & 3) == 1 or (a & 3) == 2
+    let b_vreg = (b & 3) == 1 or (b & 3) == 2
+    return a_vreg and b_vreg and (a >> 2) == (b >> 2)
+}
+
 func forwarded(anon next: regalloc.Insn, dst: regalloc.Reg, src: regalloc.Reg, once: bool) -> regalloc.Insn? {
     match next {
         .Slot(store, reg, off) -> {
@@ -18752,10 +18831,12 @@ type Codegen = struct {
     // the instruction's immediate.
     // Copy on write, out of loops: in an innermost loop that is entered only at
     // its top and calls nothing but panics, releases and the copy itself,
-    // nothing can take a new reference to an array, so once an array in a
-    // local's slot is its own it stays so. Each check emit_unique made there
-    // for a slot the loop doesn't store to goes, and one check before the
-    // loop takes its place.
+    // nothing can take a new reference to an array or store another one where
+    // an array is kept (either would call the retain), so once an array is
+    // its place's own it stays so. Each check emit_unique made there on a
+    // local's slot the loop doesn't store to, or on a field of a struct in a
+    // register the loop doesn't write, goes, and one check before the loop
+    // takes its place.
     func hoist_unique_checks(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
         mut has_check = false
         for insn in body {
@@ -18773,10 +18854,14 @@ type Codegen = struct {
                 label_at[name] = i
             }
         }
-        // Lines to drop, and per loop top the checks to put before it.
         mut drop: [bool] = [false] * len(body)
+        // Per loop top, the checks to put before it: a slot (`off` > 0, as in
+        // `fp - off`) or a field (`base` + `foff`).
         mut hoist_at: [int64] = []
         mut hoist_off: [int64] = []
+        mut hoist_base: [regalloc.Reg] = []
+        mut hoist_base_slot: [int64] = []
+        mut hoist_foff: [int64] = []
         mut hoist_width: [int64] = []
         for back, insn in body {
             let .Branch(kind, _reg, target) = insn else { continue }
@@ -18797,26 +18882,66 @@ type Codegen = struct {
                 }
             }
             for k in top..back {
-                let off = unique_check_at(body, :k)
-                if off >= 0 and not arrays.contains(stored, -off) {
-                    for d in k + 1..k + 9 {
-                        drop[d] = true
+                mut off = unique_check_at(body, :k)
+                mut base = regalloc.NO_REG
+                mut base_slot = 0
+                mut foff = 0
+                if off >= 0 {
+                    if arrays.contains(stored, -off) {
+                        continue
                     }
-                    mut seen = false
-                    for h, at in hoist_at {
-                        if at == top and hoist_off[h] == off {
-                            seen = true
+                } else {
+                    let place = field_check_place(body, :k)
+                    if place == regalloc.NO_REG {
+                        continue
+                    }
+                    // The field's address, worked out in the loop from a base it doesn't write.
+                    mut found = false
+                    for j in top..k {
+                        if body[j] is .Op(op, a, b, c, _d, _flags) and op is .Add and a == place and (c & 3) == 3 {
+                            base = b
+                            foff = regalloc.imm_value(c)
+                            found = true
                         }
                     }
-                    if not seen {
-                        hoist_at += [top]
-                        hoist_off += [off]
-                        if body[k + 5] is .Op(_op, _a, width, _c, _d, _flags) {
-                            hoist_width += [regalloc.imm_value(width)]
-                        } else {
-                            hoist_width += [8]
+                    if not found or base == regalloc.FP or base == regalloc.SP {
+                        continue
+                    }
+                    // The base is kept as it is, or loaded in the loop from a slot the loop doesn't store to.
+                    for j in top..back + 1 {
+                        if body[j] is .Slot(store, r, slot_off) and not store and same_reg(r, base) {
+                            if base_slot != 0 and base_slot != slot_off {
+                                found = false
+                            }
+                            base_slot = slot_off
+                        } else if writes_in(body, reg: base, from: j, to: j) {
+                            found = false
                         }
                     }
+                    if not found or (base_slot != 0 and arrays.contains(stored, base_slot)) {
+                        continue
+                    }
+                }
+                for d in k + 1..k + 9 {
+                    drop[d] = true
+                }
+                mut seen = false
+                for h, at in hoist_at {
+                    if at == top and hoist_off[h] == off and hoist_base[h] == base and hoist_base_slot[h] == base_slot and hoist_foff[h] == foff {
+                        seen = true
+                    }
+                }
+                if not seen {
+                    hoist_at += [top]
+                    hoist_off += [off]
+                    hoist_base += [base]
+                    hoist_base_slot += [base_slot]
+                    hoist_foff += [foff]
+                    mut width = 8
+                    if body[k + 5] is .Op(_op, _a, w, _c, _d, _flags) {
+                        width = regalloc.imm_value(w)
+                    }
+                    hoist_width += [width]
                 }
             }
         }
@@ -18830,14 +18955,25 @@ type Codegen = struct {
                 if at == i {
                     self.out_buf = []
                     let done = self.fresh("Luniq")
-                    self.emit_ldr(-hoist_off[h], reg: "x17")
+                    if hoist_off[h] >= 0 {
+                        self.emit_ldr(-hoist_off[h], reg: "x17")
+                        self.emit_op(.Sub, a: "x16", b: "fp", c: f"#{hoist_off[h]}")
+                    } else {
+                        if hoist_base_slot[h] != 0 {
+                            self.emit_ldr(hoist_base_slot[h], reg: "x16")
+                        } else {
+                            self.emit_mov("x16", src: regalloc.reg_text(hoist_base[h]))
+                        }
+                        self.emit_jump_zero("x16", target: done)
+                        self.emit_op(.Add, a: "x16", b: "x16", c: f"#{hoist_foff[h]}")
+                        self.emit_load("x17", base: "x16")
+                    }
                     self.emit_jump_zero("x17", target: done)
                     let count = self.pool.alloc_reg()
                     self.emit_load(f"w{count[1..len(count)]}", base: "x17", off: -8)
                     self.emit_op(.Compare, a: count, b: "#1")
                     self.pool.free_reg(count)
                     self.emit_jump_if(.Eq, target: done)
-                    self.emit_op(.Sub, a: "x16", b: "fp", c: f"#{hoist_off[h]}")
                     self.emit_op(.Move, a: "x17", b: f"#{hoist_width[h]}")
                     self.emit_call("_kod_arr_unique_stub")
                     self.emit_label(done)
