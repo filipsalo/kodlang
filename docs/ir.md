@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: steps 1–4, 8 and 9 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4, 8, 9 and 10 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -200,7 +200,17 @@ were.
    functions too (`arm64.encode_text` encodes an instruction given as text).
    The Makefile keeps clang's assembler, since it runs before any compiler of
    this tree exists.
-10. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+10. **Copy-on-write checks out of loops** (done). Arrays are values: before
+   an element store, emit_unique checks that the array's count is 1 and
+   copies it otherwise. In an innermost loop entered only at its top that
+   calls nothing but panics, releases and the copy, no array can gain a
+   holder (that takes a retain, a call) or be replaced where it's kept (the
+   same), so `hoist_unique_checks` drops the loop's checks on an array in a
+   local's slot the loop doesn't store to, or in a field of a struct in a
+   register the loop doesn't write or a slot it doesn't store to, and checks
+   once before the loop instead. Dropping a check that repeats one in
+   straight-line code (qsort's swap) was tried and gained nothing measurable.
+11. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions
