@@ -1496,6 +1496,23 @@ type Codegen = shared struct {
     ret_lbl: str = ""
     return_kind: TypeKind = .KVoid
 
+    // A call of the function to itself as the last thing it does jumps back to
+    // its start instead (see `tail_jump`). `tail_ok`: the function can do that.
+    tail_ok: bool = false
+    tail_func_lbl: str = ""
+    tail_top_lbl: str = ""
+    tail_release_lbl: str = ""
+    tail_used: bool = false
+    tail_param_offs: [int64] = []
+    tail_param_rc: [bool] = []
+    // Statements whose call is the last thing the function does.
+    tail_stmts: [int64] = []
+    // The callee expression of the call being compiled in a tail position.
+    tail_callee: int64 = -1
+    tail_method: bool = false
+    tail_two_part: bool = false
+    tail_jumped: bool = false
+
     // The register pool: free list, vreg→phys mapping, and
     // callee-saved high-water tracking. See `regalloc.RegPool`.
     pool: regalloc.RegPool = regalloc.RegPool()
@@ -13854,6 +13871,8 @@ type Codegen = shared struct {
 
     // Try `EnumName.Variant(args)` or `module.thing(args)` two-part forms.
     func try_two_part_call(self, anon args: [ast.CallArg], callee_lhs: int64, callee_rhs: int64) -> Val? {
+        let tail = self.tail_two_part
+        self.tail_two_part = false
         let .Ident(mod_or_obj) = self.p.exprs[callee_lhs] else { return none }
         let .Ident(method_name) = self.p.exprs[callee_rhs] else { return none }
         let enum_idx = self.two_part_ctor_enum(callee_lhs, variant_name: method_name)
@@ -13926,6 +13945,7 @@ type Codegen = shared struct {
         if lhs_kind is .KStruct(sidx, _ta) and self.has_field(method_name, struct_idx: sidx) and self.find_field_kind(method_name, struct_idx: sidx) is .KFunc(_p, _r) {
             return none
         }
+        self.tail_method = tail
         return self.compile_method_call(args, receiver_id: callee_lhs, :method_name, span: self.p.expr_spans[callee_lhs])
     }
 
@@ -14115,6 +14135,9 @@ type Codegen = shared struct {
     }
 
     func compile_call(self, anon args: [ast.CallArg], callee_id: int64) -> Val {
+        // Only this call is in the tail position, not the calls in its arguments.
+        let tail = self.tail_callee == callee_id and callee_id > 0
+        self.tail_callee = -1
         match self.p.exprs[callee_id] {
             .Ident(key) -> {
                 // `key` finds the local; anything else goes by the name as written.
@@ -14217,11 +14240,15 @@ type Codegen = shared struct {
                     self.check_call_args(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name, call_span: self.p.expr_spans[callee_id])
                     let call_slots = self.plan_call(args, param_labels: sig.param_labels, param_defaults: sig.param_default_exprs, skip: 0, call_name: name).slots
                     self.check_mut_args(args, slots: call_slots, param_mut: sig.param_mut, param_names: sig.param_names, param_kinds: sig.param_kinds, skip: 0, call_name: name)
-                    if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
-                        return inlined
-                    }
-                    if self.inline_stmts(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
-                        return inlined
+                    // A call to itself in the tail position is a jump, not a copy of the body.
+                    let self_tail = tail and self.tail_ok and self.fn_label(slot) == self.tail_func_lbl
+                    if not self_tail {
+                        if self.inline_call(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
+                            return inlined
+                        }
+                        if self.inline_stmts(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
+                            return inlined
+                        }
                     }
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
                     if self.fn_label(slot) == "_kod_bytes_le64" {
@@ -14230,6 +14257,9 @@ type Codegen = shared struct {
                     }
                     if arm64.is_intrinsic(self.fn_label(slot)) {
                         self.push_insn(.Intrinsic(label: self.fn_label(slot)))
+                        return .VReg(name: "x0")
+                    }
+                    if tail and self.tail_jump(label: self.fn_label(slot), :args, slots: call_slots, recv: 0) {
                         return .VReg(name: "x0")
                     }
                     self.emit_call(self.fn_label(slot))
@@ -14295,6 +14325,7 @@ type Codegen = shared struct {
                         if self.try_three_part_construct(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
                         }
+                        self.tail_two_part = tail
                         if self.try_two_part_call(args, callee_lhs: lhs, callee_rhs: rhs) is Some(val) {
                             return val
                         }
@@ -14310,6 +14341,7 @@ type Codegen = shared struct {
                                 self.check_private(name, struct_idx: sidx, span: self.p.expr_spans[rhs])
                                 return self.compile_indirect_call(:callee_id, :args)
                             }
+                            self.tail_method = tail
                             return self.compile_method_call(args, receiver_id: lhs, method_name: name, span: self.p.expr_spans[lhs])
                         }
                     }
@@ -14536,6 +14568,8 @@ type Codegen = shared struct {
     }
 
     func compile_method_call(self, anon args: [ast.CallArg], receiver_id: int64, method_name: str, span: ast.Span) -> Val {
+        let tail = self.tail_method
+        self.tail_method = false
         let recv_kind = self.infer_kind(receiver_id)
         if recv_kind is .KUnknown {
             self.compile_discard(receiver_id)
@@ -14688,7 +14722,7 @@ type Codegen = shared struct {
             }
             return .VImm(value: 0)
         }
-        if inline_owner >= 0 {
+        if inline_owner >= 0 and not (tail and self.tail_ok and method_lbl == self.tail_func_lbl) {
             if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
                 return inlined
             }
@@ -14773,6 +14807,9 @@ type Codegen = shared struct {
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
         if arm64.is_intrinsic(method_lbl) {
             self.push_insn(.Intrinsic(label: method_lbl))
+            return .VReg(name: "x0")
+        }
+        if tail and self.tail_jump(label: method_lbl, :args, slots: call_slots, recv: receiver_id) {
             return .VReg(name: "x0")
         }
         self.emit_call(method_lbl)
@@ -16253,7 +16290,15 @@ type Codegen = shared struct {
                 if self.is_fallible_kind(result_kind) {
                     self.report_error(f"error: the `{self.kind_display(result_kind)}` result of this call is dropped; handle it with `try`, `must` or `is Err(e)`, or write `let _ = ...` to ignore it", span: self.p.expr_spans[expr])
                 }
+                if self.tail_ok and len(self.inline_ret_lbl) == 0 and arrays.contains(self.tail_stmts, stmt_id) {
+                    self.tail_callee = self.call_callee(expr)
+                }
                 let val = self.compile_expr(expr)
+                self.tail_callee = -1
+                if self.tail_jumped {
+                    self.tail_jumped = false
+                    return
+                }
                 self.free_val(val)
             }
             .MatchStmt(subject, arms) -> {
@@ -18837,6 +18882,125 @@ type Codegen = shared struct {
         return false
     }
 
+    // Whether the function can jump back to its start for a call to itself, and
+    // which statements end it with a call. Not with `mut` parameters (their
+    // addresses), captures, or arguments on the stack.
+    func tail_setup(self, anon func_decl: ast.FuncDecl, func_lbl: str, by_ref_params: [str], has_captures: bool) -> none {
+        self.tail_func_lbl = func_lbl
+        self.tail_top_lbl = f"Ltail{func_lbl}"
+        self.tail_release_lbl = f"Ltail{func_lbl}$release"
+        self.tail_used = false
+        self.tail_callee = -1
+        self.tail_method = false
+        self.tail_jumped = false
+        self.tail_param_offs = []
+        self.tail_param_rc = []
+        self.tail_stmts = []
+        self.tail_ok = len(by_ref_params) == 0 and not has_captures and len(func_decl.params) <= 8 and not self.in_const_body
+        if not self.tail_ok {
+            return
+        }
+        for param in func_decl.params {
+            self.tail_param_offs += [self.find_var_offset(param.name)]
+            self.tail_param_rc += [self.rc_heap_kind(self.find_var_kind(param.name))]
+        }
+        if self.return_kind.is_void() {
+            self.tail_stmts = self.last_stmts(func_decl.body)
+        }
+    }
+
+    // The statements that can be the last a block runs, through `if`s.
+    func last_stmts(self, anon body: [int64]) -> [int64] {
+        if len(body) == 0 {
+            return []
+        }
+        let last = body[-1]
+        if self.p.stmts[last] is .If(_cond, then_body, else_body) {
+            return self.last_stmts(then_body) + self.last_stmts(else_body)
+        }
+        return [last]
+    }
+
+    // The callee of a call expression, or -1.
+    func call_callee(self, anon expr_id: int64) -> int64 {
+        if self.p.exprs[expr_id] is .Call(callee, _args) {
+            return callee
+        }
+        return -1
+    }
+
+    // A call of the function to itself, its arguments in x0..x7, as a jump to
+    // the start where the parameters are stored. The frame's references are
+    // given up on the way (`emit_tail_release`), so an argument may not borrow
+    // one: an argument for a counted parameter must be that same parameter,
+    // and the arguments mustn't have left anything for the statement's end.
+    func tail_jump(self, label: str, args: [ast.CallArg], slots: [int64], recv: int64) -> bool {
+        if not self.tail_ok or label != self.tail_func_lbl or len(self.loop_stack) > 0 {
+            return false
+        }
+        if self.rc_pending or len(self.rc_stmt_temps) > 0 or len(self.holds) > 0 {
+            return false
+        }
+        mut skip = 0
+        if recv > 0 {
+            skip = 1
+        }
+        if len(slots) + skip != len(self.tail_param_offs) {
+            return false
+        }
+        for pi, is_rc in self.tail_param_rc {
+            if not is_rc {
+                continue
+            }
+            mut arg_id = recv
+            if pi >= skip {
+                let ai = slots[pi - skip]
+                if ai < 0 {
+                    return false
+                }
+                arg_id = args[ai].value
+            }
+            let .Ident(key) = self.p.exprs[arg_id] else { return false }
+            if not self.var_bound(key) or self.find_var_offset(key) != self.tail_param_offs[pi] {
+                return false
+            }
+        }
+        self.emit_jump(self.tail_release_lbl)
+        self.tail_jumped = true
+        if not self.dry_run {
+            self.tail_used = true
+        }
+        return true
+    }
+
+    // Where tail calls go: the frame's references other than the parameters
+    // are given up, as on the way out, and the slots emptied for the next round.
+    func emit_tail_release(self) -> none {
+        mut slots: [int64] = []
+        for slot in self.rc_slots {
+            if not arrays.contains(self.tail_param_offs, slot) {
+                slots += [slot]
+            }
+        }
+        // Nothing to give up: straight to the start.
+        if len(slots) == 0 {
+            for i, insn in self.out_buf {
+                if insn is .Branch(kind, reg, target) and target == self.tail_release_lbl {
+                    self.out_buf[i] = regalloc.Insn.Branch(:kind, :reg, target: self.tail_top_lbl)
+                }
+            }
+            return
+        }
+        self.emit_jump(self.ret_lbl)
+        self.emit_label(self.tail_release_lbl)
+        for slot in slots {
+            self.emit_ldr(slot, reg: "x17")
+            self.emit_str_raw(slot, reg: "xzr")
+            self.rc_release_x17()
+        }
+        self.emit_jump(self.tail_top_lbl)
+    }
+
     func compile_return(self, anon value_id: int64) -> none {
         if len(self.inline_ret_lbl) > 0 {
             // A body with no result has no slot: `return none` only evaluates.
@@ -18966,7 +19130,15 @@ type Codegen = shared struct {
                 self.emit_mov("x0", src: reg)
                 self.pool.free_reg(reg)
             } else {
+                if self.tail_ok {
+                    self.tail_callee = self.call_callee(value_id)
+                }
                 let val = self.compile_expr(value_id)
+                self.tail_callee = -1
+                if self.tail_jumped {
+                    self.tail_jumped = false
+                    return
+                }
                 self.mov_to(val, dest: "x0")
                 self.report_if_unknown(value_id, typed_slot: true)
                 self.check_return_value(value_id, expected: self.return_kind)
@@ -21309,6 +21481,7 @@ type Codegen = shared struct {
         // would end up in the wrong code.
         self.ret_lbl = f"L{func_lbl}$end"
         self.return_kind = self.resolve_type(func_decl.return_typ)
+        self.tail_setup(func_decl, :func_lbl, :by_ref_params, has_captures: lit_env is Some(_e))
 
         self.emit_globl(func_lbl)
         self.emit_label(func_lbl)
@@ -21370,6 +21543,9 @@ type Codegen = shared struct {
 
         self.emit_no_value_return()
 
+        if self.tail_used {
+            self.emit_tail_release()
+        }
         if len(self.cold) > 0 {
             self.emit_jump(self.ret_lbl)
         }
@@ -21398,6 +21574,9 @@ type Codegen = shared struct {
         self.emit_mov("sp", src: "fp")
         self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
 
+        if self.tail_used {
+            self.out_buf = [regalloc.Insn.Label(name: self.tail_top_lbl)] + self.out_buf
+        }
         mut body_buf = self.peephole(self.out_buf, :vreg_start)
         self.out_buf = saved
         body_buf = self.hoist_unique_checks(body_buf)

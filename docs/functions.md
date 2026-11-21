@@ -659,3 +659,30 @@ func fib(anon n: int64) -> int64 {
     return fib(n - 1) + fib(n - 2)
 }
 ```
+
+A function that calls itself as the last thing it does, in a `return f(...)` or,
+for a function that returns nothing, as its last statement, jumps back to its
+start instead of making a call, so that recursion takes no stack however deep it
+goes:
+
+```kod
+func gcd(a: int64, b: int64) -> int64 {
+    if b == 0 {
+        return a
+    }
+    return gcd(a: b, b: a % b)
+}
+```
+
+The arguments are all worked out before any parameter changes, as for a call.
+Some calls stay ordinary calls, each with a frame of its own:
+
+- a call to another function, or one whose result the function still uses
+  (`fib(n - 1) + fib(n - 2)`, `1 + f(n - 1)`);
+- a call from inside a loop, or from a function with `mut` parameters, captures or
+  more than eight parameters;
+- a function returning a `T?`, a `T or Error`, an interface or a union;
+- a call that passes a newly made string, array, map or struct
+  (`walk(xs[1..])`), since the function's own values are let go of before the
+  jump. Passing one of its parameters on as it is (`count(xs, i: i + 1)`) is fine,
+  and numbers and `bool`s can be anything.
