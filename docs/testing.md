@@ -180,14 +180,18 @@ The naming convention `*_test.kod` makes them auto-discoverable by `kod test <di
 
 ## Testing the compiler itself
 
-`make test` rebuilds the toolchain and runs pytest, which covers three kinds of check:
+`make test` rebuilds the toolchain, then builds and runs the test runner, `tools/run_tests.kod`, which runs every `*_test.kod` in the repository that contains `test` blocks through `kod test <file>` (skipping dot-directories and the top-level `build/`); the files of `tests/unit` run together, as one `kod test tests/unit`. A file passes when `kod test` exits 0, its summary line says all passed, and it ran at least as many tests as the file has `test` blocks. Among them:
 
-- **Example programs**: every `tests/**/*.kod`. Trailing `// expected output:`, `// expected errors:`, `// expected stderr:`, `// expected status:` and `// expected mode:` comments say what should happen. Each one is compiled and run; `mode: skip` opts out, for a module other fixtures import.
-- **Test blocks**: every `*_test.kod` in the repo that contains `test` blocks runs through `kod test <file>`, one pytest case per file.
-- **Self-hosting**: the fixed-point check described in [Self-hosting](self-hosting.md#verifying-self-hosting).
+- **Example programs** (`tests/examples_test.kod`): every other `tests/**/*.kod`. Trailing `// expected output:`, `// expected errors:`, `// expected stderr:`, `// expected status:` and `// expected mode:` comments say what should happen. Each one is compiled and run; `mode: skip` opts out, for a module other fixtures import.
+- **Self-hosting** (`tests/selfhost_test.kod`): the fixed-point check described in [Self-hosting](self-hosting.md#verifying-self-hosting).
 
-The tests run programs through the native tools, `build/apps/kod/kod` and `build/stage1/sh_kodc`; Python is only the test harness and the launcher.
+The tests run programs through the native tools, `build/apps/kod/kod` and `build/stage1/sh_kodc`.
 
-`make test` runs most tests in parallel, one worker per core (with pytest-xdist). Tests that build the same program, into the same `build/apps/<name>`, share a group that one worker runs (`tests/conftest.py` decides the groups). The tests marked `serial` (those that rebuild or replace the `kod` driver, write into the project root, or run `make` on the real tree) run afterwards, one at a time. A plain `uv run pytest` runs everything one at a time, as before.
+The runner runs as many files at once as the machine has cores (`-j N` for another number), the slow ones first. Files that build the same program, into the same `build/apps/<name>`, share a group, and two of a group never run at the same time; the lists of groups, slow files and serial files are at the top of `tools/run_tests.kod`. The serial files (those that rebuild or replace the `kod` driver, write into the project root, or run `make` on the real tree) run afterwards, one at a time. Each file has 120 seconds: one still running then is killed with everything it started, and fails. The runner prints a line per file as it ends, then the whole output of each file that failed and a summary, and exits 1 if any failed. Given files or directories, it runs only those:
+
+```shell
+$ make -s stage1 kod && build/apps/kod/kod build tools/run_tests.kod
+$ build/apps/run_tests/run_tests -j 4 stdlib/ tests/lsp_test.kod
+```
 
 `make gates` is what to run before a commit: `make test`, then `make test` again with the runtime built with `-DRC_POISON`, which overwrites freed memory so a use after free shows up. It refuses to run when there is a `link.local.cfg`, since it writes its own for the poisoned pass, and removes it again however the pass ends.

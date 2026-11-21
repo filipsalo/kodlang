@@ -8,9 +8,9 @@
 #   make bootstrap-snapshot
 #                         run selfhost-check, then copy the compiler it built
 #                         to bootstrap/sh_kodc. Commit the result on its own.
-#   make test             build sh_kodc + the kod driver, then run pytest
-#                         (example programs, every *_test.kod, self-hosting checks):
-#                         in parallel, then the `serial` tests one at a time
+#   make test             build sh_kodc + the kod driver, then run every
+#                         *_test.kod with tools/run_tests.kod: in parallel, then
+#                         the serial ones one at a time
 #   make gates            make test, then make test again with a poisoned
 #                         runtime (-DRC_POISON); run before committing
 #   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
@@ -286,9 +286,10 @@ bootstrap-snapshot: selfhost-check
 	mv $(BOOTSTRAP_SH_KODC).new $(BOOTSTRAP_SH_KODC)
 	@echo "==> Wrote $(BOOTSTRAP_SH_KODC). Commit it on its own."
 
+# The runner (tools/run_tests.kod) is built with the driver like any program.
 test: stage1 kod
-	uv run pytest -q -n auto --dist loadgroup -m "not serial" tests/
-	uv run pytest -q -m serial tests/
+	$(KOD_APP)/kod build tools/run_tests.kod
+	build/apps/run_tests/run_tests
 
 # The poisoned pass writes link.local.cfg, so one that is there already is not
 # ours to replace; the trap removes ours and rebuilds however the pass ends.

@@ -1,0 +1,327 @@
+// The `kod` launcher (kod/__main__.py, run as `python3 -m kod`): the public
+// commands go to the native tool, and when there is none it says so instead of
+// building something else.
+//
+// Every run is bounded: a process that does not end within `WAIT_S` seconds is
+// killed with everything it started, and the test fails. The runs outside a
+// checkout use a fresh directory under the system temp dir; what a test makes
+// (there or under build/) is removed when it ends.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "sort"
+import "strbuilder" { StrBuilder }
+import "time"
+import "time" { Duration, monotonic_ns }
+import "unsafe"
+
+extern func getcwd(anon buf: int64, anon size: int64) -> int64
+
+let WAIT_S: int64 = 120
+let SIGSTOP: int64 = 17
+let SIGKILL: int64 = 9
+let SIGPIPE: int64 = 13
+let MISSING: str = "kod: build/apps/kod/kod not found; run kod from the repository root after `make kod`\n"
+let HELLO: str = "func main() -> int64 {\n    return 0\n}\n"
+
+// --- Running programs, bounded ------------------------------------------------
+
+// The repository root (where `kod test` runs), as an absolute path.
+func root() -> str {
+    let buf = unsafe.alloc(4096)
+    let got = getcwd(buf, 4096)
+    mut path = ""
+    if got != 0 {
+        path = unsafe.str_at(buf)
+    }
+    unsafe.free(buf)
+    return path
+}
+
+type Ran = struct {
+    // The exit status, minus the signal that ended it, or -1000 when it could
+    // not be started or had to be killed.
+    status: int64
+    stdout: str
+    stderr: str
+}
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: posix.Fd, into: StrBuilder) -> none {
+    match f.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                let _ = f.close()
+            } else {
+                into.append_bytes(data)
+            }
+        }
+        Err(_) -> {
+            let _ = f.close()
+        }
+    }
+}
+
+// Exit status (or minus the signal) from a raw wait status.
+func decode(anon raw: int64) -> int64 {
+    let sig = raw & 127
+    if sig == 0 {
+        return (raw >> 8) & 255
+    }
+    return -sig
+}
+
+// Reap `child` before `deadline`; -1000 (and the tree killed) if it is still
+// running then.
+func reap(anon child: process.Child, deadline: int64, what: str) -> int64 {
+    for true {
+        match process.wait_status(child.pid, name: what, hang: false) {
+            Ok(raw) -> {
+                if raw >= 0 {
+                    return decode(raw)
+                }
+            }
+            Err(e) -> {
+                fail(f"wait {what}: {e.to_str()}")
+                return -1000
+            }
+        }
+        if monotonic_ns() > deadline {
+            kill_tree(child.pid)
+            let _ = process.wait_status(child.pid, name: what, hang: true)
+            fail(f"{what}: killed, still running after {WAIT_S} s")
+            return -1000
+        }
+        time.sleep(Duration(ms: 2))
+    }
+    return -1000
+}
+
+// Run the launcher with `args` in `dir`, PYTHONPATH the repository root,
+// stdin /dev/null, and collect its output.
+func launch(anon args: [str], dir: str) -> Ran {
+    let argv = ["python3", "-m", "kod"] + args
+    let what = " ".join(argv)
+    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe, :dir, add_env: [f"PYTHONPATH={root()}"]) {
+        Ok(child) -> return finish(child, what: what)
+        Err(e) -> {
+            fail(f"start {what}: {e.to_str()}")
+            return Ran(status: -1000, stdout: "", stderr: "")
+        }
+    }
+}
+
+func finish(anon child: process.Child, what: str) -> Ran {
+    let deadline = monotonic_ns() + WAIT_S * 1000000000
+    let out = StrBuilder()
+    let err = StrBuilder()
+    for child.stdout.fd >= 0 or child.stderr.fd >= 0 {
+        let left = (deadline - monotonic_ns()) / 1000000
+        if left <= 0 {
+            break
+        }
+        match posix.poll(read: [child.stdout, child.stderr], timeout: Duration(ms: left)) {
+            Ok(ready) -> {
+                if ready.read[0] {
+                    take(child.stdout, into: out)
+                }
+                if ready.read[1] {
+                    take(child.stderr, into: err)
+                }
+            }
+            Err(e) -> {
+                fail(f"poll {what}: {e.to_str()}")
+                break
+            }
+        }
+    }
+    let status = reap(child, :deadline, :what)
+    for f in [child.stdout, child.stderr] {
+        if f.fd >= 0 {
+            let _ = f.close()
+        }
+    }
+    return Ran(:status, stdout: out.to_str(), stderr: err.to_str())
+}
+
+// --- Outside a checkout ---------------------------------------------------------
+
+// The names in `dir`, sorted, dot files included.
+func listing(anon dir: str) -> [str] {
+    mut names: [str] = []
+    for name in process.run(["ls", "-A", dir]).stdout.split("\n") {
+        if name != "" {
+            names += [name]
+        }
+    }
+    return sort.sorted(names)
+}
+
+// `kod <command> hello.kod` in a fresh directory outside the repository says
+// the native tool is missing, prints nothing else and makes nothing.
+func outside_a_checkout(anon command: str) -> none {
+    let made = process.run(["mktemp", "-d"])
+    let dir = made.stdout.trim()
+    if made.status != 0 or dir == "" {
+        fail(f"mktemp -d: {made.stderr}")
+        return
+    }
+    if io.write_file(f"{dir}/hello.kod", HELLO) != 0 {
+        fail(f"cannot write {dir}/hello.kod")
+    }
+    let r = launch([command, "hello.kod"], :dir)
+    assert r.status == 1
+    assert r.stderr == MISSING
+    assert r.stdout == ""
+    assert listing(dir) == ["hello.kod"]
+    process.run(["rm", "-rf", dir])
+}
+
+test "outside a checkout build says what is missing" {
+    outside_a_checkout("build")
+}
+
+test "outside a checkout run says what is missing" {
+    outside_a_checkout("run")
+}
+
+test "outside a checkout check says what is missing" {
+    outside_a_checkout("check")
+}
+
+test "outside a checkout test says what is missing" {
+    outside_a_checkout("test")
+}
+
+// --- Inside the checkout ----------------------------------------------------------
+
+test "inside a checkout it hands off to the native tool" {
+    let ran = launch(["run", "tests/hello.kod"], dir: root())
+    if ran.status != 0 {
+        fail(ran.stderr)
+    }
+    assert ran.stdout == "Hello, world!\n"
+    let checked = launch(["check", "tests/does_not_exist.kod"], dir: root())
+    assert checked.status == 1
+    assert checked.stderr.contains("tests/does_not_exist.kod:1:1: error: no such file")
+}
+
+// `kod <command> tests/hello.kod` is an argparse usage error: exit 2.
+func gone(anon command: str) -> none {
+    let r = launch([command, "tests/hello.kod"], dir: root())
+    assert r.status == 2
+    assert r.stderr.contains("invalid choice")
+    assert r.stdout == ""
+}
+
+test "the debug command _emit-asm that built things is gone" {
+    gone("_emit-asm")
+}
+
+test "the debug command _dump-ast that built things is gone" {
+    gone("_dump-ast")
+}
+
+test "the debug command _emit-test-runtime-main that built things is gone" {
+    gone("_emit-test-runtime-main")
+}
+
+test "the debug command _interpret that built things is gone" {
+    gone("_interpret")
+}
+
+test "the debug command _emit-runtime-main that built things is gone" {
+    gone("_emit-runtime-main")
+}
+
+test "the test command it lists takes a path as the native tool does" {
+    // `kod test` alone is the native tool's usage, not a run of `.`.
+    let r = launch(["test"], dir: root())
+    assert r.status == 1
+    assert r.stderr.contains("kod test <file-or-dir>")
+    // The launcher's docstring lists it with its path.
+    assert io.read_file(f"{root()}/kod/__main__.py").contains("kod test <path>")
+    // `--help` lists it, and its own parser wants the path: `-- test` stops
+    // the hand-off (argv[1] is `--`) and parses `test` alone.
+    let help = launch(["--help"], dir: root())
+    assert help.status == 0
+    assert help.stdout.contains("    test      run `test` blocks\n")
+    let parsed = launch(["--", "test"], dir: root())
+    assert parsed.status == 2
+    assert parsed.stderr.contains("usage: kod test [-h] path\n")
+    assert parsed.stderr.contains("the following arguments are required: path")
+}
+
+// --- A closed pipe ------------------------------------------------------------------
+
+// The first bytes `child` writes to stdout before `deadline`; "" at the end of
+// the stream or when the time is up.
+func first_bytes(anon child: process.Child, deadline: int64) -> str {
+    let left = (deadline - monotonic_ns()) / 1000000
+    if left <= 0 {
+        return ""
+    }
+    match posix.poll(read: [child.stdout], timeout: Duration(ms: left)) {
+        Ok(ready) -> {
+            if not ready.read[0] {
+                return ""
+            }
+        }
+        Err(_) -> return ""
+    }
+    match child.stdout.read(1) {
+        Ok(data) -> return kod_bytes_to_str(data)
+        Err(_) -> return ""
+    }
+}
+
+test "a program run through the launcher dies of a closed pipe" {
+    // Python ignores SIGPIPE, and exec keeps an ignored signal ignored, so
+    // unless the launcher resets it `uv run kod run prog | head` is a program
+    // that writes to a pipe nobody reads and carries on.
+    let stem = f"huge_launcher_{libc.getpid()}"
+    let source = f"build/{stem}.kod"
+    if io.write_file(f"{root()}/{source}", io.read_file(f"{root()}/tests/stdio/huge.kod")) != 0 {
+        fail(f"cannot write {source}")
+        return
+    }
+    let argv = ["python3", "-m", "kod", "run", source]
+    let what = " ".join(argv)
+    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Null, dir: root(), add_env: [f"PYTHONPATH={root()}"]) {
+        Ok(child) -> {
+            let deadline = monotonic_ns() + WAIT_S * 1000000000
+            let first = first_bytes(child, :deadline)
+            assert first == "0"
+            let _closed = child.stdout.close()
+            let status = reap(child, :deadline, :what)
+            assert status == -SIGPIPE
+        }
+        Err(e) -> fail(f"start {what}: {e.to_str()}")
+    }
+    process.run(["rm", "-f", f"{root()}/{source}"])
+    process.run(["rm", "-rf", f"{root()}/build/apps/{stem}"])
+}

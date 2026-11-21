@@ -345,7 +345,7 @@ KodStr *kod_unsafe_copy_out(int64_t addr, int64_t n) {
 // hdr" behavior: callers like `xs += [x]` now observe amortized O(1) per
 // append (was O(n), so O(n²) over a build loop). `let b = a; a += [x]`
 // will now also append to `b` — but no in-tree caller relied on the old
-// copy-on-concat semantics, and pytest + the Kod test suites all pass.
+// copy-on-concat semantics, and the test suites all pass.
 // Slice copy: returns a fresh array with elements [start, end). Every
 // element in a Kod array is 8 bytes (pointer-or-int64), so a flat
 // memcpy is enough — no per-element rewrap needed. Negative `end - start`

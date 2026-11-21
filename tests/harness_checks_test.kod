@@ -1,0 +1,332 @@
+// Checks of the tools as a whole: the test runner fails a failing test,
+// io.read_file reads a pipe to its end, `kod check` sees the whole program, a
+// missing entry file is an error, and generated programs with thousands of
+// checks or errors compile in linear memory and time.
+//
+// Every run is bounded: a process that does not end within its time is killed
+// with everything it started, and the test fails. What a test writes goes in a
+// directory of its own below build/ (and the programs it builds are named after
+// it), removed when the test ends.
+
+import "io"
+import "libc"
+import "process"
+import "time"
+import "unsafe"
+
+extern func wait4(anon pid: int64, anon status: int64, anon options: int64, anon usage: int64) -> int64
+
+let KOD: str = "build/apps/kod/kod"
+let SH_KODC: str = "build/stage1/sh_kodc"
+let WNOHANG: int64 = 1
+let SIGKILL: int64 = 9
+let SIGSTOP: int64 = 17
+let WAIT_MS: int64 = 120000
+let MIB: int64 = 1048576
+
+// --- Bounded runs --------------------------------------------------------------
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// What a bounded run did: its exit status (minus the signal that ended it,
+// -1000 when it was killed for taking too long), what it wrote, its ru_maxrss
+// in bytes and how long it took.
+type Done = struct {
+    status: int64
+    out: str
+    err: str
+    maxrss: int64
+    elapsed_ns: int64
+}
+
+// Reap `pid`, waiting no longer than `deadline`.
+func reap(anon pid: int64, deadline: int64, what: str) -> Done {
+    let slot = unsafe.alloc(4)
+    // A struct rusage: two struct timevals, then ru_maxrss.
+    let usage = unsafe.alloc(144)
+    mut done = Done(status: -1000, out: "", err: "", maxrss: 0, elapsed_ns: 0)
+    mut options = WNOHANG
+    for true {
+        let got = unsafe.c_int(wait4(pid, slot, options, usage))
+        if got > 0 {
+            let raw = unsafe.load32(slot)
+            if options == 0 {
+                // Killed for taking too long.
+            } else if (raw & 127) == 0 {
+                done.status = (raw >> 8) & 255
+            } else {
+                done.status = -(raw & 127)
+            }
+            done.maxrss = unsafe.load64(usage + 32)
+            break
+        }
+        if got < 0 and unsafe.errno() != 4 {
+            fail(f"{what}: cannot be waited for")
+            break
+        }
+        if got == 0 {
+            if time.monotonic_ns() > deadline {
+                kill_tree(pid)
+                fail(f"{what}: (killed: still running after {WAIT_MS / 1000} s)")
+                options = 0
+            } else {
+                time.sleep(time.Duration(ms: 1))
+            }
+        }
+    }
+    unsafe.free(slot)
+    unsafe.free(usage)
+    return done
+}
+
+// Run `argv` from the repository root, its stdout and stderr to files in
+// `dir` (removed afterwards), stdin piped from the file `input` (through
+// `cat`) or /dev/null; killed after WAIT_MS.
+func run(anon argv: [str], dir: str, input: str = "") -> Done {
+    let out_path = f"{dir}/run.out"
+    let err_path = f"{dir}/run.err"
+    mut script = "o=$1; e=$2; shift 3; exec \"$@\" >\"$o\" 2>\"$e\""
+    if input != "" {
+        script = "o=$1; e=$2; i=$3; shift 3; cat \"$i\" | \"$@\" >\"$o\" 2>\"$e\""
+    }
+    let what = " ".join(argv)
+    let start = time.monotonic_ns()
+    match process.start(["/bin/sh", "-c", script, "sh", out_path, err_path, input] + argv, stdin: .Null) {
+        Ok(child) -> {
+            mut done = reap(child.pid, deadline: start + WAIT_MS * 1000000, :what)
+            done.elapsed_ns = time.monotonic_ns() - start
+            done.out = io.read_file(out_path)
+            done.err = io.read_file(err_path)
+            let _a = libc.unlink(unsafe.c_str(out_path))
+            let _b = libc.unlink(unsafe.c_str(err_path))
+            return done
+        }
+        Err(e) -> {
+            fail(f"start {what}: {e.to_str()}")
+            return Done(status: -1000, out: "", err: "", maxrss: 0, elapsed_ns: 0)
+        }
+    }
+}
+
+// --- Scratch ------------------------------------------------------------------
+
+// A directory of its own below build/ for one test, and the suffix that names
+// the programs it builds.
+type Scratch = struct {
+    dir: str
+    token: str
+}
+
+func scratch(anon what: str) -> Scratch {
+    let token = f"h{libc.getpid()}"
+    let s = Scratch(dir: f"build/tmp_harness_{what}_{token}", :token)
+    process.run(["mkdir", "-p", s.dir])
+    return s
+}
+
+// Copy `source` into the scratch directory as `<stem>_<token>.kod`, a program
+// name no other run uses; its path.
+func copy(anon s: Scratch, anon source: str, stem: str) -> str {
+    let target = f"{s.dir}/{stem}_{s.token}.kod"
+    write(target, io.read_file(source))
+    return target
+}
+
+func remove(anon s: Scratch) -> none {
+    process.run(["rm", "-rf", s.dir])
+    process.run(["sh", "-c", f"rm -rf build/apps/*_{s.token}"])
+}
+
+func write(anon path: str, anon text: str) -> none {
+    if io.write_file(path, text) != 0 {
+        fail(f"cannot write {path}")
+    }
+}
+
+// How many times `needle` occurs in `s`, not overlapping.
+func count(anon s: str, anon needle: str) -> int64 {
+    mut n = 0
+    mut at = 0
+    for true {
+        if s.find(needle, from: at) is int64(i) {
+            n += 1
+            at = i + len(needle)
+        } else {
+            break
+        }
+    }
+    return n
+}
+
+func shown(anon d: Done) -> str {
+    return f"status {d.status}\n{d.out}\n{d.err}"
+}
+
+// --- The checks ---------------------------------------------------------------
+
+// A failing `test` block fails the run (guards against the runner silently
+// passing everything).
+test "kod test reports failures" {
+    let s = scratch("canary")
+    let canary = copy(s, "tests/test_block_canary.kod", stem: "test_block_canary")
+    let r = run([KOD, "test", canary], dir: s.dir)
+    remove(s)
+    if r.status != 1 {
+        fail(shown(r))
+    }
+    assert r.out.contains("1/2 passed")
+    assert r.out.contains("FAIL canary: this test fails")
+}
+
+// io.read_file on a pipe must read to EOF; ftell can't size it.
+test "read_file reads a pipe to its end" {
+    let s = scratch("read_file_pipe")
+    let source = copy(s, "tests/read_file_stdin.kod", stem: "read_file_stdin")
+    mut lines: [str] = []
+    for i in 0..12000 {
+        lines += [f"line {i:06} of piped input\n"]
+    }
+    let data = "".join(lines)
+    let input = f"{s.dir}/input"
+    write(input, data)
+    let build = run([KOD, "build", source], dir: s.dir)
+    if build.status != 0 {
+        fail(shown(build))
+    } else {
+        let name = f"read_file_stdin_{s.token}"
+        let r = run([f"build/apps/{name}/{name}"], dir: s.dir, :input)
+        if r.status != 0 {
+            fail(r.err)
+        }
+        let want = f"{len(data)}\n" + data + "\n"
+        if r.out != want {
+            fail(f"stdout has {len(r.out)} bytes, want {len(want)}; starts {r.out[0..60]}")
+        }
+    }
+    remove(s)
+}
+
+// `kod check` gives the hint `kod run` does, and sh_kodc on the one file
+// can't: it doesn't know the rest of the program.
+test "kod check finds a type elsewhere in the program" {
+    let s = scratch("check_hint")
+    let entry = "tests/type_bare_cross_module_late.kod"
+    let hint = f"{entry} declares `Late`: import it to use it here"
+    let checked = run([KOD, "check", entry], dir: s.dir)
+    assert checked.status == 1
+    if not checked.err.contains(hint) {
+        fail(checked.err)
+    }
+    let alone = run([SH_KODC, "tests/type_bare_cross_module_late_dep.kod"], dir: s.dir)
+    remove(s)
+    assert alone.status == 1
+    if not alone.err.contains("error: unknown type `Late`") or alone.err.contains(hint) {
+        fail(alone.err)
+    }
+}
+
+test "a missing entry file is an error" {
+    let s = scratch("missing_entry")
+    let missing = "tests/does_not_exist.kod"
+    for argv in [[SH_KODC, missing], [KOD, "build", missing]] {
+        let r = run(argv, dir: s.dir)
+        if r.status != 1 or not r.err.contains(f"{missing}:1:1: error: no such file") {
+            fail(f"{" ".join(argv)}: {shown(r)}")
+        }
+    }
+    remove(s)
+}
+
+// Compile `lines` with sh_kodc from a file `name` in a scratch directory.
+func compile_generated(anon lines: [str], name: str) -> Done {
+    let s = scratch(name)
+    let src = f"{s.dir}/{name}.kod"
+    write(src, "\n".join(lines) + "\n")
+    let r = run([SH_KODC, src], dir: s.dir)
+    remove(s)
+    return r
+}
+
+func memory_below(anon r: Done, mib: int64) -> none {
+    if r.maxrss >= mib * MIB {
+        fail(f"{r.maxrss / MIB} MB")
+    }
+}
+
+// Compile memory stays linear in the number of let-else checks.
+test "let-else checks keep memory linear" {
+    mut lines = ["func g(anon k: int64) -> int64? {", "    return k", "}"]
+    lines += ["func f(anon k: int64) -> int64 {"]
+    for i in 0..2000 {
+        lines += [f"    let .Some(v{i}) = g(k + {i}) else " + "{", f"        return {i}", "    }"]
+    }
+    lines += ["    return v0", "}", "func main() -> int64 {", "    return f(1)", "}"]
+    let r = compile_generated(lines, name: "let_else_many")
+    if r.status != 0 {
+        fail(r.err)
+    }
+    memory_below(r, mib: 300)
+}
+
+// Each function is decided once for the hints of 1000 errors along a chain.
+test "scope hints keep memory linear" {
+    mut lines = ["type Hard = shared struct {", "    tag: str"]
+    lines += ["    func fail(self, anon msg: str) -> none {", "        panic(msg)"]
+    lines += ["    }", "}"]
+    lines += ["interface Failer {", "    func fail(self, anon msg: str) -> none", "}"]
+    let n = 1000
+    for i in 0..n {
+        lines += [f"func d{i}(anon msg: str) -> none " + "{", f"    d{i + 1}(msg)", "}"]
+    }
+    lines += [f"func d{n}(anon msg: str) -> none " + "{", "    let h: Failer = Hard(tag: \"x\")"]
+    lines += ["    h.fail(msg)", "}"]
+    for i in 0..n {
+        lines += [f"func f{i}(anon k: int64) -> int64 " + "{", f"    return d{i}(\"x\")", "}"]
+    }
+    lines += ["func main() -> int64 {", "    return 0", "}"]
+    let r = compile_generated(lines, name: "hint_chain")
+    let hints = count(r.err, "ends in `h.fail(msg)`")
+    if hints != n {
+        fail(f"{hints} hints, want {n}\n{r.err[0..2000]}")
+    }
+    memory_below(r, mib: 300)
+}
+
+// 8000 errors in one file are reported in about linear time.
+test "many errors take linear time" {
+    mut lines = ["func note(anon msg: str) -> none {", "    print(msg)", "}"]
+    let n = 8000
+    for i in 0..n {
+        lines += [f"func f{i}(anon k: int64) -> int64 " + "{", "    if k > 0 {"]
+        lines += ["        return k", "    }", "    return note(\"x\")", "}"]
+    }
+    lines += ["func main() -> int64 {", "    return 0", "}"]
+    let r = compile_generated(lines, name: "many_errors")
+    let errors = count(r.err, "error: expected `int64`, got `none`")
+    if errors != n {
+        fail(f"{errors} errors, want {n}")
+    }
+    if r.elapsed_ns >= 4000000000 {
+        fail(f"{r.elapsed_ns / 100000000 / 10}.{r.elapsed_ns / 100000000 % 10} s")
+    }
+}

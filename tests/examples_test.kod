@@ -1,0 +1,219 @@
+// The example programs in tests/ (docs/testing.md, "Testing the compiler
+// itself"): every `tests/**/*.kod` but the `*_test.kod` files, with trailing
+// `// expected output:`, `// expected stderr:`, `// expected status:`,
+// `// expected errors:` and `// expected mode:` comments saying what should
+// happen. One with expected errors is compiled with sh_kodc; the others are
+// run with `kod run`. `mode: skip` opts a file out (a module other files
+// import). A file with no expectations at all is not run: nothing would be
+// checked.
+//
+// Several run at once, each bounded: one that does not end within WAIT_S
+// seconds is killed with everything it started, and fails. Their output goes
+// to files in build/tmp_examples_<pid>/, removed at the end.
+
+import "io"
+import "libc"
+import "process"
+import "sort"
+import "time"
+
+let KOD: str = "build/apps/kod/kod"
+let SH_KODC: str = "build/stage1/sh_kodc"
+let WORKERS: int64 = 8
+let WAIT_S: int64 = 120
+let SIGKILL: int64 = 9
+let SIGSTOP: int64 = 17
+
+// What an example's comments expect, by the word after `// expected `.
+type Example = struct {
+    path: str
+    keys: [str]
+    values: [str]
+
+    func get(self, anon key: str) -> str? {
+        for i, k in self.keys {
+            if k == key {
+                return self.values[i]
+            }
+        }
+        return none
+    }
+}
+
+// The expectations in `text`, as the old examples_test.py's `parse_example` read
+// them: what follows each `// expected ` up to `:` and a newline is the key,
+// and the non-blank lines after it, each without a leading `// `, the value.
+func parse(anon path: str, anon text: str) -> Example {
+    mut keys: [str] = []
+    mut values: [str] = []
+    let blocks = text.split("// expected ")
+    for b in blocks[1..len(blocks)] {
+        let Some(colon) = b.find(":\n") else {
+            fail(f"{path}: `// expected ` without `:` and a newline")
+            continue
+        }
+        let lines = b[colon + 2..len(b)].split("\n")
+        mut value = ""
+        for i, line in lines {
+            mut full = line
+            if i < len(lines) - 1 {
+                full = line + "\n"
+            }
+            if full.trim() != "" {
+                value += full.strip_prefix("// ")? or full
+            }
+        }
+        keys += [b[0..colon]]
+        values += [value]
+    }
+    return Example(:path, :keys, :values)
+}
+
+// The examples, sorted by path, as generate_tests picks them.
+func examples() -> [Example] {
+    let found = process.run(["find", "tests", "-name", "*.kod", "-type", "f"])
+    mut paths: [str] = []
+    for line in found.stdout.split("\n") {
+        if line.ends_with(".kod") and not line.ends_with("_test.kod") {
+            paths += [line]
+        }
+    }
+    mut out: [Example] = []
+    for path in sort.sorted(paths) {
+        let e = parse(path, io.read_file(path))
+        if (e.get("mode")? or "both").trim() != "skip" {
+            out += [e]
+        }
+    }
+    return out
+}
+
+// --- Bounded runs --------------------------------------------------------------
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+type Running = struct {
+    example: Example
+    // Where its stdout and stderr go: `<base>.out`, `<base>.err`.
+    base: str
+    pid: int64
+    deadline: int64
+}
+
+// The exit status of a raw wait status, minus the signal that ended it.
+func exit_status(anon raw: int64) -> int64 {
+    if (raw & 127) == 0 {
+        return (raw >> 8) & 255
+    }
+    return -(raw & 127)
+}
+
+// Check what the example `r` did against what it expects, as test_example
+// does, failing once for each difference, naming the example.
+func check(anon r: Running, status: int64) -> none {
+    let e = r.example
+    let out = io.read_file(f"{r.base}.out")
+    let err = io.read_file(f"{r.base}.err")
+    process.run(["rm", "-f", f"{r.base}.out", f"{r.base}.err"])
+    if e.get("output") is str(want) {
+        if out != want {
+            fail(f"{e.path}: stdout\n{out}\nwant\n{want}")
+        }
+    }
+    if e.get("stderr") is str(want) {
+        if not err.contains(want) {
+            fail(f"{e.path}: stderr\n{err}\nwant it to contain\n{want}")
+        }
+    }
+    mut want_status = (e.get("status")? or "0").trim()
+    if e.get("errors") is str(errors) {
+        want_status = "1"
+        for line in errors.split("\n") {
+            if line != "" and not err.contains(f"{e.path}:{line}") {
+                fail(f"{e.path}: no error `{e.path}:{line}` in\n{err}")
+            }
+        }
+    }
+    let Some(want) = want_status.parse_int() else {
+        fail(f"{e.path}: expected status `{want_status}` is not a number")
+        return
+    }
+    if status != want {
+        fail(f"{e.path}: status {status}, want {want}\n{err}")
+    }
+}
+
+test "example programs" {
+    let dir = f"build/tmp_examples_{libc.getpid()}"
+    process.run(["mkdir", "-p", dir])
+    let all = examples()
+    if len(all) == 0 {
+        fail("no examples found")
+    }
+    mut todo: [Example] = []
+    for e in all {
+        if len(e.keys) > 0 {
+            todo += [e]
+        }
+    }
+    let script = "b=$1; shift; exec \"$@\" >\"$b.out\" 2>\"$b.err\""
+    mut running: [Running] = []
+    mut next = 0
+    for next < len(todo) or len(running) > 0 {
+        for next < len(todo) and len(running) < WORKERS {
+            let e = todo[next]
+            next += 1
+            let base = f"{dir}/example{next}"
+            mut argv = [KOD, "run", e.path]
+            if e.get("errors") is str(_) {
+                argv = [SH_KODC, e.path]
+            }
+            match process.start(["/bin/sh", "-c", script, "sh", base] + argv, stdin: .Null) {
+                Ok(child) -> running += [Running(example: e, :base, pid: child.pid, deadline: time.monotonic_ns() + WAIT_S * 1000000000)]
+                Err(err) -> fail(f"{e.path}: start: {err.to_str()}")
+            }
+        }
+        mut still: [Running] = []
+        for r in running {
+            match process.wait_status(r.pid, name: r.example.path, hang: false) {
+                Ok(raw) -> {
+                    if raw >= 0 {
+                        check(r, status: exit_status(raw))
+                    } else if time.monotonic_ns() > r.deadline {
+                        kill_tree(r.pid)
+                        let _ = process.wait_status(r.pid, name: r.example.path, hang: true)
+                        fail(f"{r.example.path}: killed, still running after {WAIT_S} s")
+                    } else {
+                        still += [r]
+                    }
+                }
+                Err(err) -> fail(f"{r.example.path}: wait: {err.to_str()}")
+            }
+        }
+        if len(still) == len(running) {
+            time.sleep(time.Duration(ms: 1))
+        }
+        running = still
+    }
+    process.run(["rm", "-rf", dir])
+}

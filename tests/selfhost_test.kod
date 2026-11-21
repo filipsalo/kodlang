@@ -1,0 +1,75 @@
+// The current compiler, compiled by itself twice, emits identical assembly
+// both times (see `make selfhost-check` and docs/self-hosting.md).
+//
+// The run is bounded: when `make` has not ended within WAIT_S seconds it is
+// killed with everything it started, and the test fails. `make` builds only
+// below build/.
+
+import "io"
+import "libc"
+import "process"
+import "time"
+
+let WAIT_S: int64 = 300
+let SIGKILL: int64 = 9
+let SIGSTOP: int64 = 17
+let SCRATCH: str = "build/tmp_selfhost_test"
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+test "the compiler reaches a fixed point" {
+    let dir = f"{SCRATCH}_{libc.getpid()}"
+    process.run(["mkdir", "-p", dir])
+    let log = f"{dir}/make.log"
+    let script = "l=$1; shift; exec \"$@\" >\"$l\" 2>&1"
+    match process.start(["/bin/sh", "-c", script, "sh", log, "make", "-s", "selfhost-check"], stdin: .Null) {
+        Ok(child) -> {
+            let deadline = time.monotonic_ns() + WAIT_S * 1000000000
+            mut status: int64 = -1
+            for true {
+                match process.wait_status(child.pid, name: "make", hang: false) {
+                    Ok(raw) -> status = raw
+                    Err(e) -> {
+                        fail(f"wait make: {e.to_str()}")
+                        break
+                    }
+                }
+                if status >= 0 {
+                    break
+                }
+                if time.monotonic_ns() > deadline {
+                    kill_tree(child.pid)
+                    let _ = process.wait_status(child.pid, name: "make", hang: true)
+                    fail(f"make -s selfhost-check: killed, still running after {WAIT_S} s")
+                    break
+                }
+                time.sleep(time.Duration(ms: 10))
+            }
+            if status > 0 {
+                fail(f"make -s selfhost-check: wait status {status}\n{io.read_file(log)}")
+            }
+        }
+        Err(e) -> fail(f"start make: {e.to_str()}")
+    }
+    process.run(["rm", "-rf", dir])
+}

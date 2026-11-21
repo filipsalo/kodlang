@@ -1,0 +1,675 @@
+// The test runner behind `make test`: runs every `*_test.kod` in the
+// repository through `kod test`, many at once, and says which failed.
+//
+//   run_tests [-j N] [path ...]
+//
+// With no paths it finds every `*_test.kod` below the repository root (the
+// working directory), skipping dot-directories and the top-level build/; the
+// files of tests/unit run together as one `kod test tests/unit`. A path names
+// a file to run or a directory to search the same way. `-j N` runs at most N
+// at once (the number of cores unless given).
+//
+// A file passes when `kod test <file>` exits 0, its summary line says all
+// passed, and it ran at least as many tests as the file has `test` blocks
+// (tests/unit: as all its files have). One still running after
+// FILE_WAIT_S seconds is killed with everything it started, and fails.
+//
+// Expects build/apps/kod/kod and build/stage1/sh_kodc to be current: `make
+// test` builds them first.
+
+import "io"
+import "libc"
+import "posix"
+import "process"
+import "sort"
+import "strbuilder" { StrBuilder }
+import "term"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+let KOD: str = "build/apps/kod/kod"
+let UNIT: str = "tests/unit"
+let FILE_WAIT_S: int64 = 120
+// The self-hosting check builds two compilers, and takes longer under load.
+let LONG_WAIT_S: int64 = 300
+let LONG_KOD_TESTS: [str] = ["tests/selfhost_test.kod"]
+
+// The bound for `path`.
+func wait_for(anon path: str) -> int64 {
+    if contains(LONG_KOD_TESTS, path) {
+        return LONG_WAIT_S
+    }
+    return FILE_WAIT_S
+}
+let FIND_WAIT_S: int64 = 60
+let SIGSTOP: int64 = 17
+let SIGKILL: int64 = 9
+
+// Kod test files that change what every other test uses, so they run one at
+// a time after the rest has run in parallel: they rebuild or replace the
+// `kod` driver, write into the project root, or run `make` on the real tree.
+// build_names writes probe files at the root and rebuilds the `kod` and `lsp`
+// tools; bootstrap runs `make` on the real tree; launcher replaces the `kod`
+// driver. (build_config only reads it, with `make -n` and `make -q`, and
+// nothing in the parallel pass rebuilds it.)
+let SERIAL_KOD_TESTS: [str] = [
+    "tests/bootstrap_test.kod",
+    "tests/build_names_test.kod",
+    "tests/launcher_test.kod",
+]
+
+// Kod test files whose tests build through stdlib/kod/test_support.kod, which
+// writes to fixed scratch paths (`.kod_test_build_dir`, `build/apps/main`,
+// ...): one group, never two of them at the same time. Every other file is in
+// the group of its name without `.kod`, since `kod test` builds it into
+// `build/apps/<that name>`, so two files of the same name never run at once
+// either.
+let TEST_SUPPORT_USERS: [str] = [
+    "stdlib/build_test.kod",
+    "stdlib/import_test.kod",
+    "stdlib/panic_test.kod",
+    "stdlib/kod/compiler_errors_test.kod",
+    "stdlib/kod/match_exhaustiveness_test.kod",
+    "tests/compile_errors_test.kod",
+    "tests/compile_snippets_test.kod",
+]
+let TEST_SUPPORT_GROUP: str = "test_support"
+
+// Groups and files that take seconds, started first so that the parallel pass
+// does not end waiting on one that started late.
+let SLOW_GROUPS: [str] = ["test_support", "http_client_test"]
+// Kod test files whose tests run one after another for several seconds
+// (tests/unit, which builds and runs a hundred files, the self-hosting fixed
+// point and the example programs among them).
+let SLOW_KOD_TESTS: [str] = [
+    "tests/unit",
+    "tests/selfhost_test.kod",
+    "tests/examples_test.kod",
+    "tests/build_link_inputs_test.kod",
+    "tests/compiler_limits_test.kod",
+    "tests/build_config_test.kod",
+    "tests/stdio_test.kod",
+    "tests/lsp_test.kod",
+]
+
+// --- What to run ----------------------------------------------------------------
+
+type Job = shared struct {
+    // The file, or tests/unit.
+    path: str
+    group: str
+    // How many tests it must at least run: its `test` blocks.
+    blocks: int64
+}
+
+func contains(anon xs: [str], anon x: str) -> bool {
+    for y in xs {
+        if y == x {
+            return true
+        }
+    }
+    return false
+}
+
+// What comes after the last `/` of `path`.
+func base(anon path: str) -> str {
+    mut start = 0
+    for i in 0..len(path) {
+        if path[i] == '/' {
+            start = i + 1
+        }
+    }
+    return path[start..len(path)]
+}
+
+// What comes before the last `/` of `path` ("" without one).
+func dir_of(anon path: str) -> str {
+    mut end = 0
+    for i in 0..len(path) {
+        if path[i] == '/' {
+            end = i
+        }
+    }
+    return path[0..end]
+}
+
+func group_of(anon path: str) -> str {
+    if contains(TEST_SUPPORT_USERS, path) {
+        return TEST_SUPPORT_GROUP
+    }
+    if path == UNIT {
+        return "<tests/unit>"
+    }
+    return base(path).strip_suffix(".kod")? or base(path)
+}
+
+func is_slow(anon job: Job) -> bool {
+    return contains(SLOW_GROUPS, job.group) or contains(SLOW_KOD_TESTS, job.path)
+}
+
+func is_word(anon c: int64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+}
+
+// The lines of `text` that start, after spaces and tabs, with the word
+// `test`: its `test` blocks.
+func count_blocks(anon text: str) -> int64 {
+    mut n = 0
+    for line in text.split("\n") {
+        mut i = 0
+        for i < len(line) and (line[i] == ' ' or line[i] == '\t') {
+            i += 1
+        }
+        if line[i..len(line)].starts_with("test") and (i + 4 >= len(line) or not is_word(line[i + 4])) {
+            n += 1
+        }
+    }
+    return n
+}
+
+// `path` without a leading `./` or trailing `/`.
+func clean(anon path: str) -> str {
+    mut p = path
+    for p.starts_with("./") and len(p) > 2 {
+        p = p[2..len(p)]
+    }
+    for p.ends_with("/") and len(p) > 1 {
+        p = p[0..len(p) - 1]
+    }
+    return p
+}
+
+func is_dir(anon path: str) -> bool {
+    let r = capture(["test", "-d", path], wait_s: FIND_WAIT_S)
+    return r.ended and r.code == 0
+}
+
+// The `*_test.kod` files below `dir` (not directories of that name), sorted
+// by directory then name, skipping dot-directories and, below the root, the
+// top-level build/.
+func find_tests(anon dir: str) -> [str] or Error {
+    mut argv = ["find", dir, "(", "-type", "d", "(", "-path", "*/.*"]
+    if dir == "." {
+        argv += ["-o", "-path", "./build"]
+    }
+    argv += [")", ")", "-prune", "-o", "-name", "*_test.kod", "!", "-type", "d", "-print"]
+    let r = capture(argv, wait_s: FIND_WAIT_S)
+    if not r.ended or r.code != 0 {
+        throw process.ProcessError(message: f"find {dir}: {r.why}{r.stderr}")
+    }
+    mut paths: [str] = []
+    for line in r.stdout.split("\n") {
+        if line != "" {
+            paths += [clean(line)]
+        }
+    }
+    return sort.sorted_by(paths, less: func(a: str, b: str) -> bool {
+        let da = dir_of(a)
+        let db = dir_of(b)
+        if da != db {
+            return da < db
+        }
+        return a < b
+    })
+}
+
+// --- Running a program, bounded ------------------------------------------------
+
+// A program running with its stdout and stderr piped here.
+type Proc = shared struct {
+    child: process.Child
+    started: int64
+    deadline: int64
+    out: StrBuilder
+    err: StrBuilder
+    // The raw wait status once it has ended, -1 before.
+    raw: int64
+    expired: bool
+}
+
+func start(anon argv: [str], wait_s: int64) -> Proc or Error {
+    let child = try process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe)
+    let now = monotonic_ns()
+    return Proc(:child, started: now, deadline: now + wait_s * 1000000000, out: StrBuilder(), err: StrBuilder(), raw: -1, expired: false)
+}
+
+func is_done(anon p: Proc) -> bool {
+    return p.raw >= 0 and p.child.stdout.fd < 0 and p.child.stderr.fd < 0
+}
+
+// One read from `f` into `into`; closes `f` at the end of the stream.
+func take(anon f: posix.Fd, into: StrBuilder) -> none {
+    match f.read(65536) {
+        Ok(data) -> {
+            if len(data) == 0 {
+                let _ = f.close()
+            } else {
+                into.append_bytes(data)
+            }
+        }
+        Err(_) -> {
+            let _ = f.close()
+        }
+    }
+}
+
+// The processes below `pid`, each stopped so that it starts no more.
+func descendants(anon pid: int64) -> [int64] {
+    mut out: [int64] = []
+    let r = process.run(["pgrep", "-P", str(pid)])
+    for line in r.stdout.split("\n") {
+        if line.parse_int() is int64(child) {
+            let _stopped = libc.kill(child, SIGSTOP)
+            out += [child] + descendants(child)
+        }
+    }
+    return out
+}
+
+// SIGKILL `pid` and everything it started.
+func kill_tree(anon pid: int64) -> none {
+    let _stopped = libc.kill(pid, SIGSTOP)
+    for child in descendants(pid) {
+        let _killed = libc.kill(child, SIGKILL)
+    }
+    let _killed = libc.kill(pid, SIGKILL)
+}
+
+// Wait up to `ms` for output from any of `procs`, take it, and see which have
+// ended; one past its deadline is killed with what it started.
+func step(anon procs: [Proc], ms: int64) -> none {
+    mut fds: [posix.Fd] = []
+    mut into: [StrBuilder] = []
+    for p in procs {
+        if p.child.stdout.fd >= 0 {
+            fds += [p.child.stdout]
+            into += [p.out]
+        }
+        if p.child.stderr.fd >= 0 {
+            fds += [p.child.stderr]
+            into += [p.err]
+        }
+    }
+    if len(fds) > 0 {
+        if posix.poll(read: fds, timeout: Duration(:ms)) is Ok(ready) {
+            for i, f in fds {
+                if ready.read[i] {
+                    take(f, into: into[i])
+                }
+            }
+        }
+    } else {
+        time.sleep(Duration(:ms))
+    }
+    let now = monotonic_ns()
+    for p in procs {
+        if p.raw < 0 {
+            if process.wait_status(p.child.pid, name: p.child.name, hang: false) is Ok(int64(raw)) {
+                p.raw = raw
+            }
+        }
+        if not is_done(p) and now > p.deadline {
+            if p.raw < 0 {
+                kill_tree(p.child.pid)
+            }
+            for f in [p.child.stdout, p.child.stderr] {
+                if f.fd >= 0 {
+                    let _ = f.close()
+                }
+            }
+            if p.raw < 0 {
+                if process.wait_status(p.child.pid, name: p.child.name, hang: true) is Ok(int64(raw)) {
+                    p.raw = raw
+                }
+            }
+            if p.raw < 0 {
+                p.raw = 0
+            }
+            p.expired = true
+        }
+    }
+}
+
+// How a program ended.
+type Ended = struct {
+    // False when it could not be started or had to be killed (`why` says
+    // which).
+    ended: bool
+    // Its exit status; -1 when a signal ended it.
+    code: int64
+    why: str
+    stdout: str
+    stderr: str
+    ms: int64
+}
+
+func ended(anon p: Proc, wait_s: int64) -> Ended {
+    let ms = (monotonic_ns() - p.started) / 1000000
+    let out = p.out.to_str()
+    let err = p.err.to_str()
+    if p.expired {
+        return Ended(ended: false, code: -1, why: f"killed, still running after {wait_s} s", stdout: out, stderr: err, :ms)
+    }
+    let sig = p.raw & 127
+    if sig != 0 {
+        return Ended(ended: true, code: -1, why: f"killed by {process.signal_name(sig)}", stdout: out, stderr: err, :ms)
+    }
+    return Ended(ended: true, code: (p.raw >> 8) & 255, why: "", stdout: out, stderr: err, :ms)
+}
+
+// Run `argv` to the end, or for `wait_s` seconds.
+func capture(anon argv: [str], wait_s: int64) -> Ended {
+    match start(argv, :wait_s) {
+        Ok(p) -> {
+            for not is_done(p) {
+                step([p], ms: 50)
+            }
+            return ended(p, :wait_s)
+        }
+        Err(e) -> return Ended(ended: false, code: -1, why: f"cannot start {argv[0]}: {e.to_str()}", stdout: "", stderr: "", ms: 0)
+    }
+}
+
+// --- Judging -------------------------------------------------------------------
+
+// The numbers of the first line of `stdout` that starts `N/M passed`.
+func summary(anon stdout: str) -> [int64]? {
+    for line in stdout.split("\n") {
+        let n = digits(line, at: 0)
+        if n == 0 or n >= len(line) or line[n] != '/' {
+            continue
+        }
+        let m = digits(line, at: n + 1)
+        if m == n + 1 or not line[m..len(line)].starts_with(" passed") {
+            continue
+        }
+        return [must line[0..n].parse_int(), must line[n + 1..m].parse_int()]
+    }
+    return none
+}
+
+// Where the run of digits in `s` from `at` ends.
+func digits(anon s: str, at: int64) -> int64 {
+    mut i = at
+    for i < len(s) and s[i] >= '0' and s[i] <= '9' {
+        i += 1
+    }
+    return i
+}
+
+// Why `job`'s run failed, "" when it passed.
+func verdict(anon job: Job, anon e: Ended) -> str {
+    if not e.ended or e.code < 0 {
+        return e.why
+    }
+    if e.code != 0 {
+        return f"exit status {e.code}"
+    }
+    let Some(counts) = summary(e.stdout) else {
+        return "no `N/M passed` line in its output"
+    }
+    if counts[0] != counts[1] {
+        return f"{counts[0]}/{counts[1]} passed"
+    }
+    if counts[1] < job.blocks {
+        return f"ran {counts[1]} tests, fewer than its {job.blocks} `test` blocks"
+    }
+    return ""
+}
+
+// --- Reporting -----------------------------------------------------------------
+
+type Failure = struct {
+    path: str
+    why: str
+    stdout: str
+    stderr: str
+}
+
+type Report = shared struct {
+    colour: bool
+    passed: int64
+    failures: [Failure]
+}
+
+func seconds(anon ms: int64) -> str {
+    let tenths = (ms + 50) / 100
+    return f"{tenths / 10}.{tenths % 10} s"
+}
+
+func show(anon job: Job, anon e: Ended, report: Report) -> none {
+    let why = verdict(job, e)
+    mut mark = "ok  "
+    if why == "" {
+        report.passed += 1
+        if report.colour {
+            mark = term.green(mark)
+        }
+    } else {
+        report.failures += [Failure(path: job.path, :why, stdout: e.stdout, stderr: e.stderr)]
+        mark = "FAIL"
+        if report.colour {
+            mark = term.red(mark)
+        }
+    }
+    mut took = f"({seconds(e.ms)})"
+    if report.colour {
+        took = term.dim(took)
+    }
+    print(f"{mark} {job.path} {took}")
+    io.flush_stdout()
+}
+
+// --- Scheduling ----------------------------------------------------------------
+
+type Slot = struct {
+    job: Job
+    proc: Proc
+}
+
+// Run `jobs` in order, at most `width` at once and never two of a group at
+// the same time.
+func run_all(anon jobs: [Job], width: int64, report: Report) -> none {
+    mut pending = jobs
+    mut running: [Slot] = []
+    for len(pending) > 0 or len(running) > 0 {
+        for len(running) < width {
+            mut pick = -1
+            for i, job in pending {
+                mut busy = false
+                for s in running {
+                    if s.job.group == job.group {
+                        busy = true
+                    }
+                }
+                if not busy {
+                    pick = i
+                    break
+                }
+            }
+            if pick < 0 {
+                break
+            }
+            let job = pending[pick]
+            pending = pending[0..pick] + pending[pick + 1..len(pending)]
+            match start([KOD, "test", job.path], wait_s: wait_for(job.path)) {
+                Ok(proc) -> running += [Slot(:job, :proc)]
+                Err(e) -> {
+                    let why = f"cannot start {KOD}: {e.to_str()}"
+                    show(job, Ended(ended: false, code: -1, :why, stdout: "", stderr: "", ms: 0), :report)
+                }
+            }
+        }
+        if len(running) == 0 {
+            continue
+        }
+        mut procs: [Proc] = []
+        for s in running {
+            procs += [s.proc]
+        }
+        step(procs, ms: 100)
+        mut still: [Slot] = []
+        for s in running {
+            if is_done(s.proc) {
+                show(s.job, ended(s.proc, wait_s: wait_for(s.job.path)), :report)
+            } else {
+                still += [s]
+            }
+        }
+        running = still
+    }
+}
+
+func cores() -> int64 {
+    let r = capture(["sysctl", "-n", "hw.ncpu"], wait_s: FIND_WAIT_S)
+    if r.stdout.trim().parse_int() is int64(n) {
+        if n > 0 {
+            return n
+        }
+    }
+    return 1
+}
+
+func usage() -> int64 {
+    io.write_stderr("usage: run_tests [-j N] [file or directory ...]\n")
+    return 2
+}
+
+func main(argv: [str]) -> int64 {
+    mut width = 0
+    mut paths: [str] = []
+    mut i = 1
+    for i < len(argv) {
+        let arg = argv[i]
+        if arg == "-j" or (arg.starts_with("-j") and len(arg) > 2) {
+            mut value = arg[2..len(arg)]
+            if arg == "-j" {
+                i += 1
+                if i >= len(argv) {
+                    return usage()
+                }
+                value = argv[i]
+            }
+            let Some(n) = value.parse_int() else {
+                return usage()
+            }
+            if n < 1 {
+                return usage()
+            }
+            width = n
+        } else if arg.starts_with("-") {
+            return usage()
+        } else {
+            paths += [clean(arg)]
+        }
+        i += 1
+    }
+    if width == 0 {
+        width = cores()
+    }
+    if not io.is_file(KOD) {
+        io.write_stderr(f"run_tests: no {KOD}; run it from the repository root after `make stage1 kod`\n")
+        return 2
+    }
+    let whole = len(paths) == 0
+    if whole {
+        paths = ["."]
+    }
+
+    // The files to run, and whether tests/unit is among them.
+    mut files: [str] = []
+    mut unit = whole
+    for path in paths {
+        if path == UNIT {
+            unit = true
+        } else if io.is_file(path) {
+            if not contains(files, path) {
+                files += [path]
+            }
+        } else if is_dir(path) {
+            match find_tests(path) {
+                Ok(found) -> {
+                    for f in found {
+                        if dir_of(f) == UNIT {
+                            unit = true
+                        } else if count_blocks(io.read_file(f)) > 0 and not contains(files, f) {
+                            files += [f]
+                        }
+                    }
+                }
+                Err(e) -> {
+                    io.write_stderr(f"run_tests: {e.to_str()}\n")
+                    return 2
+                }
+            }
+        } else {
+            io.write_stderr(f"run_tests: no such file or directory: {path}\n")
+            return 2
+        }
+    }
+
+    mut slow: [Job] = []
+    mut rest: [Job] = []
+    mut serial: [Job] = []
+    if unit {
+        mut blocks = 0
+        match find_tests(UNIT) {
+            Ok(found) -> {
+                for f in found {
+                    if dir_of(f) == UNIT {
+                        blocks += count_blocks(io.read_file(f))
+                    }
+                }
+            }
+            Err(e) -> {
+                io.write_stderr(f"run_tests: {e.to_str()}\n")
+                return 2
+            }
+        }
+        slow += [Job(path: UNIT, group: group_of(UNIT), :blocks)]
+    }
+    for f in files {
+        let job = Job(path: f, group: group_of(f), blocks: count_blocks(io.read_file(f)))
+        if contains(SERIAL_KOD_TESTS, f) {
+            serial += [job]
+        } else if is_slow(job) {
+            slow += [job]
+        } else {
+            rest += [job]
+        }
+    }
+    let total = len(slow) + len(rest) + len(serial)
+    if total == 0 {
+        io.write_stderr("run_tests: no test files found\n")
+        return 1
+    }
+
+    let report = Report(colour: term.colour(posix.stdout()), passed: 0, failures: [])
+    let started = monotonic_ns()
+    run_all(slow + rest, :width, :report)
+    run_all(serial, width: 1, :report)
+    let ms = (monotonic_ns() - started) / 1000000
+
+    for f in report.failures {
+        mut head = f"==== {f.path}: {f.why} ===="
+        if report.colour {
+            head = term.red(head)
+        }
+        print(f"\n{head}")
+        print(f"{f.stdout}\n{f.stderr}")
+    }
+    mut line = f"{report.passed}/{total} files passed in {seconds(ms)}"
+    if report.colour {
+        if len(report.failures) == 0 {
+            line = term.green(line)
+        } else {
+            line = term.red(line)
+        }
+    }
+    print(f"\n{line}")
+    io.flush_stdout()
+    if len(report.failures) > 0 {
+        return 1
+    }
+    return 0
+}
