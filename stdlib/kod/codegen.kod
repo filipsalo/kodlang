@@ -714,6 +714,37 @@ func is_frame_link(anon text: str) -> bool {
 // copied (`dst` a vreg named nowhere else when `once`), or none when it can't:
 // `ldr dst, [dst, ...]` loads from `[src, ...]`, and an instruction that reads
 // `dst` as its only mention of it reads `src`.
+// The frame offset n (as in `sub x16, fp, #n`) of emit_unique's check at
+// `k` on a local's slot, or -1: the slot's load, the count's load, compare,
+// branch, address, width, call, copy back, label.
+func unique_check_at(anon body: [regalloc.Insn], k: int64) -> int64 {
+    if k + 8 >= len(body) {
+        return -1
+    }
+    let .Slot(store, arr, off) = body[k] else { return -1 }
+    if store {
+        return -1
+    }
+    let .Mem(load, width, _count, base, _at) = body[k + 1] else { return -1 }
+    if not load or width != 4 or base != arr {
+        return -1
+    }
+    let .Branch(_kind, _reg, target) = body[k + 3] else { return -1 }
+    let .Label(name) = body[k + 8] else { return -1 }
+    if name != target or not name.starts_with("Luniq") {
+        return -1
+    }
+    let .Call(callee) = body[k + 6] else { return -1 }
+    if callee != "_kod_arr_unique_stub" {
+        return -1
+    }
+    let .Op(op, _a, _b, n, _d, _flags) = body[k + 4] else { return -1 }
+    if not (op is .Sub) or regalloc.imm_value(n) != -off {
+        return -1
+    }
+    return -off
+}
+
 func forwarded(anon next: regalloc.Insn, dst: regalloc.Reg, src: regalloc.Reg, once: bool) -> regalloc.Insn? {
     match next {
         .Slot(store, reg, off) -> {
@@ -18719,6 +18750,147 @@ type Codegen = struct {
     // branch on the flags, and a small constant moved into a register only to
     // be added, subtracted or compared (`mov v, #5` then `add d, a, v`) becomes
     // the instruction's immediate.
+    // Copy on write, out of loops: in an innermost loop that is entered only at
+    // its top and calls nothing but panics, releases and the copy itself,
+    // nothing can take a new reference to an array, so once an array in a
+    // local's slot is its own it stays so. Each check emit_unique made there
+    // for a slot the loop doesn't store to goes, and one check before the
+    // loop takes its place.
+    func hoist_unique_checks(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
+        mut has_check = false
+        for insn in body {
+            if insn is .Call(target) and target == "_kod_arr_unique_stub" {
+                has_check = true
+                break
+            }
+        }
+        if not has_check {
+            return body
+        }
+        let label_at = Map[str, int64]()
+        for i, insn in body {
+            if insn is .Label(name) {
+                label_at[name] = i
+            }
+        }
+        // Lines to drop, and per loop top the checks to put before it.
+        mut drop: [bool] = [false] * len(body)
+        mut hoist_at: [int64] = []
+        mut hoist_off: [int64] = []
+        mut hoist_width: [int64] = []
+        for back, insn in body {
+            let .Branch(kind, _reg, target) = insn else { continue }
+            if not (kind is .Always) {
+                continue
+            }
+            let top = label_at.get(target)? or -1
+            if top < 0 or top >= back {
+                continue
+            }
+            if not self.hoistable_loop(body, :top, :back, :label_at) {
+                continue
+            }
+            mut stored: [int64] = []
+            for k in top..back {
+                if body[k] is .Slot(store, _r, off) and store {
+                    stored += [off]
+                }
+            }
+            for k in top..back {
+                let off = unique_check_at(body, :k)
+                if off >= 0 and not arrays.contains(stored, -off) {
+                    for d in k + 1..k + 9 {
+                        drop[d] = true
+                    }
+                    mut seen = false
+                    for h, at in hoist_at {
+                        if at == top and hoist_off[h] == off {
+                            seen = true
+                        }
+                    }
+                    if not seen {
+                        hoist_at += [top]
+                        hoist_off += [off]
+                        if body[k + 5] is .Op(_op, _a, width, _c, _d, _flags) {
+                            hoist_width += [regalloc.imm_value(width)]
+                        } else {
+                            hoist_width += [8]
+                        }
+                    }
+                }
+            }
+        }
+        if len(hoist_at) == 0 {
+            return body
+        }
+        let held = InsnList(insns: self.out_buf)
+        mut out: [regalloc.Insn] = []
+        for i, insn in body {
+            for h, at in hoist_at {
+                if at == i {
+                    self.out_buf = []
+                    let done = self.fresh("Luniq")
+                    self.emit_ldr(-hoist_off[h], reg: "x17")
+                    self.emit_jump_zero("x17", target: done)
+                    let count = self.pool.alloc_reg()
+                    self.emit_load(f"w{count[1..len(count)]}", base: "x17", off: -8)
+                    self.emit_op(.Compare, a: count, b: "#1")
+                    self.pool.free_reg(count)
+                    self.emit_jump_if(.Eq, target: done)
+                    self.emit_op(.Sub, a: "x16", b: "fp", c: f"#{hoist_off[h]}")
+                    self.emit_op(.Move, a: "x17", b: f"#{hoist_width[h]}")
+                    self.emit_call("_kod_arr_unique_stub")
+                    self.emit_label(done)
+                    for line in self.out_buf {
+                        out += [line]
+                    }
+                }
+            }
+            if not drop[i] {
+                out += [insn]
+            }
+        }
+        self.out_buf = held.insns
+        held.insns = []
+        return out
+    }
+
+    // The loop from the label at `top` to its backward branch at `back`: no
+    // other loop inside it, no way in but its top, and no call but to a panic,
+    // a release or the copy.
+    func hoistable_loop(self, anon body: [regalloc.Insn], top: int64, back: int64, label_at: Map[str, int64]) -> bool {
+        for k in top + 1..back {
+            match body[k] {
+                .Call(target) -> {
+                    if not regalloc.never_returns(target) and target != "_rc_release_stub" and target != "_kod_arr_unique_stub" {
+                        return false
+                    }
+                }
+                .Intrinsic(_label) -> return false
+                .Branch(kind, _reg, target) -> {
+                    let at = label_at.get(target)? or -1
+                    if kind is .Always and at >= top and at < k {
+                        return false
+                    }
+                }
+                else none
+            }
+        }
+        // Nothing outside jumps into it.
+        for k, insn in body {
+            if k >= top and k <= back {
+                continue
+            }
+            if insn is .Branch(_kind, _reg, target) {
+                let at = label_at.get(target)? or -1
+                if at >= top and at <= back {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
     func peephole(self, anon body: [regalloc.Insn], vreg_start: int64) -> [regalloc.Insn] {
         let n_local = len(self.pool.vreg_phys) - vreg_start
         if n_local <= 0 {
@@ -20232,6 +20404,7 @@ type Codegen = struct {
         mut body_buf = self.peephole(self.out_buf, :vreg_start)
         self.out_buf = saved.insns
         saved.insns = []
+        body_buf = self.hoist_unique_checks(body_buf)
         self.rc_ctor_mark = -1
 
         // Run linear-scan regalloc over the function's vregs, reusing
