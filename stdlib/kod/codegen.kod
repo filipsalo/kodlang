@@ -1496,6 +1496,11 @@ type Codegen = shared struct {
     frame_slots: int64 = 0
     ret_lbl: str = ""
     return_kind: TypeKind = .KVoid
+    // The one cell of each variant without a payload, in this module's data
+    // (see compile_enum_construct): label, discriminant and size in words.
+    enum_cells: [str] = []
+    enum_cell_discs: [int64] = []
+    enum_cell_words: [int64] = []
     // Where the output goes when it isn't text: straight into an object file.
     asm: macho.Assembler? = none
 
@@ -17517,6 +17522,13 @@ type Codegen = shared struct {
         self.check_payload_args(field_args, :enum_idx, :variant_idx, :span)
         let data_width = self.enums[enum_idx].data_width
         mut disc = self.enums[enum_idx].variants[variant_idx].discriminant
+        // A variant without a payload is one cell in the module's data, never
+        // freed and outside the counted heap, so making one allocates nothing
+        // and counting it does nothing.
+        if len(field_args) == 0 and len(self.enums[enum_idx].variants[variant_idx].field_kinds) == 0 {
+            self.emit_label_addr("x0", label: self.enum_cell(enum_idx, :disc, words: 1 + (data_width + 7) / 8))
+            return .VReg(name: "x0")
+        }
         self.emit_load_imm("x0", value: data_width)
         mut rc_refs: [int64] = []
         let rc_info = self.enums[enum_idx].variants[variant_idx]
@@ -17557,6 +17569,22 @@ type Codegen = shared struct {
         self.rc_mark_owned("x0", slot: rc_cell)
         self.rc_ctor_mark = len(self.out_buf)
         return .VReg(name: "x0")
+    }
+
+    func enum_cell(self, anon enum_idx: int64, disc: int64, words: int64) -> str {
+        let lbl = f"Lcell${enum_idx}${disc}"
+        for i, have in self.enum_cells {
+            if have == lbl {
+                if self.enum_cell_words[i] < words {
+                    self.enum_cell_words[i] = words
+                }
+                return lbl
+            }
+        }
+        self.enum_cells += [lbl]
+        self.enum_cell_discs += [disc]
+        self.enum_cell_words += [words]
+        return lbl
     }
 
     // E in `E.V` may be the expected enum's template.
@@ -21946,8 +21974,16 @@ type Codegen = shared struct {
         }
         self.body_instance = saved_instance
 
-        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_types) > 0 or len(self.prim_vtable_kinds) > 0 or len(self.fn_cells) > 0 or len(self.rc_descs) > 0 {
+        if len(self.str_labels) > 0 or len(self.float_labels) > 0 or len(self.vtable_types) > 0 or len(self.prim_vtable_kinds) > 0 or len(self.fn_cells) > 0 or len(self.rc_descs) > 0 or len(self.enum_cells) > 0 {
             self.println(".data")
+            for ci, cell in self.enum_cells {
+                self.println("\t.p2align 3")
+                self.println(f"{cell}:")
+                self.println(f"\t.quad {self.enum_cell_discs[ci]}")
+                for _ in 1..self.enum_cell_words[ci] {
+                    self.println("\t.quad 0")
+                }
+            }
             for fi, float_label in self.float_labels {
                 self.println("\t.p2align 3")
                 self.println(f"{float_label}:")

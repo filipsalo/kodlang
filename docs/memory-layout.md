@@ -76,6 +76,12 @@ pointer; the cell at the pointer is:
 Because enum variables are pointers, they fit in a single register and pass
 through the ARM64 calling convention without any multi-word ABI gymnastics.
 
+A variant without a payload has one cell per module, in the module's data,
+with its discriminant and zeroes for the payload: `.Up` or `TokenKind.EOF`
+is the address of that cell, so making one allocates nothing. The cell is
+outside the counted heap, so counting it does nothing either, and it is
+never freed.
+
 See `docs/enums.md` for details.
 
 ## Union values
