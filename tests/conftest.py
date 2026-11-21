@@ -45,9 +45,7 @@ SLOW_KOD_TESTS = {
 }
 
 # Modules whose tests all build the same program.
-SHARED_PROGRAM = {
-    "api_example_test.py": "api_example",
-}
+SHARED_PROGRAM: dict[str, str] = {}
 
 
 def build_group(item: pytest.Item) -> str | None:

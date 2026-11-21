@@ -27,7 +27,7 @@ open issues:
 Set `GITHUB_TOKEN` to send a bearer token (private repositories need one), and
 `GITHUB_API` to talk to something other than `https://api.github.com`. The tests
 use that to run the example against a local stand-in server
-(`tests/support/http_fixture.py`), so they need no network.
+(`tests/support/github_api.kod`), so they need no network.
 
 ## The pieces
 

@@ -1,0 +1,332 @@
+// Run examples/github_repo.kod against tests/support/github_api.kod, a local
+// stand-in for the GitHub API, and check what it prints and returns.
+//
+// The first test builds both programs; the tests after it run them, so they
+// come after it in this file. Each test that needs the API starts its own
+// server on a free port and stops it at the end. Every wait is bounded: a
+// build, a server or a run of the example that goes over its time is killed
+// and the test fails. A run's output goes to files under
+// build/tmp_api_example_<pid>, removed when it ends.
+
+import "io"
+import "libc"
+import "net/http"
+import "net/http" { Options }
+import "net/tcp"
+import "process"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+let KOD: str = "build/apps/kod/kod"
+let EXAMPLE: str = "examples/github_repo.kod"
+let BINARY: str = "build/apps/github_repo/github_repo"
+let SERVER_SOURCE: str = "tests/support/github_api.kod"
+let SERVER: str = "build/apps/github_api/github_api"
+let BUILD_WAIT_MS: int64 = 120000
+let RUN_WAIT_MS: int64 = 30000
+let START_WAIT_MS: int64 = 5000
+let STOP_WAIT_MS: int64 = 10000
+
+// ── Processes ─────────────────────────────────────────────────────────────────
+
+func scratch() -> str {
+    return f"build/tmp_api_example_{libc.getpid()}"
+}
+
+// Stop `pid` and everything it started, children first stopped so that they
+// start nothing more, then all killed.
+func kill_tree(anon pid: str) -> none {
+    process.run(["kill", "-STOP", pid])
+    for kid in process.run(["pgrep", "-P", pid]).stdout.split("\n") {
+        if kid != "" {
+            kill_tree(kid)
+        }
+    }
+    process.run(["kill", "-KILL", pid])
+}
+
+// The exit status of `child`, waiting at most `ms`; after that it is killed
+// with what it started, and the test fails (-1). A child a signal ended
+// fails the test too.
+func wait_bounded(anon child: process.Child, ms: int64, what: str) -> int64 {
+    let deadline = monotonic_ns() + ms * 1000000
+    for true {
+        match child.try_wait() {
+            Ok(code) -> {
+                if code is int64(status) {
+                    return status
+                }
+            }
+            Err(e) -> {
+                fail(f"{what}: {e.to_str()}")
+                return -1
+            }
+        }
+        if monotonic_ns() > deadline {
+            kill_tree(str(child.pid))
+            let _ = child.wait()
+            fail(f"{what}: killed, still running after {ms / 1000} s")
+            return -1
+        }
+        time.sleep(Duration(ms: 2))
+    }
+    return -1
+}
+
+// A port nothing listens on, as far as anyone can tell.
+func free_port() -> int64 {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    return port
+}
+
+// ── The stand-in API ──────────────────────────────────────────────────────────
+
+type Api = shared struct {
+    child: process.Child
+    url: str
+}
+
+// The server, started on a free port and accepting connections; none (and
+// the test fails) if it doesn't within START_WAIT_MS.
+func start_api() -> Api? {
+    let port = free_port()
+    let started = process.start([SERVER, str(port)], stdin: .Null, stdout: .Null, stderr: .Null)
+    if started is Err(e) {
+        fail(f"start {SERVER}: {e.to_str()}")
+        return none
+    }
+    let api = Api(child: started, url: f"http://127.0.0.1:{port}")
+    let deadline = monotonic_ns() + START_WAIT_MS * 1000000
+    for monotonic_ns() < deadline {
+        if tcp.connect("127.0.0.1", :port, timeout: Duration(ms: 200)) is Ok(conn) {
+            must conn.close()
+            return api
+        }
+        if api.child.try_wait() is Ok(int64(status)) {
+            fail(f"the server exited with status {status} before it accepted a connection")
+            return none
+        }
+        time.sleep(Duration(ms: 10))
+    }
+    fail(f"the server did not accept a connection within {START_WAIT_MS / 1000} s")
+    stop(api)
+    return none
+}
+
+// SIGTERM the server and wait for it to end, at most STOP_WAIT_MS; after
+// that it is killed and the test fails.
+func stop(anon api: Api) -> none {
+    let _ = api.child.kill()
+    let deadline = monotonic_ns() + STOP_WAIT_MS * 1000000
+    for true {
+        // Ended: an exit code, or the error that SIGTERM ended it.
+        match api.child.try_wait() {
+            Ok(code) -> {
+                if code is int64(_) {
+                    return
+                }
+            }
+            Err(_) -> return
+        }
+        if monotonic_ns() > deadline {
+            kill_tree(str(api.child.pid))
+            let _ = api.child.wait()
+            fail(f"the server was still running {STOP_WAIT_MS / 1000} s after SIGTERM; killed")
+            return
+        }
+        time.sleep(Duration(ms: 2))
+    }
+}
+
+// How many connections the server has served, counting this request's.
+func connections_so_far(anon api: Api) -> int64 {
+    let options = Options(deadline: Duration(seconds: 10))
+    match http.get(api.url + "/stats", :options) {
+        Ok(response) -> {
+            if response.text().parse_int() is int64(n) {
+                return n
+            }
+            fail(f"/stats answered {response.status} `{response.text()}`")
+        }
+        Err(e) -> fail(f"/stats: {e.to_str()}")
+    }
+    return -1
+}
+
+// ── The example ───────────────────────────────────────────────────────────────
+
+type Ran = shared struct {
+    status: int64
+    stdout: str
+    stderr: str
+}
+
+// Run the example with `args`, GITHUB_API set to `api_url`, GITHUB_TOKEN to
+// `token` if given, and no other GITHUB_ variable. Killed, failing the test,
+// after RUN_WAIT_MS.
+func run(anon args: [str], api_url: str, token: str? = none) -> Ran {
+    let base = scratch()
+    process.run(["mkdir", "-p", base])
+    mut vars: [str] = []
+    for v in process.current_environment() {
+        if not v.starts_with("GITHUB_") {
+            vars += [v]
+        }
+    }
+    vars += [f"GITHUB_API={api_url}"]
+    if token is str(t) {
+        vars += [f"GITHUB_TOKEN={t}"]
+    }
+    let script = "d=$1; shift; exec \"$@\" >\"$d/out\" 2>\"$d/err\""
+    mut status = -1
+    match process.start(["sh", "-c", script, "sh", base, BINARY] + args, stdin: .Null, env: vars) {
+        Ok(child) -> status = wait_bounded(child, ms: RUN_WAIT_MS, what: "the example")
+        Err(e) -> fail(f"start {BINARY}: {e.to_str()}")
+    }
+    let ran = Ran(:status, stdout: io.read_file(f"{base}/out"), stderr: io.read_file(f"{base}/err"))
+    process.run(["rm", "-rf", base])
+    return ran
+}
+
+// ── Checks ────────────────────────────────────────────────────────────────────
+
+func expect_status(anon r: Ran, anon want: int64) -> none {
+    if r.status != want {
+        fail(f"status {r.status}, expected {want}; stderr:\n{r.stderr}")
+    }
+}
+
+func expect_text(anon got: str, anon want: str, what: str) -> none {
+    if got != want {
+        fail(f"{what}:\n--- got\n{got}--- expected\n{want}---")
+    }
+}
+
+// ── The build ─────────────────────────────────────────────────────────────────
+
+func build(anon source: str, anon binary: str) -> none {
+    let base = scratch()
+    process.run(["mkdir", "-p", base])
+    let script = "exec \"$1\" build \"$2\" >\"$3/build\" 2>&1"
+    mut status = -1
+    match process.start(["sh", "-c", script, "sh", KOD, source, base], stdin: .Null) {
+        Ok(child) -> status = wait_bounded(child, ms: BUILD_WAIT_MS, what: f"kod build {source}")
+        Err(e) -> fail(f"start kod build: {e.to_str()}")
+    }
+    let built = io.read_file(f"{base}/build")
+    process.run(["rm", "-rf", base])
+    if status != 0 {
+        fail(f"kod build {source}: status {status}\n{built}")
+    }
+    assert io.is_file(binary)
+}
+
+test "the example and the stand-in API build" {
+    build(EXAMPLE, BINARY)
+    build(SERVER_SOURCE, SERVER)
+}
+
+// ── The runs ──────────────────────────────────────────────────────────────────
+
+test "a repository and its open issues" {
+    if start_api() is Api(api) {
+        let r = run(["octo/hello"], api_url: api.url)
+        expect_status(r, 0)
+        expect_text(r.stdout, "octo/hello\n  Café ☕ tools\n  language: Kod\n  stars: 1234, forks: 56\n  license: MIT\nopen issues:\n  #7 It crashes\n  #3 Add \"docs\"\n", what: "stdout")
+        expect_text(r.stderr, "", what: "stderr")
+        stop(api)
+    }
+}
+
+test "missing fields fall back" {
+    if start_api() is Api(api) {
+        let r = run(["octo/secret"], api_url: api.url, token: "s3cret")
+        expect_status(r, 0)
+        expect_text(r.stdout, "octo/secret\n  (no description)\n  language: unknown\n  stars: 0, forks: 0\n  license: none\nopen issues:\n  none\n", what: "stdout")
+        stop(api)
+    }
+}
+
+test "a repository with no issues" {
+    if start_api() is Api(api) {
+        let r = run(["octo/quiet"], api_url: api.url)
+        expect_status(r, 0)
+        if not r.stdout.ends_with("open issues:\n  none\n") {
+            fail(f"stdout does not end with the empty list of issues:\n{r.stdout}")
+        }
+        stop(api)
+    }
+}
+
+test "the token is sent only when set" {
+    if start_api() is Api(api) {
+        let r = run(["octo/secret"], api_url: api.url)
+        expect_status(r, 1)
+        expect_text(r.stdout, "", what: "stdout")
+        expect_text(r.stderr, "error: 404 Not Found: Not Found\n", what: "stderr")
+        stop(api)
+    }
+}
+
+test "an error body that is not JSON" {
+    if start_api() is Api(api) {
+        let r = run(["octo/html"], api_url: api.url)
+        expect_status(r, 1)
+        expect_text(r.stderr, "error: 502 Bad Gateway\n", what: "stderr")
+        stop(api)
+    }
+}
+
+test "an unknown repository" {
+    if start_api() is Api(api) {
+        let r = run(["octo/none"], api_url: api.url)
+        expect_status(r, 1)
+        expect_text(r.stderr, "error: 404 Not Found: Not Found\n", what: "stderr")
+        stop(api)
+    }
+}
+
+test "bad usage" {
+    if start_api() is Api(api) {
+        let cases: [[str]] = [[], ["name"], ["a/b", "extra"]]
+        for args in cases {
+            let r = run(args, api_url: api.url)
+            let shown = f"[{", ".join(args)}]"
+            if r.status != 2 {
+                fail(f"args {shown}: status {r.status}, expected 2")
+            }
+            if r.stdout != "" {
+                fail(f"args {shown}: stdout `{r.stdout}`, expected nothing")
+            }
+            if r.stderr != "usage: github_repo OWNER/REPO\n" {
+                fail(f"args {shown}: stderr `{r.stderr}`, expected the usage line")
+            }
+        }
+        stop(api)
+    }
+}
+
+test "an unreachable API" {
+    let r = run(["octo/hello"], api_url: f"http://127.0.0.1:{free_port()}")
+    expect_status(r, 1)
+    expect_text(r.stdout, "", what: "stdout")
+    if not r.stderr.starts_with("error: ") or not r.stderr.contains("connect") {
+        fail(f"stderr is not a connect error:\n{r.stderr}")
+    }
+}
+
+test "both requests share one connection" {
+    if start_api() is Api(api) {
+        let before = connections_so_far(api)
+        let r = run(["octo/hello"], api_url: api.url)
+        expect_status(r, 0)
+        let after = connections_so_far(api)
+        // `before` and `after` each count the connection that asked for them.
+        if after - before - 1 != 1 {
+            fail(f"the example used {after - before - 1} connections, expected 1")
+        }
+        stop(api)
+    }
+}

@@ -1,0 +1,223 @@
+// A stand-in for enough of GitHub's repository API to run
+// examples/github_repo.kod against, for tests/api_example_test.kod.
+//
+// Usage: github_api PORT. It answers on 127.0.0.1:PORT and exits by itself
+// after two minutes. It serves one connection at a time, and a connection
+// stays open for the next request unless the request says `Connection:
+// close`; a connection that sends nothing for ten seconds is closed. /stats
+// answers how many connections have sent a request, counting its own.
+import "io"
+import "net/tcp"
+import "posix"
+import "posix" { Fd }
+import "stream" { BufReader }
+import "time" { Duration, monotonic_ns }
+
+let LIFETIME_MS: int64 = 120000
+let IDLE_SECONDS: int64 = 10
+let JSON_TYPE: str = "Content-Type: application/json\r\n"
+
+type Header = shared struct {
+    name: str
+    value: str
+}
+
+type Request = shared struct {
+    method: str
+    target: str
+    headers: [Header]
+}
+
+type State = shared struct {
+    connections: int64
+}
+
+// The value of the last header called `name` (in lower case), as a dict of
+// the headers would have it.
+func sent(anon r: Request, anon name: str) -> str? {
+    mut found: str? = none
+    for h in r.headers {
+        if h.name.lower() == name {
+            found = h.value
+        }
+    }
+    return found
+}
+
+func reply(anon status: str, anon body: str, headers: str = "") -> bytes {
+    let b = kod_str_to_bytes(body)
+    return kod_str_to_bytes(f"HTTP/1.1 {status}\r\n{headers}Content-Length: {len(b)}\r\n\r\n{body}")
+}
+
+// The next request on the connection; none at its end, at an empty request
+// line, or at a request that can't be read.
+func read_request(anon br: BufReader) -> Request? {
+    let first = br.read_line()
+    if first is Err(_) {
+        return none
+    }
+    let line = first? or ""
+    let parts = line.split(" ")
+    if len(parts) < 3 {
+        return none
+    }
+    let r = Request(method: parts[0], target: parts[1], headers: [])
+    mut length: int64 = 0
+    for true {
+        let got = br.read_line()
+        if got is Err(_) {
+            return none
+        }
+        let text = got? or ""
+        if text == "" {
+            break
+        }
+        mut name = text
+        mut value = ""
+        if text.find(":") is int64(colon) {
+            name = text[0..colon]
+            value = text[colon + 1..len(text)].trim()
+        }
+        r.headers += [Header(:name, :value)]
+        if name.lower() == "content-length" {
+            if value.parse_int() is int64(n) {
+                length = n
+            } else {
+                return none
+            }
+        }
+    }
+    // The body is read and not used.
+    mut left = length
+    for left > 0 {
+        let piece = br.read(left)
+        if piece is Err(_) {
+            return none
+        }
+        if len(piece) == 0 {
+            break
+        }
+        left -= len(piece)
+    }
+    return r
+}
+
+func github(anon r: Request, path: str) -> bytes {
+    if sent(r, "user-agent") is none {
+        return reply("403 Forbidden", "{\"message\": \"Request forbidden: send a User-Agent header\"}", headers: JSON_TYPE)
+    }
+    if (sent(r, "accept")? or "") != "application/vnd.github+json" {
+        return reply("415 Unsupported Media Type", "{\"message\": \"bad Accept\"}", headers: JSON_TYPE)
+    }
+    // What follows `/repos/`.
+    let repo = path[7..len(path)]
+    if repo == "octo/hello" {
+        let body = "{\"full_name\": \"octo/hello\", \"description\": \"Caf\\u00e9 \\u2615 tools\", \"language\": \"Kod\", \"stargazers_count\": 1234, \"forks_count\": 56, \"license\": {\"spdx_id\": \"MIT\"}, \"score\": 9.5}"
+        return reply("200 OK", body, headers: JSON_TYPE)
+    }
+    if repo == "octo/secret" {
+        if (sent(r, "authorization")? or "") != "Bearer s3cret" {
+            return reply("404 Not Found", "{\"message\": \"Not Found\"}", headers: JSON_TYPE)
+        }
+        let body = "{\"full_name\": \"octo/secret\", \"description\": null, \"license\": null}"
+        return reply("200 OK", body, headers: JSON_TYPE)
+    }
+    if repo == "octo/hello/issues" {
+        mut query = r.target
+        if r.target.find("?") is int64(q) {
+            query = r.target[q + 1..len(r.target)]
+        }
+        if query != "state=open&per_page=3" {
+            return reply("400 Bad Request", "{\"message\": \"bad query\"}", headers: JSON_TYPE)
+        }
+        let body = "[{\"number\": 7, \"title\": \"It crashes\"}, {\"number\": 3, \"title\": \"Add \\\"docs\\\"\"}]"
+        return reply("200 OK", body, headers: JSON_TYPE)
+    }
+    if repo == "octo/secret/issues" or repo == "octo/quiet/issues" {
+        return reply("200 OK", "[]", headers: JSON_TYPE)
+    }
+    if repo == "octo/quiet" {
+        return reply("200 OK", "{\"full_name\": \"octo/quiet\"}", headers: JSON_TYPE)
+    }
+    if repo == "octo/html" {
+        return reply("502 Bad Gateway", "<html>upstream down</html>")
+    }
+    return reply("404 Not Found", "{\"message\": \"Not Found\"}", headers: JSON_TYPE)
+}
+
+func route(anon r: Request, state: State) -> bytes {
+    mut path = r.target
+    if r.target.find("?") is int64(q) {
+        path = r.target[0..q]
+    }
+    if path.starts_with("/repos/") {
+        return github(r, :path)
+    }
+    if path == "/stats" {
+        return reply("200 OK", str(state.connections))
+    }
+    return reply("404 Not Found", "no such route")
+}
+
+// Answer the requests on `conn` until it ends or asks to be closed.
+func serve(anon conn: Fd, state: State) -> none {
+    let br = BufReader(inner: conn)
+    mut requests: int64 = 0
+    for true {
+        let r = read_request(br)
+        if r is none {
+            return
+        }
+        if requests == 0 {
+            state.connections += 1
+        }
+        requests += 1
+        if conn.write_all(route(r, :state)) is Err(_) {
+            return
+        }
+        for h in r.headers {
+            if h.name.lower() == "connection" and h.value.lower().contains("close") {
+                return
+            }
+        }
+    }
+}
+
+func main(argv: [str]) -> int64 {
+    if len(argv) != 2 or argv[1].parse_int() is none {
+        io.write_stderr("usage: github_api PORT\n")
+        return 2
+    }
+    let port = argv[1].parse_int()? or 0
+    let listener = tcp.listen("127.0.0.1", :port)
+    if listener is Err(e) {
+        io.write_stderr(f"github_api: {e.to_str()}\n")
+        return 1
+    }
+    let state = State(connections: 0)
+    let deadline = monotonic_ns() + LIFETIME_MS * 1000000
+    for true {
+        let left = deadline - monotonic_ns()
+        if left <= 0 {
+            break
+        }
+        let ready = posix.poll(read: [Fd(fd: listener.fd)], timeout: Duration(ns: left))
+        if ready is Err(_) {
+            break
+        }
+        if not ready.read[0] {
+            continue
+        }
+        let accepted = listener.accept()
+        if accepted is Ok(conn) {
+            if tcp.set_timeout(conn, timeout: Duration(seconds: IDLE_SECONDS)) is Ok(_) {
+                serve(conn, :state)
+            }
+            let _ = conn.close()
+        }
+    }
+    return 0
+}
+
+// expected mode:
+// skip
