@@ -245,10 +245,11 @@ $(STAGE0)/%.o: $(STAGE0)/%.s
 stage1: $(STAGE1)/sh_kodc
 
 # build/cache/ holds module objects keyed by this compiler (docs/cli.md), so a
-# new one makes them all dead.
+# new one makes them all dead. Only build/stage1's: selfhost-check's
+# compilers are built while tests use the cache.
 $(STAGE1)/sh_kodc: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS) $(LINK_CFG)
 	mkdir -p $(STAGE1)
-	rm -rf build/cache
+	$(if $(filter build/stage1,$(STAGE1)),rm -rf build/cache)
 	$(LINK) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS)
 
