@@ -100,8 +100,11 @@ that handles requests for days stays the size its live data needs.
 **A cycle is never freed.** Two values that refer to each other keep each other
 alive after the last outside reference is gone:
 
+A value can't refer to itself, so only shared structs (see
+[Structs](structs.md)) make one:
+
 ```kod
-type Node = struct {
+type Node = shared struct {
     name: str
     other: Node?
 }
