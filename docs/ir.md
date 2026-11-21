@@ -221,7 +221,16 @@ were.
    promoted locals keeps apart, so the moved body is used only when that
    succeeds. qsort is 6% faster, compiling 1% slower; unlike step 7 it moves
    nothing in loops that call, and a store to the heap doesn't stop it.
-11. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+11. **Bounds checks out of the way** (done). An index in range falls
+   through its check (`cmp; b.hs`), so the common case takes no branch;
+   the slow path (wrapping a negative index, or the panic) is a cold block
+   laid out after the next unconditional jump, a loop's after its back edge
+   (blocks from before a loop wait until after it). The allocator counts a
+   cold block's lines as its check's line, and its jump back as no loop, so
+   it keeps nothing live longer; the hoisting passes count a loop's cold
+   blocks as part of it. qsort and sieve are 6% and 9% faster, the others
+   about 3%.
+12. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions

@@ -924,8 +924,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     // clobbers_before[k]: how many lines before line k call something or
     // name a caller-saved register outright.
     mut clobbers_before: [int64] = [0] * (len(body_buf) + 1)
+    // A cold block (codegen's emit_index_check) runs only at its check, so
+    // its lines count as the check's line: what it reads isn't kept live to
+    // where it's laid out.
+    let pos = cold_positions(body_buf)
     mut line_idx: int64 = 0
+    mut ri: int64 = 0
     for insn in body_buf {
+        line_idx = pos[ri]
         mut clobbers = 0
         match insn {
             .Slot(store, reg, _off) -> {
@@ -1043,8 +1049,8 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 // Label lines hold a symbol, not asm — no vregs.
             }
         }
-        clobbers_before[line_idx + 1] = clobbers_before[line_idx] + clobbers
-        line_idx = line_idx + 1
+        clobbers_before[ri + 1] = clobbers_before[ri] + clobbers
+        ri += 1
     }
 
     if strict {
@@ -1055,7 +1061,7 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 lv.def_line[k] = lv.first[k]
             }
         }
-        extend_over_loops(body_buf, :lv)
+        extend_over_loops(body_buf, :lv, :pos)
     }
 
     // Snapshot alloc-time phys per local vreg; this is also the
@@ -1240,7 +1246,41 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 // A vreg live at a loop's top label, set before the loop, stays live to
 // the loop's backward branch, which takes its value round again: the
 // textual interval alone would end at its last use inside the loop.
-func extend_over_loops(anon body: [Insn], lv: Liveness) -> none {
+// Each line's position for liveness: its own, or for a line of a cold block
+// (a label `Lcold...` some branch goes to, through its call to the panic)
+// the line of that branch.
+func cold_positions(anon body: [Insn]) -> [int64] {
+    mut pos: [int64] = []
+    for i in 0..len(body) {
+        pos += [i]
+    }
+    mut origin = Map[str, int64]()
+    mut any = false
+    for i, insn in body {
+        if insn is .Branch(_kind, _reg, target) and target.starts_with("Lcold") and origin.get(target) is none {
+            origin[target] = i
+            any = true
+        }
+    }
+    if not any {
+        return pos
+    }
+    mut at = -1
+    for i, insn in body {
+        if insn is .Label(name) and name.starts_with("Lcold") and not name.ends_with("_oob") {
+            at = origin.get(name)? or -1
+        }
+        if at >= 0 {
+            pos[i] = at
+            if insn is .Call(_target) {
+                at = -1
+            }
+        }
+    }
+    return pos
+}
+
+func extend_over_loops(anon body: [Insn], lv: Liveness, pos: [int64]) -> none {
     mut label_line = Map[str, int64]()
     for i, insn in body {
         if insn is .Label(name) {
@@ -1250,7 +1290,8 @@ func extend_over_loops(anon body: [Insn], lv: Liveness) -> none {
     mut tops: [int64] = []
     mut bottoms: [int64] = []
     for i, insn in body {
-        if insn is .Branch(_kind, _reg, branch_to) {
+        // A cold block's jump back is no loop.
+        if insn is .Branch(_kind, _reg, branch_to) and pos[i] == i {
             if label_line.get(branch_to) is Some(t) {
                 if t <= i {
                     tops += [t]

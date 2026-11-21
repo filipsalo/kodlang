@@ -773,6 +773,22 @@ func field_check_place(anon body: [regalloc.Insn], k: int64) -> regalloc.Reg {
     return place
 }
 
+// The last line of the loop whose backward branch is at `back`: the cold
+// blocks (emit_index_check) right after it are the loop's too.
+func cold_end(anon body: [regalloc.Insn], anon back: int64) -> int64 {
+    mut end = back
+    mut j = back + 1
+    for j < len(body) and body[j] is .Label(name) and name.starts_with("Lcold") {
+        // Through the block's call to the panic.
+        for j < len(body) and not (body[j] is .Call(_target)) {
+            j += 1
+        }
+        end = j
+        j += 1
+    }
+    return end
+}
+
 // No call in the loop from `top` to `back` but to a panic, a release or the
 // copy, no inlined runtime function, and no loop inside it.
 func loop_calls_ok(anon body: [regalloc.Insn], top: int64, back: int64, label_at: Map[str, int64]) -> bool {
@@ -786,7 +802,8 @@ func loop_calls_ok(anon body: [regalloc.Insn], top: int64, back: int64, label_at
             .Intrinsic(_label) -> return false
             .Branch(kind, _reg, target) -> {
                 let at = label_at.get(target)? or -1
-                if kind is .Always and at >= top and at < k {
+                // An inner loop's back edge; its own goes to `top` itself.
+                if kind is .Always and at > top and at < k {
                     return false
                 }
             }
@@ -1361,6 +1378,10 @@ type Codegen = shared struct {
     addressed_offs: [int64] = []
     // Whether hoist_loop_loads moved anything in the function it last saw.
     loads_hoisted: bool = false
+    // emit_index_check's slow paths, waiting for an unconditional jump, and
+    // those of the code around each loop being compiled.
+    cold: [regalloc.Insn] = []
+    cold_stack: [[regalloc.Insn]] = []
     // rc_hold's slots: those holding a call's receiver or arguments, and free ones.
     holds: [int64] = []
     hold_free: [int64] = []
@@ -4128,6 +4149,9 @@ type Codegen = shared struct {
     // A jump to `target`.
     func emit_jump(self, anon target: str) -> none {
         self.push_insn(.Branch(kind: .Always, reg: regalloc.NO_REG, :target))
+        if not self.dry_run {
+            self.flush_cold()
+        }
     }
 
     // A jump to `target` when `cond` holds of the flags.
@@ -10452,6 +10476,10 @@ type Codegen = shared struct {
     func end_loop(self) -> none {
         let lp = self.loop_stack[-1]
         self.loop_stack = self.loop_stack[0..len(self.loop_stack) - 1]
+        if len(self.cold_stack) > 0 {
+            self.cold = self.cold_stack[-1] + self.cold
+            self.cold_stack = self.cold_stack[0..len(self.cold_stack) - 1]
+        }
         if lp.sp_slot == 0 or self.dry_run {
             return
         }
@@ -10961,21 +10989,43 @@ type Codegen = shared struct {
     // counts from the end (`idx += len`), and one out of range either way
     // panics. An index already in range, nearly every one, takes one unsigned
     // compare and one branch; the negative case and the panic are past it.
+    // `idx` checked against `len`: in range (unsigned), it falls through.
+    // Otherwise, out of the way in a cold block emitted after the next
+    // unconditional jump, a negative index is wrapped (in `idx`) and the
+    // check made again, or the program panics.
     func emit_index_check(self, anon idx: str, len: str) -> none {
         let ok_lbl = self.fresh("Lidx_ok")
-        let oob_lbl = self.fresh("Lidx_oob")
+        let cold_lbl = self.fresh("Lcold")
         self.emit_op(.Compare, a: idx, b: len)
-        self.emit_jump_if(.Lo, target: ok_lbl)
-        self.emit_op(.Compare, a: idx, b: "#0")
-        self.emit_jump_if(.Ge, target: oob_lbl)
-        self.emit_op(.Add, a: idx, b: idx, c: len)
-        self.emit_op(.Compare, a: idx, b: len)
-        self.emit_jump_if(.Lo, target: ok_lbl)
-        self.emit_label(oob_lbl)
-        self.emit_mov("x0", src: idx)
-        self.emit_mov("x1", src: len)
-        self.emit_call("_kod_index_oob")
+        self.emit_jump_if(.Hs, target: cold_lbl)
         self.emit_label(ok_lbl)
+        if self.dry_run {
+            return
+        }
+        let i = regalloc.reg_of(idx)
+        let n = regalloc.reg_of(len)
+        let oob_lbl = f"{cold_lbl}_oob"
+        self.cold += [.Label(name: cold_lbl)]
+        self.cold += [regalloc.op(.Compare, a: i, b: regalloc.reg_of("#0"), c: regalloc.NO_REG, d: regalloc.NO_REG)]
+        self.cold += [.Branch(kind: .If(cond: .Ge), reg: regalloc.NO_REG, target: oob_lbl)]
+        self.cold += [regalloc.op(.Add, a: i, b: i, c: n, d: regalloc.NO_REG)]
+        self.cold += [regalloc.op(.Compare, a: i, b: n, c: regalloc.NO_REG, d: regalloc.NO_REG)]
+        self.cold += [.Branch(kind: .If(cond: .Lo), reg: regalloc.NO_REG, target: ok_lbl)]
+        self.cold += [.Label(name: oob_lbl)]
+        self.cold += [.Mov(dst: regalloc.reg_of("x0"), src: i)]
+        self.cold += [.Mov(dst: regalloc.reg_of("x1"), src: n)]
+        self.cold += [.Call(target: "_kod_index_oob")]
+    }
+
+    // The cold blocks emit_index_check left, after an unconditional jump.
+    func flush_cold(self) -> none {
+        if len(self.cold) == 0 {
+            return
+        }
+        for insn in self.cold {
+            self.out_buf += [insn]
+        }
+        self.cold = []
     }
 
     // `kod_bytes_le64(b, at)` with `b` in x0 and `at` in x1: the bytes
@@ -19157,6 +19207,8 @@ type Codegen = shared struct {
             if top < 0 or top >= back {
                 continue
             }
+            // With the cold blocks its checks left after its back edge.
+            let back = cold_end(body, back)
             if not self.hoistable_loop(body, :top, :back, :label_at) {
                 continue
             }
@@ -19316,7 +19368,12 @@ type Codegen = shared struct {
                 continue
             }
             let top = label_at.get(target)? or -1
-            if top < 0 or top >= back or not loop_calls_ok(body, :top, :back, :label_at) {
+            if top < 0 or top >= back {
+                continue
+            }
+            // With the cold blocks its checks left after its back edge.
+            let back = cold_end(body, back)
+            if not loop_calls_ok(body, :top, :back, :label_at) {
                 continue
             }
             mut calls_copy = false
@@ -19991,6 +20048,10 @@ type Codegen = shared struct {
         // `continue` lands here — re-check the loop condition. Previously
         // pointed at end_lbl, which made `continue` behave as `break`.
         self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: len(self.out_buf))]
+        // Cold blocks from before the loop wait until after it, so the loop's
+        // back edge lays out only its own.
+        self.cold_stack += [self.cold]
+        self.cold = []
         self.emit_label(start_lbl)
         self.compile_branch(cond_id, to: end_lbl, when: false, need: "a `for` condition must be a `bool`", optional_hint: "; test it with `is not none`")
         self.compile_block(body)
@@ -20051,6 +20112,10 @@ type Codegen = shared struct {
         let incr_lbl = f"{lbl}_incr"
         let end_lbl = f"{lbl}_end"
         self.loop_stack += [LoopLbl(start_lbl: incr_lbl, :end_lbl, :incr_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: len(self.out_buf))]
+        // Cold blocks from before the loop wait until after it, so the loop's
+        // back edge lays out only its own.
+        self.cold_stack += [self.cold]
+        self.cold = []
 
         let idx_name = f"__fi_{name}"
         let idx_off = self.find_var_offset(idx_name)
@@ -20867,6 +20932,8 @@ type Codegen = shared struct {
         self.mut_checked = []
         self.holds = []
         self.hold_free = []
+        self.cold = []
+        self.cold_stack = []
         self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
@@ -21017,6 +21084,9 @@ type Codegen = shared struct {
 
         self.emit_no_value_return()
 
+        if len(self.cold) > 0 {
+            self.emit_jump(self.ret_lbl)
+        }
         self.emit_label(self.ret_lbl)
         self.rc_retain_kind("x0", kind: self.return_kind)
         if self.rc_heap_kind(self.return_kind) {
