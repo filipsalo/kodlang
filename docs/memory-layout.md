@@ -190,6 +190,9 @@ two after that.
   variable the function never assigns to: the subject keeps the payload alive for
   as long as the binding can be used. A binding that shares its slot with one the
   function owns (the same name bound another way, or assigned to) is owned too.
+- `for x in xs` borrows each element: the loop holds the array, so `x` costs
+  nothing unless the function assigns to it, or its slot is owned for the same
+  reasons as a pattern's binding.
 - A function releases its variables when it returns, except that a `let` or
   `mut` local holding an array or a struct that isn't shared (a map or set
   too) is released after the last statement of its block that uses it; a
