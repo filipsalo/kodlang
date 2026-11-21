@@ -135,6 +135,7 @@ print(len(m).to_str())   // 2
 |--------|-------------|
 | `set(k, v)` | Add `k` with value `v`, or replace the value `k` has. `m[k] = v` is the same. |
 | `get(k) -> V?` | `k`'s value, or `none` when `k` isn't in the map. `m[k]` is the same. |
+| `m[k, default: d]` | `k`'s value, or `d` when `k` isn't in the map; `m[k, default: d] += v` changes it in place (see [Indexing a struct](#indexing-a-struct)). |
 | `contains(k) -> bool` | Whether `k` is in the map. |
 | `remove(k) -> V?` | Take `k` out of the map, giving the value it had, or `none` when it wasn't there. |
 | `keys() -> [K]` / `values() -> [V]` | The keys, or the values, in the order the keys were first set, as a new array. |
@@ -180,13 +181,40 @@ a value:
 
 ```kod
 func op_index(self, anon key: K) -> V? { ... }
-func op_index_set(self, anon key: K, anon value: V) -> none { ... }
+func op_index_set(mut self, anon key: K, anon value: V) -> none { ... }
 ```
 
 The key and value must have those parameters' types, like a method's
-arguments. `m[k] = v` evaluates `m`, then `k`, then `v` before the call,
-and `m[k] += v` calls `op_index` and then `op_index_set` with the same `m`
-and `k`, each evaluated once.
+arguments. `m[k] = v` evaluates `m`, then `k`, then `v` before the call.
+
+`m[k, default: d]` is `k`'s value, or `d` when there is none, through the
+struct's `op_index_or`; for a `Map` it is a `V`, not a `V?`:
+
+```kod
+mut counts = Map[str, int64]()
+for word in words {
+    counts[word, default: 0] += 1
+}
+mut groups = Map[int64, [str]]()
+groups[len(word), default: []] += [word]
+```
+
+A change to an entry, such as `m[k] += v`, `m[k][i] = v`, `m[k].x = v` or
+the same with `default:`, changes the value where the struct keeps it: `m`,
+`k` and `v` are evaluated first (in that order), then `op_index_take` (or
+`op_index_take_or` with the default) takes the value out, the change is
+made to it, and `op_index_set` puts it back. Since nothing else holds the
+value meanwhile, appending to an array in a map doesn't copy it. Without
+`default:` the key must be there; a `Map` panics when it isn't
+(`` key not in map ``). A struct that declares neither take method gets
+`m[k] += v` as `op_index` and then `op_index_set`, each with the same `m`
+and `k`:
+
+```kod
+func op_index_or(self, anon key: K, default: V) -> V { ... }
+func op_index_take(mut self, anon key: K) -> V { ... }
+func op_index_take_or(mut self, anon key: K, default: V) -> V { ... }
+```
 
 ## Error handling
 

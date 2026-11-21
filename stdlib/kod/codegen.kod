@@ -14120,6 +14120,9 @@ type Codegen = shared struct {
                 // `key` finds the local; anything else goes by the name as written.
                 let name = self.source_name(key)
                 let builtin = self.is_builtin_call(key)
+                if name == "_take_at" and len(args) == 2 and self.p.path.ends_with("stdlib/builtins.kod") {
+                    return self.compile_take_at(args[0].value, index_id: args[1].value)
+                }
                 if name == "len" and len(args) == 1 and builtin {
                     let share = self.share_begin(args[0].value)
                     let val = self.compile_len(args[0].value)
@@ -15784,6 +15787,9 @@ type Codegen = shared struct {
                         if name == "hash" and self.is_builtin_call(key) {
                             return .KInt64
                         }
+                        if name == "_take_at" and len(args) == 2 and self.p.path.ends_with("stdlib/builtins.kod") {
+                            return self.infer_kind(args[0].value).array_elem()
+                        }
                         // Struct or enum constructor: TypeName(...)
                         let struct_idx = self.find_struct_idx(name)
                         if struct_idx >= 0 {
@@ -16222,9 +16228,9 @@ type Codegen = shared struct {
                     self.bind_var(name)
                 }
             }
-            .Assign(lhs, rhs) -> self.compile_assign(lhs_id: lhs, rhs_id: rhs)
-            .PlusAssign(lhs, rhs) -> self.compile_plus_assign(lhs_id: lhs, rhs_id: rhs)
-            .MinusAssign(lhs, rhs) -> self.compile_minus_assign(lhs_id: lhs, rhs_id: rhs)
+            .Assign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 0)
+            .PlusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 1)
+            .MinusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 2)
             .Return(value) -> self.compile_return(value)
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
             .For(cond, body) -> {
@@ -18599,6 +18605,205 @@ type Codegen = shared struct {
     // `lhs -= rhs` desugars to `lhs = lhs - rhs`. Same shape as
     // compile_plus_assign; `-` is int-only (no str/array form), so a
     // bad operand type surfaces as a normal binary-op error.
+    // `target = rhs` (op 0), `+=` (1) or `-=` (2), through compile_entry_update
+    // when the target is or is in a struct's entry, `s[k]` or `s[k, default: d]`.
+    func compile_update(self, anon target: int64, rhs: int64, op: int64) -> none {
+        if self.compile_entry_update(target, :rhs, :op) {
+            return
+        }
+        match op {
+            0 -> self.compile_assign(lhs_id: target, rhs_id: rhs)
+            1 -> self.compile_plus_assign(lhs_id: target, rhs_id: rhs)
+            else self.compile_minus_assign(lhs_id: target, rhs_id: rhs)
+        }
+    }
+
+    // The struct, key and default (0 for none) of `s[k]` on a struct with
+    // op_index_take, or `s[k, default: d]` on one with op_index_take_or.
+    func entry_parts(self, anon id: int64) -> [int64] {
+        let none_parts: [int64] = []
+        match self.p.exprs[id] {
+            .Binary(base, op, key) -> {
+                if op is .Index and self.struct_has_method(base, name: "op_index_take") {
+                    return [base, key, 0]
+                }
+            }
+            .Call(callee, args) -> {
+                if self.p.exprs[callee] is .Binary(base, op, method) and op is .Dot and self.p.exprs[method] is .Ident(name) and name == "op_index_or" and len(args) == 2 and args[1].label == "default" {
+                    if self.struct_has_method(base, name: "op_index_take_or") {
+                        return [base, args[0].value, args[1].value]
+                    }
+                }
+            }
+            else none
+        }
+        return none_parts
+    }
+
+    func struct_has_method(self, anon expr_id: int64, name: str) -> bool {
+        let .KStruct(idx, _args) = self.infer_kind(expr_id) else { return false }
+        return self.structs[idx].method_idx.get(name) is Some(_mi)
+    }
+
+    // The entry nearest the root of `target`'s path (through elements,
+    // fields and entries), or 0.
+    func entry_root(self, anon target: int64) -> int64 {
+        mut node = target
+        mut found = 0
+        for true {
+            let parts = self.entry_parts(node)
+            if len(parts) > 0 {
+                found = node
+                node = parts[0]
+                continue
+            }
+            if self.p.exprs[node] is .Binary(base, op, _rhs) and (op is .Index or op is .Dot) {
+                node = base
+                continue
+            }
+            break
+        }
+        return found
+    }
+
+    // A change to, or in, an entry: the struct, the key, the default, the
+    // indexes on the way and the value are worked out (in that order), the
+    // entry is taken out into a local (op_index_take or op_index_take_or),
+    // changed there, and put back (op_index_set). Nothing else holds the value
+    // meanwhile, so changing it copies nothing. False when `target` has no
+    // entry, or when it's an entry `=` assigns, which op_index_set does.
+    func compile_entry_update(self, anon target: int64, rhs: int64, op: int64) -> bool {
+        let entry = self.entry_root(target)
+        if entry == 0 {
+            return false
+        }
+        let parts = self.entry_parts(entry)
+        let span = self.p.expr_spans[target]
+        if op == 0 and entry == target {
+            if parts[2] == 0 {
+                return false
+            }
+            // `s[k, default: d] = v` sets k; the default isn't needed.
+            self.compile_discard(self.method_call_on(parts[0], method: "op_index_set", args: [parts[1], rhs], labels: ["", ""], :span))
+            return true
+        }
+        let recv = self.stash_place(parts[0])
+        let key = self.stash_chain_operand(parts[1])
+        let take = self.method_call_on(recv, method: "op_index_take", args: [key], labels: [""], :span)
+        let value_kind = self.infer_kind(take)
+        mut take_call = take
+        if parts[2] != 0 {
+            let fallback = self.stash_operand_as(parts[2], kind: value_kind)
+            take_call = self.method_call_on(recv, method: "op_index_take_or", args: [key, fallback], labels: ["", "default"], :span)
+        }
+        let name = self.fresh("__entry")
+        let off = self.alloc_var(:name, kind: value_kind)
+        self.vars[-1].bound = true
+        self.vars[-1].declared_mut = true
+        let local = self.p.alloc_expr(ast.Expr.Ident(:name), :span)
+        let new_target = self.entry_target(target, :entry, replacement: local)
+        mut value = rhs
+        if not self.is_stable(rhs) {
+            if op == 0 {
+                value = self.stash_operand_as(rhs, kind: self.infer_kind(new_target))
+            } else {
+                value = self.stash_chain_operand(rhs)
+            }
+        }
+        self.compile_store(dest_off: off, kind: value_kind, value_id: take_call)
+        self.compile_update(new_target, rhs: value, :op)
+        self.compile_discard(self.method_call_on(recv, method: "op_index_set", args: [key, local], labels: ["", ""], :span))
+        if self.rc_heap_kind(value_kind) {
+            self.emit_ldr(off, reg: "x17")
+            self.emit_str_raw(off, reg: "xzr")
+            self.rc_release_x17()
+        }
+        return true
+    }
+
+    // `target`'s path with `entry` replaced by `replacement` and each index
+    // or argument on the way that has effects worked out now.
+    func entry_target(self, anon node: int64, entry: int64, replacement: int64) -> int64 {
+        if node == entry {
+            return replacement
+        }
+        let span = self.p.expr_spans[node]
+        match self.p.exprs[node] {
+            .Binary(base, op, rhs) -> {
+                let new_base = self.entry_target(base, :entry, :replacement)
+                mut new_rhs = rhs
+                if op is .Index and not self.is_stable(rhs) {
+                    new_rhs = self.stash_chain_operand(rhs)
+                }
+                return self.p.alloc_expr(ast.Expr.Binary(lhs: new_base, :op, rhs: new_rhs), :span)
+            }
+            .Call(callee, args) -> {
+                let .Binary(base, op, method) = self.p.exprs[callee] else { return node }
+                let new_base = self.entry_target(base, :entry, :replacement)
+                mut new_args: [ast.CallArg] = []
+                for arg in args {
+                    mut v = arg.value
+                    if not self.is_stable(v) {
+                        v = self.stash_chain_operand(v)
+                    }
+                    new_args += [ast.CallArg(label: arg.label, label_span: arg.label_span, value: v)]
+                }
+                let new_callee = self.p.alloc_expr(ast.Expr.Binary(lhs: new_base, :op, rhs: method), span: self.p.expr_spans[callee])
+                return self.p.alloc_expr(ast.Expr.Call(callee: new_callee, args: new_args), :span)
+            }
+            else return node
+        }
+    }
+
+    // `_take_at(xs, i)` in builtins.kod (Map's op_index_take): xs[i], moved out
+    // of `xs`, which is made its own first; a reference's slot is left empty,
+    // for op_index_set to fill again before anything reads it.
+    func compile_take_at(self, anon arr_id: int64, index_id: int64) -> Val {
+        let kind = self.infer_kind(arr_id)
+        let elem = kind.array_elem()
+        let arr = self.unique_array(arr_id)
+        let parked = self.preserve_begin(arr)
+        let idx = self.load(self.compile_expr(index_id))
+        let arr_r = self.preserve_end(arr, spilled: parked)
+        let len_r = self.pool.alloc_reg()
+        self.emit_load(len_r, base: arr_r, off: 8)
+        self.emit_index_check(idx, len: len_r)
+        self.pool.free_reg(len_r)
+        let buf = self.pool.alloc_reg()
+        self.emit_load(buf, base: arr_r)
+        self.pool.free_reg(arr_r)
+        let result = self.pool.alloc_reg()
+        if self.elem_width(kind) == 1 {
+            self.emit_indexed(load: true, reg: f"w{result[1..len(result)]}", base: buf, index: idx, width: 1)
+        } else {
+            self.emit_indexed(load: true, reg: result, base: buf, index: idx, scaled: true)
+            if self.rc_heap_kind(elem) {
+                self.emit_indexed(load: false, reg: "xzr", base: buf, index: idx, scaled: true)
+                // The array's reference, now the value's: in x0, as a call
+                // gives one (rc_call_result counts it as the call's result).
+                self.pool.free_reg(buf)
+                self.pool.free_reg(idx)
+                self.emit_mov("x0", src: result)
+                self.pool.free_reg(result)
+                return .VReg(name: "x0")
+            }
+        }
+        self.pool.free_reg(buf)
+        self.pool.free_reg(idx)
+        return .VReg(name: result)
+    }
+
+    // `recv.method(args...)` as an expression.
+    func method_call_on(self, anon recv: int64, method: str, args: [int64], labels: [str], span: ast.Span) -> int64 {
+        let name = self.p.alloc_expr(ast.Expr.Ident(name: method), :span)
+        let callee = self.p.alloc_expr(ast.Expr.Binary(lhs: recv, op: .Dot, rhs: name), :span)
+        mut call_args: [ast.CallArg] = []
+        for i, a in args {
+            call_args += [ast.CallArg(label: labels[i], label_span: span, value: a)]
+        }
+        return self.p.alloc_expr(ast.Expr.Call(:callee, args: call_args), :span)
+    }
+
     func compile_minus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
         let target = self.stash_store_target(lhs_id, value: rhs_id)
         let span = self.p.expr_spans[target]
