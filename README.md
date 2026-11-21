@@ -15,8 +15,11 @@ func main() -> int64 {
 
 ### Compiling
 
+First build the toolchain with `make kod`; after that `./kod` (a link at the
+repository root to the native tool) rebuilds it whenever its sources change.
+
 ```shell
-# uv run kod build hello.kod
+# ./kod build hello.kod
 # ./build/apps/hello/hello
 Hello, world!
 ```
@@ -24,8 +27,8 @@ Hello, world!
 ### Running tests
 
 ```shell
-# uv run kod test stdlib    # all tests under stdlib/
-# uv run kod test .         # everything under the project
+# ./kod test stdlib        # all tests under stdlib/
+# ./kod test .             # everything under the project
 ```
 
 See `docs/` for the full language reference.

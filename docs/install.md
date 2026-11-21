@@ -7,8 +7,7 @@ icon: lucide/download
 ## Requirements
 
 - macOS on Apple Silicon (AArch64)
-- Python 3.13+
-- [uv](https://docs.astral.sh/uv/) (recommended)
+- Python 3.13+ and [uv](https://docs.astral.sh/uv/), only for development: an HTTP test's stand-in server and `tools/as_diff.py` (building and running Kod needs neither)
 - Xcode Command Line Tools (`xcode-select --install`) — provides `as` and `clang`, which compiles the C runtime and links every program
 
 ## From source
@@ -16,7 +15,7 @@ icon: lucide/download
 ```shell
 git clone https://codeberg.org/filipsalo/kod
 cd kod
-uv sync
+uv sync    # only for the development tools
 ```
 
 ## Building the self-hosted compiler
@@ -29,20 +28,19 @@ make stage1      # incremental rebuild
 make test        # rebuild, then run the full test suite
 ```
 
-`uv run kod build|run|test|check` runs `make stage1 kod` first when invoked from the repo root, so edits to the compiler, the C runtime, or the always-linked stdlib modules are picked up automatically.
-
 ## Running
 
-`kod` is installed as a `uv run` script:
+`kod` is the native tool `build/apps/kod/kod`. Build it once with `make kod`, then start it through `./kod`, a link to it at the repository root (until it is built, `./kod` fails with the shell's `no such file or directory`):
 
 ```shell
-uv run kod build hello.kod   # compile to a native binary
-uv run kod run hello.kod     # build + execute
-uv run kod test hello.kod    # run any `test "..." {}` blocks
-uv run kod check hello.kod   # parse + codegen; report errors but emit nothing
+make kod
+./kod build hello.kod   # compile to a native binary
+./kod run hello.kod     # build + execute
+./kod test hello.kod    # run any `test "..." {}` blocks
+./kod check hello.kod   # parse + codegen; report errors but emit nothing
 ```
 
-Run `kod` from the repository root. A global `uv tool install .` is not supported: the package carries no stdlib.
+Started through `./kod`, it runs `make stage1 kod` first when something is out of date, so edits to the compiler, the C runtime, the always-linked stdlib modules or the tool itself are picked up automatically (see [CLI reference](cli.md#kod-build-file)). Run `kod` from the repository root.
 
 ## Linking
 

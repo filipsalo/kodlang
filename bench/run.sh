@@ -6,6 +6,6 @@ cd "$(dirname "$0")/.."
 
 for src in bench/*.kod; do
     stem="$(basename "$src" .kod)"
-    uv run kod build "$src" >/dev/null 2>&1
+    ./kod build "$src" >/dev/null 2>&1
     "./build/apps/$stem/$stem"
 done

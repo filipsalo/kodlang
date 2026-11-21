@@ -4,8 +4,8 @@
 
 Kod is self-hosted. `sh_kodc` (lexer, parser, codegen in `stdlib/kod/`, driver in
 `kodc.kod`) compiles every Kod program, including itself, and the native `kod` tool
-(`tools/kod.kod`) drives build / run / test / check. `kod/__main__.py` is a
-launcher that hands off to the native tool once `make` has built it. The Python
+(`tools/kod.kod`) drives build / run / test / check; people start it as `./kod`,
+a link at the repository root, which brings the toolchain up to date first. The Python
 interpreter is retired; the tag `python-bootstrap` keeps it (see
 [Self-hosting](docs/self-hosting.md#recovering-from-a-bad-snapshot)).
 

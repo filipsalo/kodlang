@@ -1,17 +1,19 @@
-// The `kod` launcher (kod/__main__.py, run as `python3 -m kod`): the public
-// commands go to the native tool, and when there is none it says so instead of
-// building something else.
+// `./kod`, the link at the repository root to the native tool
+// build/apps/kod/kod: the public commands do what the tool started by its own
+// path does, and a program run through it dies of a closed pipe. Started
+// through such a link the tool first brings the toolchain up to date with
+// `make`; that is tested in scratch directories under build/ holding a link
+// `kod` to the real tool and a stand-in `make` on PATH, so the real toolchain
+// is only ever checked, never rebuilt.
 //
 // Every run is bounded: a process that does not end within `WAIT_S` seconds is
-// killed with everything it started, and the test fails. The runs outside a
-// checkout use a fresh directory under the system temp dir; what a test makes
-// (there or under build/) is removed when it ends.
+// killed with everything it started, and the test fails. What a test makes
+// under build/ is removed when it ends.
 
 import "io"
 import "libc"
 import "posix"
 import "process"
-import "sort"
 import "strbuilder" { StrBuilder }
 import "time"
 import "time" { Duration, monotonic_ns }
@@ -23,8 +25,7 @@ let WAIT_S: int64 = 120
 let SIGSTOP: int64 = 17
 let SIGKILL: int64 = 9
 let SIGPIPE: int64 = 13
-let MISSING: str = "kod: build/apps/kod/kod not found; run kod from the repository root after `make kod`\n"
-let HELLO: str = "func main() -> int64 {\n    return 0\n}\n"
+let NOT_ROOT: str = "kod: link.cfg not found; run kod from the repository root\n"
 
 // --- Running programs, bounded ------------------------------------------------
 
@@ -121,12 +122,11 @@ func reap(anon child: process.Child, deadline: int64, what: str) -> int64 {
     return -1000
 }
 
-// Run the launcher with `args` in `dir`, PYTHONPATH the repository root,
-// stdin /dev/null, and collect its output.
-func launch(anon args: [str], dir: str) -> Ran {
-    let argv = ["python3", "-m", "kod"] + args
+// Run `argv` in `dir`, `add_env` over this environment, stdin /dev/null, and
+// collect its output.
+func launch(anon argv: [str], dir: str, add_env: [str] = []) -> Ran {
     let what = " ".join(argv)
-    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe, :dir, add_env: [f"PYTHONPATH={root()}"]) {
+    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Pipe, :dir, :add_env) {
         Ok(child) -> return finish(child, what: what)
         Err(e) -> {
             fail(f"start {what}: {e.to_str()}")
@@ -168,112 +168,208 @@ func finish(anon child: process.Child, what: str) -> Ran {
     return Ran(:status, stdout: out.to_str(), stderr: err.to_str())
 }
 
-// --- Outside a checkout ---------------------------------------------------------
+// --- Handing off -----------------------------------------------------------------
 
-// The names in `dir`, sorted, dot files included.
-func listing(anon dir: str) -> [str] {
-    mut names: [str] = []
-    for name in process.run(["ls", "-A", dir]).stdout.split("\n") {
-        if name != "" {
-            names += [name]
-        }
+// A program of its own under build/ for this process, `build/<stem>.kod`
+// holding `source`: the stem.
+func scratch_program(anon name: str, source: str) -> str {
+    let stem = f"{name}_launcher_{libc.getpid()}"
+    if io.write_file(f"{root()}/build/{stem}.kod", source) != 0 {
+        fail(f"cannot write build/{stem}.kod")
     }
-    return sort.sorted(names)
+    return stem
 }
 
-// `kod <command> hello.kod` in a fresh directory outside the repository says
-// the native tool is missing, prints nothing else and makes nothing.
-func outside_a_checkout(anon command: str) -> none {
-    let made = process.run(["mktemp", "-d"])
-    let dir = made.stdout.trim()
-    if made.status != 0 or dir == "" {
-        fail(f"mktemp -d: {made.stderr}")
-        return
+func remove_program(anon stem: str) -> none {
+    process.run(["rm", "-f", f"{root()}/build/{stem}.kod"])
+    process.run(["rm", "-rf", f"{root()}/build/apps/{stem}"])
+}
+
+// `./kod <command> <args>` and `build/apps/kod/kod <command> <args>` from the
+// root: both runs.
+func both(anon args: [str]) -> [Ran] {
+    return [launch(["./kod"] + args, dir: root()), launch(["build/apps/kod/kod"] + args, dir: root())]
+}
+
+test "./kod run and build do what the native tool does" {
+    let stem = scratch_program("greet", source: "func main(argv: [str]) -> int64 {\n    print(f\"hello {argv[1]}\")\n    return 3\n}\n")
+    let ran = both(["run", f"build/{stem}.kod", "there"])
+    for r in ran {
+        assert r.status == 3
+        assert r.stdout == "hello there\n"
+        assert r.stderr == ""
     }
-    if io.write_file(f"{dir}/hello.kod", HELLO) != 0 {
-        fail(f"cannot write {dir}/hello.kod")
+    let built = both(["build", f"build/{stem}.kod"])
+    for r in built {
+        assert r.status == 0
+        assert r.stdout == ""
+        assert r.stderr == ""
     }
-    let r = launch([command, "hello.kod"], :dir)
+    assert io.is_file(f"{root()}/build/apps/{stem}/{stem}")
+    remove_program(stem)
+}
+
+test "./kod check does what the native tool does" {
+    let checked = both(["check", "tests/does_not_exist.kod"])
+    for r in checked {
+        assert r.status == 1
+        assert r.stderr.contains("tests/does_not_exist.kod:1:1: error: no such file")
+    }
+    assert checked[0].stderr == checked[1].stderr
+    let stem = scratch_program("fine", source: "func main() -> int64 {\n    return 0\n}\n")
+    for r in both(["check", f"build/{stem}.kod"]) {
+        assert r.status == 0
+        assert r.stdout == ""
+        assert r.stderr == ""
+    }
+    remove_program(stem)
+}
+
+test "./kod test does what the native tool does" {
+    let stem = scratch_program("probe", source: "test \"one\" {\n    assert 1 + 1 == 2\n}\n\ntest \"two\" {\n    assert 1 + 1 == 3\n}\n")
+    for r in both(["test", f"build/{stem}.kod"]) {
+        assert r.status == 1
+        assert r.stdout.contains("ok   one")
+        assert r.stdout.contains("1/2 passed")
+    }
+    remove_program(stem)
+}
+
+test "./kod with no command prints the native tool's usage" {
+    for r in both(["test"]) {
+        assert r.status == 1
+        assert r.stdout == ""
+        assert r.stderr.contains("kod test <file-or-dir>")
+    }
+}
+
+// --- Refreshing the toolchain -------------------------------------------------------
+
+// A scratch root under build/: a link `kod` to the real tool, an empty
+// kodc.kod and a Makefile (so it reads as a repository root), and a stand-in
+// `make` in `bin/`. The stand-in appends a line per call to `calls`: its
+// arguments, then MAKEFLAGS, MFLAGS and MAKELEVEL (`-` when unset) and its
+// directory. `make -s -q ...` exits with the number in `q_status`; any other
+// call prints `rebuilt` to stdout and exits with the number in
+// `build_status`, and when that is 0 writes `build/apps/kod/kod`, a stand-in
+// for the rebuilt tool that prints its arguments and KOD_TOOLCHAIN_FRESH.
+func scratch_root(anon name: str, q_status: int64, build_status: int64) -> str {
+    let dir = f"{root()}/build/launcher_{name}_{libc.getpid()}"
+    process.run(["rm", "-rf", dir])
+    process.run(["mkdir", "-p", f"{dir}/bin"])
+    process.run(["ln", "-s", f"{root()}/build/apps/kod/kod", f"{dir}/kod"])
+    let fake_make = "".join([
+        "#!/bin/sh\n",
+        f"d={dir}\n",
+        "printf '%s|%s|%s|%s|%s\\n' \"$*\" \"${MAKEFLAGS--}\" \"${MFLAGS--}\" \"${MAKELEVEL--}\" \"$(pwd)\" >> \"$d/calls\"\n",
+        "if [ \"$1 $2\" = \"-s -q\" ]; then exit $(cat \"$d/q_status\"); fi\n",
+        "echo rebuilt\n",
+        "s=$(cat \"$d/build_status\")\n",
+        "if [ \"$s\" = 0 ]; then\n",
+        "  mkdir -p \"$d/build/apps/kod\"\n",
+        "  printf '#!/bin/sh\\necho \"new tool: $* fresh=$KOD_TOOLCHAIN_FRESH\"\\n' > \"$d/build/apps/kod/kod\"\n",
+        "  chmod +x \"$d/build/apps/kod/kod\"\n",
+        "fi\n",
+        "exit $s\n",
+    ])
+    let files = [
+        ["kodc.kod", ""],
+        ["Makefile", "all:\n"],
+        ["q_status", f"{q_status}\n"],
+        ["build_status", f"{build_status}\n"],
+        ["bin/make", fake_make],
+    ]
+    for f in files {
+        if io.write_file(f"{dir}/{f[0]}", f[1]) != 0 {
+            fail(f"cannot write {dir}/{f[0]}")
+        }
+    }
+    process.run(["chmod", "+x", f"{dir}/bin/make"])
+    return dir
+}
+
+// The environment of the runs: the stand-in `make` first on PATH, and an outer
+// make's variables, which the tool must not hand on.
+func make_env(anon dir: str) -> [str] {
+    return [f"PATH={dir}/bin:/usr/bin:/bin", "MAKEFLAGS=-B", "MFLAGS=-B", "MAKELEVEL=2"]
+}
+
+// `./kod run hello.kod` in `dir`.
+func through_link(anon dir: str, add_env: [str]) -> Ran {
+    return launch(["./kod", "run", "hello.kod"], :dir, :add_env)
+}
+
+func calls(anon dir: str) -> str {
+    return io.read_file(f"{dir}/calls")
+}
+
+test "./kod checks the toolchain with make -q, without an outer make's flags" {
+    let dir = scratch_root("fresh", q_status: 0, build_status: 9)
+    let r = through_link(dir, add_env: make_env(dir))
+    assert calls(dir) == f"-s -q stage1 kod|-|-|-|{dir}\n"
+    // Up to date: the tool carries on, and finds no link.cfg here.
     assert r.status == 1
-    assert r.stderr == MISSING
     assert r.stdout == ""
-    assert listing(dir) == ["hello.kod"]
+    assert r.stderr == NOT_ROOT
+    assert io.is_file(f"{dir}/build/.toolchain.lock")
     process.run(["rm", "-rf", dir])
 }
 
-test "outside a checkout build says what is missing" {
-    outside_a_checkout("build")
+test "./kod rebuilds an out-of-date toolchain and hands off to the new tool" {
+    let dir = scratch_root("stale", q_status: 1, build_status: 0)
+    let r = through_link(dir, add_env: make_env(dir))
+    assert calls(dir) == f"-s -q stage1 kod|-|-|-|{dir}\n-s stage1 kod|-|-|-|{dir}\n"
+    assert r.status == 0
+    // make's stdout goes to stderr; the new tool has the same arguments and
+    // the mark that keeps it from refreshing again.
+    assert r.stderr == "rebuilt\n"
+    assert r.stdout == "new tool: run hello.kod fresh=1\n"
+    process.run(["rm", "-rf", dir])
 }
 
-test "outside a checkout run says what is missing" {
-    outside_a_checkout("run")
-}
-
-test "outside a checkout check says what is missing" {
-    outside_a_checkout("check")
-}
-
-test "outside a checkout test says what is missing" {
-    outside_a_checkout("test")
-}
-
-// --- Inside the checkout ----------------------------------------------------------
-
-test "inside a checkout it hands off to the native tool" {
-    let ran = launch(["run", "tests/hello.kod"], dir: root())
-    if ran.status != 0 {
-        fail(ran.stderr)
-    }
-    assert ran.stdout == "Hello, world!\n"
-    let checked = launch(["check", "tests/does_not_exist.kod"], dir: root())
-    assert checked.status == 1
-    assert checked.stderr.contains("tests/does_not_exist.kod:1:1: error: no such file")
-}
-
-// `kod <command> tests/hello.kod` is an argparse usage error: exit 2.
-func gone(anon command: str) -> none {
-    let r = launch([command, "tests/hello.kod"], dir: root())
+test "./kod reports a failed rebuild with make's status" {
+    let dir = scratch_root("broken", q_status: 1, build_status: 2)
+    let r = through_link(dir, add_env: make_env(dir))
+    assert calls(dir) == f"-s -q stage1 kod|-|-|-|{dir}\n-s stage1 kod|-|-|-|{dir}\n"
     assert r.status == 2
-    assert r.stderr.contains("invalid choice")
     assert r.stdout == ""
+    assert r.stderr == "rebuilt\nkod: failed to rebuild the toolchain\n"
+    process.run(["rm", "-rf", dir])
 }
 
-test "the debug command _emit-asm that built things is gone" {
-    gone("_emit-asm")
-}
-
-test "the debug command _dump-ast that built things is gone" {
-    gone("_dump-ast")
-}
-
-test "the debug command _emit-test-runtime-main that built things is gone" {
-    gone("_emit-test-runtime-main")
-}
-
-test "the debug command _interpret that built things is gone" {
-    gone("_interpret")
-}
-
-test "the debug command _emit-runtime-main that built things is gone" {
-    gone("_emit-runtime-main")
-}
-
-test "the test command it lists takes a path as the native tool does" {
-    // `kod test` alone is the native tool's usage, not a run of `.`.
-    let r = launch(["test"], dir: root())
+test "./kod without make carries on" {
+    let dir = scratch_root("nomake", q_status: 1, build_status: 0)
+    let r = through_link(dir, add_env: ["PATH=/bin"])
+    assert not io.is_file(f"{dir}/calls")
     assert r.status == 1
-    assert r.stderr.contains("kod test <file-or-dir>")
-    // The launcher's docstring lists it with its path.
-    assert io.read_file(f"{root()}/kod/__main__.py").contains("kod test <path>")
-    // `--help` lists it, and its own parser wants the path: `-- test` stops
-    // the hand-off (argv[1] is `--`) and parses `test` alone.
-    let help = launch(["--help"], dir: root())
-    assert help.status == 0
-    assert help.stdout.contains("    test      run `test` blocks\n")
-    let parsed = launch(["--", "test"], dir: root())
-    assert parsed.status == 2
-    assert parsed.stderr.contains("usage: kod test [-h] path\n")
-    assert parsed.stderr.contains("the following arguments are required: path")
+    assert r.stderr == NOT_ROOT
+    process.run(["rm", "-rf", dir])
+}
+
+test "the tool started by its own path runs no make" {
+    let dir = scratch_root("direct", q_status: 1, build_status: 0)
+    let r = launch([f"{root()}/build/apps/kod/kod", "run", "hello.kod"], :dir, add_env: make_env(dir))
+    assert not io.is_file(f"{dir}/calls")
+    assert r.status == 1
+    assert r.stderr == NOT_ROOT
+    process.run(["rm", "-rf", dir])
+}
+
+test "the tool a refresh started does not refresh again" {
+    let dir = scratch_root("marked", q_status: 1, build_status: 0)
+    let r = through_link(dir, add_env: make_env(dir) + ["KOD_TOOLCHAIN_FRESH=1"])
+    assert not io.is_file(f"{dir}/calls")
+    assert r.status == 1
+    assert r.stderr == NOT_ROOT
+    process.run(["rm", "-rf", dir])
+}
+
+test "the mark is gone before the program runs" {
+    let stem = scratch_program("mark", source: "import \"env\"\n\nfunc main() -> int64 {\n    print(env.get(\"KOD_TOOLCHAIN_FRESH\")? or \"unset\")\n    return 0\n}\n")
+    let r = launch(["./kod", "run", f"build/{stem}.kod"], dir: root(), add_env: ["KOD_TOOLCHAIN_FRESH=1"])
+    assert r.status == 0
+    assert r.stdout == "unset\n"
+    remove_program(stem)
 }
 
 // --- A closed pipe ------------------------------------------------------------------
@@ -299,19 +395,18 @@ func first_bytes(anon child: process.Child, deadline: int64) -> str {
     }
 }
 
-test "a program run through the launcher dies of a closed pipe" {
-    // Python ignores SIGPIPE, and exec keeps an ignored signal ignored, so
-    // unless the launcher resets it `uv run kod run prog | head` is a program
-    // that writes to a pipe nobody reads and carries on.
+test "a program run through ./kod dies of a closed pipe" {
+    // `./kod run prog | head` must end `prog` when `head` stops reading, as
+    // when the shell starts it: nothing on the way may leave SIGPIPE ignored.
     let stem = f"huge_launcher_{libc.getpid()}"
     let source = f"build/{stem}.kod"
     if io.write_file(f"{root()}/{source}", io.read_file(f"{root()}/tests/stdio/huge.kod")) != 0 {
         fail(f"cannot write {source}")
         return
     }
-    let argv = ["python3", "-m", "kod", "run", source]
+    let argv = ["./kod", "run", source]
     let what = " ".join(argv)
-    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Null, dir: root(), add_env: [f"PYTHONPATH={root()}"]) {
+    match process.start(argv, stdin: .Null, stdout: .Pipe, stderr: .Null, dir: root()) {
         Ok(child) -> {
             let deadline = monotonic_ns() + WAIT_S * 1000000000
             let first = first_bytes(child, :deadline)

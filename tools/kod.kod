@@ -1,7 +1,8 @@
 // Native `kod` driver: `kod build|run|test|check`.
-// The only build orchestrator: `uv run kod` (kod/__main__.py) refreshes
-// the toolchain and hands off to it, so a normal user build doesn't
-// have to go through the Python entry point.
+// The only build orchestrator. People start it as `./kod`, a link at the
+// repository root to `build/apps/kod/kod`: started that way it first
+// brings the toolchain up to date with `make` (`refresh_toolchain`). Started
+// by its own path, as the tests and the test runner do, it doesn't.
 //
 // Pipeline:
 //   1. Parse the entry, walk its imports transitively. Read what each
@@ -71,6 +72,10 @@ func main(argv: [str]) -> int64 {
     if cmd != "build" and cmd != "run" and cmd != "test" and cmd != "check" {
         return usage()
     }
+    let refreshed = refresh_toolchain(argv)
+    if refreshed >= 0 {
+        return refreshed
+    }
     if require_repo_root() != 0 {
         return 1
     }
@@ -118,6 +123,147 @@ func require_repo_root() -> int64 {
         return 1
     }
     return 0
+}
+
+extern func flock(anon fd: int64, anon operation: int64) -> int64
+extern func mkdir(anon path: int64, anon mode: int64) -> int64
+
+let LOCK_EX: int64 = 2
+let EINTR: int64 = 4
+// Set for the tool that `refresh_toolchain` has just rebuilt and replaced
+// itself with, so that it doesn't look again; removed at once, so the
+// programs it runs don't see it.
+let FRESH_MARK: str = "KOD_TOOLCHAIN_FRESH"
+
+// The repository root, the directory that holds `Makefile` and `kodc.kod`,
+// when this process was started through the link `kod` there (`argv0` is
+// `./kod` or another path to it); "" when it wasn't, as when started as
+// `build/apps/kod/kod`, or through PATH (no `/`).
+func launch_root(anon argv0: str) -> str {
+    mut slash: int64 = -1
+    for i in 0..len(argv0) {
+        if argv0[i] == '/' {
+            slash = i
+        }
+    }
+    if slash < 0 {
+        return ""
+    }
+    mut dir: str = argv0[0..slash]
+    if slash == 0 {
+        dir = "/"
+    }
+    if io.is_file(f"{dir}/Makefile") and io.is_file(f"{dir}/kodc.kod") {
+        return dir
+    }
+    return ""
+}
+
+// The exit status from a raw wait status; 128 + the signal for one a signal
+// ended.
+func exit_status(anon raw: int64) -> int64 {
+    let sig = raw & 127
+    if sig == 0 {
+        return (raw >> 8) & 255
+    }
+    return 128 + sig
+}
+
+// Run `argv` in `dir` with the environment `env` and wait for it: its exit
+// status, or -1 when it could not be started. With `to_stderr`, what it
+// writes to stdout goes to our stderr.
+func run_make(anon argv: [str], dir: str, env: [str], to_stderr: bool) -> int64 {
+    mut out: process.Stdio = .Inherit
+    if to_stderr {
+        out = .Pipe
+    }
+    let started = process.start(argv, stdout: out, :dir, :env)
+    if started is Err(_) {
+        return -1
+    }
+    let child = started
+    if to_stderr {
+        for true {
+            let got = child.stdout.read(65536)
+            if got is Err(_) {
+                break
+            }
+            let data = got
+            if len(data) == 0 {
+                break
+            }
+            io.write_stderr(kod_bytes_to_str(data))
+        }
+        let _closed = child.stdout.close()
+    }
+    let raw = process.wait_status(child.pid, name: argv[0], hang: true)
+    if raw is Err(_) {
+        return 1
+    }
+    let status = raw
+    return exit_status(status)
+}
+
+// Started through the link at the repository root (`./kod`), bring the
+// toolchain up to date first, as `make -s stage1 kod` would: `sh_kodc`, the
+// always-linked objects and this tool. Checking costs one `make -q`. A lock
+// on `build/.toolchain.lock` keeps two of these from rebuilding at once; the
+// rebuild's stdout goes to stderr, so a `kod run` program's output is its
+// own. If something was rebuilt, the new tool takes this process's place
+// with the same arguments. When `make` can't be run, nothing is checked.
+// Returns -1 to carry on in this process, else the status to exit with: a
+// failed rebuild's, or 127 when the new tool can't be executed.
+func refresh_toolchain(anon argv: [str]) -> int64 {
+    if len(_env(FRESH_MARK)) > 0 {
+        libc.unsetenv(unsafe.c_str(FRESH_MARK))
+        return -1
+    }
+    let root = launch_root(argv[0])
+    if len(root) == 0 {
+        return -1
+    }
+    // An outer `make test`'s flags aren't for us: -B would rebuild on every
+    // call, -j print jobserver warnings, -i hide a failure.
+    mut env: [str] = []
+    for v in process.current_environment() {
+        if not v.starts_with("MAKEFLAGS=") and not v.starts_with("MFLAGS=") and not v.starts_with("MAKELEVEL=") {
+            env += [v]
+        }
+    }
+    mkdir(unsafe.c_str(f"{root}/build"), 493)
+    let lock_path = f"{root}/build/.toolchain.lock"
+    let opened = posix.create(lock_path)
+    if opened is Err(e) {
+        kod_eprint(f"kod: cannot open {lock_path}: {e.to_str()}")
+        return 1
+    }
+    let lock = opened
+    for unsafe.c_int(flock(lock.fd, LOCK_EX)) != 0 {
+        if unsafe.errno() != EINTR {
+            kod_eprint(f"kod: cannot lock {lock_path}")
+            let _ = lock.close()
+            return 1
+        }
+    }
+    let targets = ["stage1", "kod"]
+    let fresh = run_make(["make", "-s", "-q"] + targets, dir: root, :env, to_stderr: false)
+    if fresh <= 0 {
+        // Up to date, or no `make`.
+        let _ = lock.close()
+        return -1
+    }
+    let status = run_make(["make", "-s"] + targets, dir: root, :env, to_stderr: true)
+    let _ = lock.close()
+    if status != 0 {
+        kod_eprint("kod: failed to rebuild the toolchain")
+        return status
+    }
+    libc.setenv(unsafe.c_str(FRESH_MARK), unsafe.c_str("1"), 1)
+    mut again: [str] = [f"{root}/build/apps/kod/kod"]
+    for arg in argv[1..len(argv)] {
+        again += [arg]
+    }
+    return become(again)
 }
 
 // Read `link.cfg`, then `link.local.cfg` if there is one (it overrides single

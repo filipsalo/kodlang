@@ -14,7 +14,7 @@ func main() -> int64 {
 ```
 
 ```shell
-$ uv run kod build hello.kod
+$ ./kod build hello.kod
 $ ./build/apps/hello/hello
 Hello, world!
 ```

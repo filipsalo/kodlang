@@ -21,7 +21,7 @@ test "negative arithmetic" {
 ```
 
 ```shell
-$ uv run kod test arithmetic_test.kod
+$ ./kod test arithmetic_test.kod
 ok   addition works
 ok   negative arithmetic
 

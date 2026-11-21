@@ -6,6 +6,8 @@ icon: lucide/zap
 
 ## Hello, world
 
+Work in the repository root, and build the tool once with `make kod` (see [Install](install.md)): `./kod` is a link there to it.
+
 Create `hello.kod`:
 
 ```kod
@@ -18,12 +20,12 @@ func main() -> int64 {
 **Build** and run:
 
 ```shell
-$ uv run kod build hello.kod
+$ ./kod build hello.kod
 $ ./build/apps/hello/hello
 Hello, world!
 ```
 
-`uv run kod run hello.kod` does both in one step.
+`./kod run hello.kod` does both in one step.
 
 ## A real program
 
@@ -76,7 +78,7 @@ test "subtraction" {
 ```
 
 ```shell
-$ uv run kod test arithmetic_test.kod
+$ ./kod test arithmetic_test.kod
 ok   addition
 ok   subtraction
 

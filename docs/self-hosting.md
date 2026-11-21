@@ -68,7 +68,7 @@ There is no other way in: without the snapshot, `make` stops and says how to res
 
 A program links, in order: `LINK`, `-o <exe>`, the `RUNTIME_C` objects, the `STAGE0_KOD` objects, the program's module objects, the objects of the C files its modules name, its `_main` shim, and last the arguments its modules give with `kod:link` (see [Modules](modules.md#link-inputs)). A module that declares such lines cannot be in `STAGE0_KOD`, nor be one of the compiler's own modules: the Makefile does not read them. `kod` says so for `STAGE0_KOD`, and a test checks the others. Adding an always-linked module is one more word in `STAGE0_KOD`; the Makefile derives its rule. `make` rebuilds the C runtime objects and relinks `sh_kodc` and `kod` when `link.cfg` or `link.local.cfg` changes (the objects also when a header in `stdlib/` does, such as `kod_rt.h`), and also when the configuration in force is not the one they were built with (it keeps that in `build/.link-config`), so removing `link.local.cfg`, or a name from it, rebuilds too. A program gets the deployment target of the machine that builds it, as `clang` chooses it (`MACOSX_DEPLOYMENT_TARGET` in the environment overrides that).
 
-Requirements: `clang` (Xcode Command Line Tools). `kod` is run from the repository root; from another directory `uv run kod` says that `build/apps/kod/kod` is not found, and that tool, called by its path, says `link.cfg not found`. Calling `build/apps/kod/kod` directly does not rebuild `build/stage0/`, so after a change to `runtime.c` or `link.cfg` run `make kod` (or `uv run kod`, which does); when the configuration names an always-linked object that is not there yet, `kod` says `build/stage0/_name.o not found; run make`.
+Requirements: `clang` (Xcode Command Line Tools). `kod` is run from the repository root; from another directory it says `link.cfg not found`. Calling `build/apps/kod/kod` directly does not rebuild `build/stage0/`, so after a change to `runtime.c` or `link.cfg` run `make kod` (or `./kod`, which does); when the configuration names an always-linked object that is not there yet, `kod` says `build/stage0/_name.o not found; run make`.
 
 ## Refreshing the snapshot
 
@@ -93,10 +93,9 @@ The fixed-point check shows that a compiler reproduces itself, not that it is ri
 
 ## What's still Python
 
-- `kod/__main__.py`: `uv run kod build|run|test|check`, run from the repository root, refreshes the toolchain with `make` and hands off to `build/apps/kod/kod`. If `make` fails, it prints make's errors and `kod: failed to rebuild the toolchain` and stops with make's status; from any other directory, or when `make` is not installed and the tool is not built, it says that the tool is missing.
 - `tests/support/http_fixture.py` and `tools/as_diff.py`: a test's HTTP stand-in and the assembler comparison.
 
-Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly. `uv tool install .` is not supported: the wheel contains no stdlib.
+Nothing in the build path is Python: `./kod`, the link at the repository root, starts the native tool, which refreshes the toolchain with `make` itself. Tests call `build/apps/kod/kod` and `build/stage1/sh_kodc` directly.
 
 ## Codegen design
 

@@ -150,7 +150,8 @@ $(LINK_STAMP):
 	echo '$(LINK_NOW)' > $@
 
 # Native `kod` driver: `kod build / run / test / check`, written in Kod.
-# The launcher (kod/__main__.py) hands off to this binary.
+# People start it through the link ./kod at the repository root, which
+# runs `make -s stage1 kod` first when something is out of date.
 KOD_APP := build/apps/kod
 kod: $(KOD_APP)/kod
 
