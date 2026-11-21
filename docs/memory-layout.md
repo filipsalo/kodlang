@@ -80,7 +80,8 @@ A variant without a payload has one cell per module, in the module's data,
 with its discriminant and zeroes for the payload: `.Up` or `TokenKind.EOF`
 is the address of that cell, so making one allocates nothing. The cell is
 outside the counted heap, so counting it does nothing either, and it is
-never freed.
+never freed. An enum none of whose variants has a payload has no other values,
+so the compiler doesn't count them at all.
 
 See `docs/enums.md` for details.
 
