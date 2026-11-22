@@ -242,12 +242,13 @@ were.
    blocks as part of it. qsort and sieve are 6% and 9% faster, the others
    about 3%.
 12. **Instructions without a heap object each** (in progress, branch
-   `compact-insns`). An `Insn` is an enum value, so each instruction is a
-   heap cell, and branches, calls and labels hold a `str`. Profiled on
-   `codegen.kod`, the instruction passes take about 42% of compiling; within
-   them, counting, allocating, freeing and copying arrays of instructions
-   take about 13% of the whole (7% promoting locals and allocating, 2%
-   freeing the list after each function, 3.4% making the instructions).
+   `compact-insns`; steps 1 and 2 done). An `Insn` is an enum value, so
+   each instruction is a heap cell, and branches, calls and labels hold a
+   `str`. Profiled on `codegen.kod`, the instruction passes take about 42%
+   of compiling; within them, counting, allocating, freeing and copying
+   arrays of instructions take about 13% of the whole (7% promoting locals
+   and allocating, 2% freeing the list after each function, 3.4% making the
+   instructions).
    `InsnBuf` keeps a function's instructions as parallel arrays of numbers
    (a variant tag and the fields) and its labels, targets and data lines in a
    string table, so an instruction is a few array slots and a pass reads its
@@ -255,7 +256,15 @@ were.
    self-hosting check compares every file) and measured:
    1. `InsnBuf` with `push` of an `Insn` and `at(i)` back; codegen's buffer
       is one, and the passes get today's `[Insn]` from it at one boundary.
-   2. The emitting functions write the fields straight into it.
+      Done: compiling `codegen.kod` went from 3.25 G instructions (main) to
+      3.68 G, 244 to 270 ms.
+   2. The emitting functions write the fields straight into it. Done: a
+      `push_` method per variant, `settle_borrows` and the loop `sp` fixup
+      copy within `InsnBuf`s (`push_from`), and each function goes out as soon
+      as it is finished (the module buffer held them all, and doubling six
+      arrays was 2.5% of a compile); its body goes from the passes' `[Insn]`
+      straight to the output. 3.38 G instructions, 249 ms against main's
+      244 ms in the same run.
    3. The passes read and rewrite `InsnBuf`s, most expensive first: the
       assembler's input, liveness and register allocation, `forward_copies`
       and promoting locals, then the peephole, hoisting and the rest.

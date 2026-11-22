@@ -657,6 +657,12 @@ type InsnBuf = shared struct {
         return self.n
     }
 
+    // Empty, keeping the arrays' room for what comes next.
+    func clear(self) -> none {
+        self.n = 0
+        self.strs = []
+    }
+
     // Room for as many again (at least 64) in each array.
     func grow(self) -> none {
         mut more = len(self.tags)
@@ -681,106 +687,38 @@ type InsnBuf = shared struct {
     //   Pair: sub load | mode kind << 1; fa a, fb b, fc base, fd off.
     //   Op: sub the opcode; fa a, fb b, fc c, fd d, fe flags.
     //   Branch: sub kind | cond << 2; fa reg, fb target.
+    // The push_ methods below append one variant from its fields, with no
+    // Insn made; `push` is the one of `insn`'s variant.
     func push(self, anon insn: Insn) -> none {
-        mut tag: int64 = 0
-        mut a: int64 = 0
-        mut b: int64 = 0
-        mut c: int64 = 0
-        mut d: int64 = 0
-        mut e: int64 = 0
         match insn {
-            .Label(name) -> {
-                tag = INSN_LABEL
-                a = self.add_str(name)
-            }
-            .Slot(store, reg, off) -> {
-                tag = INSN_SLOT | (bit(store) << 8)
-                a = reg
-                b = off
-            }
-            .Mov(dst, src) -> {
-                tag = INSN_MOV
-                a = dst
-                b = src
-            }
+            .Label(name) -> self.push_label(name)
+            .Slot(store, reg, off) -> self.push_slot(:store, :reg, :off)
+            .Mov(dst, src) -> self.push_mov(:dst, :src)
             .Mem(load, width, reg, base, at) -> {
-                mut sub = bit(load)
                 match at {
-                    .Base -> none
-                    .Offset(off) -> {
-                        sub = sub | (AT_OFFSET << 1)
-                        c = off
-                    }
-                    .Index(index, scaled) -> {
-                        sub = sub | (AT_INDEX << 1) | (bit(scaled) << 3)
-                        c = index
-                    }
-                    .Symbol(name, got) -> {
-                        sub = sub | (AT_SYMBOL << 1) | (bit(got) << 3)
-                        c = self.add_str(name)
-                    }
+                    .Base -> self.push_mem(:load, :width, :reg, :base)
+                    .Offset(off) -> self.push_mem_offset(:load, :width, :reg, :base, :off)
+                    .Index(index, scaled) -> self.push_mem_index(:load, :width, :reg, :base, :index, :scaled)
+                    .Symbol(name, got) -> self.push_mem_symbol(:load, :width, :reg, :base, :name, :got)
                 }
-                tag = INSN_MEM | (sub << 8)
-                a = reg
-                b = base
-                d = width
             }
-            .Data(text) -> {
-                tag = INSN_DATA
-                a = self.add_str(text)
-            }
-            .Intrinsic(label) -> {
-                tag = INSN_INTRINSIC
-                a = self.add_str(label)
-            }
-            .LoadConst(dst, value) -> {
-                tag = INSN_LOAD_CONST
-                a = dst
-                b = value
-            }
-            .Pair(load, pa, pb, base, mode) -> {
-                mut sub = bit(load)
-                match mode {
-                    .At(off) -> d = off
-                    .Pre(off) -> {
-                        sub = sub | (MODE_PRE << 1)
-                        d = off
-                    }
-                    .Post(off) -> {
-                        sub = sub | (MODE_POST << 1)
-                        d = off
-                    }
-                }
-                tag = INSN_PAIR | (sub << 8)
-                a = pa
-                b = pb
-                c = base
-            }
-            .Op(op, oa, ob, oc, od, flags) -> {
-                tag = INSN_OP | (opcode_number(op) << 8)
-                a = oa
-                b = ob
-                c = oc
-                d = od
-                e = flags
-            }
-            .Call(target) -> {
-                tag = INSN_CALL
-                a = self.add_str(target)
-            }
+            .Data(text) -> self.push_data(text)
+            .Intrinsic(label) -> self.push_intrinsic(label)
+            .LoadConst(dst, value) -> self.push_load_const(:dst, :value)
+            .Pair(load, pa, pb, base, mode) -> self.push_pair(:load, a: pa, b: pb, :base, :mode)
+            .Op(op, oa, ob, oc, od, flags) -> self.push_op(op, a: oa, b: ob, c: oc, d: od, :flags)
+            .Call(target) -> self.push_call(target)
             .Branch(kind, reg, target) -> {
-                mut sub: int64 = 0
                 match kind {
-                    .Always -> none
-                    .If(cond) -> sub = BRANCH_IF | (cond_number(cond) << 2)
-                    .IfZero -> sub = BRANCH_IF_ZERO
-                    .IfNonzero -> sub = BRANCH_IF_NONZERO
+                    .If(cond) -> self.push_branch_if(cond, :reg, :target)
+                    else self.push_branch(:kind, :reg, :target)
                 }
-                tag = INSN_BRANCH | (sub << 8)
-                a = reg
-                b = self.add_str(target)
             }
         }
+    }
+
+    // Appends an instruction of tag (variant and sub fields) `tag` and fields `a` to `e`.
+    func put(self, anon tag: int64, a: int64 = 0, b: int64 = 0, c: int64 = 0, d: int64 = 0, e: int64 = 0) -> none {
         let k = self.n
         if k == len(self.tags) {
             self.grow()
@@ -792,6 +730,90 @@ type InsnBuf = shared struct {
         self.fd[k] = d
         self.fe[k] = e
         self.n = k + 1
+    }
+
+    func push_label(self, anon name: str) -> none {
+        self.put(INSN_LABEL, a: self.add_str(name))
+    }
+
+    func push_data(self, anon text: str) -> none {
+        self.put(INSN_DATA, a: self.add_str(text))
+    }
+
+    func push_intrinsic(self, anon label: str) -> none {
+        self.put(INSN_INTRINSIC, a: self.add_str(label))
+    }
+
+    func push_call(self, anon target: str) -> none {
+        self.put(INSN_CALL, a: self.add_str(target))
+    }
+
+    func push_slot(self, store: bool, reg: Reg, off: int64) -> none {
+        self.put(INSN_SLOT | (bit(store) << 8), a: reg, b: off)
+    }
+
+    func push_mov(self, dst: Reg, src: Reg) -> none {
+        self.put(INSN_MOV, a: dst, b: src)
+    }
+
+    func push_load_const(self, dst: Reg, value: int64) -> none {
+        self.put(INSN_LOAD_CONST, a: dst, b: value)
+    }
+
+    // A Mem at `base` (MemAt.Base).
+    func push_mem(self, load: bool, width: int64, reg: Reg, base: Reg) -> none {
+        self.put(INSN_MEM | (bit(load) << 8), a: reg, b: base, d: width)
+    }
+
+    func push_mem_offset(self, load: bool, width: int64, reg: Reg, base: Reg, off: int64) -> none {
+        self.put(INSN_MEM | ((bit(load) | (AT_OFFSET << 1)) << 8), a: reg, b: base, c: off, d: width)
+    }
+
+    func push_mem_index(self, load: bool, width: int64, reg: Reg, base: Reg, index: Reg, scaled: bool) -> none {
+        self.put(INSN_MEM | ((bit(load) | (AT_INDEX << 1) | (bit(scaled) << 3)) << 8), a: reg, b: base, c: index, d: width)
+    }
+
+    func push_mem_symbol(self, load: bool, width: int64, reg: Reg, base: Reg, name: str, got: bool) -> none {
+        self.put(INSN_MEM | ((bit(load) | (AT_SYMBOL << 1) | (bit(got) << 3)) << 8), a: reg, b: base, c: self.add_str(name), d: width)
+    }
+
+    func push_pair(self, load: bool, a: Reg, b: Reg, base: Reg, mode: PairMode) -> none {
+        mut sub = bit(load)
+        mut off: int64 = 0
+        match mode {
+            .At(o) -> off = o
+            .Pre(o) -> {
+                sub = sub | (MODE_PRE << 1)
+                off = o
+            }
+            .Post(o) -> {
+                sub = sub | (MODE_POST << 1)
+                off = o
+            }
+        }
+        self.put(INSN_PAIR | (sub << 8), :a, :b, c: base, d: off)
+    }
+
+    // An Op; `flags` as op_flags gives them.
+    func push_op(self, anon op: Opcode, a: Reg, b: Reg, c: Reg, d: Reg, flags: int64) -> none {
+        self.put(INSN_OP | (opcode_number(op) << 8), :a, :b, :c, :d, e: flags)
+    }
+
+    // A Branch of `kind`, other than If (see push_branch_if).
+    func push_branch(self, kind: BranchKind, reg: Reg, target: str) -> none {
+        mut sub: int64 = 0
+        match kind {
+            .Always -> none
+            .If(cond) -> sub = BRANCH_IF | (cond_number(cond) << 2)
+            .IfZero -> sub = BRANCH_IF_ZERO
+            .IfNonzero -> sub = BRANCH_IF_NONZERO
+        }
+        self.put(INSN_BRANCH | (sub << 8), a: reg, b: self.add_str(target))
+    }
+
+    // A Branch of kind If(cond).
+    func push_branch_if(self, anon cond: Cond, reg: Reg, target: str) -> none {
+        self.put(INSN_BRANCH | ((BRANCH_IF | (cond_number(cond) << 2)) << 8), a: reg, b: self.add_str(target))
     }
 
     // The index of `text` in `strs`, added.
@@ -877,15 +899,40 @@ type InsnBuf = shared struct {
         self.fc[i] = one.fc[0]
         self.fd[i] = one.fd[0]
         self.fe[i] = one.fe[0]
-        let tag = one.tags[0] & 255
-        // The string fields point into `one`'s table.
-        if tag == INSN_LABEL or tag == INSN_DATA or tag == INSN_INTRINSIC or tag == INSN_CALL {
-            self.fa[i] = self.add_str(one.strs[0])
-        } else if tag == INSN_BRANCH {
-            self.fb[i] = self.add_str(one.strs[0])
-        } else if tag == INSN_MEM and ((one.tags[0] >> 9) & 3) == AT_SYMBOL {
-            self.fc[i] = self.add_str(one.strs[0])
+        self.own_str(i, src: one)
+    }
+
+    // Appends instruction `i` of `src`.
+    func push_from(self, anon src: InsnBuf, i: int64) -> none {
+        self.put(src.tags[i], a: src.fa[i], b: src.fb[i], c: src.fc[i], d: src.fd[i], e: src.fe[i])
+        self.own_str(self.n - 1, src: src)
+    }
+
+    // Instruction `k`'s string field, if it has one, an index into `src.strs`
+    // made one into this table.
+    func own_str(self, anon k: int64, src: InsnBuf) -> none {
+        let tag = self.tags[k]
+        let variant = tag & 255
+        if variant == INSN_LABEL or variant == INSN_DATA or variant == INSN_INTRINSIC or variant == INSN_CALL {
+            self.fa[k] = self.add_str(src.strs[self.fa[k]])
+        } else if variant == INSN_BRANCH {
+            self.fb[k] = self.add_str(src.strs[self.fb[k]])
+        } else if variant == INSN_MEM and ((tag >> 9) & 3) == AT_SYMBOL {
+            self.fc[k] = self.add_str(src.strs[self.fc[k]])
         }
+    }
+
+    // Drops the last instruction.
+    func pop(self) -> none {
+        self.n = self.n - 1
+    }
+
+    // The name of instruction `i` if it is a Label, else "".
+    func label(self, anon i: int64) -> str {
+        if (self.tags[i] & 255) == INSN_LABEL {
+            return self.strs[self.fa[i]]
+        }
+        return ""
     }
 
     // Every instruction, in order.

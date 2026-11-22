@@ -1622,11 +1622,14 @@ type Codegen = shared struct {
     dry_run: bool = false
 
     // Accumulated output instructions. `println` appends here instead of
-    // writing to stdout directly; `flush_out` (called at the end of
-    // compile_module) formats and prints them in one pass. Buffering —
+    // writing to stdout directly; `flush_out` (called after each function
+    // and at the end of compile_module) formats and prints them. Buffering —
     // rather than streaming — is the foundation for the IR + regalloc
     // passes that sit between emission and final asm-formatting.
     out_buf: regalloc.InsnBuf = regalloc.InsnBuf()
+    // How many compile_funcs are under way: a function finished at depth 0
+    // goes out at once (flush_out), as nothing after it reads it.
+    func_depth: int64 = 0
 
     // Lhs of the `+=` being compiled: an array `+` on it appends in place.
     // Expr ids are per parser, and codegen swaps `self.p` for defaults.
@@ -4114,7 +4117,9 @@ type Codegen = shared struct {
         if value >= -65535 and value <= 65535 {
             self.emit_op(.Move, a: dest, b: f"#{value}")
         } else {
-            self.push_insn(.LoadConst(dst: regalloc.reg_of(dest), :value))
+            if self.can_push() {
+                self.out_buf.push_load_const(dst: regalloc.reg_of(dest), :value)
+            }
         }
     }
 
@@ -4135,15 +4140,12 @@ type Codegen = shared struct {
         return f"{prefix}${self.label_count}"
     }
 
-    // Single output gate. In dry-run mode (test_support.try_compile),
-    // this becomes a no-op so codegen can run all its checks without
-    // polluting stdout with the generated .s. Otherwise the line is
-    // buffered into `out_buf` and formatted by `flush_out`. This wraps
-    // the line in `Insn.Raw`; emitters that produce a structured `Insn`
-    // value (currently just `emit_label`) push directly to `out_buf`.
-    // A line that isn't an instruction: a directive or a label of data.
+    // A line that isn't an instruction: a directive or a label of data. In a
+    // dry run (test_support.try_compile) nothing goes out (see can_push).
     func println(self, anon line: str) -> none {
-        self.push_insn(.Data(text: line))
+        if self.can_push() {
+            self.out_buf.push_data(line)
+        }
     }
 
     // A load into `reg` from `base + off` (`base` without an `off`), of 4
@@ -4159,35 +4161,43 @@ type Codegen = shared struct {
     }
 
     func emit_mem(self, load: bool, reg: str, base: str, off: int64?, width: int64) -> none {
-        mut at: regalloc.MemAt = .Base
-        if off is Some(n) {
-            at = .Offset(off: n)
+        if not self.can_push() {
+            return
         }
         let r = regalloc.reg_of(reg)
         mut w = width
         if w == 0 {
             w = regalloc.reg_width(r)
         }
-        self.push_insn(.Mem(:load, width: w, reg: r, base: regalloc.reg_of(base), :at))
+        if off is Some(n) {
+            self.out_buf.push_mem_offset(:load, width: w, reg: r, base: regalloc.reg_of(base), off: n)
+        } else {
+            self.out_buf.push_mem(:load, width: w, reg: r, base: regalloc.reg_of(base))
+        }
     }
 
     // A load or store at `base` plus the register `index`, of `width` bytes
     // (by default 4 for a `w` register, 8 for an `x` one); `scaled`, the
     // index times the width.
     func emit_indexed(self, load: bool, reg: str, base: str, index: str, width: int64 = 0, scaled: bool = false) -> none {
+        if not self.can_push() {
+            return
+        }
         let r = regalloc.reg_of(reg)
         mut w = width
         if w == 0 {
             w = regalloc.reg_width(r)
         }
-        self.push_insn(.Mem(:load, width: w, reg: r, base: regalloc.reg_of(base), at: .Index(reg: regalloc.reg_of(index), :scaled)))
+        self.out_buf.push_mem_index(:load, width: w, reg: r, base: regalloc.reg_of(base), index: regalloc.reg_of(index), :scaled)
     }
 
     // A load or store at `base`, a page AddressPage gave, plus `name`'s offset
     // in it (`got`: of its global offset table entry).
     func emit_symbol_mem(self, load: bool, reg: str, base: str, name: str, got: bool = false) -> none {
-        let r = regalloc.reg_of(reg)
-        self.push_insn(.Mem(:load, width: regalloc.reg_width(r), reg: r, base: regalloc.reg_of(base), at: .Symbol(:name, :got)))
+        if self.can_push() {
+            let r = regalloc.reg_of(reg)
+            self.out_buf.push_mem_symbol(:load, width: regalloc.reg_width(r), reg: r, base: regalloc.reg_of(base), :name, :got)
+        }
     }
 
     // `mn a, b, c, d`, as many operands as given. Each must be one token (a
@@ -4196,22 +4206,35 @@ type Codegen = shared struct {
         if not one_token(a) or not one_token(b) or not one_token(c) or not one_token(d) {
             panic(f"compiler bug: an operand of `{arm64.op_text(:op, :a, :b, :c, :d).trim()}` isn't one token")
         }
-        self.push_insn(regalloc.op(op, a: regalloc.reg_of(a), b: regalloc.reg_of(b), c: regalloc.reg_of(c), d: regalloc.reg_of(d)))
+        if not self.can_push() {
+            return
+        }
+        let ra = regalloc.reg_of(a)
+        let rb = regalloc.reg_of(b)
+        let rc = regalloc.reg_of(c)
+        let rd = regalloc.reg_of(d)
+        self.out_buf.push_op(op, a: ra, b: rb, c: rc, d: rd, flags: regalloc.op_flags(:op, a: ra, b: rb, c: rc, d: rd))
     }
 
     // A load into (or store of) `a` and `b` at `base`, as `mode` says.
     func emit_pair(self, load: bool, a: str, b: str, base: str, mode: regalloc.PairMode) -> none {
-        self.push_insn(.Pair(:load, a: regalloc.reg_of(a), b: regalloc.reg_of(b), base: regalloc.reg_of(base), :mode))
+        if self.can_push() {
+            self.out_buf.push_pair(:load, a: regalloc.reg_of(a), b: regalloc.reg_of(b), base: regalloc.reg_of(base), :mode)
+        }
     }
 
     // `bl target`.
     func emit_call(self, anon target: str) -> none {
-        self.push_insn(.Call(:target))
+        if self.can_push() {
+            self.out_buf.push_call(target)
+        }
     }
 
     // A jump to `target`.
     func emit_jump(self, anon target: str) -> none {
-        self.push_insn(.Branch(kind: .Always, reg: regalloc.NO_REG, :target))
+        if self.can_push() {
+            self.out_buf.push_branch(kind: .Always, reg: regalloc.NO_REG, :target)
+        }
         if not self.dry_run {
             self.flush_cold()
         }
@@ -4219,32 +4242,55 @@ type Codegen = shared struct {
 
     // A jump to `target` when `cond` holds of the flags.
     func emit_jump_if(self, anon cond: regalloc.Cond, target: str) -> none {
-        self.push_insn(.Branch(kind: .If(:cond), reg: regalloc.NO_REG, :target))
+        if self.can_push() {
+            self.out_buf.push_branch_if(cond, reg: regalloc.NO_REG, :target)
+        }
     }
 
     // A jump to `target` when `reg` is zero, or with `nonzero` when it isn't.
     func emit_jump_zero(self, anon reg: str, target: str, nonzero: bool = false) -> none {
+        if not self.can_push() {
+            return
+        }
         mut kind: regalloc.BranchKind = .IfZero
         if nonzero {
             kind = .IfNonzero
         }
-        self.push_insn(.Branch(:kind, reg: regalloc.reg_of(reg), :target))
+        self.out_buf.push_branch(:kind, reg: regalloc.reg_of(reg), :target)
     }
 
     // `mov dst, src` between two registers.
     func emit_mov(self, anon dst: str, src: str) -> none {
-        self.push_insn(.Mov(dst: regalloc.reg_of(dst), src: regalloc.reg_of(src)))
+        if self.can_push() {
+            self.out_buf.push_mov(dst: regalloc.reg_of(dst), src: regalloc.reg_of(src))
+        }
     }
 
     // Appends an instruction made without text, as println does a line.
     func push_insn(self, anon insn: regalloc.Insn) -> none {
+        if self.can_push() {
+            self.out_buf.push(insn)
+        }
+    }
+
+    // What a call to `label` does, in place (Insn.Intrinsic).
+    func push_intrinsic(self, anon label: str) -> none {
+        if self.can_push() {
+            self.out_buf.push_intrinsic(label)
+        }
+    }
+
+    // Whether an instruction goes into out_buf now: not in a dry run, and
+    // after the store of a pending reference (see rc_flush_pending). Each
+    // emitter asks first, then writes its fields straight into out_buf.
+    func can_push(self) -> bool {
         if self.dry_run {
-            return none
+            return false
         }
         if self.rc_pending {
             self.rc_flush_pending()
         }
-        self.out_buf.push(insn)
+        return true
     }
 
     // Drain the buffered output to stdout, one `print` per line.
@@ -4254,12 +4300,16 @@ type Codegen = shared struct {
     // through.
     func flush_out(self) -> none {
         let buf = self.out_buf
+        // A mark into the old buffer would match a call at that length in the new one.
+        self.rc_ctor_mark = -1
+        if buf.len() == 0 {
+            return none
+        }
         if self.asm is Some(a) {
             for i in 0..buf.len() {
                 a.insn(buf.at(i), vreg_phys: self.pool.vreg_phys)
             }
-            self.out_buf = regalloc.InsnBuf()
-            self.rc_ctor_mark = -1
+            buf.clear()
             return none
         }
         // The whole buffer as one string, printed at once.
@@ -4270,19 +4320,31 @@ type Codegen = shared struct {
         if out.len() > 0 {
             write_stdout(out.to_str())
         }
-        self.out_buf = regalloc.InsnBuf()
-        // A mark into the old buffer would match a call at that length in the new one.
-        self.rc_ctor_mark = -1
+        buf.clear()
+    }
+
+    // flush_out, then `insns` written out after it.
+    func flush_insns(self, anon insns: [regalloc.Insn]) -> none {
+        self.flush_out()
+        if self.asm is Some(a) {
+            for insn in insns {
+                a.insn(insn, vreg_phys: self.pool.vreg_phys)
+            }
+            return none
+        }
+        let out = StrBuilder()
+        for insn in insns {
+            arm64.write_insn(insn, vreg_phys: self.pool.vreg_phys, :out)
+        }
+        if out.len() > 0 {
+            write_stdout(out.to_str())
+        }
     }
 
     func emit_label(self, anon lbl: str) -> none {
-        if self.dry_run {
-            return none
+        if self.can_push() {
+            self.out_buf.push_label(lbl)
         }
-        if self.rc_pending {
-            self.rc_flush_pending()
-        }
-        self.out_buf.push(regalloc.Insn.Label(name: lbl))
     }
 
     func emit_globl(self, anon lbl: str) -> none {
@@ -8458,7 +8520,9 @@ type Codegen = shared struct {
             self.push_all(frame_base_slot(store: false, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base))
             return
         }
-        self.push_insn(.Slot(store: false, reg: regalloc.reg_of(reg), off: offset))
+        if self.can_push() {
+            self.out_buf.push_slot(store: false, reg: regalloc.reg_of(reg), off: offset)
+        }
     }
 
     func rc_heap_kind(self, anon kind: TypeKind) -> bool {
@@ -8801,7 +8865,9 @@ type Codegen = shared struct {
             self.push_all(frame_base_slot(store: true, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base))
             return
         }
-        self.push_insn(.Slot(store: true, reg: regalloc.reg_of(reg), off: offset))
+        if self.can_push() {
+            self.out_buf.push_slot(store: true, reg: regalloc.reg_of(reg), off: offset)
+        }
     }
 
     func push_all(self, anon insns: [regalloc.Insn]) -> none {
@@ -10328,30 +10394,32 @@ type Codegen = shared struct {
                 owned += [m]
             }
         }
-        let body = self.out_buf.to_insns()
-        mut out: [regalloc.Insn] = []
-        for insn in body {
-            if insn is .Label(name) and name.starts_with("Lborrow$") {
+        let body = self.out_buf
+        let out = regalloc.InsnBuf()
+        for i in 0..body.len() {
+            let name = body.label(i)
+            if name.starts_with("Lborrow$") {
                 for m in owned {
                     if m.label == name {
                         // The store before the mark, counted as emit_str counts it.
-                        out = out[0..len(out) - 1]
+                        out.pop()
                         self.out_buf = regalloc.InsnBuf()
                         self.emit_mov("x17", src: m.reg)
                         self.emit_call("_rc_retain_stub")
                         self.emit_ldr(m.offset, reg: "x17")
                         self.emit_str_raw(m.offset, reg: m.reg)
                         self.rc_release_x17()
-                        for counted in self.out_buf.to_insns() {
-                            out += [counted]
+                        let counted = self.out_buf
+                        for j in 0..counted.len() {
+                            out.push_from(counted, i: j)
                         }
                     }
                 }
                 continue
             }
-            out += [insn]
+            out.push_from(body, :i)
         }
-        self.out_buf = regalloc.insn_buf(out)
+        self.out_buf = out
         self.rc_ctor_mark = -1
         self.borrow_marks = []
     }
@@ -10559,8 +10627,18 @@ type Codegen = shared struct {
         let end = self.out_buf.len()
         self.emit_mov("x17", src: "sp")
         self.emit_str(lp.sp_slot, reg: "x17")
-        let all = self.out_buf.to_insns()
-        self.out_buf = regalloc.insn_buf(all[0..lp.entry_mark] + all[end..] + all[lp.entry_mark..end])
+        let all = self.out_buf
+        let moved = regalloc.InsnBuf()
+        for i in 0..lp.entry_mark {
+            moved.push_from(all, :i)
+        }
+        for i in end..all.len() {
+            moved.push_from(all, :i)
+        }
+        for i in lp.entry_mark..end {
+            moved.push_from(all, :i)
+        }
+        self.out_buf = moved
     }
 
     // A jump out of a loop skips the restores of what was evicted inside it.
@@ -11949,7 +12027,7 @@ type Codegen = shared struct {
             if self.borrow_bindings and self.rc_heap_kind(self.find_var_kind(binding)) and not arrays.contains(self.assigned_names, binding) and not arrays.contains(self.rc_slots, binding_off) {
                 self.emit_str_raw(binding_off, reg: fv_r)
                 let mark = self.fresh("Lborrow")
-                self.out_buf.push(regalloc.Insn.Label(name: mark))
+                self.out_buf.push_label(mark)
                 self.borrow_marks += [BorrowMark(offset: binding_off, reg: fv_r, label: mark)]
             } else {
                 self.emit_str(binding_off, reg: fv_r)
@@ -13951,7 +14029,7 @@ type Codegen = shared struct {
             }
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
             if arm64.is_intrinsic(ifn.label) {
-                self.push_insn(.Intrinsic(label: ifn.label))
+                self.push_intrinsic(ifn.label)
                 return .VReg(name: "x0")
             }
             self.emit_call(ifn.label)
@@ -14277,7 +14355,7 @@ type Codegen = shared struct {
                         return .VReg(name: "x0")
                     }
                     if arm64.is_intrinsic(self.fn_label(slot)) {
-                        self.push_insn(.Intrinsic(label: self.fn_label(slot)))
+                        self.push_intrinsic(self.fn_label(slot))
                         return .VReg(name: "x0")
                     }
                     if tail and self.tail_jump(label: self.fn_label(slot), :args, slots: call_slots, recv: 0) {
@@ -14827,7 +14905,7 @@ type Codegen = shared struct {
         }
         self.emit_op(.Add, a: "sp", b: "sp", c: f"#{padded}")
         if arm64.is_intrinsic(method_lbl) {
-            self.push_insn(.Intrinsic(label: method_lbl))
+            self.push_intrinsic(method_lbl)
             return .VReg(name: "x0")
         }
         if tail and self.tail_jump(label: method_lbl, :args, slots: call_slots, recv: receiver_id) {
@@ -20667,7 +20745,7 @@ type Codegen = shared struct {
         if self.rc_heap_kind(elem_kind) and arrays.contains(self.rc_slots, hdr_off) and not arrays.contains(self.assigned_names, name) and not arrays.contains(self.rc_slots, elem_off) and self.inline_depth == 0 and not self.dry_run {
             self.emit_str_raw(elem_off, reg: elem_reg)
             let mark = self.fresh("Lborrow")
-            self.out_buf.push(regalloc.Insn.Label(name: mark))
+            self.out_buf.push_label(mark)
             self.borrow_marks += [BorrowMark(offset: elem_off, reg: elem_reg, label: mark)]
         } else {
             self.emit_str(elem_off, reg: elem_reg)
@@ -21557,6 +21635,7 @@ type Codegen = shared struct {
         let saved = self.out_buf
         let vreg_start: int64 = len(self.pool.vreg_phys)
         self.out_buf = regalloc.InsnBuf()
+        self.func_depth += 1
         self.rc_ctor_mark = -1
 
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
@@ -21637,6 +21716,7 @@ type Codegen = shared struct {
         }
         mut body_buf = self.peephole(emitted, :vreg_start)
         self.out_buf = saved
+        self.func_depth -= 1
         body_buf = self.hoist_unique_checks(body_buf)
         // Loads out of loops live across them, which only the strict allocation
         // of promoted locals keeps apart: used only when that succeeds.
@@ -21733,8 +21813,13 @@ type Codegen = shared struct {
         if arm64.line_count(body_insns) > LONG_BODY_INSNS {
             body_insns = self.long_branches(body_insns)
         }
-        for line in body_insns {
-            self.out_buf.push(line)
+        // Nothing reads the body again: at depth 0 it goes out as it is.
+        if self.func_depth == 0 {
+            self.flush_insns(body_insns)
+        } else {
+            for line in body_insns {
+                self.out_buf.push(line)
+            }
         }
         mut qi = cs
         for qi > 0 {
@@ -21746,6 +21831,10 @@ type Codegen = shared struct {
         }
         self.emit_op(.Return)
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
+        // Its registers are final, and nothing edits what is out_buf now.
+        if self.func_depth == 0 {
+            self.flush_out()
+        }
     }
 
 
