@@ -1158,9 +1158,14 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
     }
 
     // Walk vregs in def order; maintain active list (alive intervals).
+    // The lists and the free pools are stacks with a count: an element past
+    // the count is spare room, so taking and expiring don't copy them.
     mut active_id: [int64] = []
     mut active_use: [int64] = []
     mut active_phys: [Reg] = []
+    mut n_active = 0
+    mut n_callee = len(free_callee)
+    mut n_caller = len(free_caller)
     mut new_phys: [Reg] = pool.vreg_phys[vreg_start..vreg_end]
 
     for oi in 0..n_local {
@@ -1188,16 +1193,25 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
         // all sources before writing the dest, so sharing a phys
         // between dying-source and just-defined-dest on the same line
         // is well-defined for every mnemonic we emit.
-        // Compacted in place, in order; copied only when one expired.
-        let n_active = len(active_id)
+        // Compacted in place, in order.
         mut kept = 0
         for ai in 0..n_active {
             if active_use[ai] <= d {
                 let ap: Reg = active_phys[ai]
                 if is_callee_saved_phys(ap) {
-                    free_callee += [ap]
+                    if n_callee < len(free_callee) {
+                        free_callee[n_callee] = ap
+                    } else {
+                        free_callee += [ap]
+                    }
+                    n_callee += 1
                 } else {
-                    free_caller += [ap]
+                    if n_caller < len(free_caller) {
+                        free_caller[n_caller] = ap
+                    } else {
+                        free_caller += [ap]
+                    }
+                    n_caller += 1
                 }
             } else {
                 active_id[kept] = active_id[ai]
@@ -1206,23 +1220,19 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 kept += 1
             }
         }
-        if kept < n_active {
-            active_id = active_id[0..kept]
-            active_use = active_use[0..kept]
-            active_phys = active_phys[0..kept]
-        }
+        n_active = kept
 
         // Pop a phys from the matching class's free pool.
         mut chosen: Reg = NO_REG
         if cls_callee {
-            if len(free_callee) > 0 {
-                chosen = free_callee[len(free_callee) - 1]
-                free_callee = free_callee[0..len(free_callee) - 1]
+            if n_callee > 0 {
+                n_callee -= 1
+                chosen = free_callee[n_callee]
             }
         } else {
-            if len(free_caller) > 0 {
-                chosen = free_caller[len(free_caller) - 1]
-                free_caller = free_caller[0..len(free_caller) - 1]
+            if n_caller > 0 {
+                n_caller -= 1
+                chosen = free_caller[n_caller]
             }
         }
         if chosen == NO_REG and strict and droppable >= 0 {
@@ -1236,7 +1246,8 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                 victim = local_id
             }
             mut victim_at = -1
-            for ai, aid in active_id {
+            for ai in 0..n_active {
+                let aid = active_id[ai]
                 if aid >= droppable and is_callee_saved_phys(active_phys[ai]) == cls_callee and aid > victim {
                     victim = aid
                     victim_at = ai
@@ -1249,9 +1260,13 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
                     continue
                 }
                 chosen = active_phys[victim_at]
-                active_id = active_id[0..victim_at] + active_id[victim_at + 1..len(active_id)]
-                active_use = active_use[0..victim_at] + active_use[victim_at + 1..len(active_use)]
-                active_phys = active_phys[0..victim_at] + active_phys[victim_at + 1..len(active_phys)]
+                // Out of the active list, the rest moved down in order.
+                for ai in victim_at + 1..n_active {
+                    active_id[ai - 1] = active_id[ai]
+                    active_use[ai - 1] = active_use[ai]
+                    active_phys[ai - 1] = active_phys[ai]
+                }
+                n_active -= 1
             }
         }
         if chosen == NO_REG {
@@ -1264,9 +1279,16 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
             chosen = alloc_phys[local_id]
         }
         new_phys[local_id] = chosen
-        active_id += [local_id]
-        active_use += [lv.last_use[local_id]]
-        active_phys += [chosen]
+        if n_active < len(active_id) {
+            active_id[n_active] = local_id
+            active_use[n_active] = lv.last_use[local_id]
+            active_phys[n_active] = chosen
+        } else {
+            active_id += [local_id]
+            active_use += [lv.last_use[local_id]]
+            active_phys += [chosen]
+        }
+        n_active += 1
     }
 
     // Write back.
