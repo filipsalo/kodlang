@@ -666,33 +666,34 @@ let PROMOTE_MAX_INSNS: int64 = 6000
 // x28 then holds the frame's bottom and those slots are `[x28, #k]`.
 let FRAME_BASE_MIN: int64 = 256
 
-// A load or store of the slot at `offset` from fp, through x28 (the frame's bottom,
+// Appends a load or store of the slot at `offset` from fp, through x28 (the frame's bottom,
 // `frame` bytes below fp), or past the reach of `[x28, #k]` through x16.
-func frame_base_slot(store: bool, reg: regalloc.Reg, offset: int64, frame: int64) -> [regalloc.Insn] {
+func push_frame_base_slot(anon out: regalloc.InsnBuf, store: bool, reg: regalloc.Reg, offset: int64, frame: int64) -> none {
     let width = regalloc.reg_width(reg)
     let k = frame + offset
     if k >= 0 and k <= 4095 * width and k % width == 0 {
-        return [.Mem(load: not store, :width, :reg, base: regalloc.X28, at: .Offset(off: k))]
+        out.push_mem_offset(load: not store, :width, :reg, base: regalloc.X28, off: k)
+        return
     }
-    mut insns: [regalloc.Insn] = []
     if 0 - offset <= 65535 {
-        insns += [regalloc.op(.Move, a: regalloc.X16, b: regalloc.imm(0 - offset))]
+        out.push_new_op(regalloc.OP_MOVE, a: regalloc.X16, b: regalloc.imm(0 - offset))
     } else {
-        insns += [.LoadConst(dst: regalloc.X16, value: 0 - offset)]
+        out.push_load_const(dst: regalloc.X16, value: 0 - offset)
     }
-    insns += [regalloc.op(.Sub, a: regalloc.X16, b: regalloc.FP, c: regalloc.X16)]
-    insns += [.Mem(load: not store, :width, :reg, base: regalloc.X16, at: .Base)]
-    return insns
+    out.push_new_op(regalloc.OP_SUB, a: regalloc.X16, b: regalloc.FP, c: regalloc.X16)
+    out.push_mem(load: not store, :width, :reg, base: regalloc.X16)
 }
 
-// `body` with each slot past -256 addressed through x28 (see `frame_base_slot`).
-func frame_base_slots(anon body: [regalloc.Insn], frame: int64) -> [regalloc.Insn] {
-    mut out: [regalloc.Insn] = []
-    for insn in body {
-        if insn is .Slot(store, reg, off) and off < -256 {
-            out += frame_base_slot(:store, :reg, offset: off, :frame)
+// `body` with each slot past -256 addressed through x28 (see `push_frame_base_slot`).
+func frame_base_slots(anon body: regalloc.InsnBuf, frame: int64) -> regalloc.InsnBuf {
+    let out = body.derived()
+    for i in 0..body.n {
+        let tag = body.tags[i]
+        let off = body.fb[i]
+        if (tag & 255) == regalloc.INSN_SLOT and off < -256 {
+            push_frame_base_slot(out, store: (tag >> 8) == 1, reg: body.fa[i], offset: off, :frame)
         } else {
-            out += [insn]
+            out.copy_from(body, :i)
         }
     }
     return out
@@ -4271,13 +4272,6 @@ type Codegen = shared struct {
     func emit_mov(self, anon dst: str, src: str) -> none {
         if self.can_push() {
             self.out_buf.push_mov(dst: regalloc.reg_of(dst), src: regalloc.reg_of(src))
-        }
-    }
-
-    // Appends an instruction made without text, as println does a line.
-    func push_insn(self, anon insn: regalloc.Insn) -> none {
-        if self.can_push() {
-            self.out_buf.push(insn)
         }
     }
 
@@ -8525,7 +8519,9 @@ type Codegen = shared struct {
     // A slot past -256 stays a `Slot` until the frame is sized (see `frame_base_slots`).
     func emit_ldr(self, anon offset: int64, reg: str) -> none {
         if offset < -256 and self.frame_base > 0 {
-            self.push_all(frame_base_slot(store: false, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base))
+            if self.can_push() {
+                push_frame_base_slot(self.out_buf, store: false, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base)
+            }
             return
         }
         if self.can_push() {
@@ -8870,17 +8866,13 @@ type Codegen = shared struct {
 
     func emit_str_raw(self, anon offset: int64, reg: str) -> none {
         if offset < -256 and self.frame_base > 0 {
-            self.push_all(frame_base_slot(store: true, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base))
+            if self.can_push() {
+                push_frame_base_slot(self.out_buf, store: true, reg: regalloc.reg_of(reg), :offset, frame: self.frame_base)
+            }
             return
         }
         if self.can_push() {
             self.out_buf.push_slot(store: true, reg: regalloc.reg_of(reg), off: offset)
-        }
-    }
-
-    func push_all(self, anon insns: [regalloc.Insn]) -> none {
-        for insn in insns {
-            self.push_insn(insn)
         }
     }
 
@@ -20467,27 +20459,26 @@ type Codegen = shared struct {
 
     // Each conditional branch of `body` as the opposite one over a `b`, which
     // reaches 128 MB instead of 1 MB: `beq L` becomes `bne Lfar; b L; Lfar:`.
-    func long_branches(self, anon body: [regalloc.Insn]) -> [regalloc.Insn] {
-        mut out: [regalloc.Insn] = []
-        for insn in body {
-            if insn is .Branch(kind, reg, target) {
-                mut opposite: regalloc.BranchKind = .Always
-                match kind {
-                    .If(cond) -> opposite = .If(cond: regalloc.cond_opposite(cond))
-                    .IfZero -> opposite = .IfNonzero
-                    .IfNonzero -> opposite = .IfZero
-                    .Always -> {
-                        out += [insn]
-                        continue
-                    }
-                }
-                let over = self.fresh("Lfar")
-                out += [.Branch(kind: opposite, :reg, target: over)]
-                out += [.Branch(kind: .Always, reg: regalloc.NO_REG, :target)]
-                out += [.Label(name: over)]
+    func long_branches(self, anon body: regalloc.InsnBuf) -> regalloc.InsnBuf {
+        let out = body.derived()
+        for i in 0..body.n {
+            let tag = body.tags[i]
+            let sub = tag >> 8
+            let kind = sub & 3
+            if (tag & 255) != regalloc.INSN_BRANCH or kind == regalloc.BRANCH_ALWAYS {
+                out.copy_from(body, :i)
                 continue
             }
-            out += [insn]
+            mut opposite = regalloc.BRANCH_IF_ZERO
+            if kind == regalloc.BRANCH_IF {
+                opposite = regalloc.BRANCH_IF | (regalloc.cond_number(regalloc.cond_opposite(regalloc.cond_of(sub >> 2))) << 2)
+            } else if kind == regalloc.BRANCH_IF_ZERO {
+                opposite = regalloc.BRANCH_IF_NONZERO
+            }
+            let over = self.fresh("Lfar")
+            out.put(regalloc.INSN_BRANCH | (opposite << 8), a: body.fa[i], b: out.add_str(over))
+            out.put(regalloc.INSN_BRANCH, a: regalloc.NO_REG, b: body.fb[i])
+            out.push_label(over)
         }
         return out
     }
@@ -21805,8 +21796,7 @@ type Codegen = shared struct {
         } else if not self.pool.evicted {
             regalloc.run(body_buf: checked, pool: self.pool, :vreg_start)
         }
-        // The passes below still read an [Insn] (docs/ir.md, step 12).
-        mut body_buf = allocated.to_insns()
+        mut body_buf = allocated
         self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)
 
         // Round the callee-saved count up to an even number of registers
@@ -21863,17 +21853,15 @@ type Codegen = shared struct {
             rc_k = rc_k + 1
         }
         self.frame_base = 0
-        mut body_insns = body_buf
-        if arm64.line_count(body_insns) > LONG_BODY_INSNS {
-            body_insns = self.long_branches(body_insns)
+        if arm64.buf_line_count(body_buf) > LONG_BODY_INSNS {
+            body_buf = self.long_branches(body_buf)
         }
         // Nothing reads the body again: at depth 0 it goes out as it is.
         if self.func_depth == 0 {
-            self.flush_insns(body_insns)
+            // The output still reads an [Insn] (docs/ir.md, step 12).
+            self.flush_insns(body_buf.to_insns())
         } else {
-            for line in body_insns {
-                self.out_buf.push(line)
-            }
+            self.out_buf.push_all(body_buf)
         }
         mut qi = cs
         for qi > 0 {
