@@ -1626,7 +1626,7 @@ type Codegen = shared struct {
     // compile_module) formats and prints them in one pass. Buffering —
     // rather than streaming — is the foundation for the IR + regalloc
     // passes that sit between emission and final asm-formatting.
-    out_buf: [regalloc.Insn] = []
+    out_buf: regalloc.InsnBuf = regalloc.InsnBuf()
 
     // Lhs of the `+=` being compiled: an array `+` on it appends in place.
     // Expr ids are per parser, and codegen swaps `self.p` for defaults.
@@ -4244,7 +4244,7 @@ type Codegen = shared struct {
         if self.rc_pending {
             self.rc_flush_pending()
         }
-        self.out_buf += [insn]
+        self.out_buf.push(insn)
     }
 
     // Drain the buffered output to stdout, one `print` per line.
@@ -4253,23 +4253,24 @@ type Codegen = shared struct {
     // no-ops that the assembler would happily encode if we let them
     // through.
     func flush_out(self) -> none {
+        let buf = self.out_buf
         if self.asm is Some(a) {
-            for insn in self.out_buf {
-                a.insn(insn, vreg_phys: self.pool.vreg_phys)
+            for i in 0..buf.len() {
+                a.insn(buf.at(i), vreg_phys: self.pool.vreg_phys)
             }
-            self.out_buf = []
+            self.out_buf = regalloc.InsnBuf()
             self.rc_ctor_mark = -1
             return none
         }
         // The whole buffer as one string, printed at once.
         let out = StrBuilder()
-        for insn in self.out_buf {
-            arm64.write_insn(insn, vreg_phys: self.pool.vreg_phys, :out)
+        for i in 0..buf.len() {
+            arm64.write_insn(buf.at(i), vreg_phys: self.pool.vreg_phys, :out)
         }
         if out.len() > 0 {
             write_stdout(out.to_str())
         }
-        self.out_buf = []
+        self.out_buf = regalloc.InsnBuf()
         // A mark into the old buffer would match a call at that length in the new one.
         self.rc_ctor_mark = -1
     }
@@ -4281,7 +4282,7 @@ type Codegen = shared struct {
         if self.rc_pending {
             self.rc_flush_pending()
         }
-        self.out_buf += [regalloc.Insn.Label(name: lbl)]
+        self.out_buf.push(regalloc.Insn.Label(name: lbl))
     }
 
     func emit_globl(self, anon lbl: str) -> none {
@@ -8602,7 +8603,7 @@ type Codegen = shared struct {
     }
 
     func rc_call_result(self, anon expr_id: int64, callee: int64, val: Val) -> Val {
-        if self.rc_ctor_mark == len(self.out_buf) {
+        if self.rc_ctor_mark == self.out_buf.len() {
             self.rc_ctor_mark = -1
             return val
         }
@@ -10327,7 +10328,7 @@ type Codegen = shared struct {
                 owned += [m]
             }
         }
-        let body = self.out_buf
+        let body = self.out_buf.to_insns()
         mut out: [regalloc.Insn] = []
         for insn in body {
             if insn is .Label(name) and name.starts_with("Lborrow$") {
@@ -10335,13 +10336,13 @@ type Codegen = shared struct {
                     if m.label == name {
                         // The store before the mark, counted as emit_str counts it.
                         out = out[0..len(out) - 1]
-                        self.out_buf = []
+                        self.out_buf = regalloc.InsnBuf()
                         self.emit_mov("x17", src: m.reg)
                         self.emit_call("_rc_retain_stub")
                         self.emit_ldr(m.offset, reg: "x17")
                         self.emit_str_raw(m.offset, reg: m.reg)
                         self.rc_release_x17()
-                        for counted in self.out_buf {
+                        for counted in self.out_buf.to_insns() {
                             out += [counted]
                         }
                     }
@@ -10350,7 +10351,7 @@ type Codegen = shared struct {
             }
             out += [insn]
         }
-        self.out_buf = out
+        self.out_buf = regalloc.insn_buf(out)
         self.rc_ctor_mark = -1
         self.borrow_marks = []
     }
@@ -10555,10 +10556,11 @@ type Codegen = shared struct {
         if lp.sp_slot == 0 or self.dry_run {
             return
         }
-        let end = len(self.out_buf)
+        let end = self.out_buf.len()
         self.emit_mov("x17", src: "sp")
         self.emit_str(lp.sp_slot, reg: "x17")
-        self.out_buf = self.out_buf[0..lp.entry_mark] + self.out_buf[end..] + self.out_buf[lp.entry_mark..end]
+        let all = self.out_buf.to_insns()
+        self.out_buf = regalloc.insn_buf(all[0..lp.entry_mark] + all[end..] + all[lp.entry_mark..end])
     }
 
     // A jump out of a loop skips the restores of what was evicted inside it.
@@ -11095,7 +11097,7 @@ type Codegen = shared struct {
             return
         }
         for insn in self.cold {
-            self.out_buf += [insn]
+            self.out_buf.push(insn)
         }
         self.cold = []
     }
@@ -11947,7 +11949,7 @@ type Codegen = shared struct {
             if self.borrow_bindings and self.rc_heap_kind(self.find_var_kind(binding)) and not arrays.contains(self.assigned_names, binding) and not arrays.contains(self.rc_slots, binding_off) {
                 self.emit_str_raw(binding_off, reg: fv_r)
                 let mark = self.fresh("Lborrow")
-                self.out_buf += [regalloc.Insn.Label(name: mark)]
+                self.out_buf.push(regalloc.Insn.Label(name: mark))
                 self.borrow_marks += [BorrowMark(offset: binding_off, reg: fv_r, label: mark)]
             } else {
                 self.emit_str(binding_off, reg: fv_r)
@@ -17515,7 +17517,7 @@ type Codegen = shared struct {
         self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
-        self.rc_ctor_mark = len(self.out_buf)
+        self.rc_ctor_mark = self.out_buf.len()
         return .VReg(name: "x0")
     }
 
@@ -17570,7 +17572,7 @@ type Codegen = shared struct {
         self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
-        self.rc_ctor_mark = len(self.out_buf)
+        self.rc_ctor_mark = self.out_buf.len()
         return .VReg(name: "x0")
     }
 
@@ -19026,9 +19028,9 @@ type Codegen = shared struct {
         }
         // Nothing to give up: straight to the start.
         if len(slots) == 0 {
-            for i, insn in self.out_buf {
-                if insn is .Branch(kind, reg, target) and target == self.tail_release_lbl {
-                    self.out_buf[i] = regalloc.Insn.Branch(:kind, :reg, target: self.tail_top_lbl)
+            for i in 0..self.out_buf.len() {
+                if self.out_buf.at(i) is .Branch(kind, reg, target) and target == self.tail_release_lbl {
+                    self.out_buf.set(i, insn: regalloc.Insn.Branch(:kind, :reg, target: self.tail_top_lbl))
                 }
             }
             return
@@ -19772,7 +19774,7 @@ type Codegen = shared struct {
         for i, insn in body {
             for h, at in hoist_at {
                 if at == i {
-                    self.out_buf = []
+                    self.out_buf = regalloc.InsnBuf()
                     let done = self.fresh("Luniq")
                     if hoist_off[h] >= 0 {
                         self.emit_ldr(-hoist_off[h], reg: "x17")
@@ -19796,7 +19798,7 @@ type Codegen = shared struct {
                     self.emit_op(.Move, a: "x17", b: f"#{hoist_width[h]}")
                     self.emit_call("_kod_arr_unique_stub")
                     self.emit_label(done)
-                    for line in self.out_buf {
+                    for line in self.out_buf.to_insns() {
                         out += [line]
                     }
                 }
@@ -20547,7 +20549,7 @@ type Codegen = shared struct {
         let end_lbl = f"{lbl}_end"
         // `continue` lands here — re-check the loop condition. Previously
         // pointed at end_lbl, which made `continue` behave as `break`.
-        self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: len(self.out_buf))]
+        self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len())]
         // Cold blocks from before the loop wait until after it, so the loop's
         // back edge lays out only its own.
         self.cold_stack += [self.cold]
@@ -20611,7 +20613,7 @@ type Codegen = shared struct {
         let start_lbl = f"{lbl}_start"
         let incr_lbl = f"{lbl}_incr"
         let end_lbl = f"{lbl}_end"
-        self.loop_stack += [LoopLbl(start_lbl: incr_lbl, :end_lbl, :incr_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: len(self.out_buf))]
+        self.loop_stack += [LoopLbl(start_lbl: incr_lbl, :end_lbl, :incr_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len())]
         // Cold blocks from before the loop wait until after it, so the loop's
         // back edge lays out only its own.
         self.cold_stack += [self.cold]
@@ -20665,7 +20667,7 @@ type Codegen = shared struct {
         if self.rc_heap_kind(elem_kind) and arrays.contains(self.rc_slots, hdr_off) and not arrays.contains(self.assigned_names, name) and not arrays.contains(self.rc_slots, elem_off) and self.inline_depth == 0 and not self.dry_run {
             self.emit_str_raw(elem_off, reg: elem_reg)
             let mark = self.fresh("Lborrow")
-            self.out_buf += [regalloc.Insn.Label(name: mark)]
+            self.out_buf.push(regalloc.Insn.Label(name: mark))
             self.borrow_marks += [BorrowMark(offset: elem_off, reg: elem_reg, label: mark)]
         } else {
             self.emit_str(elem_off, reg: elem_reg)
@@ -21552,10 +21554,9 @@ type Codegen = shared struct {
         // and the frame prologue, pops go just before `ret`. The pushes
         // live *outside* the existing frame, so every fp-relative local
         // and sp-relative spill in the body keeps its exact offset.
-        // Released once it's back (after its last use), so the buffer isn't copied.
         let saved = self.out_buf
         let vreg_start: int64 = len(self.pool.vreg_phys)
-        self.out_buf = []
+        self.out_buf = regalloc.InsnBuf()
         self.rc_ctor_mark = -1
 
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
@@ -21629,10 +21630,12 @@ type Codegen = shared struct {
         self.emit_mov("sp", src: "fp")
         self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
 
+        // The passes below still read an [Insn] (docs/ir.md, step 12).
+        mut emitted = self.out_buf.to_insns()
         if self.tail_used {
-            self.out_buf = [regalloc.Insn.Label(name: self.tail_top_lbl)] + self.out_buf
+            emitted = [regalloc.Insn.Label(name: self.tail_top_lbl)] + emitted
         }
-        mut body_buf = self.peephole(self.out_buf, :vreg_start)
+        mut body_buf = self.peephole(emitted, :vreg_start)
         self.out_buf = saved
         body_buf = self.hoist_unique_checks(body_buf)
         // Loads out of loops live across them, which only the strict allocation
@@ -21731,7 +21734,7 @@ type Codegen = shared struct {
             body_insns = self.long_branches(body_insns)
         }
         for line in body_insns {
-            self.out_buf += [line]
+            self.out_buf.push(line)
         }
         mut qi = cs
         for qi > 0 {
