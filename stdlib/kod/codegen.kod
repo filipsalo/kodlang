@@ -1180,14 +1180,14 @@ func small_imm(anon op: regalloc.Reg) -> bool {
     return v >= 0 and v <= 4095
 }
 
-// A branch to `target` taken when condition `cond` holds, or when it
+// Appends a branch to `target` taken when condition `cond` holds, or when it
 // doesn't.
-func branch_on(anon cond: str, when_true: bool, target: str) -> regalloc.Insn {
+func push_branch_on(anon out: regalloc.InsnBuf, anon cond: str, when_true: bool, target: str) -> none {
     mut name = cond
     if not when_true {
         name = opposite_condition(cond)
     }
-    return .Branch(kind: .If(cond: must regalloc.cond_named(name)), reg: regalloc.NO_REG, :target)
+    out.push_branch_if(must regalloc.cond_named(name), reg: regalloc.NO_REG, :target)
 }
 
 // The symbol an extern calls: its name with the leading `_` of a C symbol,
@@ -20163,33 +20163,46 @@ type Codegen = shared struct {
         }
     }
 
-    func peephole(self, anon body: [regalloc.Insn], vreg_start: int64) -> [regalloc.Insn] {
+    // `body` with the patterns below folded, after a label `first` unless it's "".
+    func peephole(self, anon body: regalloc.InsnBuf, vreg_start: int64, first: str) -> regalloc.InsnBuf {
+        let out = regalloc.InsnBuf()
+        if len(first) > 0 {
+            out.push_label(first)
+        }
         let n_local = len(self.pool.vreg_phys) - vreg_start
         if n_local <= 0 {
-            return body
+            out.push_all(body)
+            return out
         }
-        let counts = regalloc.vreg_counts(body, :vreg_start, :n_local)
-        mut out: [regalloc.Insn] = []
-        let n = len(body)
+        let counts = regalloc.buf_vreg_counts(body, :vreg_start, :n_local)
+        let n = body.n
         mut i: int64 = 0
         for i < n {
             // Each pattern starts with a `cset v, c` or a `mov v, #n`, v a vreg named only there and next.
-            if i + 1 < n and body[i] is .Op(op, v, cond_or_imm, op_c, _d, _flags) and op_c == regalloc.NO_REG and (op is .SetIf or op is .Move) and self.single_use_vreg(v, :counts, :vreg_start) {
-                if op is .SetIf {
+            let tag = body.tags[i]
+            let op = tag >> 8
+            if i + 1 < n and (tag & 255) == regalloc.INSN_OP and body.fc[i] == regalloc.NO_REG and (op == regalloc.OP_SET_IF or op == regalloc.OP_MOVE) and self.single_use_vreg(body.fa[i], :counts, :vreg_start) {
+                let v = body.fa[i]
+                let cond_or_imm = body.fb[i]
+                let next_tag = body.tags[i + 1]
+                let next_op = next_tag >> 8
+                if op == regalloc.OP_SET_IF {
                     let cond = regalloc.reg_text(cond_or_imm)
                     if len(opposite_condition(cond)) > 0 {
-                        let next = body[i + 1]
                         // cbz/cbnz v, L
-                        if next is .Branch(kind, reg, target) and reg == v and (kind is .IfZero or kind is .IfNonzero) {
-                            out += [branch_on(cond, when_true: kind is .IfNonzero, :target)]
+                        if (next_tag & 255) == regalloc.INSN_BRANCH and body.fa[i + 1] == v and ((next_op & 3) == regalloc.BRANCH_IF_ZERO or (next_op & 3) == regalloc.BRANCH_IF_NONZERO) {
+                            push_branch_on(out, cond, when_true: (next_op & 3) == regalloc.BRANCH_IF_NONZERO, target: body.target(i + 1))
                             i += 2
                             continue
                         }
                         // cmp v, #0 then b.eq/b.ne L
-                        if next is .Op(next_op, x, zero, none_c, _nd, _nf) and next_op is .Compare and x == v and zero == regalloc.imm(0) and none_c == regalloc.NO_REG and i + 2 < n {
-                            if body[i + 2] is .Branch(kind, reg, target) and reg == regalloc.NO_REG and kind is .If(on) {
-                                if on is .Eq or on is .Ne {
-                                    out += [branch_on(cond, when_true: on is .Ne, :target)]
+                        if (next_tag & 255) == regalloc.INSN_OP and next_op == regalloc.OP_COMPARE and body.fa[i + 1] == v and body.fb[i + 1] == regalloc.imm(0) and body.fc[i + 1] == regalloc.NO_REG and i + 2 < n {
+                            let third = body.tags[i + 2]
+                            if (third & 255) == regalloc.INSN_BRANCH and body.fa[i + 2] == regalloc.NO_REG and ((third >> 8) & 3) == regalloc.BRANCH_IF {
+                                // Eq and Ne are conditions 0 and 1.
+                                let on = third >> 10
+                                if on == 0 or on == 1 {
+                                    push_branch_on(out, cond, when_true: on == 1, target: body.target(i + 2))
                                     i += 3
                                     continue
                                 }
@@ -20198,29 +20211,32 @@ type Codegen = shared struct {
                     }
                 } else if small_imm(cond_or_imm) {
                     let value = cond_or_imm
-                    if body[i + 1] is .Op(next_op, x, y, z, none_d, _nf) and none_d == regalloc.NO_REG {
+                    if (next_tag & 255) == regalloc.INSN_OP and body.fd[i + 1] == regalloc.NO_REG {
+                        let x = body.fa[i + 1]
+                        let y = body.fb[i + 1]
+                        let z = body.fc[i + 1]
                         // add/sub d, a, v
-                        if (next_op is .Add or next_op is .Sub) and z == v and y != v and y != regalloc.XZR {
-                            out += [regalloc.op(next_op, a: x, b: y, c: value)]
+                        if (next_op == regalloc.OP_ADD or next_op == regalloc.OP_SUB) and z == v and y != v and y != regalloc.XZR {
+                            out.push_new_op(next_op, a: x, b: y, c: value)
                             i += 2
                             continue
                         }
                         // add d, v, a
-                        if next_op is .Add and z != regalloc.NO_REG and y == v and z != v and z != regalloc.XZR {
-                            out += [regalloc.op(.Add, a: x, b: z, c: value)]
+                        if next_op == regalloc.OP_ADD and z != regalloc.NO_REG and y == v and z != v and z != regalloc.XZR {
+                            out.push_new_op(regalloc.OP_ADD, a: x, b: z, c: value)
                             i += 2
                             continue
                         }
                         // cmp a, v
-                        if next_op is .Compare and z == regalloc.NO_REG and y == v and x != v and x != regalloc.XZR {
-                            out += [regalloc.op(.Compare, a: x, b: value)]
+                        if next_op == regalloc.OP_COMPARE and z == regalloc.NO_REG and y == v and x != v and x != regalloc.XZR {
+                            out.push_new_op(regalloc.OP_COMPARE, a: x, b: value)
                             i += 2
                             continue
                         }
                     }
                 }
             }
-            out += [body[i]]
+            out.push_from(body, :i)
             i += 1
         }
         return out
@@ -21709,12 +21725,13 @@ type Codegen = shared struct {
         self.emit_mov("sp", src: "fp")
         self.emit_pair(load: true, a: "fp", b: "lr", base: "sp", mode: .Post(off: 16))
 
-        // The passes below still read an [Insn] (docs/ir.md, step 12).
-        mut emitted = self.out_buf.to_insns()
+        mut first = ""
         if self.tail_used {
-            emitted = [regalloc.Insn.Label(name: self.tail_top_lbl)] + emitted
+            first = self.tail_top_lbl
         }
-        mut body_buf = self.peephole(emitted, :vreg_start)
+        let peeped = self.peephole(self.out_buf, :vreg_start, :first)
+        // The passes below still read an [Insn] (docs/ir.md, step 12).
+        mut body_buf = peeped.to_insns()
         self.out_buf = saved
         self.func_depth -= 1
         body_buf = self.hoist_unique_checks(body_buf)
