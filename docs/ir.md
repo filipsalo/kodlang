@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: steps 1–4, 8, 9 and 10 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4, 8, 9, 10 and 11 done, 12 in progress; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -241,7 +241,27 @@ were.
    it keeps nothing live longer; the hoisting passes count a loop's cold
    blocks as part of it. qsort and sieve are 6% and 9% faster, the others
    about 3%.
-12. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+12. **Instructions without a heap object each** (in progress, branch
+   `compact-insns`). An `Insn` is an enum value, so each instruction is a
+   heap cell, and branches, calls and labels hold a `str`. Profiled on
+   `codegen.kod`, the instruction passes take about 42% of compiling; within
+   them, counting, allocating, freeing and copying arrays of instructions
+   take about 13% of the whole (7% promoting locals and allocating, 2%
+   freeing the list after each function, 3.4% making the instructions).
+   `InsnBuf` keeps a function's instructions as parallel arrays of numbers
+   (a variant tag and the fields) and its labels, targets and data lines in a
+   string table, so an instruction is a few array slots and a pass reads its
+   fields in place. In steps, each keeping the output byte-identical (the
+   self-hosting check compares every file) and measured:
+   1. `InsnBuf` with `push` of an `Insn` and `at(i)` back; codegen's buffer
+      is one, and the passes get today's `[Insn]` from it at one boundary.
+   2. The emitting functions write the fields straight into it.
+   3. The passes read and rewrite `InsnBuf`s, most expensive first: the
+      assembler's input, liveness and register allocation, `forward_copies`
+      and promoting locals, then the peephole, hoisting and the rest.
+   4. The boundary goes. The expected gain is 8–10% of a compile; the steps
+      stop when one doesn't pay.
+13. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions
