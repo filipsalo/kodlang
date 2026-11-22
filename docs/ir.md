@@ -241,10 +241,9 @@ were.
    it keeps nothing live longer; the hoisting passes count a loop's cold
    blocks as part of it. qsort and sieve are 6% and 9% faster, the others
    about 3%.
-12. **Instructions without a heap object each** (in progress, branch
-   `compact-insns`; steps 1 and 2 done). An `Insn` is an enum value, so
-   each instruction is a heap cell, and branches, calls and labels hold a
-   `str`. Profiled on `codegen.kod`, the instruction passes take about 42%
+12. **Instructions without a heap object each** (branch `compact-insns`;
+   done). An `Insn` is an enum value, so each instruction is a heap cell,
+   and branches, calls and labels hold a `str`. Profiled on `codegen.kod`, the instruction passes take about 42%
    of compiling; within them, counting, allocating, freeing and copying
    arrays of instructions take about 13% of the whole (7% promoting locals
    and allocating, 2% freeing the list after each function, 3.4% making the
@@ -265,11 +264,47 @@ were.
       arrays was 2.5% of a compile); its body goes from the passes' `[Insn]`
       straight to the output. 3.38 G instructions, 249 ms against main's
       244 ms in the same run.
-   3. The passes read and rewrite `InsnBuf`s, most expensive first: the
-      assembler's input, liveness and register allocation, `forward_copies`
-      and promoting locals, then the peephole, hoisting and the rest.
-   4. The boundary goes. The expected gain is 8–10% of a compile; the steps
-      stop when one doesn't pay.
+   3. The passes read and rewrite `InsnBuf`s, and the boundary goes. Done,
+      one pass at a time in the order `compile_func` runs them: the peephole,
+      the two hoists, promoting locals with `forward_copies` and the liveness
+      of `regalloc.run` (`cold_positions`, `extend_over_loops`,
+      `vreg_counts`), the frame base and long branches, and last the output
+      (`Assembler.insn`, `arm64.write_insn`, `insn_word` and the word
+      encoders read instruction `i` of a buffer). A pass reads the arrays
+      directly (a `kind`/`text` method call and the string it retains cost
+      0.7% of a compile in the label maps alone) and compares labels as
+      strings, as before. Converting alone didn't pay: a pass building a new
+      `InsnBuf` with a `put` per instruction costs more than an `[Insn]`
+      append, and with the boundary gone the compile was 3.41 G
+      instructions. What made it pay: `derived` buffers share their input's
+      strings, so a copy is six numbers; the peephole and `forward_copies`
+      only drop and fold, so they compact the buffer they get in place; and
+      each try of `promote_locals` rewrites a `clone` (the arrays shared until
+      the first write copies them whole). Still `Insn`: codegen's cold blocks
+      and the tail-call label fix (before the passes), the text of the rare
+      far immediate, pair and constant lines, `encode` of text lines, and the
+      tests' `to_insns`.
+
+      | commit | what | G instructions |
+      |---|---|---|
+      | main | | 3.25 |
+      | 19248e7 | step 2 | 3.38 |
+      | bbd37bf | peephole | 3.45 |
+      | dc754b5 | hoists | 3.49 |
+      | 3b29ea5 | promote, liveness | 3.50 |
+      | 24013e2 | frame base, long branches | 3.50 |
+      | 7ec2470 | output: no boundary | 3.41 |
+      | 43ea430 | compact in place | 3.32 |
+      | 51746d1 | no accessor calls | 3.27 |
+      | 9979bb8 | promote in a clone | 3.21 |
+
+      Compiling `codegen.kod` (self-built compiler, `hyperfine -N -w 3 -r
+      30`): main 239.4 ms, step 2 246.6 ms, step 3 225.4 ms, 6% faster than
+      main and 1.5–2% fewer instructions; less than the 8–10% the plan
+      expected, because copying a buffer's fields in Kod code costs about what
+      the heap objects did. What's left is copying where a pass inserts
+      (`settle_borrows`, the hoists, the frame base) and compacting
+      (`move_from`, about 2%), and the emitters' `put`.
 13. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
