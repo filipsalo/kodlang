@@ -181,70 +181,69 @@ type Assembler = shared struct {
         }
     }
 
-    // An instruction from the compiler as it is, without its text: a label
-    // defined, a word encoded, and anything else read as the line the output
-    // would have had (branches, calls, data, directives).
-    func insn(self, anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg]) -> none {
+    // Instruction `i` of `body` from the compiler as it is, without its text:
+    // a label defined, a word encoded, and anything else read as the line the
+    // output would have had (branches, calls, data, directives).
+    func insn(self, anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg]) -> none {
         self.line_no += 1
-        if insn is .Label(name) {
-            self.define(name)
+        let tag = body.tags[i]
+        let variant = tag & 255
+        if variant == regalloc.INSN_LABEL {
+            self.define(body.text(i))
             return none
         }
-        let word = arm64.insn_word(insn, :vreg_phys)
+        let word = arm64.insn_word(body, i, :vreg_phys)
         if word >= 0 {
             self.emit_word(word)
             return none
         }
-        match insn {
-            .Call(target) -> {
-                self.emit_fixup(0x94000000, kind: FIX_BRANCH26, name: target)
+        if variant == regalloc.INSN_CALL {
+            self.emit_fixup(0x94000000, kind: FIX_BRANCH26, name: body.text(i))
+            return none
+        }
+        if variant == regalloc.INSN_BRANCH {
+            let sub = tag >> 8
+            let kind = sub & 3
+            if kind == regalloc.BRANCH_ALWAYS {
+                self.emit_fixup(0x14000000, kind: FIX_BRANCH26, name: body.target(i))
                 return none
             }
-            .Branch(kind, reg, target) -> {
-                match kind {
-                    .Always -> {
-                        self.emit_fixup(0x14000000, kind: FIX_BRANCH26, name: target)
-                        return none
-                    }
-                    .If(cond) -> {
-                        self.emit_fixup(0x54000000 | arm64.cond_code(cond), kind: FIX_BRANCH19, name: target)
-                        return none
-                    }
-                    else {
-                        let t = arm64.zr_num(reg, :vreg_phys)
-                        if t >= 0 and t < 31 and regalloc.reg_width(arm64.phys_reg(reg, :vreg_phys)) == 8 {
-                            mut op = 0xB4000000
-                            if kind is .IfNonzero {
-                                op = 0xB5000000
-                            }
-                            self.emit_fixup(op | t, kind: FIX_BRANCH19, name: target)
-                            return none
-                        }
-                    }
-                }
+            if kind == regalloc.BRANCH_IF {
+                self.emit_fixup(0x54000000 | arm64.cond_code(regalloc.cond_of(sub >> 2)), kind: FIX_BRANCH19, name: body.target(i))
+                return none
             }
-            .Data(text) -> {
-                // Most data is line tables and symbol tables: `.quad` and
-                // `.long` of a number or a label, read here without the
-                // general line's slicing.
-                if text.starts_with("\t.long ") or text.starts_with("\t.quad ") {
-                    let arg = text[7..len(text)]
-                    mut size = 4
-                    if text[2] == 'q' {
-                        size = 8
-                    }
-                    self.data_value(arg, :size)
-                    return none
+            let reg = body.fa[i]
+            let t = arm64.zr_num(reg, :vreg_phys)
+            if t >= 0 and t < 31 and regalloc.reg_width(arm64.phys_reg(reg, :vreg_phys)) == 8 {
+                mut op = 0xB4000000
+                if kind == regalloc.BRANCH_IF_NONZERO {
+                    op = 0xB5000000
                 }
-                if not text.contains("\n") {
-                    self.line(text.trim())
-                    return none
-                }
+                self.emit_fixup(op | t, kind: FIX_BRANCH19, name: body.target(i))
+                return none
             }
-            else none
+        }
+        if variant == regalloc.INSN_DATA {
+            let text = body.text(i)
+            // Most data is line tables and symbol tables: `.quad` and
+            // `.long` of a number or a label, read here without the
+            // general line's slicing.
+            if text.starts_with("\t.long ") or text.starts_with("\t.quad ") {
+                let arg = text[7..len(text)]
+                mut size = 4
+                if text[2] == 'q' {
+                    size = 8
+                }
+                self.data_value(arg, :size)
+                return none
+            }
+            if not text.contains("\n") {
+                self.line(text.trim())
+                return none
+            }
         }
         let out = StrBuilder()
-        arm64.write_insn(insn, :vreg_phys, :out)
+        arm64.write_insn(body, i, :vreg_phys, :out)
         for text in out.to_str().split("\n") {
             self.line(text.trim())
         }

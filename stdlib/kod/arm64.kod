@@ -383,146 +383,161 @@ func format_insn(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg]) -> str {
 // assembled, cost about a twentieth of a compile.
 mut ASM_TEXT: bool = libc.getenv(unsafe.c_str("KOD_ASM_TEXT")) != 0
 
-func write_insn(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg], out: StrBuilder) -> none {
-    if not ASM_TEXT and write_word_only(insn, :vreg_phys, :out) {
+func write_insn(anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg], out: StrBuilder) -> none {
+    if not ASM_TEXT and write_word_only(body, i, :vreg_phys, :out) {
         return none
     }
-    match insn {
-        .Slot(store, reg, off) -> {
-            write_word(insn, :vreg_phys, :out)
-            if store {
-                out.append("\tstr ")
-            } else {
-                out.append("\tldr ")
-            }
-            write_reg(reg, :vreg_phys, :out)
-            if off >= 0 {
-                out.append(", [fp]\n")
-            } else {
-                out.append(", [fp, #")
-                out.append_int(off)
-                out.append("]\n")
-            }
+    let tag = body.tags[i]
+    let variant = tag & 255
+    let sub = tag >> 8
+    if variant == regalloc.INSN_SLOT {
+        write_word(body, i, :vreg_phys, :out)
+        if sub == 1 {
+            out.append("\tstr ")
+        } else {
+            out.append("\tldr ")
         }
-        .Mov(dst, src) -> {
-            let d = phys_of(dst, :vreg_phys)
-            let s = phys_of(src, :vreg_phys)
-            if d == s and is_numbered_reg(d) {
-                return none
-            }
-            write_word(insn, :vreg_phys, :out)
-            out.append("\tmov ")
-            out.append(d)
+        write_reg(body.fa[i], :vreg_phys, :out)
+        let off = body.fb[i]
+        if off >= 0 {
+            out.append(", [fp]\n")
+        } else {
+            out.append(", [fp, #")
+            out.append_int(off)
+            out.append("]\n")
+        }
+    } else if variant == regalloc.INSN_MOV {
+        let d = phys_of(body.fa[i], :vreg_phys)
+        let s = phys_of(body.fb[i], :vreg_phys)
+        if d == s and is_numbered_reg(d) {
+            return none
+        }
+        write_word(body, i, :vreg_phys, :out)
+        out.append("\tmov ")
+        out.append(d)
+        out.append(", ")
+        out.append(s)
+        out.append("\n")
+    } else if variant == regalloc.INSN_MEM {
+        let width = body.fd[i]
+        let at_kind = (sub >> 1) & 3
+        let at_value = body.fc[i]
+        if at_kind == regalloc.AT_OFFSET and width >= 4 and at_value > 32760 {
+            write_text(format_insn(body.at(i), :vreg_phys), flags: regalloc.INFO_BIG_IMM, :out)
+            return none
+        }
+        write_word(body, i, :vreg_phys, :out)
+        out.append("\t")
+        out.append(mem_mnemonic(load: (sub & 1) == 1, :width))
+        out.append(" ")
+        write_reg(body.fa[i], :vreg_phys, :out)
+        out.append(", [")
+        write_reg(body.fb[i], :vreg_phys, :out)
+        if at_kind == 0 {
+            out.append("]\n")
+        } else if at_kind == regalloc.AT_OFFSET {
+            out.append(", #")
+            out.append_int(at_value)
+            out.append("]\n")
+        } else if at_kind == regalloc.AT_INDEX {
             out.append(", ")
-            out.append(s)
-            out.append("\n")
+            write_reg(at_value, :vreg_phys, :out)
+            if (sub >> 3) == 1 {
+                out.append(", lsl #")
+                out.append_int(width_shift(width))
+            }
+            out.append("]\n")
+        } else {
+            out.append(", ")
+            out.append(body.strs[at_value])
+            if (sub >> 3) == 1 {
+                out.append("@GOTPAGEOFF]\n")
+            } else {
+                out.append("@PAGEOFF]\n")
+            }
         }
-        .Mem(load, width, reg, base, at) -> {
-            if at is .Offset(off) and width >= 4 and off > 32760 {
-                write_text(format_insn(insn, :vreg_phys), flags: regalloc.INFO_BIG_IMM, :out)
+    } else if variant == regalloc.INSN_OP {
+        let flags = body.fe[i]
+        if (flags & regalloc.INFO_BIG_IMM) != 0 {
+            write_text(format_insn(body.at(i), :vreg_phys), :flags, :out)
+            return none
+        }
+        let a = body.fa[i]
+        let b = body.fb[i]
+        let c = body.fc[i]
+        let d = body.fd[i]
+        if sub == regalloc.OP_MOVE and c == regalloc.NO_REG {
+            let pa = phys_of(a, :vreg_phys)
+            if pa == phys_of(b, :vreg_phys) and is_numbered_reg(pa) {
                 return none
             }
-            write_word(insn, :vreg_phys, :out)
-            out.append("\t")
-            out.append(mem_mnemonic(:load, :width))
+        }
+        write_word(body, i, :vreg_phys, :out)
+        out.append("\t")
+        out.append(arm64_mnemonic(regalloc.opcode_of(sub)))
+        // The operands are a prefix of a, b, c, d: the first empty one ends them.
+        if a != regalloc.NO_REG {
             out.append(" ")
-            write_reg(reg, :vreg_phys, :out)
-            out.append(", [")
-            write_reg(base, :vreg_phys, :out)
-            match at {
-                .Base -> out.append("]\n")
-                .Offset(off) -> {
-                    out.append(", #")
-                    out.append_int(off)
-                    out.append("]\n")
-                }
-                .Index(index, scaled) -> {
-                    out.append(", ")
-                    write_reg(index, :vreg_phys, :out)
-                    if scaled {
-                        out.append(", lsl #")
-                        out.append_int(width_shift(width))
-                    }
-                    out.append("]\n")
-                }
-                .Symbol(name, got) -> {
-                    out.append(", ")
-                    out.append(name)
-                    if got {
-                        out.append("@GOTPAGEOFF]\n")
-                    } else {
-                        out.append("@PAGEOFF]\n")
-                    }
-                }
-            }
-        }
-        .Op(op, a, b, c, d, flags) -> {
-            if (flags & regalloc.INFO_BIG_IMM) != 0 {
-                write_text(format_insn(insn, :vreg_phys), :flags, :out)
-                return none
-            }
-            if op is .Move and c == regalloc.NO_REG {
-                let pa = phys_of(a, :vreg_phys)
-                if pa == phys_of(b, :vreg_phys) and is_numbered_reg(pa) {
-                    return none
-                }
-            }
-            write_word(insn, :vreg_phys, :out)
-            out.append("\t")
-            out.append(arm64_mnemonic(op))
-            // The operands are a prefix of a, b, c, d: the first empty one ends them.
-            if a != regalloc.NO_REG {
-                out.append(" ")
-                write_reg(a, :vreg_phys, :out)
-                if b != regalloc.NO_REG {
-                    out.append(", ")
-                    write_reg(b, :vreg_phys, :out)
-                    if c != regalloc.NO_REG {
-                        out.append(", ")
-                        write_reg(c, :vreg_phys, :out)
-                        if d != regalloc.NO_REG {
-                            out.append(", ")
-                            write_reg(d, :vreg_phys, :out)
-                        }
-                    }
-                }
-            }
-            out.append("\n")
-        }
-        .Call(target) -> {
-            out.append("\tbl ")
-            out.append(target)
-            out.append("\n")
-        }
-        .Branch(kind, reg, target) -> {
-            out.append("\t")
-            out.append(branch_mnemonic(kind))
-            out.append(" ")
-            if reg != regalloc.NO_REG {
-                write_reg(reg, :vreg_phys, :out)
+            write_reg(a, :vreg_phys, :out)
+            if b != regalloc.NO_REG {
                 out.append(", ")
-            }
-            out.append(target)
-            out.append("\n")
-        }
-        .Label(name) -> {
-            out.append(name)
-            out.append(":\n")
-        }
-        .Intrinsic(label) -> {
-            // Line by line, as a call's lines were: `mov x0, x0` is no line at all.
-            for line in arm64_intrinsic(label) {
-                let text = "\t" + line
-                if not is_self_mov(text) {
-                    write_line(text, :out)
+                write_reg(b, :vreg_phys, :out)
+                if c != regalloc.NO_REG {
+                    out.append(", ")
+                    write_reg(c, :vreg_phys, :out)
+                    if d != regalloc.NO_REG {
+                        out.append(", ")
+                        write_reg(d, :vreg_phys, :out)
+                    }
                 }
             }
         }
-        .Pair(_load, _a, _b, _base, _mode) -> {
-            write_word(insn, :vreg_phys, :out)
-            write_text(format_insn(insn, :vreg_phys), flags: regalloc.insn_flags(insn), :out)
+        out.append("\n")
+    } else if variant == regalloc.INSN_CALL {
+        out.append("\tbl ")
+        out.append(body.text(i))
+        out.append("\n")
+    } else if variant == regalloc.INSN_BRANCH {
+        out.append("\t")
+        let kind = sub & 3
+        if kind == regalloc.BRANCH_ALWAYS {
+            out.append("b")
+        } else if kind == regalloc.BRANCH_IF {
+            out.append("b.")
+            out.append(cond_name(regalloc.cond_of(sub >> 2)))
+        } else if kind == regalloc.BRANCH_IF_ZERO {
+            out.append("cbz")
+        } else {
+            out.append("cbnz")
         }
-        else -> write_text(format_insn(insn, :vreg_phys), flags: regalloc.insn_flags(insn), :out)
+        out.append(" ")
+        let reg = body.fa[i]
+        if reg != regalloc.NO_REG {
+            write_reg(reg, :vreg_phys, :out)
+            out.append(", ")
+        }
+        out.append(body.target(i))
+        out.append("\n")
+    } else if variant == regalloc.INSN_LABEL {
+        out.append(body.text(i))
+        out.append(":\n")
+    } else if variant == regalloc.INSN_INTRINSIC {
+        // Line by line, as a call's lines were: `mov x0, x0` is no line at all.
+        for line in arm64_intrinsic(body.text(i)) {
+            let text = "\t" + line
+            if not is_self_mov(text) {
+                write_line(text, :out)
+            }
+        }
+    } else if variant == regalloc.INSN_DATA {
+        write_text(body.text(i), flags: regalloc.INFO_NO_MNEMONIC, :out)
+    } else {
+        // A Pair or a LoadConst.
+        let insn = body.at(i)
+        if variant == regalloc.INSN_PAIR {
+            write_word(body, i, :vreg_phys, :out)
+        }
+        write_text(format_insn(insn, :vreg_phys), flags: regalloc.insn_flags(insn), :out)
     }
 }
 
@@ -558,9 +573,9 @@ func write_line(anon text: str, out: StrBuilder) -> none {
     out.append("\n")
 }
 
-// Writes `insn` as its word alone, if it has one (see word_of).
-func write_word_only(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg], out: StrBuilder) -> bool {
-    let word = insn_word(insn, :vreg_phys)
+// Writes instruction `i` of `body` as its word alone, if it has one (see word_of).
+func write_word_only(anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg], out: StrBuilder) -> bool {
+    let word = insn_word(body, i, :vreg_phys)
     if word < 0 {
         return false
     }
@@ -569,24 +584,24 @@ func write_word_only(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg], out: S
     return true
 }
 
-// The word `insn` is written as, or -1 when it isn't one word: when encode
-// has none, for a self-move (no instruction) and a far slot (several).
-func insn_word(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg]) -> int64 {
-    match insn {
-        .Mov(dst, src) -> {
-            if phys_of(dst, :vreg_phys) == phys_of(src, :vreg_phys) {
-                return -1
-            }
+// The word instruction `i` of `body` is written as, or -1 when it isn't one
+// word: when encode has none, for a self-move (no instruction) and a far slot
+// (several).
+func insn_word(anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg]) -> int64 {
+    let tag = body.tags[i]
+    let variant = tag & 255
+    if variant == regalloc.INSN_MOV {
+        if phys_of(body.fa[i], :vreg_phys) == phys_of(body.fb[i], :vreg_phys) {
+            return -1
         }
-        .Mem(_load, width, _reg, _base, at) -> {
-            if at is .Offset(off) and width >= 4 and off > 32760 {
-                return -1
-            }
+    } else if variant == regalloc.INSN_MEM {
+        if ((tag >> 9) & 3) == regalloc.AT_OFFSET and body.fd[i] >= 4 and body.fc[i] > 32760 {
+            return -1
         }
-        .Label(_name) -> return -1
-        else none
+    } else if variant == regalloc.INSN_LABEL {
+        return -1
     }
-    return encode(insn, :vreg_phys)
+    return encode_at(body, i, :vreg_phys)
 }
 
 // Whether `reg` is `xN` or `wN`, the registers is_self_mov looks for.
@@ -815,38 +830,70 @@ func encode(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg]) -> int64 {
         .Mem(load, width, reg, base, at) -> return mem_word(:load, :width, :reg, :base, :at, :vreg_phys)
         .Op(op, a, b, c, d, _flags) -> return op_word(op, :a, :b, :c, :d, :vreg_phys)
         .Pair(load, a, b, base, mode) -> {
-            let t = zr_num(a, :vreg_phys)
-            let t2 = zr_num(b, :vreg_phys)
-            let n = sp_num(base, :vreg_phys)
-            if t < 0 or t2 < 0 or n < 0 {
-                return -1
-            }
-            mut word = 0
-            mut off = 0
             match mode {
-                .At(at) -> {
-                    word = 0xA9000000
-                    off = at
-                }
-                .Pre(at) -> {
-                    word = 0xA9800000
-                    off = at
-                }
-                .Post(at) -> {
-                    word = 0xA8800000
-                    off = at
-                }
+                .At(off) -> return pair_word(:load, :a, :b, :base, mode_kind: 0, :off, :vreg_phys)
+                .Pre(off) -> return pair_word(:load, :a, :b, :base, mode_kind: regalloc.MODE_PRE, :off, :vreg_phys)
+                .Post(off) -> return pair_word(:load, :a, :b, :base, mode_kind: regalloc.MODE_POST, :off, :vreg_phys)
             }
-            if off % 8 != 0 or off < -512 or off > 504 {
-                return -1
-            }
-            if load {
-                word = word | 0x400000
-            }
-            return word | ((off / 8) & 0x7f) << 15 | t2 << 10 | n << 5 | t
         }
         else return -1
     }
+}
+
+// The word of a Pair whose PairMode is `mode_kind` (regalloc.MODE_) and `off`, or -1.
+func pair_word(load: bool, a: regalloc.Reg, b: regalloc.Reg, base: regalloc.Reg, mode_kind: int64, off: int64, vreg_phys: [regalloc.Reg]) -> int64 {
+    let t = zr_num(a, :vreg_phys)
+    let t2 = zr_num(b, :vreg_phys)
+    let n = sp_num(base, :vreg_phys)
+    if t < 0 or t2 < 0 or n < 0 {
+        return -1
+    }
+    mut word = 0xA9000000
+    if mode_kind == regalloc.MODE_PRE {
+        word = 0xA9800000
+    } else if mode_kind == regalloc.MODE_POST {
+        word = 0xA8800000
+    }
+    if off % 8 != 0 or off < -512 or off > 504 {
+        return -1
+    }
+    if load {
+        word = word | 0x400000
+    }
+    return word | ((off / 8) & 0x7f) << 15 | t2 << 10 | n << 5 | t
+}
+
+// encode of instruction `i` of `body`.
+func encode_at(anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg]) -> int64 {
+    let tag = body.tags[i]
+    let variant = tag & 255
+    let sub = tag >> 8
+    if variant == regalloc.INSN_SLOT {
+        let reg = body.fa[i]
+        let off = body.fb[i]
+        mut at_kind: int64 = 0
+        if off < 0 {
+            at_kind = regalloc.AT_OFFSET
+        }
+        mut width = 8
+        if (reg & 3) == 2 {
+            width = 4
+        }
+        return mem_word_at(load: sub == 0, :width, :reg, base: regalloc.FP, :at_kind, at_value: off, flag: false, :vreg_phys)
+    }
+    if variant == regalloc.INSN_MOV {
+        return move_word(body.fa[i], src: body.fb[i], :vreg_phys)
+    }
+    if variant == regalloc.INSN_MEM {
+        return mem_word_at(load: (sub & 1) == 1, width: body.fd[i], reg: body.fa[i], base: body.fb[i], at_kind: (sub >> 1) & 3, at_value: body.fc[i], flag: (sub >> 3) == 1, :vreg_phys)
+    }
+    if variant == regalloc.INSN_OP {
+        return op_word(regalloc.opcode_of(sub), a: body.fa[i], b: body.fb[i], c: body.fc[i], d: body.fd[i], :vreg_phys)
+    }
+    if variant == regalloc.INSN_PAIR {
+        return pair_word(load: (sub & 1) == 1, a: body.fa[i], b: body.fb[i], base: body.fc[i], mode_kind: sub >> 1, off: body.fd[i], :vreg_phys)
+    }
+    return -1
 }
 
 // The word of `mov dst, src` between registers.
@@ -873,6 +920,17 @@ func move_word(anon dst: regalloc.Reg, src: regalloc.Reg, vreg_phys: [regalloc.R
 
 // The word of a load or store, or -1.
 func mem_word(load: bool, width: int64, reg: regalloc.Reg, base: regalloc.Reg, at: regalloc.MemAt, vreg_phys: [regalloc.Reg]) -> int64 {
+    match at {
+        .Base -> return mem_word_at(:load, :width, :reg, :base, at_kind: 0, at_value: 0, flag: false, :vreg_phys)
+        .Offset(off) -> return mem_word_at(:load, :width, :reg, :base, at_kind: regalloc.AT_OFFSET, at_value: off, flag: false, :vreg_phys)
+        .Index(index, scaled) -> return mem_word_at(:load, :width, :reg, :base, at_kind: regalloc.AT_INDEX, at_value: index, flag: scaled, :vreg_phys)
+        .Symbol(_name, _got) -> return -1
+    }
+}
+
+// mem_word of a MemAt given as InsnBuf keeps it: a kind (regalloc.AT_), the
+// offset or index register, and whether an index is scaled.
+func mem_word_at(load: bool, width: int64, reg: regalloc.Reg, base: regalloc.Reg, at_kind: int64, at_value: int64, flag: bool, vreg_phys: [regalloc.Reg]) -> int64 {
     mut t = -1
     mut size = 3
     if width == 8 {
@@ -899,23 +957,22 @@ func mem_word(load: bool, width: int64, reg: regalloc.Reg, base: regalloc.Reg, a
     }
     let head = size << 30 | opc << 22 | n << 5 | t
     mut off = 0
-    match at {
-        .Base -> off = 0
-        .Offset(o) -> off = o
-        .Index(index, scaled) -> {
-            let m = zr_num(index, :vreg_phys)
-            if m < 0 or m == 31 {
-                return -1
-            }
-            // `[n, m]`: the register form, LSL #0, or with S set, shifted
-            // by the access size.
-            mut s = 0
-            if scaled and width > 1 {
-                s = 0x1000
-            }
-            return 0x38206800 | head | m << 16 | s
+    if at_kind == regalloc.AT_OFFSET {
+        off = at_value
+    } else if at_kind == regalloc.AT_INDEX {
+        let m = zr_num(at_value, :vreg_phys)
+        if m < 0 or m == 31 {
+            return -1
         }
-        .Symbol(_name, _got) -> return -1
+        // `[n, m]`: the register form, LSL #0, or with S set, shifted
+        // by the access size.
+        mut s = 0
+        if flag and width > 1 {
+            s = 0x1000
+        }
+        return 0x38206800 | head | m << 16 | s
+    } else if at_kind == regalloc.AT_SYMBOL {
+        return -1
     }
     let scale = 1 << size
     if off >= 0 and off % scale == 0 and off / scale < 4096 {
@@ -1090,8 +1147,8 @@ func add_imm_word(anon base: int64, a: regalloc.Reg, b: regalloc.Reg, v: int64, 
 
 // Starts the line of an instruction `encode` has a word for: `.inst` and the
 // word, then a comment, which the instruction's text goes on to fill.
-func write_word(anon insn: regalloc.Insn, vreg_phys: [regalloc.Reg], out: StrBuilder) -> none {
-    let word = encode(insn, :vreg_phys)
+func write_word(anon body: regalloc.InsnBuf, anon i: int64, vreg_phys: [regalloc.Reg], out: StrBuilder) -> none {
+    let word = encode_at(body, i, :vreg_phys)
     if word < 0 {
         return none
     }
