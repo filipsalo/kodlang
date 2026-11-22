@@ -10,6 +10,7 @@
 // for the distance, as `as` does; a branch to one in its own atom is resolved
 // here.
 
+import "libc"
 import "unsafe"
 import "kod/arm64"
 import "kod/regalloc"
@@ -25,7 +26,7 @@ type Section = shared struct {
     flags: int64
     // log2 of the alignment: the largest `.p2align` in the section.
     align: int64 = 0
-    bytes: [int64] = []
+    bytes: ByteBuf = ByteBuf()
     addr: int64 = 0
     // The section's atoms: where each defined symbol not named L… starts,
     // and that symbol, in order.
@@ -140,10 +141,7 @@ type Assembler = shared struct {
             if (s.flags & 0x80000000) != 0 {
                 s.flags = s.flags | 0x400
             }
-            s.bytes += [word & 0xff]
-            s.bytes += [(word >> 8) & 0xff]
-            s.bytes += [(word >> 16) & 0xff]
-            s.bytes += [(word >> 24) & 0xff]
+            s.bytes.word(word)
         }
     }
 
@@ -151,7 +149,7 @@ type Assembler = shared struct {
         if self.in_section() {
             let s = self.sections[self.current]
             for k in 0..count {
-                s.bytes += [(value >> (8 * k)) & 0xff]
+                s.bytes.byte(value >> (8 * k))
             }
         }
     }
@@ -160,7 +158,7 @@ type Assembler = shared struct {
     func emit_fixup(self, anon word: int64, kind: int64, name: str, addend: int64 = 0) -> none {
         if self.in_section() {
             let s = self.sections[self.current]
-            self.fixups += [Fixup(section: self.current, offset: len(s.bytes), :kind, symbol: self.symbol(name), :addend)]
+            self.fixups += [Fixup(section: self.current, offset: s.bytes.len, :kind, symbol: self.symbol(name), :addend)]
             self.emit_word(word)
         }
     }
@@ -175,7 +173,7 @@ type Assembler = shared struct {
                 return none
             }
             sym.section = self.current
-            sym.offset = len(s.bytes)
+            sym.offset = s.bytes.len
             if not is_temporary(name) {
                 s.atom_offsets += [sym.offset]
                 s.atom_symbols += [k]
@@ -342,11 +340,11 @@ type Assembler = shared struct {
                         let size = 1 << n
                         // Code is padded with `nop`s, data with zeros.
                         let code = (s.flags & 0x80000000) != 0 and size >= 4
-                        for len(s.bytes) % size != 0 {
+                        for s.bytes.len % size != 0 {
                             if code {
                                 self.emit_word(0xD503201F)
                             } else {
-                                s.bytes += [0]
+                                s.bytes.byte(0)
                             }
                         }
                     }
@@ -404,7 +402,7 @@ type Assembler = shared struct {
         }
         if self.in_section() {
             let s = self.sections[self.current]
-            self.fixups += [Fixup(section: self.current, offset: len(s.bytes), kind: FIX_QUAD, symbol: self.symbol(name), :addend)]
+            self.fixups += [Fixup(section: self.current, offset: s.bytes.len, kind: FIX_QUAD, symbol: self.symbol(name), :addend)]
             self.emit_bytes(0, count: 8)
         }
     }
@@ -422,7 +420,7 @@ type Assembler = shared struct {
             for k < end {
                 let c = arg[k]
                 if c != '\\' {
-                    s.bytes += [c]
+                    s.bytes.byte(c)
                     k += 1
                     continue
                 }
@@ -441,15 +439,15 @@ type Assembler = shared struct {
                         k += 1
                         digits += 1
                     }
-                    s.bytes += [v & 0xff]
+                    s.bytes.byte(v & 0xff)
                     continue
                 }
                 match e {
-                    'n' -> s.bytes += [10]
-                    't' -> s.bytes += [9]
-                    'r' -> s.bytes += [13]
-                    '\\' -> s.bytes += ['\\']
-                    '"' -> s.bytes += ['"']
+                    'n' -> s.bytes.byte(10)
+                    't' -> s.bytes.byte(9)
+                    'r' -> s.bytes.byte(13)
+                    '\\' -> s.bytes.byte('\\')
+                    '"' -> s.bytes.byte('"')
                     else -> {
                         self.fail(f"unknown escape `\\{arg[k..k + 1]}`")
                         return none
@@ -457,7 +455,7 @@ type Assembler = shared struct {
                 }
                 k += 1
             }
-            s.bytes += [0]
+            s.bytes.byte(0)
         }
     }
 
@@ -596,14 +594,14 @@ type Assembler = shared struct {
     func patch_word(self, anon k: int64, offset: int64, value: int64) -> none {
         let s = self.sections[k]
         for b in 0..4 {
-            s.bytes[offset + b] = s.bytes[offset + b] | ((value >> (8 * b)) & 0xff)
+            s.bytes.set(offset + b, s.bytes.at(offset + b) | ((value >> (8 * b)) & 0xff))
         }
     }
 
     func patch_quad(self, anon k: int64, offset: int64, value: int64) -> none {
         let s = self.sections[k]
         for b in 0..8 {
-            s.bytes[offset + b] = (value >> (8 * b)) & 0xff
+            s.bytes.set(offset + b, value >> (8 * b))
         }
     }
 
@@ -783,41 +781,108 @@ func version_number(anon text: str) -> int64 {
     return v
 }
 
-// The object's bytes as they are written.
-type Out = shared struct {
-    bytes: [int64] = []
+// Bytes being built: C memory that grows by doubling and is written in
+// place, so a word is one store, not four elements of an array.
+type ByteBuf = shared struct {
+    addr: int64 = 0
+    len: int64 = 0
+    cap: int64 = 0
 
-    func put32(self, anon v: int64) -> none {
-        for b in 0..4 {
-            self.bytes += [(v >> (8 * b)) & 0xff]
+    // Room for `n` more bytes.
+    func room(self, anon n: int64) -> none {
+        if self.len + n <= self.cap {
+            return none
         }
-    }
-
-    func put64(self, anon v: int64) -> none {
-        for b in 0..8 {
-            self.bytes += [(v >> (8 * b)) & 0xff]
+        mut cap = self.cap * 2
+        if cap < 4096 {
+            cap = 4096
         }
+        for cap < self.len + n {
+            cap = cap * 2
+        }
+        self.addr = libc.realloc(self.addr, cap)
+        if self.addr == 0 {
+            panic("macho: out of memory")
+        }
+        self.cap = cap
     }
 
     func byte(self, anon v: int64) -> none {
-        self.bytes += [v & 0xff]
+        self.room(1)
+        unsafe.store8(self.addr + self.len, v & 0xff)
+        self.len += 1
+    }
+
+    // A 4-byte little-endian word.
+    func word(self, anon v: int64) -> none {
+        self.room(4)
+        unsafe.store32(self.addr + self.len, v & 0xffffffff)
+        self.len += 4
+    }
+
+    func at(self, anon i: int64) -> int64 {
+        return unsafe.load8(self.addr + i)
+    }
+
+    func set(self, anon i: int64, anon v: int64) -> none {
+        unsafe.store8(self.addr + i, v & 0xff)
+    }
+
+    // `other`'s bytes after these.
+    func append(self, anon other: ByteBuf) -> none {
+        self.room(other.len)
+        if other.len > 0 {
+            let _dst = unsafe.memcpy(self.addr + self.len, other.addr, other.len)
+        }
+        self.len += other.len
+    }
+
+    func to_bytes(self) -> bytes {
+        return unsafe.copy_out(self.addr, self.len)
+    }
+
+    func release(self) -> none {
+        if self.addr != 0 {
+            unsafe.free(self.addr)
+        }
+        self.addr = 0
+        self.len = 0
+        self.cap = 0
+    }
+}
+
+// The object's bytes as they are written.
+type Out = shared struct {
+    bytes: ByteBuf = ByteBuf()
+
+    func put32(self, anon v: int64) -> none {
+        self.bytes.word(v)
+    }
+
+    func put64(self, anon v: int64) -> none {
+        self.bytes.word(v)
+        self.bytes.word(v >> 32)
+    }
+
+    func byte(self, anon v: int64) -> none {
+        self.bytes.byte(v)
     }
 
     // `name` in a fixed 16-byte field.
     func name(self, anon name: str) -> none {
         for k in 0..16 {
             if k < len(name) {
-                self.bytes += [name[k]]
+                self.bytes.byte(name[k])
             } else {
-                self.bytes += [0]
+                self.bytes.byte(0)
             }
         }
     }
 
     // Zeros up to `size` bytes in all.
     func pad_to(self, anon size: int64) -> none {
-        for len(self.bytes) < size {
-            self.bytes += [0]
+        for self.bytes.len < size {
+            self.bytes.byte(0)
         }
     }
 }
@@ -834,7 +899,7 @@ func write_object(anon a: Assembler) -> bytes {
     for s in a.sections {
         addr = align_up(addr, 1 << s.align)
         s.addr = addr
-        addr += len(s.bytes)
+        addr += s.bytes.len
     }
     let vmsize = addr
     // Quads relocated against a section hold the target's address.
@@ -941,7 +1006,7 @@ func write_object(anon a: Assembler) -> bytes {
         out.name(s.name)
         out.name(s.segment)
         out.put64(s.addr)
-        out.put64(len(s.bytes))
+        out.put64(s.bytes.len)
         out.put32(fileoff + s.addr)
         out.put32(s.align)
         let nreloc = len(s.relocs) / 2
@@ -986,7 +1051,7 @@ func write_object(anon a: Assembler) -> bytes {
     for s in a.sections {
         out.pad_to(fileoff + s.addr)
         // Already bytes: appended whole.
-        out.bytes += s.bytes
+        out.bytes.append(s.bytes)
     }
     out.pad_to(reloff)
     // Relocations, their symbols renumbered.
@@ -1035,8 +1100,15 @@ func write_object(anon a: Assembler) -> bytes {
         out.byte(desc >> 8)
         out.put64(a.sections[sym.section].addr + sym.offset)
     }
-    out.bytes += strtab
-    return kod_bytes_from_array(out.bytes)
+    for b in strtab {
+        out.bytes.byte(b)
+    }
+    let obj = out.bytes.to_bytes()
+    out.bytes.release()
+    for s in a.sections {
+        s.bytes.release()
+    }
+    return obj
 }
 
 // `ks` sorted by their symbols' names.
