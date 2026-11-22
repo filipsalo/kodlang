@@ -638,6 +638,7 @@ func insn_flags(anon insn: Insn) -> int64 {
 
 type PoolState = shared struct {
     free_regs: [Reg]
+    free_count: int64
     cs_in_use: int64
     live: [str]
     // The frame slot each of `live` is saved in.
@@ -653,7 +654,10 @@ type RegPool = shared struct {
 
     // Per-function state — `reset` clears these at the start of
     // every compile_func.
+    // A stack: the first `free_count` are free; the rest are spare room, so
+    // taking one and giving it back changes a count, not the array's length.
     free_regs: [Reg] = []
+    free_count: int64 = 0
     cs_in_use: int64 = 0
     cs_high_water: int64 = 0
     // The vregs handed out and not yet freed, for `evict`.
@@ -670,6 +674,7 @@ type RegPool = shared struct {
     // alone — its ids stay valid across the whole module.
     func reset(self) -> none {
         self.free_regs = full_pool()
+        self.free_count = len(self.free_regs)
         self.cs_in_use = 0
         self.cs_high_water = 0
         self.live = []
@@ -681,8 +686,9 @@ type RegPool = shared struct {
     // `restore`. Vregs now share physicals with ones that stay in use
     // after it, each pair apart only by that save, which `run` can't see.
     func evict(self) -> PoolState {
-        let state = PoolState(free_regs: self.free_regs, cs_in_use: self.cs_in_use, live: self.live)
+        let state = PoolState(free_regs: self.free_regs, free_count: self.free_count, cs_in_use: self.cs_in_use, live: self.live)
         self.free_regs = full_pool()
+        self.free_count = len(self.free_regs)
         self.cs_in_use = 0
         self.live = []
         self.evicted = true
@@ -691,6 +697,7 @@ type RegPool = shared struct {
 
     func restore(self, anon state: PoolState) -> none {
         self.free_regs = state.free_regs
+        self.free_count = state.free_count
         self.cs_in_use = state.cs_in_use
         self.live = state.live
     }
@@ -703,12 +710,12 @@ type RegPool = shared struct {
     // `run` may rewrite it (within the same class) once the body
     // is buffered.
     func alloc_reg(self) -> str {
-        let n = len(self.free_regs)
+        let n = self.free_count
         if n == 0 {
             panic("compiler bug: out of registers; `compile_expr` evicts before this can happen, so a site is holding too many without compiling an expression")
         }
-        mut phys = self.free_regs[-1]
-        self.free_regs = self.free_regs[0..n - 1]
+        mut phys = self.free_regs[n - 1]
+        self.free_count = n - 1
         if is_callee_saved_phys(phys) {
             self.cs_in_use = self.cs_in_use + 1
             if self.cs_in_use > self.cs_high_water {
@@ -752,12 +759,17 @@ type RegPool = shared struct {
         if is_callee_saved_phys(phys) {
             self.cs_in_use = self.cs_in_use - 1
         }
-        self.free_regs += [phys]
+        if self.free_count < len(self.free_regs) {
+            self.free_regs[self.free_count] = phys
+        } else {
+            self.free_regs += [phys]
+        }
+        self.free_count += 1
     }
 
     // Whether the next alloc_reg hands out a register that survives a call.
     func next_is_callee_saved(self) -> bool {
-        return len(self.free_regs) > 0 and is_callee_saved_phys(self.free_regs[-1])
+        return self.free_count > 0 and is_callee_saved_phys(self.free_regs[self.free_count - 1])
     }
 
     // True if `reg` is (or resolves to) a callee-saved physical.
