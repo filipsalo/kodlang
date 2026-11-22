@@ -1049,12 +1049,14 @@ func forward_into(anon b: regalloc.InsnBuf, anon k: int64, dst: regalloc.Reg, sr
     return false
 }
 
-// `b` with copies a promoted body is full of taken out (see above); `b` itself
-// is rewritten on the way.
-func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64) -> regalloc.InsnBuf {
+// Takes the copies a promoted body `b` is full of out of it (see above), in
+// place: what it keeps is written over instructions at or before where they
+// were read, and the instruction after a copy it drops is rewritten.
+func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64) -> none {
     let counts = regalloc.buf_vreg_counts(b, :vreg_start, :n_local)
     let n = b.n
-    let out = b.derived()
+    // Where the next instruction kept goes.
+    mut w: int64 = 0
     // The second rule looks at the instruction before as the first rule left
     // it, whether or not that one was kept: a store (`prev_store`), its
     // register and its address (a MemAt's kind, flag and value, as InsnBuf
@@ -1123,7 +1125,8 @@ func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64)
             mut taken = false
             if not store and prev_store and prev_base == base and same_place(b, kind: at_kind, flag: at_flag, value: at_value, other_kind: prev_at_kind, other_flag: prev_at_flag, other_value: prev_at_value) and regalloc.is_plain(reg) and regalloc.is_plain(prev_reg) {
                 if reg != prev_reg {
-                    out.push_mov(dst: reg, src: prev_reg)
+                    b.write_mov(w, dst: reg, src: prev_reg)
+                    w += 1
                 }
                 taken = true
             }
@@ -1134,7 +1137,10 @@ func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64)
             prev_at_flag = at_flag
             prev_at_value = at_value
             if not taken {
-                out.copy_from(b, :i)
+                if w != i {
+                    b.move_from(w, src: b, :i)
+                }
+                w += 1
             }
             continue
         }
@@ -1159,9 +1165,12 @@ func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64)
         }
         // Anything else that stays isn't the store before a load.
         prev_store = false
-        out.copy_from(b, :i)
+        if w != i {
+            b.move_from(w, src: b, :i)
+        }
+        w += 1
     }
-    return out
+    b.n = w
 }
 
 // regalloc.same_at of two MemAts given as InsnBuf keeps them in `b`: a kind
@@ -1188,15 +1197,15 @@ func small_imm(anon op: regalloc.Reg) -> bool {
     return v >= 0 and v <= 4095
 }
 
-// Appends a branch to `target` (an index into out's strings) taken when
-// condition `cond` holds, or when it doesn't.
-func push_branch_on(anon out: regalloc.InsnBuf, anon cond: str, when_true: bool, target: int64) -> none {
+// Makes instruction `w` of `out` a branch to `target` (an index into out's
+// strings) taken when condition `cond` holds, or when it doesn't.
+func write_branch_on(anon out: regalloc.InsnBuf, anon w: int64, cond: str, when_true: bool, target: int64) -> none {
     mut name = cond
     if not when_true {
         name = opposite_condition(cond)
     }
-    let kind = regalloc.BRANCH_IF | (regalloc.cond_number(must regalloc.cond_named(name)) << 2)
-    out.put(regalloc.INSN_BRANCH | (kind << 8), a: regalloc.NO_REG, b: target)
+    let sub = regalloc.BRANCH_IF | (regalloc.cond_number(must regalloc.cond_named(name)) << 2)
+    out.write_branch(w, :sub, reg: regalloc.NO_REG, :target)
 }
 
 // The symbol an extern calls: its name with the leading `_` of a C symbol,
@@ -10387,7 +10396,7 @@ type Codegen = shared struct {
             }
         }
         let body = self.out_buf
-        let out = regalloc.InsnBuf()
+        let out = body.derived()
         for i in 0..body.len() {
             let name = body.label(i)
             if name.starts_with("Lborrow$") {
@@ -10409,7 +10418,7 @@ type Codegen = shared struct {
                 }
                 continue
             }
-            out.push_from(body, :i)
+            out.copy_from(body, :i)
         }
         self.out_buf = out
         self.rc_ctor_mark = -1
@@ -10620,15 +10629,15 @@ type Codegen = shared struct {
         self.emit_mov("x17", src: "sp")
         self.emit_str(lp.sp_slot, reg: "x17")
         let all = self.out_buf
-        let moved = regalloc.InsnBuf()
+        let moved = all.derived()
         for i in 0..lp.entry_mark {
-            moved.push_from(all, :i)
+            moved.copy_from(all, :i)
         }
         for i in end..all.len() {
-            moved.push_from(all, :i)
+            moved.copy_from(all, :i)
         }
         for i in lp.entry_mark..end {
-            moved.push_from(all, :i)
+            moved.copy_from(all, :i)
         }
         self.out_buf = moved
     }
@@ -20173,20 +20182,31 @@ type Codegen = shared struct {
     }
 
     // `body` with the patterns below folded, after a label `first` unless it's "".
+    // Without `first`, `body` itself is folded in place: an instruction is
+    // written over one at or before where it was read.
     func peephole(self, anon body: regalloc.InsnBuf, vreg_start: int64, first: str) -> regalloc.InsnBuf {
-        let out = body.derived()
-        if len(first) > 0 {
-            out.push_label(first)
-        }
         let n_local = len(self.pool.vreg_phys) - vreg_start
+        if len(first) == 0 and n_local <= 0 {
+            return body
+        }
+        mut out = body
+        // Where the next instruction goes in `out`.
+        mut w: int64 = 0
+        if len(first) > 0 {
+            out = body.derived()
+            out.push_label(first)
+            w = 1
+        }
+        let n = body.n
         if n_local <= 0 {
-            for i in 0..body.n {
-                out.copy_from(body, :i)
+            for i in 0..n {
+                out.move_from(w, src: body, :i)
+                w += 1
             }
+            out.n = w
             return out
         }
         let counts = regalloc.buf_vreg_counts(body, :vreg_start, :n_local)
-        let n = body.n
         mut i: int64 = 0
         for i < n {
             // Each pattern starts with a `cset v, c` or a `mov v, #n`, v a vreg named only there and next.
@@ -20202,7 +20222,8 @@ type Codegen = shared struct {
                     if len(opposite_condition(cond)) > 0 {
                         // cbz/cbnz v, L
                         if (next_tag & 255) == regalloc.INSN_BRANCH and body.fa[i + 1] == v and ((next_op & 3) == regalloc.BRANCH_IF_ZERO or (next_op & 3) == regalloc.BRANCH_IF_NONZERO) {
-                            push_branch_on(out, cond, when_true: (next_op & 3) == regalloc.BRANCH_IF_NONZERO, target: body.fb[i + 1])
+                            write_branch_on(out, w, cond: cond, when_true: (next_op & 3) == regalloc.BRANCH_IF_NONZERO, target: body.fb[i + 1])
+                            w += 1
                             i += 2
                             continue
                         }
@@ -20213,7 +20234,8 @@ type Codegen = shared struct {
                                 // Eq and Ne are conditions 0 and 1.
                                 let on = third >> 10
                                 if on == 0 or on == 1 {
-                                    push_branch_on(out, cond, when_true: on == 1, target: body.fb[i + 2])
+                                    write_branch_on(out, w, cond: cond, when_true: on == 1, target: body.fb[i + 2])
+                                    w += 1
                                     i += 3
                                     continue
                                 }
@@ -20228,28 +20250,35 @@ type Codegen = shared struct {
                         let z = body.fc[i + 1]
                         // add/sub d, a, v
                         if (next_op == regalloc.OP_ADD or next_op == regalloc.OP_SUB) and z == v and y != v and y != regalloc.XZR {
-                            out.push_new_op(next_op, a: x, b: y, c: value)
+                            out.write_op(w, op: next_op, a: x, b: y, c: value)
+                            w += 1
                             i += 2
                             continue
                         }
                         // add d, v, a
                         if next_op == regalloc.OP_ADD and z != regalloc.NO_REG and y == v and z != v and z != regalloc.XZR {
-                            out.push_new_op(regalloc.OP_ADD, a: x, b: z, c: value)
+                            out.write_op(w, op: regalloc.OP_ADD, a: x, b: z, c: value)
+                            w += 1
                             i += 2
                             continue
                         }
                         // cmp a, v
                         if next_op == regalloc.OP_COMPARE and z == regalloc.NO_REG and y == v and x != v and x != regalloc.XZR {
-                            out.push_new_op(regalloc.OP_COMPARE, a: x, b: value)
+                            out.write_op(w, op: regalloc.OP_COMPARE, a: x, b: value, c: regalloc.NO_REG)
+                            w += 1
                             i += 2
                             continue
                         }
                     }
                 }
             }
-            out.copy_from(body, :i)
+            if w != i or len(first) > 0 {
+                out.move_from(w, src: body, :i)
+            }
+            w += 1
             i += 1
         }
+        out.n = w
         return out
     }
 
@@ -20270,10 +20299,8 @@ type Codegen = shared struct {
         mut line_slot: [int64] = []
         mut line_len: [int64] = []
         let n = body.n
-        for _ in 0..n {
-            line_slot += [0]
-            line_len += [0]
-        }
+        line_slot = [0] * n
+        line_len = [0] * n
         mut i: int64 = 0
         for i < n {
             mut off: int64 = 0
@@ -20408,7 +20435,8 @@ type Codegen = shared struct {
                 rewritten.copy_from(body, i: j)
                 j += 1
             }
-            let out = forward_copies(rewritten, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
+            forward_copies(rewritten, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
+            let out = rewritten
             let first_promoted = saved_len - vreg_start
             if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true, droppable: first_promoted) {
                 return out
