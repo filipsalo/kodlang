@@ -943,105 +943,127 @@ func same_reg(anon a: regalloc.Reg, anon b: regalloc.Reg) -> bool {
     return a_vreg and b_vreg and (a >> 2) == (b >> 2)
 }
 
-func forwarded(anon next: regalloc.Insn, dst: regalloc.Reg, src: regalloc.Reg, once: bool) -> regalloc.Insn? {
-    match next {
-        .Slot(store, reg, off) -> {
-            if store and reg == dst and once {
-                return .Slot(store: true, reg: src, :off)
-            }
-            return none
+// Rewrites instruction `k` of `b` to read `src` instead of `dst`, which a `mov
+// dst, src` just before it copied (`dst` a vreg named nowhere else when
+// `once`), and says whether it could: `ldr dst, [dst, ...]` loads from `[src,
+// ...]`, and an instruction that reads `dst` as its only mention of it reads
+// `src`.
+func forward_into(anon b: regalloc.InsnBuf, anon k: int64, dst: regalloc.Reg, src: regalloc.Reg, once: bool) -> bool {
+    let tag = b.tags[k]
+    let variant = tag & 255
+    let sub = tag >> 8
+    if variant == regalloc.INSN_SLOT {
+        if sub == 1 and b.fa[k] == dst and once {
+            b.fa[k] = src
+            return true
         }
-        .Mov(to, from) -> {
-            if from == dst and to != dst and once {
-                return .Mov(dst: to, src: src)
-            }
-            return none
-        }
-        .Branch(kind, reg, target) -> {
-            // `cbz dst, L` reads it as its first operand; a `b…` branch names no register.
-            if (kind is .IfZero or kind is .IfNonzero) and reg == dst and once {
-                return .Branch(:kind, reg: src, :target)
-            }
-            return none
-        }
-        .Mem(load, width, reg, base, at) -> {
-            let index = regalloc.at_reg(at)
-            // `ldr dst, [dst, ...]`: load through `src`.
-            if load and width >= 4 and reg == dst and base == dst and index != dst {
-                return .Mem(:load, :width, :reg, base: src, :at)
-            }
-            // Otherwise `dst` named once, and not as a register a load writes.
-            mut named = 0
-            if reg == dst {
-                named += 1
-            }
-            if base == dst {
-                named += 1
-            }
-            if index == dst {
-                named += 1
-            }
-            if not once or named != 1 {
-                return none
-            }
-            if base == dst {
-                return .Mem(:load, :width, :reg, base: src, :at)
-            }
-            if index == dst {
-                if at is .Index(_old, scaled) {
-                    return .Mem(:load, :width, :reg, :base, at: .Index(reg: src, :scaled))
-                }
-            }
-            // As its first operand: only a store reads that one.
-            if not load {
-                return .Mem(:load, :width, reg: src, :base, :at)
-            }
-            return none
-        }
-        .Op(op, a, b, c, d, _flags) -> {
-            // As for its text: `dst` named once, and not as a first operand
-            // the instruction writes.
-            if not once or op is .CallIndirect or op is .Return {
-                return none
-            }
-            mut operands: [regalloc.Reg] = [a, b, c, d]
-            mut at = -1
-            for k, operand in operands {
-                if operand == dst {
-                    if at >= 0 {
-                        return none
-                    }
-                    at = k
-                }
-            }
-            if at < 0 or (at == 0 and not regalloc.reads_first_op(op)) {
-                return none
-            }
-            operands[at] = src
-            return regalloc.op(op, a: operands[0], b: operands[1], c: operands[2], d: operands[3])
-        }
-        .Call(_target) -> return none
-        .Pair(_load, _a, _b, _base, _mode) -> return none
-        .LoadConst(_dst, _value) -> return none
-        .Intrinsic(_label) -> return none
-        .Data(_text) -> return none
-        .Label(_name) -> return none
+        return false
     }
+    if variant == regalloc.INSN_MOV {
+        if b.fb[k] == dst and b.fa[k] != dst and once {
+            b.fb[k] = src
+            return true
+        }
+        return false
+    }
+    if variant == regalloc.INSN_BRANCH {
+        // `cbz dst, L` reads it as its first operand; a `b…` branch names no register.
+        let kind = sub & 3
+        if (kind == regalloc.BRANCH_IF_ZERO or kind == regalloc.BRANCH_IF_NONZERO) and b.fa[k] == dst and once {
+            b.fa[k] = src
+            return true
+        }
+        return false
+    }
+    if variant == regalloc.INSN_MEM {
+        let load = (sub & 1) == 1
+        let reg = b.fa[k]
+        let base = b.fb[k]
+        mut index = regalloc.NO_REG
+        if ((sub >> 1) & 3) == regalloc.AT_INDEX {
+            index = b.fc[k]
+        }
+        // `ldr dst, [dst, ...]`: load through `src`.
+        if load and b.fd[k] >= 4 and reg == dst and base == dst and index != dst {
+            b.fb[k] = src
+            return true
+        }
+        // Otherwise `dst` named once, and not as a register a load writes.
+        mut named = 0
+        if reg == dst {
+            named += 1
+        }
+        if base == dst {
+            named += 1
+        }
+        if index == dst {
+            named += 1
+        }
+        if not once or named != 1 {
+            return false
+        }
+        if base == dst {
+            b.fb[k] = src
+            return true
+        }
+        if index == dst {
+            b.fc[k] = src
+            return true
+        }
+        // As its first operand: only a store reads that one.
+        if not load {
+            b.fa[k] = src
+            return true
+        }
+        return false
+    }
+    if variant == regalloc.INSN_OP {
+        // As for its text: `dst` named once, and not as a first operand
+        // the instruction writes.
+        if not once or sub == regalloc.OP_CALL_INDIRECT or sub == regalloc.OP_RETURN {
+            return false
+        }
+        mut operands: [regalloc.Reg] = [b.fa[k], b.fb[k], b.fc[k], b.fd[k]]
+        mut at = -1
+        for j, operand in operands {
+            if operand == dst {
+                if at >= 0 {
+                    return false
+                }
+                at = j
+            }
+        }
+        if at < 0 or (at == 0 and sub != regalloc.OP_COMPARE) {
+            return false
+        }
+        operands[at] = src
+        b.fa[k] = operands[0]
+        b.fb[k] = operands[1]
+        b.fc[k] = operands[2]
+        b.fd[k] = operands[3]
+        b.fe[k] = regalloc.op_flags(op: regalloc.opcode_of(sub), a: operands[0], b: operands[1], c: operands[2], d: operands[3])
+        return true
+    }
+    // A Call, Pair, LoadConst, Intrinsic, Data or Label.
+    return false
 }
 
-func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) -> [regalloc.Insn] {
-    let counts = regalloc.vreg_counts(b, :vreg_start, :n_local)
-    let n = len(b)
-    mut out: [regalloc.Insn] = []
+// `b` with copies a promoted body is full of taken out (see above); `b` itself
+// is rewritten on the way.
+func forward_copies(anon b: regalloc.InsnBuf, vreg_start: int64, n_local: int64) -> regalloc.InsnBuf {
+    let counts = regalloc.buf_vreg_counts(b, :vreg_start, :n_local)
+    let n = b.n
+    let out = b.derived()
     // The second rule looks at the instruction before as the first rule left
     // it, whether or not that one was kept: a store (`prev_store`), its
-    // register and its address.
+    // register and its address (a MemAt's kind, flag and value, as InsnBuf
+    // keeps them).
     mut prev_store = false
     mut prev_reg = regalloc.NO_REG
     mut prev_base = regalloc.NO_REG
-    mut prev_at: regalloc.MemAt = .Base
-    // What the second rule made of the instruction after a copy it dropped.
-    mut replaced: regalloc.Insn? = none
+    mut prev_at_kind: int64 = 0
+    mut prev_at_flag: int64 = 0
+    mut prev_at_value: int64 = 0
     // The third rule has folded the next instruction, a copy, into this one.
     mut skip_next = false
     for i in 0..n {
@@ -1049,19 +1071,22 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
             skip_next = false
             continue
         }
-        mut cur = b[i]
-        if replaced is Some(r) {
-            cur = r
-            replaced = none
-        }
+        // What the second rule made of this instruction, if it dropped the
+        // copy before it, is in `b` already.
+        let tag = b.tags[i]
+        let variant = tag & 255
+        let sub = tag >> 8
         // An operation into a vreg named nowhere else, then a copy of it into
         // another vreg: the operation writes that one (`i = i + 1` as
         // `add t, i, #1; mov i, t` is `add i, i, #1`).
-        if i + 1 < n and cur is .Op(fold_op, fold_a, fold_b, fold_c, fold_d, _fold_flags) and regalloc.writes_first_op(fold_op) and not (fold_op is .Move) and (fold_a & 3) == 1 {
-            if b[i + 1] is .Mov(fold_dst, fold_src) and fold_src == fold_a and (fold_dst & 3) == 1 {
+        if i + 1 < n and variant == regalloc.INSN_OP and regalloc.writes_first_op_number(sub) and sub != regalloc.OP_MOVE and (b.fa[i] & 3) == 1 {
+            let fold_a = b.fa[i]
+            let fold_dst = b.fa[i + 1]
+            if b.tags[i + 1] == regalloc.INSN_MOV and b.fb[i + 1] == fold_a and (fold_dst & 3) == 1 {
                 let fold_id = regalloc.reg_vreg(fold_a) - vreg_start
                 if fold_id >= 0 and fold_id < n_local and counts[fold_id] == 2 {
-                    cur = regalloc.op(fold_op, a: fold_dst, b: fold_b, c: fold_c, d: fold_d)
+                    b.fa[i] = fold_dst
+                    b.fe[i] = regalloc.op_flags(op: regalloc.opcode_of(sub), a: fold_dst, b: b.fb[i], c: b.fc[i], d: b.fd[i])
                     skip_next = true
                 }
             }
@@ -1071,43 +1096,44 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
         mut store = false
         mut reg = regalloc.NO_REG
         mut base = regalloc.NO_REG
-        mut at: regalloc.MemAt = .Base
-        match cur {
-            .Slot(slot_store, slot_reg, slot_off) -> {
-                access = true
-                store = slot_store
-                reg = slot_reg
-                base = regalloc.FP
-                if slot_off < 0 {
-                    at = .Offset(off: slot_off)
-                }
+        mut at_kind: int64 = 0
+        mut at_flag: int64 = 0
+        mut at_value: int64 = 0
+        if variant == regalloc.INSN_SLOT {
+            access = true
+            store = sub == 1
+            reg = b.fa[i]
+            base = regalloc.FP
+            if b.fb[i] < 0 {
+                at_kind = regalloc.AT_OFFSET
+                at_value = b.fb[i]
             }
-            .Mem(load, width, mem_reg, mem_base, mem_at) -> {
-                if width >= 4 {
-                    access = true
-                    store = not load
-                    reg = mem_reg
-                    base = mem_base
-                    at = mem_at
-                }
-            }
-            else none
+        } else if variant == regalloc.INSN_MEM and b.fd[i] >= 4 {
+            access = true
+            store = (sub & 1) == 0
+            reg = b.fa[i]
+            base = b.fb[i]
+            at_kind = (sub >> 1) & 3
+            at_flag = sub >> 3
+            at_value = b.fc[i]
         }
         if access {
             // A load just after a store to the same address: the stored register.
             mut taken = false
-            if not store and prev_store and prev_base == base and regalloc.same_at(prev_at, at) and regalloc.is_plain(reg) and regalloc.is_plain(prev_reg) {
+            if not store and prev_store and prev_base == base and same_place(b, kind: at_kind, flag: at_flag, value: at_value, other_kind: prev_at_kind, other_flag: prev_at_flag, other_value: prev_at_value) and regalloc.is_plain(reg) and regalloc.is_plain(prev_reg) {
                 if reg != prev_reg {
-                    out += [.Mov(dst: reg, src: prev_reg)]
+                    out.push_mov(dst: reg, src: prev_reg)
                 }
                 taken = true
             }
             prev_store = store
             prev_reg = reg
             prev_base = base
-            prev_at = at
+            prev_at_kind = at_kind
+            prev_at_flag = at_flag
+            prev_at_value = at_value
             if not taken {
-                out += [cur]
+                out.copy_from(b, :i)
             }
             continue
         }
@@ -1115,29 +1141,44 @@ func forward_copies(anon b: [regalloc.Insn], vreg_start: int64, n_local: int64) 
         // and the copy goes, leaving the instruction before it as the one before.
         mut copy_dst = regalloc.NO_REG
         mut copy_src = regalloc.NO_REG
-        if cur is .Mov(dst, src) {
-            copy_dst = dst
-            copy_src = src
-        } else if cur is .Op(op, a, op_b, op_c, _d, _flags) {
-            if op is .Move and op_c == regalloc.NO_REG {
-                copy_dst = a
-                copy_src = op_b
-            }
+        if variant == regalloc.INSN_MOV {
+            copy_dst = b.fa[i]
+            copy_src = b.fb[i]
+        } else if variant == regalloc.INSN_OP and sub == regalloc.OP_MOVE and b.fc[i] == regalloc.NO_REG {
+            copy_dst = b.fa[i]
+            copy_src = b.fb[i]
         }
         // `copy_dst` a vreg (its x form), `copy_src` a vreg or an x register.
         if i + 1 < n and (copy_dst & 3) == 1 and regalloc.is_plain(copy_src) and copy_dst != copy_src {
             let id = regalloc.reg_vreg(copy_dst) - vreg_start
             let once = id >= 0 and id < n_local and counts[id] == 2
-            if forwarded(b[i + 1], dst: copy_dst, src: copy_src, :once) is Some(next) {
-                replaced = next
+            if forward_into(b, i + 1, dst: copy_dst, src: copy_src, :once) {
                 continue
             }
         }
         // Anything else that stays isn't the store before a load.
         prev_store = false
-        out += [cur]
+        out.copy_from(b, :i)
     }
     return out
+}
+
+// regalloc.same_at of two MemAts given as InsnBuf keeps them in `b`: a kind
+// (AT_), the scaled or got flag, and the offset, index register or symbol.
+func same_place(anon b: regalloc.InsnBuf, kind: int64, flag: int64, value: int64, other_kind: int64, other_flag: int64, other_value: int64) -> bool {
+    if kind != other_kind {
+        return false
+    }
+    if kind == 0 {
+        return true
+    }
+    if kind == regalloc.AT_OFFSET {
+        return value == other_value
+    }
+    if kind == regalloc.AT_INDEX {
+        return value == other_value and flag == other_flag
+    }
+    return b.strs[value] == b.strs[other_value] and flag == other_flag
 }
 
 // `#n` with 0 <= n <= 4095: what add, sub and cmp take as an immediate.
@@ -1146,14 +1187,15 @@ func small_imm(anon op: regalloc.Reg) -> bool {
     return v >= 0 and v <= 4095
 }
 
-// Appends a branch to `target` taken when condition `cond` holds, or when it
-// doesn't.
-func push_branch_on(anon out: regalloc.InsnBuf, anon cond: str, when_true: bool, target: str) -> none {
+// Appends a branch to `target` (an index into out's strings) taken when
+// condition `cond` holds, or when it doesn't.
+func push_branch_on(anon out: regalloc.InsnBuf, anon cond: str, when_true: bool, target: int64) -> none {
     mut name = cond
     if not when_true {
         name = opposite_condition(cond)
     }
-    out.push_branch_if(must regalloc.cond_named(name), reg: regalloc.NO_REG, :target)
+    let kind = regalloc.BRANCH_IF | (regalloc.cond_number(must regalloc.cond_named(name)) << 2)
+    out.put(regalloc.INSN_BRANCH | (kind << 8), a: regalloc.NO_REG, b: target)
 }
 
 // The symbol an extern calls: its name with the leading `_` of a C symbol,
@@ -19816,7 +19858,7 @@ type Codegen = shared struct {
             return body
         }
         let held = self.out_buf
-        let out = regalloc.InsnBuf()
+        let out = body.derived()
         for i in 0..n {
             for h, at in hoist_at {
                 if at == i {
@@ -19848,7 +19890,7 @@ type Codegen = shared struct {
                 }
             }
             if not drop[i] {
-                out.push_from(body, :i)
+                out.copy_from(body, :i)
             }
         }
         self.out_buf = held
@@ -20087,7 +20129,7 @@ type Codegen = shared struct {
                 lines += [k]
             }
         }
-        let out = regalloc.InsnBuf()
+        let out = body.derived()
         for i in 0..n {
             for m, to in tops {
                 let k = lines[m]
@@ -20095,15 +20137,15 @@ type Codegen = shared struct {
                     if moved_base[k] != regalloc.NO_REG and body.kind(k) == regalloc.INSN_MEM {
                         // The load through the new base, after that base's load.
                         out.push_slot(store: false, reg: moved_base[k], off: moved_base_slot[k])
-                        out.push_from(body, i: k)
+                        out.copy_from(body, i: k)
                         out.fb[out.n - 1] = moved_base[k]
                     } else {
-                        out.push_from(body, i: k)
+                        out.copy_from(body, i: k)
                     }
                 }
             }
             if not moved[i] {
-                out.push_from(body, :i)
+                out.copy_from(body, :i)
             }
         }
         return out
@@ -20148,13 +20190,15 @@ type Codegen = shared struct {
 
     // `body` with the patterns below folded, after a label `first` unless it's "".
     func peephole(self, anon body: regalloc.InsnBuf, vreg_start: int64, first: str) -> regalloc.InsnBuf {
-        let out = regalloc.InsnBuf()
+        let out = body.derived()
         if len(first) > 0 {
             out.push_label(first)
         }
         let n_local = len(self.pool.vreg_phys) - vreg_start
         if n_local <= 0 {
-            out.push_all(body)
+            for i in 0..body.n {
+                out.copy_from(body, :i)
+            }
             return out
         }
         let counts = regalloc.buf_vreg_counts(body, :vreg_start, :n_local)
@@ -20174,7 +20218,7 @@ type Codegen = shared struct {
                     if len(opposite_condition(cond)) > 0 {
                         // cbz/cbnz v, L
                         if (next_tag & 255) == regalloc.INSN_BRANCH and body.fa[i + 1] == v and ((next_op & 3) == regalloc.BRANCH_IF_ZERO or (next_op & 3) == regalloc.BRANCH_IF_NONZERO) {
-                            push_branch_on(out, cond, when_true: (next_op & 3) == regalloc.BRANCH_IF_NONZERO, target: body.target(i + 1))
+                            push_branch_on(out, cond, when_true: (next_op & 3) == regalloc.BRANCH_IF_NONZERO, target: body.fb[i + 1])
                             i += 2
                             continue
                         }
@@ -20185,7 +20229,7 @@ type Codegen = shared struct {
                                 // Eq and Ne are conditions 0 and 1.
                                 let on = third >> 10
                                 if on == 0 or on == 1 {
-                                    push_branch_on(out, cond, when_true: on == 1, target: body.target(i + 2))
+                                    push_branch_on(out, cond, when_true: on == 1, target: body.fb[i + 2])
                                     i += 3
                                     continue
                                 }
@@ -20219,7 +20263,7 @@ type Codegen = shared struct {
                     }
                 }
             }
-            out.push_from(body, :i)
+            out.copy_from(body, :i)
             i += 1
         }
         return out
@@ -20231,9 +20275,9 @@ type Codegen = shared struct {
     // (strictly). `excluded` are slots the prologue writes, outside `body`. As
     // many slots as fit, most used first: when the registers run out, half as
     // many. [] when none can be, and the caller allocates `body` as it was.
-    func promote_locals(self, anon body: [regalloc.Insn], vreg_start: int64, excluded: [int64]) -> [regalloc.Insn] {
-        if self.pool.evicted or arm64.line_count(body) > PROMOTE_MAX_INSNS {
-            return []
+    func promote_locals(self, anon body: regalloc.InsnBuf, vreg_start: int64, excluded: [int64]) -> regalloc.InsnBuf? {
+        if self.pool.evicted or arm64.buf_line_count(body) > PROMOTE_MAX_INSNS {
+            return none
         }
         // Each slot's offset and how often it's loaded or stored.
         mut offs: [int64] = []
@@ -20241,7 +20285,7 @@ type Codegen = shared struct {
         // Per line: the slot its access starts there, and how many lines it takes (0: none).
         mut line_slot: [int64] = []
         mut line_len: [int64] = []
-        let n = len(body)
+        let n = body.n
         for _ in 0..n {
             line_slot += [0]
             line_len += [0]
@@ -20252,30 +20296,34 @@ type Codegen = shared struct {
             mut first: int64 = i
             mut span: int64 = 0
             mut reg = regalloc.NO_REG
-            if body[i] is .Slot(_store, slot_reg, slot_off) {
-                if slot_off < 0 {
-                    reg = slot_reg
-                    off = slot_off
+            let tag = body.tags[i]
+            let variant = tag & 255
+            if variant == regalloc.INSN_SLOT {
+                if body.fb[i] < 0 {
+                    reg = body.fa[i]
+                    off = body.fb[i]
                     span = 1
                 }
             } else {
-                if not regalloc.names_fp(body[i]) {
+                if not regalloc.names_fp_at(body, i) {
                     i += 1
                     continue
                 }
                 // A `mut` argument's address: its slot stays in memory.
-                if body[i] is .Op(addr_op, _addr_dst, addr_base, addr_imm, _addr_d, _addr_flags) and addr_op is .Sub and addr_base == regalloc.FP and (addr_imm & 3) == 3 and arrays.contains(excluded, -(addr_imm >> 2)) {
+                let addr_imm = body.fc[i]
+                if tag == (regalloc.INSN_OP | (regalloc.OP_SUB << 8)) and body.fb[i] == regalloc.FP and (addr_imm & 3) == 3 and arrays.contains(excluded, -(addr_imm >> 2)) {
                     i += 1
                     continue
                 }
-                if is_frame_link(arm64.insn_text(body[i])) {
+                if is_frame_link(arm64.insn_text(body.at(i))) {
                     i += 1
                     continue
                 }
                 // A slot as `[fp, #-N]`.
-                if body[i] is .Mem(_load, width, mem_reg, mem_base, .Offset(mem_off)) {
-                    if mem_base == regalloc.FP and width >= 4 and mem_off < 0 {
-                        reg = mem_reg
+                if variant == regalloc.INSN_MEM and ((tag >> 9) & 3) == regalloc.AT_OFFSET {
+                    let mem_off = body.fc[i]
+                    if body.fb[i] == regalloc.FP and body.fd[i] >= 4 and mem_off < 0 {
+                        reg = body.fa[i]
                         off = mem_off
                         span = 1
                     }
@@ -20283,7 +20331,7 @@ type Codegen = shared struct {
             }
             if span == 0 or off >= 0 or reg == regalloc.NO_REG or regalloc.reg_width(reg) == 4 {
                 // Something else reads fp: leave every slot where it is.
-                return []
+                return none
             }
             line_slot[first] = off
             line_len[first] = span
@@ -20311,7 +20359,7 @@ type Codegen = shared struct {
             }
         }
         if len(cands) == 0 {
-            return []
+            return none
         }
         for a in 1..len(cands) {
             mut b = a
@@ -20336,7 +20384,7 @@ type Codegen = shared struct {
                 vregs += [regalloc.vreg(len(self.pool.vreg_phys))]
                 self.pool.vreg_phys += [regalloc.first_callee_saved()]
             }
-            mut out: [regalloc.Insn] = []
+            let rewritten = body.derived()
             mut j: int64 = 0
             for j < n {
                 if line_len[j] > 0 {
@@ -20347,31 +20395,36 @@ type Codegen = shared struct {
                         }
                     }
                     if which >= 0 {
-                        let access = body[j + line_len[j] - 1]
-                        if access is .Slot(store, slot_reg, _off) {
-                            if store {
-                                out += [.Mov(dst: vregs[which], src: slot_reg)]
+                        let access = j + line_len[j] - 1
+                        let tag = body.tags[access]
+                        let variant = tag & 255
+                        let access_reg = body.fa[access]
+                        // A Slot's store, or a Mem's load, has 1 in its sub field's low bit.
+                        let flag = ((tag >> 8) & 1) == 1
+                        if variant == regalloc.INSN_SLOT {
+                            if flag {
+                                rewritten.push_mov(dst: vregs[which], src: access_reg)
                             } else {
-                                out += [.Mov(dst: slot_reg, src: vregs[which])]
+                                rewritten.push_mov(dst: access_reg, src: vregs[which])
                             }
                             j += line_len[j]
                             continue
                         }
-                        if access is .Mem(load, _width, mem_reg, _base, _at) {
-                            if load {
-                                out += [.Mov(dst: mem_reg, src: vregs[which])]
+                        if variant == regalloc.INSN_MEM {
+                            if flag {
+                                rewritten.push_mov(dst: access_reg, src: vregs[which])
                             } else {
-                                out += [.Mov(dst: vregs[which], src: mem_reg)]
+                                rewritten.push_mov(dst: vregs[which], src: access_reg)
                             }
                             j += line_len[j]
                             continue
                         }
                     }
                 }
-                out += [body[j]]
+                rewritten.copy_from(body, i: j)
                 j += 1
             }
-            out = forward_copies(out, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
+            let out = forward_copies(rewritten, :vreg_start, n_local: len(self.pool.vreg_phys) - vreg_start)
             let first_promoted = saved_len - vreg_start
             if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true, droppable: first_promoted) {
                 return out
@@ -20379,7 +20432,7 @@ type Codegen = shared struct {
             self.pool.vreg_phys = self.pool.vreg_phys[0..saved_len]
             chosen = self.fewer_promoted(chosen, :first_promoted)
         }
-        return []
+        return none
     }
 
     // After a failed strict allocation of `chosen` (whose vregs are the local
@@ -21718,13 +21771,7 @@ type Codegen = shared struct {
         let checked = self.hoist_unique_checks(peeped)
         // Loads out of loops live across them, which only the strict allocation
         // of promoted locals keeps apart: used only when that succeeds.
-        let hoisted_buf = self.hoist_loop_loads(checked, :vreg_start)
-        // The passes below still read an [Insn] (docs/ir.md, step 12).
-        mut body_buf = checked.to_insns()
-        mut hoisted: [regalloc.Insn] = []
-        if self.loads_hoisted {
-            hoisted = hoisted_buf.to_insns()
-        }
+        let hoisted = self.hoist_loop_loads(checked, :vreg_start)
         self.rc_ctor_mark = -1
 
         // Run linear-scan regalloc over the function's vregs, reusing
@@ -21745,18 +21792,21 @@ type Codegen = shared struct {
         for off in self.addressed_offs {
             excluded += [off]
         }
-        mut promoted: [regalloc.Insn] = []
+        mut promoted: regalloc.InsnBuf? = none
         if self.loads_hoisted {
             promoted = self.promote_locals(hoisted, :vreg_start, :excluded)
         }
-        if len(promoted) == 0 {
-            promoted = self.promote_locals(body_buf, :vreg_start, :excluded)
+        if promoted is none {
+            promoted = self.promote_locals(checked, :vreg_start, :excluded)
         }
-        if len(promoted) > 0 {
-            body_buf = promoted
+        mut allocated = checked
+        if promoted is Some(p) {
+            allocated = p
         } else if not self.pool.evicted {
-            regalloc.run(:body_buf, pool: self.pool, :vreg_start)
+            regalloc.run(body_buf: checked, pool: self.pool, :vreg_start)
         }
+        // The passes below still read an [Insn] (docs/ir.md, step 12).
+        mut body_buf = allocated.to_insns()
         self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)
 
         // Round the callee-saved count up to an even number of registers

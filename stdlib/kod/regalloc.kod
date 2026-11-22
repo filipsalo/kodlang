@@ -558,6 +558,31 @@ func names_fp(anon insn: Insn) -> bool {
     }
 }
 
+// names_fp of instruction `i` of `body`.
+func names_fp_at(anon body: InsnBuf, anon i: int64) -> bool {
+    let tag = body.tags[i]
+    let variant = tag & 255
+    if variant == INSN_SLOT {
+        return true
+    }
+    if variant == INSN_MOV {
+        return body.fa[i] == FP or body.fb[i] == FP
+    }
+    if variant == INSN_MEM {
+        return body.fa[i] == FP or body.fb[i] == FP or (((tag >> 9) & 3) == AT_INDEX and body.fc[i] == FP)
+    }
+    if variant == INSN_OP {
+        return (body.fe[i] & INFO_FP) != 0
+    }
+    if variant == INSN_PAIR {
+        return body.fa[i] == FP or body.fb[i] == FP or body.fc[i] == FP
+    }
+    if variant == INSN_INTRINSIC {
+        return (intrinsic_flags(body.text(i)) & INFO_FP) != 0
+    }
+    return false
+}
+
 // What the passes need to know of an instruction at a glance: the INFO_ bits
 // and, from bit 8, its mnemonic code.
 func insn_flags(anon insn: Insn) -> int64 {
@@ -962,6 +987,20 @@ type InsnBuf = shared struct {
     // Appends an Op of opcode number `op`, its flags worked out (as `op` does).
     func push_new_op(self, anon op: int64, a: Reg = NO_REG, b: Reg = NO_REG, c: Reg = NO_REG, d: Reg = NO_REG) -> none {
         self.put(INSN_OP | (op << 8), :a, :b, :c, :d, e: op_flags(op: opcode_of(op), :a, :b, :c, :d))
+    }
+
+    // An empty InsnBuf for a pass to build from this one: it starts with this
+    // one's strings, so copy_from can copy an instruction of this one as it is,
+    // and room for as many instructions as this one has.
+    func derived(self) -> InsnBuf {
+        let room = self.n + 16
+        return InsnBuf(tags: [0] * room, fa: [0] * room, fb: [0] * room, fc: [0] * room, fd: [0] * room, fe: [0] * room, strs: self.strs)
+    }
+
+    // Appends instruction `i` of `src`, whose strings this one starts with
+    // (see `derived`).
+    func copy_from(self, anon src: InsnBuf, i: int64) -> none {
+        self.put(src.tags[i], a: src.fa[i], b: src.fb[i], c: src.fc[i], d: src.fd[i], e: src.fe[i])
     }
 
     // Appends every instruction of `src`.
@@ -1462,7 +1501,7 @@ func note_operand(anon operand: Reg, written: bool, line_idx: int64, vreg_start:
 // loop's backward branch, every register is in the pools, and running out of
 // them is a failure (false) instead of a fall back to the alloc-time
 // register, which only temporaries can share safely.
-func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = false, droppable: int64 = -1) -> bool {
+func run(body_buf: InsnBuf, pool: RegPool, vreg_start: int64, strict: bool = false, droppable: int64 = -1) -> bool {
     // Read through the pool: a second holder would make the write-back copy it.
     let vreg_end: int64 = len(pool.vreg_phys)
     let n_local: int64 = vreg_end - vreg_start
@@ -1472,151 +1511,90 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 
     let lv = Liveness(def_line: [-1] * n_local, last_use: [-1] * n_local, first: [-1] * n_local)
 
+    let body = body_buf
+    let n = body.n
     // clobbers_before[k]: how many lines before line k call something or
     // name a caller-saved register outright.
-    mut clobbers_before: [int64] = [0] * (len(body_buf) + 1)
+    mut clobbers_before: [int64] = [0] * (n + 1)
     // A cold block (codegen's emit_index_check) runs only at its check, so
     // its lines count as the check's line: what it reads isn't kept live to
     // where it's laid out.
-    let pos = cold_positions(body_buf)
-    mut line_idx: int64 = 0
-    mut ri: int64 = 0
-    for insn in body_buf {
-        line_idx = pos[ri]
+    let pos = cold_positions(body)
+    for ri in 0..n {
+        let line_idx = pos[ri]
         mut clobbers = 0
-        match insn {
-            .Slot(store, reg, _off) -> {
-                if reg_clobbers(reg) {
-                    clobbers = 1
-                }
-                let id = reg_vreg(reg)
-                if id >= vreg_start and id < vreg_start + n_local {
-                    let local_id = id - vreg_start
-                    if lv.first[local_id] < 0 {
-                        lv.first[local_id] = line_idx
-                    }
-                    // A load writes its register; a store reads it.
-                    if not store and lv.def_line[local_id] == -1 {
-                        lv.def_line[local_id] = line_idx
-                    }
-                    // Never earlier: a cold block's line counts as its check's.
-                    if lv.last_use[local_id] < line_idx {
-                        lv.last_use[local_id] = line_idx
-                    }
-                }
+        let tag = body.tags[ri]
+        let variant = tag & 255
+        let sub = tag >> 8
+        if variant == INSN_SLOT {
+            let reg = body.fa[ri]
+            if reg_clobbers(reg) {
+                clobbers = 1
             }
-            .Mov(dst, src) -> {
-                if reg_clobbers(dst) or reg_clobbers(src) {
-                    clobbers = 1
-                }
-                // As in its text: `dst` is written, then `src` read, on this line.
-                let d = reg_vreg(dst)
-                if d >= vreg_start and d < vreg_start + n_local {
-                    let local_id = d - vreg_start
-                    if lv.first[local_id] < 0 {
-                        lv.first[local_id] = line_idx
-                    }
-                    if lv.def_line[local_id] == -1 {
-                        lv.def_line[local_id] = line_idx
-                    }
-                    // Never earlier: a cold block's line counts as its check's.
-                    if lv.last_use[local_id] < line_idx {
-                        lv.last_use[local_id] = line_idx
-                    }
-                }
-                let r = reg_vreg(src)
-                if r >= vreg_start and r < vreg_start + n_local {
-                    let local_id = r - vreg_start
-                    if lv.first[local_id] < 0 {
-                        lv.first[local_id] = line_idx
-                    }
-                    // Never earlier: a cold block's line counts as its check's.
-                    if lv.last_use[local_id] < line_idx {
-                        lv.last_use[local_id] = line_idx
-                    }
-                }
+            // A load writes its register; a store reads it.
+            note_operand(reg, written: sub == 0, :line_idx, :vreg_start, :n_local, :lv)
+        } else if variant == INSN_MOV {
+            let dst = body.fa[ri]
+            let src = body.fb[ri]
+            if reg_clobbers(dst) or reg_clobbers(src) {
+                clobbers = 1
             }
-            .Data(_text) -> {
-                // Not an instruction.
+            // As in its text: `dst` is written, then `src` read, on this line.
+            note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(src, written: false, :line_idx, :vreg_start, :n_local, :lv)
+        } else if variant == INSN_INTRINSIC {
+            // Only the argument registers: no vregs.
+            if (intrinsic_flags(body.text(ri)) & INFO_CLOBBERS) != 0 {
+                clobbers = 1
             }
-            .Intrinsic(label) -> {
-                // Only the argument registers: no vregs.
-                if (intrinsic_flags(label) & INFO_CLOBBERS) != 0 {
-                    clobbers = 1
-                }
+        } else if variant == INSN_LOAD_CONST {
+            let dst = body.fa[ri]
+            if reg_clobbers(dst) {
+                clobbers = 1
             }
-            .LoadConst(dst, _value) -> {
-                if reg_clobbers(dst) {
-                    clobbers = 1
-                }
-                // The `mov` writes it; the `movk`s after it read and write it.
-                note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :lv)
+            // The `mov` writes it; the `movk`s after it read and write it.
+            note_operand(dst, written: true, :line_idx, :vreg_start, :n_local, :lv)
+        } else if variant == INSN_PAIR {
+            // No vregs: the frame link and the callee-saved registers.
+            if reg_clobbers(body.fa[ri]) or reg_clobbers(body.fb[ri]) {
+                clobbers = 1
             }
-            .Pair(_load, a, b, _base, _mode) -> {
-                // No vregs: the frame link and the callee-saved registers.
-                if reg_clobbers(a) or reg_clobbers(b) {
-                    clobbers = 1
-                }
+        } else if variant == INSN_MEM {
+            let reg = body.fa[ri]
+            let base = body.fb[ri]
+            mut index = NO_REG
+            if ((sub >> 1) & 3) == AT_INDEX {
+                index = body.fc[ri]
             }
-            .Mem(load, width, reg, base, at) -> {
-                let index = at_reg(at)
-                if reg_clobbers(reg) or reg_clobbers(base) or reg_clobbers(index) {
-                    clobbers = 1
-                }
-                // As in its text: `reg` (written by a load), then `base`, read.
-                let r = reg_vreg(reg)
-                if r >= vreg_start and r < vreg_start + n_local {
-                    let local_id = r - vreg_start
-                    if lv.first[local_id] < 0 {
-                        lv.first[local_id] = line_idx
-                    }
-                    if mem_writes(:load, :width) and lv.def_line[local_id] == -1 {
-                        lv.def_line[local_id] = line_idx
-                    }
-                    // Never earlier: a cold block's line counts as its check's.
-                    if lv.last_use[local_id] < line_idx {
-                        lv.last_use[local_id] = line_idx
-                    }
-                }
-                note_operand(base, written: false, :line_idx, :vreg_start, :n_local, :lv)
-                note_operand(index, written: false, :line_idx, :vreg_start, :n_local, :lv)
+            if reg_clobbers(reg) or reg_clobbers(base) or reg_clobbers(index) {
+                clobbers = 1
             }
-            .Op(op, a, b, c, d, flags) -> {
-                if (flags & INFO_CLOBBERS) != 0 {
-                    clobbers = 1
-                }
-                note_operand(a, written: writes_first_op(op), :line_idx, :vreg_start, :n_local, :lv)
-                note_operand(b, written: false, :line_idx, :vreg_start, :n_local, :lv)
-                note_operand(c, written: false, :line_idx, :vreg_start, :n_local, :lv)
-                note_operand(d, written: false, :line_idx, :vreg_start, :n_local, :lv)
+            // As in its text: `reg` (written by a load), then `base`, read.
+            note_operand(reg, written: mem_writes(load: (sub & 1) == 1, width: body.fd[ri]), :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(base, written: false, :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(index, written: false, :line_idx, :vreg_start, :n_local, :lv)
+        } else if variant == INSN_OP {
+            if (body.fe[ri] & INFO_CLOBBERS) != 0 {
+                clobbers = 1
             }
-            .Call(target) -> {
-                if not never_returns(target) and not keeps_regs(target) {
-                    clobbers = 1
-                }
+            note_operand(body.fa[ri], written: writes_first_op_number(sub), :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(body.fb[ri], written: false, :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(body.fc[ri], written: false, :line_idx, :vreg_start, :n_local, :lv)
+            note_operand(body.fd[ri], written: false, :line_idx, :vreg_start, :n_local, :lv)
+        } else if variant == INSN_CALL {
+            let target = body.text(ri)
+            if not never_returns(target) and not keeps_regs(target) {
+                clobbers = 1
             }
-            .Branch(_kind, reg, _target) -> {
-                if reg_clobbers(reg) {
-                    clobbers = 1
-                }
-                let id = reg_vreg(reg)
-                if id >= vreg_start and id < vreg_start + n_local {
-                    let local_id = id - vreg_start
-                    if lv.first[local_id] < 0 {
-                        lv.first[local_id] = line_idx
-                    }
-                    // Never earlier: a cold block's line counts as its check's.
-                    if lv.last_use[local_id] < line_idx {
-                        lv.last_use[local_id] = line_idx
-                    }
-                }
+        } else if variant == INSN_BRANCH {
+            let reg = body.fa[ri]
+            if reg_clobbers(reg) {
+                clobbers = 1
             }
-            .Label(_name) -> {
-                // Label lines hold a symbol, not asm — no vregs.
-            }
+            note_operand(reg, written: false, :line_idx, :vreg_start, :n_local, :lv)
         }
+        // Label and Data lines name no register.
         clobbers_before[ri + 1] = clobbers_before[ri] + clobbers
-        ri += 1
     }
 
     if strict {
@@ -1837,30 +1815,38 @@ func run(body_buf: [Insn], pool: RegPool, vreg_start: int64, strict: bool = fals
 // Each line's position for liveness: its own, or for a line of a cold block
 // (a label `Lcold...` some branch goes to, through its call to the panic)
 // the line of that branch.
-func cold_positions(anon body: [Insn]) -> [int64] {
+func cold_positions(anon body: InsnBuf) -> [int64] {
+    let n = body.n
     mut pos: [int64] = []
-    for i in 0..len(body) {
+    for i in 0..n {
         pos += [i]
     }
     mut origin = Map[str, int64]()
     mut any = false
-    for i, insn in body {
-        if insn is .Branch(_kind, _reg, target) and target.starts_with("Lcold") and origin.get(target) is none {
-            origin[target] = i
-            any = true
+    for i in 0..n {
+        if body.kind(i) == INSN_BRANCH {
+            let target = body.target(i)
+            if target.starts_with("Lcold") and origin.get(target) is none {
+                origin[target] = i
+                any = true
+            }
         }
     }
     if not any {
         return pos
     }
     mut at = -1
-    for i, insn in body {
-        if insn is .Label(name) and name.starts_with("Lcold") and not name.ends_with("_oob") {
-            at = origin.get(name)? or -1
+    for i in 0..n {
+        let variant = body.kind(i)
+        if variant == INSN_LABEL {
+            let name = body.text(i)
+            if name.starts_with("Lcold") and not name.ends_with("_oob") {
+                at = origin.get(name)? or -1
+            }
         }
         if at >= 0 {
             pos[i] = at
-            if insn is .Call(_target) {
+            if variant == INSN_CALL {
                 at = -1
             }
         }
@@ -1868,21 +1854,25 @@ func cold_positions(anon body: [Insn]) -> [int64] {
     return pos
 }
 
-func extend_over_loops(anon body: [Insn], lv: Liveness, pos: [int64]) -> none {
+func extend_over_loops(anon body: InsnBuf, lv: Liveness, pos: [int64]) -> none {
+    let n = body.n
     mut label_line = Map[str, int64]()
-    for i, insn in body {
+    for i in 0..n {
         // A statement's line marker and the skip after a release are never
         // where a branch goes back to, and are most of the labels.
-        if insn is .Label(name) and not name.starts_with("Lline") and not name.starts_with("Lrc") {
-            label_line.set(name, i)
+        if body.kind(i) == INSN_LABEL {
+            let name = body.text(i)
+            if not name.starts_with("Lline") and not name.starts_with("Lrc") {
+                label_line.set(name, i)
+            }
         }
     }
     mut tops: [int64] = []
     mut bottoms: [int64] = []
-    for i, insn in body {
+    for i in 0..n {
         // A cold block's jump back is no loop.
-        if insn is .Branch(_kind, _reg, branch_to) and pos[i] == i {
-            if label_line.get(branch_to) is Some(t) {
+        if body.kind(i) == INSN_BRANCH and pos[i] == i {
+            if label_line.get(body.target(i)) is Some(t) {
                 if t <= i {
                     tops += [t]
                     bottoms += [i]
