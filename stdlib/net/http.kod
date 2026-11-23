@@ -1333,3 +1333,218 @@ func put(anon url: str, anon body: bytes, content_type: str, options: Options = 
 func patch(anon url: str, anon body: bytes, content_type: str, options: Options = Options()) -> Response or Error {
     return try fetch("PATCH", url, options: with_body(options, body, content_type))
 }
+
+// ---- serving ----
+
+// A request as a server reads it (read_request, serve).
+type Incoming = shared struct {
+    method: str
+    // The path and query, as sent.
+    target: str
+    headers: Headers
+    body: bytes
+    // The client may send another request on the connection: HTTP/1.1 without
+    // `Connection: close`, or 1.0 with `keep-alive`.
+    keep_alive: bool = false
+
+    // `target` up to its query.
+    func path(self) -> str {
+        let q = self.target.find("?")
+        if q is not none {
+            return self.target[0..q]
+        }
+        return self.target
+    }
+
+    func text(self) -> str {
+        return kod_bytes_to_str(self.body)
+    }
+}
+
+// A response with `body`, for a handler to give back.
+func respond(anon status: int64, anon body: str, content_type: str = "text/plain; charset=utf-8") -> Response {
+    let headers = Headers()
+    headers.add("Content-Type", content_type)
+    return Response(:status, reason: "", :headers, body: kod_str_to_bytes(body))
+}
+
+// The usual reason phrase for `status`, or "".
+func reason_phrase(anon status: int64) -> str {
+    match status {
+        200 -> return "OK"
+        201 -> return "Created"
+        204 -> return "No Content"
+        301 -> return "Moved Permanently"
+        302 -> return "Found"
+        303 -> return "See Other"
+        304 -> return "Not Modified"
+        307 -> return "Temporary Redirect"
+        308 -> return "Permanent Redirect"
+        400 -> return "Bad Request"
+        401 -> return "Unauthorized"
+        403 -> return "Forbidden"
+        404 -> return "Not Found"
+        405 -> return "Method Not Allowed"
+        408 -> return "Request Timeout"
+        413 -> return "Content Too Large"
+        500 -> return "Internal Server Error"
+        501 -> return "Not Implemented"
+        503 -> return "Service Unavailable"
+        else -> return ""
+    }
+}
+
+type RequestLine = struct {
+    method: str
+    target: str
+    minor: int64
+}
+
+// `METHOD target HTTP/1.x`.
+func parse_request_line(anon line: str) -> RequestLine or Error {
+    let parts = line.split(" ")
+    if len(parts) != 3 or not is_token(parts[0]) {
+        throw protocol("bad request line")
+    }
+    let target = parts[1]
+    if len(target) == 0 or not is_clean(target, tab_ok: false) {
+        throw protocol("bad request target")
+    }
+    let version = parts[2]
+    if len(version) != 8 or not version.starts_with("HTTP/1.") or not is_digit(version[7]) {
+        throw protocol("bad HTTP version")
+    }
+    return RequestLine(method: parts[0], :target, minor: version[7] - 48)
+}
+
+func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
+    let budget = Budget(left: limits.max_header_bytes, headers: 0)
+    // Empty lines before a request are allowed (RFC 9112, 2.2).
+    mut line = ""
+    for len(line) == 0 {
+        let got = try br.read_line()
+        if got is none {
+            return none
+        }
+        line = got
+        budget.left = budget.left - len(line) - 2
+        if budget.left < 0 {
+            throw protocol("headers too large")
+        }
+    }
+    let start = try parse_request_line(line)
+    let headers = Headers()
+    try read_headers(br, budget, headers, max_headers: limits.max_headers)
+    mut body = kod_str_to_bytes("")
+    let codings = headers.all("transfer-encoding")
+    if len(codings) > 0 {
+        for v in codings {
+            if v.trim().lower() != "chunked" {
+                throw protocol(f"unsupported Transfer-Encoding {v}")
+            }
+        }
+        body = try read_chunked(br, budget, limits: limits)
+    } else {
+        let n = try read_length(headers, limits)
+        if n > 0 {
+            body = try br.read_exact(n)
+        }
+    }
+    mut keep_alive = has_token(headers, "connection", "keep-alive")
+    if start.minor >= 1 {
+        keep_alive = true
+    }
+    if has_token(headers, "connection", "close") {
+        keep_alive = false
+    }
+    return Incoming(method: start.method, target: start.target, :headers, :body, :keep_alive)
+}
+
+// The next request from `br`, or none when the connection ends before one
+// begins. A request without a body framed by Content-Length or chunks has
+// none.
+func read_request(anon br: BufReader, limits: Limits = Limits()) -> Incoming? or Error {
+    let old = br.limit
+    br.limit = limits.max_header_bytes
+    let r = read_incoming(br, limits)
+    br.limit = old
+    return r
+}
+
+// Writes `resp` with a Content-Length and, unless `keep_alive`,
+// `Connection: close`. An empty `reason` is the status's usual one.
+func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = false) -> none or Error {
+    let op = "write response"
+    if resp.status < 100 or resp.status > 599 {
+        throw invalid(op, "bad status")
+    }
+    for h in resp.headers.items {
+        if not is_token(h.name) {
+            throw invalid(op, f"bad header name {h.name}")
+        }
+        if not is_clean(h.value, tab_ok: true) {
+            throw invalid(op, f"bad value for header {h.name}")
+        }
+    }
+    mut reason = resp.reason
+    if len(reason) == 0 {
+        reason = reason_phrase(resp.status)
+    }
+    if not is_clean(reason, tab_ok: true) {
+        throw invalid(op, "bad reason")
+    }
+    let out = StrBuilder()
+    out.append(f"HTTP/1.1 {resp.status} {reason}\r\n")
+    for h in resp.headers.items {
+        if not own_header(h.name) {
+            out.append(h.name + ": " + h.value + "\r\n")
+        }
+    }
+    out.append("Content-Length: " + len(resp.body).to_str() + "\r\n")
+    if not keep_alive {
+        out.append("Connection: close\r\n")
+    }
+    out.append("\r\n")
+    out.append_bytes(resp.body)
+    try w.write_all(out.to_bytes())
+}
+
+// Answers the requests on one connection until it is to end.
+func serve_connection(anon conn: Fd, anon handler: func(Incoming) -> Response, limits: Limits) -> none or Error {
+    let br = BufReader(inner: conn, limit: limits.max_header_bytes)
+    for true {
+        let got = read_request(br, :limits)
+        if got is Err(e) {
+            if e is IoError(io) and io.kind == .Protocol {
+                let _ = write_response(conn, respond(400, f"{io.detail}\n"))
+            }
+            break
+        }
+        let req = got
+        if req is none {
+            break
+        }
+        let resp = handler(req)
+        if write_response(conn, resp, keep_alive: req.keep_alive) is Err(_) or not req.keep_alive {
+            break
+        }
+    }
+    try conn.close()
+}
+
+// Answers the requests that come to `l`, each connection in a task of its
+// own, each request by `handler` (docs/http.md#serving). Returns when
+// accepting fails, or the task is cancelled; its connections' tasks are then
+// cancelled and waited for.
+func serve(anon l: tcp.Listener, anon handler: func(Incoming) -> Response, limits: Limits = Limits()) -> none or Error {
+    for true {
+        let conn = try l.accept()
+        spawn handle_connection(conn, handler, limits)
+    }
+}
+
+// serve_connection as a task: an error of one connection (closing it, by
+// then) ends only that connection.
+func handle_connection(anon conn: Fd, anon handler: func(Incoming) -> Response, anon limits: Limits) -> none {
+    let _ = serve_connection(conn, handler, :limits)
+}

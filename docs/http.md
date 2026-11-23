@@ -2,10 +2,10 @@
 icon: lucide/globe
 ---
 
-# HTTP client
+# HTTP
 
 `stdlib/net/http.kod` makes HTTP/1.1 requests over TCP or TLS (see
-[TCP](io.md#tcp) and [TLS](io.md#tls)). Its parts that don't touch the
+[TCP](io.md#tcp) and [TLS](io.md#tls)), and [answers them](#serving). Its parts that don't touch the
 network, URLs, headers, writing a request to a `Writer` and reading a
 response from a `BufReader`, work on their own too.
 
@@ -266,6 +266,83 @@ import "net/http" { basic_auth, Options }
 let options = Options()
 options.headers.add("Authorization", try basic_auth("aladdin", "open sesame"))
 ```
+
+## Requests at the same time
+
+Inside [tasks](tasks.md), a request waits for the network while the other
+tasks run, so requests spawned together are made together, over TLS too:
+
+<!-- kod:
+import "net/http" { get }
+import "tasks"
+-->
+```kod
+func status_of(anon url: str) -> int64 or Error {
+    return (try get(url)).status
+}
+
+func check_all(anon urls: [str]) -> none {
+    mut checks: [tasks.Task[int64 or Error]] = []
+    for url in urls {
+        checks += [spawn status_of(url)]
+    }
+    for i, check in checks {
+        match check.wait() {
+            Ok(status) -> print(f"{urls[i]}: {status}")
+            Err(e) -> print(f"{urls[i]}: {e.to_str()}")
+        }
+    }
+}
+```
+
+Timeouts and deadlines hold for each task as they do without tasks. A
+`Client` can be shared between tasks; each request takes a connection of its
+own, from the idle ones or a new one. Looking up the host's address still
+holds up every task (see [Tasks](tasks.md#waiting-for-io)).
+
+## Serving
+
+`serve(listener, handler)` answers the requests that come to a
+[`tcp.Listener`](io.md#tcp): each connection is handled by a task of its own,
+and each request on it by `handler`, which gives back the `Response`.
+
+<!-- kod:
+import "net/tcp"
+-->
+```kod
+import "net/http" { Incoming, Response, respond, serve }
+
+func hello(anon req: Incoming) -> Response {
+    if req.path() != "/" {
+        return respond(404, "not found\n")
+    }
+    return respond(200, f"hello from {req.method} {req.target}\n")
+}
+
+func main() -> none or Error {
+    let l = try tcp.listen("127.0.0.1", port: 8080)
+    try serve(l, hello)
+}
+```
+
+A handler that waits, for a request of its own or a sleep, lets the other
+connections go on meanwhile. `serve` returns only when accepting fails, or
+when its task is cancelled (`task.cancel()`); then it cancels the connections'
+tasks and waits for them.
+
+| | |
+|---|---|
+| `Incoming` | `method`, `target` (path and query, as sent), `headers`, `body`; `path()` is `target` up to `?`, `text()` the body as text |
+| `respond(status, body, content_type = "text/plain; charset=utf-8")` | a `Response` with that body |
+| `serve(l, handler, limits = Limits())` | as above: `limits` caps each request's headers and body, as for a response |
+| `read_request(br, limits = Limits())` | the next request from a `BufReader`, or `none` when the connection ends before one begins |
+| `write_response(w, resp, keep_alive = false)` | writes `resp` with a `Content-Length` and, unless `keep_alive`, `Connection: close`; an empty `reason` is the status's usual one |
+
+A connection carries requests one after another, until the client sends
+`Connection: close` (or speaks HTTP/1.0 without `keep-alive`), a request
+can't be read, or the client goes away. A request's body is read by its
+`Content-Length` or chunked; anything wrong with the request ends the
+connection with a `400`.
 
 ## Building and reading by hand
 

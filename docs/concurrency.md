@@ -4,10 +4,11 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: being built. Milestones 1 to 5 of step 1 are in: `spawn`, `Task[T]`
+Status: being built. Milestones 1 to 6 of step 1 are in: `spawn`, `Task[T]`
 and `wait()`, a function waiting for its tasks, channels and `for v in ch`,
-tasks waiting for I/O, cancellation, `select`, generators and the helpers
-([Tasks](tasks.md) describes what works); the rest is a proposal. It describes what Kod would add for doing
+tasks waiting for I/O, cancellation, `select`, generators, the helpers, and
+HTTP and TLS in tasks with a server ([Tasks](tasks.md) describes what works);
+the rest is a proposal. It describes what Kod would add for doing
 several things at once, in two steps, and what it promises now so that those
 steps stay possible. The building blocks are Go's (tasks, channels, `select`),
 used in a structured way (a task belongs to the function that starts it), on

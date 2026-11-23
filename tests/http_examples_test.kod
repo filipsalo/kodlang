@@ -1,0 +1,71 @@
+// Run examples/fetch_all.kod against examples/hello_server.kod: the fetches
+// are made at the same time and the server answers them at the same time.
+//
+// The first test builds both; every run is bounded by `perl -e alarm`, so a
+// hang fails the test instead of the run.
+
+import "io"
+import "net/tcp"
+import "process"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+let KOD: str = "build/apps/kod/kod"
+let SERVER: str = "build/apps/hello_server/hello_server"
+let FETCH: str = "build/apps/fetch_all/fetch_all"
+
+// `argv` run for at most `seconds`, after which it is killed.
+func bounded(anon argv: [str], seconds: int64) -> process.ProcessResult {
+    return process.run(["perl", "-e", "alarm shift; exec @ARGV or die", f"{seconds}"] + argv)
+}
+
+func build(anon source: str) -> none {
+    let r = bounded([KOD, "build", source], seconds: 120)
+    if r.status != 0 {
+        fail(f"kod build {source}: status {r.status}\n{r.stdout}{r.stderr}")
+    }
+}
+
+test "the examples build" {
+    build("examples/hello_server.kod")
+    build("examples/fetch_all.kod")
+    assert io.is_file(SERVER)
+    assert io.is_file(FETCH)
+}
+
+func free_port() -> int64 {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    return port
+}
+
+test "fetch_all fetches from hello_server at the same time" {
+    let port = free_port()
+    let server = must process.start(["perl", "-e", "alarm shift; exec @ARGV or die", "30", SERVER, f"{port}"], stdin: .Null, stdout: .Null, stderr: .Null)
+    mut up = false
+    for _ in 0..500 {
+        if tcp.connect("127.0.0.1", :port) is Ok(conn) {
+            must conn.close()
+            up = true
+            break
+        }
+        time.sleep(Duration(ms: 10))
+    }
+    assert up
+    let base = f"http://127.0.0.1:{port}"
+    let t0 = monotonic_ns()
+    let r = bounded([FETCH, base + "/slow?ms=300", base + "/slow?ms=300", base + "/slow?ms=300", base + "/", base + "/nope"], seconds: 20)
+    let took = (monotonic_ns() - t0) / 1000000
+    let _ = server.kill()
+    let _ = server.wait()
+    assert r.status == 0
+    let lines = r.stdout.split("\n")
+    assert lines[0].starts_with("200 13 bytes ")
+    assert lines[0].ends_with(f" ms {base}/slow?ms=300")
+    assert lines[3].starts_with("200 6 bytes ")
+    assert lines[4].starts_with("404 10 bytes ")
+    assert lines[5].starts_with("5 in ")
+    // Three 300 ms requests one after another would take 900 ms.
+    assert took < 800
+}

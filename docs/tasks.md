@@ -76,8 +76,10 @@ waits, and that wait gives up:
 - a sleep ends at once, a `receive` gives `none` and a `send` isn't made;
 - `task.wait()` and `tasks.give_way()` go on as usual: they can't fail.
 
-A task that never waits can't be cancelled, and nothing cancels a detached
-task.
+`task.cancel()` cancels a task directly, unless it has ended; `task.wait()`
+then gives what the task gave back after giving up, an error from its wait
+for a fallible one. A task that never waits can't be cancelled, and nothing
+cancels a detached task.
 
 `tasks.within(d, body)` runs `body` as a task for at most `d`: it gives what
 `body` gives back, or an `IoError` of kind `.TimedOut` once `d` has passed, when
@@ -239,9 +241,14 @@ without tasks.
 Still holding up every task: `posix.poll`, `io.read_stdin_line` and the rest
 of `io`'s standard input (read through C's buffered `FILE`), looking up a
 host name (`getaddrinfo` has no form that doesn't block), and reading a
-regular file, which is ready at once. A task in `tcp.connect` waits for the
-connection however long it takes: the timeout holds only without tasks. Two
-tasks waiting to read one descriptor at the same time aren't supported.
+regular file, which is ready at once. Two tasks waiting to read one
+descriptor at the same time aren't supported.
+
+Timeouts hold in a task as without tasks: `tcp.connect`'s, and a socket's
+own (`tcp.set_timeout`, and so the HTTP client's), which ends a read or write
+that waits too long with `.TimedOut`. [HTTP](http.md#requests-at-the-same-time)
+has requests made at the same time, and a server that serves each connection
+in a task.
 
 ## Giving way
 
