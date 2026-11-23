@@ -1294,6 +1294,8 @@ func inline_body(anon p: parsing.Parser, anon expr_id: int64, params: [str]) -> 
 
 // The most expression and statement nodes a body inline_stmts compiles in place may have.
 let INLINE_MAX_NODES: int64 = 80
+// The same for a call in a loop, where inlining saves the most.
+let INLINE_LOOP_MAX_NODES: int64 = 160
 
 // The most nodes of inlined bodies one function takes in, nested ones counted
 // too (a quarter for a call in a loop), so a function of many calls doesn't
@@ -1303,9 +1305,9 @@ let INLINE_FUNC_BUDGET: int64 = 200
 // How many nodes the statements `stmts` of `p` have, or -1 when one is
 // something inline_stmts doesn't compile in place: a `match`, `for x in`,
 // `let ... else`, `throw`, `assert`, or an expression inline_expr_size refuses.
-// Past INLINE_MAX_NODES it stops counting and gives -1 too, so a long body costs little.
+// Past INLINE_LOOP_MAX_NODES it stops counting and gives -1 too, so a long body costs little.
 func inline_stmts_size(anon p: parsing.Parser, anon stmts: [int64]) -> int64 {
-    if len(stmts) > INLINE_MAX_NODES {
+    if len(stmts) > INLINE_LOOP_MAX_NODES {
         return -1
     }
     mut total: int64 = 0
@@ -1315,7 +1317,7 @@ func inline_stmts_size(anon p: parsing.Parser, anon stmts: [int64]) -> int64 {
             return -1
         }
         total += n
-        if total > INLINE_MAX_NODES {
+        if total > INLINE_LOOP_MAX_NODES {
             return -1
         }
     }
@@ -1375,6 +1377,12 @@ func inline_expr_size(anon p: parsing.Parser, anon id: int64) -> int64 {
             return n
         }
         .Call(callee, args) -> {
+            // A panic with a built message stays out of line: inlined, its
+            // pieces would be counted in slots that every call of the caller
+            // clears and checks, though the panic almost never happens.
+            if p.exprs[callee] is .Ident(name) and name == "panic" and len(args) == 1 and not (p.exprs[args[0].value] is .StrLit(_s)) {
+                return -1
+            }
             mut n = inline_size_sum(1, inline_expr_size(p, callee))
             for a in args {
                 n = inline_size_sum(n, inline_expr_size(p, a.value))
@@ -2921,12 +2929,14 @@ type Codegen = shared struct {
             return none
         }
         let size = inline_stmts_size(sig.src_p, fd.body)
-        // In a loop, where it pays, a body costs a quarter of its size.
+        // In a loop, where it pays, a body may be bigger and costs a quarter of its size.
         mut cost = size
+        mut max_nodes = INLINE_MAX_NODES
         if len(self.loop_stack) > 0 {
             cost = size / 4
+            max_nodes = INLINE_LOOP_MAX_NODES
         }
-        if size < 0 or size > INLINE_MAX_NODES or cost > self.inline_budget {
+        if size < 0 or size > max_nodes or cost > self.inline_budget {
             return none
         }
         mut skip: int64 = 0
