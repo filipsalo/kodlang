@@ -475,6 +475,9 @@ type Parser = shared struct {
     bad_lits: [int64] = []
     // Exprs written in parentheses, which may mix `and` and `or`.
     grouped: [int64] = []
+    // How many `spawn`s have been parsed: each numbers its hidden names, and a
+    // module with any imports `tasks` as `#spawn` (parse_module).
+    spawns: int64 = 0
     // Parallel to `patterns`: where each pattern's last token ends.
     pattern_ends: [int64] = []
     // Parallel to `type_exprs` up to the last qualified one: the module alias a
@@ -1801,6 +1804,62 @@ type Parser = shared struct {
         return result
     }
 
+    // `spawn f(a, b)`, `spawn detached f(a, b)` (ast.Expr.Spawn). The task runs a
+    // function literal that captures the arguments, which codegen stores where
+    // `spawn` is: `__spawnN_k` are names no source can use.
+    func parse_spawn(self, anon span: ast.Span) -> int64 {
+        mut detached = false
+        if self.at(.Identifier) and self.peek().value == "detached" and self.peek_kind_at(1) == .Identifier {
+            self.advance()
+            detached = true
+        }
+        let at = self.peek()
+        let call = self.parse_postfix(self.parse_primary())
+        let .Call(callee, args) = self.exprs[call] else {
+            self.record_error("error: `spawn` takes a call, as in `spawn fetch(url)`", got: at)
+            return call
+        }
+        self.spawns += 1
+        let n = self.spawns
+        mut inner_args: [ast.CallArg] = []
+        mut captures: [ast.Capture] = []
+        for k, arg in args {
+            if arg.by_ref {
+                self.record_error("error: `spawn` can't pass a `mut` argument: the task runs after this function has gone on", got: at)
+            }
+            let key = f"__spawn{n}_{k}"
+            let arg_span = self.expr_spans[arg.value]
+            inner_args += [ast.CallArg(label: arg.label, label_span: arg.label_span, value: self.alloc_expr(ast.Expr.Ident(name: key), span: arg_span))]
+            captures += [ast.Capture(key: key, span: arg_span)]
+        }
+        let inner = self.alloc_expr(ast.Expr.Call(:callee, args: inner_args), :span)
+        let ret = self.alloc_stmt(ast.Stmt.Return(value: inner))
+        let no_params: [ast.Param] = []
+        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, body: [ret], doc: "", :captures, spawned: true))
+        // A literal binds names inside an expression, which the Renamer looks for.
+        self.binding_exprs += 1
+        let lit = self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
+        mut group = self.alloc_expr(ast.Expr.Ident(name: "#group"), :span)
+        if detached {
+            group = self.alloc_expr(ast.Expr.NoneLit, :span)
+        }
+        let start = self.spawn_call("start", lit: lit, group: group, :span)
+        let start_none = self.spawn_call("start_none", lit: lit, group: group, :span)
+        return self.alloc_expr(ast.Expr.Spawn(:call, :decl_id, :start, :start_none, :detached), :span)
+    }
+
+    // `#spawn.name(lit, group: group)`: a call into `tasks` for `spawn`.
+    func spawn_call(self, anon name: str, lit: int64, group: int64, span: ast.Span) -> int64 {
+        let module = self.alloc_expr(ast.Expr.Ident(name: "#spawn"), :span)
+        let member = self.alloc_expr(ast.Expr.Ident(:name), :span)
+        let callee = self.alloc_expr(ast.Expr.Binary(lhs: module, op: .Dot, rhs: member), :span)
+        let args = [
+            ast.CallArg(label: "", label_span: span, value: lit),
+            ast.CallArg(label: "group", label_span: span, value: group),
+        ]
+        return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
+    }
+
     func parse_primary(self) -> int64 {
         let span: ast.Span = self.here()
         // `not x` is `x == false`, x taken at comparison precedence. The
@@ -1925,6 +1984,9 @@ type Parser = shared struct {
         // match expression
         if self.try_consume(.KwMatch) {
             return self.parse_match_expr(span)
+        }
+        if self.try_consume(.KwSpawn) {
+            return self.parse_spawn(span)
         }
         // Anonymous function: `func(params) -> R { ... }` in
         // expression position. Parses as a normal function decl
@@ -3680,6 +3742,12 @@ type Parser = shared struct {
             }
         }
         self.errors = kept
+        // `spawn` starts its tasks through `tasks`, imported under a name no source
+        // can write (parse_spawn).
+        if self.spawns > 0 {
+            let no_items: [str] = []
+            decls = [ast.Decl.Import(module_name: "tasks", local_name: "#spawn", items: no_items)] + decls
+        }
         return ast.Module(:decls)
     }
 
@@ -4294,6 +4362,13 @@ type Renamer = shared struct {
                 self.args(args)
             }
             .FuncLit(decl_id) -> self.literal(decl_id)
+            // The arguments are read where `spawn` is; the literal reads the rest.
+            .Spawn(call, _decl_id, start, _start_none, _detached) -> {
+                if self.p.exprs[call] is .Call(_callee, args) {
+                    self.args(args)
+                }
+                self.expr(start)
+            }
             else none
         }
     }

@@ -4,8 +4,9 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: a proposal; nothing on this page is built. It describes what Kod would
-add for doing several things at once, in two steps, and what it promises now
+Status: being built. Milestone 1 of step 1 is in: `spawn`, `Task[T]` and
+`wait()`, and a function waiting for its tasks ([Tasks](tasks.md) describes
+what works); the rest is a proposal. It describes what Kod would add for doing several things at once, in two steps, and what it promises now
 so that those steps stay possible. The building blocks are Go's (tasks,
 channels, `select`), used in a structured way (a task belongs to the function
 that starts it), on one thread: Kod doesn't share memory between threads.

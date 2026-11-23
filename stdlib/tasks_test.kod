@@ -1,3 +1,4 @@
+import "stream" { IoError }
 import "tasks"
 import "testing"
 
@@ -7,32 +8,52 @@ func note(anon what: str) -> none {
     trace += [what]
 }
 
-test "a task's result comes back through wait" {
-    let a = tasks.start(func() -> int64 { return 6 * 7 })
-    let b = tasks.start(func() -> str { return "hi" })
+func double(anon n: int64) -> int64 {
+    return n * 2
+}
+
+func greet(anon name: str) -> str {
+    return f"hi {name}"
+}
+
+test "a spawned call's result comes back through wait" {
+    let a = spawn double(21)
+    let b = spawn greet("kod")
     assert a.wait() == 42
-    assert b.wait() == "hi"
+    assert b.wait() == "hi kod"
     // A result can be waited for again.
     assert a.wait() == 42
 }
 
-test "tasks run when the starting one waits or gives way, in the order they became ready" {
+func count(anon xs: [str]) -> int64 {
+    return len(xs)
+}
+
+test "the arguments are evaluated where spawn is" {
+    mut x: int64 = 5
+    let t = spawn double(x)
+    x = 100
+    assert t.wait() == 10
+    mut names = ["a"]
+    let n = spawn count(names)
+    names += ["b"]
+    assert n.wait() == 1
+}
+
+func step(anon name: str) -> none {
+    note(f"{name}1")
+    tasks.give_way()
+    note(f"{name}2")
+}
+
+test "tasks run when the spawning one waits or gives way, in the order they became ready" {
     trace = []
-    let a = tasks.start_none(func() -> none {
-        note("a1")
-        tasks.give_way()
-        note("a2")
-    })
-    let b = tasks.start_none(func() -> none {
-        note("b1")
-        tasks.give_way()
-        note("b2")
-    })
+    spawn step("a")
+    spawn step("b")
     note("main")
     tasks.give_way()
     note("main again")
-    a.wait()
-    b.wait()
+    tasks.give_way()
     assert trace == ["main", "a1", "b1", "main again", "a2", "b2"]
 }
 
@@ -41,33 +62,127 @@ test "give_way with nothing else ready goes straight on" {
     tasks.give_way()
 }
 
-test "a task can start tasks and wait for them" {
-    let outer = tasks.start(func() -> int64 {
-        let inner = tasks.start(func() -> int64 { return 20 })
-        let other = tasks.start(func() -> int64 { return 22 })
-        return inner.wait() + other.wait()
-    })
-    assert outer.wait() == 42
+func start_two() -> none {
+    spawn step("x")
+    spawn step("y")
+    note("started")
+}
+
+test "a function returns only once the tasks it spawned have ended" {
+    trace = []
+    start_two()
+    note("returned")
+    assert trace == ["started", "x1", "y1", "x2", "y2", "returned"]
+}
+
+func early(anon stop: bool) -> int64 {
+    spawn step("e")
+    if stop {
+        return 1
+    }
+    return 2
+}
+
+func fails() -> int64 or Error {
+    spawn step("f")
+    throw IoError(kind: .InvalidInput, op: "fails", errno: 0, detail: "no")
+}
+
+test "an early return or an error still waits for the tasks" {
+    trace = []
+    assert early(true) == 1
+    assert trace == ["e1", "e2"]
+    trace = []
+    assert fails() is Err(_)
+    assert trace == ["f1", "f2"]
+}
+
+func spawn_detached() -> none {
+    spawn detached step("d")
+}
+
+test "a detached task outlives the function that spawned it" {
+    trace = []
+    spawn_detached()
+    note("returned")
+    tasks.give_way()
+    tasks.give_way()
+    assert trace == ["returned", "d1", "d2"]
+}
+
+func loops(anon n: int64) -> none {
+    for i in 0..n {
+        spawn step(f"l{i}")
+    }
+}
+
+test "every task a loop spawned is waited for at the end" {
+    trace = []
+    loops(3)
+    assert len(trace) == 6
+}
+
+type Counter = shared struct {
+    n: int64 = 0
+
+    func add(self, anon k: int64) -> int64 {
+        self.n += k
+        return self.n
+    }
+}
+
+func labelled(anon a: int64, b: int64, c: int64 = 100) -> int64 {
+    return a + b + c
+}
+
+test "methods, labelled arguments and function values can be spawned" {
+    let counter = Counter()
+    let first = spawn counter.add(2)
+    let second = spawn counter.add(3)
+    assert first.wait() + second.wait() == 7
+    assert counter.n == 5
+    assert (spawn labelled(1, b: 2)).wait() == 103
+    assert (spawn labelled(1, b: 2, c: 3)).wait() == 6
+    let f = func(anon n: int64) -> int64 { return n + 1 }
+    assert (spawn f(1)).wait() == 2
+}
+
+func sum_of_two() -> int64 {
+    let a = spawn double(10)
+    let b = spawn double(11)
+    return a.wait() + b.wait()
+}
+
+test "a task can spawn tasks and wait for them" {
+    assert (spawn sum_of_two()).wait() == 42
+}
+
+func slow() -> int64 {
+    tasks.give_way()
+    tasks.give_way()
+    return 7
+}
+
+func times(anon t: tasks.Task[int64], by: int64) -> int64 {
+    return t.wait() * by
 }
 
 test "several tasks can wait for one" {
-    let slow = tasks.start(func() -> int64 {
-        tasks.give_way()
-        tasks.give_way()
-        return 7
-    })
-    let x = tasks.start(func() -> int64 { return slow.wait() * 2 })
-    let y = tasks.start(func() -> int64 { return slow.wait() * 3 })
+    let s = spawn slow()
+    let x = spawn times(s, by: 2)
+    let y = spawn times(s, by: 3)
     assert x.wait() + y.wait() == 35
+}
+
+func echo(anon i: int64) -> int64 {
+    tasks.give_way()
+    return i
 }
 
 test "thousands of tasks" {
     mut all: [tasks.Task[int64]] = []
     for i in 0..5000 {
-        all += [tasks.start(func() -> int64 {
-            tasks.give_way()
-            return i
-        })]
+        all += [spawn echo(i)]
     }
     mut sum: int64 = 0
     for t in all {
@@ -84,36 +199,35 @@ func depth(anon n: int64) -> int64 {
 }
 
 test "a task's stack takes deep recursion" {
-    let t = tasks.start(func() -> int64 { return depth(100000) })
-    assert t.wait() == 100000
+    assert (spawn depth(100000)).wait() == 100000
 }
 
-test "values the task captured and gave back outlive it" {
-    let names = ["a", "b", "c"]
-    let t = tasks.start(func() -> [str] { return names + ["d"] })
-    let got = t.wait()
-    assert got == ["a", "b", "c", "d"]
-    assert names == ["a", "b", "c"]
+mut _self_task: tasks.Task[int64]? = none
+
+// Waits for itself, once main has kept its handle.
+func wait_self() -> int64 {
+    tasks.give_way()
+    return (must _self_task).wait()
 }
 
-test "waiting on a task that can't end is a deadlock" {
+test "waiting for a task that can't end is a deadlock" {
     let r = testing.run(func() {
-        mut me: tasks.Task[int64]? = none
-        let stuck = tasks.start(func() -> int64 { return (must me).wait() })
-        me = stuck
-        print(stuck.wait())
+        let t = spawn wait_self()
+        _self_task = t
+        print(t.wait())
     })
     assert r.status == 1
     assert r.stderr.contains("panic: all tasks are asleep: deadlock")
 }
 
+func boom() -> int64 {
+    panic("in the task")
+    return 0
+}
+
 test "a panic in a task stops the program" {
     let r = testing.run(func() {
-        let t = tasks.start(func() -> int64 {
-            panic("in the task")
-            return 0
-        })
-        print(t.wait())
+        print((spawn boom()).wait())
     })
     assert r.status == 1
     assert r.stderr.contains("panic: in the task")

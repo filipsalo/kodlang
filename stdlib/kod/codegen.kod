@@ -508,6 +508,9 @@ type LitEnv = shared struct {
     decl_id: int64
     keys: [str] = []
     kinds: [TypeKind] = []
+    // For `spawn`'s literal, which declares none: what it gives back, the kind of
+    // the call it makes.
+    return_kind: TypeKind? = none
 }
 
 // A pattern binding stored without counting (borrow_payload): its slot, the
@@ -1418,6 +1421,7 @@ func inline_expr_size(anon p: parsing.Parser, anon id: int64) -> int64 {
         .AsOptional(value) -> return inline_expr_size(p, value)
         .Try(_inner) -> return -1
         .FuncLit(_decl_id) -> return -1
+        .Spawn(_call, _decl_id, _start, _start_none, _detached) -> return -1
         .MatchExpr(_subject, _arms) -> return -1
         .OptionalMethodCall(_value, _method, _args) -> return -1
         else -> return 1
@@ -1707,6 +1711,10 @@ type Codegen = shared struct {
     stmt_error_mark: int64 = 0
     // Whether the function being compiled is a function literal.
     in_func_literal: bool = false
+    // `spawn`: the kind each of its literals gives back (by decl id), and the slot
+    // of the function's `#group` (0 until a `spawn` in it is compiled).
+    spawn_returns: Map[str, TypeKind] = Map[str, TypeKind]()
+    spawn_group_off: int64 = 0
     // The generic instance whose method bodies are being compiled, or -1.
     body_instance: int64 = -1
     // The enum instance whose method body is being compiled, or -1.
@@ -10849,6 +10857,7 @@ type Codegen = shared struct {
                 return .VImm(value: 0)
             }
             .OptionalMethodCall(value, method, args) -> return self.compile_optional_method_call(value_id: value, :method, :args)
+            .Spawn(call, decl_id, start, start_none, detached) -> return self.compile_spawn(call, :decl_id, :start, :start_none, :detached, span: self.p.expr_spans[expr_id])
             .FuncLit(decl_id) -> {
                 // The lambda was registered with a synthesised name
                 // and label during compile_module.
@@ -10857,7 +10866,7 @@ type Codegen = shared struct {
                     if self.mut_fn_value(self.fn_sig(slot), name: "", span: self.p.expr_spans[expr_id]) {
                         return .VImm(value: 0)
                     }
-                    if len(self.p.func_decls[decl_id].captures) > 0 {
+                    if len(self.p.func_decls[decl_id].captures) > 0 or self.p.func_decls[decl_id].spawned {
                         return self.compile_closure(decl_id, lbl: self.fn_label(slot))
                     }
                     return self.fn_address(slot)
@@ -14141,6 +14150,7 @@ type Codegen = shared struct {
     func compile_closure(self, anon decl_id: int64, lbl: str) -> Val {
         let fd = self.p.func_decls[decl_id]
         mut env = LitEnv(:decl_id)
+        env.return_kind = self.spawn_returns.get(f"{decl_id}")
         mut refs: [int64] = []
         mut ok = true
         for i, c in fd.captures {
@@ -14190,6 +14200,112 @@ type Codegen = shared struct {
         self.pool.free_reg(ptr_r)
         self.rc_mark_owned("x0", slot: rc_cell)
         return .VReg(name: "x0")
+    }
+
+    // What the task of `spawn` gives back: the kind of the call it wraps, which
+    // its literal `decl_id` gives back too (it declares none: the parser can't
+    // know the call's type).
+    func spawn_kind(self, anon call: int64, decl_id: int64) -> TypeKind {
+        let kind = self.infer_kind(call)
+        if kind is .KUnknown {
+            return kind
+        }
+        self.spawn_returns[f"{decl_id}"] = kind
+        let slot = self.lookup_lambda(decl_id)
+        if slot >= 0 {
+            self.func_sigs[slot].return_kind = kind
+        } else if slot <= -2 {
+            self.scope_fns[-2 - slot].sig.return_kind = kind
+        }
+        return kind
+    }
+
+    // `spawn f(a, b)` (ast.Expr.Spawn): the arguments go where the literal
+    // captures them from, the function's `#group` is made if this is its first
+    // `spawn` to run, and the literal starts as a task of that group (of none,
+    // detached). A `Task[T]` for a call that gives back a value, else nothing.
+    func compile_spawn(self, anon call: int64, decl_id: int64, start: int64, start_none: int64, detached: bool, span: ast.Span) -> Val {
+        if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 {
+            self.report_error("error: `spawn` can't be used in a generic function or type yet", :span)
+            return .VImm(value: 0)
+        }
+        let kind = self.spawn_kind(call, :decl_id)
+        if kind is .KUnknown {
+            self.report_error("error: cannot infer the type of the call `spawn` starts", :span)
+            return .VImm(value: 0)
+        }
+        let .Call(_callee, args) = self.p.exprs[call] else { return .VImm(value: 0) }
+        let fd = self.p.func_decls[decl_id]
+        for k, arg in args {
+            let arg_kind = self.infer_kind(arg.value)
+            if arg_kind is .KUnknown {
+                self.report_error("error: cannot infer the type of this argument to a spawned call; bind it to an annotated `let` first", span: self.p.expr_spans[arg.value])
+                return .VImm(value: 0)
+            }
+            let off = self.alloc_var(name: fd.captures[k].key, kind: arg_kind)
+            self.vars[-1].bound = true
+            self.compile_store(dest_off: off, kind: arg_kind, value_id: arg.value)
+        }
+        if not detached {
+            self.spawn_group()
+        }
+        if self.lookup_import_fn("#spawn", "start") < 0 {
+            return .VImm(value: 0)
+        }
+        if kind is .KVoid {
+            self.compile_discard(start_none)
+            return .VImm(value: 0)
+        }
+        if detached {
+            self.compile_discard(start)
+            return .VImm(value: 0)
+        }
+        return self.compile_expr(start)
+    }
+
+    // `#group = #spawn.group_of(#group)`: the function's group of tasks, made
+    // the first time a `spawn` in it runs.
+    func spawn_group(self) -> none {
+        if self.lookup_import_fn("#spawn", "group_of") < 0 {
+            self.report_error("error: `spawn` needs the `tasks` module, which wasn't loaded", span: ast.Span(start: 0))
+            return
+        }
+        let span = ast.Span(start: 0)
+        let module = self.p.alloc_expr(ast.Expr.Ident(name: "#spawn"), :span)
+        let member = self.p.alloc_expr(ast.Expr.Ident(name: "group_of"), :span)
+        let callee = self.p.alloc_expr(ast.Expr.Binary(lhs: module, op: .Dot, rhs: member), :span)
+        let group = self.p.alloc_expr(ast.Expr.Ident(name: "#group"), :span)
+        let get = self.p.alloc_expr(ast.Expr.Call(:callee, args: [ast.CallArg(label: "", label_span: span, value: group)]), :span)
+        let kind = self.fn_sig_of_import("#spawn", name: "group_of").return_kind
+        if self.spawn_group_off == 0 {
+            self.spawn_group_off = self.alloc_var(name: "#group", :kind)
+            self.vars[-1].bound = true
+        }
+        self.compile_store(dest_off: self.spawn_group_off, :kind, value_id: get)
+    }
+
+    func fn_sig_of_import(self, anon local_mod: str, name: str) -> SigInfo {
+        return self.import_fn_at(self.lookup_import_fn(local_mod, name)).sig
+    }
+
+    // Where a function that has spawned returns: it waits for the tasks of its
+    // `#group` first, keeping what it gives back in x0 around the call.
+    func emit_spawn_wait(self) -> none {
+        if self.spawn_group_off == 0 {
+            return
+        }
+        if self.lookup_import_fn("#spawn", "wait_group") < 0 {
+            return
+        }
+        self.frame_slots += 1
+        let keep = 0 - self.frame_slots * 8
+        self.emit_str_raw(keep, reg: "x0")
+        self.emit_ldr(self.spawn_group_off, reg: "x0")
+        let none_spawned = self.fresh("Lspawned")
+        self.emit_jump_zero("x0", target: none_spawned)
+        self.emit_call(self.import_fn_at(self.lookup_import_fn("#spawn", "wait_group")).label)
+        self.emit_label(none_spawned)
+        self.emit_ldr(keep, reg: "x0")
     }
 
     func compile_indirect_call(self, callee_id: int64, args: [ast.CallArg]) -> Val {
@@ -16209,6 +16325,16 @@ type Codegen = shared struct {
                     return ret.optional()
                 }
                 return .KUnknown
+            }
+            .Spawn(call, decl_id, start, _start_none, detached) -> {
+                let result = self.spawn_kind(call, :decl_id)
+                if detached or result is .KVoid {
+                    return .KVoid
+                }
+                if result is .KUnknown {
+                    return .KUnknown
+                }
+                return self.infer_kind(start)
             }
             .FuncLit(decl_id) -> {
                 // Same shape as a named function reference — return
@@ -21595,6 +21721,7 @@ type Codegen = shared struct {
         self.limit_fn_locals = []
         self.bound_log = []
         self.frame_slots = 0
+        self.spawn_group_off = 0
         let no_inline_slots: [int64] = []
         self.inline_free_slots = no_inline_slots
         self.inline_budget = INLINE_FUNC_BUDGET
@@ -21700,6 +21827,9 @@ type Codegen = shared struct {
         // would end up in the wrong code.
         self.ret_lbl = f"L{func_lbl}$end"
         self.return_kind = self.resolve_type(func_decl.return_typ)
+        if lit_env is Some(env) and env.return_kind is Some(spawned) {
+            self.return_kind = spawned
+        }
         self.tail_setup(func_decl, :func_lbl, :by_ref_params, has_captures: lit_env is Some(_e))
 
         self.emit_globl(func_lbl)
@@ -21776,6 +21906,7 @@ type Codegen = shared struct {
         if self.rc_heap_kind(self.return_kind) {
             self.emit_label(f"{self.ret_lbl}_own")
         }
+        self.emit_spawn_wait()
         // Each `mut` parameter's value goes back to the caller's slot, which
         // takes its reference over: the slot is emptied so it isn't released.
         for ri, name in by_ref_params {
@@ -22082,7 +22213,7 @@ type Codegen = shared struct {
             }
         }
         for ld_id in lambda_decl_ids {
-            if len(self.p.func_decls[ld_id].captures) == 0 {
+            if len(self.p.func_decls[ld_id].captures) == 0 and not self.p.func_decls[ld_id].spawned {
                 self.compile_func(fd_id: ld_id, struct_name: "", override_lbl: "")
             }
         }

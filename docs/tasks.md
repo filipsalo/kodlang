@@ -10,6 +10,8 @@ then the next ready one runs. Nothing is shared between threads, so there are
 no data races. [Concurrency (design)](concurrency.md) is the plan this is the
 start of; what is below is what is built.
 
+## `spawn`
+
 <!-- kod:
 func fetch_user(anon id: int64) -> str {
     return f"user {id}"
@@ -19,40 +21,82 @@ func fetch_orders(anon id: int64) -> int64 {
 }
 -->
 ```kod
-import "tasks"
-
-let user = tasks.start(func() -> str { return fetch_user(7) })
-let orders = tasks.start(func() -> int64 { return fetch_orders(7) })
-print(user.wait())      // user 7
-print(orders.wait())    // 14
+let user = spawn fetch_user(7)        // tasks.Task[str]
+let orders = spawn fetch_orders(7)    // tasks.Task[int64]
+print(user.wait())                    // user 7
+print(orders.wait())                  // 14
 ```
 
-| | |
-|---|---|
-| `tasks.start(body: func() -> T) -> Task[T]` | runs `body` as a new task, which starts the next time this one waits or gives way |
-| `tasks.start_none(body: func() -> none) -> NoneTask` | the same for a body that gives back nothing; its `wait()` gives back nothing too |
-| `task.wait() -> T` | what `body` gave back, once the task has ended; until then this task waits |
-| `tasks.give_way()` | lets the tasks that are ready run, then goes on |
+`spawn` takes a call. The arguments are evaluated where `spawn` is, and the
+call then runs as a new task, which starts the next time the spawning one
+waits or gives way. For a call that gives back a value, `spawn` gives a
+`tasks.Task[T]`, and `task.wait()` gives that value once the task has ended;
+until then the waiting task waits. A result can be waited for any number of
+times, by any task. A call that gives back nothing is spawned as a statement:
+`spawn log(line)`.
 
-A task's result can be waited for any number of times, by any task. Tasks run
+The function, method or function value called is any a call can name:
+`spawn fetch(url)`, `spawn conn.serve(req)`, `spawn handler(event)`, with
+labels and defaults as in the call. A receiver or function value is the one
+the name holds where `spawn` is. A `mut` argument can't be passed: the task
+runs after the spawning function has gone on.
+
+`spawn` needs no import; a module that uses it imports `tasks` on its own, and
+naming the type in an annotation (`tasks.Task[int64]`) needs `import "tasks"`.
+
+## Tasks belong to the function that spawns them
+
+A function doesn't return while a task it spawned is running: where it
+returns, by `return`, by `throw` or through a `try`, it first waits for each
+of its tasks that hasn't ended. So no task is left running by mistake, and
+`main` waits for its tasks before the program ends.
+
+<!-- kod:
+func fetch(anon url: str) -> none {
+}
+-->
+```kod
+func fetch_all(anon urls: [str]) -> none {
+    for url in urls {
+        spawn fetch(url)
+    }
+}   // returns once every fetch has ended
+```
+
+A task that should outlive its function is started with `spawn detached`: it
+gives no `Task`, nothing waits for it, and it runs until its call returns or
+the program ends.
+
+<!-- kod:
+func serve(anon n: int64) -> none {
+}
+let n = 1
+-->
+```kod
+spawn detached serve(n)
+```
+
+## Giving way
+
+`tasks.give_way()` lets the tasks that are ready run, then goes on. Tasks run
 in the order they became ready: a new one after those already waiting to run,
-and one that gives way after the others.
+and one that gives way after the others. A task gives way only where it
+waits; until then the others wait for it.
 
 Waiting for a task that can't end, because every task is waiting (a task
 waiting for itself, say), stops the program:
-`panic: all tasks are asleep: deadlock`.
-
-A program that ends ends its tasks too, finished or not. A panic in a task
-stops the program, as anywhere.
+`panic: all tasks are asleep: deadlock`. A panic in a task stops the program,
+as anywhere.
 
 Each task has 8 MB of stack, as the program's first thread has, reserved as
 address space and used only as far as the task goes, with a guard page below
-it: a recursion too deep for it stops the program, as on the first thread.
+it: a recursion too deep for it stops the program, as on the first thread. A
+switch from one task to another costs about 50 ns.
 
 ## What isn't built yet
 
-The `spawn` syntax, a function waiting for its tasks at its end, cancellation,
-channels, `select`, generators, and tasks waiting for I/O instead of blocking
-the thread: these come in that order, as
-[Concurrency (design)](concurrency.md#building-it) lays out. Until the I/O
-part lands, reading a socket or sleeping holds up every task.
+`spawn` doesn't work in a generic function or type yet. Cancellation,
+channels, `select`, generators, preemption, and tasks waiting for I/O instead
+of blocking the thread come in that order, as
+[Concurrency (design)](concurrency.md#building-it) lays out. Until the I/O part
+lands, reading a socket or sleeping holds up every task.
