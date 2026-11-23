@@ -171,3 +171,92 @@ test "within gives the result in time, or a timeout and cancels" {
     }
     assert ms_since(t0) < 500
 }
+
+func slow_value(anon ms: int64, anon value: int64) -> int64 or Error {
+    time.sleep(Duration(ms: ms))
+    return value
+}
+
+func slow_failure(anon ms: int64) -> int64 or Error {
+    time.sleep(Duration(ms: ms))
+    throw IoError(kind: .InvalidInput, op: "slow", errno: 0, detail: "failed")
+}
+
+test "tasks.all gives the results in order, at the same time" {
+    let t0 = monotonic_ns()
+    let got = must tasks.all([
+        func() -> int64 or Error { return slow_value(60, 1) },
+        func() -> int64 or Error { return slow_value(20, 2) },
+        func() -> int64 or Error { return slow_value(40, 3) },
+    ])
+    assert got == [1, 2, 3]
+    assert ms_since(t0) < 150
+}
+
+test "tasks.all gives the first error and cancels the rest" {
+    let t0 = monotonic_ns()
+    let got = tasks.all([
+        func() -> int64 or Error { return slow_value(5000, 1) },
+        func() -> int64 or Error { return slow_failure(20) },
+    ])
+    assert got is Err(_)
+    assert ms_since(t0) < 500
+}
+
+test "tasks.first gives the first success and cancels the rest" {
+    let t0 = monotonic_ns()
+    let got = tasks.first([
+        func() -> int64 or Error { return slow_value(5000, 1) },
+        func() -> int64 or Error { return slow_failure(10) },
+        func() -> int64 or Error { return slow_value(30, 3) },
+    ])
+    assert must got == 3
+    assert ms_since(t0) < 500
+    let none_ok = tasks.first([func() -> int64 or Error { return slow_failure(5) }])
+    assert none_ok is Err(_)
+}
+
+mut running: int64 = 0
+mut most: int64 = 0
+
+func square_slowly(anon x: int64) -> int64 {
+    running += 1
+    if running > most {
+        most = running
+    }
+    time.sleep(Duration(ms: 20))
+    running -= 1
+    return x * x
+}
+
+test "tasks.map_concurrently keeps the order and the limit" {
+    most = 0
+    let t0 = monotonic_ns()
+    let got = tasks.map_concurrently([1, 2, 3, 4, 5, 6], square_slowly, limit: 3)
+    assert got == [1, 4, 9, 16, 25, 36]
+    assert most == 3
+    assert ms_since(t0) < 120
+}
+
+func bump_slowly(anon m: tasks.Mutex) -> none {
+    m.lock()
+    let seen = counter
+    time.sleep(Duration(ms: 10))
+    counter = seen + 1
+    m.unlock()
+}
+
+mut counter: int64 = 0
+
+// Returns once the three have ended.
+func bump_three(anon m: tasks.Mutex) -> none {
+    spawn bump_slowly(m)
+    spawn bump_slowly(m)
+    spawn bump_slowly(m)
+}
+
+test "a Mutex keeps a value held across a wait" {
+    counter = 0
+    bump_three(tasks.Mutex())
+    assert counter == 3
+}

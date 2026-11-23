@@ -470,3 +470,184 @@ func _wait_until_done(anon fiber: Fiber, ns: int64) -> bool {
     let _gone = _io.remove(key)
     return fiber.done
 }
+
+// Runs `job` as a new task, belonging to no function: the helpers below wait
+// for their tasks themselves.
+func _start_job(anon job: Job) -> Fiber {
+    let fiber = _new_fiber()
+    fiber.job = job
+    _make_ready(fiber)
+    return fiber
+}
+
+// Waits, as the running task, until one of `fibers` has ended: its index.
+func _wait_any(anon fibers: [Fiber]) -> int64 {
+    for true {
+        for i, fiber in fibers {
+            if fiber.done {
+                return i
+            }
+        }
+        let me = _running()
+        for fiber in fibers {
+            fiber.waiters += [me]
+        }
+        _switch_from(me)
+    }
+    return -1
+}
+
+func _fibers_of[T](anon tasks: [Task[T]]) -> [Fiber] {
+    mut out: [Fiber] = []
+    for t in tasks {
+        out += [t.fiber]
+    }
+    return out
+}
+
+// Cancels each of `fibers` and waits for them.
+func _cancel_all(anon fibers: [Fiber]) -> none {
+    for fiber in fibers {
+        _cancel(fiber)
+    }
+    for fiber in fibers {
+        _wait_for(fiber)
+    }
+}
+
+// The indexes of `fibers` not in `seen`, in order.
+func _unseen(anon seen: [bool]) -> [int64] {
+    mut out: [int64] = []
+    for i, s in seen {
+        if not s {
+            out += [i]
+        }
+    }
+    return out
+}
+
+func _pick(anon fibers: [Fiber], anon at: [int64]) -> [Fiber] {
+    mut out: [Fiber] = []
+    for i in at {
+        out += [fibers[i]]
+    }
+    return out
+}
+
+// Each of `fs` as a task: their results in order, or the first error to
+// come, once the others are cancelled and have ended.
+func all[T](anon fs: [func() -> T or Error]) -> [T] or Error {
+    mut started: [Task[T or Error]] = []
+    for f in fs {
+        started += [start(f)]
+    }
+    let fibers = _fibers_of(started)
+    mut seen = [false] * len(fibers)
+    for _ in 0..len(fibers) {
+        let open = _unseen(seen)
+        let k = open[_wait_any(_pick(fibers, open))]
+        seen[k] = true
+        let result = started[k].wait()
+        if result is Err(e) {
+            _cancel_all(fibers)
+            throw e
+        }
+    }
+    mut out: [T] = []
+    for t in started {
+        out += [must t.wait()]
+    }
+    return out
+}
+
+// Each of `fs` as a task: the first result that isn't an error, once the
+// others are cancelled and have ended, or the last error when all fail.
+func first[T](anon fs: [func() -> T or Error]) -> T or Error {
+    mut started: [Task[T or Error]] = []
+    for f in fs {
+        started += [start(f)]
+    }
+    let fibers = _fibers_of(started)
+    mut seen = [false] * len(fibers)
+    mut last: Error? = none
+    for _ in 0..len(fibers) {
+        let open = _unseen(seen)
+        let k = open[_wait_any(_pick(fibers, open))]
+        seen[k] = true
+        let result = started[k].wait()
+        if result is Err(e) {
+            last = e
+        } else {
+            _cancel_all(fibers)
+            return must result
+        }
+    }
+    throw must last
+}
+
+// `f(x)` as a job: a generic literal can't capture `x`, a generic struct can
+// hold it.
+type _Apply[T, U] = shared struct {
+    f: func(T) -> U
+    x: T
+    results: [U] = []
+
+    func run(self) -> none {
+        self.results = [self.f(self.x)]
+    }
+}
+
+// `f` of each of `xs`, in order, with at most `limit` calls running at a time
+// (at least one).
+func map_concurrently[T, U](anon xs: [T], anon f: func(T) -> U, limit: int64) -> [U] {
+    mut jobs: [_Apply[T, U]] = []
+    for x in xs {
+        jobs += [_Apply[T, U](:f, :x)]
+    }
+    mut most = limit
+    if most < 1 {
+        most = 1
+    }
+    mut running: [Fiber] = []
+    mut all_fibers: [Fiber] = []
+    for job in jobs {
+        if len(running) == most {
+            let k = _wait_any(running)
+            running = running[0..k] + running[k + 1..len(running)]
+        }
+        let fiber = _start_job(job)
+        running += [fiber]
+        all_fibers += [fiber]
+    }
+    for fiber in all_fibers {
+        _wait_for(fiber)
+    }
+    mut out: [U] = []
+    for job in jobs {
+        out += [job.results[0]]
+    }
+    return out
+}
+
+// For a value held across a wait (docs/tasks.md): `lock` waits until no other
+// task holds it.
+type Mutex = shared struct {
+    held: bool = false
+    waiters: [Fiber] = []
+
+    func lock(self) -> none {
+        for self.held {
+            self.waiters += [_running()]
+            _park()
+        }
+        self.held = true
+    }
+
+    func unlock(self) -> none {
+        if not self.held {
+            panic("unlock of a Mutex that isn't locked")
+        }
+        self.held = false
+        self.waiters = _wake_all(self.waiters)
+    }
+}

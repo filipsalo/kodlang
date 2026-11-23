@@ -143,6 +143,18 @@ shared structs too: every task is on the one thread. A channel of an
 optional type can't tell `none` sent from closed, as `T?` of an optional is
 that optional.
 
+## Helpers
+
+| | |
+|---|---|
+| `tasks.all(fs: [func() -> T or Error]) -> [T] or Error` | runs each call as a task and gives back their results in order, or the first error to come, after cancelling the others |
+| `tasks.first(fs: [func() -> T or Error]) -> T or Error` | runs each as a task and gives back the first result that isn't an error, cancelling the others, or the last error when all fail |
+| `tasks.map_concurrently(xs: [T], f: func(T) -> U, limit: int64) -> [U]` | `f` of each of `xs`, in order, with at most `limit` calls running at a time |
+| `tasks.Mutex()` | `lock()` waits until no other task holds it, `unlock()` lets the next one have it |
+
+On one thread, nothing runs between two waits, so a `Mutex` is only for a
+value held across a wait: read it, wait for I/O, write it back.
+
 ## Waiting for I/O
 
 A task that would wait for the outside world lets the others run meanwhile:
