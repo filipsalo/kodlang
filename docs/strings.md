@@ -347,7 +347,7 @@ kept. A `StrBuilder` is a handle: copies of it (`let b = a`) share one buffer.
 A `ByteBuffer` is a growable buffer of bytes that, unlike a `StrBuilder`, can
 read back what it holds and copy from itself. Decompressors are what it is
 for: [`compress/inflate`](encoding.md#decompression) writes its output into
-one.
+one, and the compiler builds its object files in them.
 
 ```kod
 import "bytebuffer" { ByteBuffer }
@@ -364,15 +364,19 @@ assert out.at(2) == 0x63
 |--------|---------|
 | `push(b: int64)` | add one byte; only the low 8 bits are used |
 | `push_bytes(b: bytes)` | add bytes |
+| `push_le(value: int64, size: int64)` | add the low `size` bytes of `value`, lowest first (little-endian); `size` from 0 to 8 |
+| `push_buffer(other: ByteBuffer)` | add the bytes of `other` |
 | `copy_back(distance: int64, length: int64)` | add `length` bytes, each a copy of the one `distance` before it, so a `distance` shorter than `length` repeats the last `distance` bytes |
 | `at(i: int64) -> int64` | the byte at `i`, 0 to 255 |
+| `set(i: int64, b: int64)` | replace the byte at `i`; only the low 8 bits of `b` are used |
 | `len() -> int64` | bytes so far |
 | `to_bytes() -> bytes` | a copy of the content; the buffer stays usable |
 
-`at` panics for an index outside `0..len()`, and `copy_back` for a
-`distance` outside `1..len()` or a negative `length`, the way indexing an
-array out of range does. The buffer doubles when it is full. Like a
-`StrBuilder`, a `ByteBuffer` is a handle: copies of it share one buffer.
+`at` and `set` panic for an index outside `0..len()`, `push_le` for a `size`
+outside `0..8`, and `copy_back` for a `distance` outside `1..len()` or a
+negative `length`, the way indexing an array out of range does. The buffer
+doubles when it is full. Like a `StrBuilder`, a `ByteBuffer` is a handle:
+copies of it share one buffer.
 
 ## Conversion
 
