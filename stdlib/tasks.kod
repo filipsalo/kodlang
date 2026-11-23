@@ -237,3 +237,92 @@ func _finish() -> none {
     _leave_from = fiber.ctx
     _leave_to = next.ctx
 }
+
+// Carries values from tasks that send to tasks that receive, in order
+// (docs/tasks.md). A sender adds its value and then waits until at most
+// `capacity` of the values sent up to its own are still to be received: with
+// 0, until its own is.
+type Channel[T] = shared struct {
+    capacity: int64 = 0
+    // Sent and not received: `items` from `head` on.
+    items: [T] = []
+    head: int64 = 0
+    sent: int64 = 0
+    taken: int64 = 0
+    closed: bool = false
+    // Tasks waiting to receive, and to have what they sent received.
+    receivers: [Fiber] = []
+    senders: [Fiber] = []
+
+    func send(self, anon value: T) -> none {
+        if self.closed {
+            panic("send on a closed channel")
+        }
+        self.items += [value]
+        self.sent += 1
+        let ticket = self.sent
+        self.receivers = _wake_all(self.receivers)
+        for self.taken < ticket - self.capacity {
+            if self.closed {
+                panic("send on a closed channel")
+            }
+            self.senders += [_running()]
+            _park()
+        }
+    }
+
+    // The next value, once there is one; none once the channel is closed and
+    // every value has been received.
+    func receive(self) -> T? {
+        if self.has_next() {
+            return self.take()
+        }
+        return none
+    }
+
+    // Waits until a value can be received, or the channel is closed and empty;
+    // whether one can. `for v in ch` is `has_next` and `take`: nothing runs
+    // between them, since a task gives way only where it waits.
+    func has_next(self) -> bool {
+        for self.head == len(self.items) and not self.closed {
+            self.receivers += [_running()]
+            _park()
+        }
+        return self.head < len(self.items)
+    }
+
+    // The next value, which `has_next` said is there.
+    func take(self) -> T {
+        let value = self.items[self.head]
+        self.head += 1
+        self.taken += 1
+        if self.head >= 64 and self.head * 2 >= len(self.items) {
+            self.items = self.items[self.head..len(self.items)]
+            self.head = 0
+        }
+        self.senders = _wake_all(self.senders)
+        return value
+    }
+
+    func close(self) -> none {
+        if self.closed {
+            panic("close of a closed channel")
+        }
+        self.closed = true
+        self.receivers = _wake_all(self.receivers)
+        self.senders = _wake_all(self.senders)
+    }
+}
+
+// Makes each of `fibers` ready; gives back the empty list to keep.
+func _wake_all(anon fibers: [Fiber]) -> [Fiber] {
+    for fiber in fibers {
+        _make_ready(fiber)
+    }
+    return []
+}
+
+// Waits, as the running task, until something makes it ready again.
+func _park() -> none {
+    _switch_from(_running())
+}

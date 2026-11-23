@@ -232,3 +232,114 @@ test "a panic in a task stops the program" {
     assert r.status == 1
     assert r.stderr.contains("panic: in the task")
 }
+
+func produce(anon out: tasks.Channel[int64], anon n: int64) -> none {
+    for i in 0..n {
+        out.send(i)
+    }
+    out.close()
+}
+
+test "for v in ch receives each value until the channel is closed" {
+    let ch = tasks.Channel[int64]()
+    spawn produce(ch, 5)
+    mut got: [int64] = []
+    for v in ch {
+        got += [v]
+    }
+    assert got == [0, 1, 2, 3, 4]
+    assert ch.receive() is none
+}
+
+func send_noting(anon ch: tasks.Channel[str], anon values: [str]) -> none {
+    for v in values {
+        ch.send(v)
+        note(f"sent {v}")
+    }
+}
+
+test "an unbuffered send waits for its receive" {
+    trace = []
+    let ch = tasks.Channel[str]()
+    spawn send_noting(ch, ["a", "b"])
+    tasks.give_way()
+    note("receiving")
+    note(f"got {must ch.receive()}")
+    note(f"got {must ch.receive()}")
+    tasks.give_way()
+    assert trace == ["receiving", "got a", "sent a", "got b", "sent b"]
+}
+
+test "a buffered send waits only when the channel is full" {
+    trace = []
+    let ch = tasks.Channel[str](capacity: 2)
+    spawn send_noting(ch, ["a", "b", "c"])
+    tasks.give_way()
+    // Two fit; the third waits for a receive.
+    assert trace == ["sent a", "sent b"]
+    assert must ch.receive() == "a"
+    tasks.give_way()
+    assert trace == ["sent a", "sent b", "sent c"]
+    assert must ch.receive() == "b"
+    assert must ch.receive() == "c"
+}
+
+func worker(anon jobs: tasks.Channel[int64], results: tasks.Channel[int64]) -> none {
+    for j in jobs {
+        results.send(j * j)
+    }
+}
+
+test "several tasks can send to and receive from one channel" {
+    let jobs = tasks.Channel[int64](capacity: 4)
+    let results = tasks.Channel[int64](capacity: 100)
+    spawn worker(jobs, :results)
+    spawn worker(jobs, :results)
+    spawn worker(jobs, :results)
+    for i in 1..11 {
+        jobs.send(i)
+    }
+    jobs.close()
+    mut sum: int64 = 0
+    for _ in 0..10 {
+        sum += must results.receive()
+    }
+    assert sum == 385
+}
+
+test "a closed channel gives its values, then none" {
+    let ch = tasks.Channel[str](capacity: 3)
+    ch.send("x")
+    ch.send("y")
+    ch.close()
+    assert must ch.receive() == "x"
+    assert must ch.receive() == "y"
+    assert ch.receive() is none
+    assert ch.receive() is none
+}
+
+test "sending on a closed channel panics, and so does closing one twice" {
+    let send = testing.run(func() {
+        let ch = tasks.Channel[int64](capacity: 1)
+        ch.close()
+        ch.send(1)
+    })
+    assert send.status == 1
+    assert send.stderr.contains("panic: send on a closed channel")
+    let twice = testing.run(func() {
+        let ch = tasks.Channel[int64]()
+        ch.close()
+        ch.close()
+    })
+    assert twice.status == 1
+    assert twice.stderr.contains("panic: close of a closed channel")
+}
+
+test "receiving from a channel nothing will send to is a deadlock" {
+    let r = testing.run(func() {
+        let ch = tasks.Channel[int64]()
+        print(ch.receive() is none)
+    })
+    assert r.status == 1
+    assert r.stderr.contains("panic: all tasks are asleep: deadlock")
+}

@@ -4,12 +4,14 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: being built. Milestone 1 of step 1 is in: `spawn`, `Task[T]` and
-`wait()`, and a function waiting for its tasks ([Tasks](tasks.md) describes
-what works); the rest is a proposal. It describes what Kod would add for doing several things at once, in two steps, and what it promises now
-so that those steps stay possible. The building blocks are Go's (tasks,
-channels, `select`), used in a structured way (a task belongs to the function
-that starts it), on one thread: Kod doesn't share memory between threads.
+Status: being built. Milestones 1 and 2 of step 1 are in: `spawn`, `Task[T]`
+and `wait()`, a function waiting for its tasks, channels and `for v in ch`
+([Tasks](tasks.md) describes what works); the rest is a proposal. It describes
+what Kod would add for doing several things at once, in two steps, and what it
+promises now so that those steps stay possible. The building blocks are Go's
+(tasks, channels, `select`), used in a structured way (a task belongs to the
+function that starts it), on one thread: Kod doesn't share memory between
+threads.
 
 ## What it is for
 
@@ -142,8 +144,10 @@ let page = try tasks.within(Duration(s: 5), func() -> Page or Error {
 
 ### Channels
 
-`Channel[T]` is a builtin type, like `Map`: it needs no import, since `spawn`,
-`select` and `for v in ch` are part of the language too, as `chan` is in Go.
+`Channel[T]` is `tasks.Channel[T]`, as `Task[T]` is `tasks.Task[T]`: the
+scheduler they call can't move into the builtins, whose module would then
+have variables, which stops the compiler inlining any builtin into other
+modules. `for v in ch` is the language's, as `chan` is Go's.
 
 <!-- no-check -->
 ```kod
@@ -392,9 +396,6 @@ designed when there is a program that needs it.
   `process.start(argv, stdin: .Null, stdout: .Null, stderr: .Null)` and its
   pid, is gone already.
 - **`IoKind` gains `.Cancelled`**, the error a cancelled task's wait gives.
-- **`Channel` joins the builtin type names** that only the builtins may
-  declare (`Map`, `Option`, `Error`, ...); no code in the repository has a
-  type of that name.
 - **New mutable module state in the stdlib** is a cost for step 2; keep it to
   what a worker could have its own copy of.
 - **Blocking calls go through a few low-level functions** (`posix.Fd.read`

@@ -76,6 +76,42 @@ let n = 1
 spawn detached serve(n)
 ```
 
+## Channels
+
+A `tasks.Channel[T]` carries values from tasks that send them to tasks that
+receive them, in the order they were sent:
+
+<!-- kod:
+import "tasks"
+func produce(anon out: tasks.Channel[int64]) -> none {
+    for i in 0..3 {
+        out.send(i)
+    }
+    out.close()
+}
+-->
+```kod
+let numbers = tasks.Channel[int64]()             // unbuffered
+spawn produce(numbers)
+for n in numbers {                                // until it is closed
+    print(n)
+}
+```
+
+| | |
+|---|---|
+| `tasks.Channel[T](capacity: n)` | a channel that holds up to `n` values no task has received yet; `n` is 0 when left out |
+| `ch.send(value)` | adds `value`; waits while `capacity` values sent before it haven't been received, so with 0 until a task receives this one |
+| `ch.receive() -> T?` | the next value; waits while there is none, and gives `none` once the channel is closed and every value has been received |
+| `ch.close()` | no more values will come: those waiting to receive get `none` once the rest are received |
+| `for v in ch` | receives each value until the channel is closed and empty |
+
+Sending on a closed channel, or closing one twice, panics, as in Go; so does a
+send still waiting when its channel is closed. A channel can carry any value,
+shared structs too: every task is on the one thread. A channel of an
+optional type can't tell `none` sent from closed, as `T?` of an optional is
+that optional.
+
 ## Giving way
 
 `tasks.give_way()` lets the tasks that are ready run, then goes on. Tasks run
@@ -83,8 +119,8 @@ in the order they became ready: a new one after those already waiting to run,
 and one that gives way after the others. A task gives way only where it
 waits; until then the others wait for it.
 
-Waiting for a task that can't end, because every task is waiting (a task
-waiting for itself, say), stops the program:
+Waiting that can't end, because every task is waiting (for a task, a channel
+or a send to be received; a task waiting for itself, say), stops the program:
 `panic: all tasks are asleep: deadlock`. A panic in a task stops the program,
 as anywhere.
 
@@ -96,7 +132,7 @@ switch from one task to another costs about 50 ns.
 ## What isn't built yet
 
 `spawn` doesn't work in a generic function or type yet. Cancellation,
-channels, `select`, generators, preemption, and tasks waiting for I/O instead
+`select`, generators, preemption, and tasks waiting for I/O instead
 of blocking the thread come in that order, as
 [Concurrency (design)](concurrency.md#building-it) lays out. Until the I/O part
 lands, reading a socket or sleeping holds up every task.
