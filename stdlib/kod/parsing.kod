@@ -1804,6 +1804,118 @@ type Parser = shared struct {
         return result
     }
 
+    // `select { receive(ch) is v -> ... send(ch, x) -> ... after(d) -> ... else -> ... }`
+    // (docs/tasks.md), as statements: each channel and value is held in a local,
+    // each case is told to a `#spawn.Selector`, its `choose` gives the index of the
+    // arm to run (-1 for `else`), and a chain of `if`s runs it, doing the receive
+    // or send that can now go at once. All in an `if true` block, for its scope.
+    func parse_select(self, anon span: ast.Span) -> int64 {
+        self.spawns += 1
+        let n = self.spawns
+        let sel = f"__sel{n}"
+        mut setup: [int64] = []
+        setup += [self.alloc_stmt(ast.Stmt.Let(name: sel, typ: 0, value: self.spawn_member_call("Selector", recv: "", args: [], :span), mutable: false))]
+        mut prefixes: [[int64]] = []
+        mut bodies: [[int64]] = []
+        mut else_body: [int64] = []
+        mut has_else = false
+        self.expect(.OpenCurly)
+        self.skip_newlines()
+        for not self.at(.CloseCurly) and not self.at(.EOF) {
+            if self.try_consume(.KwElse) {
+                self.expect(.Arrow)
+                else_body = self.parse_select_body()
+                has_else = true
+                self.skip_newlines()
+                continue
+            }
+            let at = self.peek()
+            let word = self.expect_identifier()
+            let k = len(bodies)
+            let ch = f"{sel}_{k}"
+            mut prefix: [int64] = []
+            self.expect(.OpenParen)
+            if word == "receive" {
+                setup += [self.alloc_stmt(ast.Stmt.Let(name: ch, typ: 0, value: self.parse_expr(), mutable: false))]
+                self.expect(.CloseParen)
+                setup += [self.spawn_stmt_call(sel, method: "add_receive", arg: ch, :span)]
+                mut bound = "_"
+                if self.try_consume(.KwIs) {
+                    bound = self.expect_identifier()
+                }
+                prefix += [self.alloc_stmt(ast.Stmt.Let(name: bound, typ: 0, value: self.select_method(ch, method: "receive_now", arg: "", :span), mutable: false))]
+            } else if word == "send" {
+                setup += [self.alloc_stmt(ast.Stmt.Let(name: ch, typ: 0, value: self.parse_expr(), mutable: false))]
+                self.expect(.Comma)
+                let value = f"{ch}_value"
+                setup += [self.alloc_stmt(ast.Stmt.Let(name: value, typ: 0, value: self.parse_expr(), mutable: false))]
+                self.expect(.CloseParen)
+                setup += [self.spawn_stmt_call(sel, method: "add_send", arg: ch, :span)]
+                prefix += [self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.select_method(ch, method: "send", arg: value, :span)))]
+            } else if word == "after" {
+                let wait = f"{ch}_wait"
+                setup += [self.alloc_stmt(ast.Stmt.Let(name: wait, typ: 0, value: self.parse_expr(), mutable: false))]
+                self.expect(.CloseParen)
+                setup += [self.spawn_stmt_call(sel, method: "add_after", arg: wait, :span)]
+            } else {
+                self.record_error("error: a `select` arm is `receive(ch)`, `receive(ch) is v`, `send(ch, value)`, `after(d)` or `else`", got: at)
+            }
+            self.expect(.Arrow)
+            prefixes += [prefix]
+            bodies += [self.parse_select_body()]
+            self.skip_newlines()
+        }
+        self.expect(.CloseCurly)
+        let chosen = f"{sel}_chosen"
+        let flag = self.alloc_expr(ast.Expr.BoolLit(value: has_else), :span)
+        let choose = self.select_call_expr(sel, method: "choose", args: [ast.CallArg(label: "", label_span: span, value: flag)], :span)
+        setup += [self.alloc_stmt(ast.Stmt.Let(name: chosen, typ: 0, value: choose, mutable: false))]
+        mut chain = else_body
+        mut k = len(bodies) - 1
+        for k >= 0 {
+            let lhs = self.alloc_expr(ast.Expr.Ident(name: chosen), :span)
+            let rhs = self.alloc_expr(ast.Expr.IntLit(value: k), :span)
+            let cond = self.alloc_expr(ast.Expr.Binary(:lhs, op: .Eq, :rhs), :span)
+            chain = [self.alloc_stmt(ast.Stmt.If(:cond, then_body: prefixes[k] + bodies[k], else_body: chain))]
+            k -= 1
+        }
+        let yes = self.alloc_expr(ast.Expr.BoolLit(value: true), :span)
+        return self.alloc_stmt(ast.Stmt.If(cond: yes, then_body: setup + chain, else_body: []))
+    }
+
+    func parse_select_body(self) -> [int64] {
+        if self.at(.OpenCurly) {
+            return self.parse_block()
+        }
+        return [self.parse_stmt()]
+    }
+
+    // `recv.method(arg)` (no argument for ""), names a parser-made local.
+    func select_method(self, anon recv: str, method: str, arg: str, span: ast.Span) -> int64 {
+        mut args: [ast.CallArg] = []
+        if len(arg) > 0 {
+            args += [ast.CallArg(label: "", label_span: span, value: self.alloc_expr(ast.Expr.Ident(name: arg), :span))]
+        }
+        return self.select_call_expr(recv, :method, :args, :span)
+    }
+
+    func select_call_expr(self, anon recv: str, method: str, args: [ast.CallArg], span: ast.Span) -> int64 {
+        let lhs = self.alloc_expr(ast.Expr.Ident(name: recv), :span)
+        let member = self.alloc_expr(ast.Expr.Ident(name: method), :span)
+        let callee = self.alloc_expr(ast.Expr.Binary(:lhs, op: .Dot, rhs: member), :span)
+        return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
+    }
+
+    // `sel.method(arg)` as a statement.
+    func spawn_stmt_call(self, anon sel: str, method: str, arg: str, span: ast.Span) -> int64 {
+        return self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.select_method(sel, :method, :arg, :span)))
+    }
+
+    // `#spawn.name(args)`.
+    func spawn_member_call(self, anon name: str, recv: str, args: [ast.CallArg], span: ast.Span) -> int64 {
+        return self.select_call_expr("#spawn", method: name, :args, :span)
+    }
+
     // `spawn f(a, b)`, `spawn detached f(a, b)` (ast.Expr.Spawn). The task runs a
     // function literal that captures the arguments, which codegen stores where
     // `spawn` is: `__spawnN_k` are names no source can use.
@@ -2882,6 +2994,11 @@ type Parser = shared struct {
             return self.alloc_stmt(ast.Stmt.Assert(expr: value, :source_text, :span))
         }
 
+        if self.at(.KwSelect) {
+            let select_span = self.here()
+            self.advance()
+            return self.parse_select(select_span)
+        }
         // if / else. `if expr is Pat { body }` is sugar for a one-arm
         // match-statement (with bindings from Pat scoped to body).
         if self.try_consume(.KwIf) {

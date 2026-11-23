@@ -350,9 +350,36 @@ type Channel[T] = shared struct {
     func has_next(self) -> bool {
         for self.head == len(self.items) and not self.closed and not _running().cancelled {
             self.receivers += [_running()]
+            // A `select` that waits to send sees a receiver come.
+            self.senders = _wake_all(self.senders)
             _park()
         }
         return self.head < len(self.items)
+    }
+
+    // The next value if there is one now, without waiting; none otherwise.
+    func receive_now(self) -> T? {
+        if self.head < len(self.items) {
+            return self.take()
+        }
+        return none
+    }
+
+    // For `select` (Selectable).
+    func ready_to_receive(self) -> bool {
+        return self.head < len(self.items) or self.closed
+    }
+
+    func ready_to_send(self) -> bool {
+        return self.closed or self.sent - self.taken < self.capacity or len(self.receivers) > 0
+    }
+
+    func wait_to_receive(self, anon fiber: Fiber) -> none {
+        self.receivers += [fiber]
+    }
+
+    func wait_to_send(self, anon fiber: Fiber) -> none {
+        self.senders += [fiber]
     }
 
     // The next value, which `has_next` said is there.
@@ -650,4 +677,136 @@ type Mutex = shared struct {
         self.held = false
         self.waiters = _wake_all(self.waiters)
     }
+}
+
+// A channel as `select` sees it, whatever its values' type.
+interface Selectable {
+    func ready_to_receive(self) -> bool
+    func ready_to_send(self) -> bool
+    func wait_to_receive(self, anon fiber: Fiber) -> none
+    func wait_to_send(self, anon fiber: Fiber) -> none
+}
+
+// What a `select` waits for (parsing.parse_select): its arms in order, each
+// a receive (0), a send (1) or an `after` (2), with its channel or wait.
+type Selector = shared struct {
+    kinds: [int64] = []
+    channels: [Selectable] = []
+    // For each arm, its index in `channels`, or -1.
+    channel_at: [int64] = []
+    waits: [int64] = []
+
+    func add_receive(self, anon ch: Selectable) -> none {
+        self._add(0, :ch)
+    }
+
+    func add_send(self, anon ch: Selectable) -> none {
+        self._add(1, :ch)
+    }
+
+    func _add(self, anon kind: int64, ch: Selectable) -> none {
+        self.kinds += [kind]
+        self.channel_at += [len(self.channels)]
+        self.channels += [ch]
+        self.waits += [0]
+    }
+
+    func add_after(self, anon d: Duration) -> none {
+        self.kinds += [2]
+        self.channel_at += [-1]
+        self.waits += [d.ns]
+    }
+
+    // The arm to run: one that can go now, at random among those; -1 for
+    // `else` when none can and there is one; else, once one can, waiting.
+    func choose(self, anon has_else: bool) -> int64 {
+        let me = _running()
+        mut timer_key: int64 = 0
+        mut timer_arm: int64 = -1
+        for true {
+            let ready = self._ready()
+            if len(ready) > 0 {
+                _forget(timer_key)
+                return ready[_random(len(ready))]
+            }
+            if timer_key != 0 and not _io.contains(timer_key) {
+                return timer_arm
+            }
+            if has_else {
+                return -1
+            }
+            if me.cancelled {
+                _forget(timer_key)
+                return self._cancelled_arm()
+            }
+            if timer_key == 0 {
+                timer_arm = self._soonest()
+                if timer_arm >= 0 {
+                    _io_next += 1
+                    timer_key = _io_next
+                    if kod_task_kq_add(0, -7, self.waits[timer_arm], timer_key) != 0 {
+                        return timer_arm
+                    }
+                    _io[timer_key] = me
+                }
+            }
+            for i, kind in self.kinds {
+                if kind == 0 {
+                    self.channels[self.channel_at[i]].wait_to_receive(me)
+                } else if kind == 1 {
+                    self.channels[self.channel_at[i]].wait_to_send(me)
+                }
+            }
+            _switch_from(me)
+        }
+        return -1
+    }
+
+    func _ready(self) -> [int64] {
+        mut ready: [int64] = []
+        for i, kind in self.kinds {
+            if kind == 0 and self.channels[self.channel_at[i]].ready_to_receive() {
+                ready += [i]
+            } else if kind == 1 and self.channels[self.channel_at[i]].ready_to_send() {
+                ready += [i]
+            }
+        }
+        return ready
+    }
+
+    // The `after` arm with the shortest wait, or -1.
+    func _soonest(self) -> int64 {
+        mut best: int64 = -1
+        for i, kind in self.kinds {
+            if kind == 2 and (best < 0 or self.waits[i] < self.waits[best]) {
+                best = i
+            }
+        }
+        return best
+    }
+
+    // A cancelled task's `select`: its first receive, else its first `after`,
+    // else `else`.
+    func _cancelled_arm(self) -> int64 {
+        for i, kind in self.kinds {
+            if kind == 0 {
+                return i
+            }
+        }
+        return self._soonest()
+    }
+}
+
+func _forget(anon key: int64) -> none {
+    if key != 0 {
+        let _gone = _io.remove(key)
+    }
+}
+
+// Picks among ready `select` arms (a linear congruential generator).
+mut _seed: int64 = 12345
+
+func _random(anon n: int64) -> int64 {
+    _seed = (_seed * 1103515245 + 12345) % 2147483648
+    return (_seed / 65536) % n
 }

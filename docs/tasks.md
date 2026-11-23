@@ -143,6 +143,45 @@ shared structs too: every task is on the one thread. A channel of an
 optional type can't tell `none` sent from closed, as `T?` of an optional is
 that optional.
 
+## `select`
+
+`select` waits for whichever of several channel operations can go first:
+
+<!-- kod:
+import "tasks"
+import "time" { Duration }
+let results = tasks.Channel[int64](capacity: 1)
+let jobs = tasks.Channel[str](capacity: 1)
+let next = "job"
+mut total: int64 = 0
+mut sent: int64 = 0
+-->
+```kod
+select {
+    receive(results) is r -> total += r? or 0
+    send(jobs, next) -> sent += 1
+    after(Duration(seconds: 5)) -> print("nothing for 5 s")
+    else -> print("nothing ready")
+}
+```
+
+Each channel and each value to send is evaluated first, in order. Then the
+arm whose operation can go at once runs, picked at random among those that
+can, so that none is passed over for good:
+
+- `receive(ch) is v` when `ch` has a value or is closed: `v` is what
+  `ch.receive()` gives, a `T?` that is `none` once the channel is closed and
+  empty; `receive(ch)` drops it;
+- `send(ch, value)` when `ch` can take the value without the sender waiting
+  for long (it has room, or a task is waiting to receive), or is closed, when
+  the send panics;
+- `after(d)` once `d` has passed and nothing else has gone;
+- `else` at once, when nothing else can go.
+
+Without `else`, `select` waits until an arm can go. A cancelled task's
+`select` takes its first `receive` arm (with `none` if nothing is there), or
+its first `after`, or `else`.
+
 ## Helpers
 
 | | |
