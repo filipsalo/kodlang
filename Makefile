@@ -299,10 +299,9 @@ test: stage1 kod
 
 # The poisoned pass writes link.local.cfg, so one that is there already is not
 # ours to replace; the trap removes ours and rebuilds however the pass ends.
-# Files `kod fmt` is kept off: their spacing or import order is what they test
-# (errors that point at a line), or they don't parse on purpose.
-FMT_SKIP := tests/unit/match_negative_literal_test.kod tests/dep_parse_error_dep.kod \
-    tests/import_name_twice.kod tests/type_names_variant_alias.kod
+# Files `kod fmt` is kept off: their spacing is what they test, or they don't
+# parse on purpose.
+FMT_SKIP := tests/unit/match_negative_literal_test.kod tests/dep_parse_error_dep.kod
 fmt-check: kod
 	@$(KOD_APP)/kod fmt --check $(filter-out $(FMT_SKIP),$(shell git ls-files '*.kod'))
 
