@@ -277,6 +277,11 @@ Logical operators: `and`, `or`, `not`. Comparison: `==`, `!=`, `<`, `<=`, `>`,
 `not a and b` is `(not a) and b`. Its operand must be a `bool`; test an optional
 with `x is none`.
 
+`and` and `or` don't mix without parentheses: `a and b or c` is an error that
+suggests `(a and b) or c` and `a and (b or c)`, since either could be meant.
+A run of one of them, `a or b or c`, needs none, and neither does the `or` of
+`x? or default`, which is no boolean operator.
+
 `bool` and `int64` don't mix, and nothing else stands in for a `bool`. Both
 operands of `and` and `or` must be `bool`, and so must the condition of an
 `if`, a `for` loop and an `assert`: test a number with `n != 0` and an
