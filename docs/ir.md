@@ -4,7 +4,7 @@ icon: lucide/workflow
 
 # Compiler IR (design)
 
-Status: steps 1–4, 8, 9, 10 and 11 done, 12 in progress; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
+Status: steps 1–4 and 8–13 done; steps 5 and 7 measured and not landed. This page is the plan for giving the compiler an intermediate
 representation; it describes the compiler, not the language.
 
 ## Where it starts
@@ -305,7 +305,93 @@ were.
       the heap objects did. What's left is copying where a pass inserts
       (`settle_borrows`, the hoists, the frame base) and compacting
       (`move_from`, about 2%), and the emitters' `put`.
-13. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
+13. **Loads made once** (branch `load-reuse`; done). qsort's swap
+   (`let t = self.xs[i]; self.xs[i] = self.xs[j]; self.xs[j] = t`) loaded
+   `self.xs`, its length and its buffer again for each access, and checked
+   twice that the array was its field's own. Hand-edited, the swap ran 2.6%
+   faster with those loads made once within it, 5.3% with the second check
+   gone too, and 8.4% reusing the header, length and buffer the scan loop
+   before it had loaded.
+
+   `regalloc.reuse_loads` walks a function's body once, in layout order,
+   while it is still in vregs (after the hoists, before promoting locals, so
+   a value reused is only a vreg that lives longer), numbering values: a
+   vreg gets a value number where it is written and keeps it while nothing
+   writes it; a copy and an add of 0 keep their source's; an add of a
+   constant is its base plus an offset; a slot's load is the value last
+   stored to or loaded from the slot, so `self` loaded twice is one base. A
+   load is known by its address (the base's number and offset, or for an
+   element `[buf, idx, lsl #k]` the base's and the index's numbers) and
+   width. One whose value a vreg still holds becomes a `mov` from it.
+
+   What may change memory forgets what it may have changed:
+   - a store through an index (an element of an array, str or bytes: codegen
+     writes those only that way, into buffers apart from any header or
+     field) forgets the elements;
+   - any other store forgets every load but the frame slots';
+   - a store to a slot forgets that slot; a slot's own facts stay across
+     everything else, unless the function takes an address in its frame
+     (other than a copy-on-write check's place), when every store and call
+     forgets the slots too;
+   - a call forgets every load but the slots', except the retain stub, which
+     writes only a count word (it forgets loads at negative offsets and of 4
+     bytes), and a panic, which doesn't come back. A release can free
+     anything, and the copy-on-write stubs replace the array in its place,
+     so both forget every load.
+
+   Where ways meet, what is known is what all of them know, and a vreg
+   written on any of them since the first branched (looked back over at
+   most 512 writes) gets a new number. A label no branch goes to
+   (`Lline$`) is no join. Branches back to a label are of two kinds:
+   - from a block laid out further on that only branches before the label
+     reach and nothing falls into (a bounds check's cold block, which only
+     wraps the index): the state its branch had, less what the block
+     writes, meets the rest;
+   - a loop's: when nothing outside the stretch from the label to its last
+     backward branch (and the blocks after it that only it reaches and that
+     end in a panic) branches into it, what the stretch writes, stores or
+     calls is forgotten at the label, and the rest goes into the loop.
+   Anything else (a label whose address is taken, a directive amid the
+   code) forgets everything.
+
+   The copy-on-write check (`ldr h, [p]`, the count's load, `cmp #1`,
+   `b.eq L`, the stub, `mov h, x17`, `L:`) is a join of its own: after `L`,
+   either way, `[p]` holds `h`, and an array's count is 1. A later check of
+   the same array, with nothing between that could give it a holder (a call,
+   a retain) or put another array in the place (a store), goes, so the
+   stores after it reuse the header and buffer the first one left. (A value
+   struct's check doesn't learn the count: its stub leaves a constant struct
+   as it is.)
+
+   It runs only on functions that change an array in place (that have such
+   a check). On every function, it found a load to reuse in about one line
+   of 300 of the compiler's own code, made the compiler no faster, and cost
+   9% of compiling `codegen.kod`; 32 of its 889 functions have a check. The
+   rewritten body is used only when promoting locals succeeds with it: the
+   strict allocation keeps the longer-lived vregs apart, and the loose one,
+   which counts on the emitter's own register discipline, can't.
+
+   `t` in the swap stayed in its frame slot: promoted, it is a callee-saved
+   vreg no call crosses, so the allocator gave it the caller-saved class,
+   and with those all taken dropped it. Now such a vreg takes a free
+   callee-saved register first.
+
+   qsort, CPU cycles (least of 20 runs, the machine being busy; 911 M cycles
+   is about 227 ms):
+
+   | | M cycles | |
+   |---|---|---|
+   | main | 911 | |
+   | the allocator's fallback alone | 906 | −0.6% |
+   | reusing loads alone | 859 | −5.7% |
+   | both | 837 | −8.2% |
+   | hand-edited (above) | 838 | |
+   | C -O2 | 644 | −29% |
+
+   words, trees, sieve, loop and fib compile to the same code. Compiling
+   `codegen.kod` (self-built compiler): 3.18 G instructions on main, 3.20 G
+   (+0.8%); 831 M cycles, 837 M (+0.75%); 226.2 ms, 227.4 ms.
+14. **Then, as needed:** an x86-64 lowering (see the parked assessment: register
    pools, calling convention, runtime stubs, symbol names).
 
 ## Open questions
