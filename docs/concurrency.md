@@ -4,10 +4,10 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: being built. Milestones 1 to 4 of step 1 are in: `spawn`, `Task[T]`
+Status: being built. Milestones 1 to 5 of step 1 are in: `spawn`, `Task[T]`
 and `wait()`, a function waiting for its tasks, channels and `for v in ch`,
-tasks waiting for I/O, and cancellation ([Tasks](tasks.md) describes what
-works); the rest is a proposal. It describes what Kod would add for doing
+tasks waiting for I/O, cancellation, `select`, generators and the helpers
+([Tasks](tasks.md) describes what works); the rest is a proposal. It describes what Kod would add for doing
 several things at once, in two steps, and what it promises now so that those
 steps stay possible. The building blocks are Go's (tasks, channels, `select`),
 used in a structured way (a task belongs to the function that starts it), on
@@ -213,6 +213,11 @@ not to the generator, which returns at once: a caller that stops reading
 early cancels it when it returns, as with any task. `yield` is allowed only
 in a function that gives back a `Channel`, and a generator's `return` takes
 no value.
+
+As built, the body's task is detached instead: a generator has no handle on
+its caller's tasks, so a caller that stops reading early leaves the body
+waiting in its next `yield`. Giving the caller the task needs the call to
+pass its group in, which can come with generic `spawn`.
 
 ### Actors
 

@@ -182,6 +182,34 @@ Without `else`, `select` waits until an arm can go. A cancelled task's
 `select` takes its first `receive` arm (with `none` if nothing is there), or
 its first `after`, or `else`.
 
+## Generators
+
+A function with `yield` in it is a **generator**: it gives back a
+`tasks.Channel[T]` at once and runs its body as a task, which each
+`yield value` sends on:
+
+<!-- kod:
+import "tasks"
+-->
+```kod
+func countdown(anon n: int64) -> tasks.Channel[int64] {
+    for i in 0..n {
+        yield n - i
+    }
+}
+
+for k in countdown(3) {
+    print(k)                 // 3, 2, 1
+}
+```
+
+The channel is unbuffered, so the body runs only as far ahead as the reader
+reads, and it is closed when the body ends, by its last line or a `return`,
+which takes no value. `yield` goes in a named function or method that gives
+back a `tasks.Channel[T]`, not in a function literal. The body's task is
+detached: a reader that stops before the end leaves it waiting in its next
+`yield` until the program ends.
+
 ## Helpers
 
 | | |
@@ -234,6 +262,5 @@ switch from one task to another costs about 50 ns.
 
 ## What isn't built yet
 
-`spawn` doesn't work in a generic function or type yet. `select`, generators
-and preemption come in that order, as
-[Concurrency (design)](concurrency.md#building-it) lays out.
+`spawn` and `yield` don't work in a generic function or type yet. Preemption comes
+next, as [Concurrency (design)](concurrency.md#building-it) lays out.

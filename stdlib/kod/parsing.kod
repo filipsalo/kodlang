@@ -405,6 +405,14 @@ type ParseError = struct {
     }
 }
 
+// What enter_function keeps of the function around a body.
+type SavedFunction = struct {
+    yields: [int64]
+    yield_values: [int64]
+    value_returns: [lexing.Token]
+    value_return_stmts: [int64]
+}
+
 type Parser = shared struct {
     // Path of the source file this parser was built from. Used by
     // the codegen's error reporter to produce `path:line:col` prefixes.
@@ -478,6 +486,13 @@ type Parser = shared struct {
     // How many `spawn`s have been parsed: each numbers its hidden names, and a
     // module with any imports `tasks` as `#spawn` (parse_module).
     spawns: int64 = 0
+    // The function being parsed: its `yield` statements, and the value each
+    // sends (one with any is a generator, generator_body), and where it returns
+    // a value.
+    yields: [int64] = []
+    yield_values: [int64] = []
+    value_returns: [lexing.Token] = []
+    value_return_stmts: [int64] = []
     // Parallel to `patterns`: where each pattern's last token ends.
     pattern_ends: [int64] = []
     // Parallel to `type_exprs` up to the last qualified one: the module alias a
@@ -2113,7 +2128,14 @@ type Parser = shared struct {
             }
             self.binding_exprs += 1
             let binding_mark = self.binding_exprs
+            let outer = self.enter_function()
+            let body_tok = self.peek()
             let body: [int64] = self.parse_block()
+            if len(self.yields) > 0 {
+                self.record_error("error: `yield` goes in a named function or method that gives back a `tasks.Channel[T]`, not in a function literal", got: body_tok)
+                self.drop_yields()
+            }
+            self.leave_function(outer)
             let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark)
             let decl_id: int64 = self.alloc_func_decl(fd)
             return self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
@@ -2966,9 +2988,13 @@ type Parser = shared struct {
                 self.skip_newlines()
                 return self.alloc_stmt(ast.Stmt.Return(value: 0))
             }
+            let value_tok = self.peek()
             let value: int64 = self.parse_expr()
             self.skip_newlines()
-            return self.alloc_stmt(ast.Stmt.Return(:value))
+            let stmt = self.alloc_stmt(ast.Stmt.Return(:value))
+            self.value_returns += [value_tok]
+            self.value_return_stmts += [stmt]
+            return stmt
         }
 
         // throw — same as `return .Err(value)` for a function declared
@@ -2994,6 +3020,18 @@ type Parser = shared struct {
             return self.alloc_stmt(ast.Stmt.Assert(expr: value, :source_text, :span))
         }
 
+        // `yield e` sends on the generator's channel (generator_body).
+        if self.at(.KwYield) {
+            let yield_span = self.here()
+            self.advance()
+            let value = self.parse_expr()
+            self.skip_newlines()
+            let arg = ast.CallArg(label: "", label_span: yield_span, :value)
+            let stmt = self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.select_call_expr("__gen", method: "send", args: [arg], span: yield_span)))
+            self.yields += [stmt]
+            self.yield_values += [value]
+            return stmt
+        }
         if self.at(.KwSelect) {
             let select_span = self.here()
             self.advance()
@@ -3283,12 +3321,98 @@ type Parser = shared struct {
         }
         mut params: [ast.Param] = self.parse_param_list()
         mut return_typ: int64 = 0
+        let ret_start = self.pos + 1
         if self.try_consume(.Arrow) {
             return_typ = self.parse_type_expr()
         }
+        let ret_end = self.pos
         let binding_mark = self.binding_exprs
+        let outer = self.enter_function()
         mut body: [int64] = self.parse_block()
+        if len(self.yields) > 0 {
+            body = self.generator_body(body, :return_typ, :ret_start, :ret_end, :name_span, generic: len(type_params) > 0)
+        }
+        self.leave_function(outer)
         return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc, expr_binds: self.binding_exprs > binding_mark, :type_params)
+    }
+
+    // Starts a function's body: the outer one's yields and returns, for
+    // leave_function.
+    func enter_function(self) -> SavedFunction {
+        let outer = SavedFunction(yields: self.yields, yield_values: self.yield_values, value_returns: self.value_returns, value_return_stmts: self.value_return_stmts)
+        self.yields = []
+        self.yield_values = []
+        self.value_returns = []
+        self.value_return_stmts = []
+        return outer
+    }
+
+    func leave_function(self, anon outer: SavedFunction) -> none {
+        self.yields = outer.yields
+        self.yield_values = outer.yield_values
+        self.value_returns = outer.value_returns
+        self.value_return_stmts = outer.value_return_stmts
+    }
+
+    // After an error, each `yield` just evaluates its value, so that it reports
+    // no other.
+    func drop_yields(self) -> none {
+        for k, stmt in self.yields {
+            self.stmts[stmt] = ast.Stmt.ExprStmt(expr: self.yield_values[k])
+        }
+    }
+
+    // A function with `yield` (docs/tasks.md#generators) makes its channel, runs
+    // its body as a task that each `yield` sends on, and gives the channel back:
+    //
+    //     let __gen = <return type>()
+    //     return #spawn.generate(__gen, func() { <body> })
+    //
+    // The constructor is parsed again from the return type's tokens, which must
+    // name a `Channel[T]`.
+    func generator_body(self, anon body: [int64], return_typ: int64, ret_start: int64, ret_end: int64, name_span: ast.Span, generic: bool) -> [int64] {
+        mut names_channel = false
+        mut i = ret_start
+        for i + 1 < ret_end {
+            if self.tokens[i].kind is .Identifier and self.tokens[i].value == "Channel" and self.tokens[i + 1].kind is .OpenBracket {
+                names_channel = true
+            }
+            i += 1
+        }
+        if return_typ == 0 or not names_channel {
+            self.record_error("error: a function with `yield` gives back a `tasks.Channel[T]`, which the values are sent on", got: self.tokens[ret_start - 1])
+            self.drop_yields()
+            return body
+        }
+        if generic {
+            self.record_error("error: `yield` can't be used in a generic function or type yet", got: self.tokens[ret_start - 1])
+            self.drop_yields()
+            return body
+        }
+        for k, tok in self.value_returns {
+            self.record_error("error: a function with `yield` ends with a `return` that takes no value", got: tok)
+            self.stmts[self.value_return_stmts[k]] = ast.Stmt.Return(value: 0)
+        }
+        let span = name_span
+        let back = self.pos
+        self.pos = ret_start
+        let channel_type = self.parse_postfix(self.parse_primary())
+        self.pos = back
+        let no_args: [ast.CallArg] = []
+        let ctor = self.alloc_expr(ast.Expr.Call(callee: channel_type, args: no_args), :span)
+        let make = self.alloc_stmt(ast.Stmt.Let(name: "__gen", typ: 0, value: ctor, mutable: false))
+        let no_params: [ast.Param] = []
+        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, :body, doc: ""))
+        self.binding_exprs += 1
+        let lit = self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
+        let gen = self.alloc_expr(ast.Expr.Ident(name: "__gen"), :span)
+        let args = [
+            ast.CallArg(label: "", label_span: span, value: gen),
+            ast.CallArg(label: "", label_span: span, value: lit),
+        ]
+        self.spawns += 1
+        let ret = self.alloc_stmt(ast.Stmt.Return(value: self.spawn_member_call("generate", recv: "", :args, :span)))
+        return [make, ret]
     }
 
     func parse_func_type_params(self) -> [str] {
