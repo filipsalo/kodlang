@@ -3,6 +3,7 @@
 
 import "kod/lexing"
 import "kod/parsing"
+import "sort"
 
 // A file `format` won't touch, and why.
 type SyntaxErrors = struct {
@@ -42,7 +43,13 @@ func format(anon source: str, path: str) -> str or Error {
     if len(p.errors) > 0 {
         throw SyntaxErrors(errors: p.errors)
     }
-    let formatted = layout(source, tokens)
+    let sorted = sort_imports(source, tokens)
+    mut formatted = ""
+    if sorted == source {
+        formatted = layout(source, tokens)
+    } else {
+        formatted = layout(sorted, lexing.Lexer(source: sorted, pos: 0, start: 0).lex())
+    }
     // A bug here must not end up in someone's file: what doesn't parse is refused.
     let again = parsing.make_parser(lexing.Lexer(source: formatted, pos: 0, start: 0).lex(), :path, source: formatted)
     let _again = again.parse_module()
@@ -334,4 +341,136 @@ func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
         i = j + 1
     }
     return out
+}
+
+// A line of the source as tokens see it: a multi-line string is inside one.
+type SourceLine = struct {
+    // Where it starts and ends in the source, its newline not included.
+    start: int64
+    end: int64
+    // Its first token, or EOL when it has none; whether every token is a
+    // comment; and whether no bracket is open at its start.
+    first: lexing.TokenKind
+    comments_only: bool
+    top: bool
+    // For an import, its path.
+    path: str
+}
+
+// The lines of `source`, by its tokens.
+func source_lines(anon source: str, anon tokens: [lexing.Token]) -> [SourceLine] {
+    mut lines: [SourceLine] = []
+    mut depth: int64 = 0
+    mut line_start: int64 = 0
+    let n = len(tokens)
+    mut i: int64 = 0
+    for i < n {
+        mut j = i
+        for j < n and not (tokens[j].kind is .EOL) and not (tokens[j].kind is .EOF) {
+            j += 1
+        }
+        mut end = len(source)
+        if j < n {
+            end = tokens[j].start
+        }
+        mut first: lexing.TokenKind = .EOL
+        mut comments_only = j > i
+        mut path = ""
+        if j > i {
+            first = tokens[i].kind
+            if first is .KwImport and i + 1 < j and tokens[i + 1].kind is .StringLit {
+                let lit = tokens[i + 1].value
+                path = lit[1..len(lit) - 1]
+            }
+        }
+        let top = depth == 0
+        for m in i..j {
+            if not (tokens[m].kind is .Comment) {
+                comments_only = false
+            }
+            if is_open(tokens[m].kind) {
+                depth += 1
+            } else if is_close(tokens[m].kind) and depth > 0 {
+                depth -= 1
+            }
+        }
+        lines += [SourceLine(start: line_start, :end, :first, :comments_only, :top, :path)]
+        if j >= n or tokens[j].kind is .EOF {
+            break
+        }
+        line_start = tokens[j].end
+        i = j + 1
+    }
+    return lines
+}
+
+// Whether import path `a` goes before `b`: the standard library's first,
+// then those starting with `./`, each by path.
+func import_before(anon a: str, anon b: str) -> bool {
+    let a_rel = a.starts_with("./")
+    let b_rel = b.starts_with("./")
+    if a_rel != b_rel {
+        return b_rel
+    }
+    return a < b
+}
+
+// An import line with the comment lines just above it that move with it.
+type ImportUnit = struct {
+    path: str
+    text: str
+}
+
+// `source` with each group of top-level import lines sorted (docs/cli.md).
+func sort_imports(anon source: str, anon tokens: [lexing.Token]) -> str {
+    let lines = source_lines(source, tokens)
+    mut out = ""
+    // Where `out` has copied `source` up to.
+    mut copied: int64 = 0
+    mut k: int64 = 0
+    let n = len(lines)
+    for k < n {
+        let line = lines[k]
+        if not (line.top and line.first is .KwImport) {
+            k += 1
+            continue
+        }
+        // A group: imports, and comment lines between them, with no blank line.
+        mut units: [ImportUnit] = []
+        mut pending: [str] = []
+        let group_start = line.start
+        mut group_end = line.end
+        mut m = k
+        for m < n and lines[m].top and (lines[m].first is .KwImport or lines[m].comments_only) {
+            let l = lines[m]
+            let text = source[l.start..l.end]
+            if l.first is .KwImport {
+                mut unit_text = ""
+                for c in pending {
+                    unit_text += c + "\n"
+                }
+                units += [ImportUnit(path: l.path, text: unit_text + text)]
+                pending = []
+                group_end = l.end
+            } else {
+                pending += [text]
+            }
+            m += 1
+        }
+        // Comment lines after the last import stay after the group.
+        let sorted = sort.sorted_by(units, less: func(a: ImportUnit, b: ImportUnit) -> bool {
+            return import_before(a.path, b.path)
+        })
+        mut text = ""
+        for u in sorted {
+            if len(text) > 0 {
+                text += "\n"
+            }
+            text += u.text
+        }
+        out += source[copied..group_start] + text
+        copied = group_end
+        k = m
+    }
+    return out + source[copied..len(source)]
 }

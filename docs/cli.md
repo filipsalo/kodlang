@@ -90,8 +90,9 @@ A file with a syntax error is left as it is; its errors are printed and the
 exit status is 1. `kod fmt` needs no build: it runs anywhere, not only in the
 repository root.
 
-The formatter keeps the line breaks it is given, adding only the blank lines
-between declarations below, and it decides everything else:
+The formatter keeps the line breaks it is given; it only reorders import lines
+and adds blank lines between declarations, as below. It decides everything
+else:
 
 - **Indentation** is four spaces per level. A line is one level deeper than
   the line that opened the innermost bracket (`(`, `[` or `{`) still open at
@@ -112,6 +113,11 @@ between declarations below, and it decides everything else:
 - A **top-level declaration** that follows one spanning several lines (a
   function, a type, a test) has a blank line before it, or before the comments
   just above it.
+- **Imports** are sorted in each group of import lines with no blank line
+  between: the standard library's first, then those whose path starts with
+  `./`, each by path, and imports of one path in the order they were. A
+  comment line between two imports moves with the one below it; one above a
+  group stays where it is.
 - A **list** whose closing bracket starts a line ends with a comma: the
   arguments or parameters of a call or a `func`, and an array literal.
 - A **multi-line string**'s lines move with the line it starts on, so its
