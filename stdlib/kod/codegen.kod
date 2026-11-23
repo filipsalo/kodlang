@@ -1465,6 +1465,9 @@ type Codegen = shared struct {
     // rc_hold's slots: those holding a call's receiver or arguments, and free ones.
     holds: [int64] = []
     hold_free: [int64] = []
+    // For the next prepare_args_with_kinds: the call is an inline intrinsic,
+    // which frees nothing, so its arguments need no holds.
+    args_unheld: bool = false
     // See note_branches.
     branch_first: Map[str, int64] = Map[str, int64]()
     branch_last: Map[str, int64] = Map[str, int64]()
@@ -14053,6 +14056,8 @@ type Codegen = shared struct {
             if self.inline_stmts(sig, owner: -1, recv: 0, :args, slots: call_slots) is Some(inlined) {
                 return inlined
             }
+            // An intrinsic is a few instructions that free nothing: its arguments need no holds.
+            self.args_unheld = arm64.is_intrinsic(ifn.label)
             self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
             if arm64.is_intrinsic(ifn.label) {
                 self.push_intrinsic(ifn.label)
@@ -14375,6 +14380,8 @@ type Codegen = shared struct {
                             return inlined
                         }
                     }
+                    // An intrinsic is a few instructions that free nothing: its arguments need no holds.
+                    self.args_unheld = self.fn_label(slot) == "_kod_bytes_le64" or arm64.is_intrinsic(self.fn_label(slot))
                     self.prepare_args_with_kinds(args, expected_kinds: sig.param_kinds, default_exprs: sig.param_default_exprs, src_p: sig.src_p, slots: call_slots)
                     if self.fn_label(slot) == "_kod_bytes_le64" {
                         self.emit_bytes_le64()
@@ -15387,6 +15394,9 @@ type Codegen = shared struct {
     }
 
     func prepare_args_with_kinds(self, anon args: [ast.CallArg], expected_kinds: [TypeKind], default_exprs: [int64], src_p: parsing.Parser, slots: [int64], type_params: [str] = [], type_args: [TypeKind] = []) -> none {
+        // Set by the caller for an inline intrinsic; nested calls in the arguments hold as usual.
+        let hold_args = not self.args_unheld
+        self.args_unheld = false
         let arg_regs: [str] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
         // When the call has fewer args than the function declares,
         // missing slots fill from `default_exprs` (compiled in the
@@ -15432,11 +15442,15 @@ type Codegen = shared struct {
                     // The callee takes the value over from the slot and puts it back.
                 } else if i < len(expected_kinds) {
                     arg_reg = self.compile_into(args[ai].value, expected: expected_kinds[i])
-                    self.rc_hold(args[ai].value, reg: arg_reg)
+                    if hold_args {
+                        self.rc_hold(args[ai].value, reg: arg_reg)
+                    }
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
-                    self.rc_hold(args[ai].value, reg: arg_reg)
+                    if hold_args {
+                        self.rc_hold(args[ai].value, reg: arg_reg)
+                    }
                 }
             } else {
                 let saved_ctx = self.context()
