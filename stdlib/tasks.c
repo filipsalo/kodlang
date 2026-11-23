@@ -2,9 +2,12 @@
  * runs on a stack of its own, and a switch saves the registers a call keeps
  * and loads another task's. Which task runs next is the Kod side's choice. */
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/event.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 /* A task's stack: as much as the first thread has, reserved as address space,
@@ -82,4 +85,57 @@ __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
         "ldp d12, d13, [x1, #136]\n"
         "ldp d14, d15, [x1, #152]\n"
         "ret\n");
+}
+
+/* Waiting for events: one kqueue for the program, each registration one-shot,
+ * its udata the key the scheduler finds the waiting task by. */
+static int kod_kq = -1;
+static struct kevent kod_events[64];
+
+/* Registers `filter` on `ident` (a timer is named by `key`, as its ident is
+ * free); 0 when kevent took it, -1 when it can't come, as for a child that
+ * has already exited or a descriptor that isn't open. */
+int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key) {
+    if (kod_kq < 0) kod_kq = kqueue();
+    if (kod_kq < 0) return -1;
+    uint32_t fflags = 0;
+    if (filter == EVFILT_PROC) fflags = NOTE_EXIT;
+    if (filter == EVFILT_TIMER) {
+        fflags = NOTE_NSECONDS;
+        ident = key;
+    }
+    struct kevent ev, out;
+    EV_SET(&ev, (uintptr_t)ident, (int16_t)filter, EV_ADD | EV_ONESHOT | EV_RECEIPT, fflags, data, (void *)key);
+    int n;
+    do {
+        n = kevent(kod_kq, &ev, 1, &out, 1, NULL);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) return -1;
+    if (n == 1 && (out.flags & EV_ERROR) && out.data != 0) return -1;
+    return 0;
+}
+
+/* Waits for events, until one comes when `block`, else not at all: how many
+ * came; kod_task_kq_key gives each one's key. */
+int64_t kod_task_kq_wait(int64_t block) {
+    if (kod_kq < 0) return 0;
+    struct timespec zero = {0, 0};
+    int n;
+    do {
+        n = kevent(kod_kq, NULL, 0, kod_events, 64, block ? NULL : &zero);
+    } while (n < 0 && errno == EINTR);
+    return n < 0 ? 0 : n;
+}
+
+int64_t kod_task_kq_key(int64_t i) {
+    return (int64_t)kod_events[i].udata;
+}
+
+/* The task scheduler's wait (stdlib/tasks.kod), which kod_wait_event calls
+ * once a task has been started. */
+extern int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data);
+extern int64_t kod_tasks_wait_event(int64_t ident, int64_t filter, int64_t data) __asm__("$tasks$_wait_event");
+
+void kod_task_hook(void) {
+    kod_wait_hook = kod_tasks_wait_event;
 }

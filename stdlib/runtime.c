@@ -541,3 +541,15 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
     if (refs) rc_arr_retain_all((void **)out->ptr, total);
     return out;
 }
+
+/* Waiting without holding up other tasks (docs/tasks.md): stdlib/tasks.c sets
+ * the hook once a program has started a task. A call that would block calls
+ * kod_wait_event first, with kevent's ident, filter and data (EVFILT_READ on a
+ * descriptor, EVFILT_TIMER for nanoseconds, EVFILT_PROC on a child); 1 means
+ * the task waited for the event while others ran, 0 that the caller should
+ * just block, as it does without tasks. */
+int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
+
+int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
+    return kod_wait_hook ? kod_wait_hook(ident, filter, data) : 0;
+}

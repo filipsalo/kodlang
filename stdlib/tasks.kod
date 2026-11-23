@@ -10,6 +10,10 @@ extern func kod_task_ctx_new() -> int64
 extern func kod_task_ctx_free(anon ctx: int64) -> none
 extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
 extern func kod_task_switch(anon from: int64, anon to: int64) -> none
+extern func kod_task_kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64
+extern func kod_task_kq_wait(anon block: int64) -> int64
+extern func kod_task_kq_key(anon i: int64) -> int64
+extern func kod_task_hook() -> none
 
 // What a task runs: its Task, whatever its result's type.
 interface Job {
@@ -37,6 +41,15 @@ mut _head: int64 = 0
 
 // Tasks that have ended, whose stacks the next task to run frees.
 mut _dead: [Fiber] = []
+
+// Tasks that haven't ended, the program's first one included: while it is the
+// only one, a call that would block just blocks (_wait_event).
+mut _live: int64 = 1
+mut _hooked: bool = false
+
+// Tasks waiting for a kevent event, by the key their registration carries.
+mut _io: Map[int64, Fiber] = Map[int64, Fiber]()
+mut _io_next: int64 = 0
 
 // The registers of the switch a task that ends makes: no reference stays in
 // its frame, which never returns.
@@ -138,6 +151,10 @@ func _join(anon fiber: Fiber, group: TaskGroup?) -> none {
 
 // Lets the tasks that are ready run, then goes on.
 func give_way() -> none {
+    // Tasks whose event has come are ready too, so I/O doesn't wait for a busy task.
+    if _io.len() > 0 {
+        _poll(false)
+    }
     if _head == len(_ready) {
         return
     }
@@ -147,6 +164,11 @@ func give_way() -> none {
 }
 
 func _new_fiber() -> Fiber {
+    if not _hooked {
+        kod_task_hook()
+        _hooked = true
+    }
+    _live += 1
     let stack = kod_task_stack_new()
     if stack == 0 {
         panic("tasks: no room for another task's stack")
@@ -167,11 +189,15 @@ func _make_ready(anon fiber: Fiber) -> none {
     _ready += [fiber]
 }
 
-// The next ready task, taken off the queue; when there is none, every task
-// waits for another, and none can go on.
+// The next ready task, taken off the queue. While there is none, it waits for
+// the events tasks wait for; with none of those either, every task waits for
+// another, and none can go on.
 func _take_next() -> Fiber {
-    if _head == len(_ready) {
-        panic("all tasks are asleep: deadlock")
+    for _head == len(_ready) {
+        if _io.len() == 0 {
+            panic("all tasks are asleep: deadlock")
+        }
+        _poll(true)
     }
     let next = _ready[_head]
     _head += 1
@@ -226,6 +252,7 @@ func _finish() -> none {
     // keeps the other.
     fiber.job = none
     job.run()
+    _live -= 1
     fiber.done = true
     for waiter in fiber.waiters {
         _make_ready(waiter)
@@ -325,4 +352,37 @@ func _wake_all(anon fibers: [Fiber]) -> [Fiber] {
 // Waits, as the running task, until something makes it ready again.
 func _park() -> none {
     _switch_from(_running())
+}
+
+// kod_wait_event, once a task has been started (stdlib/runtime.c): makes the
+// running task wait for the event while the others run, 1; or 0, and the
+// caller blocks as it would without tasks, when this task is the only one or
+// the event can't come (a child that has already exited, say).
+func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int64 {
+    if _live <= 1 {
+        return 0
+    }
+    _io_next += 1
+    let key = _io_next
+    if kod_task_kq_add(ident, filter, data, key) != 0 {
+        return 0
+    }
+    let me = _running()
+    _io[key] = me
+    _switch_from(me)
+    return 1
+}
+
+// Makes ready the tasks whose events have come, waiting for one when `block`.
+func _poll(anon block: bool) -> none {
+    mut wait: int64 = 0
+    if block {
+        wait = 1
+    }
+    let n = kod_task_kq_wait(wait)
+    for i in 0..n {
+        if _io.remove(kod_task_kq_key(i)) is Fiber(fiber) {
+            _make_ready(fiber)
+        }
+    }
 }

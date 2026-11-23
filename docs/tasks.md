@@ -112,6 +112,27 @@ shared structs too: every task is on the one thread. A channel of an
 optional type can't tell `none` sent from closed, as `T?` of an optional is
 that optional.
 
+## Waiting for I/O
+
+A task that would wait for the outside world lets the others run meanwhile:
+
+- `time.sleep(d)`;
+- reading and writing a `posix.Fd`, and so a socket, a pipe to a child or
+  anything [streams](io.md) are built on, including TLS and HTTP;
+- `tcp` accepting and connecting;
+- waiting for a child process (`process.Child.wait`).
+
+While the others have nothing to do either, the program waits for the first
+of those events (`kevent`). A program with one task just blocks there, as
+without tasks.
+
+Still holding up every task: `posix.poll`, `io.read_stdin_line` and the rest
+of `io`'s standard input (read through C's buffered `FILE`), looking up a
+host name (`getaddrinfo` has no form that doesn't block), and reading a
+regular file, which is ready at once. A task in `tcp.connect` waits for the
+connection however long it takes: the timeout holds only without tasks. Two
+tasks waiting to read one descriptor at the same time aren't supported.
+
 ## Giving way
 
 `tasks.give_way()` lets the tasks that are ready run, then goes on. Tasks run
@@ -132,7 +153,5 @@ switch from one task to another costs about 50 ns.
 ## What isn't built yet
 
 `spawn` doesn't work in a generic function or type yet. Cancellation,
-`select`, generators, preemption, and tasks waiting for I/O instead
-of blocking the thread come in that order, as
-[Concurrency (design)](concurrency.md#building-it) lays out. Until the I/O part
-lands, reading a socket or sleeping holds up every task.
+`select`, generators and preemption come in that order, as
+[Concurrency (design)](concurrency.md#building-it) lays out.
