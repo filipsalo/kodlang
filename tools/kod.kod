@@ -38,6 +38,8 @@ import "process"
 import "kod/parsing"
 import "kod/ast"
 import "kod/build"
+import "kod/formatting"
+import "sort"
 
 // A C file that modules of a program name, with the flags of the first
 // `kod:cc` line that does, and where that line is (`path:line`).
@@ -69,12 +71,16 @@ func main(argv: [str]) -> int64 {
         return usage()
     }
     let cmd: str = argv[1]
-    if cmd != "build" and cmd != "run" and cmd != "test" and cmd != "check" {
+    if cmd != "build" and cmd != "run" and cmd != "test" and cmd != "check" and cmd != "fmt" {
         return usage()
     }
     let refreshed = refresh_toolchain(argv)
     if refreshed >= 0 {
         return refreshed
+    }
+    // Formatting needs no build, so it runs anywhere.
+    if cmd == "fmt" {
+        return run_fmt(argv[2..len(argv)])
     }
     if require_repo_root() != 0 {
         return 1
@@ -312,6 +318,7 @@ func usage() -> int64 {
     kod_eprint("       kod run <file> [args...]")
     kod_eprint("       kod test <file-or-dir>")
     kod_eprint("       kod check <file>")
+    kod_eprint("       kod fmt [--check] <path>...")
     return 1
 }
 
@@ -409,12 +416,12 @@ func below_dir(anon path: str, dir: str) -> str {
     return path[start..len(path)]
 }
 
-// Is a test file left out of `kod test <dir>`? One with a path component
-// below `dir` that starts with `.` (worktrees under `.claude/`, editor
-// files, scratch files such as `.kod_compile_test.kod`), or below a `build`
-// directory directly in `dir`. (The tests' own finder skips the
+// Is a file left out of `kod test <dir>` and `kod fmt <dir>`? One with a path
+// component below `dir` that starts with `.` (worktrees under `.claude/`,
+// editor files, scratch files such as `.kod_compile_test.kod`), or below a
+// `build` directory directly in `dir`. (The tests' own finder skips the
 // directories among these, not the files.)
-func is_skipped_test_file(anon rel: str) -> bool {
+func is_skipped_file(anon rel: str) -> bool {
     mut start: int64 = 0
     mut i: int64 = 0
     for i <= len(rel) {
@@ -470,7 +477,7 @@ func run_dir_tests(anon dir: str, cfg: build.LinkVars) -> int64 {
     // skipped without a word reads as one that passed.
     mut test_files: [str] = []
     for tf in split_at(r.stdout, sep: 0) {
-        if not is_skipped_test_file(below_dir(tf, dir: root)) {
+        if not is_skipped_file(below_dir(tf, dir: root)) {
             if not io.is_file(tf) {
                 kod_eprint(f"kod test: cannot read {tf}")
                 return 1
@@ -489,6 +496,78 @@ func run_dir_tests(anon dir: str, cfg: build.LinkVars) -> int64 {
         return 1
     }
     return become([exe])
+}
+
+// `kod fmt [--check] <path>...` (docs/cli.md): formats each file, printing
+// those that change, and with `--check` writes none and says 1 if any would.
+// A file that doesn't parse is left alone and makes the status 1.
+func run_fmt(anon args: [str]) -> int64 {
+    mut check = false
+    mut paths: [str] = []
+    for a in args {
+        if a == "--check" {
+            check = true
+        } else {
+            paths += [a]
+        }
+    }
+    if len(paths) == 0 {
+        return usage()
+    }
+    mut files: [str] = []
+    for p in paths {
+        if io.is_file(p) {
+            files += [p]
+        } else {
+            let found = kod_files_below(p)
+            if found is none {
+                return 1
+            }
+            files += found
+        }
+    }
+    mut status: int64 = 0
+    for f in files {
+        let source = io.read_file(f)
+        let formatted = formatting.format(source, path: f)
+        if formatted is Err(e) {
+            kod_eprint(e.to_str())
+            status = 1
+            continue
+        }
+        if formatted != source {
+            print(f)
+            if check {
+                status = 1
+            } else if io.write_file(f, formatted) != 0 {
+                kod_eprint(f"kod fmt: cannot write {f}")
+                status = 1
+            }
+        }
+    }
+    return status
+}
+
+// The `.kod` files below `dir`, sorted, but not those under a directory whose
+// name starts with `.` or the top-level `build/`; none, after saying why, when
+// `dir` is not a directory.
+func kod_files_below(anon dir: str) -> [str]? {
+    mut root: str = dir
+    if len(dir) > 0 and dir[0] == '-' {
+        root = f"./{dir}"
+    }
+    let r: process.ProcessResult = process.run(["find", root, "!", "-type", "d", "-name", "*.kod", "-print0"])
+    if r.status != 0 {
+        kod_eprint(f"kod fmt: no such file or directory: {dir}")
+        return none
+    }
+    mut found: [str] = []
+    for path in split_at(r.stdout, sep: 0) {
+        if not is_skipped_file(below_dir(path, dir: root)) and io.is_file(path) {
+            found += [build.normalize_path(path)]
+        }
+    }
+    return sort.sorted(found)
 }
 
 // Walk the entry's import graph and return the full list of .kod

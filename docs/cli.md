@@ -73,6 +73,48 @@ Run the full compile pipeline through codegen, report errors, but write no artif
 ./kod check src/foo.kod
 ```
 
+### `kod fmt <path>...`
+
+Format Kod source files in place: each path is a `.kod` file or a directory,
+whose `.kod` files are formatted at any depth (directories whose names start
+with `.`, and `build/`, are skipped). Each file that changes is printed. With
+`--check` nothing is written: the files that would change are printed, and the
+exit status is 1 if there are any.
+
+```shell
+./kod fmt stdlib/json.kod tools
+./kod fmt --check .
+```
+
+A file with a syntax error is left as it is; its errors are printed and the
+exit status is 1. `kod fmt` needs no build: it runs anywhere, not only in the
+repository root.
+
+The formatter keeps the line breaks it is given, so a file's lines and line
+numbers stay the same, and it decides everything else:
+
+- **Indentation** is four spaces per level. A line is one level deeper than
+  the line that opened the innermost bracket (`(`, `[` or `{`) still open at
+  its start; a line that starts by closing brackets is at the level of the
+  line that opened the last of them.
+- **Spaces** separate tokens, one each, except: none after `(` and `[`, and
+  none before `)`, `]`, `,` and `?`; none around `.`, `..` and `...`; none
+  before `(` or `[` that follows a name, a literal or a closing bracket (a
+  call or an index), nor in `func(`; none before `:` and one after, except
+  after a `:name` shorthand argument; none after a prefix `-`;
+  none in `{}`. A `.` that starts an implicit variant (`= .Red`) has a space
+  before it.
+- A **comment** at the end of a line keeps the space before it.
+- Inside a `{ … }` that closes on the same line, a gap of two or more spaces
+  stays two, so the arms of a one-line `match` stay apart.
+- **Blank lines**: at most one in a row, none at the start or the end of the
+  file and none before a line that closes a bracket. The file ends with one
+  newline, and no line has trailing spaces or tabs.
+- A **multi-line string**'s lines move with the line it starts on, so its
+  value stays the same (see [multi-line strings](strings.md#multi-line-strings)).
+
+Formatting a formatted file changes nothing.
+
 ## Build outputs
 
 | Path | Description |

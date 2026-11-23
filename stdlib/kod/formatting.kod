@@ -1,0 +1,261 @@
+// The formatter behind `kod fmt`: indentation, spacing and blank lines,
+// keeping the lines it is given. The rules are in docs/cli.md#kod-fmt-path.
+
+import "kod/lexing"
+import "kod/parsing"
+
+// A file `format` won't touch, and why.
+type SyntaxErrors = struct {
+    errors: [parsing.ParseError]
+
+    // Each error as the compiler shows it: where and what, the line and a caret.
+    func to_str(self) -> str {
+        mut out = ""
+        for e in self.errors {
+            if len(out) > 0 {
+                out += "\n"
+            }
+            out += e.to_str()
+            if len(e.source_line) > 0 {
+                out += f"\n{e.source_line}\n{e.caret}"
+            }
+        }
+        return out
+    }
+}
+
+// `source` formatted. `path` names it in errors.
+func format(anon source: str, path: str) -> str or Error {
+    let tokens = lexing.Lexer(:source, pos: 0, start: 0).lex()
+    let p = parsing.make_parser(tokens, :path, :source)
+    let _module = p.parse_module()
+    if len(p.errors) > 0 {
+        throw SyntaxErrors(errors: p.errors)
+    }
+    return layout(source, tokens)
+}
+
+func is_open(anon k: lexing.TokenKind) -> bool {
+    return k is .OpenParen or k is .OpenCurly or k is .OpenBracket
+}
+
+func is_close(anon k: lexing.TokenKind) -> bool {
+    return k is .CloseParen or k is .CloseCurly or k is .CloseBracket
+}
+
+// Whether `k` ends an operand, so a `-` after it is infix, a `(` a call and a
+// `[` an index.
+func ends_operand(anon k: lexing.TokenKind) -> bool {
+    return match k {
+        .Identifier | .IntegerLit | .FloatLit | .StringLit | .FStringLit | .BytesLit -> true
+        .KwTrue | .KwFalse | .KwNone -> true
+        .CloseParen | .CloseBracket | .Question -> true
+        else -> false
+    }
+}
+
+// Whether a space goes between tokens `p` and `c` on a line. `before` is the
+// token before `p` (`.EOL` at the start of the line), which tells a prefix `:`
+// or `-` from an infix one.
+func spaced(anon before: lexing.TokenKind, anon p: lexing.TokenKind, anon c: lexing.TokenKind) -> bool {
+    if c is .Comma or c is .CloseParen or c is .CloseBracket {
+        return false
+    }
+    if p is .OpenParen or p is .OpenBracket {
+        return false
+    }
+    if p is .OpenCurly and c is .CloseCurly {
+        return false
+    }
+    if c is .Dot {
+        return not ends_operand(p)
+    }
+    if p is .Dot or p is .DotDot or c is .DotDot or p is .Ellipsis or c is .Ellipsis {
+        return false
+    }
+    if c is .Question {
+        return false
+    }
+    if c is .Colon {
+        return p is .Comma
+    }
+    if p is .Colon {
+        // `:name` after `(` or `,` is a shorthand argument.
+        return not (before is .OpenParen or before is .Comma)
+    }
+    if p is .Minus {
+        // A prefix, unless it follows an operand.
+        return ends_operand(before)
+    }
+    if c is .OpenParen {
+        return not (ends_operand(p) or p is .KwFunc)
+    }
+    if c is .OpenBracket {
+        return not ends_operand(p)
+    }
+    return true
+}
+
+// `n` spaces.
+func spaces(anon n: int64) -> str {
+    mut out = ""
+    for _ in 0..n {
+        out += " "
+    }
+    return out
+}
+
+// How many columns the spaces and tabs of `s` take, a tab four.
+func width(anon s: str) -> int64 {
+    mut w: int64 = 0
+    for c in s {
+        if c == '\t' {
+            w += 4
+        } else {
+            w += 1
+        }
+    }
+    return w
+}
+
+// The leading spaces and tabs of `s`.
+func leading_blanks(anon s: str) -> str {
+    mut k: int64 = 0
+    for k < len(s) and (s[k] == ' ' or s[k] == '\t') {
+        k += 1
+    }
+    return s[0..k]
+}
+
+// A string token's text, moved from a line indented `old_indent` to one
+// indented `new_indent` columns. A multi-line string's content lines and
+// closing `"""` keep their offset from the line: the indent of its closing
+// line, which its value is dedented by, becomes that many columns, and each
+// content line's copy of it the same, so the value doesn't change.
+func moved_string(anon text: str, old_indent: int64, new_indent: int64) -> str {
+    let lines = text.split("\n")
+    if len(lines) < 2 {
+        return text
+    }
+    let prefix = leading_blanks(lines[len(lines) - 1])
+    mut offset = width(prefix) - old_indent
+    if offset < 0 {
+        offset = 0
+    }
+    let indent = spaces(new_indent + offset)
+    mut out = lines[0]
+    for line in lines[1..len(lines)] {
+        out += "\n"
+        if line.starts_with(prefix) and len(line) > len(prefix) {
+            out += indent + line[len(prefix)..len(line)]
+        } else if line == prefix {
+            // The closing line, or a content line of nothing but the indent.
+            out += indent
+        } else {
+            out += line
+        }
+    }
+    return out
+}
+
+// `tokens` of `source` laid out by the rules: the tokens of each line,
+// reindented and respaced, and the blank lines between.
+func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
+    mut out = ""
+    // For each bracket still open, the line it was opened on; each line's level.
+    mut opened: [int64] = []
+    mut levels: [int64] = []
+    mut line_no: int64 = 0
+    mut blank_run: int64 = 0
+    mut wrote_any = false
+    // Where the current line starts in `source`.
+    mut line_start: int64 = 0
+    let n = len(tokens)
+    mut i: int64 = 0
+    for i < n {
+        // The line's tokens are i..j, then its EOL, if any.
+        mut j = i
+        for j < n and not (tokens[j].kind is .EOL) and not (tokens[j].kind is .EOF) {
+            j += 1
+        }
+        if j == i {
+            if wrote_any {
+                blank_run += 1
+            }
+        } else {
+            // A line that starts by closing brackets is at the level of the line
+            // that opened the last of them; any other one deeper than the line
+            // of the innermost open bracket.
+            mut k = i
+            mut closed_line: int64 = -1
+            for k < j and is_close(tokens[k].kind) {
+                if len(opened) > 0 {
+                    closed_line = opened[len(opened) - 1]
+                    opened = opened[0..len(opened) - 1]
+                }
+                k += 1
+            }
+            mut level: int64 = 0
+            if closed_line >= 0 {
+                level = levels[closed_line]
+            } else if len(opened) > 0 {
+                level = levels[opened[len(opened) - 1]] + 1
+            }
+            for len(levels) <= line_no {
+                levels += [0]
+            }
+            levels[line_no] = level
+            for m in k..j {
+                if is_open(tokens[m].kind) {
+                    opened += [line_no]
+                } else if is_close(tokens[m].kind) and len(opened) > 0 {
+                    opened = opened[0..len(opened) - 1]
+                }
+            }
+            let old_indent = width(source[line_start..tokens[i].start])
+            let new_indent = level * 4
+            if blank_run > 0 and not is_close(tokens[i].kind) {
+                out += "\n"
+            }
+            blank_run = 0
+            out += spaces(new_indent)
+            // `{` opened on this line and not closed yet.
+            mut braces: int64 = 0
+            for m in i..j {
+                let tok = tokens[m]
+                if m > i {
+                    let prev = tokens[m - 1]
+                    mut before: lexing.TokenKind = .EOL
+                    if m - 2 >= i {
+                        before = tokens[m - 2].kind
+                    }
+                    if tok.kind is .Comment {
+                        // An end-of-line comment keeps the gap before it.
+                        out += source[prev.end..tok.start]
+                    } else if spaced(before, prev.kind, tok.kind) {
+                        if braces > 0 and tok.start - prev.end >= 2 {
+                            out += "  "
+                        } else {
+                            out += " "
+                        }
+                    }
+                }
+                out += moved_string(source[tok.start..tok.end], :old_indent, :new_indent)
+                if tok.kind is .OpenCurly {
+                    braces += 1
+                } else if tok.kind is .CloseCurly and braces > 0 {
+                    braces -= 1
+                }
+            }
+            out += "\n"
+            wrote_any = true
+        }
+        line_no += 1
+        if j >= n or tokens[j].kind is .EOF {
+            break
+        }
+        line_start = tokens[j].end
+        i = j + 1
+    }
+    return out
+}

@@ -115,7 +115,8 @@ COMPILER_LIB_OBJS := \
     $(STAGE0)/_arm64.o \
     $(STAGE0)/_macho.o \
     $(STAGE0)/_codegen.o \
-    $(STAGE0)/_build.o
+    $(STAGE0)/_build.o \
+    $(STAGE0)/_formatting.o
 
 COMPILER_KOD := \
     stdlib/kod/ast.kod \
@@ -126,6 +127,7 @@ COMPILER_KOD := \
     stdlib/kod/macho.kod \
     stdlib/kod/codegen.kod \
     stdlib/kod/build.kod \
+    stdlib/kod/formatting.kod \
     kodc.kod
 
 STAGE1_OBJS := \
@@ -149,7 +151,7 @@ $(LINK_STAMP):
 	mkdir -p $(dir $@)
 	echo '$(LINK_NOW)' > $@
 
-# Native `kod` driver: `kod build / run / test / check`, written in Kod.
+# Native `kod` driver: `kod build / run / test / check / fmt`, written in Kod.
 # People start it through the link ./kod at the repository root, which
 # runs `make -s stage1 kod` first when something is out of date.
 KOD_APP := build/apps/kod
@@ -232,6 +234,10 @@ $(STAGE0)/_codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	$(KODC) $< > $@
 
 $(STAGE0)/_build.s: stdlib/kod/build.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) $< > $@
+
+$(STAGE0)/_formatting.s: stdlib/kod/formatting.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
 
