@@ -1,0 +1,203 @@
+// kod:cc tasks.c
+
+// Tasks: calls that run on stacks of their own and take turns on the one
+// thread (docs/tasks.md). The stacks and the switch are in tasks.c; which
+// task runs next is decided here.
+
+extern func kod_task_stack_new() -> int64
+extern func kod_task_stack_free(anon base: int64) -> none
+extern func kod_task_ctx_new() -> int64
+extern func kod_task_ctx_free(anon ctx: int64) -> none
+extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
+extern func kod_task_switch(anon from: int64, anon to: int64) -> none
+
+// What a task runs: its Task, whatever its result's type.
+interface Job {
+    func run(self) -> none
+}
+
+// A task as the scheduler sees it: its saved registers, its stack (0 for the
+// program's first one, which has the thread's own), what it runs, and the
+// tasks waiting for it to end.
+type Fiber = shared struct {
+    ctx: int64
+    stack: int64 = 0
+    job: Job? = none
+    done: bool = false
+    waiters: [Fiber] = []
+}
+
+// The task that is running, made for the program's first one when first
+// asked for.
+mut _current: Fiber? = none
+
+// Tasks ready to run, from `_head` on, in the order they became ready.
+mut _ready: [Fiber] = []
+mut _head: int64 = 0
+
+// Tasks that have ended, whose stacks the next task to run frees.
+mut _dead: [Fiber] = []
+
+// The registers of the switch a task that ends makes: no reference stays in
+// its frame, which never returns.
+mut _leave_from: int64 = 0
+mut _leave_to: int64 = 0
+
+// A task started by `start`, and what it gave back once it has ended.
+type Task[T] = shared struct {
+    fiber: Fiber
+    body: func() -> T
+    // Empty until the task ends; then what it gave back.
+    results: [T] = []
+
+    func run(self) -> none {
+        self.results = [self.body()]
+    }
+
+    // What the task gave back; until it has ended, this task waits for it.
+    func wait(self) -> T {
+        if not self.fiber.done {
+            _wait_for(self.fiber)
+        }
+        return self.results[0]
+    }
+}
+
+// Runs `body` as a new task, which first runs the next time this one waits
+// or gives way.
+func start[T](anon body: func() -> T) -> Task[T] {
+    let fiber = _new_fiber()
+    let task = Task[T](:fiber, :body)
+    fiber.job = task
+    _make_ready(fiber)
+    return task
+}
+
+// A task started by `start_none`, whose body gives back nothing (`none` can't
+// be a type argument, so it isn't a `Task[none]`).
+type NoneTask = shared struct {
+    fiber: Fiber
+    body: func() -> none
+
+    func run(self) -> none {
+        self.body()
+    }
+
+    // Until the task has ended, this task waits for it.
+    func wait(self) -> none {
+        if not self.fiber.done {
+            _wait_for(self.fiber)
+        }
+    }
+}
+
+// As `start`, for a body that gives back nothing.
+func start_none(anon body: func() -> none) -> NoneTask {
+    let fiber = _new_fiber()
+    let task = NoneTask(:fiber, :body)
+    fiber.job = task
+    _make_ready(fiber)
+    return task
+}
+
+// Lets the tasks that are ready run, then goes on.
+func give_way() -> none {
+    if _head == len(_ready) {
+        return
+    }
+    let me = _running()
+    _make_ready(me)
+    _switch_from(me)
+}
+
+func _new_fiber() -> Fiber {
+    let stack = kod_task_stack_new()
+    if stack == 0 {
+        panic("tasks: no room for another task's stack")
+    }
+    let fiber = Fiber(ctx: kod_task_ctx_new(), :stack)
+    kod_task_ctx_init(fiber.ctx, stack)
+    return fiber
+}
+
+func _running() -> Fiber {
+    if _current is none {
+        _current = Fiber(ctx: kod_task_ctx_new())
+    }
+    return must _current
+}
+
+func _make_ready(anon fiber: Fiber) -> none {
+    _ready += [fiber]
+}
+
+// The next ready task, taken off the queue; when there is none, every task
+// waits for another, and none can go on.
+func _take_next() -> Fiber {
+    if _head == len(_ready) {
+        panic("all tasks are asleep: deadlock")
+    }
+    let next = _ready[_head]
+    _head += 1
+    // Drop what has been taken once it is most of the queue.
+    if _head >= 64 and _head * 2 >= len(_ready) {
+        _ready = _ready[_head..len(_ready)]
+        _head = 0
+    }
+    return next
+}
+
+// Switches from `me`, the running task, to the next ready one, and comes
+// back here when `me` runs again.
+func _switch_from(anon me: Fiber) -> none {
+    let next = _take_next()
+    _current = next
+    kod_task_switch(me.ctx, next.ctx)
+    _reap()
+}
+
+// Frees the stacks of tasks that have ended; none of them is running.
+func _reap() -> none {
+    if len(_dead) == 0 {
+        return
+    }
+    for fiber in _dead {
+        kod_task_stack_free(fiber.stack)
+        kod_task_ctx_free(fiber.ctx)
+    }
+    _dead = []
+}
+
+// Waits, as the running task, for `fiber` to end.
+func _wait_for(anon fiber: Fiber) -> none {
+    let me = _running()
+    fiber.waiters += [me]
+    _switch_from(me)
+}
+
+// A new task's first turn (tasks.c calls it on the task's stack): runs it,
+// readies those waiting for it, and switches away for good.
+func _run_current() -> none {
+    _reap()
+    _finish()
+    kod_task_switch(_leave_from, _leave_to)
+}
+
+func _finish() -> none {
+    let fiber = must _current
+    let job = must fiber.job
+    // The Task holds the Fiber; the Fiber lets go of the Task, so neither
+    // keeps the other.
+    fiber.job = none
+    job.run()
+    fiber.done = true
+    for waiter in fiber.waiters {
+        _make_ready(waiter)
+    }
+    fiber.waiters = []
+    _dead += [fiber]
+    let next = _take_next()
+    _current = next
+    _leave_from = fiber.ctx
+    _leave_to = next.ctx
+}
