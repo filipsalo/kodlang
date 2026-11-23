@@ -24,6 +24,16 @@ type SyntaxErrors = struct {
     }
 }
 
+// Formatting `path` gave text that doesn't parse: a bug in the formatter.
+type FormatBug = struct {
+    path: str
+    first: str
+
+    func to_str(self) -> str {
+        return f"{self.path}: kod fmt left it as it was: formatting it gave code that doesn't parse ({self.first}); this is a bug in kod fmt"
+    }
+}
+
 // `source` formatted. `path` names it in errors.
 func format(anon source: str, path: str) -> str or Error {
     let tokens = lexing.Lexer(:source, pos: 0, start: 0).lex()
@@ -32,7 +42,14 @@ func format(anon source: str, path: str) -> str or Error {
     if len(p.errors) > 0 {
         throw SyntaxErrors(errors: p.errors)
     }
-    return layout(source, tokens)
+    let formatted = layout(source, tokens)
+    // A bug here must not end up in someone's file: what doesn't parse is refused.
+    let again = parsing.make_parser(lexing.Lexer(source: formatted, pos: 0, start: 0).lex(), :path, source: formatted)
+    let _again = again.parse_module()
+    if len(again.errors) > 0 {
+        throw FormatBug(:path, first: again.errors[0].to_str())
+    }
+    return formatted
 }
 
 func is_open(anon k: lexing.TokenKind) -> bool {
@@ -158,16 +175,49 @@ func moved_string(anon text: str, old_indent: int64, new_indent: int64) -> str {
     return out
 }
 
+// Whether the bracket at `tokens[at]` opens a list that may end in a comma:
+// the arguments of a call, the parameters of a `func`, or an array literal.
+// A `(` that groups and a `[` that indexes don't.
+func opens_list(anon tokens: [lexing.Token], anon at: int64) -> bool {
+    let kind = tokens[at].kind
+    // The token before, across line ends and comments.
+    mut b = at - 1
+    for b >= 0 and (tokens[b].kind is .EOL or tokens[b].kind is .Comment) {
+        b -= 1
+    }
+    mut prev: lexing.TokenKind = .EOL
+    if b >= 0 {
+        prev = tokens[b].kind
+    }
+    if kind is .OpenParen {
+        return ends_operand(prev) or prev is .KwFunc
+    }
+    if kind is .OpenBracket {
+        return not ends_operand(prev)
+    }
+    return false
+}
+
 // `tokens` of `source` laid out by the rules: the tokens of each line,
 // reindented and respaced, and the blank lines between.
 func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
     mut out = ""
-    // For each bracket still open, the line it was opened on; each line's level.
+    // For each bracket still open: the line it was opened on, its token, and
+    // whether it opens a list. Each line's level.
     mut opened: [int64] = []
+    mut opened_at: [int64] = []
+    mut opened_list: [bool] = []
     mut levels: [int64] = []
     mut line_no: int64 = 0
     mut blank_run: int64 = 0
     mut wrote_any = false
+    // The last line written: whether it was at the top level and started by
+    // closing a bracket, which ends a declaration of several lines.
+    mut after_block = false
+    // The last token written that isn't a comment, and where `out` was just
+    // after it: where a list's comma goes.
+    mut last_code: int64 = -1
+    mut last_code_end: int64 = 0
     // Where the current line starts in `source`.
     mut line_start: int64 = 0
     let n = len(tokens)
@@ -183,6 +233,15 @@ func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
                 blank_run += 1
             }
         } else {
+            // A list closed by the bracket that starts this line, its last item
+            // on an earlier line, ends with a comma.
+            let first = tokens[i].kind
+            if (first is .CloseParen or first is .CloseBracket) and len(opened) > 0 {
+                let top = len(opened) - 1
+                if opened_list[top] and opened[top] < line_no and last_code > opened_at[top] and not (tokens[last_code].kind is .Comma) {
+                    out = out[0..last_code_end] + "," + out[last_code_end..len(out)]
+                }
+            }
             // A line that starts by closing brackets is at the level of the line
             // that opened the last of them; any other one deeper than the line
             // of the innermost open bracket.
@@ -190,8 +249,11 @@ func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
             mut closed_line: int64 = -1
             for k < j and is_close(tokens[k].kind) {
                 if len(opened) > 0 {
-                    closed_line = opened[len(opened) - 1]
-                    opened = opened[0..len(opened) - 1]
+                    let top = len(opened) - 1
+                    closed_line = opened[top]
+                    opened = opened[0..top]
+                    opened_at = opened_at[0..top]
+                    opened_list = opened_list[0..top]
                 }
                 k += 1
             }
@@ -208,16 +270,26 @@ func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
             for m in k..j {
                 if is_open(tokens[m].kind) {
                     opened += [line_no]
+                    opened_at += [m]
+                    opened_list += [opens_list(tokens, m)]
                 } else if is_close(tokens[m].kind) and len(opened) > 0 {
-                    opened = opened[0..len(opened) - 1]
+                    let top = len(opened) - 1
+                    opened = opened[0..top]
+                    opened_at = opened_at[0..top]
+                    opened_list = opened_list[0..top]
                 }
             }
             let old_indent = width(source[line_start..tokens[i].start])
             let new_indent = level * 4
-            if blank_run > 0 and not is_close(tokens[i].kind) {
+            let closes = is_close(first)
+            if blank_run > 0 and not closes {
+                out += "\n"
+            } else if blank_run == 0 and after_block and level == 0 and not closes {
+                // A declaration after one of several lines, or the comments above it.
                 out += "\n"
             }
             blank_run = 0
+            after_block = level == 0 and closes
             out += spaces(new_indent)
             // `{` opened on this line and not closed yet.
             mut braces: int64 = 0
@@ -241,6 +313,10 @@ func layout(anon source: str, anon tokens: [lexing.Token]) -> str {
                     }
                 }
                 out += moved_string(source[tok.start..tok.end], :old_indent, :new_indent)
+                if not (tok.kind is .Comment) {
+                    last_code = m
+                    last_code_end = len(out)
+                }
                 if tok.kind is .OpenCurly {
                     braces += 1
                 } else if tok.kind is .CloseCurly and braces > 0 {

@@ -90,8 +90,8 @@ A file with a syntax error is left as it is; its errors are printed and the
 exit status is 1. `kod fmt` needs no build: it runs anywhere, not only in the
 repository root.
 
-The formatter keeps the line breaks it is given, so a file's lines and line
-numbers stay the same, and it decides everything else:
+The formatter keeps the line breaks it is given, adding only the blank lines
+between declarations below, and it decides everything else:
 
 - **Indentation** is four spaces per level. A line is one level deeper than
   the line that opened the innermost bracket (`(`, `[` or `{`) still open at
@@ -101,15 +101,19 @@ numbers stay the same, and it decides everything else:
   none before `)`, `]`, `,` and `?`; none around `.`, `..` and `...`; none
   before `(` or `[` that follows a name, a literal or a closing bracket (a
   call or an index), nor in `func(`; none before `:` and one after, except
-  after a `:name` shorthand argument; none after a prefix `-`;
-  none in `{}`. A `.` that starts an implicit variant (`= .Red`) has a space
-  before it.
+  after a `:name` shorthand argument; none after a prefix `-`; none in `{}`.
+  A `.` that starts an implicit variant (`= .Red`) has a space before it.
 - A **comment** at the end of a line keeps the space before it.
 - Inside a `{ … }` that closes on the same line, a gap of two or more spaces
   stays two, so the arms of a one-line `match` stay apart.
 - **Blank lines**: at most one in a row, none at the start or the end of the
   file and none before a line that closes a bracket. The file ends with one
   newline, and no line has trailing spaces or tabs.
+- A **top-level declaration** that follows one spanning several lines (a
+  function, a type, a test) has a blank line before it, or before the comments
+  just above it.
+- A **list** whose closing bracket starts a line ends with a comma: the
+  arguments or parameters of a call or a `func`, and an array literal.
 - A **multi-line string**'s lines move with the line it starts on, so its
   value stays the same (see [multi-line strings](strings.md#multi-line-strings)).
 
