@@ -194,4 +194,4 @@ $ make -s stage1 kod && build/apps/kod/kod build tools/run_tests.kod
 $ build/apps/run_tests/run_tests -j 4 stdlib/ tests/lsp_test.kod
 ```
 
-`make gates` is what to run before a commit: `make test`, then `make test` again with the runtime built with `-DRC_POISON`, which overwrites freed memory so a use after free shows up. It refuses to run when there is a `link.local.cfg`, since it writes its own for the poisoned pass, and removes it again however the pass ends.
+`make gates` is what to run before a commit: `make fmt-check`, which runs `kod fmt --check` (see [CLI](cli.md#kod-fmt-path)) on every `.kod` file git tracks except the few in the Makefile's `FMT_SKIP`, whose spacing is what they test or which don't parse on purpose; then `make test`, then `make test` again with the runtime built with `-DRC_POISON`, which overwrites freed memory so a use after free shows up. It refuses to run when there is a `link.local.cfg`, since it writes its own for the poisoned pass, and removes it again however the pass ends.

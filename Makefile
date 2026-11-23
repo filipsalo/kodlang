@@ -11,8 +11,9 @@
 #   make test             build sh_kodc + the kod driver, then run every
 #                         *_test.kod with tools/run_tests.kod: in parallel, then
 #                         the serial ones one at a time
-#   make gates            make test, then make test again with a poisoned
-#                         runtime (-DRC_POISON); run before committing
+#   make fmt-check        kod fmt --check on every tracked .kod file but FMT_SKIP
+#   make gates            make fmt-check, make test, then make test again with
+#                         a poisoned runtime (-DRC_POISON); run before committing
 #   make selfhost-check   fixed point: stage1 compiles the compiler (stage2),
 #                         stage2 compiles it again (stage3); asm must match,
 #                         and stage1 and stage2 must compile every .kod file
@@ -134,7 +135,7 @@ STAGE1_OBJS := \
     $(STAGE1)/kodc.o \
     $(STAGE1)/runtime_main.o
 
-.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test gates selfhost-check asm-diff clean clean-apps clean-stage1
+.PHONY: all stage0 stage1 bootstrap bootstrap-snapshot kod test gates fmt-check selfhost-check asm-diff clean clean-apps clean-stage1
 
 # sh_kodc writes complete-looking assembly even when it reports errors;
 # without this a failed compile leaves a fresh .s that the next make
@@ -298,9 +299,16 @@ test: stage1 kod
 
 # The poisoned pass writes link.local.cfg, so one that is there already is not
 # ours to replace; the trap removes ours and rebuilds however the pass ends.
+# Files `kod fmt` is kept off: their spacing is what they test, or they don't
+# parse on purpose.
+FMT_SKIP := tests/unit/match_negative_literal_test.kod tests/dep_parse_error_dep.kod
+fmt-check: kod
+	@$(KOD_APP)/kod fmt --check $(filter-out $(FMT_SKIP),$(shell git ls-files '*.kod'))
+
 POISON_CFLAGS := -target arm64-apple-darwin -I stdlib -O2 -DRC_POISON
 gates:
 	@if [ -e link.local.cfg ]; then echo "gates: link.local.cfg exists; move it aside first" >&2; exit 1; fi
+	$(MAKE) -s fmt-check
 	$(MAKE) -s test
 	@echo "==> gates: again with a poisoned runtime"
 	@trap 'rm -f link.local.cfg; $(MAKE) -s stage1 kod' EXIT; \
