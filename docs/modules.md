@@ -132,7 +132,7 @@ The stdlib lives under `stdlib/` in the repository.
 | `sort` | `sorted(xs)` and `sorted_by(xs, less:)`, stable, returning a new array. See [Arrays](arrays.md#sorting). |
 | `arrays` | `contains(xs, x)` and `equal(a, b)`. See [Arrays](arrays.md#helpers). |
 | `json` | Strict JSON parse/emit, with builders. See [JSON](json.md). |
-| `strbuilder`, `stream`, `posix` | `StrBuilder`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
+| `strbuilder`, `bytebuffer`, `stream`, `posix` | `StrBuilder`; `ByteBuffer`; `Reader` / `Writer` and `IoError`; file descriptors. See [Strings](strings.md) and [Streams](io.md). |
 | `net/tcp`, `net/tls`, `net/http` | TCP, TLS, and HTTP/1.1 messages with a client. See [Streams](io.md) and [HTTP client](http.md). |
 | `jsonrpc` | Content-Length framed messages on stdin/stdout, as used by LSP. |
 | `encoding/base64` | Base64, standard and URL-safe, strict decoding. See [Encodings](encoding.md). |

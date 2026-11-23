@@ -342,6 +342,38 @@ The buffer doubles when it is full, so appending n bytes costs O(n) overall.
 `to_str` makes a `StrBuilder` usable in an f-string. Embedded NUL bytes are
 kept. A `StrBuilder` is a handle: copies of it (`let b = a`) share one buffer.
 
+## Building bytes
+
+A `ByteBuffer` is a growable buffer of bytes that, unlike a `StrBuilder`, can
+read back what it holds and copy from itself. Decompressors are what it is
+for: [`compress/inflate`](encoding.md#decompression) writes its output into
+one.
+
+```kod
+import "bytebuffer" { ByteBuffer }
+
+let out = ByteBuffer()
+out.push_bytes(b"ab")
+out.push(0x63)
+out.copy_back(distance: 3, length: 7)
+assert out.to_bytes() == b"abcabcabca"
+assert out.at(2) == 0x63
+```
+
+| Method | Meaning |
+|--------|---------|
+| `push(b: int64)` | add one byte; only the low 8 bits are used |
+| `push_bytes(b: bytes)` | add bytes |
+| `copy_back(distance: int64, length: int64)` | add `length` bytes, each a copy of the one `distance` before it, so a `distance` shorter than `length` repeats the last `distance` bytes |
+| `at(i: int64) -> int64` | the byte at `i`, 0 to 255 |
+| `len() -> int64` | bytes so far |
+| `to_bytes() -> bytes` | a copy of the content; the buffer stays usable |
+
+`at` panics for an index outside `0..len()`, and `copy_back` for a
+`distance` outside `1..len()` or a negative `length`, the way indexing an
+array out of range does. The buffer doubles when it is full. Like a
+`StrBuilder`, a `ByteBuffer` is a handle: copies of it share one buffer.
+
 ## Conversion
 
 Primitives have a `to_str` method:

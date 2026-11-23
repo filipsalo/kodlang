@@ -2,16 +2,16 @@
 // See docs/encoding.md. Error details use zlib's wording.
 
 import "stream" { IoError }
-import "libc"
-import "unsafe"
+import "bytebuffer" { ByteBuffer }
 import "hash/crc32"
 // The length and distance tables of RFC 1951 §3.2.5.
 import "compress/tables" { LEN_BASE, LEN_EXTRA, DIST_BASE, DIST_EXTRA }
 
-// The CRC-32 state and the Adler-32 sum after the `n` bytes at `addr`,
-// continuing from `crc` / `sum` (stdlib/runtime.c).
-extern func kod_crc32_at(anon crc: int64, anon addr: int64, anon n: int64) -> int64
-extern func kod_adler32_at(anon sum: int64, anon addr: int64, anon n: int64) -> int64
+// The CRC-32 state and the Adler-32 sum after builder bytes start..end,
+// continuing from `crc` / `sum` (stdlib/runtime.c). A ByteBuffer's handle
+// is such a builder.
+extern func kod_crc32_sb(anon crc: int64, anon sb: str, anon start: int64, anon end: int64) -> int64
+extern func kod_adler32_sb(anon sum: int64, anon sb: str, anon start: int64, anon end: int64) -> int64
 
 // A canonical Huffman code as a lookup table. Index it with the next `bits`
 // bits of input, in stream order, to get `symbol << 4 | code length`, or 0 for
@@ -69,11 +69,9 @@ type Inflater = shared struct {
     pad: int64 = 0
     // The first error; once it is set, every loop stops.
     err: str = ""
-    // The output so far, in C memory at `out_addr`: `out_len` bytes, with
-    // room for `out_cap`. A back-reference copies from it directly. `run`
-    // hands it over as `bytes` and frees it.
-    out_addr: int64 = 0
-    out_cap: int64 = 0
+    // The output so far; a back-reference copies from it. `out_len` is its
+    // length.
+    out: ByteBuffer = ByteBuffer()
     out_len: int64 = 0
     // Output of the current gzip member or stream; its checksum is worked
     // out over all of it once the stream ends.
@@ -152,28 +150,6 @@ type Inflater = shared struct {
         self.stream_len = 0
     }
 
-    // Room for `n` more bytes of output, and 8 after them that `copy` may
-    // write over.
-    func room(self, anon n: int64) -> none {
-        let want = self.out_len + n + 8
-        if want <= self.out_cap {
-            return
-        }
-        mut cap = self.out_cap * 2
-        if cap < 65536 {
-            cap = 65536
-        }
-        for cap < want {
-            cap = cap * 2
-        }
-        let grown = libc.realloc(self.out_addr, cap)
-        if grown == 0 {
-            panic("inflate: out of memory")
-        }
-        self.out_addr = grown
-        self.out_cap = cap
-    }
-
     // A byte of output.
     func put(self, anon b: int64) -> none {
         if self.err != "" {
@@ -183,10 +159,7 @@ type Inflater = shared struct {
             self.fail("output too large")
             return
         }
-        if self.out_len + 9 > self.out_cap {
-            self.room(1)
-        }
-        unsafe.store8(self.out_addr + self.out_len, b)
+        self.out.push(b)
         self.out_len += 1
         self.stream_len += 1
     }
@@ -265,10 +238,8 @@ type Inflater = shared struct {
     // locals and topped up to 56 bits or more whenever it has fewer than
     // 48, which cover a literal/length code (15), its extra bits (5), a
     // distance code (15) and its extra bits (13). The output length is kept
-    // in a local too, with room for the longest back-reference (258 bytes)
-    // made before each symbol, so that writing needs no checks but
-    // `max_output`. Near the end of the input, `symbols_near_end` reads bit
-    // by bit and tells running out from a bad code.
+    // in a local too. Near the end of the input, `symbols_near_end` reads
+    // bit by bit and tells running out from a bad code.
     func symbols(self, anon lit: Huffman, anon dist: Huffman) -> none {
         if self.err != "" {
             return
@@ -281,21 +252,16 @@ type Inflater = shared struct {
         // Where the stream's output starts; a back-reference can't go
         // further back.
         let stream_start = self.out_len - self.stream_len
+        let out = self.out
         mut buf = self.buf
         mut count = self.count
         mut pos = self.pos
-        mut out = self.out_addr
         mut olen = self.out_len
         mut near_end = self.pad != 0
         for not near_end {
             if pos + 8 > n {
                 near_end = true
                 break
-            }
-            if olen + 266 > self.out_cap {
-                self.out_len = olen
-                self.room(258)
-                out = self.out_addr
             }
             // The next 8 input bytes at once, when fewer than 48 bits are
             // left: as many whole bytes as fit below bit 63 count. Bits
@@ -320,7 +286,7 @@ type Inflater = shared struct {
                     self.fail("output too large")
                     break
                 }
-                unsafe.store8(out + olen, symbol)
+                out.push(symbol)
                 olen += 1
                 continue
             }
@@ -356,27 +322,11 @@ type Inflater = shared struct {
                 self.fail("invalid distance too far back")
                 break
             }
-            // What `copy` does, on the locals.
             mut m = length
             if m > max_output - olen {
                 m = max_output - olen
             }
-            mut to = out + olen
-            let end = to + m
-            mut from = to - distance
-            if distance >= 8 {
-                for to < end {
-                    unsafe.store64(to, unsafe.load64(from))
-                    to += 8
-                    from += 8
-                }
-            } else {
-                for to < end {
-                    unsafe.store8(to, unsafe.load8(from))
-                    to += 1
-                    from += 1
-                }
-            }
+            out.copy_back(:distance, length: m)
             olen += m
             if m < length {
                 self.fail("output too large")
@@ -430,32 +380,13 @@ type Inflater = shared struct {
     }
 
     // A back-reference: `length` bytes copied from `distance` back, which
-    // callers check is no further back than the stream's output goes. When
-    // the distance is at least 8 it copies 8 bytes at a time, each word read
-    // written before; the last word may write up to 7 bytes past the end,
-    // into the room that `room` keeps.
+    // callers check is no further back than the stream's output goes.
     func copy(self, distance: int64, length: int64) -> none {
         mut n = length
         if n > self.max_output - self.out_len {
             n = self.max_output - self.out_len
         }
-        self.room(n)
-        mut to = self.out_addr + self.out_len
-        let end = to + n
-        mut from = to - distance
-        if distance >= 8 {
-            for to < end {
-                unsafe.store64(to, unsafe.load64(from))
-                to += 8
-                from += 8
-            }
-        } else {
-            for to < end {
-                unsafe.store8(to, unsafe.load8(from))
-                to += 1
-                from += 1
-            }
-        }
+        self.out.copy_back(:distance, length: n)
         self.out_len += n
         self.stream_len += n
         if n < length {
@@ -629,7 +560,7 @@ type Inflater = shared struct {
             return
         }
         let end = self.out_len
-        if crc != (kod_crc32_at(0xFFFFFFFF, self.out_addr + end - self.stream_len, self.stream_len) ^ 0xFFFFFFFF) {
+        if crc != (kod_crc32_sb(0xFFFFFFFF, self.out.handle, end - self.stream_len, end) ^ 0xFFFFFFFF) {
             self.fail("incorrect data check")
         } else if size != (self.stream_len & 0xFFFFFFFF) {
             self.fail("incorrect length check")
@@ -666,7 +597,7 @@ type Inflater = shared struct {
             sum = (sum << 8) | self.byte()
         }
         let end = self.out_len
-        if self.err == "" and sum != kod_adler32_at(1, self.out_addr + end - self.stream_len, self.stream_len) {
+        if self.err == "" and sum != kod_adler32_sb(1, self.out.handle, end - self.stream_len, end) {
             self.fail("incorrect data check")
         }
     }
@@ -693,12 +624,10 @@ func run(anon op: str, anon data: bytes, anon mode: int64, anon max_output: int6
     }
     let inflater = Inflater(data: data, mode: mode, max_output: max_output)
     inflater.run()
-    let out = unsafe.copy_out(inflater.out_addr, inflater.out_len)
-    unsafe.free(inflater.out_addr)
     if inflater.err != "" {
         throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: inflater.err)
     }
-    return out
+    return inflater.out.to_bytes()
 }
 
 func gunzip(anon data: bytes, max_output: int64 = 16777216) -> bytes or Error {

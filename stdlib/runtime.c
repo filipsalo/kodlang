@@ -210,6 +210,11 @@ static void kod_sb_reserve(KodStrBuilder *sb, int64_t extra) {
     sb->cap = new_cap;
 }
 
+// Room for `extra` more bytes (stdlib/bytebuffer.kod).
+void kod_sb_reserve_extra(int64_t handle, int64_t extra) {
+    kod_sb_reserve((KodStrBuilder *)handle, extra);
+}
+
 void kod_sb_append(int64_t handle, KodStr *s) {
     KodStrBuilder *sb = (KodStrBuilder *)handle;
     kod_sb_reserve(sb, s->len);
@@ -320,13 +325,16 @@ int64_t kod_crc32_bytes(int64_t crc, KodStr *b, int64_t start, int64_t end) {
     return kod_crc32_run((uint32_t)crc, (const unsigned char *)b->buf + start, n);
 }
 
-// Over the `n` bytes at `addr` (compress/inflate.kod's output buffer).
-int64_t kod_crc32_at(int64_t crc, int64_t addr, int64_t n) {
-    return kod_crc32_run((uint32_t)crc, (const unsigned char *)addr, n > 0 ? n : 0);
+int64_t kod_crc32_sb(int64_t crc, int64_t handle, int64_t start, int64_t end) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    int64_t n = kod_clamp_range(sb->len, &start, end);
+    return kod_crc32_run((uint32_t)crc, (const unsigned char *)sb->buf + start, n);
 }
 
-int64_t kod_adler32_at(int64_t sum, int64_t addr, int64_t n) {
-    return kod_adler32_run((uint32_t)sum, (const unsigned char *)addr, n > 0 ? n : 0);
+int64_t kod_adler32_sb(int64_t sum, int64_t handle, int64_t start, int64_t end) {
+    KodStrBuilder *sb = (KodStrBuilder *)handle;
+    int64_t n = kod_clamp_range(sb->len, &start, end);
+    return kod_adler32_run((uint32_t)sum, (const unsigned char *)sb->buf + start, n);
 }
 
 // stdlib/unsafe.kod; its loads, stores, c_int and refs are compiler intrinsics.

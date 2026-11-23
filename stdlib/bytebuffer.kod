@@ -1,0 +1,105 @@
+// A growable buffer of bytes that can read back what it holds and copy from
+// itself, as decompressors need. See docs/strings.md#building-bytes.
+//
+// Underneath is the runtime's string builder (stdlib/runtime.c), which owns
+// the memory: it is counted like any value and freed with the last copy. The
+// methods read and write that memory directly, and every one checks its
+// arguments first, so no use of a ByteBuffer can reach outside it.
+
+import "unsafe"
+
+extern func kod_sb_reserve_extra(anon sb: str, anon extra: int64) -> none
+// The address of the builder behind a handle (an unsafe intrinsic).
+extern func kod_unsafe_str_ref(anon s: str) -> int64
+
+// The builder holds the buffer's address, its length and its capacity, at
+// offsets 0, 8 and 16. (Literals, not module constants: a module with
+// variables keeps its methods from being inlined.)
+
+// The panics, out of line: a message built in a method would cost every call
+// the slots its pieces are counted in.
+func bad_distance(anon distance: int64, anon n: int64) -> none {
+    panic(f"copy_back distance {distance} out of range for buffer of length {n}")
+}
+
+func bad_length(anon length: int64) -> none {
+    panic(f"copy_back length {length} is negative")
+}
+
+func bad_index(anon i: int64, anon n: int64) -> none {
+    panic(f"index {i} out of bounds for buffer of length {n}")
+}
+
+type ByteBuffer = shared struct {
+    handle: str = kod_sb_new()
+
+    func len(self) -> int64 {
+        return unsafe.load64(kod_unsafe_str_ref(self.handle) + 8)
+    }
+
+    // Only the low 8 bits of `b` are used.
+    func push(self, anon b: int64) -> none {
+        let sb = kod_unsafe_str_ref(self.handle)
+        let n = unsafe.load64(sb + 8)
+        if n == unsafe.load64(sb + 16) {
+            kod_sb_reserve_extra(self.handle, 1)
+        }
+        unsafe.store8(unsafe.load64(sb) + n, b)
+        unsafe.store64(sb + 8, n + 1)
+    }
+
+    func push_bytes(self, anon b: bytes) -> none {
+        kod_sb_append(self.handle, kod_bytes_to_str(b))
+    }
+
+    // `length` bytes, each a copy of the one `distance` before it: with a
+    // distance shorter than the length, the last `distance` bytes repeated.
+    // At a distance of 8 or more it copies a word at a time, each word read
+    // written before; the last may write up to 7 bytes past the new end,
+    // inside the room reserved for it, where nothing is kept.
+    func copy_back(self, distance: int64, length: int64) -> none {
+        let sb = kod_unsafe_str_ref(self.handle)
+        let n = unsafe.load64(sb + 8)
+        if distance < 1 or distance > n {
+            bad_distance(distance, n)
+        }
+        if length < 0 {
+            bad_length(length)
+        }
+        if n + length + 8 > unsafe.load64(sb + 16) {
+            kod_sb_reserve_extra(self.handle, length + 8)
+        }
+        mut to = unsafe.load64(sb) + n
+        let end = to + length
+        mut from = to - distance
+        if distance >= 8 {
+            for to < end {
+                unsafe.store64(to, unsafe.load64(from))
+                to += 8
+                from += 8
+            }
+        } else {
+            for to < end {
+                unsafe.store8(to, unsafe.load8(from))
+                to += 1
+                from += 1
+            }
+        }
+        unsafe.store64(sb + 8, n + length)
+    }
+
+    // The byte at `i`, 0 to 255.
+    func at(self, anon i: int64) -> int64 {
+        let sb = kod_unsafe_str_ref(self.handle)
+        let n = unsafe.load64(sb + 8)
+        if i < 0 or i >= n {
+            bad_index(i, n)
+        }
+        return unsafe.load8(unsafe.load64(sb) + i)
+    }
+
+    // A copy of the content so far; the buffer stays usable.
+    func to_bytes(self) -> bytes {
+        return kod_str_to_bytes(kod_sb_to_str(self.handle))
+    }
+}
