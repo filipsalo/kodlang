@@ -336,10 +336,10 @@ func shout(anon text: str) -> str or Error {
 - `child.pid` is its process id.
 
 A child that is never waited for stays a zombie until this process exits.
-`process.run`, `process.spawn` and `process.kill` are shorthands for common cases:
+`process.run` and `process.kill` are shorthands for common cases:
 
 `process.run(argv)` captures stdout and stderr; unlike `output`, it can't
-fail: a program that can't be run, or that a signal ends, has the status -1. `process.spawn(argv)` starts `argv[0]` (looked up on `PATH`) without waiting for it, with stdin, stdout and stderr on `/dev/null`, and returns its process id, or -1 when it could not be started. `process.kill(pid)` ends a child that `spawn` started, with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never killed stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run.
+fail: a program that can't be run, or that a signal ends, has the status -1. `process.kill(pid)` ends a child by its process id (a `Child`'s `pid`), with `SIGTERM`, waits for it, and returns whether it was signalled; a child that is never waited for stays a zombie until the parent exits. `process.exec(argv)` instead replaces the calling process with `argv[0]`, looked up on `PATH`: the new program has the same terminal, stdin and process id. Stdout is flushed first. If stdin is a pipe, input the program has already read into its buffer (as `io.read_stdin_line` does, beyond the line it asked for) is not handed on; a file or a terminal loses nothing. `exec` returns, with -1, only if `argv[0]` could not be run.
 
 ```kod
 import "process"

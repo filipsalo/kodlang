@@ -387,10 +387,9 @@ designed when there is a program that needs it.
   stay non-atomic, though they could be made atomic for little.
 - **`spawn`, `select` and `yield` become keywords** when step 1 lands
   (`detached` is one only after `spawn`). No code in the repository uses
-  `select` or `yield` as a name; `process.spawn`, which starts a subprocess
-  without waiting for it, goes then: it is a shorthand for
+  `select` or `yield` as a name. `process.spawn`, a shorthand for
   `process.start(argv, stdin: .Null, stdout: .Null, stderr: .Null)` and its
-  pid, and its 4 callers are tests.
+  pid, is gone already.
 - **`IoKind` gains `.Cancelled`**, the error a cancelled task's wait gives.
 - **`Channel` joins the builtin type names** that only the builtins may
   declare (`Map`, `Option`, `Error`, ...); no code in the repository has a
