@@ -1,0 +1,290 @@
+// regalloc.reuse_loads (docs/ir.md, step 13): which loads become moves from
+// a register that still holds their value, and which must stay because
+// something between may have changed what they read.
+
+import "kod/regalloc"
+import "kod/arm64"
+
+func v(anon n: int64) -> regalloc.Reg {
+    return regalloc.vreg(n)
+}
+
+func r(anon name: str) -> regalloc.Reg {
+    return regalloc.reg_of(name)
+}
+
+func slot_ld(anon reg: regalloc.Reg, off: int64) -> regalloc.Insn {
+    return .Slot(store: false, :reg, :off)
+}
+
+func slot_st(anon reg: regalloc.Reg, off: int64) -> regalloc.Insn {
+    return .Slot(store: true, :reg, :off)
+}
+
+// `ldr dst, [base, #off]`, 8 bytes (4 with `width`, into dst's `w` form).
+func ld(anon dst: regalloc.Reg, anon base: regalloc.Reg, off: int64, width: int64 = 8) -> regalloc.Insn {
+    if width == 4 {
+        return .Mem(load: true, :width, reg: regalloc.wvreg(dst >> 2), :base, at: .Offset(:off))
+    }
+    return .Mem(load: true, :width, reg: dst, :base, at: .Offset(:off))
+}
+
+func st(anon src: regalloc.Reg, anon base: regalloc.Reg, off: int64) -> regalloc.Insn {
+    return .Mem(load: false, width: 8, reg: src, :base, at: .Offset(:off))
+}
+
+// `ldr dst, [base, idx, lsl #3]`.
+func ldx(anon dst: regalloc.Reg, anon base: regalloc.Reg, idx: regalloc.Reg) -> regalloc.Insn {
+    return .Mem(load: true, width: 8, reg: dst, :base, at: .Index(reg: idx, scaled: true))
+}
+
+func stx(anon src: regalloc.Reg, anon base: regalloc.Reg, idx: regalloc.Reg) -> regalloc.Insn {
+    return .Mem(load: false, width: 8, reg: src, :base, at: .Index(reg: idx, scaled: true))
+}
+
+func mov(anon dst: regalloc.Reg, anon src: regalloc.Reg) -> regalloc.Insn {
+    return .Mov(:dst, :src)
+}
+
+func add(anon dst: regalloc.Reg, anon src: regalloc.Reg, anon k: int64) -> regalloc.Insn {
+    return regalloc.op(.Add, a: dst, b: src, c: regalloc.imm(k))
+}
+
+func cmp(anon a: regalloc.Reg, anon b: regalloc.Reg) -> regalloc.Insn {
+    return regalloc.op(.Compare, :a, :b)
+}
+
+func label(anon name: str) -> regalloc.Insn {
+    return .Label(:name)
+}
+
+func b(anon target: str) -> regalloc.Insn {
+    return .Branch(kind: .Always, reg: regalloc.NO_REG, :target)
+}
+
+func b_if(anon cond: regalloc.Cond, anon target: str) -> regalloc.Insn {
+    return .Branch(kind: .If(:cond), reg: regalloc.NO_REG, :target)
+}
+
+func call(anon target: str) -> regalloc.Insn {
+    return .Call(:target)
+}
+
+// The lines of `insns` after reuse_loads, as text.
+func run(anon insns: [regalloc.Insn]) -> [str] {
+    let buf = regalloc.insn_buf(insns)
+    regalloc.reuse_loads(buf, vreg_start: 0, n_local: 64)
+    mut lines: [str] = []
+    for i in 0..buf.n {
+        lines += [arm64.format_insn(buf.at(i), vreg_phys: []).trim()]
+    }
+    return lines
+}
+
+// How many of `lines` are `line`.
+func count(anon lines: [str], anon line: str) -> int64 {
+    mut n = 0
+    for l in lines {
+        if l == line {
+            n += 1
+        }
+    }
+    return n
+}
+
+// `self.xs` loaded from `self` in the slot at -8: [fp, #-8] into v1, the
+// field at #8 into v2.
+func self_xs() -> [regalloc.Insn] {
+    return [slot_ld(v(1), off: -8), ld(v(2), v(1), off: 8)]
+}
+
+test "a load repeated is a move from the register that has its value" {
+    let out = run(self_xs() + [slot_ld(v(3), off: -8), ld(v(4), v(3), off: 8)])
+    assert out[3] == "mov v4, v2"
+    // An add of a constant is the same address.
+    let added = run(self_xs() + [add(v(3), v(1), 8), ld(v(4), v(3), off: 0), add(v(5), v(1), 0), ld(v(6), v(5), off: 8)])
+    assert added[3] == "mov v4, v2"
+    assert added[5] == "mov v6, v2"
+    // A different offset or width is a different load.
+    let other = run(self_xs() + [ld(v(3), v(1), off: 16), ld(v(4), v(1), off: 8, width: 4)])
+    assert other[2] == "ldr v3, [v1, #16]"
+    assert other[3] == "ldr w4, [v1, #8]"
+}
+
+test "a store to a field forgets fields and elements" {
+    let out = run(self_xs() + [ldx(v(5), v(2), idx: v(6)), st(v(9), v(8), off: 24), ld(v(3), v(1), off: 8), ldx(v(7), v(2), idx: v(6))])
+    assert out[4] == "ldr v3, [v1, #8]"
+    assert out[5] == "ldr v7, [v2, v6, lsl #3]"
+}
+
+test "a store to an element forgets elements, not fields" {
+    let out = run(self_xs() + [ldx(v(5), v(2), idx: v(6)), stx(v(9), v(8), idx: v(10)), ld(v(3), v(1), off: 8), ldx(v(7), v(2), idx: v(6))])
+    assert out[4] == "mov v3, v2"
+    assert out[5] == "ldr v7, [v2, v6, lsl #3]"
+    // The same element, stored and loaded again.
+    let same = run(self_xs() + [ldx(v(5), v(2), idx: v(6)), stx(v(9), v(2), idx: v(6)), ldx(v(7), v(2), idx: v(6))])
+    assert same[4] == "ldr v7, [v2, v6, lsl #3]"
+}
+
+test "a call forgets the heap, not the frame's slots" {
+    let out = run(self_xs() + [call("_f"), slot_ld(v(3), off: -8), ld(v(4), v(3), off: 8), ld(v(5), v(1), off: 8)])
+    assert out[4] == "ldr v4, [v3, #8]"
+    // v1 and v3 are the same value, loaded from the same slot.
+    assert out[5] == "mov v5, v4"
+}
+
+test "with an address in the frame taken, a call forgets the slots too" {
+    let taken = [regalloc.op(.Sub, a: v(20), b: r("fp"), c: regalloc.imm(16))]
+    let out = run(taken + self_xs() + [call("_f"), slot_ld(v(3), off: -8), ld(v(4), v(3), off: 8), ld(v(5), v(1), off: 8)])
+    assert out[6] == "ldr v5, [v1, #8]"
+}
+
+test "a slot stored between is a different base" {
+    let out = run(self_xs() + [slot_st(v(9), off: -8), slot_ld(v(3), off: -8), ld(v(4), v(3), off: 8)])
+    assert out[4] == "ldr v4, [v3, #8]"
+    // Stored from the register that was loaded from it: the same value.
+    let back = run(self_xs() + [slot_st(v(1), off: -8), slot_ld(v(3), off: -8), ld(v(4), v(3), off: 8)])
+    assert back[4] == "mov v4, v2"
+}
+
+test "the retain stub forgets only count words; a release forgets the heap" {
+    let counted = [slot_ld(v(1), off: -8), ld(v(2), v(1), off: -8, width: 4), ld(v(3), v(1), off: 8)]
+    let retained = run(counted + [call("_rc_retain_stub"), ld(v(4), v(1), off: -8, width: 4), ld(v(5), v(1), off: 8)])
+    assert retained[4] == "ldr w4, [v1, #-8]"
+    assert retained[5] == "mov v5, v3"
+    let released = run(counted + [call("_rc_release_stub"), ld(v(5), v(1), off: 8)])
+    assert released[4] == "ldr v5, [v1, #8]"
+}
+
+test "a register written between is a different base" {
+    let out = run(self_xs() + [ld(v(1), v(9), off: 0), ld(v(3), v(1), off: 8)])
+    assert out[3] == "ldr v3, [v1, #8]"
+}
+
+test "a line marker is no join" {
+    let out = run(self_xs() + [label("Lline$1"), ld(v(3), v(1), off: 8)])
+    assert out[3] == "mov v3, v2"
+}
+
+test "where ways meet, what all of them know" {
+    // Neither way changes anything.
+    let kept = run(self_xs() + [b_if(.Eq, "Lelse$1"), ld(v(5), v(1), off: 16), b("Lend$2"), label("Lelse$1"), label("Lend$2"), ld(v(3), v(1), off: 8)])
+    assert kept[7] == "mov v3, v2"
+    // One way stores to a field.
+    let stored = run(self_xs() + [b_if(.Eq, "Lelse$1"), st(v(5), v(1), off: 8), b("Lend$2"), label("Lelse$1"), label("Lend$2"), ld(v(3), v(1), off: 8)])
+    assert stored[7] == "ldr v3, [v1, #8]"
+    // One way writes the base register.
+    let written = run(self_xs() + [b_if(.Eq, "Lend$2"), ld(v(1), v(9), off: 0), label("Lend$2"), ld(v(3), v(1), off: 8)])
+    assert written[5] == "ldr v3, [v1, #8]"
+    // A load only one way made isn't known after.
+    let one_way = run(self_xs() + [b_if(.Eq, "Lend$2"), ld(v(5), v(1), off: 16), label("Lend$2"), ld(v(6), v(1), off: 16)])
+    assert one_way[5] == "ldr v6, [v1, #16]"
+}
+
+// A bounds check of v3 against the length v2 (loaded from v1), its cold
+// block after the jump past it, and `middle` between.
+func checked(anon middle: [regalloc.Insn], cold: [regalloc.Insn] = []) -> [regalloc.Insn] {
+    let head: [regalloc.Insn] = [slot_ld(v(1), off: -8), ld(v(2), v(1), off: 8), cmp(v(3), v(2)), b_if(.Hs, "Lcold$1"), label("Lidx_ok$2")]
+    let tail: [regalloc.Insn] = [b("Lout$3"), label("Lcold$1")]
+    let rest: [regalloc.Insn] = [
+        cmp(v(3), regalloc.imm(0)),
+        b_if(.Ge, "Lcold$1_oob"),
+        regalloc.op(.Add, a: v(3), b: v(3), c: v(2)),
+        cmp(v(3), v(2)),
+        b_if(.Lo, "Lidx_ok$2"),
+        label("Lcold$1_oob"),
+        mov(r("x0"), v(3)),
+        mov(r("x1"), v(2)),
+        call("_kod_index_oob"),
+        label("Lout$3"),
+    ]
+    return head + middle + tail + cold + rest
+}
+
+test "a bounds check's cold block changes only the index" {
+    let out = run(checked([ld(v(4), v(1), off: 0), ldx(v(5), v(4), idx: v(3)), ld(v(6), v(1), off: 8), ld(v(7), v(1), off: 0), ldx(v(8), v(7), idx: v(3))]))
+    assert out[7] == "mov v6, v2"
+    assert out[8] == "mov v7, v4"
+    assert out[9] == "mov v8, v5"
+    // An element loaded with the index before the check isn't the one after.
+    let before = run([ldx(v(9), v(10), idx: v(3))] + checked([ldx(v(11), v(10), idx: v(3))]))
+    assert before[6] == "ldr v11, [v10, v3, lsl #3]"
+    // A cold block that stores forgets.
+    let storing = run(checked([ld(v(6), v(1), off: 8)], cold: [st(v(9), v(12), off: 0)]))
+    assert storing[5] == "ldr v6, [v1, #8]"
+}
+
+// A loop from Ltop$1 to its backward branch, leaving to Lexit$2, with
+// `body` in it, after `self_xs`; then `after`.
+func looped(anon body: [regalloc.Insn], after: [regalloc.Insn] = []) -> [regalloc.Insn] {
+    return self_xs() + [label("Lfor$1_top"), cmp(v(30), v(31)), b_if(.Ge, "Lfor$1_exit")] + body + [b("Lfor$1_top"), label("Lfor$1_exit")] + after
+}
+
+test "a loop keeps what nothing in it changes" {
+    let out = run(looped([ld(v(3), v(1), off: 8)], after: [ld(v(4), v(1), off: 8)]))
+    assert out[5] == "mov v3, v2"
+    assert out[8] == "mov v4, v2"
+    // A store in the loop forgets at its top, whatever comes before it.
+    let stored = run(looped([ld(v(3), v(1), off: 8), st(v(9), v(10), off: 16)]))
+    assert stored[5] == "ldr v3, [v1, #8]"
+    // A call in it too.
+    let called = run(looped([ld(v(3), v(1), off: 8), call("_f")]))
+    assert called[5] == "ldr v3, [v1, #8]"
+    // So does writing the base.
+    let written = run(looped([ld(v(3), v(1), off: 8), ld(v(1), v(11), off: 0)]))
+    assert written[5] == "ldr v3, [v1, #8]"
+}
+
+test "a loop something outside jumps into forgets everything" {
+    let into = [b_if(.Eq, "Linner$9")] + looped([ld(v(3), v(1), off: 8), label("Linner$9"), ld(v(4), v(1), off: 8)])
+    let out = run(into)
+    assert out[6] == "ldr v3, [v1, #8]"
+    assert out[8] == "ldr v4, [v1, #8]"
+}
+
+// emit_unique's check on the field at `place` (v10) whose array is `arr`,
+// closed by Luniq$`n`; with `strukt`, a value struct's check.
+func unique(anon arr: int64, anon count_reg: int64, anon n: int64, strukt: bool = false) -> [regalloc.Insn] {
+    let done = f"Luniq${n}"
+    mut stub: [regalloc.Insn] = [regalloc.op(.Move, a: r("x17"), b: regalloc.imm(8)), call("_kod_arr_unique_stub")]
+    if strukt {
+        stub = [call("_kod_obj_unique_stub")]
+    }
+    return [
+        .Mem(load: true, width: 8, reg: v(arr), base: v(10), at: .Base),
+        ld(v(count_reg), v(arr), off: -8, width: 4),
+        cmp(v(count_reg), regalloc.imm(1)),
+        b_if(.Eq, done),
+        mov(r("x16"), v(10)),
+    ] + stub + [
+        mov(v(arr), r("x17")),
+        label(done),
+    ]
+}
+
+test "a second copy-on-write check of the same array goes" {
+    let first = [slot_ld(v(1), off: -8), add(v(10), v(1), 0)] + unique(11, 12, 1) + [ld(v(13), v(11), off: 0), stx(v(20), v(13), idx: v(21))]
+    let out = run(first + unique(14, 15, 2) + [ld(v(16), v(14), off: 0), stx(v(22), v(16), idx: v(23))])
+    assert count(out, "bl _kod_arr_unique_stub") == 1
+    assert out[13] == "mov v14, v11"
+    assert out[14] == "Luniq$2:"
+    assert out[15] == "mov v16, v13"
+    // A call between could give the array another holder.
+    let called = run(first + [call("_f")] + unique(14, 15, 2))
+    assert count(called, "bl _kod_arr_unique_stub") == 2
+    // So could a retain.
+    let retained = run(first + [call("_rc_retain_stub")] + unique(14, 15, 2))
+    assert count(retained, "bl _kod_arr_unique_stub") == 2
+    // A store to a field could put another array in the place.
+    let stored = run(first + [st(v(24), v(25), off: 0)] + unique(14, 15, 2))
+    assert count(stored, "bl _kod_arr_unique_stub") == 2
+}
+
+test "a value struct's check leaves a constant struct as it is, so it stays" {
+    let first = [slot_ld(v(1), off: -8), add(v(10), v(1), 0)] + unique(11, 12, 1, strukt: true) + [st(v(20), v(11), off: 8)]
+    let out = run(first + unique(14, 15, 2, strukt: true))
+    assert count(out, "bl _kod_obj_unique_stub") == 2
+    // What the place holds is still known after the first.
+    let loaded = run([slot_ld(v(1), off: -8), add(v(10), v(1), 0)] + unique(11, 12, 1, strukt: true) + [.Mem(load: true, width: 8, reg: v(13), base: v(10), at: .Base)])
+    assert loaded[10] == "mov v13, v11"
+}

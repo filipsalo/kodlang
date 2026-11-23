@@ -1966,3 +1966,1276 @@ func pack(pool: RegPool, vreg_start: int64) -> int64 {
     }
     return len(used)
 }
+
+// Loads made once (docs/ir.md, step 13). `reuse_loads` walks a function's
+// body in vregs, in layout order, numbering values: a vreg gets a value
+// number where it is written and keeps it while nothing writes it. A load is
+// known by its address in value numbers; one whose value a vreg still holds
+// becomes a `mov` from it. What is known about memory is a list of facts.
+
+// How many changes of value numbers a join looks back over before it
+// forgets everything instead.
+let LOG_REACH: int64 = 512
+// The most facts kept: past it, the oldest go.
+let FACTS_CAP: int64 = 32
+// A fact is FACT_WORDS numbers in a row: what its address is (FACT_ below),
+// the base's value number, the offset, the index's value number (with the
+// width, +16 when the index is scaled), the width, the value's number, and
+// the local vreg holding it (-1 for none).
+let FACT_WORDS: int64 = 7
+// What a fact's address is: a field or header word (a base and an offset),
+// an element (a base, an offset and an index), or a frame slot (an offset
+// from fp).
+let FACT_FIELD: int64 = 0
+let FACT_ELEM: int64 = 1
+let FACT_SLOT: int64 = 2
+// What an instruction may change in memory, as a mask: the count words (a
+// field at a negative offset, or any of 4 bytes), the elements, every field
+// and header word (the count words too), the frame slots.
+let KILL_COUNT: int64 = 1
+let KILL_ELEM: int64 = 2
+let KILL_FIELD: int64 = 4
+let KILL_HEAP: int64 = 6
+let KILL_SLOTS: int64 = 8
+// The value number of the constant 1, a count once a copy-on-write check passed.
+let VN_ONE: int64 = -3
+
+// The value number of the constant `k` (0 or more): negative, so no fresh one
+// is ever equal to it.
+func const_vn(anon k: int64) -> int64 {
+    return -(k + 2)
+}
+
+// Rewrites `body` (vregs `vreg_start` up to `vreg_start + n_local`) in place:
+// each load whose value a vreg holds becomes a `mov` from it, and each
+// copy-on-write check whose array is known to be its place's own goes.
+// Returns how many lines changed.
+func reuse_loads(anon body: InsnBuf, vreg_start: int64, n_local: int64) -> int64 {
+    if n_local <= 0 {
+        return 0
+    }
+    let r = LoadReuse(:body, :vreg_start, :n_local)
+    if not r.prepare() {
+        return 0
+    }
+    r.walk()
+    r.compact()
+    return r.changed
+}
+
+// Whether `body` changes an array in place (has a copy-on-write check):
+// the code reuse_loads is for (see codegen's compile_func).
+func changes_arrays(anon body: InsnBuf) -> bool {
+    let tags = body.tags
+    for i in 0..body.n {
+        if (tags[i] & 255) == INSN_CALL and is_unique_stub(body.strs[body.fa[i]]) {
+            return true
+        }
+    }
+    return false
+}
+
+type LoadReuse = shared struct {
+    body: InsnBuf
+    vreg_start: int64
+    n_local: int64
+    changed: int64 = 0
+    // The facts now: the first `nf` of `facts` (FACT_WORDS each), and their
+    // version, which no other content of facts had (see meet_with).
+    facts: [int64] = []
+    nf: int64 = 0
+    fver: int64 = 0
+    vers: int64 = 0
+    // Whether this line can be reached at all.
+    reachable: bool = true
+    // Per local vreg: its value number, valid while its epoch is `epoch`.
+    reg_vn: [int64] = []
+    reg_epoch: [int64] = []
+    epoch: int64 = 1
+    // Value numbers: an add of a constant is its base's base plus an offset.
+    next_vn: int64 = 1
+    vn_base: [int64] = []
+    vn_off: [int64] = []
+    // Each change of a local vreg's value number, by line, in order: the
+    // first `n_log`.
+    log_line: [int64] = []
+    log_reg: [int64] = []
+    n_log: int64 = 0
+    // Per local vreg: the label line that last gave it a new value number.
+    renewed_at: [int64] = []
+    // Whether the function takes an address in its frame (other than a
+    // copy-on-write check's place), so any store or call may write a slot.
+    frame_addr: bool = false
+    // Per line: a branch's target and a label's own number among the
+    // labels (-1 for none).
+    target: [int64] = []
+    ord: [int64] = []
+    // The lines dropped checks took: from each of drop_from up to its drop_to.
+    drop_from: [int64] = []
+    drop_to: [int64] = []
+    // The line the walk goes on at, past a dropped check (-1: none).
+    skip_to: int64 = -1
+    // Per label, by its number: its line, how many branches go to it, the
+    // lines of the first and last of them, and the first of the branches
+    // back to it (an index into back_line, -1 for none).
+    lab_line: [int64] = []
+    refs: [int64] = []
+    ref_first: [int64] = []
+    ref_last: [int64] = []
+    back_head: [int64] = []
+    // The branches back to a label: their lines, each list linked by back_next.
+    back_line: [int64] = []
+    back_next: [int64] = []
+    // Per label: the facts its forward branches had, met (with their count
+    // and version), and the first of those branches (-1 for none yet).
+    pend: [[int64]] = []
+    pend_n: [int64] = []
+    pend_ver: [int64] = []
+    pend_line: [int64] = []
+    // Per label closing a copy-on-write check: the place's fact (kind, base,
+    // off), the array's vreg, and whether its count is then 1 (an array's
+    // check; a struct's leaves a constant one as it is); kind -1 for none.
+    uniq_kind: [int64] = []
+    uniq_one: [bool] = []
+    uniq_base: [int64] = []
+    uniq_off: [int64] = []
+    uniq_reg: [int64] = []
+    // A store's slot, as slot_store leaves it: its offset and width (0: none).
+    store_off: int64 = 0
+    store_width: int64 = 0
+
+    // Works out the labels and branches; false when the body has nothing to reuse.
+    func prepare(self) -> bool {
+        let b = self.body
+        let n = b.n
+        mut loads = 0
+        mut nl = 0
+        for i in 0..n {
+            let tag = b.tags[i]
+            let variant = tag & 255
+            if variant == INSN_LABEL {
+                nl += 1
+            } else if variant == INSN_MEM and ((tag >> 8) & 1) == 1 and b.fb[i] != FP {
+                loads += 1
+            }
+        }
+        if loads < 2 {
+            return false
+        }
+        // The labels by their names: a table of label numbers + 1, by a
+        // hash of the name's end (labels differ in their numbers).
+        mut size = 16
+        for size < nl * 2 {
+            size = size * 2
+        }
+        let mask = size - 1
+        mut table = [0] * size
+        self.ord = [-1] * n
+        self.lab_line = [0] * nl
+        mut k = 0
+        for i in 0..n {
+            if (b.tags[i] & 255) == INSN_LABEL {
+                self.ord[i] = k
+                self.lab_line[k] = i
+                mut h = label_hash(b.strs[b.fa[i]]) & mask
+                for table[h] != 0 {
+                    h = (h + 1) & mask
+                }
+                table[h] = k + 1
+                k += 1
+            }
+        }
+        self.refs = [0] * nl
+        self.ref_first = [-1] * nl
+        self.ref_last = [-1] * nl
+        self.back_head = [-1] * nl
+        self.target = [-1] * n
+        for i in 0..n {
+            let tag = b.tags[i]
+            let variant = tag & 255
+            if variant == INSN_BRANCH {
+                let t = self.label_named(b.strs[b.fb[i]], :table, :mask)
+                self.target[i] = t
+                if t >= 0 {
+                    if self.refs[t] == 0 {
+                        self.ref_first[t] = i
+                    }
+                    self.refs[t] += 1
+                    self.ref_last[t] = i
+                    if i > self.lab_line[t] {
+                        self.back_line += [i]
+                        self.back_next += [self.back_head[t]]
+                        self.back_head[t] = len(self.back_line) - 1
+                    }
+                }
+            } else if variant == INSN_OP {
+                let a = b.fa[i]
+                let ob = b.fb[i]
+                let oc = b.fc[i]
+                let od = b.fd[i]
+                if (ob == FP or ob == SP or oc == FP or oc == SP or od == FP or od == SP) and a != FP and a != SP and not self.check_place_at(i) {
+                    self.frame_addr = true
+                }
+                // A label as an operand (its address taken): reached from anywhere.
+                self.note_label_operand(ob, :table, :mask)
+                self.note_label_operand(oc, :table, :mask)
+                self.note_label_operand(od, :table, :mask)
+            } else if variant == INSN_MOV {
+                let src = b.fb[i]
+                let dst = b.fa[i]
+                if (src == FP or src == SP) and dst != FP and dst != SP {
+                    self.frame_addr = true
+                }
+            } else if variant == INSN_MEM {
+                if b.fa[i] == FP or b.fa[i] == SP {
+                    self.frame_addr = true
+                }
+                if ((tag >> 9) & 3) == AT_SYMBOL {
+                    self.reached_anywhere(self.label_named(b.strs[b.fc[i]], :table, :mask))
+                }
+            }
+        }
+        self.facts = [0] * (FACTS_CAP * FACT_WORDS)
+        self.reg_vn = [0] * self.n_local
+        self.reg_epoch = [0] * self.n_local
+        self.renewed_at = [-1] * self.n_local
+        let room = n / 4 + 64
+        self.vn_base = [0] * room
+        self.vn_off = [0] * room
+        self.log_line = [0] * room
+        self.log_reg = [0] * room
+        let none_yet: [int64] = []
+        self.pend = [none_yet] * nl
+        self.pend_n = [0] * nl
+        self.pend_ver = [0] * nl
+        self.pend_line = [-1] * nl
+        self.uniq_kind = [-1] * nl
+        self.uniq_base = [0] * nl
+        self.uniq_off = [0] * nl
+        self.uniq_reg = [0] * nl
+        self.uniq_one = [false] * nl
+        return true
+    }
+
+    // The number of the label named `name`, or -1.
+    func label_named(self, anon name: str, table: [int64], mask: int64) -> int64 {
+        let b = self.body
+        mut h = label_hash(name) & mask
+        for table[h] != 0 {
+            let k = table[h] - 1
+            if b.strs[b.fa[self.lab_line[k]]] == name {
+                return k
+            }
+            h = (h + 1) & mask
+        }
+        return -1
+    }
+
+    // Label `t` (-1: none) can be reached from anywhere.
+    func reached_anywhere(self, anon t: int64) -> none {
+        if t >= 0 {
+            self.refs[t] += 1
+            self.ref_first[t] = 0
+            self.ref_last[t] = self.body.n
+            self.back_head[t] = -2
+        }
+    }
+
+    // A label named as operand `r` can be reached from anywhere.
+    func note_label_operand(self, anon r: Reg, table: [int64], mask: int64) -> none {
+        if (r & 3) != 0 or r <= XZR {
+            return
+        }
+        let name = NAMES[r >> 2]
+        if len(name) > 0 and name[0] == 'L' {
+            self.reached_anywhere(self.label_named(name, :table, :mask))
+        }
+    }
+
+    // Whether line `i` is `sub x16, fp, #n` giving a copy-on-write stub its place.
+    func check_place_at(self, anon i: int64) -> bool {
+        let b = self.body
+        if b.tags[i] != (INSN_OP | (OP_SUB << 8)) or b.fa[i] != X16 or b.fb[i] != FP or (b.fc[i] & 3) != 3 {
+            return false
+        }
+        for k in i + 1..i + 3 {
+            if k < b.n and (b.tags[k] & 255) == INSN_CALL and is_unique_stub(b.strs[b.fa[k]]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The local id of vreg operand `reg`, or -1.
+    func local(self, anon reg: Reg) -> int64 {
+        let tag = reg & 3
+        if tag != 1 and tag != 2 {
+            return -1
+        }
+        let id = (reg >> 2) - self.vreg_start
+        if id < 0 or id >= self.n_local {
+            return -1
+        }
+        return id
+    }
+
+    // The facts changed: a new version.
+    func bump(self) -> none {
+        self.vers += 1
+        self.fver = self.vers
+    }
+
+    func fresh(self) -> int64 {
+        let v = self.next_vn
+        self.next_vn = v + 1
+        if v == len(self.vn_base) {
+            let more = [0] * (v + 64)
+            self.vn_base += more
+            self.vn_off += more
+        }
+        self.vn_base[v] = v
+        self.vn_off[v] = 0
+        return v
+    }
+
+    // The value number `reg` has here: a local vreg's, a new one for
+    // anything else (or a local vreg nothing is known of yet, which keeps it).
+    func read(self, anon reg: Reg) -> int64 {
+        let id = self.local(reg)
+        if id < 0 {
+            return self.fresh()
+        }
+        if self.reg_epoch[id] == self.epoch and self.reg_vn[id] != 0 {
+            return self.reg_vn[id]
+        }
+        let v = self.fresh()
+        self.reg_vn[id] = v
+        self.reg_epoch[id] = self.epoch
+        return v
+    }
+
+    // Local vreg `id` holds `v` from line `line` on.
+    func set(self, anon id: int64, v: int64, line: int64) -> none {
+        self.reg_vn[id] = v
+        self.reg_epoch[id] = self.epoch
+        let k = self.n_log
+        if k == len(self.log_line) {
+            let more = [0] * (k + 64)
+            self.log_line += more
+            self.log_reg += more
+        }
+        self.log_line[k] = line
+        self.log_reg[k] = id
+        self.n_log = k + 1
+    }
+
+    // `reg`, if a local vreg, gets a new value number at `line` (made when
+    // it is read: 0 until then).
+    func clobber(self, anon reg: Reg, line: int64) -> none {
+        let id = self.local(reg)
+        if id >= 0 {
+            self.set(id, v: 0, :line)
+        }
+    }
+
+    func canon_base(self, anon v: int64) -> int64 {
+        if v < 0 {
+            return v
+        }
+        return self.vn_base[v]
+    }
+
+    func canon_off(self, anon v: int64) -> int64 {
+        if v < 0 {
+            return 0
+        }
+        return self.vn_off[v]
+    }
+
+    // Nothing is known: no facts, and no vreg's value number holds.
+    func forget_all(self) -> none {
+        self.epoch += 1
+        self.nf = 0
+        self.bump()
+    }
+
+    // Drops fact `k` (the last takes its place).
+    func drop_fact(self, anon k: int64) -> none {
+        let last = self.nf - 1
+        if k != last {
+            let to = k * FACT_WORDS
+            let from = last * FACT_WORDS
+            for w in 0..FACT_WORDS {
+                self.facts[to + w] = self.facts[from + w]
+            }
+        }
+        self.nf = last
+        self.bump()
+    }
+
+    // Drops the facts `mask` (KILL_) says may have changed.
+    func kill(self, anon mask: int64) -> none {
+        if mask == 0 or self.nf == 0 {
+            return
+        }
+        mut k = 0
+        for k < self.nf {
+            let at = k * FACT_WORDS
+            let kind = self.facts[at]
+            mut gone = false
+            if kind == FACT_FIELD {
+                gone = (mask & KILL_FIELD) != 0 or ((mask & KILL_COUNT) != 0 and (self.facts[at + 2] < 0 or self.facts[at + 4] == 4))
+            } else if kind == FACT_ELEM {
+                gone = (mask & KILL_ELEM) != 0
+            } else {
+                gone = (mask & KILL_SLOTS) != 0
+            }
+            if gone {
+                self.drop_fact(k)
+            } else {
+                k += 1
+            }
+        }
+    }
+
+    // Drops the slot facts a `width`-byte store at fp + `off` overlaps.
+    func kill_slot(self, anon off: int64, width: int64) -> none {
+        mut k = 0
+        for k < self.nf {
+            let at = k * FACT_WORDS
+            if self.facts[at] == FACT_SLOT and self.facts[at + 2] < off + width and off < self.facts[at + 2] + self.facts[at + 4] {
+                self.drop_fact(k)
+            } else {
+                k += 1
+            }
+        }
+    }
+
+    // The fact at an address, or -1.
+    func find(self, kind: int64, base: int64, off: int64, index: int64, width: int64) -> int64 {
+        let facts = self.facts
+        for k in 0..self.nf {
+            let at = k * FACT_WORDS
+            if facts[at + 2] == off and facts[at + 1] == base and facts[at] == kind and facts[at + 3] == index and facts[at + 4] == width {
+                return k
+            }
+        }
+        return -1
+    }
+
+    func add(self, kind: int64, base: int64, off: int64, index: int64, width: int64, value: int64, holder: int64) -> none {
+        mut k = self.find(:kind, :base, :off, :index, :width)
+        if k < 0 {
+            if self.nf == FACTS_CAP {
+                self.drop_fact(0)
+            }
+            k = self.nf
+            self.nf = k + 1
+        }
+        let at = k * FACT_WORDS
+        self.facts[at] = kind
+        self.facts[at + 1] = base
+        self.facts[at + 2] = off
+        self.facts[at + 3] = index
+        self.facts[at + 4] = width
+        self.facts[at + 5] = value
+        self.facts[at + 6] = holder
+        self.bump()
+    }
+
+    // Whether local vreg `h` (-1: none) still holds value number `v`.
+    func holds(self, anon h: int64, v: int64) -> bool {
+        return h >= 0 and self.reg_epoch[h] == self.epoch and self.reg_vn[h] == v
+    }
+
+    // Keeps only the facts `other` (`other_n` of them, version `other_ver`) has too.
+    func meet_with(self, anon other: [int64], other_n: int64, other_ver: int64) -> none {
+        if other_ver == self.fver {
+            return
+        }
+        mut k = 0
+        for k < self.nf {
+            let at = k * FACT_WORDS
+            mut found = false
+            for j in 0..other_n {
+                let o = j * FACT_WORDS
+                if other[o + 2] == self.facts[at + 2] and other[o + 1] == self.facts[at + 1] and other[o + 5] == self.facts[at + 5] and other[o] == self.facts[at] and other[o + 3] == self.facts[at + 3] and other[o + 4] == self.facts[at + 4] {
+                    found = true
+                    break
+                }
+            }
+            if found {
+                k += 1
+            } else {
+                self.drop_fact(k)
+            }
+        }
+    }
+
+    // Takes the facts label `t` has pending as the state's own.
+    func take_pending(self, anon t: int64) -> none {
+        self.facts = self.pend[t]
+        self.nf = self.pend_n[t]
+        self.fver = self.pend_ver[t]
+    }
+
+    // Meets the state (or, with `have` false, replaces it) with what label
+    // `t` has pending.
+    func meet_pending(self, anon t: int64, have: bool) -> none {
+        if have {
+            self.meet_with(self.pend[t], other_n: self.pend_n[t], other_ver: self.pend_ver[t])
+        } else {
+            self.take_pending(t)
+        }
+    }
+
+    // What line `j` may change in memory (KILL_ bits; a slot store's own
+    // slot is slot_store's).
+    func kills_at(self, anon j: int64) -> int64 {
+        let b = self.body
+        let tag = b.tags[j]
+        let variant = tag & 255
+        mut frame: int64 = 0
+        // What a store to a slot may change besides it.
+        mut via_slot: int64 = 0
+        if self.frame_addr {
+            frame = KILL_SLOTS
+            via_slot = KILL_HEAP
+        }
+        if variant == INSN_SLOT {
+            if (tag >> 8) == 1 {
+                return via_slot
+            }
+            return 0
+        }
+        if variant == INSN_MEM {
+            if ((tag >> 8) & 1) == 1 {
+                return 0
+            }
+            let base = b.fb[j]
+            let at_kind = (tag >> 9) & 3
+            if base == FP or base == SP {
+                if base == FP and at_kind == AT_OFFSET {
+                    // A slot's store: slot_store.
+                    return via_slot
+                }
+                return KILL_SLOTS | via_slot
+            }
+            if at_kind == AT_INDEX {
+                return KILL_ELEM | frame
+            }
+            if at_kind == AT_SYMBOL {
+                return KILL_HEAP | KILL_SLOTS
+            }
+            return KILL_HEAP | frame
+        }
+        if variant == INSN_CALL {
+            let name = b.strs[b.fa[j]]
+            if never_returns(name) {
+                return 0
+            }
+            if name == "_rc_retain_stub" {
+                return KILL_COUNT
+            }
+            return KILL_HEAP | frame
+        }
+        if variant == INSN_OP {
+            if (tag >> 8) == OP_CALL_INDIRECT {
+                return KILL_HEAP | frame
+            }
+            return 0
+        }
+        if variant == INSN_INTRINSIC {
+            return KILL_HEAP | frame
+        }
+        if variant == INSN_PAIR {
+            if ((tag >> 8) & 1) == 0 {
+                return KILL_HEAP | KILL_SLOTS
+            }
+            return 0
+        }
+        if variant == INSN_DATA {
+            return KILL_HEAP | KILL_SLOTS
+        }
+        return 0
+    }
+
+    // Whether line `j` stores to a slot, which it leaves in store_off and
+    // store_width: a Slot's store, a store at `[fp, #off]`, and a
+    // copy-on-write stub given `fp - n` as its place.
+    func slot_store(self, anon j: int64) -> bool {
+        let b = self.body
+        let tag = b.tags[j]
+        let variant = tag & 255
+        if variant == INSN_SLOT and (tag >> 8) == 1 {
+            self.store_off = b.fb[j]
+            self.store_width = reg_width(b.fa[j])
+            return true
+        }
+        if variant == INSN_MEM and ((tag >> 8) & 1) == 0 and b.fb[j] == FP and ((tag >> 9) & 3) == AT_OFFSET {
+            self.store_off = b.fc[j]
+            self.store_width = b.fd[j]
+            return true
+        }
+        if variant == INSN_CALL and is_unique_stub(b.strs[b.fa[j]]) {
+            for k in j - 2..j {
+                if k >= 0 and self.check_place_at(k) {
+                    self.store_off = 0 - imm_value(b.fc[k])
+                    self.store_width = 8
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // The local vregs line `j` writes each get a new value number at `line`.
+    func clobber_written(self, anon j: int64, line: int64) -> none {
+        let b = self.body
+        let tag = b.tags[j]
+        let variant = tag & 255
+        let sub = tag >> 8
+        if variant == INSN_SLOT {
+            if sub == 0 {
+                self.clobber(b.fa[j], :line)
+            }
+        } else if variant == INSN_MOV or variant == INSN_LOAD_CONST {
+            self.clobber(b.fa[j], :line)
+        } else if variant == INSN_MEM {
+            if (sub & 1) == 1 {
+                self.clobber(b.fa[j], :line)
+            }
+        } else if variant == INSN_OP {
+            if not reads_only(sub) {
+                self.clobber(b.fa[j], :line)
+            }
+        } else if variant == INSN_PAIR {
+            if (sub & 1) == 1 {
+                self.clobber(b.fa[j], :line)
+                self.clobber(b.fb[j], :line)
+            }
+        }
+    }
+
+    // Lines `from` up to `to` may have run: what they write is forgotten (at `line`).
+    func forget_range(self, from: int64, to: int64, line: int64) -> none {
+        mut mask: int64 = 0
+        let b = self.body
+        let tags = b.tags
+        let fa = b.fa
+        let vs = self.vreg_start
+        let nloc = self.n_local
+        for j in from..to + 1 {
+            let tag = tags[j]
+            let variant = tag & 255
+            let sub = tag >> 8
+            mut written = NO_REG
+            if variant == INSN_MOV or variant == INSN_LOAD_CONST {
+                written = fa[j]
+            } else if variant == INSN_OP {
+                if reads_only(sub) {
+                    mask = mask | self.kills_at(j)
+                } else {
+                    written = fa[j]
+                }
+            } else if variant == INSN_MEM {
+                if (sub & 1) == 1 {
+                    written = fa[j]
+                } else {
+                    mask = mask | self.kills_at(j)
+                    if self.slot_store(j) {
+                        self.kill_slot(self.store_off, width: self.store_width)
+                    }
+                }
+            } else if variant == INSN_SLOT {
+                if sub == 0 {
+                    written = fa[j]
+                } else {
+                    mask = mask | self.kills_at(j)
+                    self.kill_slot(b.fb[j], width: reg_width(fa[j]))
+                }
+            } else if variant == INSN_CALL {
+                mask = mask | self.kills_at(j)
+                if self.slot_store(j) {
+                    self.kill_slot(self.store_off, width: self.store_width)
+                }
+            } else if variant != INSN_LABEL and variant != INSN_BRANCH {
+                // Intrinsic, Pair, Data.
+                mask = mask | self.kills_at(j)
+                self.clobber_written(j, :line)
+            }
+            let id = (written >> 2) - vs
+            if (written & 3) != 0 and (written & 3) != 3 and id >= 0 and id < nloc {
+                self.set(id, v: 0, :line)
+            }
+        }
+        self.kill(mask)
+    }
+
+    // The value number of the slot at `off` of `width` bytes, made one if
+    // nothing is known of it.
+    func slot_value(self, anon off: int64, width: int64) -> int64 {
+        let k = self.find(kind: FACT_SLOT, base: 0, :off, index: 0, :width)
+        if k >= 0 {
+            return self.facts[k * FACT_WORDS + 5]
+        }
+        let v = self.fresh()
+        self.add(kind: FACT_SLOT, base: 0, :off, index: 0, :width, value: v, holder: -1)
+        return v
+    }
+
+    // A slot's load into `reg` at line `i`.
+    func slot_load(self, anon reg: Reg, off: int64, width: int64, i: int64) -> none {
+        let v = self.slot_value(off, :width)
+        let id = self.local(reg)
+        if id >= 0 {
+            self.set(id, :v, line: i)
+        }
+    }
+
+    // A slot's store of `reg`.
+    func slot_store_of(self, anon reg: Reg, off: int64, width: int64) -> none {
+        self.kill_slot(off, :width)
+        if width == 8 {
+            let v = self.read(reg)
+            self.add(kind: FACT_SLOT, base: 0, :off, index: 0, :width, value: v, holder: -1)
+        }
+    }
+
+    func walk(self) -> none {
+        let b = self.body
+        let tags = b.tags
+        let fa = b.fa
+        let fb = b.fb
+        let n = b.n
+        let vs = self.vreg_start
+        let nloc = self.n_local
+        mut i = 0
+        for i < n {
+            let tag = tags[i]
+            let variant = tag & 255
+            let sub = tag >> 8
+            if variant == INSN_LABEL {
+                if self.refs[self.ord[i]] != 0 {
+                    self.at_label(i)
+                }
+                i += 1
+                continue
+            }
+            if not self.reachable {
+                i += 1
+                continue
+            }
+            if variant == INSN_MOV {
+                // A copy keeps its source's value number.
+                let dst = fa[i]
+                let id = (dst >> 2) - vs
+                if (dst & 3) != 0 and (dst & 3) != 3 and id >= 0 and id < nloc {
+                    let src = fb[i]
+                    let sid = (src >> 2) - vs
+                    if (dst & 3) == 1 and (src & 3) == 1 and sid >= 0 and sid < nloc {
+                        self.set(id, v: self.read(src), line: i)
+                    } else {
+                        self.set(id, v: 0, line: i)
+                    }
+                }
+            } else if variant == INSN_OP {
+                self.op(i, opn: sub)
+            } else if variant == INSN_MEM {
+                if (sub & 1) == 1 {
+                    let u = self.unique_label(i)
+                    let place = fb[i]
+                    self.load(i)
+                    if u >= 0 {
+                        self.check_unique(i, label: u, :place)
+                    }
+                } else {
+                    if fb[i] == FP and ((sub >> 1) & 3) == AT_OFFSET {
+                        self.slot_store_of(fa[i], off: b.fc[i], width: b.fd[i])
+                    }
+                    self.kill(self.kills_at(i))
+                }
+            } else if variant == INSN_SLOT {
+                if sub == 1 {
+                    self.slot_store_of(fa[i], off: fb[i], width: reg_width(fa[i]))
+                    if self.frame_addr {
+                        self.kill(KILL_HEAP)
+                    }
+                } else {
+                    let u = self.unique_label(i)
+                    self.slot_load(fa[i], off: fb[i], width: reg_width(fa[i]), :i)
+                    if u >= 0 {
+                        self.check_unique(i, label: u, place: NO_REG)
+                    }
+                }
+            } else if variant == INSN_BRANCH {
+                let t = self.target[i]
+                if t >= 0 and self.lab_line[t] > i {
+                    self.note_branch(t, line: i)
+                }
+                if (sub & 3) == BRANCH_ALWAYS {
+                    self.reachable = false
+                }
+            } else if variant == INSN_CALL {
+                let name = b.strs[fa[i]]
+                if never_returns(name) {
+                    self.reachable = false
+                } else if name == "_rc_retain_stub" {
+                    self.kill(KILL_COUNT)
+                } else {
+                    if is_unique_stub(name) and self.slot_store(i) {
+                        self.kill_slot(self.store_off, width: self.store_width)
+                    }
+                    self.kill(self.kills_at(i))
+                }
+            } else if variant == INSN_DATA {
+                self.forget_all()
+            } else {
+                // Intrinsic, LoadConst, Pair.
+                self.kill(self.kills_at(i))
+                self.clobber_written(i, line: i)
+            }
+            i += 1
+            if self.skip_to >= 0 {
+                i = self.skip_to
+                self.skip_to = -1
+            }
+        }
+    }
+
+    // An Op at line `i`, of opcode number `opn`.
+    func op(self, anon i: int64, opn: int64) -> none {
+        let b = self.body
+        if opn == OP_RETURN {
+            self.reachable = false
+            return
+        }
+        if opn == OP_CALL_INDIRECT {
+            self.kill(self.kills_at(i))
+            return
+        }
+        if reads_only(opn) {
+            return
+        }
+        let a = b.fa[i]
+        let id = self.local(a)
+        if id < 0 {
+            return
+        }
+        let src = b.fb[i]
+        let c = b.fc[i]
+        if (a & 3) == 1 and opn == OP_MOVE and (src & 3) == 3 and c == NO_REG {
+            self.set(id, v: const_vn(imm_value(src)), line: i)
+            return
+        }
+        if (a & 3) == 1 and (opn == OP_ADD or opn == OP_SUB) and (src & 3) == 1 and self.local(src) >= 0 and (c & 3) == 3 and b.fd[i] == NO_REG {
+            let s = self.read(src)
+            mut k = imm_value(c)
+            if opn == OP_SUB {
+                k = 0 - k
+            }
+            if k == 0 {
+                self.set(id, v: s, line: i)
+                return
+            }
+            let v = self.fresh()
+            self.vn_base[v] = self.canon_base(s)
+            self.vn_off[v] = self.canon_off(s) + k
+            self.set(id, :v, line: i)
+            return
+        }
+        self.set(id, v: 0, line: i)
+    }
+
+    // A load at line `i`: from a fact when one is known, else a new fact.
+    func load(self, anon i: int64) -> none {
+        let b = self.body
+        let tag = b.tags[i]
+        let dst = b.fa[i]
+        let base = b.fb[i]
+        let width = b.fd[i]
+        let at_kind = (tag >> 9) & 3
+        if base == FP and at_kind == AT_OFFSET {
+            self.slot_load(dst, off: b.fc[i], :width, :i)
+            return
+        }
+        let id = self.local(dst)
+        if id < 0 or width == 2 or at_kind == AT_SYMBOL or self.local(base) < 0 {
+            self.clobber(dst, line: i)
+            return
+        }
+        let bv = self.read(base)
+        mut kind = FACT_FIELD
+        mut off = self.canon_off(bv)
+        mut index: int64 = 0
+        if at_kind == AT_OFFSET {
+            off += b.fc[i]
+        } else if at_kind == AT_INDEX {
+            kind = FACT_ELEM
+            if self.local(b.fc[i]) < 0 {
+                self.clobber(dst, line: i)
+                return
+            }
+            index = self.read(b.fc[i]) * 32 + width
+            if ((tag >> 11) & 1) == 1 {
+                index += 16
+            }
+        }
+        let cb = self.canon_base(bv)
+        let k = self.find(:kind, base: cb, :off, :index, :width)
+        if k >= 0 {
+            let v = self.facts[k * FACT_WORDS + 5]
+            let h = self.facts[k * FACT_WORDS + 6]
+            if self.holds(h, :v) {
+                if h != id {
+                    b.write_mov(i, dst: vreg(id + self.vreg_start), src: vreg(h + self.vreg_start))
+                    self.changed += 1
+                }
+            } else {
+                self.facts[k * FACT_WORDS + 6] = id
+            }
+            self.set(id, :v, line: i)
+            return
+        }
+        let v = self.fresh()
+        self.set(id, :v, line: i)
+        self.add(:kind, base: cb, :off, :index, :width, value: v, holder: id)
+    }
+
+    // A forward branch at `line` to label `t`: what is known goes with it.
+    func note_branch(self, anon t: int64, line: int64) -> none {
+        if self.pend_line[t] < 0 {
+            self.pend[t] = self.facts
+            self.pend_n[t] = self.nf
+            self.pend_ver[t] = self.fver
+            self.pend_line[t] = line
+            return
+        }
+        if self.pend_ver[t] == self.fver {
+            return
+        }
+        // Met with what the earlier branches had: done on the state's own
+        // facts, which are then put back.
+        let mine = self.facts
+        let mine_n = self.nf
+        let mine_ver = self.fver
+        self.take_pending(t)
+        self.meet_with(mine, other_n: mine_n, other_ver: mine_ver)
+        self.pend[t] = self.facts
+        self.pend_n[t] = self.nf
+        self.pend_ver[t] = self.fver
+        self.facts = mine
+        self.nf = mine_n
+        self.fver = mine_ver
+    }
+
+    // The label at line `i`: what all ways to it know.
+    func at_label(self, anon i: int64) -> none {
+        let t = self.ord[i]
+        if self.refs[t] == 0 {
+            // Nothing branches here (a line marker): no join.
+            return
+        }
+        mut have = self.reachable
+        mut since = i
+        if self.pend_line[t] >= 0 {
+            self.meet_pending(t, :have)
+            have = true
+            since = self.pend_line[t]
+        }
+        if self.back_head[t] == -2 {
+            // Its address is taken: anything may come here.
+            self.forget_all()
+            self.reachable = true
+            return
+        }
+        if self.back_head[t] != -1 {
+            // Branches back to it: from blocks only earlier branches reach,
+            // or from a loop's body.
+            mut detached = self.back_head[t] >= 0
+            mut e = self.back_head[t]
+            for e >= 0 {
+                let c = self.block_start(self.back_line[e])
+                if c < 0 or not self.detached(c, label: i) {
+                    detached = false
+                    break
+                }
+                e = self.back_next[e]
+            }
+            if detached {
+                e = self.back_head[t]
+                for e >= 0 {
+                    let q = self.back_line[e]
+                    let c = self.ord[self.block_start(q)]
+                    if self.pend_line[c] >= 0 {
+                        self.meet_pending(c, :have)
+                        have = true
+                        if self.pend_line[c] < since {
+                            since = self.pend_line[c]
+                        }
+                        self.forget_range(from: self.lab_line[c] + 1, to: q, line: i)
+                    }
+                    e = self.back_next[e]
+                }
+            } else {
+                let end = self.loop_end(i)
+                if end < 0 {
+                    self.forget_all()
+                    self.reachable = true
+                    return
+                }
+                self.forget_range(from: i + 1, to: end, line: i)
+            }
+        }
+        if not have {
+            self.forget_all()
+            self.reachable = true
+            return
+        }
+        self.reachable = true
+        // A vreg written on some way here since the first branch to it has
+        // a new value number.
+        let last = self.n_log
+        mut k = last - 1
+        for k >= 0 and self.log_line[k] > since {
+            k -= 1
+            if last - k > LOG_REACH {
+                self.forget_all()
+                return
+            }
+        }
+        for j in k + 1..last {
+            let id = self.log_reg[j]
+            if self.renewed_at[id] != i {
+                self.renewed_at[id] = i
+                self.set(id, v: 0, line: i)
+            }
+        }
+        if self.uniq_kind[t] >= 0 and self.refs[t] == 1 {
+            // After a copy-on-write check, either way: the place holds the
+            // array, which is its own (its count is 1).
+            let id = self.uniq_reg[t]
+            let v = self.read(vreg(id + self.vreg_start))
+            self.add(kind: self.uniq_kind[t], base: self.uniq_base[t], off: self.uniq_off[t], index: 0, width: 8, value: v, holder: id)
+            if self.uniq_one[t] {
+                self.add(kind: FACT_FIELD, base: self.canon_base(v), off: self.canon_off(v) - 8, index: 0, width: 4, value: VN_ONE, holder: -1)
+            }
+        }
+    }
+
+    // The line of the label that starts the block line `q` is in (scanning
+    // back to it, past labels nothing branches to), or -1.
+    func block_start(self, anon q: int64) -> int64 {
+        let b = self.body
+        mut c = q
+        for c >= 0 and ((b.tags[c] & 255) != INSN_LABEL or self.refs[self.ord[c]] == 0) {
+            c -= 1
+        }
+        return c
+    }
+
+    // Whether the block from the label at line `c` is reached only by
+    // branches before the label at line `label`, and not by falling into it.
+    func detached(self, anon c: int64, label: int64) -> bool {
+        let t = self.ord[c]
+        if c <= label or self.ref_last[t] >= label or self.refs[t] == 0 {
+            return false
+        }
+        return self.ends_block(c - 1)
+    }
+
+    // Whether line `j` never falls through to the next.
+    func ends_block(self, anon j: int64) -> bool {
+        let b = self.body
+        let tag = b.tags[j]
+        let variant = tag & 255
+        if variant == INSN_BRANCH {
+            return ((tag >> 8) & 3) == BRANCH_ALWAYS
+        }
+        if variant == INSN_CALL {
+            return never_returns(b.strs[b.fa[j]])
+        }
+        return variant == INSN_OP and (tag >> 8) == OP_RETURN
+    }
+
+    // Whether line `j` is a label some branch goes to.
+    func is_target(self, anon j: int64) -> bool {
+        return (self.body.tags[j] & 255) == INSN_LABEL and self.refs[self.ord[j]] > 0
+    }
+
+    // The last line of the loop whose top is the label at line `top`, or -1
+    // when something outside it jumps into it: its last backward branch, then
+    // the blocks after that only it reaches.
+    func loop_end(self, anon top: int64) -> int64 {
+        let b = self.body
+        mut end = self.ref_last[self.ord[top]]
+        mut grew = true
+        for grew {
+            grew = false
+            // A block after it that only it branches to and that ends in a
+            // panic (a bounds check's cold block) is the loop's too.
+            let next = end + 1
+            if next < b.n and self.is_target(next) and self.ends_block(end) and self.ref_first[self.ord[next]] > top and self.ref_last[self.ord[next]] < next {
+                mut j = next + 1
+                mut inside = true
+                for j < b.n and not self.ends_block(j) {
+                    if self.is_target(j) and (self.ref_first[self.ord[j]] <= top or self.ref_last[self.ord[j]] > j) {
+                        inside = false
+                    }
+                    j += 1
+                }
+                if inside and j < b.n and (b.tags[j] & 255) == INSN_CALL and never_returns(b.strs[b.fa[j]]) {
+                    end = j
+                    grew = true
+                }
+            }
+        }
+        for j in top + 1..end + 1 {
+            if self.is_target(j) and (self.ref_first[self.ord[j]] < top or self.ref_last[self.ord[j]] > end) {
+                return -1
+            }
+        }
+        return end
+    }
+
+    // At line `i`, the load of an array a copy-on-write check closed by the
+    // label at line `label` follows (`place` the register holding its place,
+    // NO_REG for a slot): when the array is known to be its place's own, the
+    // check goes; else the label learns what holds after it.
+    func check_unique(self, anon i: int64, label: int64, place: Reg) -> none {
+        let b = self.body
+        let u = self.ord[label]
+        let arr = self.local(b.fa[i])
+        let v = self.read(b.fa[i])
+        let count = self.find(kind: FACT_FIELD, base: self.canon_base(v), off: self.canon_off(v) - 8, index: 0, width: 4)
+        if count >= 0 and self.facts[count * FACT_WORDS + 5] == VN_ONE and self.refs[u] == 1 {
+            self.drop_from += [i + 1]
+            self.drop_to += [label]
+            self.skip_to = label
+            self.refs[u] = 0
+            self.changed += 1
+            return
+        }
+        if place == NO_REG {
+            self.uniq_kind[u] = FACT_SLOT
+            self.uniq_base[u] = 0
+            self.uniq_off[u] = b.fb[i]
+        } else {
+            let pv = self.read(place)
+            self.uniq_kind[u] = FACT_FIELD
+            self.uniq_base[u] = self.canon_base(pv)
+            self.uniq_off[u] = self.canon_off(pv)
+        }
+        self.uniq_reg[u] = arr
+        self.uniq_one[u] = b.strs[b.fa[label - 2]] == "_kod_arr_unique_stub"
+    }
+
+    // The line of the label closing emit_unique's check when line `i` is its
+    // array's load, or -1: `ldr h, [p]` (or `ldr h, [fp, #-n]`), the count's
+    // load, `cmp`, `b.eq L`, `mov x16, p` (or `sub x16, fp, #n`), for an
+    // array `mov x17, #width`, the stub, `mov h, x17`, `L:`.
+    func unique_label(self, anon i: int64) -> int64 {
+        let b = self.body
+        if i + 8 >= b.n {
+            return -1
+        }
+        let count = b.tags[i + 1]
+        if count != (INSN_MEM | ((1 | (AT_OFFSET << 1)) << 8)) or b.fc[i + 1] != -8 {
+            return -1
+        }
+        let tag = b.tags[i]
+        let h = b.fa[i]
+        if (h & 3) != 1 or self.local(h) < 0 {
+            return -1
+        }
+        let slot = tag == INSN_SLOT
+        if not slot and not (tag == (INSN_MEM | (1 << 8)) and b.fd[i] == 8 and self.local(b.fb[i]) >= 0) {
+            return -1
+        }
+        if b.fd[i + 1] != 4 or b.fb[i + 1] != h {
+            return -1
+        }
+        if b.tags[i + 2] != (INSN_OP | (OP_COMPARE << 8)) or b.fb[i + 2] != imm(1) or (b.fa[i + 2] >> 2) != (b.fa[i + 1] >> 2) or b.fc[i + 2] != NO_REG {
+            return -1
+        }
+        if b.tags[i + 3] != (INSN_BRANCH | ((BRANCH_IF | (cond_number(.Eq) << 2)) << 8)) or self.target[i + 3] < 0 {
+            return -1
+        }
+        let u = self.lab_line[self.target[i + 3]]
+        if slot {
+            if not self.check_place_at(i + 4) or imm_value(b.fc[i + 4]) != 0 - b.fb[i] {
+                return -1
+            }
+        } else if b.tags[i + 4] != INSN_MOV or b.fa[i + 4] != X16 or b.fb[i + 4] != b.fb[i] {
+            return -1
+        }
+        mut call = i + 5
+        if (b.tags[call] & 255) == INSN_OP {
+            if b.tags[call] != (INSN_OP | (OP_MOVE << 8)) or b.fa[call] != X17 {
+                return -1
+            }
+            call += 1
+        }
+        if (b.tags[call] & 255) != INSN_CALL or not is_unique_stub(b.strs[b.fa[call]]) {
+            return -1
+        }
+        if b.tags[call + 1] != INSN_MOV or b.fa[call + 1] != h or b.fb[call + 1] != X17 {
+            return -1
+        }
+        if u != call + 2 {
+            return -1
+        }
+        return u
+    }
+
+    // Drops the lines of the checks that went.
+    func compact(self) -> none {
+        if len(self.drop_from) == 0 {
+            return
+        }
+        let b = self.body
+        mut w = self.drop_from[0]
+        mut d = 0
+        mut i = w
+        for i < b.n {
+            if d < len(self.drop_from) and i == self.drop_from[d] {
+                i = self.drop_to[d]
+                d += 1
+                continue
+            }
+            b.move_from(w, src: b, :i)
+            w += 1
+            i += 1
+        }
+        b.n = w
+    }
+}
+
+// A hash of a label's name from its length and last bytes, where labels
+// differ (their numbers).
+func label_hash(anon name: str) -> int64 {
+    let n = len(name)
+    mut h = n
+    mut j = n - 6
+    if j < 0 {
+        j = 0
+    }
+    for j < n {
+        h = h * 31 + name[j]
+        j += 1
+    }
+    return h & 0x3fffffff
+}
+
+let X17: Reg = 72
+
+// Whether `target` is a copy-on-write stub (emit_unique's).
+func is_unique_stub(anon target: str) -> bool {
+    return target == "_kod_arr_unique_stub" or target == "_kod_obj_unique_stub"
+}
+
+// Whether an Op of opcode number `n` only reads its operands (it sets
+// flags, calls or returns).
+func reads_only(anon n: int64) -> bool {
+    return n == OP_COMPARE or n == 12 or n == 22 or n == OP_CALL_INDIRECT or n == OP_RETURN
+}
