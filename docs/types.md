@@ -283,8 +283,11 @@ operands of `and` and `or` must be `bool`, and so must the condition of an
 optional with `x is not none`. Arithmetic, bitwise and ordering operators
 don't take `bool` operands, and `==`/`!=` compare a `bool` only with
 another `bool`, so `b == 1`, `true + 1` and `if flags & 1` are errors.
-Comparisons bind tighter than `&`, `|` and `^`, so a bit test is written
-`(flags & 1) != 0`.
+`&`, `^` and `|` bind tighter than comparisons, as in Python and Rust rather
+than C, so a bit test needs no parentheses: `flags & 1 != 0` is
+`(flags & 1) != 0`, and `a == b | c` is `a == (b | c)`. Among them `&` binds
+tightest and `|` loosest, and shifts and arithmetic bind tighter still:
+`a | b & c << 1` is `a | (b & (c << 1))`.
 
 Chained comparisons are supported Python-style: `a < b < c` is `(a < b) and (b < c)` with `b` evaluated once. The operands are evaluated left to right, and a chain stops at the first comparison that is false, so in `a < b < f()` `f` isn't called when `a < b` is false. Any comparison chain works — `0 <= i < len(xs)` is the canonical bounds check.
 
