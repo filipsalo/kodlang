@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -544,12 +545,24 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
 
 /* Waiting without holding up other tasks (docs/tasks.md): stdlib/tasks.c sets
  * the hook once a program has started a task. A call that would block calls
- * kod_wait_event first, with kevent's ident, filter and data (EVFILT_READ on a
- * descriptor, EVFILT_TIMER for nanoseconds, EVFILT_PROC on a child); 1 means
- * the task waited for the event while others ran, 0 that the caller should
- * just block, as it does without tasks. */
+ * kod_wait_event first, with kevent's ident, filter and data (EVFILT_READ or
+ * EVFILT_WRITE on a descriptor, data the most nanoseconds to wait or 0;
+ * EVFILT_TIMER for nanoseconds; EVFILT_PROC on a child); 1 means the task
+ * waited for the event while others ran, 0 that the caller should just block,
+ * as it does without tasks, 2 that the task is cancelled, and 3 that the time
+ * ran out first. A socket's own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the
+ * limit for a descriptor given none, as it is for a read that blocks. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
 int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
-    return kod_wait_hook ? kod_wait_hook(ident, filter, data) : 0;
+    if (!kod_wait_hook) return 0;
+    if ((filter == -1 || filter == -2) && data == 0) {
+        struct timeval tv = {0, 0};
+        socklen_t size = sizeof tv;
+        int option = filter == -1 ? SO_RCVTIMEO : SO_SNDTIMEO;
+        if (getsockopt((int)ident, SOL_SOCKET, option, &tv, &size) == 0) {
+            data = (int64_t)tv.tv_sec * 1000000000 + (int64_t)tv.tv_usec * 1000;
+        }
+    }
+    return kod_wait_hook(ident, filter, data);
 }
