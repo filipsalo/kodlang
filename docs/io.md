@@ -46,6 +46,7 @@ type IoKind = enum {
     HostNotFound
     Tls
     Protocol
+    Cancelled
 }
 
 type IoError = struct {
@@ -86,7 +87,9 @@ only ever non-blocking through a timeout (see [TCP](#tcp)). `HostNotFound` is
 for a name that doesn't resolve and has no OS error number (`errno` is 0).
 `Tls` is for a TLS failure that isn't a plain I/O error, such as a certificate
 that doesn't verify (see [TLS](#tls)). `Protocol` is for a peer that breaks the rules of the
-protocol being spoken, such as a malformed HTTP response (see [HTTP](http.md)). An interrupted system call is retried inside the
+protocol being spoken, such as a malformed HTTP response (see [HTTP](http.md)).
+`Cancelled` is for an operation in a [task](tasks.md#cancellation) that was
+cancelled while it waited (`ECANCELED`). An interrupted system call is retried inside the
 runtime, so `EINTR` never reaches a caller.
 
 ## Reader and Writer

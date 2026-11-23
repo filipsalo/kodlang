@@ -4,6 +4,9 @@
 // thread (docs/tasks.md). The stacks and the switch are in tasks.c; which
 // task runs next is decided here.
 
+import "stream" { IoError }
+import "time" { Duration }
+
 extern func kod_task_stack_new() -> int64
 extern func kod_task_stack_free(anon base: int64) -> none
 extern func kod_task_ctx_new() -> int64
@@ -29,6 +32,15 @@ type Fiber = shared struct {
     job: Job? = none
     done: bool = false
     waiters: [Fiber] = []
+    // In the ready queue: made ready again, it isn't queued twice. A task woken
+    // for nothing (a channel's list can name one that has gone on) finds what
+    // it waits for not there yet and waits again: every wait is a loop.
+    queued: bool = false
+    // Cancelled (wait_group): its waits for I/O give `.Cancelled`, its sleeps
+    // and channel waits give up.
+    cancelled: bool = false
+    // The key of the kevent registration it waits on, 0 for none.
+    io_key: int64 = 0
 }
 
 // The task that is running, made for the program's first one when first
@@ -69,9 +81,7 @@ type Task[T] = shared struct {
 
     // What the task gave back; until it has ended, this task waits for it.
     func wait(self) -> T {
-        if not self.fiber.done {
-            _wait_for(self.fiber)
-        }
+        _wait_for(self.fiber)
         return self.results[0]
     }
 }
@@ -100,9 +110,7 @@ type NoneTask = shared struct {
 
     // Until the task has ended, this task waits for it.
     func wait(self) -> none {
-        if not self.fiber.done {
-            _wait_for(self.fiber)
-        }
+        _wait_for(self.fiber)
     }
 }
 
@@ -132,15 +140,33 @@ func group_of(anon group: TaskGroup?) -> TaskGroup? {
     return group
 }
 
-// Waits for each task in `group` that hasn't ended.
-func wait_group(anon group: TaskGroup?) -> none {
+// Waits for each task in `group` that hasn't ended, cancelling them first when
+// `cancel` (codegen: when the function returns an error).
+func wait_group(anon group: TaskGroup?, anon cancel: bool) -> none {
     let g = group? or TaskGroup()
-    for fiber in g.fibers {
-        if not fiber.done {
-            _wait_for(fiber)
+    if cancel {
+        for fiber in g.fibers {
+            _cancel(fiber)
         }
     }
+    for fiber in g.fibers {
+        _wait_for(fiber)
+    }
     g.fibers = []
+}
+
+// Marks `fiber` cancelled and wakes it if it waits, forgetting the event it
+// waited for.
+func _cancel(anon fiber: Fiber) -> none {
+    if fiber.done or fiber.cancelled {
+        return
+    }
+    fiber.cancelled = true
+    if fiber.io_key != 0 {
+        let _gone = _io.remove(fiber.io_key)
+        fiber.io_key = 0
+    }
+    _make_ready(fiber)
 }
 
 func _join(anon fiber: Fiber, group: TaskGroup?) -> none {
@@ -186,6 +212,10 @@ func _running() -> Fiber {
 }
 
 func _make_ready(anon fiber: Fiber) -> none {
+    if fiber.queued or fiber.done {
+        return
+    }
+    fiber.queued = true
     _ready += [fiber]
 }
 
@@ -200,6 +230,7 @@ func _take_next() -> Fiber {
         _poll(true)
     }
     let next = _ready[_head]
+    next.queued = false
     _head += 1
     // Drop what has been taken once it is most of the queue.
     if _head >= 64 and _head * 2 >= len(_ready) {
@@ -232,9 +263,11 @@ func _reap() -> none {
 
 // Waits, as the running task, for `fiber` to end.
 func _wait_for(anon fiber: Fiber) -> none {
-    let me = _running()
-    fiber.waiters += [me]
-    _switch_from(me)
+    for not fiber.done {
+        let me = _running()
+        fiber.waiters += [me]
+        _switch_from(me)
+    }
 }
 
 // A new task's first turn (tasks.c calls it on the task's stack): runs it,
@@ -285,11 +318,15 @@ type Channel[T] = shared struct {
         if self.closed {
             panic("send on a closed channel")
         }
+        // A cancelled task's send isn't made.
+        if _running().cancelled {
+            return
+        }
         self.items += [value]
         self.sent += 1
         let ticket = self.sent
         self.receivers = _wake_all(self.receivers)
-        for self.taken < ticket - self.capacity {
+        for self.taken < ticket - self.capacity and not _running().cancelled {
             if self.closed {
                 panic("send on a closed channel")
             }
@@ -311,7 +348,7 @@ type Channel[T] = shared struct {
     // whether one can. `for v in ch` is `has_next` and `take`: nothing runs
     // between them, since a task gives way only where it waits.
     func has_next(self) -> bool {
-        for self.head == len(self.items) and not self.closed {
+        for self.head == len(self.items) and not self.closed and not _running().cancelled {
             self.receivers += [_running()]
             _park()
         }
@@ -357,8 +394,13 @@ func _park() -> none {
 // kod_wait_event, once a task has been started (stdlib/runtime.c): makes the
 // running task wait for the event while the others run, 1; or 0, and the
 // caller blocks as it would without tasks, when this task is the only one or
-// the event can't come (a child that has already exited, say).
+// the event can't come (a child that has already exited, say); or 2 when the
+// task is cancelled, and the caller gives up with `.Cancelled`.
 func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int64 {
+    let me = _running()
+    if me.cancelled {
+        return 2
+    }
     if _live <= 1 {
         return 0
     }
@@ -367,9 +409,16 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     if kod_task_kq_add(ident, filter, data, key) != 0 {
         return 0
     }
-    let me = _running()
     _io[key] = me
-    _switch_from(me)
+    me.io_key = key
+    // _poll takes the key out when the event comes, _cancel when the task is.
+    for _io.contains(key) {
+        _switch_from(me)
+    }
+    me.io_key = 0
+    if me.cancelled {
+        return 2
+    }
     return 1
 }
 
@@ -385,4 +434,39 @@ func _poll(anon block: bool) -> none {
             _make_ready(fiber)
         }
     }
+}
+
+// `body` as a task given at most `d`: what it gives back, or a `.TimedOut`
+// error once `d` has passed, when the task is cancelled and waited for.
+func within[T](anon d: Duration, anon body: func() -> T) -> T or Error {
+    let task = start(body)
+    if not _wait_until_done(task.fiber, ns: d.ns) {
+        _cancel(task.fiber)
+        _wait_for(task.fiber)
+        throw IoError(kind: .TimedOut, op: "within", errno: 0, detail: "timed out")
+    }
+    return task.wait()
+}
+
+// Waits, as the running task, until `fiber` has ended or `ns` have passed:
+// whether it has ended.
+func _wait_until_done(anon fiber: Fiber, ns: int64) -> bool {
+    if fiber.done {
+        return true
+    }
+    let me = _running()
+    _io_next += 1
+    let key = _io_next
+    if kod_task_kq_add(0, -7, ns, key) != 0 {
+        _wait_for(fiber)
+        return true
+    }
+    _io[key] = me
+    for not fiber.done and _io.contains(key) {
+        fiber.waiters += [me]
+        _switch_from(me)
+    }
+    // Ended first: the timer's event, when it comes, finds no one waiting.
+    let _gone = _io.remove(key)
+    return fiber.done
 }

@@ -63,6 +63,37 @@ func fetch_all(anon urls: [str]) -> none {
 }   // returns once every fetch has ended
 ```
 
+## Cancellation
+
+A function that returns an error, by `throw` or through a `try`, **cancels**
+the tasks it spawned that haven't ended before it waits for them; one that
+returns anything else just waits. A cancelled task goes on until it next
+waits, and that wait gives up:
+
+- reading, writing, accepting, connecting and waiting for a child fail with an
+  `IoError` of kind `.Cancelled`, which `try` passes up, so the task's own
+  tasks are cancelled in turn;
+- a sleep ends at once, a `receive` gives `none` and a `send` isn't made;
+- `task.wait()` and `tasks.give_way()` go on as usual: they can't fail.
+
+A task that never waits can't be cancelled, and nothing cancels a detached
+task.
+
+`tasks.within(d, body)` runs `body` as a task for at most `d`: it gives what
+`body` gives back, or an `IoError` of kind `.TimedOut` once `d` has passed, when
+the task is cancelled and waited for.
+
+<!-- kod:
+import "tasks"
+import "time" { Duration }
+func fetch_page() -> str {
+    return "page"
+}
+-->
+```kod
+let page = tasks.within(Duration(seconds: 5), func() -> str { return fetch_page() })
+```
+
 A task that should outlive its function is started with `spawn detached`: it
 gives no `Task`, nothing waits for it, and it runs until its call returns or
 the program ends.
@@ -152,6 +183,6 @@ switch from one task to another costs about 50 ns.
 
 ## What isn't built yet
 
-`spawn` doesn't work in a generic function or type yet. Cancellation,
-`select`, generators and preemption come in that order, as
+`spawn` doesn't work in a generic function or type yet. `select`, generators
+and preemption come in that order, as
 [Concurrency (design)](concurrency.md#building-it) lays out.

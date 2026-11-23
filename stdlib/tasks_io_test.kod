@@ -1,8 +1,10 @@
 // Tasks that wait for I/O, timers and child processes let the others run
 // (docs/tasks.md).
 
+import "arrays"
 import "net/tcp"
 import "process"
+import "stream" { IoError }
 import "tasks"
 import "time"
 import "time" { Duration, monotonic_ns }
@@ -100,4 +102,72 @@ test "with one task, a sleep just sleeps" {
     let t0 = monotonic_ns()
     time.sleep(Duration(ms: 30))
     assert ms_since(t0) >= 30
+}
+
+func accept_forever(anon l: tcp.Listener) -> none or Error {
+    let conn = l.accept()
+    if conn is Err(e) and e is IoError(io) and io.kind == .Cancelled {
+        note("accept cancelled")
+    }
+    try conn
+}
+
+func give_up(anon l: tcp.Listener) -> none or Error {
+    spawn accept_forever(l)
+    time.sleep(Duration(ms: 20))
+    throw IoError(kind: .InvalidInput, op: "give_up", errno: 0, detail: "no")
+}
+
+test "a function that returns an error cancels its tasks" {
+    trace = []
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let t0 = monotonic_ns()
+    assert give_up(l) is Err(_)
+    assert trace == ["accept cancelled"]
+    assert ms_since(t0) < 500
+    must l.close()
+}
+
+func nap_then_note(anon ms: int64) -> none {
+    time.sleep(Duration(ms: ms))
+    note("woke")
+}
+
+func receive_or_note(anon ch: tasks.Channel[int64]) -> none {
+    if ch.receive() is none {
+        note("receive gave up")
+    }
+}
+
+func fail_with_waiters(anon ch: tasks.Channel[int64]) -> none or Error {
+    spawn nap_then_note(5000)
+    spawn receive_or_note(ch)
+    tasks.give_way()
+    throw IoError(kind: .InvalidInput, op: "fail", errno: 0, detail: "no")
+}
+
+test "a cancelled task's sleep ends and its receive gives none" {
+    trace = []
+    let t0 = monotonic_ns()
+    assert fail_with_waiters(tasks.Channel[int64]()) is Err(_)
+    assert ms_since(t0) < 500
+    assert arrays.contains(trace, "woke")
+    assert arrays.contains(trace, "receive gave up")
+}
+
+func ok_after(anon ms: int64) -> int64 {
+    time.sleep(Duration(ms: ms))
+    return ms
+}
+
+test "within gives the result in time, or a timeout and cancels" {
+    assert must tasks.within(Duration(ms: 500), func() -> int64 { return ok_after(10) }) == 10
+    let t0 = monotonic_ns()
+    let late = tasks.within(Duration(ms: 50), func() -> int64 { return ok_after(5000) })
+    if late is Err(e) and e is IoError(io) {
+        assert io.kind == .TimedOut
+    } else {
+        fail("no timeout")
+    }
+    assert ms_since(t0) < 500
 }

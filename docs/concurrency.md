@@ -4,14 +4,14 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: being built. Milestones 1 to 3 of step 1 are in: `spawn`, `Task[T]`
+Status: being built. Milestones 1 to 4 of step 1 are in: `spawn`, `Task[T]`
 and `wait()`, a function waiting for its tasks, channels and `for v in ch`,
-and tasks waiting for I/O ([Tasks](tasks.md) describes what works); the rest
-is a proposal. It describes what Kod would add for doing several things at
-once, in two steps, and what it promises now so that those steps stay
-possible. The building blocks are Go's (tasks, channels, `select`), used in a
-structured way (a task belongs to the function that starts it), on one thread:
-Kod doesn't share memory between threads.
+tasks waiting for I/O, and cancellation ([Tasks](tasks.md) describes what
+works); the rest is a proposal. It describes what Kod would add for doing
+several things at once, in two steps, and what it promises now so that those
+steps stay possible. The building blocks are Go's (tasks, channels, `select`),
+used in a structured way (a task belongs to the function that starts it), on
+one thread: Kod doesn't share memory between threads.
 
 ## What it is for
 
@@ -90,11 +90,14 @@ task kept, as any value must be (`let _t = spawn f()` to drop it on purpose).
 ### Tasks belong to the function that starts them
 
 A function doesn't return while a task it spawned is running: at its end it
-waits for each one it hasn't waited for. When the function leaves early, by
-`return`, `throw` or a `try` that passes an error up, the tasks it hasn't
-waited for are **cancelled** first. A cancelled task carries on until it next
-waits, and that wait gives an `IoError` of kind `.Cancelled`, which `try`
-passes up as any error, so it ends; what such a task gave back is dropped.
+waits for each one it hasn't waited for. When the function returns an error,
+by `throw` or a `try` that passes one up, the tasks it hasn't waited for are
+**cancelled** first; a plain `return` just waits, so that `spawn log(x)` before
+one still logs. A cancelled task carries on until it next waits, and that wait
+gives up: one that can fail gives an `IoError` of kind `.Cancelled`, which
+`try` passes up as any error, so it ends; a sleep ends, a `receive` gives
+`none`, a `send` isn't made; `wait()` and `give_way()` go on, as they can't
+fail. What such a task gave back is dropped.
 
 It is the function a task belongs to, not the block it was spawned in: a
 loop that spawns a task each time leaves them running until the function
@@ -110,10 +113,9 @@ func dashboard(anon id: int64) -> Page or Error {
 }   // when fetch_user fails, fetch_orders is cancelled, not left running
 ```
 
-A `Task` can't leave the function that spawned it: it can't be returned,
-stored in a field, an array or a variable outside it, or captured by a
-closure that outlives it. It can be passed to functions that the spawning one
-calls.
+A `Task` can be kept, returned or stored like any value: the function that
+spawned it has waited for it by the time it returns, so a `Task` that has
+left that function holds a result, and nothing needs checking.
 
 A task that should outlive its function, such as a server's connection
 handler, is started with `spawn detached`: it gives no `Task`, nothing waits
@@ -132,12 +134,13 @@ program ends; detached ones end with the program.
 
 ### Timeouts
 
-`tasks.within(d, f)` runs `f` and gives back what it gives back, or a
-`Timeout` error after `d`, when it cancels `f` and the tasks `f` started:
+`tasks.within(d, f)` runs `f` as a task and gives back what it gives back, or
+an `IoError` of kind `.TimedOut` after `d`, when it cancels `f` and so the
+tasks `f` started:
 
 <!-- no-check -->
 ```kod
-let page = try tasks.within(Duration(s: 5), func() -> Page or Error {
+let page = try tasks.within(Duration(seconds: 5), func() -> Page or Error {
     return dashboard(id)
 })
 ```
@@ -176,7 +179,7 @@ syntax, and takes the shape of `match`:
 select {
     receive(results) is r -> total += r
     send(jobs, next) -> sent += 1
-    after(Duration(s: 5)) -> throw Timeout()
+    after(Duration(seconds: 5)) -> throw Timeout()
     else -> idle()
 }
 ```
@@ -336,8 +339,6 @@ as well, which is yet to be measured.
   `try` take) wait for the list, cancelling first when the exit is early.
   Cancelling sets a flag on the task and wakes it if it waits; each wait
   point checks the flag. A function that spawns nothing pays nothing.
-- **The compiler** checks that a `Task` doesn't leave its function, as it
-  checks other uses of a local.
 - **Backtraces** walk the frame chain of the task that panicked, which ends
   at its entry function. A panic ends the program, as now (and as in Go),
   wherever it happens.
@@ -417,9 +418,8 @@ make it.
 2. `Channel[T]`, `close`, `for v in ch`, and deadlock detection.
 3. `kevent`: descriptors, timers and child processes; `posix.Fd`, `tcp`,
    `process` and `time.sleep` give way inside a task.
-4. Cancellation: early exits cancel, `.Cancelled` at every wait point,
-   `spawn detached`, `tasks.within`; the check that a `Task` stays in its
-   function.
+4. Cancellation: an error exit cancels, every wait point gives up,
+   `spawn detached`, `tasks.within`.
 5. `select`, generators and `yield`, `tasks.all`, `tasks.first`,
    `map_concurrently`, `tasks.Mutex`.
 6. TLS and HTTP inside tasks; a demo that fetches several URLs at once, and
