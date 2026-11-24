@@ -381,6 +381,7 @@ handler, without the body, where there is no handler for `HEAD` itself.
 | `queries(name)` | all its values, `[str]` |
 | `header(name)` | a header's value; `str?` |
 | `text()` | the body as text |
+| `reader()` | a `Reader` of the body: see [Streaming](#streaming) |
 
 ### `Response`
 
@@ -392,7 +393,90 @@ handler, without the body, where there is no handler for `HEAD` itself.
 | `http.redirect(to, status = 302)` | a redirect to `to` |
 | `http.status(code)` | only a status, with its reason as the body where it can have one |
 | `respond(status, body, content_type = "text/plain; charset=utf-8")` | any of them |
+| `http.stream(write, status = 200, content_type = "application/octet-stream", length = none)` | a body that `write` [writes piece by piece](#streaming) |
+| `http.file(path, content_type = none)` | a file's content, streamed; `Response or Error`, a 404 `HttpError` when there is no such file (or it is a directory). Its type is the one its name's ending says, when left out |
 | `resp.with_header(name, value)` | `resp`, with a header added |
+
+### Streaming
+
+A response's body needn't be in memory as a whole. `http.stream` takes a function
+that writes it, which is called once the handler has given the response back:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+-->
+```kod
+func rows(anon _req: Request) -> Response or Error {
+    return http.stream(func(anon w: http.BodyWriter) -> none or Error {
+        for i in 0..1000000 {
+            try w.write_str(f"{i},{i * i}\n")
+        }
+    }, content_type: "text/csv")
+}
+```
+
+A `BodyWriter` is a [`Writer`](io.md#reader-and-writer). What is written goes out
+once there are 64 KB of it, or at `w.flush()`, as for a stream of events. A
+write waits while the client is slow to read, so the body takes no more memory
+than that. `length` is the body's length when it is known, sent as
+`Content-Length`; writing more or less than that is an error. Without it, the
+body is sent in chunks (to a client that speaks HTTP/1.0, until the connection
+closes), or with its length if it all fits in one piece.
+
+Until the first piece goes out nothing has been sent, so an error or a panic in
+the function is answered as a handler's is, by a `500` or an `HttpError`'s
+status. After that it is logged and ends the connection, so that the client can
+tell the body isn't whole (a client that speaks HTTP/1.0 can't, without
+`length`). When the client goes away, the next write fails, which isn't logged.
+A `HEAD`, and a status without a body, don't call the function.
+
+A request's body can be read as it comes too, by a route added with
+`stream_body: true`, or, without routes, when the `Server` has
+`stream_bodies: true`:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+import "posix"
+import "stream" { Reader }
+let routes = http.Router()
+-->
+```kod
+func copy(anon from: Reader, anon to: posix.Fd) -> int64 or Error {
+    mut total: int64 = 0
+    for true {
+        let piece = try from.read(65536)
+        if len(piece) == 0 {
+            break
+        }
+        try to.write_all(piece)
+        total += len(piece)
+    }
+    return total
+}
+
+func save(anon req: Request) -> Response or Error {
+    let out = try posix.create("upload.tmp")
+    let copied = copy(req.reader(), out)
+    try out.close()                          // whether or not the client went away
+    return http.text(f"{try copied} bytes\n", status: 201)
+}
+
+routes.put("/upload", save, stream_body: true)
+```
+
+`req.reader()` is a [`Reader`](io.md#reader-and-writer) of the body; without
+`stream_body`, of the bytes already read. `limits.max_body` doesn't hold for a
+streamed body, nor does `body_timeout` limit the whole of it: the handler decides
+how much, and how long, is too much. `req.body` is empty.
+
+When the client sends something wrong, stops sending for `body_timeout`, or
+goes away, a read fails; a handler that passes the error on answers with the
+`400` or `408` it would have been. A client that asks first
+(`Expect: 100-continue`) is told to go on at the first read. What the handler
+leaves unread is read and dropped when it is short (64 KB); otherwise the
+connection ends after the response.
 
 ### Connections
 
@@ -433,15 +517,16 @@ func main() -> none or Error {
 | `handler` | | answers them all instead, when there are no `routes` |
 | `host`, `port` | `127.0.0.1`, 8080 | where `run` listens; an empty `host` means every IPv4 interface |
 | `header_timeout` | 10 s | how long a client may take to send a request's headers, from when it connects or, on a kept-alive connection, from their first byte |
-| `body_timeout` | 60 s | how long it may take to send the body after them |
-| `write_timeout` | 60 s | how long it may take to read the response |
+| `body_timeout` | 60 s | how long it may take to send the body after them; of a [streamed](#streaming) body, how long until the next of it comes |
+| `write_timeout` | 60 s | how long it may take to read the response; of a streamed one, each 64 KB or less of it |
 | `idle_timeout` | 60 s | how long a kept-alive connection may wait for its next request |
 | `stop_timeout` | 10 s | how long requests may go on after `stop` |
 | `max_connections` | 10000 | how many connections are open at once |
 | `stop_on_signals` | true | whether `run` stops on `SIGINT` and `SIGTERM`; when false it leaves [signals](tasks.md#signals) alone too |
+| `stream_bodies` | false | whether `handler` reads the [bodies](#streaming) of requests itself |
 | `limits` | `Limits()` | caps each request's headers and body, as for a response |
 | `log` | stderr | a `func(str) -> none` that gets a line or more for each handler that fails |
-| `access_log` | false | whether `log` gets a line for each request too: `127.0.0.1:50123 GET /users/7 200 14 B 0.31 ms` |
+| `access_log` | false | whether `log` gets a line for each request too: `127.0.0.1:50123 GET /users/7 200 14 B 0.31 ms`, with the length of the body sent and the time until it was |
 
 `serve(l, handler, limits = Limits())` is `Server(:handler, :limits).serve(l)`.
 
