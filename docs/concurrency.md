@@ -217,10 +217,13 @@ early cancels it when it returns, as with any task. `yield` is allowed only
 in a function that gives back a `Channel`, and a generator's `return` takes
 no value.
 
-As built, the body's task is detached instead: a generator has no handle on
-its caller's tasks, so a caller that stops reading early leaves the body
-waiting in its next `yield`. Giving the caller the task needs the call to
-pass its group in.
+As built, the body's task belongs to no function, and ends once nothing holds
+the channel: its hold on the channel is weak, so a reader that lets go of it
+early frees it, and the body's next `yield` finds it gone and ends the body.
+One already waiting in a `yield` ends when the next generator starts, which
+wakes those whose channel is gone. Belonging to the caller instead would
+cancel the body where the caller returns, which goes wrong for a function
+that hands a generator's channel on to its own caller.
 
 ### Actors
 

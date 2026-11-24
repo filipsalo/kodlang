@@ -3023,14 +3023,16 @@ type Parser = shared struct {
             return self.alloc_stmt(ast.Stmt.Assert(expr: value, :source_text, :span))
         }
 
-        // `yield e` sends on the generator's channel (generator_body).
+        // `yield e` sends on the generator's channel, and ends the body once
+        // no reader holds it (generator_body): `if __genw.give(e) { return }`.
         if self.at(.KwYield) {
             let yield_span = self.here()
             self.advance()
             let value = self.parse_expr()
             self.skip_newlines()
             let arg = ast.CallArg(label: "", label_span: yield_span, :value)
-            let stmt = self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.select_call_expr("__gen", method: "send", args: [arg], span: yield_span)))
+            let give = self.select_call_expr("__genw", method: "give", args: [arg], span: yield_span)
+            let stmt = self.alloc_stmt(ast.Stmt.If(cond: give, then_body: [self.alloc_stmt(ast.Stmt.Return(value: 0))], else_body: []))
             self.yields += [stmt]
             self.yield_values += [value]
             return stmt
@@ -3374,8 +3376,11 @@ type Parser = shared struct {
     // its body as a task that each `yield` sends on, and gives the channel back:
     //
     //     let __gen = <return type>()
-    //     return #spawn.generate(__gen, func() { <body> })
+    //     let __genw = #spawn.gen_ref(__gen)
+    //     return #spawn.generate(__gen, __genw, func() { <body> })
     //
+    // The body holds the channel only through `__genw`, weakly, so it ends once
+    // no reader holds the channel.
     // The constructor is parsed again from the return type's tokens, which must
     // name a `Channel[T]`.
     func generator_body(self, anon body: [int64], return_typ: int64, ret_start: int64, ret_end: int64, name_span: ast.Span) -> [int64] {
@@ -3404,18 +3409,22 @@ type Parser = shared struct {
         let no_args: [ast.CallArg] = []
         let ctor = self.alloc_expr(ast.Expr.Call(callee: channel_type, args: no_args), :span)
         let make = self.alloc_stmt(ast.Stmt.Let(name: "__gen", typ: 0, value: ctor, mutable: false))
+        let gen_arg = ast.CallArg(label: "", label_span: span, value: self.alloc_expr(ast.Expr.Ident(name: "__gen"), :span))
+        let weak_ref = self.alloc_stmt(ast.Stmt.Let(name: "__genw", typ: 0, value: self.spawn_member_call("gen_ref", recv: "", args: [gen_arg], :span), mutable: false))
         let no_params: [ast.Param] = []
         let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, :body, doc: "", in_generic: self.in_generic))
         self.binding_exprs += 1
         let lit = self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
         let gen = self.alloc_expr(ast.Expr.Ident(name: "__gen"), :span)
+        let genw = self.alloc_expr(ast.Expr.Ident(name: "__genw"), :span)
         let args = [
             ast.CallArg(label: "", label_span: span, value: gen),
+            ast.CallArg(label: "", label_span: span, value: genw),
             ast.CallArg(label: "", label_span: span, value: lit),
         ]
         self.spawns += 1
         let ret = self.alloc_stmt(ast.Stmt.Return(value: self.spawn_member_call("generate", recv: "", :args, :span)))
-        return [make, ret]
+        return [make, weak_ref, ret]
     }
 
     func parse_func_type_params(self) -> [str] {

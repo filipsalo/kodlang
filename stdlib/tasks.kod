@@ -758,21 +758,136 @@ func first[T](anon fs: [func() -> T or Error]) -> T or Error {
     throw must last
 }
 
-// A generator's body as a job (generate): the channel is closed when it ends.
+// A generator's body as a job (generate): the channel, if a reader still
+// holds it, is closed when the body ends.
 type _Gen[T] = shared struct {
-    ch: Channel[T]
+    gen: _GenRef[T]
     body: func() -> none
 
     func run(self) -> none {
         self.body()
-        self.ch.close()
+        let Some(ch) = self.gen.ch else {
+            return
+        }
+        ch.close()
     }
 }
 
+// What a generator's body holds its channel by: weakly, so that the body runs
+// only while a reader holds the channel (docs/tasks.md#generators).
+type _GenRef[T] = shared struct {
+    weak ch: Channel[T]?
+    // The body's task while it waits in `give`, and whether it is on
+    // _gen_waiting.
+    waiting: Fiber? = none
+    listed: bool = false
+
+    // `yield value`: sends it and waits until it is received; true when the
+    // body is to end instead, as no reader holds the channel any more or the
+    // task is cancelled. Only `put` and `taken_yet` hold the channel, so it
+    // isn't held while the task waits.
+    func give(self, anon value: T) -> bool {
+        let ticket = self.put(value)
+        if ticket < 0 {
+            return true
+        }
+        for true {
+            let taken = self.taken_yet(ticket)
+            if taken != 0 {
+                return taken < 0
+            }
+            self.waiting = _running()
+            if not self.listed {
+                self.listed = true
+                _gen_waiting += [self]
+            }
+            _park()
+            self.waiting = none
+        }
+        return true
+    }
+
+    // Adds `value` to the channel, as `send` does: its ticket, or -1 when the
+    // body is to end.
+    func put(self, anon value: T) -> int64 {
+        if _running().cancelled {
+            return -1
+        }
+        let Some(ch) = self.ch else {
+            return -1
+        }
+        if ch.closed {
+            panic("send on a closed channel")
+        }
+        ch.items += [value]
+        ch.sent += 1
+        ch.receivers = _wake_all(ch.receivers)
+        return ch.sent
+    }
+
+    // 1 once the value of `ticket` has been received, -1 when the body is to
+    // end, else 0, the task waiting among the channel's senders.
+    func taken_yet(self, anon ticket: int64) -> int64 {
+        if _running().cancelled {
+            return -1
+        }
+        let Some(ch) = self.ch else {
+            return -1
+        }
+        if ch.closed {
+            panic("send on a closed channel")
+        }
+        if ch.taken >= ticket - ch.capacity {
+            return 1
+        }
+        ch.senders += [_running()]
+        return 0
+    }
+
+    // Whether to stay on _gen_waiting: while the body waits for a reader;
+    // one whose channel is gone is woken to end.
+    func sweep(self) -> bool {
+        if self.waiting is Fiber(fiber) {
+            if self.ch is none {
+                _make_ready(fiber)
+            } else {
+                return true
+            }
+        }
+        self.listed = false
+        return false
+    }
+}
+
+// What _gen_waiting holds, whatever the channel's type.
+interface _GenWaiting {
+    func sweep(self) -> bool
+}
+
+// Generator bodies that have waited in a `yield`: those whose channel is gone
+// are woken when the next generator starts (generate).
+mut _gen_waiting: [_GenWaiting] = []
+
+// The weak hold on `ch` its generator's body has.
+func gen_ref[T](anon ch: Channel[T]) -> _GenRef[T] {
+    return _GenRef[T](:ch)
+}
+
 // What a function with `yield` gives back (docs/tasks.md#generators): `body`
-// runs as a detached task that sends on `ch`, which is closed when it ends.
-func generate[T](anon ch: Channel[T], anon body: func() -> none) -> Channel[T] {
-    let _fiber = _start_job(_Gen[T](:ch, :body))
+// runs as a task, belonging to no function, that sends on `ch` through `gen`;
+// `ch` is closed when it ends. Bodies left waiting in a `yield` by a reader
+// that let go of the channel are woken first, to end.
+func generate[T](anon ch: Channel[T], anon gen: _GenRef[T], anon body: func() -> none) -> Channel[T] {
+    if len(_gen_waiting) > 0 {
+        mut kept: [_GenWaiting] = []
+        for w in _gen_waiting {
+            if w.sweep() {
+                kept += [w]
+            }
+        }
+        _gen_waiting = kept
+    }
+    let _fiber = _start_job(_Gen[T](:gen, :body))
     return ch
 }
 

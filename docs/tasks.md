@@ -208,9 +208,31 @@ for k in countdown(3) {
 The channel is unbuffered, so the body runs only as far ahead as the reader
 reads, and it is closed when the body ends, by its last line or a `return`,
 which takes no value. `yield` goes in a named function or method that gives
-back a `tasks.Channel[T]`, not in a function literal. The body's task is
-detached: a reader that stops before the end leaves it waiting in its next
-`yield` until the program ends.
+back a `tasks.Channel[T]`, not in a function literal.
+
+The body runs while something holds the channel. Once nothing does, say a
+`for` over it stopped early and the channel was let go, the body ends at its
+`yield`, as at a `return` there: the channel isn't closed, nothing being left
+to read it. A body already waiting in a `yield` when that happens ends when
+the next generator starts. A cancelled body's `yield` ends it too. Like a
+`spawn detached` task, the body belongs to no function, so nothing waits for
+it.
+
+<!-- kod:
+import "tasks"
+func countdown(anon n: int64) -> tasks.Channel[int64] {
+    for i in 0..n {
+        yield n - i
+    }
+}
+-->
+```kod
+for k in countdown(1000000) {
+    if k < 999998 {
+        break                // countdown's body ends at its next `yield`
+    }
+}
+```
 
 ## Helpers
 
