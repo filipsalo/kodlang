@@ -17,8 +17,16 @@
 /* Saved registers: x19..x28, fp, lr, sp, d8..d15. */
 #define KOD_TASK_CTX_WORDS 21
 
+/* Stacks of tasks that have ended, kept for the next ones: mapping a stack and
+ * touching its first pages costs more than the rest of starting a task. */
+#define KOD_TASK_STACKS_KEPT 64
+#define KOD_TASK_STACK_HOT (256 * 1024)
+static int64_t kod_stacks_kept[KOD_TASK_STACKS_KEPT];
+static int kod_stacks_kept_n = 0;
+
 /* The base of a new stack (its guard page), or 0 when there is no room. */
 int64_t kod_task_stack_new(void) {
+    if (kod_stacks_kept_n > 0) return kod_stacks_kept[--kod_stacks_kept_n];
     size_t page = (size_t)getpagesize();
     void *base = mmap(NULL, KOD_TASK_STACK + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (base == MAP_FAILED) return 0;
@@ -27,7 +35,21 @@ int64_t kod_task_stack_new(void) {
 }
 
 void kod_task_stack_free(int64_t base) {
-    if (base != 0) munmap((void *)base, KOD_TASK_STACK + (size_t)getpagesize());
+    if (base == 0) return;
+    if (kod_stacks_kept_n < KOD_TASK_STACKS_KEPT) {
+        /* Its top pages are what most tasks use. When the task went deeper (the
+         * page below them is in memory), the memory of the rest goes back to the
+         * system. */
+        size_t page = (size_t)getpagesize();
+        char *below = (char *)base + page + KOD_TASK_STACK - KOD_TASK_STACK_HOT - page;
+        char resident = 0;
+        if (mincore(below, page, &resident) == 0 && (resident & MINCORE_INCORE)) {
+            madvise((void *)(base + (int64_t)page), KOD_TASK_STACK - KOD_TASK_STACK_HOT, MADV_FREE);
+        }
+        kod_stacks_kept[kod_stacks_kept_n++] = base;
+        return;
+    }
+    munmap((void *)base, KOD_TASK_STACK + (size_t)getpagesize());
 }
 
 int64_t kod_task_ctx_new(void) {

@@ -272,7 +272,8 @@ it out again.
 Each task has 8 MB of stack, as the program's first thread has, reserved as
 address space and used only as far as the task goes, with a guard page below
 it: a recursion too deep for it stops the program, as on the first thread. A
-switch from one task to another costs about 50 ns.
+switch from one task to another costs about 50 ns, and starting a task about
+1 µs: the stacks of tasks that have ended are kept for new ones.
 
 ## What isn't built yet
 
