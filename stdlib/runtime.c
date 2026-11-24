@@ -27,6 +27,11 @@
 extern void kod_inspect_print_backtrace_from(int64_t fp)
     __asm__("$kod$inspect$print_backtrace_from");
 
+// The polling page (docs/tasks.md#preemption): each loop iteration loads from
+// it, and while it is unreadable the load faults, which makes the task give
+// way. A page of its own, so that making it unreadable touches nothing else.
+__attribute__((aligned(16384), section("__DATA,__kod_poll"))) char kod_poll_page[16384];
+
 // Set by stdlib/tasks.c once a task has been started: prints, after a panic's
 // backtrace, where the running task was spawned.
 void (*kod_backtrace_hook)(void) = 0;

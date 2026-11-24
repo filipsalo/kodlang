@@ -4,13 +4,14 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: being built. Milestones 1 to 7 of step 1 are in: `spawn`, `Task[T]`
-and `wait()`, a function waiting for its tasks, channels and `for v in ch`,
-tasks waiting for I/O, cancellation, `select`, generators, the helpers, HTTP
-and TLS in tasks with a server, backtraces that say where a task was
-spawned, and module variables initialized once across tasks ([Tasks](tasks.md)
-describes what works); preemption and the rest are a proposal. It describes what Kod would add for doing
-several things at once, in two steps, and what it promises now so that those
+Status: step 1 is built, but for the check at function entry: `spawn`,
+`Task[T]` and `wait()`, a function waiting for its tasks, channels and
+`for v in ch`, tasks waiting for I/O, cancellation, `select`, generators, the
+helpers, HTTP and TLS in tasks with a server, backtraces that say where a
+task was spawned, module variables initialized once across tasks, and
+preemption at loop iterations ([Tasks](tasks.md) describes what works); step 2
+is a proposal. It describes what Kod would add for doing several things at
+once, in two steps, and what it promises now so that those
 steps stay possible. The building blocks are Go's (tasks, channels, `select`),
 used in a structured way (a task belongs to the function that starts it), on
 one thread: Kod doesn't share memory between threads.
@@ -308,11 +309,21 @@ and branches on:
 |---|---|---|---|---|---|---|
 | load a flag, branch if set | +17% | +11% | +5% | 0% | 0% | +1% |
 | load from the polling page | 0% | +9% | 0% | 0% | 0% | +2% |
+| as built (2026-11-24) | +8% | +7% | 0% | 0% | 0% | 0% |
 
-The branch is what costs, in tight loops; what a check stops the optimiser
-doing (reusing a load or hoisting it out of a loop, which it must not do
-across a point where another task may run) cost nothing measurable. A tight
-loop of stores, as sieve's, still pays for the load.
+The branch is what costs, in tight loops. The experiment left out what the
+check must stop the optimiser doing: reusing, after the check, a value loaded
+from the heap before it, which another task may have changed (or freed) in
+between. As built, the check is opaque to the passes, and qsort's inner loops
+load `self.xs`'s buffer and length again after each one's check: that is its
++8%. A tight loop of stores, as sieve's, pays for the load. The compiler, with
+the check in its own loops, is about 1% slower, within the noise.
+
+As built, every 10 ms a thread makes the page unreadable once a program has
+started a task; the fault handler makes it readable again and sends the task
+to a stub that saves every register a call may change, calls `give_way`, and
+goes on past the load. No check is put in the scheduler (`tasks`), the
+builtins it uses, or the backtrace printer, which a switch mustn't land in.
 
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does
