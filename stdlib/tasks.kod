@@ -4,6 +4,7 @@
 // thread (docs/tasks.md). The stacks and the switch are in tasks.c; which
 // task runs next is decided here.
 
+import "kod/inspect"
 import "stream" { IoError }
 import "time" { Duration }
 
@@ -17,6 +18,10 @@ extern func kod_task_kq_add(anon ident: int64, anon filter: int64, anon data: in
 extern func kod_task_kq_wait(anon block: int64) -> int64
 extern func kod_task_kq_key(anon i: int64) -> int64
 extern func kod_task_hook() -> none
+extern func kod_task_set_now(anon stack: int64) -> none
+extern func kod_eprint(anon s: str) -> none
+extern func _inspect_caller_fp() -> int64
+extern func _inspect_read_i64(anon addr: int64) -> int64
 
 // kevent's filters.
 let EVFILT_READ: int64 = -1
@@ -46,6 +51,8 @@ type Fiber = shared struct {
     cancelled: bool = false
     // The key of the kevent registration it waits on, 0 for none.
     io_key: int64 = 0
+    // Where it was spawned (_spawn_trace).
+    spawned_at: [int64] = []
 }
 
 // The task that is running, made for the program's first one when first
@@ -213,9 +220,77 @@ func _new_fiber() -> Fiber {
     if stack == 0 {
         panic("tasks: no room for another task's stack")
     }
-    let fiber = Fiber(ctx: kod_task_ctx_new(), :stack)
+    let fiber = Fiber(ctx: kod_task_ctx_new(), :stack, spawned_at: _spawn_trace())
     kod_task_ctx_init(fiber.ctx, stack)
     return fiber
+}
+
+// Where the running task spawns one: the return addresses of the calls it is
+// in (at most 16), then 0 and where it was spawned itself, at most 64 in all.
+// Only the addresses: _print_spawn_trace looks them up after a panic.
+func _spawn_trace() -> [int64] {
+    mut pcs: [int64] = []
+    mut fp = _inspect_caller_fp()
+    for fp != 0 and len(pcs) < 16 {
+        let next = _inspect_read_i64(fp)
+        if next == 0 {
+            break
+        }
+        pcs += [_inspect_read_i64(fp + 8)]
+        if next <= fp {
+            break
+        }
+        fp = next
+    }
+    let outer = _running().spawned_at
+    if len(outer) > 0 {
+        pcs += [0]
+        mut keep = 63 - len(pcs)
+        if keep > len(outer) {
+            keep = len(outer)
+        }
+        pcs += outer[0..keep]
+    }
+    return pcs
+}
+
+// After a panic's backtrace (tasks.c sets the hook): where the running task
+// was spawned, and where the one that spawned it was, and so on.
+func _print_spawn_trace() -> none {
+    if _current is none {
+        return
+    }
+    let me = _current
+    mut header_due = true
+    mut skipping = false
+    mut i: int64 = 0
+    for pc in me.spawned_at {
+        if pc == 0 {
+            header_due = true
+            skipping = false
+            continue
+        }
+        if skipping {
+            continue
+        }
+        if inspect.resolve(addr: pc) is inspect.Frame(f) {
+            // Below a test is only the test runner.
+            if f.name == inspect.TEST_RUNNER {
+                skipping = true
+                continue
+            }
+            if f.file == "stdlib/tasks.kod" {
+                continue
+            }
+            if header_due {
+                kod_eprint("spawned at:")
+                header_due = false
+                i = 0
+            }
+            kod_eprint(f"  #{i}  {f.name} ({f.file}:{f.line})")
+            i += 1
+        }
+    }
 }
 
 func _running() -> Fiber {
@@ -259,6 +334,7 @@ func _take_next() -> Fiber {
 func _switch_from(anon me: Fiber) -> none {
     let next = _take_next()
     _current = next
+    kod_task_set_now(next.stack)
     kod_task_switch(me.ctx, next.ctx)
     _reap()
 }
@@ -308,8 +384,29 @@ func _finish() -> none {
     _dead += [fiber]
     let next = _take_next()
     _current = next
+    kod_task_set_now(next.stack)
     _leave_from = fiber.ctx
     _leave_to = next.ctx
+}
+
+// Tasks waiting for a module variable's initializer, which another task runs,
+// by the variable's cell (runtime.c, kod_var_busy).
+mut _var_waiters: Map[int64, [Fiber]] = Map[int64, [Fiber]]()
+
+// Waits, as the running task, until the cell's value is there (state 1).
+func _wait_var(anon cell: int64) -> none {
+    let me = _running()
+    for _inspect_read_i64(cell) != 1 {
+        _var_waiters[cell] = (_var_waiters.get(cell)? or []) + [me]
+        _switch_from(me)
+    }
+}
+
+func _wake_var(anon cell: int64) -> none {
+    let none_waiting: [Fiber] = []
+    for fiber in _var_waiters.remove(cell)? or none_waiting {
+        _make_ready(fiber)
+    }
 }
 
 // Carries values from tasks that send to tasks that receive, in order

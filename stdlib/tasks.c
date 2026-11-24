@@ -38,17 +38,19 @@ void kod_task_ctx_free(int64_t ctx) {
     free((void *)ctx);
 }
 
-/* The task scheduler's entry for a task's first turn (stdlib/tasks.kod). */
-extern void kod_tasks_run_current(void) __asm__("$tasks$_run_current");
-
-/* Where a new task starts: it runs the task, which switches away for good. */
-static void kod_task_entry(void) {
-    kod_tasks_run_current();
-    __builtin_trap();
+/* Where a new task starts: it runs the task through the scheduler's entry for
+ * a task's first turn (stdlib/tasks.kod), which switches away for good. The
+ * frame chain ends there (fp 0), so a backtrace stops at the task's first
+ * call. */
+__attribute__((naked)) static void kod_task_entry(void) {
+    __asm__(
+        "mov fp, #0\n"
+        "mov lr, #0\n"
+        "bl \"$tasks$_run_current\"\n"
+        "brk #1\n");
 }
 
-/* Makes `ctx` start kod_task_entry on the stack at `base`, its frame chain
- * ending there (fp 0), so backtraces stop at the task's first call. */
+/* Makes `ctx` start kod_task_entry on the stack at `base`. */
 void kod_task_ctx_init(int64_t ctx, int64_t base) {
     uint64_t *c = (uint64_t *)ctx;
     c[10] = 0;
@@ -136,6 +138,25 @@ int64_t kod_task_kq_key(int64_t i) {
 extern int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data);
 extern int64_t kod_tasks_wait_event(int64_t ident, int64_t filter, int64_t data) __asm__("$tasks$_wait_event");
 
+/* After a panic's backtrace, where the running task was spawned. */
+extern void (*kod_backtrace_hook)(void);
+extern void kod_tasks_print_spawn_trace(void) __asm__("$tasks$_print_spawn_trace");
+
+/* A module variable another task is initializing (runtime.c, kod_var_busy). */
+extern int64_t kod_task_now;
+extern void (*kod_var_wait_hook)(int64_t cell);
+extern void (*kod_var_wake_hook)(int64_t cell);
+extern void kod_tasks_wait_var(int64_t cell) __asm__("$tasks$_wait_var");
+extern void kod_tasks_wake_var(int64_t cell) __asm__("$tasks$_wake_var");
+
 void kod_task_hook(void) {
     kod_wait_hook = kod_tasks_wait_event;
+    kod_backtrace_hook = kod_tasks_print_spawn_trace;
+    kod_var_wait_hook = kod_tasks_wait_var;
+    kod_var_wake_hook = kod_tasks_wake_var;
+}
+
+/* The task about to run, by its stack (0 for the program's first). */
+void kod_task_set_now(int64_t stack) {
+    kod_task_now = stack;
 }

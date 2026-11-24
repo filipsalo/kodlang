@@ -4521,6 +4521,28 @@ type Codegen = shared struct {
     // line covering that lr.
     //
     // Lines rows are { void *pc; int32 line; int32 _pad; } = 16 bytes.
+    // The name a backtrace gives the literal `spawn f(x)` runs: `spawn f`,
+    // `spawn conn.serve`.
+    func spawned_display(self, anon decl: ast.FuncDecl) -> str {
+        if len(decl.body) == 1 and self.p.stmts[decl.body[0]] is .Return(value) and self.p.exprs[value] is .Call(callee, _args) {
+            return "spawn " + self.callee_text(callee)
+        }
+        return "spawn"
+    }
+
+    func callee_text(self, anon e: int64) -> str {
+        match self.p.exprs[e] {
+            .Ident(name) -> return name
+            .Binary(lhs, op, rhs) -> {
+                if op == .Dot {
+                    return self.callee_text(lhs) + "." + self.callee_text(rhs)
+                }
+            }
+            else -> return "…"
+        }
+        return "…"
+    }
+
     func emit_symtab_entry(self, anon func_lbl: str, name: str, file: str, line: int64) -> none {
         if self.dry_run {
             self.func_lines_labels = []
@@ -18771,7 +18793,9 @@ type Codegen = shared struct {
 
     // A getter `lbl` that calls `init` at its first use and keeps what it returns in the
     // cell `lbl$cell`, `{state, value}`: state 0 before the first use, 2 while `init`
-    // runs (a use then is a cycle, which panics), 1 after. It returns a new reference.
+    // runs, with the running task's tag as the value, 3 when as well another task waits
+    // for it, 1 after (stdlib/runtime.c, kod_var_busy). A use while `init` runs is a
+    // cycle, which panics, or from another task waits. It returns a new reference.
     func emit_cached_getter(self, anon lbl: str, init: str, name: str, kind: TypeKind) -> none {
         let cell = f"{lbl}$cell"
         let ready = self.fresh("Lvar_ready")
@@ -18799,15 +18823,32 @@ type Codegen = shared struct {
         self.emit_jump_zero("x17", target: cycle, nonzero: true)
         self.emit_op(.Move, a: "x17", b: "#2")
         self.emit_store("x17", base: "x16")
+        self.emit_op(.AddressPage, a: "x17", b: "_kod_task_now@PAGE")
+        self.emit_op(.Add, a: "x17", b: "x17", c: "_kod_task_now@PAGEOFF")
+        self.emit_load("x17", base: "x17")
+        self.emit_store("x17", base: "x16", off: 8)
         // The initializer's reference becomes the cell's.
         self.emit_call(init)
         self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
         self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
+        self.emit_load("x1", base: "x16")
         self.emit_store("x0", base: "x16", off: 8)
         self.emit_op(.Move, a: "x17", b: "#1")
         self.emit_store("x17", base: "x16")
+        self.emit_op(.Compare, a: "x1", b: "#3")
+        self.emit_jump_if(.Ne, target: ready)
+        self.emit_mov("x0", src: "x16")
+        self.emit_call("_kod_var_wake")
+        let reload = self.fresh("Lvar_reload")
+        self.emit_label(reload)
+        self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
+        self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
         self.emit_jump(ready)
+        // Another task's initializer: kod_var_busy waits for it; this one's is a cycle.
         self.emit_label(cycle)
+        self.emit_mov("x0", src: "x16")
+        self.emit_call("_kod_var_busy")
+        self.emit_jump_zero("x0", target: reload, nonzero: true)
         self.emit_op(.AddressPage, a: "x0", b: f"{msg}@PAGE")
         self.emit_op(.Add, a: "x0", b: "x0", c: f"{msg}@PAGEOFF")
         self.emit_call("_kod_panic")
@@ -21865,6 +21906,9 @@ type Codegen = shared struct {
         }
         if self.in_test {
             display_name = f"test \"{self.test_display}\""
+        }
+        if func_decl.spawned {
+            display_name = self.spawned_display(func_decl)
         }
         let decl_line: int64 = self.line_of_offset(func_decl.name_span.start)
 

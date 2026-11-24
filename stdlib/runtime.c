@@ -27,6 +27,35 @@
 extern void kod_inspect_print_backtrace_from(int64_t fp)
     __asm__("$kod$inspect$print_backtrace_from");
 
+// Set by stdlib/tasks.c once a task has been started: prints, after a panic's
+// backtrace, where the running task was spawned.
+void (*kod_backtrace_hook)(void) = 0;
+
+// A module variable's cell is {state, value}: state 0 before its first use, 2
+// while its initializer runs, with the running task's tag (kod_task_now: its
+// stack, 0 for the program's first task) as the value, 3 when as well a task
+// waits for it, 1 after (codegen.kod, emit_cached_getter). A use while it is 2
+// or 3 calls kod_var_busy: from another task than the one running the
+// initializer, it waits until the value is there, 1; from that one it is a
+// cycle, 0, and the getter panics.
+int64_t kod_task_now = 0;
+void (*kod_var_wait_hook)(int64_t cell) = 0;
+void (*kod_var_wake_hook)(int64_t cell) = 0;
+
+int64_t kod_var_busy(int64_t *cell) {
+    if (kod_var_wait_hook && cell[1] != kod_task_now) {
+        cell[0] = 3;
+        kod_var_wait_hook((int64_t)cell);
+        return 1;
+    }
+    return 0;
+}
+
+// After the initializer of a cell that was 3: the tasks waiting go on.
+void kod_var_wake(int64_t *cell) {
+    if (kod_var_wake_hook) kod_var_wake_hook((int64_t)cell);
+}
+
 // KodStr and KodArray, the layout of a Kod `str` and `[T]`, are in kod_rt.h,
 // which C files that Kod modules name include too.
 
@@ -61,6 +90,7 @@ void kod_panic(KodStr *msg) {
     fputc('\n', stderr);
     kod_inspect_print_backtrace_from(
         (int64_t)(uintptr_t)__builtin_frame_address(0));
+    if (kod_backtrace_hook) kod_backtrace_hook();
     exit(1);
 }
 
@@ -108,6 +138,7 @@ void kod_index_oob(int64_t idx, int64_t len) {
             (long long)idx, (long long)len);
     kod_inspect_print_backtrace_from(
         (int64_t)(uintptr_t)__builtin_frame_address(0));
+    if (kod_backtrace_hook) kod_backtrace_hook();
     exit(1);
 }
 
@@ -116,6 +147,7 @@ void kod_div_zero(void) {
     fprintf(stderr, "panic: integer division by zero\n");
     kod_inspect_print_backtrace_from(
         (int64_t)(uintptr_t)__builtin_frame_address(0));
+    if (kod_backtrace_hook) kod_backtrace_hook();
     exit(1);
 }
 

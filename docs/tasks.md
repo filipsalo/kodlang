@@ -260,7 +260,14 @@ waits; until then the others wait for it.
 Waiting that can't end, because every task is waiting (for a task, a channel
 or a send to be received; a task waiting for itself, say), stops the program:
 `panic: all tasks are asleep: deadlock`. A panic in a task stops the program,
-as anywhere.
+as anywhere. Its backtrace is the task's own calls, from the call `spawn`
+made (`spawn fetch`), then under `spawned at:` the calls the spawning task was
+in when it spawned it, and so on up to the program's first task.
+
+A module-level variable is worked out at its first use, as without tasks
+(see [Module-level variables](types.md#module-level-variables)). When its initializer waits and another task
+uses the variable meanwhile, that task waits for the value rather than work
+it out again.
 
 Each task has 8 MB of stack, as the program's first thread has, reserved as
 address space and used only as far as the task goes, with a guard page below
