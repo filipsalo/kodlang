@@ -367,6 +367,8 @@ assert out.at(2) == 0x63
 | `push_le(value: int64, size: int64)` | add the low `size` bytes of `value`, lowest first (little-endian); `size` from 0 to 8 |
 | `push_buffer(other: ByteBuffer)` | add the bytes of `other` |
 | `copy_back(distance: int64, length: int64)` | add `length` bytes, each a copy of the one `distance` before it, so a `distance` shorter than `length` repeats the last `distance` bytes |
+| `drop_front(n: int64)` | drop the first `n` bytes |
+| `slice(from: int64, to: int64) -> bytes` | a copy of the bytes from `from` up to `to` |
 | `at(i: int64) -> int64` | the byte at `i`, 0 to 255 |
 | `set(i: int64, b: int64)` | replace the byte at `i`; only the low 8 bits of `b` are used |
 | `len() -> int64` | bytes so far |

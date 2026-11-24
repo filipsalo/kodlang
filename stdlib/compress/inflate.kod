@@ -5,7 +5,7 @@ import "bytebuffer" { ByteBuffer }
 // The length and distance tables of RFC 1951 §3.2.5.
 import "compress/tables" { LEN_BASE, LEN_EXTRA, DIST_BASE, DIST_EXTRA }
 import "hash/crc32"
-import "stream" { IoError }
+import "stream" { IoError, Reader }
 
 // The CRC-32 state and the Adler-32 sum after builder bytes start..end,
 // continuing from `crc` / `sum` (stdlib/runtime.c). A ByteBuffer's handle
@@ -54,11 +54,59 @@ func fives() -> [int64] {
     return [5] * 32
 }
 
+// What comes next in the input.
+type Step = enum {
+    // The header of a gzip member or a zlib stream.
+    Head
+    // A block.
+    Block
+    // Literals and back-references, or the bytes of a stored block.
+    Symbols
+    Stored
+    // A block has ended.
+    After
+    // The checksum, and then maybe another gzip member.
+    Tail
+    Next
+    Done
+}
+
+// How much compressed data is read at a time, and how much output is made
+// before it is asked for.
+let PIECE: int64 = 65536
+// As far back as a back-reference goes.
+let WINDOW: int64 = 32768
+
+// Decodes a stream a step at a time. Without a `source` the input is `data`, and
+// the output all of it. With one, `data` is what has been read of it and not
+// used, and decoding pauses, between two symbols, when there is output enough
+// or when it would wait for the source with output still to be given.
 type Inflater = shared struct {
     data: bytes
-    // gzip (0), zlib (1) or raw deflate (2).
+    // gzip (0), zlib (1), raw deflate (2), or whichever of zlib and raw it is (3).
     mode: int64
     max_output: int64
+    source: Reader? = none
+    // No more input will come.
+    ended: bool = true
+    // `refill` isn't to be used: what happens without is undone.
+    held: bool = false
+    source_failed: Error? = none
+    step: Step = .Head
+    // The block's codes, whether it is the last one, and how much of a stored
+    // one is left.
+    lit: Huffman = Huffman(table: [], bits: 0)
+    dist: Huffman = Huffman(table: [], bits: 0)
+    last: bool = false
+    left: int64 = 0
+    // The output length to pause at (with a source), or not to go past.
+    limit: int64 = 0
+    paused: bool = false
+    // How much of the output has been given.
+    given: int64 = 0
+    // The checksum of this stream's output, up to `checked`.
+    sum: int64 = 0
+    checked: int64 = 0
     // The next input byte, and the bits read from earlier ones but not used
     // yet, oldest in the lowest bit. When the input runs out, `need` adds
     // zero bits on top and counts them in `pad`, and using any of them is the
@@ -73,8 +121,7 @@ type Inflater = shared struct {
     // length.
     out: ByteBuffer = ByteBuffer()
     out_len: int64 = 0
-    // Output of the current gzip member or stream; its checksum is worked
-    // out over all of it once the stream ends.
+    // Output of the current gzip member or stream.
     stream_len: int64 = 0
     crc_table: [int64] = crc32.make_table()
     header_crc: int64 = 0xFFFFFFFF
@@ -90,7 +137,7 @@ type Inflater = shared struct {
     // Make at least `n` bits available in `buf`.
     func need(self, anon n: int64) -> none {
         for self.count < n {
-            if self.pos < len(self.data) {
+            if self.pos < len(self.data) or self.refill() {
                 self.buf = self.buf | (self.data[self.pos] << self.count)
                 self.pos += 1
             } else {
@@ -98,6 +145,42 @@ type Inflater = shared struct {
             }
             self.count += 8
         }
+    }
+
+    // Adds to the input from the source; false when there is no more.
+    func refill(self) -> bool {
+        if self.ended or self.held {
+            return false
+        }
+        let from = must self.source
+        let got = from.read(PIECE)
+        if got is Err(e) {
+            self.source_failed = e
+            self.fail("source failed")
+            self.ended = true
+            return false
+        }
+        let more = got
+        if len(more) == 0 {
+            self.ended = true
+            return false
+        }
+        if self.pos < len(self.data) {
+            self.data = self.data[self.pos..len(self.data)] + more
+        } else {
+            self.data = more
+        }
+        self.pos = 0
+        return true
+    }
+
+    // Whether the next `n` bits aren't there without waiting for the source, and
+    // there is output to give first; then it pauses.
+    func starved(self, anon n: int64) -> bool {
+        if not self.ended and self.given < self.out_len and self.count - self.pad + 8 * (len(self.data) - self.pos) < n {
+            self.paused = true
+        }
+        return self.paused
     }
 
     func drop(self, anon n: int64) -> none {
@@ -122,7 +205,7 @@ type Inflater = shared struct {
 
     // Whether input is left after the current byte.
     func more_input(self) -> bool {
-        return self.count - self.pad >= 8 or self.pos < len(self.data)
+        return self.count - self.pad >= 8 or self.pos < len(self.data) or self.refill()
     }
 
     func byte(self) -> int64 {
@@ -148,6 +231,22 @@ type Inflater = shared struct {
 
     func start_stream(self) -> none {
         self.stream_len = 0
+        self.sum = 0xFFFFFFFF
+        if self.mode == 1 {
+            self.sum = 1
+        }
+        self.checked = self.out_len
+        self.step = .Block
+    }
+
+    // Brings the checksum up to date.
+    func sum_up(self) -> none {
+        if self.mode == 0 {
+            self.sum = kod_crc32_sb(self.sum, self.out.handle, self.checked, self.out_len)
+        } else if self.mode == 1 {
+            self.sum = kod_adler32_sb(self.sum, self.out.handle, self.checked, self.out_len)
+        }
+        self.checked = self.out_len
     }
 
     // A byte of output.
@@ -233,24 +332,31 @@ type Inflater = shared struct {
         return entry >> 4
     }
 
-    // The literals and back-references of one block, up to its end marker.
-    // While at least 8 input bytes are left, the bit buffer is kept in
+    // The literals and back-references of one block, up to its end marker or a
+    // pause. While at least 8 input bytes are left, the bit buffer is kept in
     // locals and topped up to 56 bits or more whenever it has fewer than
     // 48, which cover a literal/length code (15), its extra bits (5), a
     // distance code (15) and its extra bits (13). The output length is kept
     // in a local too. Near the end of the input, `symbols_near_end` reads
     // bit by bit and tells running out from a bad code.
-    func symbols(self, anon lit: Huffman, anon dist: Huffman) -> none {
-        if self.err != "" {
-            return
+    func symbols(self) -> none {
+        for self.err == "" and not self.paused and self.step is .Symbols {
+            self.symbols_far()
+            self.symbols_near_end()
         }
+    }
+
+    func symbols_far(self) -> none {
+        let lit = self.lit
+        let dist = self.dist
         let data = self.data
         let n = len(data)
         let lit_mask = (1 << lit.bits) - 1
         let dist_mask = (1 << dist.bits) - 1
-        let max_output = self.max_output
+        let limit = self.limit
+        let pausing = self.source is not none
         // Where the stream's output starts; a back-reference can't go
-        // further back.
+        // further back. (Below 0 once output has been dropped.)
         let stream_start = self.out_len - self.stream_len
         let out = self.out
         mut buf = self.buf
@@ -282,8 +388,14 @@ type Inflater = shared struct {
             count -= entry & 15
             let symbol = entry >> 4
             if symbol < 256 {
-                if olen == max_output {
-                    self.fail("output too large")
+                if olen >= limit {
+                    if not pausing {
+                        self.fail("output too large")
+                        break
+                    }
+                    out.push(symbol)
+                    olen += 1
+                    self.paused = true
                     break
                 }
                 out.push(symbol)
@@ -291,6 +403,7 @@ type Inflater = shared struct {
                 continue
             }
             if symbol == 256 {
+                self.step = .After
                 break
             }
             let i = symbol - 257
@@ -322,61 +435,102 @@ type Inflater = shared struct {
                 self.fail("invalid distance too far back")
                 break
             }
-            mut m = length
-            if m > max_output - olen {
-                m = max_output - olen
-            }
-            out.copy_back(:distance, length: m)
-            olen += m
-            if m < length {
-                self.fail("output too large")
+            if length > limit - olen {
+                mut m = length
+                if pausing {
+                    self.paused = true
+                } else {
+                    m = limit - olen
+                    self.fail("output too large")
+                }
+                out.copy_back(:distance, length: m)
+                olen += m
                 break
             }
+            out.copy_back(:distance, :length)
+            olen += length
         }
         self.buf = buf
         self.count = count
         self.pos = pos
         self.stream_len = olen - stream_start
         self.out_len = olen
-        if near_end and self.err == "" {
-            self.symbols_near_end(lit, dist)
+    }
+
+    // As symbols_far, as long as fewer than 8 input bytes are left.
+    func symbols_near_end(self) -> none {
+        for self.err == "" and not self.paused and self.step is .Symbols and (self.pos + 8 > len(self.data) or self.pad != 0) {
+            if self.source is not none and self.out_len >= self.limit {
+                self.paused = true
+                return
+            }
+            if self.ended {
+                self.symbol()
+                continue
+            }
+            // A symbol that is all there is decoded before more is waited for.
+            let buf = self.buf
+            let count = self.count
+            let pos = self.pos
+            self.held = true
+            self.symbol()
+            self.held = false
+            if self.err == "truncated" {
+                self.err = ""
+                self.buf = buf
+                self.count = count
+                self.pos = pos
+                self.pad = 0
+                if self.given < self.out_len {
+                    self.paused = true
+                    return
+                }
+                let _ = self.refill()
+            } else {
+                // Zeros it was looked up with and didn't use.
+                self.count -= self.pad
+                self.pad = 0
+            }
         }
     }
 
-    func symbols_near_end(self, anon lit: Huffman, anon dist: Huffman) -> none {
-        for self.err == "" {
-            let symbol = self.decode(lit)
-            if symbol < 0 or symbol == 256 {
-                return
-            }
-            if symbol < 256 {
-                self.put(symbol)
-                continue
-            }
-            let i = symbol - 257
-            if i >= 29 {
-                self.fail("invalid literal/length code")
-                return
-            }
-            let length = LEN_BASE[i] + self.bits(LEN_EXTRA[i])
-            let d = self.decode(dist)
-            if d < 0 {
-                return
-            }
-            if d >= 30 {
-                self.fail("invalid distance code")
-                return
-            }
-            let distance = DIST_BASE[d] + self.bits(DIST_EXTRA[d])
-            if self.err != "" {
-                return
-            }
-            if distance > self.stream_len {
-                self.fail("invalid distance too far back")
-                return
-            }
-            self.copy(distance: distance, length: length)
+    // A literal, a back-reference or the end of the block.
+    func symbol(self) -> none {
+        let symbol = self.decode(self.lit)
+        if symbol < 0 {
+            return
         }
+        if symbol == 256 {
+            self.step = .After
+            return
+        }
+        if symbol < 256 {
+            self.put(symbol)
+            return
+        }
+        let i = symbol - 257
+        if i >= 29 {
+            self.fail("invalid literal/length code")
+            return
+        }
+        let length = LEN_BASE[i] + self.bits(LEN_EXTRA[i])
+        let d = self.decode(self.dist)
+        if d < 0 {
+            return
+        }
+        if d >= 30 {
+            self.fail("invalid distance code")
+            return
+        }
+        let distance = DIST_BASE[d] + self.bits(DIST_EXTRA[d])
+        if self.err != "" {
+            return
+        }
+        if distance > self.stream_len {
+            self.fail("invalid distance too far back")
+            return
+        }
+        self.copy(distance: distance, length: length)
     }
 
     // A back-reference: `length` bytes copied from `distance` back, which
@@ -401,12 +555,42 @@ type Inflater = shared struct {
             self.fail("invalid stored block lengths")
             return
         }
-        for _ in 0..n {
-            if self.err != "" {
+        self.left = n
+        self.step = .Stored
+    }
+
+    // The bytes of a stored block, up to its end or a pause.
+    func stored_bytes(self) -> none {
+        for self.left > 0 and self.err == "" {
+            if self.source is not none and self.out_len >= self.limit {
+                self.paused = true
                 return
             }
-            self.put(self.byte())
+            if self.starved(8) {
+                return
+            }
+            mut n = self.left
+            for most in [len(self.data) - self.pos, self.limit - self.out_len] {
+                if n > most {
+                    n = most
+                }
+            }
+            if self.count > 0 or n <= 0 {
+                // A byte in the bit buffer, or one that has to be read first, or is
+                // too many.
+                self.put(self.byte())
+                self.left -= 1
+                continue
+            }
+            self.out.push_bytes(self.data[self.pos..self.pos + n])
+            self.out_len += n
+            self.stream_len += n
+            self.left -= n
+            self.pos += n
+            // Bits above `count` are those of the next byte, which is another now.
+            self.buf = 0
         }
+        self.step = .After
     }
 
     // A block that sends its own codes, as code lengths that are themselves
@@ -462,37 +646,32 @@ type Inflater = shared struct {
             self.fail("invalid code -- missing end-of-block")
             return
         }
-        let lit = self.code(lengths[0..nlit], "literal/lengths")
-        let dist = self.code(lengths[nlit..nlit + ndist], "distances")
-        if self.err == "" {
-            self.symbols(lit, dist)
-        }
+        self.lit = self.code(lengths[0..nlit], "literal/lengths")
+        self.dist = self.code(lengths[nlit..nlit + ndist], "distances")
+        self.step = .Symbols
     }
 
-    // The blocks of a stream, up to the one marked last.
-    func blocks(self) -> none {
-        for self.err == "" {
-            let last = self.bits(1)
-            let kind = self.bits(2)
-            if self.err != "" {
-                return
+    // The start of a block, up to what it holds.
+    func block(self) -> none {
+        self.last = self.bits(1) == 1
+        let kind = self.bits(2)
+        if self.err != "" {
+            return
+        }
+        if kind == 0 {
+            self.stored()
+        } else if kind == 1 {
+            if len(self.fixed_lit.table) == 0 {
+                self.fixed_lit = self.code(fixed_lengths(), "literal/lengths")
+                self.fixed_dist = self.code(fives(), "distances")
             }
-            if kind == 0 {
-                self.stored()
-            } else if kind == 1 {
-                if len(self.fixed_lit.table) == 0 {
-                    self.fixed_lit = self.code(fixed_lengths(), "literal/lengths")
-                    self.fixed_dist = self.code(fives(), "distances")
-                }
-                self.symbols(self.fixed_lit, self.fixed_dist)
-            } else if kind == 2 {
-                self.dynamic()
-            } else {
-                self.fail("invalid block type")
-            }
-            if last == 1 {
-                return
-            }
+            self.lit = self.fixed_lit
+            self.dist = self.fixed_dist
+            self.step = .Symbols
+        } else if kind == 2 {
+            self.dynamic()
+        } else {
+            self.fail("invalid block type")
         }
     }
 
@@ -504,7 +683,7 @@ type Inflater = shared struct {
         }
     }
 
-    func gzip_member(self) -> none {
+    func gzip_head(self) -> none {
         self.header_crc = 0xFFFFFFFF
         let id1 = self.header_byte()
         let id2 = self.header_byte()
@@ -552,22 +731,24 @@ type Inflater = shared struct {
             }
         }
         self.start_stream()
-        self.blocks()
+    }
+
+    func gzip_tail(self) -> none {
         self.align()
         let crc = self.le32()
         let size = self.le32()
         if self.err != "" {
             return
         }
-        let end = self.out_len
-        if crc != (kod_crc32_sb(0xFFFFFFFF, self.out.handle, end - self.stream_len, end) ^ 0xFFFFFFFF) {
+        self.sum_up()
+        if crc != (self.sum ^ 0xFFFFFFFF) {
             self.fail("incorrect data check")
         } else if size != (self.stream_len & 0xFFFFFFFF) {
             self.fail("incorrect length check")
         }
     }
 
-    func zlib_stream(self) -> none {
+    func zlib_head(self) -> none {
         let cmf = self.byte()
         let flags = self.byte()
         if self.err != "" {
@@ -590,39 +771,123 @@ type Inflater = shared struct {
             return
         }
         self.start_stream()
-        self.blocks()
+    }
+
+    func zlib_tail(self) -> none {
         self.align()
         mut sum: int64 = 0
         for _ in 0..4 {
             sum = (sum << 8) | self.byte()
         }
-        let end = self.out_len
-        if self.err == "" and sum != kod_adler32_sb(1, self.out.handle, end - self.stream_len, end) {
+        if self.err != "" {
+            return
+        }
+        self.sum_up()
+        if sum != self.sum {
             self.fail("incorrect data check")
         }
     }
 
-    func run(self) -> none {
-        if self.mode == 0 {
-            // Members one after another give their output joined.
-            self.gzip_member()
-            for self.err == "" and self.more_input() {
-                self.gzip_member()
+    func head(self) -> none {
+        if self.mode == 3 {
+            self.need(16)
+            self.mode = 2
+            if zlib_header(self.buf & 255, (self.buf >> 8) & 255) {
+                self.mode = 1
             }
+        }
+        if self.mode == 0 {
+            self.gzip_head()
         } else if self.mode == 1 {
-            self.zlib_stream()
+            self.zlib_head()
         } else {
             self.start_stream()
-            self.blocks()
         }
     }
+
+    // The bits of the end of a stream, at most.
+    func tail_bits(self) -> int64 {
+        if self.mode == 0 {
+            return 64
+        }
+        if self.mode == 1 {
+            return 32
+        }
+        return 0
+    }
+
+    func tail(self) -> none {
+        self.step = .Done
+        if self.mode == 0 {
+            self.gzip_tail()
+            // Members one after another give their output joined.
+            self.step = .Next
+        } else if self.mode == 1 {
+            self.zlib_tail()
+        }
+    }
+
+    // Goes on until the end, an error or a pause.
+    func run(self) -> none {
+        self.paused = false
+        for self.err == "" and not self.paused and self.step is not .Done {
+            match self.step {
+                .Head -> self.head()
+                .Block -> {
+                    if not self.starved(3) {
+                        self.block()
+                    }
+                }
+                .Symbols -> self.symbols()
+                .Stored -> self.stored_bytes()
+                .After -> {
+                    self.step = .Block
+                    if self.last {
+                        self.step = .Tail
+                    }
+                }
+                .Tail -> {
+                    if not self.starved(self.tail_bits()) {
+                        self.tail()
+                    }
+                }
+                .Next -> {
+                    if not self.starved(8) {
+                        self.step = .Done
+                        if self.more_input() {
+                            self.step = .Head
+                        }
+                    }
+                }
+                .Done -> none
+            }
+        }
+    }
+
+    // Drops output that has been given and is too far back to be copied.
+    func forget(self) -> none {
+        let n = self.out_len - WINDOW
+        if n >= 3 * WINDOW {
+            self.sum_up()
+            self.out.drop_front(n)
+            self.out_len -= n
+            self.given -= n
+            self.checked -= n
+        }
+    }
+}
+
+// Whether a stream that starts with these two bytes is a zlib stream: deflate, a
+// window of at most 32 KiB, and a check that makes the two a multiple of 31.
+func zlib_header(anon cmf: int64, anon flags: int64) -> bool {
+    return (cmf & 15) == 8 and cmf >> 4 <= 7 and (cmf * 256 + flags) % 31 == 0
 }
 
 func run(anon op: str, anon data: bytes, anon mode: int64, anon max_output: int64) -> bytes or Error {
     if max_output < 0 {
         throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: "max_output cannot be negative")
     }
-    let inflater = Inflater(data: data, mode: mode, max_output: max_output)
+    let inflater = Inflater(data: data, mode: mode, max_output: max_output, limit: max_output)
     inflater.run()
     if inflater.err != "" {
         throw IoError(kind: .InvalidInput, op: op, errno: 0, detail: inflater.err)
@@ -640,4 +905,58 @@ func inflate_zlib(anon data: bytes, max_output: int64 = 16777216) -> bytes or Er
 
 func inflate_raw(anon data: bytes, max_output: int64 = 16777216) -> bytes or Error {
     return try run("inflate_raw", data, 2, max_output)
+}
+
+// What is decompressed of a Reader: see docs/encoding.md#piece-by-piece.
+type InflateReader = shared struct {
+    inflater: Inflater
+
+    func read(self, anon max: int64) -> bytes or Error {
+        let it = self.inflater
+        if max <= 0 {
+            return kod_str_to_bytes("")
+        }
+        if it.given == it.out_len and it.err == "" {
+            it.forget()
+            it.limit = it.out_len + PIECE
+            it.run()
+        }
+        if it.given < it.out_len {
+            mut end = it.given + max
+            if end > it.out_len {
+                end = it.out_len
+            }
+            let piece = it.out.slice(it.given, end)
+            it.given = end
+            return piece
+        }
+        if it.source_failed is Some(e) {
+            throw e
+        }
+        if it.err != "" {
+            throw IoError(kind: .InvalidInput, op: "inflate", errno: 0, detail: it.err)
+        }
+        return kod_str_to_bytes("")
+    }
+}
+
+func reader(anon from: Reader, anon mode: int64) -> InflateReader {
+    return InflateReader(inflater: Inflater(data: kod_str_to_bytes(""), mode: mode, max_output: 9223372036854775807, source: from, ended: false))
+}
+
+func gunzip_reader(anon from: Reader) -> InflateReader {
+    return reader(from, 0)
+}
+
+func zlib_reader(anon from: Reader) -> InflateReader {
+    return reader(from, 1)
+}
+
+func raw_reader(anon from: Reader) -> InflateReader {
+    return reader(from, 2)
+}
+
+// A zlib stream, or a raw one when it doesn't start as a zlib stream does.
+func deflate_reader(anon from: Reader) -> InflateReader {
+    return reader(from, 3)
 }

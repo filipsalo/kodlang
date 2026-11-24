@@ -1,7 +1,8 @@
 import "compress/deflate"
 import "compress/inflate"
 import "encoding/base64"
-import "stream" { IoError, IoKind }
+import "strbuilder" { StrBuilder }
+import "stream" { IoError, IoKind, Reader }
 
 func data(anon b64: str) -> bytes {
     return must base64.decode(b64)
@@ -229,5 +230,230 @@ test "gunzip: back-references at every distance from 1 to 17 read back" {
         if not fails_with(inflate.gunzip(packed, max_output: len(input) - 3), "output too large") {
             fail(f"period {period}: max_output")
         }
+    }
+}
+
+// A Reader of `data`, `step` bytes at a time, which counts its reads.
+type Steps = shared struct {
+    data: bytes
+    step: int64
+    pos: int64 = 0
+    reads: int64 = 0
+    fail_at: int64 = -1
+
+    func read(self, anon max: int64) -> bytes or Error {
+        self.reads += 1
+        if self.fail_at >= 0 and self.pos >= self.fail_at {
+            throw IoError(kind: .ConnectionReset, op: "steps", errno: 0, detail: "gone")
+        }
+        mut end = self.pos + self.step
+        if end > self.pos + max {
+            end = self.pos + max
+        }
+        let piece = self.data[self.pos..end]
+        self.pos += len(piece)
+        return piece
+    }
+}
+
+func reader_of(anon mode: int64, anon from: Reader) -> inflate.InflateReader {
+    if mode == 0 {
+        return inflate.gunzip_reader(from)
+    }
+    if mode == 1 {
+        return inflate.zlib_reader(from)
+    }
+    return inflate.raw_reader(from)
+}
+
+func whole(anon mode: int64, anon packed: bytes) -> bytes or Error {
+    if mode == 0 {
+        return try inflate.gunzip(packed)
+    }
+    if mode == 1 {
+        return try inflate.inflate_zlib(packed)
+    }
+    return try inflate.inflate_raw(packed)
+}
+
+type Drained = struct {
+    out: bytes
+    error: str
+}
+
+func drain(anon r: Reader, anon max: int64) -> Drained {
+    let out = StrBuilder()
+    for true {
+        let got = r.read(max)
+        if got is Err(e) {
+            // It goes on failing.
+            assert r.read(max) is Err(_)
+            return Drained(out: out.to_bytes(), error: detail(e))
+        }
+        let piece = got
+        assert len(piece) <= max
+        if len(piece) == 0 {
+            return Drained(out: out.to_bytes(), error: "")
+        }
+        out.append_bytes(piece)
+    }
+}
+
+func detail(anon e: Error) -> str {
+    if e is IoError(io) {
+        return io.detail
+    }
+    return e.to_str()
+}
+
+// Reading piece by piece is as decompressing it whole.
+func same(anon mode: int64, anon packed: bytes, steps: [int64]) -> none {
+    let all = whole(mode, packed)
+    for step in steps {
+        for max in [1000, 65536] {
+            let got = drain(reader_of(mode, Steps(data: packed, :step)), max)
+            if all is Err(e) {
+                assert got.error == detail(e)
+            } else {
+                assert got.error == ""
+                assert got.out == must all
+            }
+        }
+    }
+}
+
+let STEPS: [int64] = [1, 2, 3, 5, 7, 8, 9, 16, 100, 4096, 65536]
+
+test "readers: every format and level, with input in pieces of any size" {
+    let input = kod_str_to_bytes(numbered_lines() + "The quick brown fox jumps over the lazy dog. ".repeat(300) + numbered_lines())
+    for level in [0, 1, 6, 9] {
+        same(0, deflate.gzip(input, :level), steps: STEPS)
+        same(1, deflate.zlib(input, :level), steps: STEPS)
+        same(2, deflate.raw(input, :level), steps: STEPS)
+    }
+    let nothing = kod_str_to_bytes("")
+    same(0, deflate.gzip(nothing), steps: STEPS)
+    same(1, deflate.zlib(nothing), steps: STEPS)
+    same(2, deflate.raw(nothing), steps: STEPS)
+    same(0, deflate.gzip(input) + deflate.gzip(nothing) + deflate.gzip(input), steps: STEPS)
+}
+
+test "readers: output far past the window" {
+    let line = numbered_lines()
+    mut text = line
+    for len(text) < 3000000 {
+        text += text + "another line "
+    }
+    let input = kod_str_to_bytes(text)
+    for packed in [deflate.gzip(input), deflate.gzip(input, level: 0)] {
+        for step in [1000, 65536] {
+            let r = inflate.gunzip_reader(Steps(data: packed, :step))
+            let got = drain(r, 10000)
+            assert got.error == ""
+            assert got.out == input
+            // All it keeps of that.
+            assert r.inflater.out.len() < 300000
+        }
+    }
+    // As long as it likes from nearly nothing.
+    let bomb = deflate.gzip(kod_bytes_from_array([0] * 5000000))
+    assert len(bomb) < 10000
+    assert len(drain(inflate.gunzip_reader(Steps(data: bomb, step: 65536)), 65536).out) == 5000000
+}
+
+test "readers: input cut short, at every length" {
+    let packed = deflate.gzip(kod_str_to_bytes("to be or not to be, that is the question. " + "to be or not to be, that is it"))
+    for n in 0..len(packed) {
+        same(0, packed[0..n], steps: [1, 3, 8, 100])
+        same(2, packed[10..n], steps: [1, 100])
+    }
+    same(0, packed + kod_str_to_bytes("x"), steps: [1, 3, 8, 100])
+    // Those two end where their data does.
+    same(1, deflate.zlib(packed) + kod_str_to_bytes("more"), steps: [1, 3, 8, 100])
+    same(2, deflate.raw(packed) + kod_str_to_bytes("more"), steps: [1, 3, 8, 100])
+}
+
+test "readers: corrupt input" {
+    let input = kod_str_to_bytes(numbered_lines()[0..6000])
+    mut seed: int64 = 7
+    for round in 0..1500 {
+        let mode = round % 3
+        mut packed = deflate.raw(input, level: 1 + round % 9)
+        if mode == 0 {
+            packed = deflate.gzip(input, level: round % 10)
+        } else if mode == 1 {
+            packed = deflate.zlib(input, level: round % 10)
+        }
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        mut at = (seed / 65536) % len(packed)
+        if round % 2 == 0 {
+            // Where the headers and the codes are.
+            at = at % 120
+        }
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let bad = packed[0..at] + kod_bytes_from_array([(seed / 65536) % 256]) + packed[at + 1..len(packed)]
+        same(mode, bad, steps: [1 + round % 13, 65536])
+    }
+}
+
+test "readers: what a sender flushed is given before more is waited for" {
+    let messages = ["event 0\n", "event 1 event 1\n", "x", "event 2 and the rest of it\n"]
+    let streams: [[str]] = [
+        ["H4sIAAAAAAAAE0otS80rUTDgAgAAAP//", "SgXThgpQmgsAAAD//w==", "qgAAAAD//w==", "gjCMFBLzUhRKMlIVilKLSxTy0xQyS7gAAAAA//8=", "AwCZ9XVbNAAAAA=="],
+        ["eJxKLUvNK1Ew4AIAAAD//w==", "SgXThgpQmgsAAAD//w==", "qgAAAAD//w==", "gjCMFBLzUhRKMlIVilKLSxTy0xQyS7gAAAAA//8=", "AwDHkxEH"],
+        ["Si1LzStRMOACAAAA//8=", "SgXThgpQmgsAAAD//w==", "qgAAAAD//w==", "gjCMFBLzUhRKMlIVilKLSxTy0xQyS7gAAAAA//8=", "AwA="],
+        ["H4sIAAAAAAAAE0otS80rUTDgAgg=", "oFQwbagApbkAAg==", "qAIg", "gCAMI4XEvBSFkoxUhaLU4hKF/DSFzBIugAA=", "AwCZ9XVbNAAAAA=="],
+        ["eJxKLUvNK1Ew4AII", "oFQwbagApbkAAg==", "qAIg", "gCAMI4XEvBSFkoxUhaLU4hKF/DSFzBIugAA=", "AwDHkxEH"],
+        ["Si1LzStRMOACCA==", "oFQwbagApbkAAg==", "qAIg", "gCAMI4XEvBSFkoxUhaLU4hKF/DSFzBIugAA=", "AwA="],
+    ]
+    for k, pieces in streams {
+        // Cut after each message: a read that waits for more finds it ended.
+        mut sent = kod_str_to_bytes("")
+        mut want = ""
+        for i, message in messages {
+            sent = sent + data(pieces[i])
+            want += message
+            for step in [1, 4, 1000] {
+                let from = Steps(data: sent, :step, fail_at: len(sent))
+                let got = drain(reader_of(k % 3, from), 1000)
+                assert kod_bytes_to_str(got.out) == want
+                assert got.error == "gone"
+            }
+        }
+        sent = sent + data(pieces[4])
+        same(k % 3, sent, steps: STEPS)
+    }
+}
+
+test "readers: one read of the source gives what it can" {
+    let from = Steps(data: deflate.gzip(kod_str_to_bytes("hello")), step: 1000)
+    let r = inflate.gunzip_reader(from)
+    assert kod_bytes_to_str(must r.read(100)) == "hello"
+    assert from.reads == 1
+    assert len(must r.read(100)) == 0
+    assert len(must r.read(100)) == 0
+}
+
+test "readers: the source's error, after what came before it" {
+    let packed = deflate.gzip(kod_str_to_bytes(numbered_lines()))
+    let half = len(packed) / 2
+    let r = inflate.gunzip_reader(Steps(data: packed, step: 1000, fail_at: half))
+    let got = drain(r, 1000)
+    assert got.error == "gone"
+    assert len(got.out) > 1000
+    assert numbered_lines().starts_with(kod_bytes_to_str(got.out))
+    if r.read(10) is Err(IoError(e)) {
+        assert e.kind == .ConnectionReset
+    }
+}
+
+test "deflate_reader: zlib, or raw" {
+    let input = kod_str_to_bytes(numbered_lines())
+    for step in [1, 2, 1000] {
+        assert drain(inflate.deflate_reader(Steps(data: deflate.zlib(input), :step)), 1000).out == input
+        assert drain(inflate.deflate_reader(Steps(data: deflate.raw(input), :step)), 1000).out == input
+        assert drain(inflate.deflate_reader(Steps(data: deflate.raw(kod_str_to_bytes("")), :step)), 1000).error == ""
+        assert drain(inflate.deflate_reader(Steps(data: kod_str_to_bytes(""), :step)), 1000).error == "truncated"
+        assert drain(inflate.deflate_reader(Steps(data: kod_str_to_bytes("x"), :step)), 1000).error == "truncated"
     }
 }

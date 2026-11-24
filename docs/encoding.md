@@ -101,6 +101,44 @@ checksum that does not match, `incorrect length check`, `invalid distance too fa
 back`). Bytes after the last gzip member
 are an error, and so is a stream that ends before its final block.
 
+### Piece by piece
+
+Data that comes from a `Reader`, or is too long to hold, is decompressed as it is
+read:
+
+<!-- kod:
+import "stream" { MemReader }
+let from = MemReader(data: deflate.gzip(kod_str_to_bytes("hello, hello")), pos: 0)
+-->
+```kod
+let plain = inflate.gunzip_reader(from)
+for true {
+    let piece = try plain.read(65536)
+    if len(piece) == 0 {
+        break
+    }
+    print(len(piece))
+}
+```
+
+| Function | Meaning |
+|---|---|
+| `gunzip_reader(from: Reader) -> InflateReader` | a gzip file, as `gunzip` |
+| `zlib_reader(from: Reader) -> InflateReader` | a zlib stream |
+| `raw_reader(from: Reader) -> InflateReader` | a raw deflate stream |
+| `deflate_reader(from: Reader) -> InflateReader` | a zlib stream, or a raw one when it doesn't begin as a zlib stream does (as HTTP's `deflate` may be) |
+
+An `InflateReader` is a [`Reader`](io.md#reader-and-writer) of the decompressed
+data, which takes a few hundred KB of memory however long that is. It gives what it has
+before it waits for more compressed data, so what a sender has flushed isn't held
+up. There is no `max_output`: stop reading when there is too much.
+
+A read fails as the functions above do, with the same details and `op` `inflate`,
+once what was good before it has been read, and goes on failing. The checksum comes
+last, so the data isn't known to be whole until the end has been read. An error of `from` is
+given as it is. A gzip file is read to the end of `from`; after the others, `from`
+may have been read past their end, by as much as it gave.
+
 ## Percent-encoding
 
 For URLs and query strings, see [HTTP client](http.md#query-strings-and-percent-encoding).
