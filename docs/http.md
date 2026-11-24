@@ -176,6 +176,10 @@ list of codings) is left alone: the body comes back as received, with its header
 for you to handle.
 A response with no body, such as one to `HEAD`, is not decoded.
 
+An [opened](#bodies-that-dont-fit-in-memory) response's body is decoded as it is
+read, to any length. Its `Content-Encoding` and `Content-Length` headers are removed,
+as the decoded length isn't known. That the body is not valid is an error of a read.
+
 ## Redirects
 
 `301`, `302` and `303` are retried as `GET` without a body (`HEAD` stays
@@ -251,8 +255,8 @@ The connection goes back to the `Client`, or is closed, once the body has been
 read to its end or a read has failed. `resp.close()` ends it before that, and does
 nothing after; a response that is neither read to its end nor closed keeps its
 connection open. `resp.body` is empty, and `limits.max_body` doesn't hold. `timeout`
-is for each read, and `deadline` goes on until the last. No compressed body is
-asked for, and one that comes anyway is left as it is. When the connection ends
+is for each read, and `deadline` goes on until the last. A compressed body
+is [decoded](#compression) as it is read. When the connection ends
 before the body does, a read fails with `UnexpectedEof`. Redirects are followed as
 by `fetch`. For a response that has been read already, `reader()` reads its
 `body`.

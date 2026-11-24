@@ -1,5 +1,7 @@
 // Bodies a client reads as they come, and sends from a Reader
 // (docs/http.md#bodies-that-dont-fit-in-memory).
+import "compress/deflate"
+import "encoding/base64"
 import "net/http" { BodyWriter, Client, Options, Request, Response, Router, Server, get, open, redirect, status, stream, text }
 import "net/tcp"
 import "posix" { Fd }
@@ -39,6 +41,9 @@ type Source = shared struct {
         return times("a", k)
     }
 }
+
+// Three events compressed with a flush after each, and the end.
+let FLUSHED: [str] = ["H4sIAAAAAAAAE0otS80rUTDgAgAAAP//", "SgXThlwAAAAA//8=", "gtBGXAAAAAD//w==", "AwC+5IS3GAAAAA=="]
 
 mut _addresses: [str] = []
 
@@ -113,6 +118,8 @@ type Fixture = shared struct {
         routes.get("/slowly", slowly)
         routes.get("/breaks", breaks)
         routes.get("/empty", empty)
+        routes.get("/packed", packed)
+        routes.get("/events", events)
         routes.get("/moved", moved)
         routes.put("/count", count, stream_body: true)
         routes.post("/count", count, stream_body: true)
@@ -307,13 +314,17 @@ test "bodies framed in other ways" {
         ["HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;a=b\r\nabc\r\n1\r\nd\r\n0\r\nT: 1\r\n\r\n", "abcd"],
         ["HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc", "[http: connection closed before the end of the body]"],
         ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY", "[http: chunk is missing its closing line break]"],
-        ["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc", "abc"],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 3\r\n\r\nabc", "abc"],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc", "[http: bad gzip body: incorrect header check]"],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n", ""],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", ""],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n", ""],
     ]
     for c in cases {
         let answering = spawn answer_once(l, c[0])
         let resp = must open("GET", url)
         let asked = answering.wait()
-        assert not asked.contains("Accept-Encoding")
+        assert asked.contains("\r\nAccept-Encoding: gzip\r\n")
         assert all_of(resp.reader()) == c[1]
     }
     for bad in ["HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n", "nonsense\r\n\r\n"] {
@@ -322,6 +333,124 @@ test "bodies framed in other ways" {
         let _ = answering.wait()
     }
     must l.close()
+}
+
+// A body of a million bytes, packed as `?as=` says, in pieces of 1000 bytes.
+func packed(anon req: Request) -> Response or Error {
+    _addresses += [req.remote]
+    mut body = deflate.gzip(million())
+    mut coding = "gzip"
+    if req.query("as") is str(how) {
+        if how == "zlib" {
+            body = deflate.zlib(million())
+            coding = "deflate"
+        } else if how == "raw" {
+            body = deflate.raw(million())
+            coding = "deflate"
+        } else if how == "cut" {
+            body = body[0..len(body) / 2]
+        } else if how == "wrong" {
+            body = body[0..len(body) - 1] + kod_str_to_bytes("x")
+        } else if how == "more" {
+            body = deflate.zlib(million()) + kod_str_to_bytes("more")
+            coding = "deflate"
+        }
+    }
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        mut at: int64 = 0
+        for at < len(body) {
+            mut end = at + 1000
+            if end > len(body) {
+                end = len(body)
+            }
+            try w.write_all(body[at..end])
+            try w.flush()
+            at = end
+        }
+    }).with_header("Content-Encoding", coding)
+}
+
+func million() -> bytes {
+    let out = StrBuilder()
+    for i in 0..125000 {
+        out.append(f"{i % 9973:07}\n")
+    }
+    return out.to_bytes()
+}
+
+test "a compressed body is decoded as it is read" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    // Smaller than it, and than what it unpacks to.
+    client.limits.max_body = 100
+    for how in ["gzip", "zlib", "raw", "more", "gzip"] {
+        let resp = must client.open("GET", f.url(f"/packed?as={how}"))
+        assert resp.header("content-encoding") is none
+        assert resp.header("content-length") is none
+        assert must resp.reader().read_all() == million()
+        assert len(must resp.reader().read(10)) == 0
+    }
+    // On one connection.
+    assert len(client.pool) == 1
+    for a in _addresses {
+        assert a == _addresses[0]
+    }
+    let head = must client.open("HEAD", f.url("/packed"))
+    assert (head.header("content-encoding")? or "none") == "gzip"
+    // Read with fetch, held to max_body.
+    assert client.fetch("GET", f.url("/packed")) is Err(_)
+    client.close()
+    f.end(serving)
+}
+
+test "a compressed body that is wrong, or closed" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let cut = (must client.open("GET", f.url("/packed?as=cut"))).reader()
+    mut n: int64 = 0
+    mut why = ""
+    for why == "" {
+        let got = cut.read(10000)
+        match got {
+            Ok(piece) -> n += len(piece)
+            Err(e) -> why = message(e)
+        }
+    }
+    assert n > 100000
+    assert why == "http: bad gzip body: truncated"
+    assert cut.read(10) is Err(_)
+    assert all_of((must client.open("GET", f.url("/packed?as=wrong"))).reader()).contains("incorrect length check")
+    let closed = must client.open("GET", f.url("/packed"))
+    assert len(must closed.reader().read(10)) == 10
+    closed.close()
+    assert all_of(closed.reader()) == "[read: the response is closed]"
+    assert len(client.pool) == 0
+    client.close()
+    f.end(serving)
+}
+
+func events(anon _req: Request) -> Response or Error {
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        for piece in FLUSHED {
+            try w.write_all(must base64.decode(piece))
+            try w.flush()
+            time.sleep(Duration(ms: 60))
+        }
+    }).with_header("Content-Encoding", "gzip")
+}
+
+test "compressed events come as they are flushed" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let body = (must open("GET", f.url("/events"))).reader()
+    let t0 = monotonic_ns()
+    assert kod_bytes_to_str(must body.read(100)) == "event 0\n"
+    assert monotonic_ns() - t0 < 50000000
+    assert kod_bytes_to_str(must body.read(100)) == "event 1\n"
+    assert all_of(body) == "event 2\n"
+    f.end(serving)
 }
 
 test "timeouts and deadlines go on in the body" {

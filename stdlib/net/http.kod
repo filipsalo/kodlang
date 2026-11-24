@@ -123,6 +123,8 @@ type Response = shared struct {
     length: int64? = none
     // The body that is yet to be read (Client.open).
     stream: OpenBody? = none
+    // What that is decoded to, when it is compressed.
+    decoded: DecodedBody? = none
 
     func text(self) -> str {
         return kod_bytes_to_str(self.body)
@@ -130,6 +132,9 @@ type Response = shared struct {
 
     // The body, as it comes when the response was opened.
     func reader(self) -> Reader {
+        if self.decoded is DecodedBody(d) {
+            return d
+        }
         if self.stream is OpenBody(b) {
             return b
         }
@@ -1200,21 +1205,12 @@ type Acquired = shared struct {
     reused: bool
 }
 
-// Whether `data` starts with a zlib header: deflate, a window of at most
-// 32 KiB, and a check that makes the two bytes a multiple of 31.
-func zlib_header(anon data: bytes) -> bool {
-    if len(data) < 2 {
-        return false
-    }
-    return (data[0] & 0x0f) == 8 and data[0] >> 4 <= 7 and (data[0] * 256 + data[1]) % 31 == 0
-}
-
 // `body` decoded as the coding `gzip` or `deflate` says, to at most `max` bytes.
 func inflated(anon body: bytes, coding: str, max: int64) -> bytes or Error {
     if coding != "deflate" {
         return try inflate.gunzip(body, max_output: max)
     }
-    if zlib_header(body) {
+    if len(body) >= 2 and inflate.zlib_header(body[0], body[1]) {
         return try inflate.inflate_zlib(body, max_output: max)
     }
     return try inflate.inflate_raw(body, max_output: max)
@@ -1254,7 +1250,7 @@ func decode_content(anon resp: Response, anon limits: Limits) -> Response or Err
 
 // Write `req` and read its response.
 func attempt(anon link: Link, anon br: BufReader, anon req: Outgoing, cfg: Settings, keep_alive: bool, whole: bool) -> Response or Error {
-    let sent = write_request(link, req, :keep_alive, accept_gzip: cfg.accept_gzip and whole)
+    let sent = write_request(link, req, :keep_alive, accept_gzip: cfg.accept_gzip)
     if sent is Err(e) {
         // A server may answer without reading all of a body.
         let has_body = len(req.body) > 0 or req.body_from is not none
@@ -1287,6 +1283,9 @@ type OpenBody = shared struct {
     key: str = ""
     keep: bool = false
     failed: Error? = none
+    closed: bool = false
+    // How much has been read.
+    total: int64 = 0
 
     func read(self, anon max: int64) -> bytes or Error {
         if self.failed is Some(e) {
@@ -1298,6 +1297,7 @@ type OpenBody = shared struct {
             self.end(keep: false)
             throw e
         }
+        self.total += len(got)
         if self.frames.done {
             self.end(keep: self.keep)
         }
@@ -1306,6 +1306,7 @@ type OpenBody = shared struct {
 
     func close(self) -> none {
         if self.link is not none {
+            self.closed = true
             self.failed = invalid("read", "the response is closed")
             self.end(keep: false)
         }
@@ -1338,6 +1339,62 @@ type OpenBody = shared struct {
         }
         self.client = none
     }
+}
+
+// The body of an opened response, decompressed.
+type DecodedBody = shared struct {
+    raw: OpenBody
+    // `gzip` or `deflate`, for errors.
+    coding: str
+    inflater: inflate.InflateReader
+    failed: Error? = none
+    done: bool = false
+
+    func read(self, anon max: int64) -> bytes or Error {
+        if self.done {
+            return kod_str_to_bytes("")
+        }
+        if self.failed is Some(e) {
+            throw e
+        }
+        if self.raw.closed and self.raw.failed is Some(e) {
+            throw e
+        }
+        let got = self.inflater.read(max)
+        if got is Err(e) {
+            if self.raw.failed is none and self.raw.total == 0 {
+                // No body, so none that is compressed.
+                self.done = true
+                return kod_str_to_bytes("")
+            }
+            mut failed = e
+            if self.raw.failed is none and e is IoError(io) {
+                failed = protocol(f"bad {self.coding} body: {io.detail}")
+            }
+            self.failed = failed
+            self.raw.end(keep: false)
+            throw failed
+        }
+        if max > 0 and len(got) == 0 {
+            // What may come after its end.
+            self.raw.drop_rest()
+            self.done = true
+        }
+        return got
+    }
+}
+
+// Has the response's reader decode its body, when that is compressed.
+func decode_opened(anon resp: Response, anon body: OpenBody) -> none {
+    let name = (resp.headers.get("content-encoding")? or "").trim().lower()
+    if name == "gzip" or name == "x-gzip" {
+        resp.decoded = DecodedBody(raw: body, coding: "gzip", inflater: inflate.gunzip_reader(body))
+    } else if name == "deflate" {
+        resp.decoded = DecodedBody(raw: body, coding: name, inflater: inflate.deflate_reader(body))
+    } else {
+        return
+    }
+    resp.headers = without(resp.headers, ["content-encoding", "content-length"])
 }
 
 // Connections kept between requests. See docs/http.md.
@@ -1465,6 +1522,8 @@ type Client = shared struct {
                 body.keep = reuse and response.keep_alive
                 if body.frames.done {
                     body.end(keep: body.keep)
+                } else {
+                    decode_opened(response, body)
                 }
                 return response
             }
