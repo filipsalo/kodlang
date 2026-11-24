@@ -76,6 +76,9 @@ waits, and that wait gives up:
 - a sleep ends at once, a `receive` gives `none` and a `send` isn't made;
 - `task.wait()` and `tasks.give_way()` go on as usual: they can't fail.
 
+A loop whose only waits are such ends by asking: `tasks.cancelled()` is
+whether the running task is cancelled.
+
 `task.cancel()` cancels a task directly, unless it has ended; `task.wait()`
 then gives what the task gave back after giving up, an error from its wait
 for a fallible one. A task that never waits can't be cancelled, and nothing

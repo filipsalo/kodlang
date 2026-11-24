@@ -1,0 +1,333 @@
+// Stress test of http.Server: starts itself as a server in a child process, puts
+// one kind of load after another on it, and prints what came of each.
+//
+//   kod run bench/http/stress.kod            all of it
+//   kod run bench/http/stress.kod keep idle  the scenarios so named
+//   kod run bench/http/stress.kod serve      only the server
+//
+// The clients are tasks in this program, on one core as the server is, so what
+// they measure is the two together: `hey` gets more out of the same server.
+import "io"
+import "net/http" { Incoming, Response, Server, read_response, respond }
+import "net/tcp"
+import "posix" { Fd }
+import "process"
+import "sort"
+import "stream" { BufReader }
+import "time"
+import "time" { Duration, monotonic_ns }
+
+extern func rc_live_bytes() -> int64
+
+// ---- the server ----
+
+func text_of(anon n: int64) -> str {
+    mut s = "0123456789abcdef"
+    for len(s) < n {
+        s = s + s
+    }
+    return s[0..n]
+}
+
+mut _server: Server? = none
+
+func answer(anon req: Incoming) -> Response or Error {
+    match req.path() {
+        "/" -> return respond(200, "hello\n")
+        "/slow" -> {
+            time.sleep(Duration(ms: 100))
+            return respond(200, "slow\n")
+        }
+        "/echo" -> return respond(200, req.text())
+        "/big" -> return respond(200, text_of(10000000))
+        "/panic" -> {
+            let xs = [1]
+            return respond(200, f"{xs[len(req.target)]}")
+        }
+        "/stat" -> {
+            let server = must _server
+            return respond(200, f"{len(server.conns)} {rc_live_bytes()}")
+        }
+        else -> return respond(404, "not found\n")
+    }
+}
+
+func serve() -> none or Error {
+    let l = try tcp.listen("127.0.0.1", port: 0, backlog: 1024)
+    // Short timeouts, so that a scenario can wait for them; the cap leaves room
+    // for the others' connections.
+    let server = Server(
+        handler: answer,
+        header_timeout: Duration(seconds: 2),
+        body_timeout: Duration(seconds: 2),
+        write_timeout: Duration(seconds: 3),
+        idle_timeout: Duration(seconds: 5),
+        max_connections: 4000,
+        log: func(anon _line: str) {},
+    )
+    _server = server
+    print(f"{l.port()}")
+    io.flush_stdout()
+    try server.serve(l)
+}
+
+// ---- the clients ----
+
+mut port: int64 = 0
+
+// What the clients of one scenario saw.
+type Tally = shared struct {
+    times_us: [int64] = []
+    errors: int64 = 0
+    statuses: Map[int64, int64] = Map[int64, int64]()
+    left: int64
+}
+
+func request_text(anon path: str, body: str, close: bool) -> str {
+    mut method = "GET"
+    mut extra = ""
+    if len(body) > 0 {
+        method = "POST"
+        extra = f"Content-Length: {len(body)}\r\n"
+    }
+    if close {
+        extra += "Connection: close\r\n"
+    }
+    return f"{method} {path} HTTP/1.1\r\nHost: a\r\n{extra}\r\n{body}"
+}
+
+// Sends requests until the tally has none left, on one connection unless
+// `close`.
+func client(anon tally: Tally, text: bytes, close: bool) -> none {
+    mut conn: Fd? = none
+    mut br: BufReader? = none
+    for tally.left > 0 {
+        tally.left -= 1
+        let t0 = monotonic_ns()
+        if conn is none {
+            let got = tcp.connect("127.0.0.1", :port)
+            if got is Ok(fd) {
+                conn = fd
+                br = BufReader(inner: fd)
+            } else {
+                tally.errors += 1
+                continue
+            }
+        }
+        let fd = must conn
+        let status = exchange(fd, must br, :text)
+        tally.statuses[status, default: 0] += 1
+        if status == 0 {
+            tally.errors += 1
+        }
+        tally.times_us += [(monotonic_ns() - t0) / 1000]
+        if close or status == 0 {
+            let _ = fd.close()
+            conn = none
+            br = none
+        }
+    }
+    if conn is Fd(fd) {
+        let _ = fd.close()
+    }
+}
+
+// The status of the response to `text`, 0 when there is none.
+func exchange(anon fd: Fd, anon br: BufReader, text: bytes) -> int64 {
+    if fd.write_all(text) is Err(_) {
+        return 0
+    }
+    let got = read_response(br, "GET")
+    if got is Ok(resp) {
+        return resp.status
+    }
+    return 0
+}
+
+func run_clients(anon tally: Tally, clients: int64, text: bytes, close: bool) -> none {
+    for _ in 0..clients {
+        spawn client(tally, :text, :close)
+    }
+}
+
+// `requests` requests by `clients` clients: a line of what came of them.
+func load(anon what: str, clients: int64, requests: int64, path: str = "/", body: str = "", close: bool = false) -> none {
+    let tally = Tally(left: requests)
+    let text = kod_str_to_bytes(request_text(path, :body, :close))
+    let t0 = monotonic_ns()
+    run_clients(tally, :clients, :text, :close)
+    let ns = monotonic_ns() - t0
+    let times = sort.sorted(tally.times_us)
+    mut codes = ""
+    for status in tally.statuses {
+        if status != 0 {
+            codes += f" {status}:{must tally.statuses[status]}"
+        }
+    }
+    mut spread = ""
+    if len(times) > 0 {
+        spread = f"p50 {ms_text(times[len(times) / 2])}  p99 {ms_text(times[len(times) * 99 / 100])}  max {ms_text(times[-1])}"
+    }
+    print(f"{what:<34} {len(times) * 1000000000 / ns:>7}/s  {spread}  errors {tally.errors} {codes}")
+    io.flush_stdout()
+}
+
+func ms_text(anon us: int64) -> str {
+    return f"{us.to_float64() / 1000.0:>7.2f} ms"
+}
+
+// Connections that stay open having sent `text`.
+func hold(anon n: int64, text: str) -> [Fd] {
+    let data = kod_str_to_bytes(text)
+    mut held: [Fd] = []
+    for _ in 0..n {
+        let got = tcp.connect("127.0.0.1", :port)
+        if got is Ok(fd) {
+            if len(data) > 0 {
+                let _ = fd.write_all(data)
+            }
+            held += [fd]
+        }
+    }
+    return held
+}
+
+func drop(anon held: [Fd]) -> none {
+    for fd in held {
+        let _ = fd.close()
+    }
+}
+
+// "connections live-bytes" as the server has it.
+func stat() -> [int64] {
+    let got = tcp.connect("127.0.0.1", :port)
+    if got is Err(_) {
+        return [-1, -1]
+    }
+    let fd = got
+    if fd.write_all(kod_str_to_bytes(request_text("/stat", body: "", close: true))) is Err(_) {
+        return [-1, -1]
+    }
+    let resp = read_response(BufReader(inner: fd), "GET")
+    let _ = fd.close()
+    if resp is Ok(r) {
+        let parts = r.text().split(" ")
+        // Not counting the connection that asks.
+        return [(parts[0].parse_int()? or 0) - 1, parts[1].parse_int()? or 0]
+    }
+    return [-1, -1]
+}
+
+func memory(anon what: str, pid: int64) -> none {
+    let s = stat()
+    let rss = process.run(["ps", "-o", "rss=", "-p", f"{pid}"]).stdout.trim().parse_int()? or 0
+    print(f"{what:<34} {s[0]} connections, {s[1] / 1024} KB live, {rss / 1024} MB resident")
+    io.flush_stdout()
+}
+
+// Waits until the server has no connections, at most `seconds`: how long it took.
+func settle(anon what: str, seconds: int64) -> none {
+    let t0 = monotonic_ns()
+    mut open = stat()[0]
+    for open > 0 and monotonic_ns() - t0 < seconds * 1000000000 {
+        time.sleep(Duration(ms: 50))
+        open = stat()[0]
+    }
+    print(f"{what:<34} {open} connections left after {(monotonic_ns() - t0) / 1000000} ms")
+    io.flush_stdout()
+}
+
+func wanted(anon names: [str], anon name: str) -> bool {
+    if len(names) == 0 {
+        return true
+    }
+    for n in names {
+        if n == name {
+            return true
+        }
+    }
+    return false
+}
+
+func scenarios(anon names: [str], pid: int64) -> none {
+    load("warm up", clients: 10, requests: 2000)
+    memory("", :pid)
+    if wanted(names, "keep") {
+        load("keep-alive, 1 client", clients: 1, requests: 20000)
+        load("keep-alive, 50 clients", clients: 50, requests: 100000)
+        load("keep-alive, 500 clients", clients: 500, requests: 100000)
+        memory("  after", :pid)
+    }
+    if wanted(names, "new") {
+        load("a connection each, 50 clients", clients: 50, requests: 10000, close: true)
+        load("  again", clients: 50, requests: 10000, close: true)
+        memory("  after", :pid)
+    }
+    if wanted(names, "slow") {
+        load("100 ms handlers, 1000 clients", clients: 1000, requests: 3000, path: "/slow")
+    }
+    if wanted(names, "echo") {
+        load("64 KB echoed, 50 clients", clients: 50, requests: 5000, path: "/echo", body: text_of(65536))
+        memory("  after", :pid)
+    }
+    if wanted(names, "big") {
+        load("10 MB responses, 4 clients", clients: 4, requests: 40, path: "/big")
+        memory("  after", :pid)
+    }
+    if wanted(names, "panic") {
+        load("handlers that panic, 50 clients", clients: 50, requests: 20000, path: "/panic")
+        memory("  after", :pid)
+    }
+    if wanted(names, "idle") {
+        let silent = hold(1000, text: "")
+        let half = hold(1000, text: "GET / HTTP/1.1\r\nHost: a\r\nX-Half: ")
+        memory("2000 silent or half requests", :pid)
+        load("  keep-alive, 50 clients", clients: 50, requests: 50000)
+        settle("  dropped", seconds: 10)
+        drop(silent)
+        drop(half)
+        memory("  after", :pid)
+    }
+    if wanted(names, "unread") {
+        let unread = hold(50, text: request_text("/big", body: "", close: false))
+        load("50 unread responses, 50 clients", clients: 50, requests: 50000)
+        settle("  dropped", seconds: 10)
+        drop(unread)
+        memory("  after", :pid)
+    }
+    if wanted(names, "cap") {
+        let silent = hold(4500, text: "")
+        memory("4500 connections, cap 4000", :pid)
+        load("  keep-alive, 10 clients", clients: 10, requests: 1000)
+        drop(silent)
+        settle("  dropped", seconds: 10)
+    }
+    load("at the end", clients: 50, requests: 50000)
+    memory("", :pid)
+}
+
+func main(argv: [str]) -> int64 {
+    if len(argv) == 2 and argv[1] == "serve" {
+        if serve() is Err(e) {
+            io.write_stderr(f"{e.to_str()}\n")
+            return 1
+        }
+        return 0
+    }
+    let child = must process.start([argv[0], "serve"], stdin: .Null, stdout: .Pipe)
+    let first = must BufReader(inner: child.stdout).read_line()
+    port = (first? or "").parse_int()? or 0
+    if port == 0 {
+        io.write_stderr("the server didn't start\n")
+        return 1
+    }
+    scenarios(argv[1..len(argv)], pid: child.pid)
+    let died = must child.try_wait()
+    if died is int64(status) {
+        print(f"the server ended with status {status}")
+        return 1
+    }
+    let _ = child.kill()
+    let _ = child.wait()
+    return 0
+}

@@ -1,0 +1,374 @@
+// http.Server: failing handlers, timeouts, the connection cap and stop
+// (docs/http.md#server).
+import "net/http" { Incoming, Response, Server, get, respond }
+import "net/tcp"
+import "posix" { Fd }
+import "stream" { IoError }
+import "tasks"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+type Log = shared struct {
+    lines: [str] = []
+}
+
+func part(anon n: int64) -> int64 {
+    return 100 / n
+}
+
+func answer(anon req: Incoming) -> Response or Error {
+    let path = req.path()
+    if path == "/slow" {
+        time.sleep(Duration(ms: 80))
+        return respond(200, "slow")
+    }
+    if path == "/error" {
+        throw IoError(kind: .Other, op: "answer", errno: 0, detail: "no luck")
+    }
+    if path == "/panic" {
+        return respond(200, f"{part(0)}")
+    }
+    if path == "/task" {
+        let t = spawn part(0)
+        return respond(200, f"{t.wait()}")
+    }
+    if path == "/bad" {
+        let resp = respond(200, "")
+        resp.headers.add("X", "a\r\nb")
+        return resp
+    }
+    if path == "/big" {
+        return respond(200, big_text())
+    }
+    if path == "/empty" {
+        return respond(204, "")
+    }
+    if req.method == "POST" {
+        return respond(200, f"got {len(req.body)}")
+    }
+    return respond(200, f"{req.method} {req.target}")
+}
+
+func big_text() -> str {
+    mut s = "0123456789abcdef"
+    for len(s) < 16000000 {
+        s = s + s
+    }
+    return s
+}
+
+// A server on a port of its own, with short timeouts.
+type Fixture = shared struct {
+    l: tcp.Listener
+    server: Server
+    log: Log
+
+    func init() -> Fixture {
+        let log = Log()
+        let server = Server(
+            handler: answer,
+            header_timeout: Duration(ms: 120),
+            body_timeout: Duration(ms: 160),
+            write_timeout: Duration(ms: 200),
+            idle_timeout: Duration(ms: 140),
+            log: func(anon line: str) { log.lines += [line] },
+        )
+        return Fixture(l: must tcp.listen("127.0.0.1", port: 0), :server, :log)
+    }
+
+    func url(self, anon path: str) -> str {
+        return f"http://127.0.0.1:{self.l.port()}{path}"
+    }
+
+    func connect(self) -> Fd {
+        return must tcp.connect("127.0.0.1", port: self.l.port())
+    }
+
+    func fetch(self, anon path: str) -> str or Error {
+        let r = try get(self.url(path))
+        return f"{r.status} {r.text()}"
+    }
+}
+
+func ms_since(anon t0: int64) -> int64 {
+    return (monotonic_ns() - t0) / 1000000
+}
+
+// Everything `conn` gets until it is closed, or "timeout" after 3 s.
+func rest(anon conn: Fd) -> str {
+    // Fails when the other side is gone already.
+    let _ = tcp.set_timeout(conn, timeout: Duration(seconds: 3))
+    mut out = ""
+    for true {
+        let data = conn.read(65536)
+        if data is Err(e) {
+            return out + f"[{e.to_str()}]"
+        }
+        let piece = data
+        if len(piece) == 0 {
+            return out
+        }
+        out += kod_bytes_to_str(piece)
+    }
+    return out
+}
+
+func say(anon conn: Fd, anon text: str) -> none {
+    must conn.write_all(kod_str_to_bytes(text))
+}
+
+// The response to one request on a connection that stays open.
+func ask(anon conn: Fd, anon text: str) -> str {
+    say(conn, text)
+    return kod_bytes_to_str(must conn.read(65536))
+}
+
+test "a handler's error or panic is a 500, and logged" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    assert must f.fetch("/error") == "500 Internal Server Error\n"
+    assert must f.fetch("/panic") == "500 Internal Server Error\n"
+    assert must f.fetch("/task") == "500 Internal Server Error\n"
+    assert must f.fetch("/bad") == "500 Internal Server Error\n"
+    // The server goes on, and so does the connection.
+    let conn = f.connect()
+    assert ask(conn, "GET /panic HTTP/1.1\r\nHost: a\r\n\r\n").starts_with("HTTP/1.1 500 ")
+    assert ask(conn, "GET /ok HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /ok")
+    must conn.close()
+    assert len(f.log.lines) == 5
+    assert f.log.lines[0] == "GET /error: answer: no luck"
+    assert f.log.lines[1].starts_with("GET /panic: panic: integer division by zero\nbacktrace:\n")
+    assert f.log.lines[2].contains("spawned at:\n")
+    assert f.log.lines[3].starts_with("GET /bad: ")
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "a client that takes too long is dropped" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    // Says nothing.
+    let silent = f.connect()
+    let t0 = monotonic_ns()
+    assert rest(silent) == ""
+    assert 100 <= ms_since(t0) < 400
+    // Says half a request.
+    let half = f.connect()
+    say(half, "GET / HTTP/1.1\r\nHost:")
+    assert rest(half).starts_with("HTTP/1.1 408 Request Timeout\r\n")
+    // Says a byte now and then.
+    let slow = f.connect()
+    let t1 = monotonic_ns()
+    for c in ["G", "E", "T", " ", "/", " ", "H", "T", "T", "P", "/", "1"] {
+        if slow.write(kod_str_to_bytes(c)) is Err(_) {
+            break
+        }
+        time.sleep(Duration(ms: 20))
+    }
+    // Still sending, it may lose the answer to a reset.
+    let told = rest(slow)
+    assert told.starts_with("HTTP/1.1 408 ") or told.contains("reset")
+    assert ms_since(t1) < 600
+    // Doesn't send the body it announced.
+    let body = f.connect()
+    say(body, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc")
+    assert rest(body).starts_with("HTTP/1.1 408 ")
+    // Sends no second request.
+    let idle = f.connect()
+    assert ask(idle, "GET /1 HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /1")
+    assert ask(idle, "GET /2 HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /2")
+    let t2 = monotonic_ns()
+    assert rest(idle) == ""
+    assert 100 <= ms_since(t2) < 400
+    for conn in [silent, half, slow, body, idle] {
+        must conn.close()
+    }
+    // One that got a 408 is kept a little, so that it can be read.
+    time.sleep(Duration(ms: 300))
+    assert len(f.server.conns) == 0
+    assert len(f.log.lines) == 0
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "a client that doesn't read its response holds up nobody, and is dropped" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    let conn = f.connect()
+    say(conn, "GET /big HTTP/1.1\r\nHost: a\r\n\r\n")
+    time.sleep(Duration(ms: 30))
+    let t0 = monotonic_ns()
+    assert must f.fetch("/ok") == "200 GET /ok"
+    assert ms_since(t0) < 100
+    assert len(f.server.conns) == 1
+    time.sleep(Duration(ms: 400))
+    assert len(f.server.conns) == 0
+    must conn.close()
+    // One that reads gets all of it.
+    let r = must get(f.url("/big"))
+    assert len(r.body) == len(big_text())
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "a handler has no timeout" {
+    let f = Fixture()
+    f.server.header_timeout = Duration(ms: 20)
+    f.server.body_timeout = Duration(ms: 20)
+    f.server.write_timeout = Duration(ms: 20)
+    f.server.idle_timeout = Duration(ms: 20)
+    let serving = spawn f.server.serve(f.l)
+    assert must f.fetch("/slow") == "200 slow"
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "at the cap, new connections wait for one to end" {
+    let f = Fixture()
+    f.server.max_connections = 2
+    let serving = spawn f.server.serve(f.l)
+    let a = spawn f.fetch("/slow")
+    let b = spawn f.fetch("/slow")
+    time.sleep(Duration(ms: 20))
+    let t0 = monotonic_ns()
+    assert must f.fetch("/ok") == "200 GET /ok"
+    assert 30 <= ms_since(t0) < 300
+    assert must a.wait() == "200 slow"
+    assert must b.wait() == "200 slow"
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "at the cap, a connection that waits for its next request makes room" {
+    let f = Fixture()
+    f.server.max_connections = 2
+    f.server.idle_timeout = Duration(seconds: 20)
+    let serving = spawn f.server.serve(f.l)
+    let a = f.connect()
+    let b = f.connect()
+    assert ask(a, "GET /a HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /a")
+    assert ask(b, "GET /b HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /b")
+    let t0 = monotonic_ns()
+    assert must f.fetch("/ok") == "200 GET /ok"
+    assert ms_since(t0) < 200
+    // The one that had waited longest.
+    assert rest(a) == ""
+    assert ask(b, "GET /b2 HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /b2")
+    must a.close()
+    must b.close()
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "stop lets requests finish and closes what is idle" {
+    let f = Fixture()
+    f.server.idle_timeout = Duration(seconds: 20)
+    let serving = spawn f.server.serve(f.l)
+    let idle = f.connect()
+    assert ask(idle, "GET /a HTTP/1.1\r\nHost: a\r\n\r\n").ends_with("GET /a")
+    let fresh = f.connect()
+    let busy = f.connect()
+    say(busy, "GET /slow HTTP/1.1\r\nHost: a\r\n\r\n")
+    time.sleep(Duration(ms: 20))
+    let t0 = monotonic_ns()
+    f.server.stop()
+    assert rest(idle) == ""
+    assert rest(fresh) == ""
+    let got = rest(busy)
+    assert got.contains("Connection: close\r\n")
+    assert got.ends_with("slow")
+    assert serving.wait() is Ok(_)
+    assert ms_since(t0) < 300
+    for conn in [idle, fresh, busy] {
+        must conn.close()
+    }
+    must f.l.close()
+}
+
+test "stop cuts off what doesn't finish in time" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    let busy = f.connect()
+    say(busy, "GET /slow HTTP/1.1\r\nHost: a\r\n\r\n")
+    time.sleep(Duration(ms: 10))
+    f.server.stop(within: Duration(ms: 10))
+    if serving.wait() is Err(IoError(e)) {
+        assert e.kind == .TimedOut
+    } else {
+        fail("serve didn't say so")
+    }
+    must busy.close()
+    must f.l.close()
+}
+
+test "cancelling serve ends it" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    let conn = f.connect()
+    assert must f.fetch("/ok") == "200 GET /ok"
+    let t0 = monotonic_ns()
+    serving.cancel()
+    if serving.wait() is Err(IoError(e)) {
+        assert e.kind == .Cancelled
+    } else {
+        fail("serve didn't end with an error")
+    }
+    assert ms_since(t0) < 100
+    must conn.close()
+    must f.l.close()
+}
+
+// The status line that answers `text`.
+func refused(anon f: Fixture, anon text: str) -> str {
+    let conn = f.connect()
+    say(conn, text)
+    let got = rest(conn)
+    must conn.close()
+    return got.split("\r\n")[0]
+}
+
+test "requests the server refuses" {
+    let f = Fixture()
+    f.server.limits.max_body = 100
+    f.server.limits.max_header_bytes = 1000
+    let serving = spawn f.server.serve(f.l)
+    mut long = "x"
+    for len(long) < 2000 {
+        long = long + long
+    }
+    assert refused(f, "NOT HTTP\r\n\r\n") == "HTTP/1.1 400 Bad Request"
+    assert refused(f, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 101\r\n\r\n") == "HTTP/1.1 413 Content Too Large"
+    assert refused(f, f"GET / HTTP/1.1\r\nX: {long}\r\n\r\n") == "HTTP/1.1 431 Request Header Fields Too Large"
+    assert refused(f, "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n") == "HTTP/1.1 501 Not Implemented"
+    assert refused(f, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n") == "HTTP/1.1 400 Bad Request"
+    assert refused(f, "POST / HTTP/1.1\r\nExpect: tea\r\nContent-Length: 3\r\n\r\n") == "HTTP/1.1 417 Expectation Failed"
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}
+
+test "Expect, HEAD, 204 and requests sent together" {
+    let f = Fixture()
+    let serving = spawn f.server.serve(f.l)
+    let conn = f.connect()
+    assert ask(conn, "POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n") == "HTTP/1.1 100 Continue\r\n\r\n"
+    assert ask(conn, "abc").ends_with("\r\n\r\ngot 3")
+    let head = ask(conn, "HEAD /h HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert head.contains("Content-Length: 7\r\n")
+    assert head.ends_with("\r\n\r\n")
+    assert ask(conn, "GET /empty HTTP/1.1\r\nHost: a\r\n\r\n") == "HTTP/1.1 204 No Content\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+    say(conn, "GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+    let both = rest(conn)
+    assert both.contains("GET /1HTTP/1.1 200 OK")
+    assert both.ends_with("GET /2")
+    must conn.close()
+    f.server.stop()
+    assert serving.wait() is Ok(_)
+    must f.l.close()
+}

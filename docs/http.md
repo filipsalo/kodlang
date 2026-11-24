@@ -312,7 +312,7 @@ import "net/tcp"
 ```kod
 import "net/http" { Incoming, Response, respond, serve }
 
-func hello(anon req: Incoming) -> Response {
+func hello(anon req: Incoming) -> Response or Error {
     if req.path() != "/" {
         return respond(404, "not found\n")
     }
@@ -326,23 +326,75 @@ func main() -> none or Error {
 ```
 
 A handler that waits, for a request of its own or a sleep, lets the other
-connections go on meanwhile. `serve` returns only when accepting fails, or
-when its task is cancelled (`task.cancel()`); then it cancels the connections'
-tasks and waits for them.
+connections go on meanwhile. One that returns an error or
+[panics](panics.md) fails only its own request: the client gets a `500`, and
+the error, or the panic's message and backtrace, is logged. (A task it
+spawned `detached` is nobody's, so a panic in one still ends the program.)
 
 | | |
 |---|---|
 | `Incoming` | `method`, `target` (path and query, as sent), `headers`, `body`; `path()` is `target` up to `?`, `text()` the body as text |
 | `respond(status, body, content_type = "text/plain; charset=utf-8")` | a `Response` with that body |
-| `serve(l, handler, limits = Limits())` | as above: `limits` caps each request's headers and body, as for a response |
+| `serve(l, handler, limits = Limits())` | `Server(:handler, :limits).serve(l)` |
 | `read_request(br, limits = Limits())` | the next request from a `BufReader`, or `none` when the connection ends before one begins |
-| `write_response(w, resp, keep_alive = false)` | writes `resp` with a `Content-Length` and, unless `keep_alive`, `Connection: close`; an empty `reason` is the status's usual one |
+| `write_response(w, resp, keep_alive = false, head = false)` | writes `resp` with a `Content-Length` and, unless `keep_alive`, `Connection: close`; an empty `reason` is the status's usual one; `head` leaves out the body, for the answer to a `HEAD` |
 
 A connection carries requests one after another, until the client sends
 `Connection: close` (or speaks HTTP/1.0 without `keep-alive`), a request
 can't be read, or the client goes away. A request's body is read by its
-`Content-Length` or chunked; anything wrong with the request ends the
-connection with a `400`.
+`Content-Length` or chunked; a client that sends `Expect: 100-continue` is
+told to go on. Anything wrong with a request ends the connection, with a
+`400`, or a `413` for a body past the limits, a `431` for headers past them, or
+a `501` for a `Transfer-Encoding` other than `chunked`.
+
+### `Server`
+
+`Server` has the settings, each with a default:
+
+<!-- kod:
+import "net/http" { Incoming, Response, Server, respond }
+import "net/tcp"
+import "time" { Duration }
+func hello(anon req: Incoming) -> Response or Error {
+    return respond(200, "hello\n")
+}
+-->
+```kod
+func main() -> none or Error {
+    let l = try tcp.listen("127.0.0.1", port: 8080)
+    let server = Server(handler: hello, max_connections: 500, idle_timeout: Duration(seconds: 15))
+    try server.serve(l)
+}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `handler` | | answers a request |
+| `header_timeout` | 10 s | how long a client may take to send a request's headers, from when it connects or, on a kept-alive connection, from their first byte |
+| `body_timeout` | 60 s | how long it may take to send the body after them |
+| `write_timeout` | 60 s | how long it may take to read the response |
+| `idle_timeout` | 60 s | how long a kept-alive connection may wait for its next request |
+| `max_connections` | 10000 | how many connections are open at once |
+| `limits` | `Limits()` | caps each request's headers and body, as for a response |
+| `log` | stderr | a `func(str) -> none` that gets a line or more for each handler that fails |
+
+The timeouts cap the whole of what they name, not each read, so a client that
+sends a byte at a time is dropped too: with a `408` when it has begun a
+request (which it may miss if it is still sending), else just closed. A handler has no timeout; use
+[`tasks.within`](tasks.md#cancellation) for what it waits for.
+
+At `max_connections`, a kept-alive connection that waits for its next request
+is closed to make room, the one that would time out first; when there is
+none, new connections wait to be accepted until one ends. Running out of file
+descriptors doesn't end the server: it waits a little and tries again.
+
+`server.stop(within: d)` ends `serve`: no more connections are accepted, those
+waiting for a request are closed, and the requests being read or answered get
+`d` (10 seconds when left out) to finish, their responses saying
+`Connection: close`. `serve` then returns; when some hadn't finished, they are
+cancelled and it returns a `TimedOut` error. It returns an error when accepting
+fails or its task is cancelled (`task.cancel()`) too; then the connections'
+tasks are cancelled and waited for.
 
 ## Building and reading by hand
 

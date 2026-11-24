@@ -5,9 +5,11 @@ import "encoding/base64"
 import "net/tcp"
 import "net/tls"
 import "net/tls" { TlsStream }
+import "panics"
 import "posix" { Fd }
 import "strbuilder" { StrBuilder }
 import "stream" { IoError, BufReader, Reader, Writer }
+import "tasks"
 import "time"
 import "time" { Duration }
 
@@ -1387,6 +1389,8 @@ func reason_phrase(anon status: int64) -> str {
         405 -> return "Method Not Allowed"
         408 -> return "Request Timeout"
         413 -> return "Content Too Large"
+        417 -> return "Expectation Failed"
+        431 -> return "Request Header Fields Too Large"
         500 -> return "Internal Server Error"
         501 -> return "Not Implemented"
         503 -> return "Service Unavailable"
@@ -1417,7 +1421,9 @@ func parse_request_line(anon line: str) -> RequestLine or Error {
     return RequestLine(method: parts[0], :target, minor: version[7] - 48)
 }
 
-func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
+// The next request up to its body, or none when the connection ends before one
+// begins.
+func read_head(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
     let budget = Budget(left: limits.max_header_bytes, headers: 0)
     // Empty lines before a request are allowed (RFC 9112, 2.2).
     mut line = ""
@@ -1432,24 +1438,12 @@ func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Erro
             throw protocol("headers too large")
         }
     }
+    if br.ended {
+        throw truncated("connection closed in the middle of a line")
+    }
     let start = try parse_request_line(line)
     let headers = Headers()
     try read_headers(br, budget, headers, max_headers: limits.max_headers)
-    mut body = kod_str_to_bytes("")
-    let codings = headers.all("transfer-encoding")
-    if len(codings) > 0 {
-        for v in codings {
-            if v.trim().lower() != "chunked" {
-                throw protocol(f"unsupported Transfer-Encoding {v}")
-            }
-        }
-        body = try read_chunked(br, budget, limits: limits)
-    } else {
-        let n = try read_length(headers, limits)
-        if n > 0 {
-            body = try br.read_exact(n)
-        }
-    }
     mut keep_alive = has_token(headers, "connection", "keep-alive")
     if start.minor >= 1 {
         keep_alive = true
@@ -1457,7 +1451,37 @@ func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Erro
     if has_token(headers, "connection", "close") {
         keep_alive = false
     }
-    return Incoming(method: start.method, target: start.target, :headers, :body, :keep_alive)
+    return Incoming(method: start.method, target: start.target, :headers, body: kod_str_to_bytes(""), :keep_alive)
+}
+
+// The body of `req`, which read_head gave: none when nothing frames one.
+func read_request_body(anon br: BufReader, anon req: Incoming, anon limits: Limits) -> none or Error {
+    let codings = req.headers.all("transfer-encoding")
+    if len(codings) > 0 {
+        for v in codings {
+            if v.trim().lower() != "chunked" {
+                throw protocol(f"unsupported Transfer-Encoding {v}")
+            }
+        }
+        // Two lengths: whoever is in front of this server may have taken the other.
+        if req.headers.has("content-length") {
+            throw protocol("both Transfer-Encoding and Content-Length")
+        }
+        req.body = try read_chunked(br, Budget(left: limits.max_header_bytes, headers: 0), limits: limits)
+        return
+    }
+    let n = try read_length(req.headers, limits)
+    if n > 0 {
+        req.body = try br.read_exact(n)
+    }
+}
+
+func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
+    let got = try read_head(br, limits)
+    if got is Incoming(req) {
+        try read_request_body(br, req, limits)
+    }
+    return got
 }
 
 // The next request from `br`, or none when the connection ends before one
@@ -1471,9 +1495,13 @@ func read_request(anon br: BufReader, limits: Limits = Limits()) -> Incoming? or
     return r
 }
 
+// The longest body written in one piece with its headers.
+let JOINED_BODY: int64 = 65536
+
 // Writes `resp` with a Content-Length and, unless `keep_alive`,
-// `Connection: close`. An empty `reason` is the status's usual one.
-func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = false) -> none or Error {
+// `Connection: close`. An empty `reason` is the status's usual one. `head`
+// leaves out the body, whose length it still gives: the answer to a HEAD.
+func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = false, head: bool = false) -> none or Error {
     let op = "write response"
     if resp.status < 100 or resp.status > 599 {
         throw invalid(op, "bad status")
@@ -1500,51 +1528,448 @@ func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = fals
             out.append(h.name + ": " + h.value + "\r\n")
         }
     }
-    out.append("Content-Length: " + len(resp.body).to_str() + "\r\n")
+    // These have no body, nor a length for one.
+    let bodiless = resp.status < 200 or resp.status == 204 or resp.status == 304
+    if not bodiless {
+        out.append("Content-Length: " + len(resp.body).to_str() + "\r\n")
+    }
     if not keep_alive {
         out.append("Connection: close\r\n")
     }
     out.append("\r\n")
-    out.append_bytes(resp.body)
+    if head or bodiless or len(resp.body) == 0 {
+        try w.write_all(out.to_bytes())
+        return
+    }
+    if len(resp.body) <= JOINED_BODY {
+        out.append_bytes(resp.body)
+        try w.write_all(out.to_bytes())
+        return
+    }
+    // Not copied again to go out together with the headers.
     try w.write_all(out.to_bytes())
+    try w.write_all(resp.body)
 }
 
-// Answers the requests on one connection until it is to end.
-func serve_connection(anon conn: Fd, anon handler: func(Incoming) -> Response, limits: Limits) -> none or Error {
-    let br = BufReader(inner: conn, limit: limits.max_header_bytes)
-    for true {
-        let got = read_request(br, :limits)
-        if got is Err(e) {
-            if e is IoError(io) and io.kind == .Protocol {
-                let _ = write_response(conn, respond(400, f"{io.detail}\n"))
+// What a server's connection is doing, which decides how long it may take.
+type Phase = enum {
+    // Waiting for a request's first byte.
+    Waiting
+    Head
+    Body
+    Handling
+    Writing
+    // Reading what the client still sends, so that it reads the answer.
+    Ending
+}
+
+// A connection of a Server. Nothing it reads or writes has a limit of its own:
+// Server.reap ends what goes on past `deadline_ns`.
+type ServerConn = shared struct {
+    fd: Fd
+    server: Server
+    phase: Phase = .Waiting
+    // When its phase is to end (a monotonic time), 0 for no such time.
+    deadline_ns: int64 = 0
+    served: int64 = 0
+    expired: bool = false
+
+    func enter(self, anon phase: Phase, anon limit: Duration) -> none {
+        self.phase = phase
+        self.deadline_ns = 0
+        if limit.ns > 0 {
+            self.deadline_ns = time.monotonic_ns() + limit.ns
+        }
+    }
+
+    func read(self, anon max: int64) -> bytes or Error {
+        let data = try self.fd.read(max)
+        if self.phase is .Waiting and len(data) > 0 and not self.expired {
+            // A first request's headers have had their time since it connected.
+            self.phase = .Head
+            if self.served > 0 {
+                self.enter(.Head, self.server.header_timeout)
             }
-            break
         }
-        let req = got
-        if req is none {
-            break
-        }
-        let resp = handler(req)
-        if write_response(conn, resp, keep_alive: req.keep_alive) is Err(_) or not req.keep_alive {
-            break
+        return data
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        return try self.fd.write(data)
+    }
+
+    // Ends what it waits for: a read gives the end of the stream.
+    func expire(self) -> none {
+        self.expired = true
+        self.deadline_ns = 0
+        tcp.shutdown(self.fd, read: true, write: self.phase is .Writing)
+    }
+
+    // Answers its requests until it is to end.
+    func converse(self) -> none or Error {
+        let server = self.server
+        let br = BufReader(inner: self, limit: server.limits.max_header_bytes)
+        for true {
+            self.wait_for_request(br)
+            let got = read_head(br, server.limits)
+            if got is Err(e) {
+                self.refuse(e)
+                return
+            }
+            let req = got
+            if req is none {
+                return
+            }
+            if self.read_body(br, req) is Err(e) {
+                self.refuse(e)
+                return
+            }
+            self.enter(.Handling, Duration())
+            let resp = server.answer(req)
+            let keep_alive = req.keep_alive and not server.stopping and not server.full
+            self.enter(.Writing, server.write_timeout)
+            try self.reply(req, resp, :keep_alive)
+            self.served += 1
+            if not keep_alive {
+                return
+            }
         }
     }
-    try conn.close()
-}
 
-// Answers the requests that come to `l`, each connection in a task of its
-// own, each request by `handler` (docs/http.md#serving). Returns when
-// accepting fails, or the task is cancelled; its connections' tasks are then
-// cancelled and waited for.
-func serve(anon l: tcp.Listener, anon handler: func(Incoming) -> Response, limits: Limits = Limits()) -> none or Error {
-    for true {
-        let conn = try l.accept()
-        spawn handle_connection(conn, handler, limits)
+    func wait_for_request(self, anon br: BufReader) -> none {
+        mut limit = self.server.idle_timeout
+        if self.served == 0 {
+            limit = self.server.header_timeout
+        }
+        self.enter(.Waiting, limit)
+        // The next request came along with the last one.
+        if br.pos < len(br.buf) {
+            self.enter(.Head, self.server.header_timeout)
+        } else if self.server.stopping {
+            self.expire()
+        }
+    }
+
+    func read_body(self, anon br: BufReader, anon req: Incoming) -> none or Error {
+        self.enter(.Body, self.server.body_timeout)
+        if req.headers.get("expect") is str(expect) {
+            if expect.lower() != "100-continue" {
+                throw protocol("unknown Expect")
+            }
+            // Before it is told to go on, so that it needn't send too much.
+            let _ = try read_length(req.headers, self.server.limits)
+            try self.write_all(kod_str_to_bytes("HTTP/1.1 100 Continue\r\n\r\n"))
+        }
+        try read_request_body(br, req, self.server.limits)
+    }
+
+    func reply(self, anon req: Incoming, anon resp: Response, keep_alive: bool) -> none or Error {
+        let head = req.method == "HEAD"
+        let wrote = write_response(self, resp, :keep_alive, :head)
+        if wrote is Err(IoError(e)) and e.kind == .InvalidInput {
+            // Not a response: nothing has been written.
+            let log = self.server.log
+            log(f"{req.method} {req.target}: {e.to_str()}")
+            try write_response(self, respond(500, "Internal Server Error\n"), :keep_alive, :head)
+            return
+        }
+        try wrote
+    }
+
+    // Answers a request that couldn't be read, where it was a client's doing.
+    func refuse(self, anon e: Error) -> none {
+        let Some(io) = io_error(e) else {
+            return
+        }
+        mut status: int64 = 0
+        mut detail = io.detail
+        if self.expired {
+            // One that was only waiting is closed without a word.
+            if self.phase is .Waiting {
+                return
+            }
+            status = 408
+            detail = "the request took too long"
+        } else if io.kind == .Protocol {
+            status = refusal(io.detail)
+        }
+        if status == 0 {
+            return
+        }
+        self.enter(.Writing, self.server.write_timeout)
+        if write_response(self, respond(status, f"{detail}\n")) is Err(_) {
+            return
+        }
+        // Closing while the client still sends would reset the connection, and
+        // the client might lose the answer.
+        if self.expired {
+            // Its reads are at an end: what comes now is dropped, as long as
+            // the connection is open both ways.
+            self.enter(.Ending, Duration())
+            time.sleep(Duration(ms: 250))
+            return
+        }
+        tcp.shutdown(self.fd, write: true)
+        self.enter(.Ending, Duration(seconds: 1))
+        mut left: int64 = 1048576
+        for left > 0 and not self.expired {
+            let data = self.fd.read(65536)
+            if data is Err(_) {
+                return
+            }
+            if len(data) == 0 {
+                return
+            }
+            left -= len(data)
+        }
     }
 }
 
-// serve_connection as a task: an error of one connection (closing it, by
-// then) ends only that connection.
-func handle_connection(anon conn: Fd, anon handler: func(Incoming) -> Response, anon limits: Limits) -> none {
-    let _ = serve_connection(conn, handler, :limits)
+func io_error(anon e: Error) -> IoError? {
+    if e is IoError(io) {
+        return io
+    }
+    return none
+}
+
+// The status that says what is wrong with a request.
+func refusal(anon detail: str) -> int64 {
+    if detail == "body too large" {
+        return 413
+    }
+    if detail == "headers too large" or detail == "too many headers" {
+        return 431
+    }
+    if detail == "unknown Expect" {
+        return 417
+    }
+    if detail.starts_with("unsupported Transfer-Encoding") {
+        return 501
+    }
+    return 400
+}
+
+// Server.log's default.
+func log_to_stderr(anon line: str) -> none {
+    kod_eprint(line)
+}
+
+// Answers requests: see docs/http.md#serving.
+type Server = shared struct {
+    handler: func(Incoming) -> Response or Error
+    header_timeout: Duration = Duration(seconds: 10)
+    body_timeout: Duration = Duration(seconds: 60)
+    write_timeout: Duration = Duration(seconds: 60)
+    idle_timeout: Duration = Duration(seconds: 60)
+    max_connections: int64 = 10000
+    limits: Limits = Limits()
+    log: func(str) -> none = log_to_stderr
+    // The open connections, by a number of their own.
+    conns: Map[int64, ServerConn] = Map[int64, ServerConn]()
+    last_conn: int64 = 0
+    // Whether `serve` runs; whether `stop` has been called, and until when
+    // requests may go on (a monotonic time).
+    open: bool = false
+    stopping: bool = false
+    stop_ns: int64 = 0
+    // The task that accepts connections.
+    acceptor: tasks.Task[int64 or Error]? = none
+    // A connection waits for another to end, which sends on `room`.
+    full: bool = false
+    room: tasks.Channel[bool] = tasks.Channel[bool](capacity: 1)
+    // Closed once the last connection has ended after `stop`.
+    quiet: tasks.Channel[bool] = tasks.Channel[bool]()
+
+    // Answers the requests that come to `l`, until `stop`.
+    func serve(self, anon l: tcp.Listener) -> none or Error {
+        self.open = true
+        let reaper = spawn self.reap()
+        let served = self.run(l)
+        self.open = false
+        self.acceptor = none
+        reaper.cancel()
+        try served
+    }
+
+    func run(self, anon l: tcp.Listener) -> none or Error {
+        let accepted = tasks.Channel[Fd]()
+        let acceptor = spawn self.accept(l, accepted)
+        self.acceptor = acceptor
+        for fd in accepted {
+            self.last_conn += 1
+            let conn = ServerConn(:fd, server: self)
+            self.conns[self.last_conn] = conn
+            spawn self.attend(conn, id: self.last_conn)
+        }
+        if not self.stopping {
+            // Accepting failed, or this task is cancelled.
+            acceptor.cancel()
+            let _ = try acceptor.wait()
+            return
+        }
+        if len(self.conns) == 0 {
+            return
+        }
+        let left = self.stop_ns - time.monotonic_ns()
+        select {
+            receive(self.quiet) -> none
+            after(Duration(ns: left)) -> none
+        }
+        if len(self.conns) > 0 {
+            throw IoError(kind: .TimedOut, op: "serve", errno: 0, detail: f"stopped with {len(self.conns)} connections still busy")
+        }
+    }
+
+    // Accepts connections and sends them on `accepted`, until that fails.
+    func accept(self, anon l: tcp.Listener, anon accepted: tasks.Channel[Fd]) -> int64 or Error {
+        let ended = self.accept_all(l, accepted)
+        accepted.close()
+        return ended
+    }
+
+    func accept_all(self, anon l: tcp.Listener, anon accepted: tasks.Channel[Fd]) -> int64 or Error {
+        for true {
+            if len(self.conns) >= self.max_connections {
+                try self.wait_for_room(l)
+            }
+            let got = l.accept()
+            if got is Err(e) {
+                // Too many open files, here or in the system: some may be closed.
+                if e is IoError(io) and (io.errno == 24 or io.errno == 23) {
+                    self.make_room()
+                    time.sleep(Duration(ms: 20))
+                    continue
+                }
+                throw e
+            }
+            let fd = got
+            if tasks.cancelled() {
+                let _ = fd.close()
+                throw IoError(kind: .Cancelled, op: "accept", errno: 0, detail: "cancelled")
+            }
+            accepted.send(fd)
+        }
+        return 0
+    }
+
+    // With all the connections there may be, waits for another to come, and for
+    // one of those to end.
+    func wait_for_room(self, anon l: tcp.Listener) -> none or Error {
+        try l.wait()
+        for len(self.conns) >= self.max_connections and not tasks.cancelled() {
+            self.make_room()
+            self.full = true
+            let _ = self.room.receive()
+            self.full = false
+        }
+    }
+
+    // Closes the connection that has waited longest for its next request.
+    func make_room(self) -> none {
+        mut oldest: ServerConn? = none
+        mut oldest_ns: int64 = 0
+        for id in self.conns {
+            // Gone meanwhile, when this loop was preempted.
+            let Some(conn) = self.conns[id] else { continue }
+            if conn.phase is .Waiting and conn.served > 0 and not conn.expired {
+                if oldest is none or conn.deadline_ns < oldest_ns {
+                    oldest = conn
+                    oldest_ns = conn.deadline_ns
+                }
+            }
+        }
+        if oldest is ServerConn(conn) {
+            conn.expire()
+        }
+    }
+
+    // Answers the requests of one connection, then forgets it.
+    func attend(self, anon conn: ServerConn, id: int64) -> none {
+        let log = self.log
+        if panics.run(func() { let _ = conn.converse() }) is panics.Panic(p) {
+            log(f"{p.to_str()}\n{p.backtrace}")
+        }
+        let _ = self.conns.remove(id)
+        let _ = conn.fd.close()
+        if self.full and len(self.room.items) == self.room.head {
+            self.room.send(true)
+        }
+        if self.stopping and len(self.conns) == 0 and not self.quiet.closed {
+            self.quiet.close()
+        }
+    }
+
+    // The handler's response to `req`, or a 500.
+    func answer(self, anon req: Incoming) -> Response {
+        let handler = self.handler
+        let got = panics.catch(func() -> Response or Error { return handler(req) })
+        match got {
+            Ok(resp) -> return resp
+            Err(e) -> {
+                let log = self.log
+                if e is panics.Panic(p) {
+                    log(f"{req.method} {req.target}: {p.to_str()}\n{p.backtrace}")
+                } else {
+                    log(f"{req.method} {req.target}: {e.to_str()}")
+                }
+                return respond(500, "Internal Server Error\n")
+            }
+        }
+    }
+
+    // Ends the connections that have taken too long for what they are doing.
+    func reap(self) -> int64 {
+        mut shortest = self.header_timeout.ns
+        for limit in [self.body_timeout, self.write_timeout, self.idle_timeout] {
+            if limit.ns < shortest {
+                shortest = limit.ns
+            }
+        }
+        mut tick = shortest / 8
+        if tick < 5000000 {
+            tick = 5000000
+        }
+        if tick > 500000000 {
+            tick = 500000000
+        }
+        for self.open {
+            time.sleep(Duration(ns: tick))
+            if tasks.cancelled() {
+                return 0
+            }
+            let now = time.monotonic_ns()
+            for id in self.conns {
+                let Some(conn) = self.conns[id] else { continue }
+                if conn.deadline_ns != 0 and now >= conn.deadline_ns {
+                    conn.expire()
+                }
+            }
+        }
+        return 0
+    }
+
+    // Ends `serve`, once the requests being read or answered are done or `within`
+    // has passed.
+    func stop(self, within: Duration = Duration(seconds: 10)) -> none {
+        if self.stopping {
+            return
+        }
+        self.stopping = true
+        self.stop_ns = time.monotonic_ns() + within.ns
+        for id in self.conns {
+            let Some(conn) = self.conns[id] else { continue }
+            if conn.phase is .Waiting {
+                conn.expire()
+            }
+        }
+        if self.acceptor is Some(task) {
+            task.cancel()
+        }
+    }
+}
+
+// Answers the requests that come to `l` by `handler`, with a Server's settings
+// left as they are.
+func serve(anon l: tcp.Listener, anon handler: func(Incoming) -> Response or Error, limits: Limits = Limits()) -> none or Error {
+    try Server(:handler, :limits).serve(l)
 }
