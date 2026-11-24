@@ -4,12 +4,12 @@ icon: lucide/git-fork
 
 # Concurrency (design)
 
-Status: step 1 is built, but for the check at function entry: `spawn`,
+Status: step 1 is built: `spawn`,
 `Task[T]` and `wait()`, a function waiting for its tasks, channels and
 `for v in ch`, tasks waiting for I/O, cancellation, `select`, generators, the
 helpers, HTTP and TLS in tasks with a server, backtraces that say where a
 task was spawned, module variables initialized once across tasks, and
-preemption at loop iterations ([Tasks](tasks.md) describes what works); step 2
+preemption ([Tasks](tasks.md) describes what works); step 2
 is a proposal. It describes what Kod would add for doing several things at
 once, in two steps, and what it promises now so that those
 steps stay possible. The building blocks are Go's (tasks, channels, `select`),
@@ -334,7 +334,8 @@ The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does
 pays for it too, and it is the one thing step 1 costs such a program. Code
 that loops by recursion, without a loop, needs the check at function entry
-as well, which is yet to be measured.
+as well: measured on top of the loop checks, fib +1%, trees +1%, the compiler
++1%, the rest 0%, and built.
 
 ### The runtime
 

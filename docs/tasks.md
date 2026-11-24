@@ -261,8 +261,8 @@ and where it is preempted.
 
 A task that runs for a while without waiting is made to give way, so one
 busy loop doesn't keep the others waiting: about every 10 ms, the running
-task gives way at the top of its next loop iteration, as if it called
-`tasks.give_way()` there.
+task gives way at the top of its next loop iteration or function call, as if
+it called `tasks.give_way()` there.
 
 <!-- kod:
 import "tasks"
@@ -284,14 +284,13 @@ let quick = spawn work(1)
 print(quick.wait())              // doesn't wait for crunch to end
 ```
 
-So between two iterations of a loop, other tasks may have run, as across a
-wait: a value read from a shared struct before may have changed since.
-Nothing else is interrupted: a loop's body, a call without a loop in it, and
-recursion without a loop run to the end of the iteration. Only the top of a
-loop iteration is a place where a task is preempted, so no reference count or
-array is left half changed.
+So between two iterations of a loop, and as a function is called, other tasks
+may have run, as across a wait: a value read from a shared struct before may
+have changed since. Nothing else is interrupted: only those two are places
+where a task is preempted, so no reference count or array is left half
+changed.
 
-Every loop has the check, a load from a page the program makes unreadable
+Every loop and function has the check, a load from a page the program makes unreadable
 when it is time ([Concurrency (design)](concurrency.md#preemption)); it costs
 a few percent in
 the tightest loops, and a program that never starts a task pays that too.
@@ -317,7 +316,6 @@ switch from one task to another costs about 50 ns, and starting a task about
 
 ## What isn't built yet
 
-`spawn` and `yield` don't work in a generic function or type yet. A function
-that recurses without a loop isn't preempted: the check at function entry the
-design has is yet to be measured. Tasks run on one thread; using several
+`spawn` and `yield` don't work in a generic function or type yet. Tasks run on
+one thread; using several
 cores is [step 2](concurrency.md#building-it).
