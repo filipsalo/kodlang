@@ -824,13 +824,17 @@ func cold_end(anon body: regalloc.InsnBuf, anon back: int64) -> int64 {
 }
 
 // No call in the loop from `top` to `back` but to a panic, a release or the
-// copy, no inlined runtime function, no preemption check (emit_poll: another
-// task may change the heap there, as in a call), and no loop inside it.
-func loop_calls_ok(anon body: regalloc.InsnBuf, top: int64, back: int64, label_at: Map[str, int64]) -> bool {
+// copy, no inlined runtime function, no loop inside it, and, unless
+// `polls_ok`, no preemption check (emit_poll: another task may change the
+// heap there, as in a call).
+func loop_calls_ok(anon body: regalloc.InsnBuf, top: int64, back: int64, label_at: Map[str, int64], polls_ok: bool) -> bool {
     for k in top + 1..back {
         let variant = (body.tags[k] & 255)
         if variant == regalloc.INSN_DATA {
-            return false
+            if not polls_ok {
+                return false
+            }
+            continue
         }
         if variant == regalloc.INSN_CALL {
             let target = body.strs[body.fa[k]]
@@ -848,6 +852,16 @@ func loop_calls_ok(anon body: regalloc.InsnBuf, top: int64, back: int64, label_a
         }
     }
     return true
+}
+
+// Whether the loop from `top` to `back` has a preemption check (emit_poll).
+func has_poll(anon body: regalloc.InsnBuf, top: int64, back: int64) -> bool {
+    for k in top + 1..back {
+        if (body.tags[k] & 255) == regalloc.INSN_DATA {
+            return true
+        }
+    }
+    return false
 }
 
 // No branch from outside the loop from `top` to `back` goes into it.
@@ -19946,7 +19960,8 @@ type Codegen = shared struct {
     // its place's own it stays so. Each check emit_unique made there on a
     // local's slot the loop doesn't store to, or on a field of a struct in a
     // register the loop doesn't write, goes, and one check before the loop
-    // takes its place.
+    // takes its place. In a loop with a preemption check, only a local's: no
+    // other task can reach the frame, nor take an array a local holds alone.
     func hoist_unique_checks(self, anon body: regalloc.InsnBuf) -> regalloc.InsnBuf {
         let n = body.n
         mut has_check = false
@@ -19988,6 +20003,9 @@ type Codegen = shared struct {
             if not self.hoistable_loop(body, :top, :back, :label_at) {
                 continue
             }
+            // Where the loop may be preempted, another task may take a field's
+            // array or store another there; a local's slot is this task's own.
+            let polled = has_poll(body, :top, :back)
             mut stored: [int64] = []
             for k in top..back {
                 // A Slot's store has sub 1.
@@ -20006,7 +20024,7 @@ type Codegen = shared struct {
                     }
                 } else {
                     let place = field_check_place(body, :k)
-                    if place == regalloc.NO_REG {
+                    if place == regalloc.NO_REG or polled {
                         continue
                     }
                     // The field's address, worked out in the loop from a base it doesn't write.
@@ -20155,7 +20173,7 @@ type Codegen = shared struct {
             }
             // With the cold blocks its checks left after its back edge.
             let back = cold_end(body, back)
-            if not loop_calls_ok(body, :top, :back, :label_at) {
+            if not loop_calls_ok(body, :top, :back, :label_at, polls_ok: false) {
                 continue
             }
             mut calls_copy = false
@@ -20359,9 +20377,9 @@ type Codegen = shared struct {
 
     // The loop from the label at `top` to its backward branch at `back`: no
     // other loop inside it, no way in but its top, and no call but to a panic,
-    // a release or the copy.
+    // a release or the copy (a preemption check is let through).
     func hoistable_loop(self, anon body: regalloc.InsnBuf, top: int64, back: int64, label_at: Map[str, int64]) -> bool {
-        if not loop_calls_ok(body, :top, :back, :label_at) {
+        if not loop_calls_ok(body, :top, :back, :label_at, polls_ok: true) {
             return false
         }
         // Nothing outside jumps into it.

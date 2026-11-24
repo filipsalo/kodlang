@@ -310,6 +310,7 @@ and branches on:
 | load a flag, branch if set | +17% | +11% | +5% | 0% | 0% | +1% |
 | load from the polling page | 0% | +9% | 0% | 0% | 0% | +2% |
 | as built (2026-11-24) | +16% | +10% | 0% | 0% | 0% | 0% |
+| as built, a local's copy-on-write check hoisted | +16% | +8% | 0% | 0% | 0% | 0% |
 
 The branch is what costs, in tight loops. The experiment left out what the
 check must stop the optimiser doing: reusing after the check a value loaded
@@ -318,11 +319,15 @@ copy-on-write check, since at the check another task may change (or free)
 what was loaded, or take a reference to the array. As built, the check is
 opaque to load reuse, and a loop with one isn't hoisted from: qsort's inner
 loops load `self.xs`'s buffer and length again after each check (+8%) and on
-each iteration (+8% more). A tight loop of stores, as sieve's, pays for the
-load. The compiler, with the check in its own loops, is about 1% slower,
-within the noise. Telling the loads from task-private memory (a local, a
-value struct's field) from those through a shared struct would let the
-private ones be reused and hoisted again.
+each iteration (+8% more): `self` is a shared struct, so that is the price
+of reading what another task may have stored. A loop's copy-on-write check on
+a local's array is still hoisted, since no other task can reach the frame or
+take an array a local holds alone (sieve: +10% to +8%); one on a field isn't.
+What is left of sieve's cost is the check's own load, in a loop of a few
+instructions. The compiler, with the check in its own loops, is about 1%
+slower, within the noise. Loads, unlike the copy-on-write check, aren't told
+apart by where they come from: a slot may hold a shared struct as well as an
+array, and the passes that would reuse or hoist them see no types.
 
 As built, every 10 ms a thread makes the page unreadable once a program has
 started a task; the fault handler makes it readable again and sends the task
