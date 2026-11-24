@@ -138,6 +138,7 @@ for n in numbers {                                // until it is closed
 |---|---|
 | `tasks.Channel[T](capacity: n)` | a channel that holds up to `n` values no task has received yet; `n` is 0 when left out |
 | `ch.send(value)` | adds `value`; waits while `capacity` values sent before it haven't been received, so with 0 until a task receives this one |
+| `ch.send_now(value) -> bool` | adds `value` if the channel is open and fewer than `capacity` values are waiting to be received, without waiting; whether it did |
 | `ch.receive() -> T?` | the next value; waits while there is none, and gives `none` once the channel is closed and every value has been received |
 | `ch.close()` | no more values will come: those waiting to receive get `none` once the rest are received |
 | `for v in ch` | receives each value until the channel is closed and empty |
@@ -246,8 +247,9 @@ for k in countdown(1000000) {
 | `tasks.map_concurrently(xs: [T], f: func(T) -> U, limit: int64) -> [U]` | `f` of each of `xs`, in order, with at most `limit` calls running at a time |
 | `tasks.Mutex()` | `lock()` waits until no other task holds it, `unlock()` lets the next one have it |
 
-On one thread, nothing runs between two waits, so a `Mutex` is only for a
-value held across a wait: read it, wait for I/O, write it back.
+A `Mutex` is for a value that must not change between being read and written
+back: across a wait, or across a loop iteration or a call, where a task may be
+[preempted](#preemption).
 
 ## Waiting for I/O
 
@@ -274,6 +276,43 @@ own (`tcp.set_timeout`, and so the HTTP client's), which ends a read or write
 that waits too long with `.TimedOut`. [HTTP](http.md#requests-at-the-same-time)
 has requests made at the same time, and a server that serves each connection
 in a task.
+
+## Signals
+
+`signals.listen` gives the signals that come to the program on a channel,
+instead of what they would do by themselves, such as end it:
+
+<!-- kod:
+func reload() -> none {
+}
+-->
+```kod
+import "process" { Signal }
+import "signals"
+
+func reload_on_hup() -> none or Error {
+    let sigs = try signals.listen([.Hup])
+    for _sig in sigs.channel {
+        reload()
+    }
+}
+```
+
+| Name | Meaning |
+|------|---------|
+| `signals.listen(sigs)` | a `Signals or Error` for a list of [`process.Signal`](builtins.md); `.Kill` is an `InvalidInput` error |
+| `s.channel` | a `Channel[Signal]` of those that have come |
+| `s.stop()` | ends it: closes the channel, and the signals do again what they did before |
+
+When several listen for a signal, each gets it, and it does what it did before
+again once the last has stopped. A signal that comes while 16 wait to be
+received is dropped. A signal the program was started to ignore, as by `nohup`,
+is given too. While something listens, waiting isn't a
+[deadlock](#preemption): a signal may come.
+
+A task doesn't have to wait for one to come: a busy loop is preempted for it,
+but a call that holds up every task (as [above](#waiting-for-io)) delays it.
+Programs started with `process` don't inherit any of it.
 
 ## Giving way
 

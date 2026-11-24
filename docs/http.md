@@ -407,8 +407,11 @@ a `501` for a `Transfer-Encoding` other than `chunked`.
 ### `Server`
 
 `Server(...)` has the settings, each with a default. `run()` listens on `host`
-and `port` and answers requests until `stop`; `serve(l)` does so on a
-[`tcp.Listener`](io.md#tcp) there is already. Both give `none or Error`.
+and `port` and answers requests until `stop`, or until Ctrl-C or a `kill`
+(`SIGINT` or `SIGTERM`), which stops it as `stop` does; a second one ends the
+program at once. `serve(l)` answers those that come to a
+[`tcp.Listener`](io.md#tcp) there is already, and leaves signals alone. Both give
+`none or Error`.
 
 <!-- kod:
 import "net/http" { Request, Response, Server, text }
@@ -433,7 +436,9 @@ func main() -> none or Error {
 | `body_timeout` | 60 s | how long it may take to send the body after them |
 | `write_timeout` | 60 s | how long it may take to read the response |
 | `idle_timeout` | 60 s | how long a kept-alive connection may wait for its next request |
+| `stop_timeout` | 10 s | how long requests may go on after `stop` |
 | `max_connections` | 10000 | how many connections are open at once |
+| `stop_on_signals` | true | whether `run` stops on `SIGINT` and `SIGTERM`; when false it leaves [signals](tasks.md#signals) alone too |
 | `limits` | `Limits()` | caps each request's headers and body, as for a response |
 | `log` | stderr | a `func(str) -> none` that gets a line or more for each handler that fails |
 | `access_log` | false | whether `log` gets a line for each request too: `127.0.0.1:50123 GET /users/7 200 14 B 0.31 ms` |
@@ -452,7 +457,7 @@ descriptors doesn't end the server: it waits a little and tries again.
 
 `server.stop(within: d)` ends `serve`: no more connections are accepted, those
 waiting for a request are closed, and the requests being read or answered get
-`d` (10 seconds when left out) to finish, their responses saying
+`d` (`stop_timeout` when left out) to finish, their responses saying
 `Connection: close`. `serve` then returns, and a later one returns at once; when some hadn't finished, they are
 cancelled and it returns a `TimedOut` error. It returns an error when accepting
 fails or its task is cancelled (`task.cancel()`) too; then the connections'

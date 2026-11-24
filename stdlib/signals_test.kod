@@ -1,0 +1,122 @@
+// signals.listen (docs/tasks.md#signals).
+import "libc" { getpid }
+import "posix"
+import "process"
+import "process" { Signal }
+import "signals"
+import "stream" { IoError }
+import "tasks"
+import "testing"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+// Sends this program `sig`.
+func send(anon sig: Signal) -> none {
+    must posix.signal(getpid(), sig.number())
+}
+
+// The name of the next signal, or "none" when none comes in a second.
+func next(anon s: signals.Signals) -> str {
+    select {
+        receive(s.channel) is got -> {
+            if got is Signal(sig) {
+                return process.signal_name(sig.number())
+            }
+        }
+        after(Duration(seconds: 1)) -> none
+    }
+    return "none"
+}
+
+test "a signal comes on the channel" {
+    let s = must signals.listen([.Usr1, .Usr2, .Usr1])
+    send(.Usr2)
+    assert next(s) == "SIGUSR2"
+    send(.Usr1)
+    assert next(s) == "SIGUSR1"
+    s.stop()
+    assert s.channel.receive() is none
+    // A second stop does nothing.
+    s.stop()
+}
+
+test "each listener gets the signals it asked for" {
+    let a = must signals.listen([.Usr1, .Hup])
+    let b = must signals.listen([.Usr1])
+    send(.Usr1)
+    assert next(a) == "SIGUSR1"
+    assert next(b) == "SIGUSR1"
+    a.stop()
+    send(.Usr1)
+    assert next(b) == "SIGUSR1"
+    b.stop()
+    // And again, after the last has stopped.
+    let c = must signals.listen([.Usr1])
+    send(.Usr1)
+    assert next(c) == "SIGUSR1"
+    c.stop()
+}
+
+test "listening and stopping many times" {
+    for _i in 0..200 {
+        let s = must signals.listen([.Usr1])
+        send(.Usr1)
+        assert next(s) == "SIGUSR1"
+        s.stop()
+    }
+}
+
+test "a busy loop is preempted for a signal" {
+    let s = must signals.listen([.Usr1])
+    let waiting = spawn next(s)
+    tasks.give_way()
+    send(.Usr1)
+    let t0 = monotonic_ns()
+    for s.channel.taken == 0 and monotonic_ns() - t0 < 1000000000 {
+    }
+    assert s.channel.taken == 1
+    assert waiting.wait() == "SIGUSR1"
+    s.stop()
+}
+
+test "signals past those that fit are dropped" {
+    let s = must signals.listen([.Usr1])
+    for _i in 0..40 {
+        send(.Usr1)
+        time.sleep(Duration(ms: 1))
+    }
+    s.stop()
+    mut n = 0
+    for _sig in s.channel {
+        n += 1
+    }
+    assert n == 16
+}
+
+test "kill can't be listened for" {
+    if signals.listen([.Usr1, .Kill]) is Err(IoError(e)) {
+        assert e.kind == .InvalidInput
+    } else {
+        fail("listened for SIGKILL")
+    }
+}
+
+test "a stopped signal does what it did before" {
+    let r = testing.run(func() {
+        let s = must signals.listen([.Usr1])
+        send(.Usr1)
+        assert next(s) == "SIGUSR1"
+        s.stop()
+        send(.Usr1)
+        time.sleep(Duration(seconds: 1))
+    })
+    assert r.signal == 30
+}
+
+test "a program started while listening isn't listening" {
+    let s = must signals.listen([.Term])
+    let child = must process.start(["sleep", "10"])
+    must child.kill()
+    assert child.wait() is Err(_)
+    s.stop()
+}

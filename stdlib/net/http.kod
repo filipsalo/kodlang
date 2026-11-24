@@ -8,6 +8,7 @@ import "net/tls"
 import "net/tls" { TlsStream }
 import "panics"
 import "posix" { Fd }
+import "signals"
 import "sort"
 import "strbuilder" { StrBuilder }
 import "stream" { IoError, BufReader, Reader, Writer }
@@ -2060,10 +2061,12 @@ type Server = shared struct {
     body_timeout: Duration = Duration(seconds: 60)
     write_timeout: Duration = Duration(seconds: 60)
     idle_timeout: Duration = Duration(seconds: 60)
+    stop_timeout: Duration = Duration(seconds: 10)
     max_connections: int64 = 10000
     limits: Limits = Limits()
     log: func(str) -> none = log_to_stderr
     access_log: bool = false
+    stop_on_signals: bool = true
     // The open connections, by a number of their own.
     conns: Map[int64, ServerConn] = Map[int64, ServerConn]()
     last_conn: int64 = 0
@@ -2080,12 +2083,34 @@ type Server = shared struct {
     // Closed once the last connection has ended after `stop`.
     quiet: tasks.Channel[bool] = tasks.Channel[bool]()
 
-    // Listens on `host` and `port`, and answers requests until `stop`.
+    // Listens on `host` and `port`, and answers requests until `stop` or a signal.
     func run(self) -> none or Error {
         let l = try tcp.listen(self.host, port: self.port, backlog: 1024)
-        let served = self.serve(l)
+        let served = self.serve_until_signal(l)
         let _ = l.close()
         try served
+    }
+
+    func serve_until_signal(self, anon l: tcp.Listener) -> none or Error {
+        if not self.stop_on_signals {
+            try self.serve(l)
+            return
+        }
+        let sigs = try signals.listen([.Int, .Term])
+        let waiting = spawn self.stop_at_signal(sigs)
+        let served = self.serve(l)
+        waiting.cancel()
+        try served
+    }
+
+    // Stops at a signal; those that come after it do what they would without this.
+    func stop_at_signal(self, anon sigs: signals.Signals) -> bool {
+        let came = sigs.channel.receive() is not none
+        sigs.stop()
+        if came {
+            self.stop()
+        }
+        return came
     }
 
     // Answers the requests that come to `l`, until `stop`.
@@ -2283,13 +2308,14 @@ type Server = shared struct {
     }
 
     // Ends `serve`, once the requests being read or answered are done or `within`
-    // has passed.
-    func stop(self, within: Duration = Duration(seconds: 10)) -> none {
+    // (`stop_timeout` when left out) has passed.
+    func stop(self, within: Duration? = none) -> none {
         if self.stopping {
             return
         }
         self.stopping = true
-        self.stop_ns = time.monotonic_ns() + within.ns
+        let limit = within? or self.stop_timeout
+        self.stop_ns = time.monotonic_ns() + limit.ns
         for id in self.conns {
             let Some(conn) = self.conns[id] else { continue }
             if conn.phase is .Waiting {

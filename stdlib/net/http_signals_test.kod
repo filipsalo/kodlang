@@ -1,0 +1,128 @@
+// What Ctrl-C and `kill` do to http.Server.run (docs/http.md#server).
+import "libc"
+import "net/http" { Request, Response, Server, get, text }
+import "net/tcp"
+import "posix"
+import "process" { Signal }
+import "stream" { IoError }
+import "testing"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+func slow(anon _req: Request) -> Response or Error {
+    time.sleep(Duration(ms: 150))
+    return text("slow")
+}
+
+func stuck(anon _req: Request) -> Response or Error {
+    time.sleep(Duration(seconds: 20))
+    return text("stuck")
+}
+
+// A port that was free a moment ago.
+func free_port() -> int64 {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let port = l.port()
+    must l.close()
+    return port
+}
+
+func send(anon sig: Signal) -> none {
+    must posix.signal(libc.getpid(), sig.number())
+}
+
+// "ok", or how `server.run()` failed.
+func run(anon server: Server) -> str {
+    if server.run() is Err(e) {
+        if e is IoError(io) and io.kind is .TimedOut {
+            return "timed out"
+        }
+        return e.to_str()
+    }
+    return "ok"
+}
+
+func body(anon port: int64) -> str {
+    if get(f"http://127.0.0.1:{port}/") is Ok(resp) {
+        return resp.text()
+    }
+    return "failed"
+}
+
+test "run stops at SIGTERM or SIGINT, once the requests are done" {
+    for sig in [Signal.Term, Signal.Int] {
+        let server = Server(handler: slow, port: free_port())
+        let running = spawn run(server)
+        time.sleep(Duration(ms: 30))
+        let asked = spawn body(server.port)
+        time.sleep(Duration(ms: 50))
+        send(sig)
+        assert asked.wait() == "slow"
+        assert running.wait() == "ok"
+        assert body(server.port) == "failed"
+    }
+}
+
+test "requests still going after stop_timeout are cancelled" {
+    let server = Server(handler: stuck, port: free_port(), stop_timeout: Duration(ms: 60))
+    let running = spawn run(server)
+    time.sleep(Duration(ms: 30))
+    let asked = spawn body(server.port)
+    time.sleep(Duration(ms: 50))
+    let t0 = monotonic_ns()
+    send(.Term)
+    assert running.wait() == "timed out"
+    assert monotonic_ns() - t0 < 2000000000
+    let _ = asked.wait()
+}
+
+test "a second signal ends the program" {
+    let r = testing.run(func() {
+        let server = Server(handler: stuck, port: free_port())
+        let running = spawn run(server)
+        time.sleep(Duration(ms: 30))
+        let asked = spawn body(server.port)
+        time.sleep(Duration(ms: 50))
+        send(.Term)
+        time.sleep(Duration(ms: 30))
+        assert server.stopping
+        send(.Term)
+        let _ = asked.wait()
+        let _ = running.wait()
+    })
+    assert r.signal == 15
+}
+
+test "after stop, a signal does what it did before" {
+    let r = testing.run(func() {
+        let server = Server(handler: slow, port: free_port())
+        let running = spawn run(server)
+        time.sleep(Duration(ms: 30))
+        server.stop()
+        assert running.wait() == "ok"
+        send(.Int)
+        time.sleep(Duration(seconds: 1))
+    })
+    assert r.signal == 2
+}
+
+test "stop_on_signals: false leaves signals alone" {
+    let r = testing.run(func() {
+        let server = Server(handler: slow, port: free_port(), stop_on_signals: false)
+        let running = spawn run(server)
+        time.sleep(Duration(ms: 30))
+        send(.Term)
+        let _ = running.wait()
+    })
+    assert r.signal == 15
+}
+
+test "two servers stop at one signal" {
+    let a = Server(handler: slow, port: free_port())
+    let b = Server(handler: slow, port: free_port())
+    let running = [spawn run(a), spawn run(b)]
+    time.sleep(Duration(ms: 30))
+    send(.Int)
+    assert running[0].wait() == "ok"
+    assert running[1].wait() == "ok"
+}

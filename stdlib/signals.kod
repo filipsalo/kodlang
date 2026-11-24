@@ -1,0 +1,144 @@
+// kod:cc signals.c
+
+// The signals that come to the program, as values on a channel
+// (docs/tasks.md#signals).
+import "posix" { Fd }
+import "process" { Signal }
+import "stream" { IoError, os_error }
+import "tasks"
+import "unsafe"
+
+extern func kod_signal_open() -> int64
+extern func kod_signal_drain() -> none
+extern func kod_signal_take(anon sig: int64) -> int64
+extern func kod_signal_give_back(anon sig: int64) -> none
+
+// How many signals wait to be received before more are dropped.
+let KEPT: int64 = 16
+
+// What `listen` gives.
+type Signals = shared struct {
+    channel: tasks.Channel[Signal]
+    sigs: [Signal]
+
+    // Closes the channel; the signals do again what they did before, once
+    // nothing else listens for them.
+    func stop(self) -> none {
+        _changing.lock()
+        if not self.channel.closed {
+            self.channel.close()
+            _drop_stopped()
+        }
+        _changing.unlock()
+    }
+}
+
+// Held while the variables below change.
+mut _changing: tasks.Mutex = tasks.Mutex()
+mut _listening: [Signals] = []
+// The numbers of the signals that go to the pipe.
+mut _taken: [int64] = []
+// The task that reads the pipe, while something listens.
+mut _reader: tasks.NoneTask? = none
+
+// Listens for `sigs`, until `stop`.
+func listen(anon sigs: [Signal]) -> Signals or Error {
+    for sig in sigs {
+        if sig is .Kill {
+            throw IoError(kind: .InvalidInput, op: "listen", errno: 0, detail: "SIGKILL can't be listened for")
+        }
+    }
+    _changing.lock()
+    let got = _start(sigs)
+    _changing.unlock()
+    return got
+}
+
+func _start(anon sigs: [Signal]) -> Signals or Error {
+    let fd = kod_signal_open()
+    if fd < 0 {
+        throw os_error("listen", errno: unsafe.errno())
+    }
+    if len(_taken) == 0 {
+        // Those that came too late for an earlier listener.
+        kod_signal_drain()
+    }
+    let s = Signals(channel: tasks.Channel[Signal](capacity: KEPT), :sigs)
+    _listening += [s]
+    for sig in sigs {
+        let number = sig.number()
+        if not _has(_taken, number) {
+            if kod_signal_take(number) < 0 {
+                let err = os_error("listen", errno: unsafe.errno())
+                s.channel.close()
+                _drop_stopped()
+                throw err
+            }
+            _taken += [number]
+        }
+    }
+    if _reader is none {
+        // No function's task: it outlives the one that calls `listen`.
+        _reader = tasks.start_none(func() { _read_signals(Fd(:fd)) })
+    }
+    return s
+}
+
+// Forgets the listeners that have stopped, and what was for them only.
+func _drop_stopped() -> none {
+    mut open: [Signals] = []
+    mut wanted: [int64] = []
+    for s in _listening {
+        if not s.channel.closed {
+            open += [s]
+            for sig in s.sigs {
+                wanted += [sig.number()]
+            }
+        }
+    }
+    mut taken: [int64] = []
+    for number in _taken {
+        if _has(wanted, number) {
+            taken += [number]
+        } else {
+            kod_signal_give_back(number)
+        }
+    }
+    _listening = open
+    _taken = taken
+    if len(open) == 0 and _reader is tasks.NoneTask(t) {
+        t.cancel()
+        _reader = none
+    }
+}
+
+func _has(anon numbers: [int64], anon number: int64) -> bool {
+    for n in numbers {
+        if n == number {
+            return true
+        }
+    }
+    return false
+}
+
+// Reads the numbers of the signals that come, and sends each to those that
+// listen for it.
+func _read_signals(anon fd: Fd) -> none {
+    for not tasks.cancelled() {
+        let got = fd.read(64)
+        if got is Err(_) {
+            return
+        }
+        for number in got {
+            for s in _listening {
+                for sig in s.sigs {
+                    if sig.number() == number {
+                        // Dropped when there is no room.
+                        let _ = s.channel.send_now(sig)
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
