@@ -37,7 +37,8 @@ void rc_retain_c(void *p);
 void rc_release_c(void *p);
 
 
-// Prints `panic: ` and the message to stderr, with a backtrace, and exits 1.
+// Prints `panic: ` and the message to stderr, with a backtrace, and exits 1;
+// or a catch takes it (docs/panics.md), and this function never comes back.
 __attribute__((noreturn)) void kod_panic(KodStr *msg);
 
 // Allocate a fresh KodStr plus a `len`-byte NUL-terminated buffer in

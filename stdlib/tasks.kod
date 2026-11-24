@@ -5,6 +5,7 @@
 // task runs next is decided here.
 
 import "kod/inspect"
+import "panics"
 import "stream" { IoError }
 import "time" { Duration }
 
@@ -19,6 +20,7 @@ extern func kod_task_kq_wait(anon block: int64) -> int64
 extern func kod_task_kq_key(anon i: int64) -> int64
 extern func kod_task_hook() -> none
 extern func kod_task_set_now(anon stack: int64) -> none
+extern func kod_panic_uncaught(anon msg: str) -> none
 extern func kod_eprint(anon s: str) -> none
 extern func _inspect_caller_fp() -> int64
 extern func _inspect_read_i64(anon addr: int64) -> int64
@@ -53,6 +55,15 @@ type Fiber = shared struct {
     io_key: int64 = 0
     // Where it was spawned (_spawn_trace).
     spawned_at: [int64] = []
+    // The panic that ended it, and the group that takes it, when the function it
+    // belongs to runs under a catch (docs/panics.md#tasks).
+    failed: panics.Panic? = none
+    group: TaskGroup? = none
+    // The groups of its functions with a panic it is still to go on with, which it
+    // does at its next wait; not while it waits for the tasks of an abandoned
+    // function (_unwind_group).
+    hurt: [TaskGroup] = []
+    unwinding: int64 = 0
 }
 
 // The task that is running, made for the program's first one when first
@@ -94,6 +105,7 @@ type Task[T] = shared struct {
     // What the task gave back; until it has ended, this task waits for it.
     func wait(self) -> T {
         _wait_for(self.fiber)
+        _raise_failed(self.fiber)
         return self.results[0]
     }
 
@@ -128,6 +140,7 @@ type NoneTask = shared struct {
     // Until the task has ended, this task waits for it.
     func wait(self) -> none {
         _wait_for(self.fiber)
+        _raise_failed(self.fiber)
     }
 
     func cancel(self) -> none {
@@ -150,13 +163,24 @@ func start_none(anon body: func() -> none, group: TaskGroup? = none) -> NoneTask
 // it where the function returns.
 type TaskGroup = shared struct {
     fibers: [Fiber] = []
+    // The task whose function it is, and the catch that function runs under (0
+    // for none): where a panic in one of its tasks goes.
+    owner: Fiber
+    catch: int64 = 0
+    // The panic of the first of its tasks to have one, until `owner` goes on
+    // with it.
+    failed: panics.Panic? = none
+}
+
+func _new_group() -> TaskGroup {
+    return TaskGroup(owner: _running(), catch: panics.here())
 }
 
 // `group`, or a new one when there is none yet. Optional both ways, as the
 // hidden local that holds it is, which is none until the first `spawn` runs.
 func group_of(anon group: TaskGroup?) -> TaskGroup? {
     if group is none {
-        return TaskGroup()
+        return _new_group()
     }
     return group
 }
@@ -164,7 +188,9 @@ func group_of(anon group: TaskGroup?) -> TaskGroup? {
 // Waits for each task in `group` that hasn't ended, cancelling them first when
 // `cancel` (codegen: when the function returns an error).
 func wait_group(anon group: TaskGroup?, anon cancel: bool) -> none {
-    let g = group? or TaskGroup()
+    let Some(g) = group else {
+        return
+    }
     if cancel {
         for fiber in g.fibers {
             _cancel(fiber)
@@ -174,6 +200,77 @@ func wait_group(anon group: TaskGroup?, anon cancel: bool) -> none {
         _wait_for(fiber)
     }
     g.fibers = []
+    if g.failed is panics.Panic(p) {
+        _take_failed(g)
+        panics.again_at(p, catch: g.catch)
+    }
+}
+
+// A caught panic abandons the function `group` belongs to (runtime.c,
+// kod_unwind_frame): its tasks are cancelled and waited for, and any panic of
+// theirs is part of it.
+func _unwind_group(anon group: TaskGroup?) -> none {
+    let Some(g) = group else {
+        return
+    }
+    let me = _running()
+    me.unwinding += 1
+    for fiber in g.fibers {
+        _cancel(fiber)
+    }
+    for fiber in g.fibers {
+        _wait_for(fiber)
+    }
+    g.fibers = []
+    _take_failed(g)
+    me.unwinding -= 1
+}
+
+// Forgets the panic `group` has.
+func _take_failed(anon group: TaskGroup) -> none {
+    group.failed = none
+    mut kept: [TaskGroup] = []
+    for g in group.owner.hurt {
+        if g.failed is panics.Panic(_p) {
+            kept += [g]
+        }
+    }
+    group.owner.hurt = kept
+}
+
+// `fiber`, a task of a function that runs under a catch, has panicked: the task
+// that function is in goes on with it when it next waits, so is woken if it
+// waits now.
+func _fail(anon fiber: Fiber, anon p: panics.Panic, group: TaskGroup) -> none {
+    fiber.failed = p
+    if group.failed is panics.Panic(_first) {
+        return
+    }
+    group.failed = p
+    let owner = group.owner
+    owner.hurt += [group]
+    if owner.unwinding == 0 {
+        _wake(owner)
+    }
+}
+
+// After a wait: goes on with a panic of one of this task's own tasks.
+func _raise_hurt(anon me: Fiber) -> none {
+    if len(me.hurt) == 0 or me.unwinding > 0 {
+        return
+    }
+    let group = me.hurt[0]
+    if group.failed is panics.Panic(p) {
+        _take_failed(group)
+        panics.again_at(p, catch: group.catch)
+    }
+}
+
+// Goes on with the panic that ended `fiber`, if one did.
+func _raise_failed(anon fiber: Fiber) -> none {
+    if fiber.failed is panics.Panic(p) {
+        panics.again(p)
+    }
 }
 
 // Marks `fiber` cancelled and wakes it if it waits, forgetting the event it
@@ -183,6 +280,11 @@ func _cancel(anon fiber: Fiber) -> none {
         return
     }
     fiber.cancelled = true
+    _wake(fiber)
+}
+
+// Makes `fiber` ready, forgetting the event it waits for.
+func _wake(anon fiber: Fiber) -> none {
     if fiber.io_key != 0 {
         let _gone = _io.remove(fiber.io_key)
         fiber.io_key = 0
@@ -193,6 +295,9 @@ func _cancel(anon fiber: Fiber) -> none {
 func _join(anon fiber: Fiber, group: TaskGroup?) -> none {
     if group is TaskGroup(g) {
         g.fibers += [fiber]
+        if g.catch != 0 {
+            fiber.group = g
+        }
     }
 }
 
@@ -314,7 +419,7 @@ func _make_ready(anon fiber: Fiber) -> none {
 func _take_next() -> Fiber {
     for _head == len(_ready) {
         if _io.len() == 0 {
-            panic("all tasks are asleep: deadlock")
+            kod_panic_uncaught("all tasks are asleep: deadlock")
         }
         _poll(true)
     }
@@ -339,6 +444,13 @@ func _switch_from(anon me: Fiber) -> none {
     _reap()
 }
 
+// As _switch_from, for a wait: a panic of one of this task's own tasks ends it.
+func _wait_turn(anon me: Fiber) -> none {
+    _raise_hurt(me)
+    _switch_from(me)
+    _raise_hurt(me)
+}
+
 // Frees the stacks of tasks that have ended; none of them is running.
 func _reap() -> none {
     if len(_dead) == 0 {
@@ -353,10 +465,11 @@ func _reap() -> none {
 
 // Waits, as the running task, for `fiber` to end.
 func _wait_for(anon fiber: Fiber) -> none {
+    let me = _running()
+    _raise_hurt(me)
     for not fiber.done {
-        let me = _running()
         fiber.waiters += [me]
-        _switch_from(me)
+        _wait_turn(me)
     }
 }
 
@@ -374,7 +487,14 @@ func _finish() -> none {
     // The Task holds the Fiber; the Fiber lets go of the Task, so neither
     // keeps the other.
     fiber.job = none
-    job.run()
+    if fiber.group is TaskGroup(group) {
+        if panics.run(func() { job.run() }) is panics.Panic(p) {
+            _fail(fiber, p, :group)
+        }
+        fiber.group = none
+    } else {
+        job.run()
+    }
     _live -= 1
     fiber.done = true
     for waiter in fiber.waiters {
@@ -399,13 +519,12 @@ func _preempt() -> none {
 // by the variable's cell (runtime.c, kod_var_busy).
 mut _var_waiters: Map[int64, [Fiber]] = Map[int64, [Fiber]]()
 
-// Waits, as the running task, until the cell's value is there (state 1).
+// Waits, as the running task, until the cell's initializer is over, or for
+// nothing: kod_var_busy looks again.
 func _wait_var(anon cell: int64) -> none {
     let me = _running()
-    for _inspect_read_i64(cell) != 1 {
-        _var_waiters[cell] = (_var_waiters.get(cell)? or []) + [me]
-        _switch_from(me)
-    }
+    _var_waiters[cell] = (_var_waiters.get(cell)? or []) + [me]
+    _switch_from(me)
 }
 
 func _wake_var(anon cell: int64) -> none {
@@ -427,6 +546,8 @@ type Channel[T] = shared struct {
     sent: int64 = 0
     taken: int64 = 0
     closed: bool = false
+    // The panic that ended the generator whose channel it is.
+    failed: panics.Panic? = none
     // Tasks waiting to receive, and to have what they sent received.
     receivers: [Fiber] = []
     senders: [Fiber] = []
@@ -471,6 +592,7 @@ type Channel[T] = shared struct {
             self.senders = _wake_all(self.senders)
             _park()
         }
+        self.raise_failed()
         return self.head < len(self.items)
     }
 
@@ -479,7 +601,15 @@ type Channel[T] = shared struct {
         if self.head < len(self.items) {
             return self.take()
         }
+        self.raise_failed()
         return none
+    }
+
+    // Once every value is received, the generator's panic, if it had one.
+    func raise_failed(self) -> none {
+        if self.head == len(self.items) and self.failed is panics.Panic(p) {
+            panics.again(p)
+        }
     }
 
     // For `select` (Selectable).
@@ -532,7 +662,7 @@ func _wake_all(anon fibers: [Fiber]) -> [Fiber] {
 
 // Waits, as the running task, until something makes it ready again.
 func _park() -> none {
-    _switch_from(_running())
+    _wait_turn(_running())
 }
 
 // kod_wait_event, once a task has been started (stdlib/runtime.c): makes the
@@ -580,6 +710,11 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
         _switch_from(me)
     }
     me.io_key = 0
+    if len(me.hurt) > 0 {
+        let _gone = _io.remove(key)
+        _forget(timer_key)
+        _raise_hurt(me)
+    }
     let timed_out = timer_key != 0 and not _io.contains(timer_key) and _io.contains(key)
     // The event that didn't come may still: then it finds no one waiting.
     let _event = _io.remove(key)
@@ -612,7 +747,9 @@ func _poll(anon block: bool) -> none {
 // `body` as a task given at most `d`: what it gives back, or a `.TimedOut`
 // error once `d` has passed, when the task is cancelled and waited for.
 func within[T](anon d: Duration, anon body: func() -> T) -> T or Error {
-    let task = start(body)
+    // Its tasks end with it, should it be abandoned.
+    let group: TaskGroup? = _new_group()
+    let task = start(body, :group)
     if not _wait_until_done(task.fiber, ns: d.ns) {
         _cancel(task.fiber)
         _wait_for(task.fiber)
@@ -637,24 +774,26 @@ func _wait_until_done(anon fiber: Fiber, ns: int64) -> bool {
     _io[key] = me
     for not fiber.done and _io.contains(key) {
         fiber.waiters += [me]
-        _switch_from(me)
+        _wait_turn(me)
     }
     // Ended first: the timer's event, when it comes, finds no one waiting.
     let _gone = _io.remove(key)
     return fiber.done
 }
 
-// Runs `job` as a new task, belonging to no function: the helpers below wait
-// for their tasks themselves.
-func _start_job(anon job: Job) -> Fiber {
+// Runs `job` as a new task, of the function `group` belongs to or of none: the
+// helpers below wait for their tasks themselves.
+func _start_job(anon job: Job, group: TaskGroup? = none) -> Fiber {
     let fiber = _new_fiber()
     fiber.job = job
+    _join(fiber, :group)
     _make_ready(fiber)
     return fiber
 }
 
 // Waits, as the running task, until one of `fibers` has ended: its index.
 func _wait_any(anon fibers: [Fiber]) -> int64 {
+    _raise_hurt(_running())
     for true {
         for i, fiber in fibers {
             if fiber.done {
@@ -665,7 +804,7 @@ func _wait_any(anon fibers: [Fiber]) -> int64 {
         for fiber in fibers {
             fiber.waiters += [me]
         }
-        _switch_from(me)
+        _wait_turn(me)
     }
     return -1
 }
@@ -710,9 +849,10 @@ func _pick(anon fibers: [Fiber], anon at: [int64]) -> [Fiber] {
 // Each of `fs` as a task: their results in order, or the first error to
 // come, once the others are cancelled and have ended.
 func all[T](anon fs: [func() -> T or Error]) -> [T] or Error {
+    let group: TaskGroup? = _new_group()
     mut started: [Task[T or Error]] = []
     for f in fs {
-        started += [start(f)]
+        started += [start(f, :group)]
     }
     let fibers = _fibers_of(started)
     mut seen = [false] * len(fibers)
@@ -736,9 +876,10 @@ func all[T](anon fs: [func() -> T or Error]) -> [T] or Error {
 // Each of `fs` as a task: the first result that isn't an error, once the
 // others are cancelled and have ended, or the last error when all fail.
 func first[T](anon fs: [func() -> T or Error]) -> T or Error {
+    let group: TaskGroup? = _new_group()
     mut started: [Task[T or Error]] = []
     for f in fs {
-        started += [start(f)]
+        started += [start(f, :group)]
     }
     let fibers = _fibers_of(started)
     mut seen = [false] * len(fibers)
@@ -763,12 +904,23 @@ func first[T](anon fs: [func() -> T or Error]) -> T or Error {
 type _Gen[T] = shared struct {
     gen: _GenRef[T]
     body: func() -> none
+    // Whether it was made under a catch: its panic then goes to who receives.
+    caught: bool
 
     func run(self) -> none {
-        self.body()
+        mut failed: panics.Panic? = none
+        if self.caught {
+            failed = panics.run(self.body)
+        } else {
+            self.body()
+        }
         let Some(ch) = self.gen.ch else {
+            if failed is panics.Panic(p) {
+                kod_eprint(f"panic in a generator nothing receives from: {p.message}\n{p.backtrace}")
+            }
             return
         }
+        ch.failed = failed
         ch.close()
     }
 }
@@ -887,7 +1039,7 @@ func generate[T](anon ch: Channel[T], anon gen: _GenRef[T], anon body: func() ->
         }
         _gen_waiting = kept
     }
-    let _fiber = _start_job(_Gen[T](:gen, :body))
+    let _fiber = _start_job(_Gen[T](:gen, :body, caught: panics.here() != 0))
     return ch
 }
 
@@ -913,6 +1065,7 @@ func map_concurrently[T, U](anon xs: [T], anon f: func(T) -> U, limit: int64) ->
     if most < 1 {
         most = 1
     }
+    let group: TaskGroup? = _new_group()
     mut running: [Fiber] = []
     mut all_fibers: [Fiber] = []
     for job in jobs {
@@ -920,7 +1073,7 @@ func map_concurrently[T, U](anon xs: [T], anon f: func(T) -> U, limit: int64) ->
             let k = _wait_any(running)
             running = running[0..k] + running[k + 1..len(running)]
         }
-        let fiber = _start_job(job)
+        let fiber = _start_job(job, :group)
         running += [fiber]
         all_fibers += [fiber]
     }
@@ -1035,7 +1188,7 @@ type Selector = shared struct {
                     self.channels[self.channel_at[i]].wait_to_send(me)
                 }
             }
-            _switch_from(me)
+            _wait_turn(me)
         }
         return -1
     }

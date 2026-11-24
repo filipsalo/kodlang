@@ -373,7 +373,7 @@ as well: measured on top of the loop checks, fib +1%, trees +1%, the compiler
   point checks the flag. A function that spawns nothing pays nothing.
 - **Backtraces** walk the frame chain of the task that panicked, which ends
   at its entry function. A panic ends the program, as now (and as in Go),
-  wherever it happens.
+  wherever it happens, unless it is [caught](panics.md).
 - **Module variables**: a lazy initializer may now give way halfway (it reads
   a file, say). Another task that reads the variable meanwhile waits for it,
   instead of starting a second initialization.

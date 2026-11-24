@@ -244,7 +244,7 @@ C files export bare symbols into one namespace shared with libc and `runtime.c`:
 - `arena_alloc(size)`: memory that is never freed.
 - `rc_alloc(size, mask)`: a counted object, zeroed, with a count of 1 that the caller owns. `mask` says which of its 8-byte slots hold references, bit 0 for the first; it must not use bits past 20. `rc_alloc_raw` is the same but leaves filling it to the caller. `rc_retain_c(p)` and `rc_release_c(p)` count a reference up and down, and do nothing for memory outside the counted heap.
 - `kod_str_new(len)`: a new `str` of `len` bytes for the caller to fill in. `kod_str_from_bytes(p, n)`: a `str` that is a copy of `n` bytes at `p`, which may contain NUL bytes.
-- `panic(msg)`: print `panic: ` and the message with a backtrace, and exit 1.
+- `panic(msg)`: print `panic: ` and the message with a backtrace, and exit 1, or go to the [catch](panics.md) that takes it; either way it doesn't come back.
 
 A function value isn't a C function pointer, so an `extern` can't take or return one: `` an `extern` can't take or return a function value ``. To give C a function to call back, pass the address [`unsafe.c_function(f)`](unsafe.md#callbacks) gives as an `int64`.
 

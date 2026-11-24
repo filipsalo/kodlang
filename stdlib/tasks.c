@@ -17,8 +17,8 @@
  * with a guard page below it that an overflow faults on. */
 #define KOD_TASK_STACK (8 * 1024 * 1024)
 
-/* Saved registers: x19..x28, fp, lr, sp, d8..d15. */
-#define KOD_TASK_CTX_WORDS 21
+/* Saved registers: x19..x28, fp, lr, sp, d8..d15; and the innermost catch. */
+#define KOD_TASK_CTX_WORDS 22
 
 /* Stacks of tasks that have ended, kept for the next ones: mapping a stack and
  * touching its first pages costs more than the rest of starting a task. */
@@ -83,8 +83,10 @@ void kod_task_ctx_init(int64_t ctx, int64_t base) {
     c[12] = (uint64_t)base + (uint64_t)getpagesize() + KOD_TASK_STACK;
 }
 
-/* Saves this task's registers in `from` and goes on as the task saved in
- * `to`, returning where that one last called this (or into its entry). */
+/* Saves this task's registers (and its innermost catch, runtime.c) in `from`
+ * and goes on as the task
+ * saved in `to`, returning where that one last called this (or into its
+ * entry). */
 __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
     __asm__(
         "stp x19, x20, [x0, #0]\n"
@@ -99,6 +101,11 @@ __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
         "stp d10, d11, [x0, #120]\n"
         "stp d12, d13, [x0, #136]\n"
         "stp d14, d15, [x0, #152]\n"
+        "adrp x9, _kod_catch_top@PAGE\n"
+        "ldr x10, [x9, _kod_catch_top@PAGEOFF]\n"
+        "str x10, [x0, #168]\n"
+        "ldr x10, [x1, #168]\n"
+        "str x10, [x9, _kod_catch_top@PAGEOFF]\n"
         "ldp x19, x20, [x1, #0]\n"
         "ldp x21, x22, [x1, #16]\n"
         "ldp x23, x24, [x1, #32]\n"
@@ -174,10 +181,15 @@ extern void (*kod_var_wake_hook)(int64_t cell);
 extern void kod_tasks_wait_var(int64_t cell) __asm__("$tasks$_wait_var");
 extern void kod_tasks_wake_var(int64_t cell) __asm__("$tasks$_wake_var");
 
+/* A caught panic abandons a function that has spawned tasks. */
+extern void (*kod_unwind_group_hook)(void *group);
+extern void kod_tasks_unwind_group(void *group) __asm__("$tasks$_unwind_group");
+
 static void kod_preempt_start(void);
 
 void kod_task_hook(void) {
     kod_preempt_start();
+    kod_unwind_group_hook = kod_tasks_unwind_group;
     kod_wait_hook = kod_tasks_wait_event;
     kod_backtrace_hook = kod_tasks_print_spawn_trace;
     kod_var_wait_hook = kod_tasks_wait_var;
@@ -201,6 +213,8 @@ void kod_task_set_now(int64_t stack) {
 uint64_t kod_preempt_resume = 0;
 
 extern char kod_poll_page[KOD_POLL_PAGE];
+/* Set while a panic's backtrace is being kept (runtime.c). */
+extern int kod_no_preempt;
 static struct sigaction kod_old_segv, kod_old_bus;
 
 static void *kod_ticker(void *arg) {
@@ -306,6 +320,7 @@ static void kod_poll_fault(int sig, siginfo_t *info, void *context) {
     char *at = (char *)info->si_addr;
     if (at >= kod_poll_page && at < kod_poll_page + KOD_POLL_PAGE) {
         mprotect(kod_poll_page, KOD_POLL_PAGE, PROT_READ | PROT_WRITE);
+        if (kod_no_preempt) return;
         /* The signal's frame is below the task's sp: nothing is written there. */
         _STRUCT_ARM_THREAD_STATE64 *ts = &((ucontext_t *)context)->uc_mcontext->__ss;
         kod_preempt_resume = ts->__pc + 4;

@@ -206,6 +206,14 @@ two after that.
 object is freed, and freeing saves the rest, so they can sit anywhere in an
 expression.
 
+Every reference a function owns is in a slot of its frame, 0 while it holds
+nothing, whenever the function calls anything that may panic. So when a
+[catch](panics.md) takes a panic, each function between is let go of by
+releasing its slots, which a row of the `__DATA,__kod_unwind` section lists
+(`emit_unwind_row` in `codegen.kod`, `kod_unwind` in `runtime.c`). A `mut`
+parameter's slot is put back into the caller's instead, and a map entry that
+was being changed back into its map.
+
 ### Function values
 
 A function value is a reference to a cell whose first word is the address of the

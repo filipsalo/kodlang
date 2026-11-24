@@ -668,6 +668,10 @@ func one_token(anon operand: str) -> bool {
     return true
 }
 
+// The count of an unwind row that is a module variable's getter (KOD_UNWIND_VAR in
+// stdlib/runtime.c).
+let UNWIND_VAR: int64 = 1073741824
+
 // The most instructions a body may have for promote_locals to try it.
 let PROMOTE_MAX_INSNS: int64 = 6000
 
@@ -1469,6 +1473,8 @@ type Codegen = shared struct {
     inline_probe: bool = false
     // Frame slots that own a reference: released when the function exits.
     rc_slots: [int64] = []
+    // Three slots for each map entry the function changes where it's kept (hold_taken).
+    taken: [int64] = []
     // Slots holding the fresh results of the statement being compiled.
     rc_stmt_temps: [int64] = []
     // The value just compiled already has its slot: a constructor's, not a call's.
@@ -4604,6 +4610,66 @@ type Codegen = shared struct {
         self.println("\t.text")
         self.func_lines_labels = []
         self.func_lines_values = []
+    }
+
+    // Where the frame of `func_lbl` holds references, for a caught panic that
+    // abandons it: the rows kod_unwind_row in stdlib/runtime.c reads. Every
+    // reference a function owns is in a slot of rc_slots, 0 while it holds
+    // nothing, wherever it can be when it calls something; and what a `mut`
+    // parameter's slot holds goes back where its `by_ref_offs` slot says.
+    // `last_lbl` is the function's last instruction.
+    func emit_unwind_row(self, anon func_lbl: str, last_lbl: str, by_ref_slots: [int64], by_ref_offs: [int64]) -> none {
+        if self.dry_run {
+            return
+        }
+        mut words: [int64] = []
+        for off in self.rc_slots {
+            let at = 0 - off / 8 * 4
+            mut back = -1
+            mut taken = -1
+            for i, slot in self.taken {
+                if i % 3 == 0 and slot == off {
+                    taken = i
+                }
+            }
+            for i, slot in by_ref_slots {
+                if slot == off {
+                    back = i
+                }
+            }
+            if back >= 0 {
+                words += [at + 1, 0 - by_ref_offs[back] / 8 * 4]
+            } else if taken >= 0 {
+                words += [at + 3, 0 - self.taken[taken + 1] / 8 * 4, 0 - self.taken[taken + 2] / 8 * 4]
+            } else if self.holds_task_group(off) {
+                words += [at + 2]
+            } else {
+                words += [at]
+            }
+        }
+        self.println("\t.section __DATA,__kod_unwind,regular,no_dead_strip")
+        self.println("\t.p2align 3")
+        self.println(f"\t.quad {func_lbl}")
+        self.println(f"\t.quad {last_lbl}")
+        self.println(f"\t.long {len(words)}")
+        for w in words {
+            self.println(f"\t.long {w}")
+        }
+        self.println("\t.p2align 3")
+        self.println("\t.text")
+    }
+
+    // Whether the slot is a `TaskGroup?` (stdlib/tasks.kod), whose tasks end
+    // before the function that holds it.
+    func holds_task_group(self, anon off: int64) -> bool {
+        for v in self.vars {
+            if v.offset == off and v.kind is .KOptional(inner) {
+                if inner is .KStruct(idx, _args) {
+                    return self.structs[idx].name == "TaskGroup" and self.structs[idx].def_path == CHANNEL_MODULE_PATH
+                }
+            }
+        }
+        return false
     }
 
     func emit_asciz(self, anon value: str) -> none {
@@ -14396,8 +14462,15 @@ type Codegen = shared struct {
         if self.lookup_import_fn("#spawn", "wait_group") < 0 {
             return
         }
-        self.frame_slots += 1
-        let keep = 0 - self.frame_slots * 8
+        // What it returns, its own by now, until its tasks have ended.
+        let counted = self.rc_heap_kind(self.return_kind)
+        mut keep: int64 = 0
+        if counted {
+            keep = self.rc_new_slot()
+        } else {
+            self.frame_slots += 1
+            keep = 0 - self.frame_slots * 8
+        }
         self.emit_str_raw(keep, reg: "x0")
         self.emit_ldr(self.spawn_group_off, reg: "x0")
         let none_spawned = self.fresh("Lspawned")
@@ -14412,6 +14485,9 @@ type Codegen = shared struct {
         self.emit_call(self.import_fn_at(self.lookup_import_fn("#spawn", "wait_group")).label)
         self.emit_label(none_spawned)
         self.emit_ldr(keep, reg: "x0")
+        if counted {
+            self.emit_str_raw(keep, reg: "xzr")
+        }
     }
 
     func compile_indirect_call(self, callee_id: int64, args: [ast.CallArg]) -> Val {
@@ -18880,11 +18956,14 @@ type Codegen = shared struct {
         let ready = self.fresh("Lvar_ready")
         let init_lbl = self.fresh("Lvar_init")
         let cycle = self.fresh("Lvar_cycle")
+        let reload = self.fresh("Lvar_reload")
+        let last_lbl = self.fresh("Lunwind")
         let msg = self.intern_str(f"`{name}` is used while its value is being worked out")
         self.emit_globl(lbl)
         self.emit_label(lbl)
         self.emit_pair(load: false, a: "fp", b: "lr", base: "sp", mode: .Pre(off: -16))
         self.emit_mov("fp", src: "sp")
+        self.emit_label(reload)
         self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
         self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
         self.emit_load("x17", base: "x16")
@@ -18918,11 +18997,7 @@ type Codegen = shared struct {
         self.emit_jump_if(.Ne, target: ready)
         self.emit_mov("x0", src: "x16")
         self.emit_call("_kod_var_wake")
-        let reload = self.fresh("Lvar_reload")
-        self.emit_label(reload)
-        self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
-        self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
-        self.emit_jump(ready)
+        self.emit_jump(reload)
         // Another task's initializer: kod_var_busy waits for it; this one's is a cycle.
         self.emit_label(cycle)
         self.emit_mov("x0", src: "x16")
@@ -18931,6 +19006,18 @@ type Codegen = shared struct {
         self.emit_op(.AddressPage, a: "x0", b: f"{msg}@PAGE")
         self.emit_op(.Add, a: "x0", b: "x0", c: f"{msg}@PAGEOFF")
         self.emit_call("_kod_panic")
+        // For a panic in `init` (kod_unwind_frame in stdlib/runtime.c).
+        self.emit_label(last_lbl)
+        self.emit_op(.Return)
+        if not self.dry_run {
+            self.println("\t.section __DATA,__kod_unwind,regular,no_dead_strip")
+            self.println("\t.p2align 3")
+            self.println(f"\t.quad {lbl}")
+            self.println(f"\t.quad {last_lbl}")
+            self.println(f"\t.long {UNWIND_VAR}")
+            self.println("\t.long 0")
+            self.println(f"\t.quad {cell}")
+        }
         self.println("\t.data")
         self.println("\t.p2align 3")
         // Global, as the getter is: a generic instance or an inlined body that
@@ -19166,15 +19253,61 @@ type Codegen = shared struct {
                 value = self.stash_chain_operand(rhs)
             }
         }
+        let is_map = self.rc_heap_kind(value_kind) and self.is_builtin_map(self.infer_kind(recv))
+        if is_map {
+            self.emit_op(.AddressPage, a: "x16", b: "_kod_taken@PAGE")
+            self.emit_op(.Add, a: "x16", b: "x16", c: "_kod_taken@PAGEOFF")
+            self.emit_store("xzr", base: "x16")
+        }
         self.compile_store(dest_off: off, kind: value_kind, value_id: take_call)
+        mut held: int64 = 0
+        if is_map {
+            held = self.hold_taken(off)
+        }
         self.compile_update(new_target, rhs: value, :op)
         self.compile_discard(self.method_call_on(recv, method: "op_index_set", args: [key, local], labels: ["", ""], :span))
+        if held != 0 {
+            self.emit_ldr(held, reg: "x17")
+            self.emit_str_raw(held, reg: "xzr")
+            self.rc_release_x17()
+        }
         if self.rc_heap_kind(value_kind) {
             self.emit_ldr(off, reg: "x17")
             self.emit_str_raw(off, reg: "xzr")
             self.rc_release_x17()
         }
         return true
+    }
+
+    // After a map's op_index_take has put its entry's value in the slot
+    // `value_off`: keeps where it was (compile_take_at left it in kod_taken:
+    // the buffer, 0 when the map had no entry, and the index), so that a panic
+    // a catch takes puts it back (emit_unwind_row). Holding the buffer keeps
+    // the place there to look at. Gives back the slot that holds it.
+    func hold_taken(self, anon value_off: int64) -> int64 {
+        let buf_off = self.rc_new_slot()
+        self.frame_slots += 1
+        let at_off = 0 - self.frame_slots * 8
+        self.taken += [buf_off, at_off, value_off]
+        let buf = self.pool.alloc_reg()
+        let at = self.pool.alloc_reg()
+        self.emit_op(.AddressPage, a: "x16", b: "_kod_taken@PAGE")
+        self.emit_op(.Add, a: "x16", b: "x16", c: "_kod_taken@PAGEOFF")
+        self.emit_load(buf, base: "x16")
+        self.emit_load(at, base: "x16", off: 8)
+        self.emit_str_raw(at_off, reg: at)
+        self.rc_retain(buf)
+        self.emit_str_raw(buf_off, reg: buf)
+        self.pool.free_reg(at)
+        self.pool.free_reg(buf)
+        return buf_off
+    }
+
+    // Whether it's the builtin Map.
+    func is_builtin_map(self, anon kind: TypeKind) -> bool {
+        let .KStruct(idx, _args) = kind else { return false }
+        let template = self.structs[idx].template_idx
+        return template >= 0 and self.structs[template].name == "Map" and self.structs[template].def_path.ends_with("stdlib/builtins.kod")
     }
 
     // `target`'s path with `entry` replaced by `replacement` and each index
@@ -19235,6 +19368,11 @@ type Codegen = shared struct {
             self.emit_indexed(load: true, reg: result, base: buf, index: idx, scaled: true)
             if self.rc_heap_kind(elem) {
                 self.emit_indexed(load: false, reg: "xzr", base: buf, index: idx, scaled: true)
+                // Where it was, for hold_taken.
+                self.emit_op(.AddressPage, a: "x16", b: "_kod_taken@PAGE")
+                self.emit_op(.Add, a: "x16", b: "x16", c: "_kod_taken@PAGEOFF")
+                self.emit_store(buf, base: "x16")
+                self.emit_store(idx, base: "x16", off: 8)
                 // The array's reference, now the value's: in x0, as a call
                 // gives one (rc_call_result counts it as the call's result).
                 self.pool.free_reg(buf)
@@ -19769,7 +19907,7 @@ type Codegen = shared struct {
             self.emit_load("x9", base: "x1", off: 0)    // x9 = to_str method
             self.emit_load("x0", base: "x0", off: 0)    // x0 = self (data ptr)
             self.emit_op(.CallIndirect, a: "x9")              // x0 = str
-            self.emit_call("_kod_panic")
+            self.emit_call("_kod_panic_owned")
         } else {
             // Propagate: the cell ptr is already in x0; just return it.
             self.emit_ret_jump()
@@ -20995,7 +21133,7 @@ type Codegen = shared struct {
     // nor in the backtraces a panic prints.
     func emit_poll(self) -> none {
         let path = self.p.path
-        if path.ends_with(CHANNEL_MODULE_PATH) or path.ends_with("stdlib/builtins.kod") or path.ends_with("stdlib/kod/inspect.kod") {
+        if path.ends_with(CHANNEL_MODULE_PATH) or path.ends_with("stdlib/builtins.kod") or path.ends_with("stdlib/kod/inspect.kod") or path.ends_with("stdlib/panics.kod") {
             return
         }
         // As text, which the passes take as changing anything in memory: once
@@ -21915,6 +22053,7 @@ type Codegen = shared struct {
         self.inline_free_slots = no_inline_slots
         self.inline_budget = INLINE_FUNC_BUDGET
         self.rc_slots = []
+        self.taken = []
         self.rc_stmt_temps = []
         self.rc_free_temps = []
         self.rc_let_off = 0
@@ -22152,6 +22291,13 @@ type Codegen = shared struct {
         for off in self.addressed_offs {
             excluded += [off]
         }
+        // Read when a panic abandons the frame (emit_unwind_row).
+        for off in by_ref_offs {
+            excluded += [off]
+        }
+        for off in self.taken {
+            excluded += [off]
+        }
         mut promoted: regalloc.InsnBuf? = none
         // Loads made once live longer too: used only when promoting succeeds.
         mut before_reuse = checked
@@ -22253,7 +22399,18 @@ type Codegen = shared struct {
         if save_x28 {
             self.emit_pair(load: true, a: "x28", b: "xzr", base: "sp", mode: .Post(off: 16))
         }
-        self.emit_op(.Return)
+        if len(self.rc_slots) > 0 {
+            let last_lbl = self.fresh("Lunwind")
+            self.emit_label(last_lbl)
+            self.emit_op(.Return)
+            mut by_ref_slots: [int64] = []
+            for name in by_ref_params {
+                by_ref_slots += [self.find_var_offset(name)]
+            }
+            self.emit_unwind_row(func_lbl, :last_lbl, :by_ref_slots, :by_ref_offs)
+        } else {
+            self.emit_op(.Return)
+        }
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
         // Its registers are final, and nothing edits what is out_buf now.
         if self.func_depth == 0 {

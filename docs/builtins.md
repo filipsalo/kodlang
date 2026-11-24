@@ -224,7 +224,7 @@ func op_index_take_or(mut self, anon key: K, default: V) -> V { ... }
 |------|-------------|
 | `Error` (interface) | Marker for types that can be `throw`n. Requires `to_str(self) -> str`. |
 | `ExitCode` (interface) | `exit_code(self) -> int64`, declared but not consulted yet: an `Err` that `main` returns exits with status 1 whatever it implements. |
-| `panic` | Print `panic: <msg>\n` to stderr and `exit(1)`. Used by `must` and by `assert` outside a test. |
+| `panic` | Print `panic: <msg>\n` to stderr and `exit(1)`, unless it is [caught](panics.md). Used by `must` and by `assert` outside a test. |
 | `kod_eprint` (extern) | Write to stderr without exiting. |
 
 ## Testing
