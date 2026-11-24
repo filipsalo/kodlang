@@ -126,10 +126,13 @@ __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
 static int kod_kq = -1;
 static struct kevent kod_events[64];
 
+extern int kod_wait_file;
+
 /* Registers `filter` on `ident` (a timer is named by `key`, as its ident is
  * free); 0 when kevent took it, -1 when it can't come, as for a child that
- * has already exited or a descriptor that isn't open. */
+ * has already exited, a file, or a descriptor that isn't open. */
 int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key) {
+    if ((filter == EVFILT_READ || filter == EVFILT_WRITE) && kod_wait_file) return -1;
     if (kod_kq < 0) kod_kq = kqueue();
     if (kod_kq < 0) return -1;
     uint32_t fflags = 0;

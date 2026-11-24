@@ -815,14 +815,22 @@ int64_t kod_wait_room(void) {
     return kod_room;
 }
 
+/* Whether the descriptor kod_wait_event was last called for is a file's, which
+ * is always ready: kevent says nothing of one read to its end (tasks.c). */
+int kod_wait_file = 0;
+
 int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
     if (!kod_wait_hook) return 0;
+    kod_wait_file = 0;
     if ((filter == -1 || filter == -2) && data == 0) {
         struct timeval tv = {0, 0};
         socklen_t size = sizeof tv;
         int option = filter == -1 ? SO_RCVTIMEO : SO_SNDTIMEO;
         if (getsockopt((int)ident, SOL_SOCKET, option, &tv, &size) == 0) {
             data = (int64_t)tv.tv_sec * 1000000000 + (int64_t)tv.tv_usec * 1000;
+        } else {
+            struct stat st;
+            kod_wait_file = fstat((int)ident, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode));
         }
     }
     return kod_wait_hook(ident, filter, data);
