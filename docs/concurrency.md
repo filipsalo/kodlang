@@ -220,7 +220,7 @@ no value.
 As built, the body's task is detached instead: a generator has no handle on
 its caller's tasks, so a caller that stops reading early leaves the body
 waiting in its next `yield`. Giving the caller the task needs the call to
-pass its group in, which can come with generic `spawn`.
+pass its group in.
 
 ### Actors
 

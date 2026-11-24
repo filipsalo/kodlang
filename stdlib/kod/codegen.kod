@@ -511,6 +511,13 @@ type LitEnv = shared struct {
     // For `spawn`'s literal, which declares none: what it gives back, the kind of
     // the call it makes.
     return_kind: TypeKind? = none
+    // For a literal in generic code (ast.FuncDecl.in_generic), compiled once per
+    // instance: its label, and the instance it was made in.
+    label: str = ""
+    ctx: TypeContext? = none
+    body_instance: int64 = -1
+    body_func_inst: int64 = -1
+    body_enum_inst: int64 = -1
 }
 
 // A pattern binding stored without counting (borrow_payload): its slot, the
@@ -5987,7 +5994,7 @@ type Codegen = shared struct {
         }
         if fd_id > 0 {
             let fd = s.p.func_decls[fd_id]
-            k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: f"${s.prefix}${key}", sig: self.resolve_sig(fd_id, p: s.p), def_path: s.path, def_span: fd.name_span))
+            k = self.push_scope_fn(si, f: ImportFn(module: s.path, name: key, label: f"${s.prefix}${key}", sig: self.lambda_sig(fd_id, p: s.p), def_path: s.path, def_span: fd.name_span))
         }
         self.leave(saved_ctx)
         return k
@@ -7815,6 +7822,52 @@ type Codegen = shared struct {
     // self's own registered tables — they must have been registered via
     // register_module_types beforehand.
     // A generic function's parameters resolve to `type_args`, or else to unknown kinds.
+    // A function's signature; one of a literal in generic code names type
+    // parameters only its instances know, so it is worked out at each use
+    // (generic_lit_sig), and this one has its kinds unknown.
+    func lambda_sig(self, anon decl_id: int64, p: parsing.Parser) -> SigInfo {
+        let fd = p.func_decls[decl_id]
+        if not fd.in_generic {
+            return self.resolve_sig(decl_id, :p)
+        }
+        mut param_kinds: [TypeKind] = []
+        mut param_labels: [str] = []
+        mut param_names: [str] = []
+        mut param_default_exprs: [int64] = []
+        mut param_mut: [bool] = []
+        for param in fd.params {
+            param_mut += [param.mutable]
+            param_kinds += [.KUnknown]
+            if param.anonymous {
+                param_labels += [""]
+            } else {
+                param_labels += [param.label]
+            }
+            param_names += [param.name]
+            param_default_exprs += [param.default_expr]
+        }
+        return SigInfo(:param_kinds, :param_labels, :param_names, return_kind: .KUnknown, :param_default_exprs, src_p: p, :decl_id, :param_mut)
+    }
+
+    // The signature of the literal `decl_id` in generic code, in the instance
+    // being compiled; a `spawn`'s gives back what its call does (spawn_kind).
+    func generic_lit_sig(self, anon decl_id: int64) -> SigInfo {
+        let sig = self.resolve_sig(decl_id, p: self.p)
+        if self.p.func_decls[decl_id].spawned {
+            if self.spawn_returns.get(f"{decl_id}") is Some(kind) {
+                sig.return_kind = kind
+            }
+        }
+        return sig
+    }
+
+    // The label of the literal `decl_id` in generic code: the enclosing
+    // function's, which names the instance and the module compiling it.
+    func generic_lit_label(self, anon decl_id: int64) -> str {
+        let outer = self.ret_lbl[1..len(self.ret_lbl) - 4]
+        return f"{outer}$lit{decl_id}"
+    }
+
     func resolve_sig(self, anon decl_id: int64, p: parsing.Parser, type_args: [TypeKind] = []) -> SigInfo {
         let func_decl = p.func_decls[decl_id]
         let saved_ctx = self.context()
@@ -10901,6 +10954,12 @@ type Codegen = shared struct {
             .FuncLit(decl_id) -> {
                 // The lambda was registered with a synthesised name
                 // and label during compile_module.
+                if self.p.func_decls[decl_id].in_generic {
+                    if self.mut_fn_value(self.generic_lit_sig(decl_id), name: "", span: self.p.expr_spans[expr_id]) {
+                        return .VImm(value: 0)
+                    }
+                    return self.compile_closure(decl_id, lbl: self.generic_lit_label(decl_id))
+                }
                 let slot = self.lookup_lambda(decl_id)
                 if slot != -1 {
                     if self.mut_fn_value(self.fn_sig(slot), name: "", span: self.p.expr_spans[expr_id]) {
@@ -14191,14 +14250,18 @@ type Codegen = shared struct {
         let fd = self.p.func_decls[decl_id]
         mut env = LitEnv(:decl_id)
         env.return_kind = self.spawn_returns.get(f"{decl_id}")
+        if fd.in_generic {
+            env.label = lbl
+            env.ctx = self.context()
+            env.body_instance = self.body_instance
+            env.body_func_inst = self.body_func_inst
+            env.body_enum_inst = self.body_enum_inst
+        }
         mut refs: [int64] = []
         mut ok = true
         for i, c in fd.captures {
             let name = self.source_name(c.key)
-            if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 {
-                self.report_error(f"error: a function literal in a generic function or type can't capture `{name}`", span: c.span)
-                ok = false
-            } else if self.find_var_declared_mut(c.key) {
+            if self.find_var_declared_mut(c.key) {
                 // A captured `mut` local is a cell by now (see parsing.Renamer); a parameter isn't.
                 self.report_error(f"error: a function literal can't capture `{name}`, a `mut` parameter; copy it into a `mut` local to share it", span: c.span)
                 ok = false
@@ -14215,7 +14278,7 @@ type Codegen = shared struct {
         }
         mut known = false
         for e in self.lit_envs {
-            if e.decl_id == decl_id {
+            if e.decl_id == decl_id and e.label == env.label {
                 known = true
             }
         }
@@ -14265,10 +14328,6 @@ type Codegen = shared struct {
     // `spawn` to run, and the literal starts as a task of that group (of none,
     // detached). A `Task[T]` for a call that gives back a value, else nothing.
     func compile_spawn(self, anon call: int64, decl_id: int64, start: int64, start_none: int64, detached: bool, span: ast.Span) -> Val {
-        if self.body_instance >= 0 or self.body_func_inst >= 0 or self.body_enum_inst >= 0 {
-            self.report_error("error: `spawn` can't be used in a generic function or type yet", :span)
-            return .VImm(value: 0)
-        }
         let kind = self.spawn_kind(call, :decl_id)
         if kind is .KUnknown {
             self.report_error("error: cannot infer the type of the call `spawn` starts", :span)
@@ -16386,6 +16445,10 @@ type Codegen = shared struct {
                 return self.infer_kind(start)
             }
             .FuncLit(decl_id) -> {
+                if self.p.func_decls[decl_id].in_generic {
+                    let sig = self.generic_lit_sig(decl_id)
+                    return .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind)
+                }
                 // Same shape as a named function reference — return
                 // a KFunc built from the synthesised entry's
                 // pre-resolved signature.
@@ -21767,6 +21830,28 @@ type Codegen = shared struct {
     // `regalloc.pack` to collapse the chosen callee-saved set into a
     // dense `x19..` prefix.
 
+    // The body of a literal that captures or is in generic code (compile_closure),
+    // in the instance it was made in.
+    func compile_lit_env(self, anon env: LitEnv) -> none {
+        self.lit_env = env
+        let Some(ctx) = env.ctx else {
+            self.compile_func(fd_id: env.decl_id, struct_name: "", override_lbl: "")
+            return
+        }
+        let saved_ctx = self.enter(ctx.p, names: ctx.names, args: ctx.args)
+        let saved_instance = self.body_instance
+        let saved_func_inst = self.body_func_inst
+        let saved_enum_inst = self.body_enum_inst
+        self.body_instance = env.body_instance
+        self.body_func_inst = env.body_func_inst
+        self.body_enum_inst = env.body_enum_inst
+        self.compile_func(fd_id: env.decl_id, struct_name: "", override_lbl: env.label)
+        self.body_instance = saved_instance
+        self.body_func_inst = saved_func_inst
+        self.body_enum_inst = saved_enum_inst
+        self.leave(saved_ctx)
+    }
+
     // `owner` is the struct whose method this is, or -1.
     func compile_func_instance(self, anon idx: int64) -> none {
         let inst = self.func_insts[idx]
@@ -22256,7 +22341,7 @@ type Codegen = shared struct {
                 self.func_idx.set(synthesized, len(self.func_names))
                 self.func_names += [synthesized]
                 self.func_labels += [f"${self.path_prefix}${synthesized}"]
-                self.func_sigs += [self.resolve_sig(li, p: self.p)]
+                self.func_sigs += [self.lambda_sig(li, p: self.p)]
                 self.func_def_paths += [self.p.path]
                 self.func_def_spans += [self.p.func_decls[li].name_span]
                 self.func_docs += [""]
@@ -22324,7 +22409,7 @@ type Codegen = shared struct {
             }
         }
         for ld_id in lambda_decl_ids {
-            if len(self.p.func_decls[ld_id].captures) == 0 and not self.p.func_decls[ld_id].spawned {
+            if len(self.p.func_decls[ld_id].captures) == 0 and not self.p.func_decls[ld_id].spawned and not self.p.func_decls[ld_id].in_generic {
                 self.compile_func(fd_id: ld_id, struct_name: "", override_lbl: "")
             }
         }
@@ -22386,24 +22471,21 @@ type Codegen = shared struct {
             self.emit_symtab_entry(run_lbl, name: "kod test", file: self.p.path, line: 0)
         }
 
-        // A literal that captures can be compiled once what it captures has kinds, which
-        // is when its creation site has been. Its body may hold more such sites.
-        mut env_cursor = 0
-        for env_cursor < len(self.lit_envs) {
-            let env = self.lit_envs[env_cursor]
-            self.lit_env = env
-            self.compile_func(fd_id: env.decl_id, struct_name: "", override_lbl: "")
-            env_cursor += 1
-        }
-        self.lit_envs = []
-
         // Emit the method bodies of generic instances that something uses, and the generic
         // functions called. Each kind of body can ask for more of the other, and a vtable
-        // uses all of its interface's methods, so go round until all run out.
+        // uses all of its interface's methods, so go round until all run out. A literal
+        // that captures, or is in generic code, is compiled once what it captures has
+        // kinds, which is when its creation site has been. Its body may hold more such
+        // sites, or uses of instances.
+        mut env_cursor = 0
         mut vtable_cursor = 0
         mut method_cursor = 0
         mut func_cursor = 0
-        for vtable_cursor < len(self.vtable_types) or method_cursor < len(self.method_insts) or func_cursor < len(self.func_inst_queue) {
+        for env_cursor < len(self.lit_envs) or vtable_cursor < len(self.vtable_types) or method_cursor < len(self.method_insts) or func_cursor < len(self.func_inst_queue) {
+            for env_cursor < len(self.lit_envs) {
+                self.compile_lit_env(self.lit_envs[env_cursor])
+                env_cursor += 1
+            }
             for vtable_cursor < len(self.vtable_types) {
                 for m in self.interfaces[self.vtable_iface_idx[vtable_cursor]].methods {
                     let _ = self.owner_method_label(self.vtable_types[vtable_cursor], name: m.name)
@@ -22419,6 +22501,7 @@ type Codegen = shared struct {
                 func_cursor += 1
             }
         }
+        self.lit_envs = []
         self.emit_provided_thunks()
         let saved_instance = self.body_instance
         mut ci = 0

@@ -493,6 +493,9 @@ type Parser = shared struct {
     yield_values: [int64] = []
     value_returns: [lexing.Token] = []
     value_return_stmts: [int64] = []
+    // Inside a generic function, or a method of a generic type: a function
+    // literal here is compiled per instance (ast.FuncDecl.in_generic).
+    in_generic: bool = false
     // Parallel to `patterns`: where each pattern's last token ends.
     pattern_ends: [int64] = []
     // Parallel to `type_exprs` up to the last qualified one: the module alias a
@@ -1962,7 +1965,7 @@ type Parser = shared struct {
         let inner = self.alloc_expr(ast.Expr.Call(:callee, args: inner_args), :span)
         let ret = self.alloc_stmt(ast.Stmt.Return(value: inner))
         let no_params: [ast.Param] = []
-        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, body: [ret], doc: "", :captures, spawned: true))
+        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, body: [ret], doc: "", :captures, spawned: true, in_generic: self.in_generic))
         // A literal binds names inside an expression, which the Renamer looks for.
         self.binding_exprs += 1
         let lit = self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
@@ -2136,7 +2139,7 @@ type Parser = shared struct {
                 self.drop_yields()
             }
             self.leave_function(outer)
-            let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark)
+            let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark, in_generic: self.in_generic)
             let decl_id: int64 = self.alloc_func_decl(fd)
             return self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
         }
@@ -3328,10 +3331,15 @@ type Parser = shared struct {
         let ret_end = self.pos
         let binding_mark = self.binding_exprs
         let outer = self.enter_function()
+        let outer_generic = self.in_generic
+        if len(type_params) > 0 {
+            self.in_generic = true
+        }
         mut body: [int64] = self.parse_block()
         if len(self.yields) > 0 {
-            body = self.generator_body(body, :return_typ, :ret_start, :ret_end, :name_span, generic: len(type_params) > 0)
+            body = self.generator_body(body, :return_typ, :ret_start, :ret_end, :name_span)
         }
+        self.in_generic = outer_generic
         self.leave_function(outer)
         return ast.FuncDecl(:name, :name_span, :params, :return_typ, :body, :doc, expr_binds: self.binding_exprs > binding_mark, :type_params)
     }
@@ -3370,7 +3378,7 @@ type Parser = shared struct {
     //
     // The constructor is parsed again from the return type's tokens, which must
     // name a `Channel[T]`.
-    func generator_body(self, anon body: [int64], return_typ: int64, ret_start: int64, ret_end: int64, name_span: ast.Span, generic: bool) -> [int64] {
+    func generator_body(self, anon body: [int64], return_typ: int64, ret_start: int64, ret_end: int64, name_span: ast.Span) -> [int64] {
         mut names_channel = false
         mut i = ret_start
         for i + 1 < ret_end {
@@ -3381,11 +3389,6 @@ type Parser = shared struct {
         }
         if return_typ == 0 or not names_channel {
             self.record_error("error: a function with `yield` gives back a `tasks.Channel[T]`, which the values are sent on", got: self.tokens[ret_start - 1])
-            self.drop_yields()
-            return body
-        }
-        if generic {
-            self.record_error("error: `yield` can't be used in a generic function or type yet", got: self.tokens[ret_start - 1])
             self.drop_yields()
             return body
         }
@@ -3402,7 +3405,7 @@ type Parser = shared struct {
         let ctor = self.alloc_expr(ast.Expr.Call(callee: channel_type, args: no_args), :span)
         let make = self.alloc_stmt(ast.Stmt.Let(name: "__gen", typ: 0, value: ctor, mutable: false))
         let no_params: [ast.Param] = []
-        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, :body, doc: ""))
+        let decl_id = self.alloc_func_decl(ast.FuncDecl(name: "", name_span: span, params: no_params, return_typ: 0, :body, doc: "", in_generic: self.in_generic))
         self.binding_exprs += 1
         let lit = self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
         let gen = self.alloc_expr(ast.Expr.Ident(name: "__gen"), :span)
@@ -3695,11 +3698,13 @@ type Parser = shared struct {
                 self.skip_newlines()
                 mut fields: [ast.StructField] = self.parse_struct_fields()
                 mut methods: [int64] = []
+                self.in_generic = len(type_params) > 0
                 for self.at(.KwFunc) {
                     let module: ast.FuncDecl = self.parse_func_decl(doc: "", is_method: true)
                     methods += [self.alloc_func_decl(module)]
                     self.skip_newlines()
                 }
+                self.in_generic = false
                 self.expect(.CloseCurly)
                 self.skip_newlines()
                 return ast.Decl.Struct(:name, :name_span, :type_params, :fields, :methods, :shared)
@@ -3709,11 +3714,13 @@ type Parser = shared struct {
                 self.skip_newlines()
                 mut variants: [ast.EnumVariant] = self.parse_enum_variants()
                 mut methods: [int64] = []
+                self.in_generic = len(type_params) > 0
                 for self.at(.KwFunc) {
                     let method: ast.FuncDecl = self.parse_func_decl(doc: "", is_method: true)
                     methods += [self.alloc_func_decl(method)]
                     self.skip_newlines()
                 }
+                self.in_generic = false
                 self.expect(.CloseCurly)
                 self.skip_newlines()
                 return ast.Decl.Enum(:name, :name_span, :type_params, :variants, :methods)

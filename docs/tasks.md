@@ -316,6 +316,5 @@ switch from one task to another costs about 50 ns, and starting a task about
 
 ## What isn't built yet
 
-`spawn` and `yield` don't work in a generic function or type yet. Tasks run on
-one thread; using several
-cores is [step 2](concurrency.md#building-it).
+Tasks run on one thread; using several cores is
+[step 2](concurrency.md#building-it).

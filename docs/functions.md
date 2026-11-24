@@ -473,10 +473,6 @@ Other limits:
 - A literal can't see its own `let`, so it can't call itself through it. Use a
   named function to recurse: `` unknown function `fact`; a function literal can't
   see its own `let`, so use a named function to recurse ``.
-- A literal inside a generic function, or a method of a generic type, can't
-  capture: `` a function literal in a generic function or type can't capture
-  `x` ``. Passing a closure to a generic function works, as in
-  `sort.sorted_by(xs, less: ...)`.
 - A default value sees no locals, so a literal used as one captures nothing.
 - A closure kept in a struct that it captures is a cycle, and a cycle is never
   freed (see [Reclaiming memory](memory-layout.md#reclaiming-memory)).
@@ -580,6 +576,19 @@ Parameter defaults and the body resolve names in the module that wrote them,
 as for a [generic struct's methods](modules.md), and `T` means the instance's
 type in both.
 
+A function literal in a generic body, or in a method of a generic type, is
+compiled for each instance too: it can name `T` and capture, as anywhere else.
+
+```kod
+func repeater[T](anon x: T) -> func(int64) -> [T] {
+    return func(anon n: int64) -> [T] {
+        return [x] * n
+    }
+}
+
+print(repeater("ab")(3))     // ["ab", "ab", "ab"]
+```
+
 ### Limits
 
 - A generic function is a value once it has its type arguments, as in
@@ -590,8 +599,6 @@ type in both.
 - Only top-level functions can be generic. A method can use its struct's type
   parameters but can't declare its own, and neither can an interface method, a
   function literal, an extern or `main`. A module-level constant can't either.
-- A function literal in a generic body can't name `T`, as in a generic struct's
-  methods, because it's compiled once and not per instance.
 - A type parameter's name can't repeat in one list, and hides a type of the
   same name for the length of the function.
 
