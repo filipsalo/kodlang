@@ -103,6 +103,11 @@ type Outgoing = shared struct {
     url: Url
     headers: Headers
     body: bytes
+    // Where the body comes from instead, and its length when that is known.
+    body_from: Reader? = none
+    body_length: int64? = none
+    // Why writing it failed, when that is what did.
+    unsent: Error? = none
 }
 
 type Response = shared struct {
@@ -116,9 +121,26 @@ type Response = shared struct {
     // known (http.stream).
     writer: (func(BodyWriter) -> none or Error)? = none
     length: int64? = none
+    // The body that is yet to be read (Client.open).
+    stream: OpenBody? = none
 
     func text(self) -> str {
         return kod_bytes_to_str(self.body)
+    }
+
+    // The body, as it comes when the response was opened.
+    func reader(self) -> Reader {
+        if self.stream is OpenBody(b) {
+            return b
+        }
+        return MemReader(data: self.body, pos: 0)
+    }
+
+    // Ends the body of an opened response, if it hasn't been read to its end.
+    func close(self) -> none {
+        if self.stream is OpenBody(b) {
+            b.close()
+        }
     }
 
     func ok(self) -> bool {
@@ -554,15 +576,71 @@ func write_request(anon w: Writer, anon req: Outgoing, keep_alive: bool = false,
     if accept_gzip and not req.headers.has("Accept-Encoding") {
         out.append("Accept-Encoding: gzip\r\n")
     }
-    if len(req.body) > 0 or is_post_like(req.method) {
-        out.append("Content-Length: " + len(req.body).to_str() + "\r\n")
+    if req.body_from is not none {
+        if req.body_length is int64(n) {
+            out.append(length_header(n))
+        } else {
+            out.append(CHUNKED)
+        }
+    } else if len(req.body) > 0 or is_post_like(req.method) {
+        out.append(length_header(len(req.body)))
     }
     if not keep_alive {
         out.append("Connection: close\r\n")
     }
     out.append("\r\n")
+    if req.body_from is Some(from) {
+        try write_body_from(w, req, from, after: out)
+        return
+    }
     out.append_bytes(req.body)
-    try w.write_all(out.to_bytes())
+    try write_piece(w, req, out)
+}
+
+// Writes `piece` and empties it; a failure is kept with `req`.
+func write_piece(anon w: Writer, anon req: Outgoing, anon piece: StrBuilder) -> none or Error {
+    if w.write_all(piece.to_bytes()) is Err(e) {
+        req.unsent = e
+        throw e
+    }
+    piece.clear()
+}
+
+// Writes the body that `from` gives, the first of it together with `after`.
+func write_body_from(anon w: Writer, anon req: Outgoing, anon from: Reader, after: StrBuilder) -> none or Error {
+    let out = after
+    mut total: int64 = 0
+    for true {
+        let data = try from.read(STREAM_PIECE)
+        total += len(data)
+        if req.body_length is int64(n) and (total > n or (len(data) == 0 and total < n)) {
+            throw invalid("write request", f"{total} bytes of a body of {n}")
+        }
+        if req.body_length is none {
+            add_chunk(out, data)
+        } else {
+            out.append_bytes(data)
+        }
+        if out.len() > 0 {
+            try write_piece(w, req, out)
+        }
+        if len(data) == 0 {
+            return
+        }
+    }
+}
+
+let CHUNKED: str = "Transfer-Encoding: chunked\r\n"
+
+// `data` as a chunk; without any, the last one.
+func add_chunk(anon out: StrBuilder, anon data: bytes) -> none {
+    if len(data) == 0 {
+        out.append("0\r\n\r\n")
+        return
+    }
+    out.append(f"{len(data):x}\r\n")
+    out.append_bytes(data)
+    out.append("\r\n")
 }
 
 // ---- reading a response ----
@@ -743,9 +821,56 @@ func read_length(anon headers: Headers, anon limits: Limits) -> int64 or Error {
     return n
 }
 
-func read_body(anon br: BufReader, anon method: str, status: int64, headers: Headers, budget: Budget, limits: Limits) -> bytes or Error {
-    if method == "HEAD" or status < 200 or status == 204 or status == 304 {
-        return kod_str_to_bytes("")
+// A body as it comes, in whatever way the headers say it is framed.
+type Frames = shared struct {
+    br: BufReader
+    limits: Limits
+    chunked: bool = false
+    // Of the body, or of this chunk; -1 when it goes on until the connection ends.
+    left: int64 = 0
+    done: bool = false
+
+    // Some of the body, at most `max` bytes; none of it at the end.
+    func next(self, anon max: int64) -> bytes or Error {
+        if self.done or max <= 0 {
+            return kod_str_to_bytes("")
+        }
+        if self.chunked and self.left == 0 {
+            self.left = try read_chunk_size(self.br)
+            if self.left == 0 {
+                let budget = Budget(left: self.limits.max_header_bytes, headers: 0)
+                try read_headers(self.br, budget, Headers(), max_headers: self.limits.max_headers)
+                self.done = true
+                return kod_str_to_bytes("")
+            }
+        }
+        mut want = max
+        if 0 <= self.left < want {
+            want = self.left
+        }
+        let data = try self.br.read(want)
+        if len(data) == 0 {
+            if self.left < 0 {
+                self.done = true
+                return data
+            }
+            throw truncated("connection closed before the end of the body")
+        }
+        if self.left > 0 {
+            self.left -= len(data)
+            if self.left == 0 and self.chunked {
+                try read_chunk_end(self.br)
+            }
+            self.done = self.left == 0 and not self.chunked
+        }
+        return data
+    }
+}
+
+// How the body of a response is framed.
+func response_frames(anon br: BufReader, anon method: str, status: int64, headers: Headers, limits: Limits) -> Frames or Error {
+    if method == "HEAD" or not may_have_body(status) {
+        return Frames(:br, :limits, done: true)
     }
     let codings = headers.all("transfer-encoding")
     if len(codings) > 0 {
@@ -754,11 +879,22 @@ func read_body(anon br: BufReader, anon method: str, status: int64, headers: Hea
                 throw protocol(f"unsupported Transfer-Encoding {v}")
             }
         }
-        return try read_chunked(br, budget, limits: limits)
+        return Frames(:br, :limits, chunked: true)
     }
-    let n = try read_length(headers, limits)
-    if n >= 0 {
-        return try br.read_exact(n)
+    let left = try read_length(headers, limits)
+    return Frames(:br, :limits, :left, done: left == 0)
+}
+
+func read_body(anon br: BufReader, anon method: str, status: int64, headers: Headers, budget: Budget, limits: Limits) -> bytes or Error {
+    let frames = try response_frames(br, method, :status, :headers, :limits)
+    if frames.done {
+        return kod_str_to_bytes("")
+    }
+    if frames.chunked {
+        return try read_chunked(br, budget, :limits)
+    }
+    if frames.left > 0 {
+        return try br.read_exact(frames.left)
     }
     let out = StrBuilder()
     for true {
@@ -808,13 +944,20 @@ func may_reuse(anon method: str, status: StatusLine, headers: Headers) -> bool {
     return has_token(headers, "connection", "keep-alive")
 }
 
-func read_one(anon br: BufReader, anon method: str, limits: Limits) -> Response or Error {
+// With `whole` false, the body is left to be read by the response's `stream`.
+func read_one(anon br: BufReader, anon method: str, limits: Limits, whole: bool = true) -> Response or Error {
     mut interim: int64 = 0
     for true {
         let budget = Budget(left: limits.max_header_bytes, headers: 0)
         let status = try parse_status(try next_line(br, budget))
         let headers = Headers()
         try read_headers(br, budget, headers, max_headers: limits.max_headers)
+        if status.code >= 200 and not whole {
+            mut unlimited = limits
+            unlimited.max_body = MAX_LENGTH
+            let frames = try response_frames(br, method, status: status.code, :headers, limits: unlimited)
+            return Response(status: status.code, reason: status.reason, :headers, body: kod_str_to_bytes(""), keep_alive: may_reuse(method, :status, :headers), stream: OpenBody(:frames))
+        }
         if status.code >= 200 {
             let body = try read_body(br, method, status: status.code, headers: headers, budget: budget, limits: limits)
             return Response(status: status.code, reason: status.reason, headers: headers, body: body, keep_alive: may_reuse(method, status: status, headers: headers))
@@ -844,6 +987,8 @@ func read_response(anon br: BufReader, anon method: str, limits: Limits = Limits
 type Options = shared struct {
     headers: Headers = Headers()
     body: bytes = kod_str_to_bytes("")
+    body_from: Reader? = none
+    body_length: int64? = none
     trust_file: str? = none
     timeout: Duration? = none
     max_redirects: int64? = none
@@ -856,6 +1001,8 @@ type Options = shared struct {
 type Settings = shared struct {
     headers: Headers
     body: bytes
+    body_from: Reader?
+    body_length: int64?
     trust_file: str
     timeout: Duration
     max_redirects: int64
@@ -1106,9 +1253,91 @@ func decode_content(anon resp: Response, anon limits: Limits) -> Response or Err
 }
 
 // Write `req` and read its response.
-func attempt(anon link: Link, anon br: BufReader, anon req: Outgoing, cfg: Settings, keep_alive: bool) -> Response or Error {
-    try write_request(link, req, keep_alive: keep_alive, accept_gzip: cfg.accept_gzip)
-    return read_response(br, req.method, limits: cfg.limits)
+func attempt(anon link: Link, anon br: BufReader, anon req: Outgoing, cfg: Settings, keep_alive: bool, whole: bool) -> Response or Error {
+    let sent = write_request(link, req, :keep_alive, accept_gzip: cfg.accept_gzip and whole)
+    if sent is Err(e) {
+        // A server may answer without reading all of a body.
+        let has_body = len(req.body) > 0 or req.body_from is not none
+        if has_body and req.unsent is not none and gone(e) {
+            let early = read_one(br, req.method, limits: cfg.limits, :whole)
+            if early is Ok(resp) {
+                resp.keep_alive = false
+                return resp
+            }
+        }
+        throw e
+    }
+    return try read_one(br, req.method, limits: cfg.limits, :whole)
+}
+
+// Whether `e` says that the other side reads no more.
+func gone(anon e: Error) -> bool {
+    if e is IoError(io) {
+        return io.kind == .BrokenPipe or io.kind == .ConnectionReset
+    }
+    return false
+}
+
+// The body of an opened response: see docs/http.md.
+type OpenBody = shared struct {
+    frames: Frames
+    // Its connection, until it has ended, and where that goes then.
+    link: Link? = none
+    client: Client? = none
+    key: str = ""
+    keep: bool = false
+    failed: Error? = none
+
+    func read(self, anon max: int64) -> bytes or Error {
+        if self.failed is Some(e) {
+            throw e
+        }
+        let got = self.frames.next(max)
+        if got is Err(e) {
+            self.failed = e
+            self.end(keep: false)
+            throw e
+        }
+        if self.frames.done {
+            self.end(keep: self.keep)
+        }
+        return got
+    }
+
+    func close(self) -> none {
+        if self.link is not none {
+            self.failed = invalid("read", "the response is closed")
+            self.end(keep: false)
+        }
+    }
+
+    // Reads the rest, when there is little of it, so that the connection can be
+    // used again, and closes it.
+    func drop_rest(self) -> none {
+        mut most = STREAM_PIECE
+        for self.link is not none and most > 0 {
+            let got = self.read(most)
+            if got is Err(_) {
+                return
+            }
+            most -= len(got)
+        }
+        self.close()
+    }
+
+    func end(self, keep: bool) -> none {
+        let Some(link) = self.link else {
+            return
+        }
+        self.link = none
+        let br = self.frames.br
+        if keep and br.pos >= len(br.buf) and self.client is Client(c) {
+            c.keep(self.key, link)
+        } else {
+            discard(link)
+        }
+        self.client = none
+    }
 }
 
 // Connections kept between requests. See docs/http.md.
@@ -1129,6 +1358,8 @@ type Client = shared struct {
         return Settings(
             headers: merged(self.headers, options.headers),
             body: options.body,
+            body_from: options.body_from,
+            body_length: options.body_length,
             trust_file: options.trust_file? or self.trust_file,
             timeout: options.timeout? or self.timeout,
             max_redirects: options.max_redirects? or self.max_redirects,
@@ -1192,10 +1423,12 @@ type Client = shared struct {
         self.pool = empty
     }
 
-    func acquire(self, anon key: str, anon url: Url, cfg: Settings, deadline_ns: int64) -> Acquired or Error {
-        let kept = self.take(key)
-        if kept is Some(entry) {
-            return Acquired(link: entry.link, reused: true)
+    func acquire(self, anon key: str, anon url: Url, cfg: Settings, deadline_ns: int64, fresh: bool) -> Acquired or Error {
+        if not fresh {
+            let kept = self.take(key)
+            if kept is Some(entry) {
+                return Acquired(link: entry.link, reused: true)
+            }
         }
         let connect_ms = try wait_ms(timeout_ms: cfg.timeout.ceil_ms(), deadline_ns: deadline_ns)
         let link = try open_link(url, cfg: cfg, connect_ms: connect_ms)
@@ -1203,17 +1436,19 @@ type Client = shared struct {
     }
 
     // One request, on a kept connection if there is one, else on a new one.
-    func exchange(self, anon req: Outgoing, cfg: Settings, deadline_ns: int64) -> Response or Error {
+    // With `whole` false, its body is yet to be read.
+    func exchange(self, anon req: Outgoing, cfg: Settings, deadline_ns: int64, whole: bool) -> Response or Error {
         let url = req.url
         let key = f"{url.scheme}://{url.host}:{url.port}"
         let reuse = self.max_idle_per_host > 0
         mut repeated = false
         for true {
-            let got = try self.acquire(key, url, cfg: cfg, deadline_ns: deadline_ns)
+            // What a Reader gave can't be sent again, should a reused connection be dead.
+            let got = try self.acquire(key, url, cfg: cfg, deadline_ns: deadline_ns, fresh: req.body_from is not none)
             let link = got.link
             link.arm(cfg.timeout.ceil_ms(), deadline_ns)
             let br = BufReader(inner: link, limit: cfg.limits.max_header_bytes)
-            let outcome = attempt(link, br, req, cfg: cfg, keep_alive: reuse)
+            let outcome = attempt(link, br, req, cfg: cfg, keep_alive: reuse, :whole)
             if outcome is Err(e) {
                 discard(link)
                 if got.reused and not repeated and link.received() == 0 and repeatable(req.method) {
@@ -1223,6 +1458,16 @@ type Client = shared struct {
                 throw e
             }
             let response = outcome
+            if response.stream is OpenBody(body) {
+                body.link = link
+                body.client = self
+                body.key = key
+                body.keep = reuse and response.keep_alive
+                if body.frames.done {
+                    body.end(keep: body.keep)
+                }
+                return response
+            }
             if reuse and response.keep_alive and br.pos >= len(br.buf) {
                 self.keep(key, link)
             } else {
@@ -1234,7 +1479,19 @@ type Client = shared struct {
     }
 
     func fetch(self, anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+        return try self.request(method, url, options, whole: true)
+    }
+
+    // As fetch, without reading the body: see Response.reader and close.
+    func open(self, anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+        return try self.request(method, url, options, whole: false)
+    }
+
+    func request(self, anon method: str, anon url: str, anon options: Options, whole: bool) -> Response or Error {
         let cfg = self.settings(options)
+        if cfg.body_from is not none and len(cfg.body) > 0 {
+            throw invalid("fetch", "both a body and body_from")
+        }
         if cfg.deadline < Duration() {
             throw invalid("fetch", "deadline cannot be negative")
         }
@@ -1245,14 +1502,18 @@ type Client = shared struct {
         mut current = try parse_url(url)
         mut verb = method
         mut payload = cfg.body
+        mut from = cfg.body_from
         mut headers = cfg.headers
         mut hops: int64 = 0
         for true {
-            let req = Outgoing(method: verb, url: current, headers: headers, body: payload)
-            let resp = try self.exchange(req, cfg: cfg, deadline_ns: deadline_ns)
+            let req = Outgoing(method: verb, url: current, headers: headers, body: payload, body_from: from, body_length: cfg.body_length)
+            let resp = try self.exchange(req, cfg: cfg, deadline_ns: deadline_ns, :whole)
             let location = resp.header("location")
             if not is_redirect(resp.status) or location is none or cfg.max_redirects <= 0 {
                 return resp
+            }
+            if resp.stream is OpenBody(body) {
+                body.drop_rest()
             }
             hops = hops + 1
             if hops > cfg.max_redirects {
@@ -1267,7 +1528,10 @@ type Client = shared struct {
                     verb = "GET"
                 }
                 payload = kod_str_to_bytes("")
+                from = none
                 headers = without(headers, ["content-type"])
+            } else if from is not none {
+                throw invalid("redirect", "a body from a Reader can't be sent again")
             }
             if next.host != current.host or next.port != current.port {
                 headers = without(headers, ["authorization", "cookie", "proxy-authorization"])
@@ -1305,6 +1569,8 @@ func with_body(anon options: Options, anon body: bytes, anon content_type: str) 
     return Options(
         headers: headers,
         body: body,
+        body_from: options.body_from,
+        body_length: options.body_length,
         trust_file: options.trust_file,
         timeout: options.timeout,
         max_redirects: options.max_redirects,
@@ -1339,6 +1605,11 @@ func without(anon headers: Headers, anon names: [str]) -> Headers {
 func fetch(anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
     let client = Client(max_idle_per_host: 0)
     return try client.fetch(method, url, options: options)
+}
+
+func open(anon method: str, anon url: str, options: Options = Options()) -> Response or Error {
+    let client = Client(max_idle_per_host: 0)
+    return try client.open(method, url, options: options)
 }
 
 func get(anon url: str, options: Options = Options()) -> Response or Error {
@@ -1905,13 +2176,13 @@ type BodyWriter = shared struct {
             framing = length_header(self.buf.len())
         } else if self.chunks {
             self.chunked = true
-            framing = "Transfer-Encoding: chunked\r\n"
+            framing = CHUNKED
         } else {
             self.keep_alive = false
         }
         if self.conn is ServerConn(c) {
             c.replying = true
-            if c.body is BodyReader(b) and not b.done {
+            if c.body is BodyReader(b) and not b.done() {
                 self.keep_alive = false
             }
         }
@@ -1921,22 +2192,21 @@ type BodyWriter = shared struct {
 
 // A request's body, as it comes: see docs/http.md#streaming.
 type BodyReader = shared struct {
-    br: BufReader
+    frames: Frames
     conn: ServerConn
-    limits: Limits
-    chunked: bool
-    // Of the body, or of this chunk.
-    left: int64
     // The client waits to be told to go on.
     expected: bool = false
-    done: bool = false
     failed: IoError? = none
+
+    func done(self) -> bool {
+        return self.frames.done
+    }
 
     func read(self, anon max: int64) -> bytes or Error {
         if self.failed is IoError(e) {
             throw e
         }
-        if self.done or max <= 0 {
+        if self.done() or max <= 0 {
             return kod_str_to_bytes("")
         }
         let conn = self.conn
@@ -1961,41 +2231,16 @@ type BodyReader = shared struct {
                 try self.conn.write_all(kod_str_to_bytes("HTTP/1.1 100 Continue\r\n\r\n"))
             }
         }
-        if self.chunked and self.left == 0 {
-            self.left = try read_chunk_size(self.br)
-            if self.left == 0 {
-                let budget = Budget(left: self.limits.max_header_bytes, headers: 0)
-                try read_headers(self.br, budget, Headers(), max_headers: self.limits.max_headers)
-                self.done = true
-                return kod_str_to_bytes("")
-            }
-        }
-        mut want = max
-        if want > self.left {
-            want = self.left
-        }
-        let data = try self.br.read(want)
-        if len(data) == 0 {
-            throw truncated("connection closed before the end of the body")
-        }
-        self.left -= len(data)
-        if self.left == 0 {
-            if self.chunked {
-                try read_chunk_end(self.br)
-            } else {
-                self.done = true
-            }
-        }
-        return data
+        return try self.frames.next(max)
     }
 
     // Reads the rest, when there is little of it, so that the connection can go on.
     func drop_rest(self) -> none {
-        if self.failed is not none or self.expected or (not self.chunked and self.left > STREAM_PIECE) {
+        if self.failed is not none or self.expected or (not self.frames.chunked and self.frames.left > STREAM_PIECE) {
             return
         }
         mut most = STREAM_PIECE
-        for not self.done and most > 0 {
+        for not self.done() and most > 0 {
             let got = self.read(most)
             if got is Err(_) {
                 return
@@ -2323,7 +2568,7 @@ type ServerConn = shared struct {
             if self.gone {
                 return
             }
-            if self.body is BodyReader(b) and not b.done and resp.writer is none {
+            if self.body is BodyReader(b) and not b.done() and resp.writer is none {
                 b.drop_rest()
             }
             let keep_alive = req.keep_alive and not server.stopping and not server.full
@@ -2332,7 +2577,7 @@ type ServerConn = shared struct {
                 server.log_access(req, self, began)
             }
             if not try replied {
-                if self.body is BodyReader(b) and not b.done {
+                if self.body is BodyReader(b) and not b.done() {
                     self.end_gently()
                 }
                 return
@@ -2398,8 +2643,12 @@ type ServerConn = shared struct {
         mut left: int64 = 0
         if not chunked {
             left = try read_length(req.headers, limits)
+            if left < 0 {
+                left = 0
+            }
         }
-        let body = BodyReader(:br, conn: self, :limits, :chunked, :left, :expected, done: not chunked and left <= 0)
+        let frames = Frames(:br, :limits, :chunked, :left, done: not chunked and left == 0)
+        let body = BodyReader(:frames, conn: self, :expected)
         self.body = body
         req.stream = body
     }
@@ -2411,7 +2660,7 @@ type ServerConn = shared struct {
             return try self.reply_stream(req, resp, write, :keep_alive)
         }
         mut goes_on = keep_alive
-        if self.body is BodyReader(b) and not b.done {
+        if self.body is BodyReader(b) and not b.done() {
             goes_on = false
         }
         self.replying = true

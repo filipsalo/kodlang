@@ -1,0 +1,517 @@
+// Bodies a client reads as they come, and sends from a Reader
+// (docs/http.md#bodies-that-dont-fit-in-memory).
+import "net/http" { BodyWriter, Client, Options, Request, Response, Router, Server, get, open, redirect, status, stream, text }
+import "net/tcp"
+import "posix" { Fd }
+import "strbuilder" { StrBuilder }
+import "stream" { IoError, MemReader, Reader }
+import "tasks"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+func times(anon c: str, anon n: int64) -> bytes {
+    let out = StrBuilder()
+    for _i in 0..n {
+        out.append(c)
+    }
+    return out.to_bytes()
+}
+
+// A Reader of `n` bytes, `step` at a time, which fails after `fail_at` of them.
+type Source = shared struct {
+    n: int64
+    step: int64 = 10000
+    fail_at: int64 = -1
+    given: int64 = 0
+
+    func read(self, anon max: int64) -> bytes or Error {
+        if self.fail_at >= 0 and self.given >= self.fail_at {
+            throw IoError(kind: .Other, op: "source", errno: 0, detail: "dry")
+        }
+        mut k = self.step
+        if k > max {
+            k = max
+        }
+        if k > self.n - self.given {
+            k = self.n - self.given
+        }
+        self.given += k
+        return times("a", k)
+    }
+}
+
+mut _addresses: [str] = []
+
+func big(anon req: Request) -> Response or Error {
+    _addresses += [req.remote]
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        for i in 0..40 {
+            try w.write_all(times(f"{i % 10}", 10000))
+        }
+    })
+}
+
+func sized(anon req: Request) -> Response or Error {
+    _addresses += [req.remote]
+    return text("hello")
+}
+
+func slowly(anon _req: Request) -> Response or Error {
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        for i in 0..4 {
+            try w.write_str(f"{i}")
+            try w.flush()
+            time.sleep(Duration(ms: 60))
+        }
+    })
+}
+
+func breaks(anon _req: Request) -> Response or Error {
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        try w.write_str("some")
+        try w.flush()
+        throw IoError(kind: .Other, op: "breaks", errno: 0, detail: "no more")
+    })
+}
+
+func count(anon req: Request) -> Response or Error {
+    _addresses += [req.remote]
+    let body = req.reader()
+    mut n: int64 = 0
+    for true {
+        let data = try body.read(65536)
+        if len(data) == 0 {
+            break
+        }
+        n += len(data)
+    }
+    let how = req.header("transfer-encoding")? or f"length {req.header("content-length")? or "none"}"
+    return text(f"{n} {how}")
+}
+
+func refuse(anon _req: Request) -> Response or Error {
+    return text("too much", status: 413)
+}
+
+func moved(anon req: Request) -> Response or Error {
+    return redirect(req.query("to")? or "/sized", status: (req.query("status")? or "302").parse_int()? or 302)
+}
+
+func empty(anon _req: Request) -> Response or Error {
+    return status(204)
+}
+
+type Fixture = shared struct {
+    l: tcp.Listener
+    server: Server
+
+    func init() -> Fixture {
+        _addresses = []
+        let routes = Router()
+        routes.get("/big", big)
+        routes.get("/sized", sized)
+        routes.get("/slowly", slowly)
+        routes.get("/breaks", breaks)
+        routes.get("/empty", empty)
+        routes.get("/moved", moved)
+        routes.put("/count", count, stream_body: true)
+        routes.post("/count", count, stream_body: true)
+        routes.put("/refuse", refuse, stream_body: true)
+        routes.put("/moved", moved, stream_body: true)
+        let server = Server(:routes, log: func(anon _line: str) {
+        })
+        return Fixture(l: must tcp.listen("127.0.0.1", port: 0), :server)
+    }
+
+    func url(self, anon path: str) -> str {
+        return f"http://127.0.0.1:{self.l.port()}{path}"
+    }
+
+    func end(self, anon serving: tasks.Task[str]) -> none {
+        self.server.stop(within: Duration(ms: 200))
+        assert serving.wait() == "ok"
+        must self.l.close()
+    }
+}
+
+func serve(anon f: Fixture) -> str {
+    if f.server.serve(f.l) is Err(e) {
+        return e.to_str()
+    }
+    return "ok"
+}
+
+func message(anon e: Error) -> str {
+    return e.to_str()
+}
+
+func all_of(anon r: Reader) -> str {
+    let got = r.read_all()
+    if got is Err(e) {
+        return f"[{e.to_str()}]"
+    }
+    return kod_bytes_to_str(got)
+}
+
+// Answers one connection with `answer`, after reading what comes within 50 ms,
+// and closes it.
+func answer_once(anon l: tcp.Listener, anon answer: str) -> str {
+    let conn = must l.accept()
+    time.sleep(Duration(ms: 50))
+    let got = kod_bytes_to_str(must conn.read(65536))
+    must conn.write_all(kod_str_to_bytes(answer))
+    must conn.close()
+    return got
+}
+
+test "a body is read as it comes" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let resp = must client.open("GET", f.url("/big"))
+    assert resp.status == 200
+    assert len(resp.body) == 0
+    let body = resp.reader()
+    mut n: int64 = 0
+    for true {
+        let data = must body.read(5000)
+        if len(data) == 0 {
+            break
+        }
+        assert len(data) <= 5000
+        for c in data {
+            assert c == 48 + (n / 10000) % 10
+            n += 1
+        }
+    }
+    assert n == 400000
+    // Still at its end.
+    assert len(must body.read(10)) == 0
+    client.close()
+    f.end(serving)
+}
+
+test "the response is there before its body" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let t0 = monotonic_ns()
+    let resp = must open("GET", f.url("/slowly"))
+    let body = resp.reader()
+    assert kod_bytes_to_str(must body.read(100)) == "0"
+    assert monotonic_ns() - t0 < 50000000
+    assert all_of(body) == "123"
+    f.end(serving)
+}
+
+test "a body past max_body" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    client.limits.max_body = 10
+    assert client.fetch("GET", f.url("/big")) is Err(_)
+    assert len(all_of((must client.open("GET", f.url("/big"))).reader())) == 400000
+    client.close()
+    f.end(serving)
+}
+
+test "connections are used again after a body read to its end" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    for _i in 0..2 {
+        assert len(all_of((must client.open("GET", f.url("/big"))).reader())) == 400000
+        assert all_of((must client.open("GET", f.url("/sized"))).reader()) == "hello"
+        assert (must client.get(f.url("/sized"))).text() == "hello"
+        // No body: nothing to read first.
+        assert (must client.open("HEAD", f.url("/sized"))).status == 200
+        assert (must client.open("GET", f.url("/empty"))).status == 204
+    }
+    assert len(client.pool) == 1
+    for a in _addresses {
+        assert a == _addresses[0]
+    }
+    client.close()
+    f.end(serving)
+}
+
+test "two bodies at once, on connections of their own" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let a = must client.open("GET", f.url("/big"))
+    let b = must client.open("GET", f.url("/big"))
+    let ra = a.reader()
+    let rb = b.reader()
+    mut n: int64 = 0
+    for _i in 0..20 {
+        assert kod_bytes_to_str(must ra.read_exact(20000)) == kod_bytes_to_str(must rb.read_exact(20000))
+        n += 20000
+    }
+    assert n == 400000
+    assert _addresses[0] != _addresses[1]
+    a.close()
+    b.close()
+    client.close()
+    f.end(serving)
+}
+
+test "close ends a body before its end" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let resp = must client.open("GET", f.url("/big"))
+    let body = resp.reader()
+    assert len(must body.read(100)) == 100
+    resp.close()
+    resp.close()
+    assert all_of(body) == "[read: the response is closed]"
+    assert len(client.pool) == 0
+    time.sleep(Duration(ms: 30))
+    assert len(f.server.conns) == 0
+    // After the end, it does nothing.
+    let whole = must client.open("GET", f.url("/sized"))
+    assert all_of(whole.reader()) == "hello"
+    whole.close()
+    assert len(client.pool) == 1
+    client.close()
+    f.end(serving)
+}
+
+test "a body cut short" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let resp = must client.open("GET", f.url("/breaks"))
+    let body = resp.reader()
+    assert kod_bytes_to_str(must body.read(100)) == "some"
+    for _i in 0..2 {
+        if body.read(100) is Err(IoError(e)) {
+            assert e.kind == .UnexpectedEof
+        } else {
+            fail("read past a body's end")
+        }
+    }
+    assert len(client.pool) == 0
+    client.close()
+    f.end(serving)
+}
+
+test "bodies framed in other ways" {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let url = f"http://127.0.0.1:{l.port()}/"
+    let cases = [
+        // Until the connection closes.
+        ["HTTP/1.1 200 OK\r\n\r\nall of it", "all of it"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef", "abc"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", ""],
+        ["HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;a=b\r\nabc\r\n1\r\nd\r\n0\r\nT: 1\r\n\r\n", "abcd"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc", "[http: connection closed before the end of the body]"],
+        ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY", "[http: chunk is missing its closing line break]"],
+        ["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc", "abc"],
+    ]
+    for c in cases {
+        let answering = spawn answer_once(l, c[0])
+        let resp = must open("GET", url)
+        let asked = answering.wait()
+        assert not asked.contains("Accept-Encoding")
+        assert all_of(resp.reader()) == c[1]
+    }
+    for bad in ["HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n", "nonsense\r\n\r\n"] {
+        let answering = spawn answer_once(l, bad)
+        assert open("GET", url) is Err(_)
+        let _ = answering.wait()
+    }
+    must l.close()
+}
+
+test "timeouts and deadlines go on in the body" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let quick = must client.open("GET", f.url("/slowly"), options: Options(timeout: Duration(ms: 25)))
+    if quick.reader().read_all() is Err(IoError(e)) {
+        assert e.kind == .TimedOut
+    } else {
+        fail("waited past the timeout")
+    }
+    let dead = must client.open("GET", f.url("/slowly"), options: Options(deadline: Duration(ms: 90)))
+    assert all_of(dead.reader()) == "[http: deadline exceeded]"
+    let slow = must client.open("GET", f.url("/slowly"), options: Options(timeout: Duration(ms: 200)))
+    assert all_of(slow.reader()) == "0123"
+    client.close()
+    f.end(serving)
+}
+
+test "open follows redirects" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let resp = must client.open("GET", f.url("/moved"))
+    assert all_of(resp.reader()) == "hello"
+    assert all_of((must client.open("GET", f.url("/moved?to=/big&status=307"))).reader()).starts_with("000")
+    let itself = must client.open("GET", f.url("/moved"), options: Options(max_redirects: 0))
+    assert itself.status == 302
+    assert len(all_of(itself.reader())) == 0
+    // On one connection.
+    assert len(client.pool) == 1
+    for a in _addresses {
+        assert a == _addresses[0]
+    }
+    client.close()
+    f.end(serving)
+}
+
+test "reader of a response read already" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let resp = must get(f.url("/sized"))
+    assert all_of(resp.reader()) == "hello"
+    resp.close()
+    assert resp.text() == "hello"
+    f.end(serving)
+}
+
+test "a body is sent from a Reader" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    for n in [0, 1, 10000, 65536, 65537, 1000000] {
+        let chunked = must client.fetch("PUT", f.url("/count"), options: Options(body_from: Source(:n)))
+        assert chunked.text() == f"{n} chunked"
+        let sized = must client.fetch("POST", f.url("/count"), options: Options(body_from: Source(:n), body_length: n))
+        assert sized.text() == f"{n} length {n}"
+    }
+    // Opened too.
+    let resp = must client.open("PUT", f.url("/count"), options: Options(body_from: Source(n: 5)))
+    assert all_of(resp.reader()) == "5 chunked"
+    // A connection that has been used isn't; its own can be, after.
+    assert len(client.pool) > 0
+    assert (must client.get(f.url("/sized"))).text() == "hello"
+    client.close()
+    f.end(serving)
+}
+
+test "a body of another length" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    for want in [99, 101] {
+        let got = client.fetch("PUT", f.url("/count"), options: Options(body_from: Source(n: 100), body_length: want))
+        if got is Err(IoError(e)) {
+            assert e.kind == .InvalidInput
+        } else {
+            fail("sent a body of another length")
+        }
+    }
+    let both = client.fetch("PUT", f.url("/count"), options: Options(body: kod_str_to_bytes("x"), body_from: Source(n: 100)))
+    assert both is Err(_)
+    assert len(client.pool) == 0
+    // With a Content-Type, by post and the others, and not both bodies there either.
+    let typed = must client.post(f.url("/count"), kod_str_to_bytes(""), content_type: "text/csv", options: Options(body_from: Source(n: 7)))
+    assert typed.text() == "7 chunked"
+    assert client.post(f.url("/count"), kod_str_to_bytes("x"), content_type: "text/csv", options: Options(body_from: Source(n: 7))) is Err(_)
+    client.close()
+    f.end(serving)
+}
+
+test "a Reader's error ends the request" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    let got = client.fetch("PUT", f.url("/count"), options: Options(body_from: Source(n: 100000, fail_at: 50000)))
+    if got is Err(e) {
+        assert message(e) == "source: dry"
+    } else {
+        fail("sent the body")
+    }
+    assert len(client.pool) == 0
+    client.close()
+    f.end(serving)
+}
+
+test "redirects of a body from a Reader" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    // As a GET without it.
+    let got = must client.fetch("PUT", f.url("/moved?to=/sized&status=303"), options: Options(body_from: Source(n: 100)))
+    assert got.text() == "hello"
+    for code in [307, 308] {
+        let again = client.fetch("PUT", f.url(f"/moved?to=/count&status={code}"), options: Options(body_from: Source(n: 100)))
+        if again is Err(IoError(e)) {
+            assert e.kind == .InvalidInput
+        } else {
+            fail("sent the body again")
+        }
+    }
+    client.close()
+    f.end(serving)
+}
+
+// Answers at once and closes, having read only the headers.
+func answer_early(anon l: tcp.Listener) -> int64 {
+    let conn = must l.accept()
+    let _ = conn.read(1000)
+    must conn.write_all(kod_str_to_bytes("HTTP/1.1 413 Content Too Large\r\nContent-Length: 4\r\n\r\nstop"))
+    tcp.shutdown(conn, write: true)
+    time.sleep(Duration(ms: 100))
+    must conn.close()
+    return 0
+}
+
+test "a server that answers before all has been sent" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    // Server reads on for a while, so that this answer is seen.
+    let got = must client.fetch("PUT", f.url("/refuse"), options: Options(body_from: Source(n: 500000)))
+    assert got.status == 413 and got.text() == "too much"
+    assert len(client.pool) == 0
+    client.close()
+    f.end(serving)
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let answering = spawn answer_early(l)
+    let early = client.fetch("PUT", f"http://127.0.0.1:{l.port()}/", options: Options(body_from: Source(n: 50000000)))
+    // The reset may overtake the answer.
+    if early is Ok(r) {
+        assert r.status == 413
+    } else if early is Err(IoError(e)) {
+        assert e.kind == .BrokenPipe or e.kind == .ConnectionReset
+    }
+    let _ = answering.wait()
+    must l.close()
+}
+
+func pass_on(anon req: Request, anon to: str) -> Response or Error {
+    let upstream = try open("GET", to + req.path())
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        let copied = upstream.reader().copy_to(w)
+        upstream.close()
+        let _ = try copied
+    }, status: upstream.status)
+}
+
+test "a server passes a body on as it comes" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let to = f"http://127.0.0.1:{f.l.port()}"
+    let server = Server(
+        handler: func(anon req: Request) -> Response or Error {
+            return try pass_on(req, to)
+        },
+        log: func(anon _line: str) {
+        },
+    )
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let proxying = spawn server.serve(l)
+    let url = f"http://127.0.0.1:{l.port()}"
+    assert len((must get(url + "/big")).body) == 400000
+    assert (must get(url + "/sized")).text() == "hello"
+    assert (must get(url + "/nothing")).status == 404
+    // Nothing had been passed on yet.
+    assert (must get(url + "/breaks")).status == 500
+    server.stop()
+    assert proxying.wait() is Ok(_)
+    must l.close()
+    f.end(serving)
+}

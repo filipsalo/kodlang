@@ -51,10 +51,11 @@ let made = try client.post("https://api.example.com/users", payload, content_typ
 | `get(url, options = Options())`, `delete(url, options = Options())` | `GET`, `DELETE` |
 | `post(url, body, content_type, options = Options())`, `put(...)`, `patch(...)` | the method with a `bytes` body and a `Content-Type` |
 | `fetch(method, url, options = Options())` | any method; the body is `options.body` |
+| `open(method, url, options = Options())` | as `fetch`, without reading the body: see [Bodies that don't fit in memory](#bodies-that-dont-fit-in-memory) |
 | `close()` | close the idle connections (see [Connection reuse](#connection-reuse)) |
 
 All return `Response or Error`. The functions `get`, `post`, `put`, `patch`,
-`delete` and `fetch` of the module do the same with a new `Client` for each
+`delete`, `fetch` and `open` of the module do the same with a new `Client` for each
 call, which is closed again afterwards: one request, one connection.
 
 A `Client` has these fields, each with the default shown:
@@ -77,6 +78,7 @@ one that you leave out means the `Client`'s value:
 |-------|---------|
 | `headers` | added to the client's; where both have a header of the same name, the request's wins |
 | `body` | the request body (`bytes`); empty by default |
+| `body_from`, `body_length` | instead of `body`, a `Reader` to [send it from](#bodies-that-dont-fit-in-memory), and its length when that is known |
 | `trust_file`, `timeout`, `deadline`, `max_redirects`, `accept_gzip`, `limits` | replace the client's for this request, including with `0` or `false` |
 
 <!-- kod:
@@ -218,6 +220,66 @@ a `Content-Length` that is not plain digits or that repeats with a different
 value, a `Transfer-Encoding` other than plain `chunked` (the client doesn't undo `gzip` or any other coding), a bad chunk size or a
 chunk without its closing line break. A connection that ends before the
 announced length or the last chunk is `UnexpectedEof`.
+
+## Bodies that don't fit in memory
+
+`open` gives the response once its headers have come. `resp.reader()` is a
+[`Reader`](io.md#reader-and-writer) of the body, which is read as it is asked for, so
+it takes no more memory than one piece:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+import "posix"
+-->
+```kod
+func download(anon url: str, to: str) -> int64 or Error {
+    let resp = try http.open("GET", url)
+    if not resp.ok() {
+        resp.close()
+        throw http.HttpError(status: resp.status, message: resp.reason)
+    }
+    let out = try posix.create(to)
+    let copied = resp.reader().copy_to(out)
+    resp.close()
+    try out.close()
+    return try copied
+}
+```
+
+The connection goes back to the `Client`, or is closed, once the body has been
+read to its end or a read has failed. `resp.close()` ends it before that, and does
+nothing after; a response that is neither read to its end nor closed keeps its
+connection open. `resp.body` is empty, and `limits.max_body` doesn't hold. `timeout`
+is for each read, and `deadline` goes on until the last. No compressed body is
+asked for, and one that comes anyway is left as it is. When the connection ends
+before the body does, a read fails with `UnexpectedEof`. Redirects are followed as
+by `fetch`. For a response that has been read already, `reader()` reads its
+`body`.
+
+`Options(body_from: r)` sends what the `Reader` `r` gives until its end, in chunks,
+or with `body_length` as its `Content-Length`; a body of another length than that is
+an `InvalidInput` error. It works with `fetch` and `open`, always on a new connection:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+import "io"
+import "posix"
+-->
+```kod
+func upload(anon path: str, anon url: str) -> http.Response or Error {
+    let f = try posix.open_read(path)
+    let sent = http.fetch("PUT", url, options: http.Options(body_from: f, body_length: io.file_size(path)))
+    try f.close()
+    return try sent
+}
+```
+
+A `Reader` can't be read twice, so a `307` or `308` redirect of such a request is
+an error. An error of the `Reader` ends the request and is given back. When the
+server answers and stops reading before all has been sent, the answer is given back
+if it can still be read.
 
 ## Limits
 
@@ -439,26 +501,12 @@ A request's body can be read as it comes too, by a route added with
 import "net/http"
 import "net/http" { Request, Response, get }
 import "posix"
-import "stream" { Reader }
 let routes = http.Router()
 -->
 ```kod
-func copy(anon from: Reader, anon to: posix.Fd) -> int64 or Error {
-    mut total: int64 = 0
-    for true {
-        let piece = try from.read(65536)
-        if len(piece) == 0 {
-            break
-        }
-        try to.write_all(piece)
-        total += len(piece)
-    }
-    return total
-}
-
 func save(anon req: Request) -> Response or Error {
     let out = try posix.create("upload.tmp")
-    let copied = copy(req.reader(), out)
+    let copied = req.reader().copy_to(out)
     try out.close()                          // whether or not the client went away
     return http.text(f"{try copied} bytes\n", status: 201)
 }

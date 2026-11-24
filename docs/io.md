@@ -100,6 +100,7 @@ interface Reader {
 
     func read_all(self) -> bytes or Error { ... }
     func read_exact(self, anon n: int64) -> bytes or Error { ... }
+    func copy_to(self, anon to: Writer) -> int64 or Error { ... }
 }
 
 interface Writer {
@@ -125,6 +126,7 @@ interface:
 |--------|---------|
 | `r.read_all()` | read until the end of the stream; `bytes or Error` |
 | `r.read_exact(n)` | exactly `n` bytes, or an `UnexpectedEof` error; `bytes or Error` |
+| `r.copy_to(w)` | write everything until the end of the stream to the `Writer` `w`, a piece at a time; how many bytes that was; `int64 or Error` |
 | `w.write_all(data)` | write every byte, repeating `write` as needed; a `write` that accepts 0 bytes of a non-empty `data` is an `Other` error (`write returned 0`); `none or Error` |
 | `w.write_str(s)` | `write_all` of a `str` |
 
