@@ -149,6 +149,13 @@ int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key
     return 0;
 }
 
+/* Takes back a timer that has yet to come. */
+void kod_task_kq_drop_timer(int64_t key) {
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)key, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    kevent(kod_kq, &ev, 1, NULL, 0, NULL);
+}
+
 /* Waits for events, until one comes when `block`, else not at all: how many
  * came; kod_task_kq_key gives each one's key. */
 int64_t kod_task_kq_wait(int64_t block) {
@@ -163,6 +170,16 @@ int64_t kod_task_kq_wait(int64_t block) {
 
 int64_t kod_task_kq_key(int64_t i) {
     return (int64_t)kod_events[i].udata;
+}
+
+int64_t kod_task_kq_data(int64_t i) {
+    return (int64_t)kod_events[i].data;
+}
+
+/* What kod_wait_room answers (runtime.c), for the task that goes on. */
+extern int64_t kod_room;
+void kod_task_set_room(int64_t room) {
+    kod_room = room;
 }
 
 /* The task scheduler's wait (stdlib/tasks.kod), which kod_wait_event calls

@@ -4,6 +4,7 @@
 import "arrays"
 import "net/tcp"
 import "posix"
+import "posix" { Fd }
 import "process"
 import "stream" { IoError }
 import "tasks"
@@ -97,6 +98,54 @@ test "a server and a client in one program" {
     assert must server.wait() == "ping"
     must conn.close()
     must l.close()
+}
+
+func long_bytes(anon n: int64) -> bytes {
+    mut s = "0123456789abcdef"
+    for len(s) < n {
+        s = s + s
+    }
+    return kod_str_to_bytes(s[0..n])
+}
+
+func send_all(anon conn: Fd, anon data: bytes) -> none or Error {
+    try conn.write_all(data)
+    try conn.close()
+}
+
+test "a write nobody reads doesn't hold up the other tasks" {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let data = long_bytes(8000000)
+    let client = must tcp.connect("127.0.0.1", port: l.port())
+    let conn = must l.accept()
+    let sender = spawn send_all(conn, data)
+    let t0 = monotonic_ns()
+    assert nap_task() == 20
+    assert ms_since(t0) < 500
+    // It goes on as it is read, and all of it comes.
+    let back = must client.read_all()
+    assert sender.wait() is Ok(_)
+    assert back == data
+    must client.close()
+    must l.close()
+}
+
+func nap_task() -> int64 {
+    let t = spawn nap(20)
+    return t.wait()
+}
+
+test "a write to a full pipe doesn't hold up the other tasks" {
+    let child = must process.start(["sh", "-c", "sleep 0.3; wc -c"], stdin: .Pipe, stdout: .Pipe, stderr: .Null)
+    let data = long_bytes(300000)
+    let sender = spawn send_all(child.stdin, data)
+    let t0 = monotonic_ns()
+    assert nap_task() == 20
+    assert ms_since(t0) < 200
+    let out = must child.stdout.read_all()
+    assert kod_bytes_to_str(out).trim() == "300000"
+    assert sender.wait() is Ok(_)
+    assert must child.wait() == 0
 }
 
 test "with one task, a sleep just sleeps" {

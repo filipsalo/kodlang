@@ -16,8 +16,11 @@ extern func kod_task_ctx_free(anon ctx: int64) -> none
 extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
 extern func kod_task_switch(anon from: int64, anon to: int64) -> none
 extern func kod_task_kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64
+extern func kod_task_kq_drop_timer(anon key: int64) -> none
 extern func kod_task_kq_wait(anon block: int64) -> int64
 extern func kod_task_kq_key(anon i: int64) -> int64
+extern func kod_task_kq_data(anon i: int64) -> int64
+extern func kod_task_set_room(anon room: int64) -> none
 extern func kod_task_hook() -> none
 extern func kod_task_set_now(anon stack: int64) -> none
 extern func kod_panic_uncaught(anon msg: str) -> none
@@ -53,6 +56,8 @@ type Fiber = shared struct {
     cancelled: bool = false
     // The key of the kevent registration it waits on, 0 for none.
     io_key: int64 = 0
+    // What the event that came said: for a write, how much there is room for.
+    io_data: int64 = 0
     // Where it was spawned (_spawn_trace).
     spawned_at: [int64] = []
     // The panic that ended it, and the group that takes it, when the function it
@@ -718,15 +723,14 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     let timed_out = timer_key != 0 and not _io.contains(timer_key) and _io.contains(key)
     // The event that didn't come may still: then it finds no one waiting.
     let _event = _io.remove(key)
-    if timer_key != 0 {
-        let _timer = _io.remove(timer_key)
-    }
+    _forget(timer_key)
     if me.cancelled {
         return 2
     }
     if timed_out {
         return 3
     }
+    kod_task_set_room(me.io_data)
     return 1
 }
 
@@ -739,6 +743,7 @@ func _poll(anon block: bool) -> none {
     let n = kod_task_kq_wait(wait)
     for i in 0..n {
         if _io.remove(kod_task_kq_key(i)) is Fiber(fiber) {
+            fiber.io_data = kod_task_kq_data(i)
             _make_ready(fiber)
         }
     }
@@ -776,8 +781,7 @@ func _wait_until_done(anon fiber: Fiber, ns: int64) -> bool {
         fiber.waiters += [me]
         _wait_turn(me)
     }
-    // Ended first: the timer's event, when it comes, finds no one waiting.
-    let _gone = _io.remove(key)
+    _forget(key)
     return fiber.done
 }
 
@@ -1228,9 +1232,10 @@ type Selector = shared struct {
     }
 }
 
+// Forgets a timer, taking it from kevent too if it has yet to come.
 func _forget(anon key: int64) -> none {
-    if key != 0 {
-        let _gone = _io.remove(key)
+    if key != 0 and _io.remove(key) is Fiber(_waiting) {
+        kod_task_kq_drop_timer(key)
     }
 }
 

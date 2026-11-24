@@ -22,8 +22,10 @@ let SO_NOSIGPIPE: int64 = 4130
 let IPPROTO_TCP: int64 = 6
 let TCP_NODELAY: int64 = 1
 let EINTR: int64 = 4
+let EAGAIN: int64 = 35
 let EINPROGRESS: int64 = 36
 let EADDRNOTAVAIL: int64 = 49
+let ECONNABORTED: int64 = 53
 let ETIMEDOUT: int64 = 60
 let ECONNREFUSED: int64 = 61
 let F_SETFD: int64 = 2
@@ -138,6 +140,15 @@ func wait_for(anon fd: int64, events: int64, ms: int64) -> int64 {
     return n
 }
 
+// Block until there is one of `events` on `fd`, or a signal comes.
+func block_for(anon fd: int64, events: int64) -> none {
+    let p = unsafe.alloc(8)
+    unsafe.store32(p, fd)
+    unsafe.store32(p + 4, events)
+    libc.poll(p, 1, -1)
+    unsafe.free(p)
+}
+
 // Connect `fd` to the address `ai` within `ms`: 0, or the errno.
 func connect_within(anon fd: int64, ai: int64, ms: int64) -> int64 {
     let flags = unsafe.c_int(libc.fcntl(fd, F_GETFL, 0))
@@ -234,20 +245,28 @@ type Listener = shared struct {
 
     func accept(self) -> Fd or Error {
         mut c = -1
-        // With tasks, the others run until a connection is waiting.
-        if kod_wait_event(self.fd, -1, 0) == 2 {
-            throw os_error("accept", errno: 89)
-        }
-        for true {
+        for c < 0 {
             c = unsafe.c_int(libc.accept(self.fd, 0, 0))
             if c >= 0 {
                 break
             }
             let err = unsafe.errno()
-            if err != EINTR {
+            if err == EAGAIN {
+                // With tasks, the others run until a connection is waiting. The
+                // listener doesn't block, as that connection may be gone by then.
+                let waited = kod_wait_event(self.fd, -1, 0)
+                if waited == 2 {
+                    throw os_error("accept", errno: 89)
+                }
+                if waited == 0 {
+                    block_for(self.fd, events: POLLIN)
+                }
+            } else if err != EINTR and err != ECONNABORTED {
                 throw os_error("accept", errno: err)
             }
         }
+        // It starts out with the listener's flags.
+        libc.fcntl(c, F_SETFL, 0)
         libc.fcntl(c, F_SETFD, FD_CLOEXEC)
         set_flag(c, level: SOL_SOCKET, option: SO_NOSIGPIPE)
         set_flag(c, level: IPPROTO_TCP, option: TCP_NODELAY)
@@ -295,6 +314,7 @@ func listen(anon host: str, port: int64, backlog: int64 = 128) -> Listener or Er
             set_flag(fd, level: SOL_SOCKET, option: SO_REUSEADDR)
             if unsafe.c_int(libc.bind(fd, unsafe.load64(ai + AI_ADDR), unsafe.load32(ai + AI_ADDRLEN))) == 0 and unsafe.c_int(libc.listen(fd, backlog)) == 0 {
                 libc.freeaddrinfo(list)
+                libc.fcntl(fd, F_SETFL, O_NONBLOCK)
                 return Listener(:fd)
             }
             last = unsafe.errno()

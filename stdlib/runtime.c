@@ -808,6 +808,13 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * limit for a descriptor given none, as it is for a read that blocks. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
+// After kod_wait_event gave 1 for a write: how many bytes the descriptor has
+// room for, so that a write of no more doesn't wait; 0 when that isn't known.
+int64_t kod_room = 0;
+int64_t kod_wait_room(void) {
+    return kod_room;
+}
+
 int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
     if (!kod_wait_hook) return 0;
     if ((filter == -1 || filter == -2) && data == 0) {
