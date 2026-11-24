@@ -309,15 +309,20 @@ and branches on:
 |---|---|---|---|---|---|---|
 | load a flag, branch if set | +17% | +11% | +5% | 0% | 0% | +1% |
 | load from the polling page | 0% | +9% | 0% | 0% | 0% | +2% |
-| as built (2026-11-24) | +8% | +7% | 0% | 0% | 0% | 0% |
+| as built (2026-11-24) | +16% | +10% | 0% | 0% | 0% | 0% |
 
 The branch is what costs, in tight loops. The experiment left out what the
-check must stop the optimiser doing: reusing, after the check, a value loaded
-from the heap before it, which another task may have changed (or freed) in
-between. As built, the check is opaque to the passes, and qsort's inner loops
-load `self.xs`'s buffer and length again after each one's check: that is its
-+8%. A tight loop of stores, as sieve's, pays for the load. The compiler, with
-the check in its own loops, is about 1% slower, within the noise.
+check must stop the optimiser doing: reusing after the check a value loaded
+from the heap before it, or hoisting a heap load out of the loop, or a loop's
+copy-on-write check, since at the check another task may change (or free)
+what was loaded, or take a reference to the array. As built, the check is
+opaque to load reuse, and a loop with one isn't hoisted from: qsort's inner
+loops load `self.xs`'s buffer and length again after each check (+8%) and on
+each iteration (+8% more). A tight loop of stores, as sieve's, pays for the
+load. The compiler, with the check in its own loops, is about 1% slower,
+within the noise. Telling the loads from task-private memory (a local, a
+value struct's field) from those through a shared struct would let the
+private ones be reused and hoisted again.
 
 As built, every 10 ms a thread makes the page unreadable once a program has
 started a task; the fault handler makes it readable again and sends the task
