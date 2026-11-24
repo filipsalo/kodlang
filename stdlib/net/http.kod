@@ -1,5 +1,6 @@
 // HTTP/1.1: URLs, headers, writing a request and reading a response, and a
 // Client that sends requests over TCP or TLS, with redirects. See docs/http.md.
+import "arrays"
 import "compress/inflate"
 import "encoding/base64"
 import "net/tcp"
@@ -7,6 +8,7 @@ import "net/tls"
 import "net/tls" { TlsStream }
 import "panics"
 import "posix" { Fd }
+import "sort"
 import "strbuilder" { StrBuilder }
 import "stream" { IoError, BufReader, Reader, Writer }
 import "tasks"
@@ -92,7 +94,8 @@ type Url = shared struct {
     }
 }
 
-type Request = shared struct {
+// A request as a client writes it (write_request).
+type Outgoing = shared struct {
     method: str
     url: Url
     headers: Headers
@@ -117,6 +120,12 @@ type Response = shared struct {
 
     func header(self, anon name: str) -> str? {
         return self.headers.get(name)
+    }
+
+    // The response itself, with a header added.
+    func with_header(self, anon name: str, anon value: str) -> Response {
+        self.headers.add(name, value)
+        return self
     }
 }
 
@@ -505,7 +514,7 @@ func own_header(anon name: str) -> bool {
     return n == "host" or n == "connection" or n == "content-length" or n == "transfer-encoding"
 }
 
-func write_request(anon w: Writer, anon req: Request, keep_alive: bool = false, accept_gzip: bool = false) -> none or Error {
+func write_request(anon w: Writer, anon req: Outgoing, keep_alive: bool = false, accept_gzip: bool = false) -> none or Error {
     let op = "write request"
     if not is_token(req.method) {
         throw invalid(op, "bad method")
@@ -1081,7 +1090,7 @@ func decode_content(anon resp: Response, anon limits: Limits) -> Response or Err
 }
 
 // Write `req` and read its response.
-func attempt(anon link: Link, anon br: BufReader, anon req: Request, cfg: Settings, keep_alive: bool) -> Response or Error {
+func attempt(anon link: Link, anon br: BufReader, anon req: Outgoing, cfg: Settings, keep_alive: bool) -> Response or Error {
     try write_request(link, req, keep_alive: keep_alive, accept_gzip: cfg.accept_gzip)
     return read_response(br, req.method, limits: cfg.limits)
 }
@@ -1178,7 +1187,7 @@ type Client = shared struct {
     }
 
     // One request, on a kept connection if there is one, else on a new one.
-    func exchange(self, anon req: Request, cfg: Settings, deadline_ns: int64) -> Response or Error {
+    func exchange(self, anon req: Outgoing, cfg: Settings, deadline_ns: int64) -> Response or Error {
         let url = req.url
         let key = f"{url.scheme}://{url.host}:{url.port}"
         let reuse = self.max_idle_per_host > 0
@@ -1223,7 +1232,7 @@ type Client = shared struct {
         mut headers = cfg.headers
         mut hops: int64 = 0
         for true {
-            let req = Request(method: verb, url: current, headers: headers, body: payload)
+            let req = Outgoing(method: verb, url: current, headers: headers, body: payload)
             let resp = try self.exchange(req, cfg: cfg, deadline_ns: deadline_ns)
             let location = resp.header("location")
             if not is_redirect(resp.status) or location is none or cfg.max_redirects <= 0 {
@@ -1338,8 +1347,8 @@ func patch(anon url: str, anon body: bytes, content_type: str, options: Options 
 
 // ---- serving ----
 
-// A request as a server reads it (read_request, serve).
-type Incoming = shared struct {
+// A request as a server reads it (read_request, Server).
+type Request = shared struct {
     method: str
     // The path and query, as sent.
     target: str
@@ -1348,19 +1357,87 @@ type Incoming = shared struct {
     // The client may send another request on the connection: HTTP/1.1 without
     // `Connection: close`, or 1.0 with `keep-alive`.
     keep_alive: bool = false
+    // The client's address, as `127.0.0.1:50123`.
+    remote: str = ""
+    // What the names in its route's pattern stand for (Router.answer).
+    params: [Header] = []
 
-    // `target` up to its query.
+    // `target` up to its query; of a whole URL (a proxy may send one), its path.
     func path(self) -> str {
-        let q = self.target.find("?")
+        mut path = self.target
+        let q = path.find("?")
         if q is not none {
-            return self.target[0..q]
+            path = path[0..q]
         }
-        return self.target
+        if path.starts_with("http://") {
+            let rest = path[7..len(path)]
+            let slash = rest.find("/")
+            if slash is not none {
+                return rest[slash..len(rest)]
+            }
+            return "/"
+        }
+        return path
     }
 
     func text(self) -> str {
         return kod_bytes_to_str(self.body)
     }
+
+    func header(self, anon name: str) -> str? {
+        return self.headers.get(name)
+    }
+
+    // The part of the path that `{name}` in the route's pattern stands for.
+    func param(self, anon name: str) -> str {
+        for p in self.params {
+            if p.name == name {
+                return p.value
+            }
+        }
+        panic(f"the route of {self.path()} has no parameter `{name}`")
+    }
+
+    // The first value of `name` in the query, or none.
+    func query(self, anon name: str) -> str? {
+        let all = self.queries(name)
+        if len(all) == 0 {
+            return none
+        }
+        return all[0]
+    }
+
+    // All the values of `name` in the query.
+    func queries(self, anon name: str) -> [str] {
+        mut out: [str] = []
+        let q = self.target.find("?")
+        if q is none {
+            return out
+        }
+        for pair in self.target[q + 1..len(self.target)].split("&") {
+            mut key = pair
+            mut value = ""
+            let eq = pair.find("=")
+            if eq is not none {
+                key = pair[0..eq]
+                value = pair[eq + 1..len(pair)]
+            }
+            if query_text(key) == name {
+                out += [query_text(value)]
+            }
+        }
+        return out
+    }
+}
+
+// Text of a query, decoded; as it is when it can't be.
+func query_text(anon s: str) -> str {
+    let spaced = s.replace("+", to: " ")
+    let decoded = percent_decode(spaced)
+    if decoded is Ok(t) {
+        return t
+    }
+    return spaced
 }
 
 // A response with `body`, for a handler to give back.
@@ -1368,6 +1445,41 @@ func respond(anon status: int64, anon body: str, content_type: str = "text/plain
     let headers = Headers()
     headers.add("Content-Type", content_type)
     return Response(:status, reason: "", :headers, body: kod_str_to_bytes(body))
+}
+
+func text(anon body: str, status: int64 = 200) -> Response {
+    return respond(status, body)
+}
+
+func html(anon body: str, status: int64 = 200) -> Response {
+    return respond(status, body, content_type: "text/html; charset=utf-8")
+}
+
+// `body` is the JSON's text.
+func json(anon body: str, status: int64 = 200) -> Response {
+    return respond(status, body, content_type: "application/json")
+}
+
+func redirect(anon to: str, status: int64 = 302) -> Response {
+    return Response(:status, reason: "", headers: Headers(), body: kod_str_to_bytes("")).with_header("Location", to)
+}
+
+// Only a status, with its reason as the body.
+func status(anon code: int64) -> Response {
+    if code < 200 or code == 204 or code == 304 {
+        return Response(status: code, reason: "", headers: Headers(), body: kod_str_to_bytes(""))
+    }
+    return respond(code, f"{reason_phrase(code)}\n")
+}
+
+// What a handler throws for a response of that status.
+type HttpError = struct {
+    status: int64
+    message: str = ""
+
+    func to_str(self) -> str {
+        return f"{self.status} {self.message}"
+    }
 }
 
 // The usual reason phrase for `status`, or "".
@@ -1423,7 +1535,7 @@ func parse_request_line(anon line: str) -> RequestLine or Error {
 
 // The next request up to its body, or none when the connection ends before one
 // begins.
-func read_head(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
+func read_head(anon br: BufReader, anon limits: Limits) -> Request? or Error {
     let budget = Budget(left: limits.max_header_bytes, headers: 0)
     // Empty lines before a request are allowed (RFC 9112, 2.2).
     mut line = ""
@@ -1451,11 +1563,11 @@ func read_head(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
     if has_token(headers, "connection", "close") {
         keep_alive = false
     }
-    return Incoming(method: start.method, target: start.target, :headers, body: kod_str_to_bytes(""), :keep_alive)
+    return Request(method: start.method, target: start.target, :headers, body: kod_str_to_bytes(""), :keep_alive)
 }
 
 // The body of `req`, which read_head gave: none when nothing frames one.
-func read_request_body(anon br: BufReader, anon req: Incoming, anon limits: Limits) -> none or Error {
+func read_request_body(anon br: BufReader, anon req: Request, anon limits: Limits) -> none or Error {
     let codings = req.headers.all("transfer-encoding")
     if len(codings) > 0 {
         for v in codings {
@@ -1476,9 +1588,9 @@ func read_request_body(anon br: BufReader, anon req: Incoming, anon limits: Limi
     }
 }
 
-func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Error {
+func read_incoming(anon br: BufReader, anon limits: Limits) -> Request? or Error {
     let got = try read_head(br, limits)
-    if got is Incoming(req) {
+    if got is Request(req) {
         try read_request_body(br, req, limits)
     }
     return got
@@ -1487,7 +1599,7 @@ func read_incoming(anon br: BufReader, anon limits: Limits) -> Incoming? or Erro
 // The next request from `br`, or none when the connection ends before one
 // begins. A request without a body framed by Content-Length or chunks has
 // none.
-func read_request(anon br: BufReader, limits: Limits = Limits()) -> Incoming? or Error {
+func read_request(anon br: BufReader, limits: Limits = Limits()) -> Request? or Error {
     let old = br.limit
     br.limit = limits.max_header_bytes
     let r = read_incoming(br, limits)
@@ -1551,6 +1663,182 @@ func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = fals
     try w.write_all(resp.body)
 }
 
+// ---- routes ----
+
+type Route = shared struct {
+    method: str
+    // The names in its pattern, in order.
+    names: [str]
+    handler: func(Request) -> Response or Error
+}
+
+// Where the patterns that go on alike part: after each part of a path, the
+// written parts that may come, a `{name}` and a `{name...}`.
+type RouteNode = shared struct {
+    parts: Map[str, RouteNode] = Map[str, RouteNode]()
+    one: RouteNode? = none
+    rest: RouteNode? = none
+    // Those whose patterns end here.
+    routes: [Route] = []
+}
+
+// A search for the route of a path: what the names stand for so far, and the
+// methods of the routes that fit but for theirs.
+type RouteSearch = shared struct {
+    method: str
+    parts: [str]
+    values: [str] = []
+    allowed: [str] = []
+
+    // The route from `node` on that fits the parts from `i` on.
+    func find(self, anon node: RouteNode, i: int64) -> Route? {
+        if i == len(self.parts) {
+            for r in node.routes {
+                if r.method == self.method {
+                    return r
+                }
+                if not arrays.contains(self.allowed, r.method) {
+                    self.allowed += [r.method]
+                }
+            }
+            return none
+        }
+        let part = self.parts[i]
+        if node.parts.get(part) is RouteNode(next) {
+            if self.find(next, i: i + 1) is Route(r) {
+                return r
+            }
+        }
+        if len(part) > 0 and node.one is RouteNode(next) {
+            self.values += [part]
+            if self.find(next, i: i + 1) is Route(r) {
+                return r
+            }
+            self.values = self.values[0..len(self.values) - 1]
+        }
+        if len(part) > 0 and node.rest is RouteNode(next) {
+            self.values += ["/".join(self.parts[i..])]
+            if self.find(next, i: len(self.parts)) is Route(r) {
+                return r
+            }
+            self.values = self.values[0..len(self.values) - 1]
+        }
+        return none
+    }
+}
+
+// The parts of a path or a pattern, which starts with a slash: what is between
+// its slashes.
+func path_parts(anon path: str) -> [str] {
+    return path[1..len(path)].split("/")
+}
+
+// Which handler answers which requests: see docs/http.md#routes.
+type Router = shared struct {
+    root: RouteNode = RouteNode()
+
+    func get(self, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        self.add("GET", pattern, handler)
+    }
+
+    func post(self, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        self.add("POST", pattern, handler)
+    }
+
+    func put(self, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        self.add("PUT", pattern, handler)
+    }
+
+    func patch(self, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        self.add("PATCH", pattern, handler)
+    }
+
+    func delete(self, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        self.add("DELETE", pattern, handler)
+    }
+
+    func add(self, anon method: str, anon pattern: str, anon handler: func(Request) -> Response or Error) -> none {
+        if not pattern.starts_with("/") {
+            panic(f"a route's pattern starts with `/`: `{pattern}`")
+        }
+        let parts = path_parts(pattern)
+        mut names: [str] = []
+        mut node = self.root
+        for i, part in parts {
+            if not part.contains("{") and not part.contains("}") {
+                let next = node.parts.get(part)? or RouteNode()
+                node.parts[part] = next
+                node = next
+                continue
+            }
+            mut name = ""
+            if len(part) > 2 and part.starts_with("{") and part.ends_with("}") {
+                name = part[1..len(part) - 1]
+            }
+            let is_rest = name.ends_with("...")
+            if is_rest {
+                name = name[0..len(name) - 3]
+            }
+            if len(name) == 0 or name.contains("{") or name.contains("}") or arrays.contains(names, name) or (is_rest and i < len(parts) - 1) {
+                panic(f"bad part `{part}` in the route `{pattern}`")
+            }
+            names += [name]
+            if is_rest {
+                let next = node.rest? or RouteNode()
+                node.rest = next
+                node = next
+            } else {
+                let next = node.one? or RouteNode()
+                node.one = next
+                node = next
+            }
+        }
+        for r in node.routes {
+            if r.method == method {
+                panic(f"two routes for {method} `{pattern}`")
+            }
+        }
+        node.routes += [Route(:method, :names, :handler)]
+    }
+
+    // The response of the route `req` fits, or a 404 or 405.
+    func answer(self, anon req: Request) -> Response or Error {
+        let path = req.path()
+        if not path.starts_with("/") {
+            return status(404)
+        }
+        mut parts: [str] = []
+        for part in path_parts(path) {
+            let decoded = percent_decode(part)
+            if decoded is Err(_) {
+                throw HttpError(status: 400, message: "bad path")
+            }
+            parts += [decoded]
+        }
+        let search = RouteSearch(method: req.method, :parts)
+        mut route = search.find(self.root, i: 0)
+        if route is none and req.method == "HEAD" {
+            search.method = "GET"
+            search.allowed = []
+            route = search.find(self.root, i: 0)
+        }
+        if route is Route(r) {
+            for i, name in r.names {
+                req.params += [Header(:name, value: search.values[i])]
+            }
+            let handler = r.handler
+            return try handler(req)
+        }
+        if len(search.allowed) == 0 {
+            return status(404)
+        }
+        if arrays.contains(search.allowed, "GET") and not arrays.contains(search.allowed, "HEAD") {
+            search.allowed += ["HEAD"]
+        }
+        return status(405).with_header("Allow", ", ".join(sort.sorted(search.allowed)))
+    }
+}
+
 // What a server's connection is doing, which decides how long it may take.
 type Phase = enum {
     // Waiting for a request's first byte.
@@ -1609,6 +1897,7 @@ type ServerConn = shared struct {
     func converse(self) -> none or Error {
         let server = self.server
         let br = BufReader(inner: self, limit: server.limits.max_header_bytes)
+        let remote = tcp.peer(self.fd)
         for true {
             self.wait_for_request(br)
             let got = read_head(br, server.limits)
@@ -1620,6 +1909,7 @@ type ServerConn = shared struct {
             if req is none {
                 return
             }
+            req.remote = remote
             if self.read_body(br, req) is Err(e) {
                 self.refuse(e)
                 return
@@ -1650,7 +1940,7 @@ type ServerConn = shared struct {
         }
     }
 
-    func read_body(self, anon br: BufReader, anon req: Incoming) -> none or Error {
+    func read_body(self, anon br: BufReader, anon req: Request) -> none or Error {
         self.enter(.Body, self.server.body_timeout)
         if req.headers.get("expect") is str(expect) {
             if expect.lower() != "100-continue" {
@@ -1663,14 +1953,14 @@ type ServerConn = shared struct {
         try read_request_body(br, req, self.server.limits)
     }
 
-    func reply(self, anon req: Incoming, anon resp: Response, keep_alive: bool) -> none or Error {
+    func reply(self, anon req: Request, anon resp: Response, keep_alive: bool) -> none or Error {
         let head = req.method == "HEAD"
         let wrote = write_response(self, resp, :keep_alive, :head)
         if wrote is Err(IoError(e)) and e.kind == .InvalidInput {
             // Not a response: nothing has been written.
             let log = self.server.log
             log(f"{req.method} {req.target}: {e.to_str()}")
-            try write_response(self, respond(500, "Internal Server Error\n"), :keep_alive, :head)
+            try write_response(self, status(500), :keep_alive, :head)
             return
         }
         try wrote
@@ -1754,9 +2044,18 @@ func log_to_stderr(anon line: str) -> none {
     kod_eprint(line)
 }
 
+// Server.handler's default.
+func answer_404(anon _req: Request) -> Response or Error {
+    return status(404)
+}
+
 // Answers requests: see docs/http.md#serving.
 type Server = shared struct {
-    handler: func(Incoming) -> Response or Error
+    routes: Router? = none
+    // Answers the requests when there are no routes.
+    handler: func(Request) -> Response or Error = answer_404
+    host: str = "127.0.0.1"
+    port: int64 = 8080
     header_timeout: Duration = Duration(seconds: 10)
     body_timeout: Duration = Duration(seconds: 60)
     write_timeout: Duration = Duration(seconds: 60)
@@ -1764,6 +2063,7 @@ type Server = shared struct {
     max_connections: int64 = 10000
     limits: Limits = Limits()
     log: func(str) -> none = log_to_stderr
+    access_log: bool = false
     // The open connections, by a number of their own.
     conns: Map[int64, ServerConn] = Map[int64, ServerConn]()
     last_conn: int64 = 0
@@ -1780,18 +2080,29 @@ type Server = shared struct {
     // Closed once the last connection has ended after `stop`.
     quiet: tasks.Channel[bool] = tasks.Channel[bool]()
 
+    // Listens on `host` and `port`, and answers requests until `stop`.
+    func run(self) -> none or Error {
+        let l = try tcp.listen(self.host, port: self.port, backlog: 1024)
+        let served = self.serve(l)
+        let _ = l.close()
+        try served
+    }
+
     // Answers the requests that come to `l`, until `stop`.
     func serve(self, anon l: tcp.Listener) -> none or Error {
+        if self.stopping {
+            return
+        }
         self.open = true
         let reaper = spawn self.reap()
-        let served = self.run(l)
+        let served = self.serve_all(l)
         self.open = false
         self.acceptor = none
         reaper.cancel()
         try served
     }
 
-    func run(self, anon l: tcp.Listener) -> none or Error {
+    func serve_all(self, anon l: tcp.Listener) -> none or Error {
         let accepted = tasks.Channel[Fd]()
         let acceptor = spawn self.accept(l, accepted)
         self.acceptor = acceptor
@@ -1899,20 +2210,43 @@ type Server = shared struct {
         }
     }
 
-    // The handler's response to `req`, or a 500.
-    func answer(self, anon req: Incoming) -> Response {
+    // The handler's response to `req`, or what its error or panic makes one.
+    func answer(self, anon req: Request) -> Response {
+        let t0 = time.monotonic_ns()
+        let resp = self.respond_to(req)
+        if self.access_log {
+            let log = self.log
+            let us = (time.monotonic_ns() - t0) / 1000
+            log(f"{req.remote} {req.method} {req.target} {resp.status} {len(resp.body)} B {us.to_float64() / 1000.0:.2f} ms")
+        }
+        return resp
+    }
+
+    func respond_to(self, anon req: Request) -> Response {
         let handler = self.handler
-        let got = panics.catch(func() -> Response or Error { return handler(req) })
+        let routes = self.routes
+        let got = panics.catch(func() -> Response or Error {
+            if routes is Router(r) {
+                return try r.answer(req)
+            }
+            return try handler(req)
+        })
         match got {
             Ok(resp) -> return resp
             Err(e) -> {
+                if e is HttpError(h) {
+                    if len(h.message) == 0 {
+                        return status(h.status)
+                    }
+                    return respond(h.status, f"{h.message}\n")
+                }
                 let log = self.log
                 if e is panics.Panic(p) {
                     log(f"{req.method} {req.target}: {p.to_str()}\n{p.backtrace}")
-                } else {
+                } else if not tasks.cancelled() {
                     log(f"{req.method} {req.target}: {e.to_str()}")
                 }
-                return respond(500, "Internal Server Error\n")
+                return status(500)
             }
         }
     }
@@ -1970,6 +2304,6 @@ type Server = shared struct {
 
 // Answers the requests that come to `l` by `handler`, with a Server's settings
 // left as they are.
-func serve(anon l: tcp.Listener, anon handler: func(Incoming) -> Response or Error, limits: Limits = Limits()) -> none or Error {
+func serve(anon l: tcp.Listener, anon handler: func(Request) -> Response or Error, limits: Limits = Limits()) -> none or Error {
     try Server(:handler, :limits).serve(l)
 }

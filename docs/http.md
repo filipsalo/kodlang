@@ -302,42 +302,99 @@ holds up every task (see [Tasks](tasks.md#waiting-for-io)).
 
 ## Serving
 
-`serve(listener, handler)` answers the requests that come to a
-[`tcp.Listener`](io.md#tcp): each connection is handled by a task of its own,
-and each request on it by `handler`, which gives back the `Response`.
+A `Router` says which handler answers which requests, and a `Server` answers
+them: each connection is handled by a task of its own, and each request on it
+by a handler, which takes the `Request` and gives back a `Response`.
 
-<!-- kod:
-import "net/tcp"
--->
 ```kod
-import "net/http" { Incoming, Response, respond, serve }
+import "net/http"
+import "net/http" { Request, Response }
 
-func hello(anon req: Incoming) -> Response or Error {
-    if req.path() != "/" {
-        return respond(404, "not found\n")
+type User = struct {
+    name: str
+}
+
+func find_user(anon id: int64) -> User or Error {
+    if id != 7 {
+        throw http.HttpError(status: 404, message: f"no user {id}")
     }
-    return respond(200, f"hello from {req.method} {req.target}\n")
+    return User(name: "Ada")
+}
+
+func show_user(anon req: Request) -> Response or Error {
+    let Some(id) = req.param("id").parse_int() else {
+        throw http.HttpError(status: 400, message: "an id is a number")
+    }
+    let user = try find_user(id)
+    return http.json(f"\{\"name\": \"{user.name}\"}")
 }
 
 func main() -> none or Error {
-    let l = try tcp.listen("127.0.0.1", port: 8080)
-    try serve(l, hello)
+    let routes = http.Router()
+    routes.get("/", func(anon req: Request) -> Response or Error {
+        return http.text(f"hello, {req.query("name")? or "you"}\n")
+    })
+    routes.get("/users/{id}", show_user)
+    try http.Server(port: 8080, :routes).run()
 }
 ```
 
 A handler that waits, for a request of its own or a sleep, lets the other
-connections go on meanwhile. One that returns an error or
-[panics](panics.md) fails only its own request: the client gets a `500`, and
-the error, or the panic's message and backtrace, is logged. (A task it
-spawned `detached` is nobody's, so a panic in one still ends the program.)
+connections go on meanwhile. One that fails fails only its own request:
+
+- an `HttpError` is a response with its `status`, and its `message` as the body;
+- any other error, and a [panic](panics.md), is a `500`, and the error, or the
+  panic's message and backtrace, is logged. (A task the handler spawned
+  `detached` is nobody's, so a panic in one still ends the program.)
+
+### Routes
+
+`routes.get(pattern, handler)`, and likewise `post`, `put`, `patch` and
+`delete`, or `routes.add(method, pattern, handler)` for any other method, say
+who answers the requests of that method whose path fits `pattern`:
+
+| In a pattern | Fits |
+|---|---|
+| `/users/all` | just that |
+| `/users/{id}` | any one part that isn't empty: `req.param("id")` is the part, percent-decoded |
+| `/files/{path...}` | all the rest, with at least one part: `req.param("path")` is `a/b.txt` for `/files/a/b.txt` (and may have `..` in it: check it before it names a file) |
+
+A written part goes before a `{name}` at the same place, and that before a
+`{name...}`: with the first two above, `/users/all` is the first's. Adding a
+pattern that fits the same paths as one added before for that method, or isn't
+one at all, panics.
+
+A path no pattern fits is a `404`. One that only patterns of other methods fit
+is a `405`, with the methods it has in `Allow`. `HEAD` is answered by `GET`'s
+handler, without the body, where there is no handler for `HEAD` itself.
+
+### `Request`
 
 | | |
 |---|---|
-| `Incoming` | `method`, `target` (path and query, as sent), `headers`, `body`; `path()` is `target` up to `?`, `text()` the body as text |
-| `respond(status, body, content_type = "text/plain; charset=utf-8")` | a `Response` with that body |
-| `serve(l, handler, limits = Limits())` | `Server(:handler, :limits).serve(l)` |
-| `read_request(br, limits = Limits())` | the next request from a `BufReader`, or `none` when the connection ends before one begins |
-| `write_response(w, resp, keep_alive = false, head = false)` | writes `resp` with a `Content-Length` and, unless `keep_alive`, `Connection: close`; an empty `reason` is the status's usual one; `head` leaves out the body, for the answer to a `HEAD` |
+| `method`, `target` | as sent; `target` is the path and the query |
+| `headers`, `body` | `Headers`, and the body's `bytes` |
+| `remote` | the client's address, such as `127.0.0.1:50123` |
+| `path()` | `target` up to `?`; of a whole URL, as a proxy may send, its path |
+| `param(name)` | the part of the path `{name}` in the pattern stands for; panics when the pattern has no such name |
+| `query(name)` | the first value of `name` in the query, decoded (`+` is a space); `str?` |
+| `queries(name)` | all its values, `[str]` |
+| `header(name)` | a header's value; `str?` |
+| `text()` | the body as text |
+
+### `Response`
+
+| | |
+|---|---|
+| `http.text(body, status = 200)` | plain text |
+| `http.html(body, status = 200)` | HTML |
+| `http.json(body, status = 200)` | JSON, given as text: see [`json`](json.md) for making it |
+| `http.redirect(to, status = 302)` | a redirect to `to` |
+| `http.status(code)` | only a status, with its reason as the body where it can have one |
+| `respond(status, body, content_type = "text/plain; charset=utf-8")` | any of them |
+| `resp.with_header(name, value)` | `resp`, with a header added |
+
+### Connections
 
 A connection carries requests one after another, until the client sends
 `Connection: close` (or speaks HTTP/1.0 without `keep-alive`), a request
@@ -349,27 +406,29 @@ a `501` for a `Transfer-Encoding` other than `chunked`.
 
 ### `Server`
 
-`Server` has the settings, each with a default:
+`Server(...)` has the settings, each with a default. `run()` listens on `host`
+and `port` and answers requests until `stop`; `serve(l)` does so on a
+[`tcp.Listener`](io.md#tcp) there is already. Both give `none or Error`.
 
 <!-- kod:
-import "net/http" { Incoming, Response, Server, respond }
-import "net/tcp"
+import "net/http" { Request, Response, Server, text }
 import "time" { Duration }
-func hello(anon req: Incoming) -> Response or Error {
-    return respond(200, "hello\n")
+func hello(anon req: Request) -> Response or Error {
+    return text("hello\n")
 }
 -->
 ```kod
 func main() -> none or Error {
-    let l = try tcp.listen("127.0.0.1", port: 8080)
     let server = Server(handler: hello, max_connections: 500, idle_timeout: Duration(seconds: 15))
-    try server.serve(l)
+    try server.run()
 }
 ```
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `handler` | | answers a request |
+| `routes` | none | the `Router` that answers requests |
+| `handler` | | answers them all instead, when there are no `routes` |
+| `host`, `port` | `127.0.0.1`, 8080 | where `run` listens; an empty `host` means every IPv4 interface |
 | `header_timeout` | 10 s | how long a client may take to send a request's headers, from when it connects or, on a kept-alive connection, from their first byte |
 | `body_timeout` | 60 s | how long it may take to send the body after them |
 | `write_timeout` | 60 s | how long it may take to read the response |
@@ -377,6 +436,9 @@ func main() -> none or Error {
 | `max_connections` | 10000 | how many connections are open at once |
 | `limits` | `Limits()` | caps each request's headers and body, as for a response |
 | `log` | stderr | a `func(str) -> none` that gets a line or more for each handler that fails |
+| `access_log` | false | whether `log` gets a line for each request too: `127.0.0.1:50123 GET /users/7 200 14 B 0.31 ms` |
+
+`serve(l, handler, limits = Limits())` is `Server(:handler, :limits).serve(l)`.
 
 The timeouts cap the whole of what they name, not each read, so a client that
 sends a byte at a time is dropped too: with a `408` when it has begun a
@@ -391,7 +453,7 @@ descriptors doesn't end the server: it waits a little and tries again.
 `server.stop(within: d)` ends `serve`: no more connections are accepted, those
 waiting for a request are closed, and the requests being read or answered get
 `d` (10 seconds when left out) to finish, their responses saying
-`Connection: close`. `serve` then returns; when some hadn't finished, they are
+`Connection: close`. `serve` then returns, and a later one returns at once; when some hadn't finished, they are
 cancelled and it returns a `TimedOut` error. It returns an error when accepting
 fails or its task is cancelled (`task.cancel()`) too; then the connections'
 tasks are cancelled and waited for.
@@ -404,7 +466,9 @@ tasks are cancelled and waited for.
 |----------|---------|
 | `parse_url(s)` | `Url or Error` with `scheme`, `host`, `port`, `target` (path and query) |
 | `resolve(base, location)` | the `Url` a `Location` points to |
-| `write_request(w, req, keep_alive = false, accept_gzip = false)` | write a `Request` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`, and `Accept-Encoding: gzip` when `accept_gzip` and there is no `Accept-Encoding` header already; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
+| `write_request(w, req, keep_alive = false, accept_gzip = false)` | write an `Outgoing` (`method`, `url`, `headers`, `body`) to any `Writer`, with `Connection: close` unless `keep_alive`, and `Accept-Encoding: gzip` when `accept_gzip` and there is no `Accept-Encoding` header already; header names and values with a line break or other control character, and a bad method, are `InvalidInput` errors |
+| `read_request(br, limits = Limits())` | the next `Request` from a `BufReader`, or `none` when the connection ends before one begins |
+| `write_response(w, resp, keep_alive = false, head = false)` | writes `resp` with a `Content-Length` and, unless `keep_alive`, `Connection: close`; an empty `reason` is the status's usual one; `head` leaves out the body, for the answer to a `HEAD` |
 | `read_response(br, method, limits = Limits())` | read one response from a `BufReader`; `method` decides whether there is a body; `Response.keep_alive` says whether the connection can carry another request |
 
 `write_request` and `read_response` work on `MemWriter` and `MemReader`, which

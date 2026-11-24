@@ -281,6 +281,7 @@ func fetch_status_line(host: str) -> str or Error {
 | `listen(host, port, backlog = 128)` | a `Listener` bound to `host:port`; an empty `host` means every IPv4 interface and port 0 picks a free port; `Listener or Error` |
 | `l.accept()` | the next connection, waiting for one; `Fd or Error` |
 | `l.wait()` | waits until there is a connection for `accept` to take; `none or Error` |
+| `peer(f)` | the address at the other end, as `127.0.0.1:50123` or `[::1]:50123`; `""` when there is none |
 | `shutdown(f, read = false, write = false)` | ends one direction of the connection, or both: a read of it gives the end of the stream, also one a task waits in, and a write fails |
 | `is_idle(f)` | true if nothing is waiting to be read from `f`; false if it has data, an end of stream (the peer closed it) or an error pending |
 | `l.port()` | the port it is bound to |

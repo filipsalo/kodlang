@@ -1,0 +1,217 @@
+// Routes, and what handlers are given and give back (docs/http.md#routes).
+import "net/http"
+import "net/http" { HttpError, Request, Response, Router, Server }
+import "net/tcp"
+import "panics"
+import "tasks"
+
+func named(anon name: str) -> func(Request) -> Response or Error {
+    return func(anon req: Request) -> Response or Error {
+        mut out = name
+        for p in req.params {
+            out += f" {p.name}={p.value}"
+        }
+        return http.text(out)
+    }
+}
+
+func routes() -> Router {
+    let r = Router()
+    r.get("/", named("root"))
+    r.get("/users", named("users"))
+    r.post("/users", named("new user"))
+    r.get("/users/{id}", named("user"))
+    r.get("/users/all", named("all"))
+    r.delete("/users/{id}", named("gone"))
+    r.put("/users/{id}", named("put"))
+    r.post("/users/all", named("post all"))
+    r.get("/users/{id}/posts/{post}", named("post"))
+    r.get("/users/{id}/posts/last", named("last"))
+    r.get("/files/{path...}", named("files"))
+    r.get("/files/readme", named("readme"))
+    r.get("/dir/", named("dir"))
+    r.add("PURGE", "/cache", named("purge"))
+    return r
+}
+
+func request(anon method: str, anon target: str) -> Request {
+    return Request(:method, :target, headers: http.Headers(), body: kod_str_to_bytes(""))
+}
+
+func ask(anon r: Router, anon method: str, anon target: str) -> str {
+    let got = r.answer(request(method, target))
+    if got is Err(e) {
+        return e.to_str()
+    }
+    let resp = got
+    if resp.status != 200 {
+        return f"{resp.status} {resp.header("Allow")? or ""}"
+    }
+    return resp.text()
+}
+
+test "a route for each path and method" {
+    let r = routes()
+    assert ask(r, "GET", "/") == "root"
+    assert ask(r, "GET", "/?x=1") == "root"
+    assert ask(r, "GET", "/users") == "users"
+    assert ask(r, "POST", "/users") == "new user"
+    assert ask(r, "PURGE", "/cache") == "purge"
+    assert ask(r, "GET", "/dir/") == "dir"
+    assert ask(r, "GET", "http://a.test/users?x=/") == "users"
+    assert ask(r, "GET", "http://a.test") == "root"
+}
+
+test "names stand for parts of the path, decoded" {
+    let r = routes()
+    assert ask(r, "GET", "/users/7") == "user id=7"
+    assert ask(r, "PUT", "/users/7") == "put id=7"
+    assert ask(r, "GET", "/users/7/posts/9?all=1") == "post id=7 post=9"
+    assert ask(r, "GET", "/users/a%2Fb%20c") == "user id=a/b c"
+    assert ask(r, "GET", "/files/a") == "files path=a"
+    assert ask(r, "GET", "/files/a/b%20c/d.txt") == "files path=a/b c/d.txt"
+    assert ask(r, "GET", "/users/%zz") == "400 bad path"
+}
+
+test "a written part goes first, then a name, then the rest" {
+    let r = routes()
+    assert ask(r, "GET", "/users/all") == "all"
+    assert ask(r, "GET", "/users/all/posts/9") == "post id=all post=9"
+    assert ask(r, "GET", "/users/7/posts/last") == "last id=7"
+    assert ask(r, "GET", "/files/readme") == "readme"
+    assert ask(r, "GET", "/files/readme/x") == "files path=readme/x"
+    // Where the written part has no such method, the name may.
+    assert ask(r, "DELETE", "/users/all") == "gone id=all"
+}
+
+test "what fits nothing is a 404, or a 405 with what there is" {
+    let r = routes()
+    for target in ["/nope", "/users/", "/users/7/", "/users/7/posts", "/files", "/files/", "/dir", "//", "*", ""] {
+        if ask(r, "GET", target) != "404 " {
+            fail(f"{target}: {ask(r, "GET", target)}")
+        }
+    }
+    assert ask(r, "POST", "/") == "405 GET, HEAD"
+    assert ask(r, "PATCH", "/users/all") == "405 DELETE, GET, HEAD, POST, PUT"
+    assert ask(r, "GET", "/cache") == "405 PURGE"
+    assert ask(r, "HEAD", "/cache") == "405 PURGE"
+    assert ask(Router(), "GET", "/") == "404 "
+}
+
+test "HEAD is answered as GET, or by its own route" {
+    let r = routes()
+    assert ask(r, "HEAD", "/users/7") == "user id=7"
+    r.add("HEAD", "/users/{id}", named("head"))
+    assert ask(r, "HEAD", "/users/7") == "head id=7"
+}
+
+func refusal(anon pattern: str) -> str {
+    let r = routes()
+    if panics.run(func() { r.get(pattern, named("x")) }) is panics.Panic(p) {
+        return p.message
+    }
+    return ""
+}
+
+test "patterns that can't be" {
+    assert refusal("users") == "a route's pattern starts with `/`: `users`"
+    assert refusal("/users/{other}") == "two routes for GET `/users/{other}`"
+    assert refusal("/a/{}") == "bad part `{}` in the route `/a/{}`"
+    assert refusal("/a/{b") == "bad part `{b` in the route `/a/{b`"
+    assert refusal("/a/x{b}") == "bad part `x{b}` in the route `/a/x{b}`"
+    assert refusal("/a/{b...}/c") == "bad part `{b...}` in the route `/a/{b...}/c`"
+    assert refusal("/{a}/{a}") == "bad part `{a}` in the route `/{a}/{a}`"
+    assert refusal("/{...}") == "bad part `{...}` in the route `/{...}`"
+    assert refusal("/fine/{a}/{b...}") == ""
+}
+
+test "a request's query, headers and parameters" {
+    let req = request("GET", "/s?q=a+b%21&tag=x&tag=y&empty=&bare&bad=%zz")
+    req.headers.add("X-Token", "t")
+    assert req.path() == "/s"
+    assert (req.query("q")? or "") == "a b!"
+    assert req.queries("tag") == ["x", "y"]
+    assert (req.query("empty")? or "none") == ""
+    assert (req.query("bare")? or "none") == ""
+    assert (req.query("bad")? or "") == "%zz"
+    assert req.query("nope") is none
+    assert request("GET", "/").query("q") is none
+    assert (req.header("x-token")? or "") == "t"
+    assert req.header("x-other") is none
+    let p = panics.run(func() { print(req.param("id")) })
+    assert p is panics.Panic(_p)
+}
+
+test "responses" {
+    let t = http.text("hi", status: 201)
+    assert t.status == 201
+    assert (t.header("Content-Type")? or "") == "text/plain; charset=utf-8"
+    assert (http.html("<p>").header("Content-Type")? or "") == "text/html; charset=utf-8"
+    assert (http.json("[]").header("Content-Type")? or "") == "application/json"
+    let r = http.redirect("/else")
+    assert r.status == 302
+    assert (r.header("Location")? or "") == "/else"
+    assert http.redirect("/else", status: 308).status == 308
+    assert http.status(404).text() == "Not Found\n"
+    assert http.status(204).text() == ""
+    let h = http.text("x").with_header("X-A", "1").with_header("X-B", "2")
+    assert (h.header("X-A")? or "") == "1"
+    assert (h.header("X-B")? or "") == "2"
+}
+
+type Log = shared struct {
+    lines: [str] = []
+}
+
+test "a server with routes" {
+    let log = Log()
+    let r = routes()
+    r.get("/secret", func(anon _req: Request) -> Response or Error {
+        throw HttpError(status: 403, message: "not for you")
+    })
+    r.get("/teapot", func(anon _req: Request) -> Response or Error {
+        throw HttpError(status: 404)
+    })
+    r.get("/where", func(anon req: Request) -> Response or Error { return http.text(req.remote) })
+    let server = Server(routes: r, access_log: true, log: func(anon line: str) { log.lines += [line] })
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let base = f"http://127.0.0.1:{l.port()}"
+    let serving = spawn server.serve(l)
+    assert (must http.get(base + "/users/7")).text() == "user id=7"
+    let secret = must http.get(base + "/secret")
+    assert secret.status == 403
+    assert secret.text() == "not for you\n"
+    assert (must http.get(base + "/teapot")).text() == "Not Found\n"
+    assert (must http.post(base + "/", kod_str_to_bytes("x"), content_type: "text/plain")).status == 405
+    let head = must http.fetch("HEAD", base + "/users/7")
+    assert head.status == 200
+    assert (head.header("Content-Length")? or "") == "9"
+    assert len(head.body) == 0
+    let remote = (must http.get(base + "/where")).text()
+    assert remote.starts_with("127.0.0.1:")
+    server.stop()
+    assert serving.wait() is Ok(_)
+    must l.close()
+    // Only access lines: an HttpError is an answer.
+    assert len(log.lines) == 6
+    assert log.lines[0].contains(" GET /users/7 200 9 B ")
+    assert log.lines[1].contains(" GET /secret 403 12 B ")
+    assert log.lines[3].contains(" POST / 405 ")
+}
+
+test "run listens on a port of its own" {
+    let server = Server(routes: routes(), port: 0)
+    let running = spawn server.run()
+    tasks.give_way()
+    assert server.open
+    server.stop()
+    assert running.wait() is Ok(_)
+    // Stopped before it runs, it doesn't.
+    let never = Server(routes: routes(), port: 0)
+    never.stop()
+    assert never.run() is Ok(_)
+    let busy = must tcp.listen("127.0.0.1", port: 0)
+    let refused = Server(routes: routes(), port: busy.port()).run()
+    assert refused is Err(_)
+    must busy.close()
+}
