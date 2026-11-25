@@ -1275,8 +1275,9 @@ func extern_label(anon name: str) -> str {
 }
 
 // The value of `expr_id` in `p` when it is int64 or bool literals and the operators
-// + - * & | ^ << >> on them, worked out as the generated code would (wrapping, and
-// shifts by the amount mod 64, as the compiler's own arithmetic does); none otherwise.
+// + - * & | ^ << >> on them, worked out as the generated code would (shifts by the
+// amount mod 64, as the compiler's own arithmetic does); none otherwise, and none
+// for a sum, difference or product that overflows, which panics when it runs.
 func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
     match p.exprs[expr_id] {
         .IntLit(value) -> return value
@@ -1290,9 +1291,9 @@ func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
             let .Some(a) = fold_int(p, lhs) else { return none }
             let .Some(b) = fold_int(p, rhs) else { return none }
             match op {
-                .Add -> return a + b
-                .Sub -> return a - b
-                .Mul -> return a * b
+                .Add -> return checked_add(a, b)
+                .Sub -> return checked_sub(a, b)
+                .Mul -> return checked_mul(a, b)
                 .BitAnd -> return a & b
                 .BitOr -> return a | b
                 .BitXor -> return a ^ b
@@ -1304,6 +1305,53 @@ func fold_int(anon p: parsing.Parser, anon expr_id: int64) -> int64? {
         else return none
     }
 }
+
+// The operator `n.wrapping_add(m)` and the others (by their labels) are without its check.
+func wrapping_op(anon label: str) -> ast.Op? {
+    match label {
+        "$primitives$int64$wrapping_add" -> return .Add
+        "$primitives$int64$wrapping_sub" -> return .Sub
+        "$primitives$int64$wrapping_mul" -> return .Mul
+        else return none
+    }
+}
+
+// `a + b`, or none when it doesn't fit in an int64.
+func checked_add(anon a: int64, anon b: int64) -> int64? {
+    if (b > 0 and a > INT64_MAX - b) or (b < 0 and a < INT64_MIN - b) {
+        return none
+    }
+    return a + b
+}
+
+// `a - b`, or none when it doesn't fit in an int64.
+func checked_sub(anon a: int64, anon b: int64) -> int64? {
+    if (b < 0 and a > INT64_MAX + b) or (b > 0 and a < INT64_MIN + b) {
+        return none
+    }
+    return a - b
+}
+
+// `a * b`, or none when it doesn't fit in an int64.
+func checked_mul(anon a: int64, anon b: int64) -> int64? {
+    if a == 0 or b == 0 {
+        return 0
+    }
+    if a == -1 or b == -1 {
+        if a == INT64_MIN or b == INT64_MIN {
+            return none
+        }
+        return a * b
+    }
+    let product = a.wrapping_mul(b)
+    if product / b != a {
+        return none
+    }
+    return product
+}
+
+let INT64_MAX: int64 = 9223372036854775807
+let INT64_MIN: int64 = -9223372036854775808
 
 // Whether the expression `expr_id` in `p` is literals, the names in `params`,
 // operators and field reads only: no call, index, `is`, or any other name.
@@ -7990,7 +8038,7 @@ type Codegen = shared struct {
         return self.compile_expr(self.p.alloc_expr(.MatchExpr(subject: l, :arms), :span))
     }
 
-    // `match v { A(a) -> hash(a) * 31 + 0, B(b) -> hash(b) * 31 + 1, ... }`: the hash of
+    // `match v { A(a) -> _mix(0, hash(a)), B(b) -> _mix(1, hash(b)), ... }`: the hash of
     // the member the union `v` holds, mixed with which member it is, so members that
     // hash alike (`0` and `false`) don't collide. `==` never holds across members.
     func union_hash(self, anon value_id: int64, union_idx: int64) -> int64 {
@@ -8004,8 +8052,7 @@ type Codegen = shared struct {
             let callee = self.p.alloc_expr(.Ident(name: "hash"), :span)
             let member = self.p.alloc_expr(.Ident(:name), :span)
             let hashed = self.p.alloc_expr(.Call(:callee, args: [ast.CallArg(label: "", label_span: span, value: member)]), :span)
-            let scaled = self.p.alloc_expr(.Binary(lhs: hashed, op: .Mul, rhs: self.p.alloc_expr(.IntLit(value: 31), :span)), :span)
-            let body = self.p.alloc_expr(.Binary(lhs: scaled, op: .Add, rhs: self.p.alloc_expr(.IntLit(value: j), :span)), :span)
+            let body = self.array_helper_call("_mix", args: [self.p.alloc_expr(.IntLit(value: j), :span), hashed], :span)
             arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body))]
         }
         return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
@@ -12497,7 +12544,8 @@ type Codegen = shared struct {
         return ""
     }
 
-    func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64) -> Val {
+    // With `wrapping`, `+`, `-` and `*` keep the low 64 bits rather than panic on overflow.
+    func compile_arith_cmp(self, lhs_id: int64, op: ast.Op, rhs_id: int64, wrapping: bool = false) -> Val {
         mut lhs_kind = self.infer_kind(lhs_id)
         let rhs_kind0 = self.infer_kind(rhs_id)
         if self.has_ops {
@@ -12507,6 +12555,19 @@ type Codegen = shared struct {
         }
         if op is .Sub and rhs_kind0 is .KFloat64 and self.is_unary_minus(lhs_id) {
             return self.compile_float_neg(rhs_id)
+        }
+        // Two literals, as `-5` is: their sum, difference or product, if it fits.
+        if self.p.exprs[lhs_id] is .IntLit(a) and self.p.exprs[rhs_id] is .IntLit(b) {
+            mut folded: int64? = none
+            match op {
+                .Add -> folded = checked_add(a, b)
+                .Sub -> folded = checked_sub(a, b)
+                .Mul -> folded = checked_mul(a, b)
+                else none
+            }
+            if folded is Some(n) {
+                return .VImm(value: n)
+            }
         }
         if op is .Eq or op is .Ne {
             let union_kind = self.union_eq_kind(lhs_id, :rhs_id, :lhs_kind, rhs_kind: rhs_kind0)
@@ -12701,13 +12762,34 @@ type Codegen = shared struct {
                 self.emit_op(.SetIf, a: result, b: "ge")
             }
             .Add -> {
-                self.emit_op(.Add, a: result, b: lhs_reg, c: rhs_reg)
+                if wrapping {
+                    self.emit_op(.Add, a: result, b: lhs_reg, c: rhs_reg)
+                } else {
+                    self.emit_op(.AddCheck, a: result, b: lhs_reg, c: rhs_reg)
+                    self.emit_overflow_branch(.Vs)
+                }
             }
             .Sub -> {
-                self.emit_op(.Sub, a: result, b: lhs_reg, c: rhs_reg)
+                if wrapping {
+                    self.emit_op(.Sub, a: result, b: lhs_reg, c: rhs_reg)
+                } else {
+                    self.emit_op(.SubCheck, a: result, b: lhs_reg, c: rhs_reg)
+                    self.emit_overflow_branch(.Vs)
+                }
             }
             .Mul -> {
                 self.emit_op(.Mul, a: result, b: lhs_reg, c: rhs_reg)
+                if not wrapping {
+                    // The product fits when its top 64 bits are copies of its sign.
+                    let high = self.pool.alloc_reg()
+                    let sign = self.pool.alloc_reg()
+                    self.emit_op(.MulHigh, a: high, b: lhs_reg, c: rhs_reg)
+                    self.emit_op(.ShiftRightSigned, a: sign, b: result, c: "#63")
+                    self.emit_op(.Compare, a: high, b: sign)
+                    self.emit_overflow_branch(.Ne)
+                    self.pool.free_reg(high)
+                    self.pool.free_reg(sign)
+                }
             }
             .Div -> {
                 let k = pow2_exponent(self.p, rhs_id)
@@ -12722,6 +12804,7 @@ type Codegen = shared struct {
                     self.pool.free_reg(t)
                 } else {
                     self.emit_div_zero_check(rhs_reg, :rhs_id)
+                    self.emit_div_overflow_check(lhs_reg, divisor: rhs_reg, :rhs_id)
                     self.emit_op(.DivSigned, a: result, b: lhs_reg, c: rhs_reg)
                 }
             }
@@ -12786,6 +12869,42 @@ type Codegen = shared struct {
         self.emit_jump_zero(divisor_reg, target: ok_lbl, nonzero: true)
         self.emit_call("_kod_div_zero")
         self.emit_label(ok_lbl)
+    }
+
+    // A jump, when `cond` holds, to a cold block that panics: an int64 overflowed.
+    func emit_overflow_branch(self, anon cond: regalloc.Cond) -> none {
+        let cold_lbl = self.fresh("Lovf")
+        self.emit_jump_if(cond, target: cold_lbl)
+        if self.dry_run {
+            return
+        }
+        self.cold += [.Label(name: cold_lbl)]
+        self.cold += [.Call(target: "_kod_int_overflow")]
+    }
+
+    // The one quotient that doesn't fit, the smallest int64 over -1, panics.
+    // A divisor of -1 is checked by one add and one branch; the dividend, in
+    // a cold block.
+    func emit_div_overflow_check(self, anon dividend: str, divisor: str, rhs_id: int64) -> none {
+        if self.p.exprs[rhs_id] is .IntLit(value) and value != -1 {
+            return
+        }
+        let t = self.pool.alloc_reg()
+        let ok_lbl = self.fresh("Ldiv_fits")
+        let cold_lbl = self.fresh("Lcold")
+        self.emit_op(.Add, a: t, b: divisor, c: "#1")
+        self.emit_jump_zero(t, target: cold_lbl)
+        self.emit_label(ok_lbl)
+        self.pool.free_reg(t)
+        if self.dry_run {
+            return
+        }
+        let x16 = regalloc.reg_of("x16")
+        self.cold += [.Label(name: cold_lbl)]
+        self.cold += [.LoadConst(dst: x16, value: INT64_MIN)]
+        self.cold += [regalloc.op(.Compare, a: regalloc.reg_of(dividend), b: x16)]
+        self.cold += [.Branch(kind: .If(cond: .Ne), reg: regalloc.NO_REG, target: ok_lbl)]
+        self.cold += [.Call(target: "_kod_int_overflow")]
     }
 
     // `result = lhs op rhs` on float bit patterns: through d0 and d1, which nothing else holds.
@@ -15971,6 +16090,10 @@ type Codegen = shared struct {
                 self.compile_discard(arg.value)
             }
             return .VImm(value: 0)
+        }
+        // `n.wrapping_add(m)` and the others are the operator without its check.
+        if len(args) == 1 and wrapping_op(method_lbl) is Some(wrap_op) {
+            return self.compile_arith_cmp(lhs_id: receiver_id, op: wrap_op, rhs_id: args[0].value, wrapping: true)
         }
         if inline_owner >= 0 and not (tail and self.tail_ok and method_lbl == self.tail_func_lbl) {
             if self.inline_call(self.structs[inline_owner].methods[inline_mi].sig, owner: inline_owner, recv: receiver_id, :args, slots: call_slots) is Some(inlined) {
@@ -21744,15 +21867,16 @@ type Codegen = shared struct {
                         let y = body.fb[i + 1]
                         let z = body.fc[i + 1]
                         // add/sub d, a, v
-                        if (next_op == regalloc.OP_ADD or next_op == regalloc.OP_SUB) and z == v and y != v and y != regalloc.XZR {
+                        let adds = next_op == regalloc.OP_ADD or next_op == regalloc.OP_ADD_CHECK
+                        if (adds or next_op == regalloc.OP_SUB or next_op == regalloc.OP_SUB_CHECK) and z == v and y != v and y != regalloc.XZR {
                             out.write_op(w, op: next_op, a: x, b: y, c: value)
                             w += 1
                             i += 2
                             continue
                         }
                         // add d, v, a
-                        if next_op == regalloc.OP_ADD and z != regalloc.NO_REG and y == v and z != v and z != regalloc.XZR {
-                            out.write_op(w, op: regalloc.OP_ADD, a: x, b: z, c: value)
+                        if adds and z != regalloc.NO_REG and y == v and z != v and z != regalloc.XZR {
+                            out.write_op(w, op: next_op, a: x, b: z, c: value)
                             w += 1
                             i += 2
                             continue

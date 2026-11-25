@@ -375,6 +375,12 @@ void kod_div_zero(void) {
     kod_panic_text(msg, strlen(msg), 0, __builtin_frame_address(0));
 }
 
+// Called when an int64 `+`, `-`, `*` or `/` gives a result that doesn't fit.
+void kod_int_overflow(void) {
+    const char *msg = "integer overflow";
+    kod_panic_text(msg, strlen(msg), 0, __builtin_frame_address(0));
+}
+
 // Print to stderr without exiting. Used by the codegen to surface
 // user-facing errors (unknown method, etc.) while continuing to
 // scan the rest of the module for additional errors.

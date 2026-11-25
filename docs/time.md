@@ -122,7 +122,7 @@ since a `Time` has no way to hold one.
 | Method | Meaning |
 |---|---|
 | `t + d` | the `Time` a `Duration` later |
-| `a - b` | the `Duration` from `b` to `a`, which wraps past about 292 years, as a `Duration` does |
+| `a - b` | the `Duration` from `b` to `a`, which panics past about 292 years, as a `Duration` does |
 | `a == b`, `a < b` and the like | whether they're the same moment, or which comes first |
 | `utc()` | a `Utc` with `year`, `month` (1 to 12), `day`, `hour`, `minute` and `second` |
 | `to_str()` | RFC 3339 in UTC, with a fraction only if there is one, as in `2026-01-02T02:04:05.25Z` |

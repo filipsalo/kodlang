@@ -242,9 +242,22 @@ Integer `/` rounds toward zero and `%` takes the sign of its left operand, so
 `-7 / 2` is `-3` and `-7 % 2` is `-1`, and `(a / b) * b + a % b` is always `a`.
 For a remainder that counts as a clock does, `(-7).mod(2)` is `1` (see `n.mod(m)` below).
 Dividing by zero, with `/` or `%`, panics:
-`panic: integer division by zero`, with a backtrace. The one quotient that
-doesn't fit, the smallest `int64` divided by `-1`, wraps around to the smallest
-`int64`, and its remainder is `0`.
+`panic: integer division by zero`, with a backtrace.
+
+A result of `+`, `-`, `*` or `/` that doesn't fit in an `int64` panics too:
+`panic: integer overflow`. That includes negating the smallest `int64` and
+dividing it by `-1`, the one quotient that doesn't fit (its remainder is `0`).
+Where wrapping around is what is wanted, as in a hash or a random number
+generator, `n.wrapping_add(m)`, `n.wrapping_sub(m)` and `n.wrapping_mul(m)`
+keep the low 64 bits of the result instead. A constant whose value overflows
+panics when it is read. The checks cost one instruction and one branch for
+`+` and `-`, a few for `*`, and two for a `/` whose divisor isn't a literal.
+
+```kod
+let big: int64 = 9223372036854775807
+print(big.wrapping_add(1))              // -9223372036854775808
+print(big + 1)                          // panic: integer overflow
+```
 
 `>>` shifts in zeros, so it treats an `int64` as 64 bits rather than a signed
 number, and so do the counting methods here. Each method is a few instructions at most:
@@ -255,8 +268,9 @@ number, and so do the counting methods here. Each method is a few instructions a
 | `n.trailing_zeros()` | how many zero bits are below the lowest one bit; 64 for `0` |
 | `n.count_ones()` | how many bits are one; 64 for `-1` |
 | `n.mod(m)` | `n % m` moved into `0..m` (or `m..0` for a negative `m`): `(-1).mod(100)` is `99`, where `-1 % 100` is `-1`; panics for `m` 0 as `%` does |
-| `n.abs()` | `n` without its sign; the smallest `int64`, whose positive twin doesn't fit, gives itself |
-| `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n * m` is the bottom 64 |
+| `n.abs()` | `n` without its sign; panics for the smallest `int64`, whose positive twin doesn't fit |
+| `n.wrapping_add(m)` `n.wrapping_sub(m)` `n.wrapping_mul(m)` | `n + m`, `n - m` and `n * m` wrapped around to 64 bits, where the operators panic |
+| `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n.wrapping_mul(m)` is the bottom 64 |
 
 ```kod
 print(1.leading_zeros())                // 63

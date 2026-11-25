@@ -67,6 +67,9 @@ func arm64_mnemonic(anon op: regalloc.Opcode) -> str {
         .FloatCompare -> return "fcmp"
         .CallIndirect -> return "blr"
         .Return -> return "ret"
+        .AddCheck -> return "adds"
+        .SubCheck -> return "subs"
+        .MulHigh -> return "smulh"
     }
 }
 
@@ -228,6 +231,9 @@ func arm64_intrinsic(anon label: str) -> [str] {
         // Count the bits of each byte, then add up the eight counts.
         "$primitives$int64$count_ones" -> return ["fmov d0, x0", "cnt v0.8b, v0.8b", "addv b0, v0.8b", "fmov x0, d0"]
         "$primitives$int64$mul_high" -> return ["umulh x0, x0, x1"]
+        "$primitives$int64$wrapping_add" -> return ["add x0, x0, x1"]
+        "$primitives$int64$wrapping_sub" -> return ["sub x0, x0, x1"]
+        "$primitives$int64$wrapping_mul" -> return ["mul x0, x0, x1"]
         "_kod_f64_abs" -> return ["fmov d0, x0", "fabs d0, d0", "fmov x0, d0"]
         // Rounding toward minus infinity, plus infinity, and to nearest
         // with ties away from zero, as C's floor, ceil and round.
@@ -1058,6 +1064,8 @@ func op_word(anon op: regalloc.Opcode, a: regalloc.Reg, b: regalloc.Reg, c: rega
         match op {
             .Add -> return add_imm_word(0x91000000, :a, :b, :v, :vreg_phys)
             .Sub -> return add_imm_word(0xD1000000, :a, :b, :v, :vreg_phys)
+            .AddCheck -> return adds_imm_word(0xB1000000, :a, :b, :v, :vreg_phys)
+            .SubCheck -> return adds_imm_word(0xF1000000, :a, :b, :v, :vreg_phys)
             .ShiftLeft -> {
                 let rd = zr_num(a, :vreg_phys)
                 let rn = zr_num(b, :vreg_phys)
@@ -1117,8 +1125,22 @@ func op_word(anon op: regalloc.Opcode, a: regalloc.Reg, b: regalloc.Reg, c: rega
         .ShiftLeft -> return 0x9AC02000 | regs
         .ShiftRight -> return 0x9AC02400 | regs
         .ShiftRightSigned -> return 0x9AC02800 | regs
+        .AddCheck -> return 0xAB000000 | regs
+        .SubCheck -> return 0xEB000000 | regs
+        .MulHigh -> return 0x9B407C00 | regs
         else return -1
     }
+}
+
+// `adds` or `subs` (`base`) of an immediate up to 4095: 31 is sp as the
+// source and xzr as the destination.
+func adds_imm_word(anon base: int64, a: regalloc.Reg, b: regalloc.Reg, v: int64, vreg_phys: [regalloc.Reg]) -> int64 {
+    let rd = zr_num(a, :vreg_phys)
+    let rn = sp_num(b, :vreg_phys)
+    if rd < 0 or rn < 0 or v > 4095 {
+        return -1
+    }
+    return base | v << 10 | rn << 5 | rd
 }
 
 // `add` or `sub` (`base`) of an immediate up to 4095, where 31 is sp.
@@ -1209,7 +1231,7 @@ func encode_text(anon line: str) -> int64 {
             }
             return -1
         }
-        "add" | "sub" | "mul" | "sdiv" | "orr" | "lsl" | "lsr" | "cmp" | "cset" | "csel" | "blr" -> {
+        "add" | "sub" | "mul" | "sdiv" | "orr" | "lsl" | "lsr" | "cmp" | "cset" | "csel" | "blr" | "adds" | "subs" | "smulh" -> {
             mut regs: [regalloc.Reg] = [regalloc.NO_REG, regalloc.NO_REG, regalloc.NO_REG, regalloc.NO_REG]
             if len(ops) > 4 {
                 return -1
@@ -1625,6 +1647,9 @@ func opcode_of(anon mn: str) -> regalloc.Opcode? {
         "cset" -> return .SetIf
         "csel" -> return .Select
         "blr" -> return .CallIndirect
+        "adds" -> return .AddCheck
+        "subs" -> return .SubCheck
+        "smulh" -> return .MulHigh
         else return none
     }
 }
@@ -1716,7 +1741,7 @@ func bitmask_imm(anon v: int64) -> int64 {
     let ones = elt.count_ones()
     mut run = -1
     if ones < 64 {
-        run = (1 << ones) - 1
+        run = (1 << ones).wrapping_sub(1)
     }
     // The rotation right of `run` that gives `elt`.
     for r in 0..size {
@@ -1738,7 +1763,7 @@ func rotate_right(anon x: int64, anon r: int64, anon size: int64) -> int64 {
         return x
     }
     if size == 64 {
-        return (x >> r) & ((1 << (64 - r)) - 1) | x << (64 - r)
+        return (x >> r) & (1 << (64 - r)).wrapping_sub(1) | x << (64 - r)
     }
     let mask = (1 << size) - 1
     return ((x >> r) | (x << (size - r))) & mask
