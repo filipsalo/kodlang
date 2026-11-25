@@ -652,3 +652,146 @@ func read_after_cancel() -> str {
     }
     return "read"
 }
+
+// ---- closing what another task waits for ----
+
+// How a read of `f` ends.
+func reading(anon f: Fd) -> str {
+    let got = f.read(100)
+    if got is Err(e) {
+        return e.to_str()
+    }
+    return f"{len(got)} bytes"
+}
+
+func filling(anon f: Fd) -> str {
+    let piece = kod_str_to_bytes("x" + "0123456789abcdef".repeat(4096))
+    for true {
+        if f.write(piece) is Err(e) {
+            return e.to_str()
+        }
+    }
+    return ""
+}
+
+func accepting(anon l: tcp.Listener) -> str {
+    let got = l.accept()
+    if got is Err(e) {
+        return e.to_str()
+    }
+    must got.close()
+    return "accepted"
+}
+
+// Two ends of a connection.
+func connected() -> [Fd] {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let accepted = spawn must_accept(l)
+    let c = must tcp.connect("127.0.0.1", port: l.port())
+    let s = accepted.wait()
+    must l.close()
+    return [c, s]
+}
+
+func must_accept(anon l: tcp.Listener) -> Fd {
+    return must l.accept()
+}
+
+let GONE: str = "Bad file descriptor"
+
+test "closing a connection wakes the task that reads it" {
+    let ends = connected()
+    let r = spawn reading(ends[0])
+    time.sleep(Duration(ms: 20))
+    let t0 = monotonic_ns()
+    must ends[0].close()
+    assert r.wait() == f"read: {GONE}"
+    assert ms_since(t0) < 20
+    must ends[1].close()
+}
+
+test "with a timeout too, long before it" {
+    let ends = connected()
+    must tcp.set_timeout(ends[0], timeout: Duration(seconds: 2))
+    let r = spawn reading(ends[0])
+    time.sleep(Duration(ms: 20))
+    let t0 = monotonic_ns()
+    must ends[0].close()
+    assert r.wait() == f"read: {GONE}"
+    assert ms_since(t0) < 20
+    must ends[1].close()
+}
+
+test "closing wakes the task that writes, and the one that reads" {
+    let ends = connected()
+    let w = spawn filling(ends[0])
+    let r = spawn reading(ends[0])
+    time.sleep(Duration(ms: 50))
+    must ends[0].close()
+    assert w.wait() == f"write: {GONE}"
+    assert r.wait() == f"read: {GONE}"
+    must ends[1].close()
+}
+
+test "closing a listener wakes the task that accepts" {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let a = spawn accepting(l)
+    time.sleep(Duration(ms: 20))
+    must l.close()
+    assert a.wait() == f"accept: {GONE}"
+    // And again fails, rather than close what has the number now.
+    assert l.close() is Err(_)
+}
+
+test "closing a pipe to a child wakes the task that reads it" {
+    let child = must process.start(["sleep", "10"], stdout: .Pipe)
+    let r = spawn reading(child.stdout)
+    time.sleep(Duration(ms: 20))
+    must child.stdout.close()
+    assert r.wait() == f"read: {GONE}"
+    must child.kill()
+    let _ = child.wait()
+}
+
+test "a task that is woken doesn't read what has the number next" {
+    let ends = connected()
+    let r = spawn reading(ends[0])
+    time.sleep(Duration(ms: 20))
+    let number = ends[0].fd
+    must ends[0].close()
+    // Before it runs.
+    let f = must posix.open_read("stdlib/tasks.kod")
+    assert unsafe.c_int(libc.dup2(f.fd, number)) == number
+    let next = Fd(fd: number)
+    assert r.wait() == f"read: {GONE}"
+    assert must next.read(10) == must (must posix.open_read("stdlib/tasks.kod")).read(10)
+    must next.close()
+    must f.close()
+    must ends[1].close()
+}
+
+test "a descriptor's number used again is waited for as any" {
+    for _i in 0..20 {
+        let ends = connected()
+        let r = spawn reading(ends[0])
+        time.sleep(Duration(ms: 1))
+        must ends[1].write_str("hello")
+        assert r.wait() == "5 bytes"
+        let again = spawn reading(ends[0])
+        time.sleep(Duration(ms: 1))
+        must ends[0].close()
+        assert again.wait() == f"read: {GONE}"
+        must ends[1].close()
+    }
+}
+
+test "closing what nobody waits for any more" {
+    let ends = connected()
+    let r = spawn reading(ends[0])
+    time.sleep(Duration(ms: 10))
+    r.cancel()
+    assert r.wait() == "read: Operation canceled"
+    must ends[0].close()
+    time.sleep(Duration(ms: 10))
+    must ends[1].close()
+}

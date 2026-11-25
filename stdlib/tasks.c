@@ -128,6 +128,35 @@ static struct kevent kod_events[64];
 
 extern int kod_wait_file;
 
+/* The keys last registered for each descriptor, to read it and to write to it:
+ * who may wait for it. */
+static int64_t *kod_fd_keys = NULL;
+static int64_t kod_fd_keys_n = 0;
+
+/* The key for reading (0) or writing (1) the descriptor, which is forgotten; 0
+ * for none. */
+int64_t kod_task_fd_key(int64_t fd, int64_t writes) {
+    int64_t at = 2 * fd + writes;
+    if (fd < 0 || at >= kod_fd_keys_n) return 0;
+    int64_t key = kod_fd_keys[at];
+    kod_fd_keys[at] = 0;
+    return key;
+}
+
+static void kod_fd_keys_set(int64_t fd, int64_t writes, int64_t key) {
+    int64_t at = 2 * fd + writes;
+    if (fd < 0) return;
+    if (at >= kod_fd_keys_n) {
+        int64_t n = 2 * at + 128;
+        int64_t *grown = realloc(kod_fd_keys, (size_t)n * sizeof *grown);
+        if (!grown) return;
+        for (int64_t i = kod_fd_keys_n; i < n; i++) grown[i] = 0;
+        kod_fd_keys = grown;
+        kod_fd_keys_n = n;
+    }
+    kod_fd_keys[at] = key;
+}
+
 /* Registers `filter` on `ident` (a timer is named by `key`, as its ident is
  * free); 0 when kevent took it, -1 when it can't come, as for a child that
  * has already exited, a file, or a descriptor that isn't open. */
@@ -149,6 +178,7 @@ int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key
     } while (n < 0 && errno == EINTR);
     if (n < 0) return -1;
     if (n == 1 && (out.flags & EV_ERROR) && out.data != 0) return -1;
+    if (filter == EVFILT_READ || filter == EVFILT_WRITE) kod_fd_keys_set(ident, filter == EVFILT_WRITE, key);
     return 0;
 }
 
@@ -205,12 +235,17 @@ extern void kod_tasks_wake_var(int64_t cell) __asm__("$tasks$_wake_var");
 extern void (*kod_unwind_group_hook)(void *group);
 extern void kod_tasks_unwind_group(void *group) __asm__("$tasks$_unwind_group");
 
+/* A descriptor is about to be closed (runtime.c). */
+extern void (*kod_close_hook)(int64_t fd);
+extern void kod_tasks_closing(int64_t fd) __asm__("$tasks$_closing");
+
 static void kod_preempt_start(void);
 
 void kod_task_hook(void) {
     kod_preempt_start();
     kod_unwind_group_hook = kod_tasks_unwind_group;
     kod_wait_hook = kod_tasks_wait_event;
+    kod_close_hook = kod_tasks_closing;
     kod_backtrace_hook = kod_tasks_print_spawn_trace;
     kod_var_wait_hook = kod_tasks_wait_var;
     kod_var_wake_hook = kod_tasks_wake_var;

@@ -803,8 +803,8 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * EVFILT_WRITE on a descriptor, data the most nanoseconds to wait or 0;
  * EVFILT_TIMER for nanoseconds; EVFILT_PROC on a child); 1 means the task
  * waited for the event while others ran, 0 that the caller should just block,
- * as it does without tasks, 2 that the task is cancelled, and 3 that the time
- * ran out first. A socket's own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the
+ * as it does without tasks, 2 that the task is cancelled, 3 that the time
+ * ran out first, and 4 that another task has closed the descriptor. A socket's own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the
  * limit for a descriptor given none, as it is for a read that blocks. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
@@ -813,6 +813,14 @@ int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 int64_t kod_room = 0;
 int64_t kod_wait_room(void) {
     return kod_room;
+}
+
+/* Told of a descriptor about to be closed, so that no task waits for it for
+ * good: kevent says nothing of it then (stdlib/tasks.c sets the hook). */
+void (*kod_close_hook)(int64_t fd) = 0;
+
+void kod_closing(int64_t fd) {
+    if (kod_close_hook) kod_close_hook(fd);
 }
 
 /* Whether the descriptor kod_wait_event was last called for is a file's, which

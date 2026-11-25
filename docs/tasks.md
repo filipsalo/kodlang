@@ -271,6 +271,9 @@ host name (`getaddrinfo` has no form that doesn't block), and reading a
 regular file, which is ready at once. Two tasks waiting to read one
 descriptor at the same time aren't supported.
 
+Closing a descriptor, a listener or a TLS stream that another task waits for
+ends that wait with an error (`Bad file descriptor`; for TLS, `connection is closed`).
+
 Timeouts hold in a task as without tasks: `tcp.connect`'s, and a socket's
 own (`tcp.set_timeout`, and so the HTTP client's), which ends a read or write
 that waits too long with `.TimedOut`. [HTTP](http.md#requests-at-the-same-time)

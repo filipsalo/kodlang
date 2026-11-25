@@ -16,6 +16,7 @@ extern func kod_task_ctx_free(anon ctx: int64) -> none
 extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
 extern func kod_task_switch(anon from: int64, anon to: int64) -> none
 extern func kod_task_kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64
+extern func kod_task_fd_key(anon fd: int64, anon writes: int64) -> int64
 extern func kod_task_kq_drop_timer(anon key: int64) -> none
 extern func kod_task_kq_wait(anon block: int64) -> int64
 extern func kod_task_kq_key(anon i: int64) -> int64
@@ -56,6 +57,8 @@ type Fiber = shared struct {
     cancelled: bool = false
     // The key of the kevent registration it waits on, 0 for none.
     io_key: int64 = 0
+    // The descriptor it waited for has been closed.
+    io_closed: bool = false
     // What the event that came said: for a write, how much there is room for.
     io_data: int64 = 0
     // Where it was spawned (_spawn_trace).
@@ -712,7 +715,7 @@ func _park() -> none {
 // the event can't come (a child that has already exited, say); or 2 when the
 // task is cancelled, and the caller gives up with `.Cancelled`; or 3 when the
 // descriptor's limit of `data` nanoseconds passed first, and the caller gives
-// up with `.TimedOut`.
+// up with `.TimedOut`; or 4 when another task has closed the descriptor.
 func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int64 {
     let me = _running()
     if me.cancelled {
@@ -746,6 +749,7 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     }
     _io[key] = me
     me.io_key = key
+    me.io_closed = false
     // _poll takes the key out when the event comes, _cancel when the task is.
     for _io.contains(key) and (timer_key == 0 or _io.contains(timer_key)) {
         _switch_from(me)
@@ -766,8 +770,22 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     if timed_out {
         return 3
     }
+    if me.io_closed {
+        return 4
+    }
     kod_task_set_room(me.io_data)
     return 1
+}
+
+// The descriptor is about to be closed (runtime.c, kod_closing): the tasks that wait
+// for it give up.
+func _closing(anon fd: int64) -> none {
+    for writes in 0..2 {
+        if _io.remove(kod_task_fd_key(fd, writes)) is Fiber(fiber) {
+            fiber.io_closed = true
+            _make_ready(fiber)
+        }
+    }
 }
 
 // Makes ready the tasks whose events have come, waiting for one when `block`.
