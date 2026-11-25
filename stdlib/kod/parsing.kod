@@ -417,6 +417,7 @@ type SavedFunction = struct {
     yield_values: [int64]
     value_returns: [lexing.Token]
     value_return_stmts: [int64]
+    loops: int64
 }
 
 type Parser = shared struct {
@@ -441,6 +442,8 @@ type Parser = shared struct {
     pattern_subs: [[ast.SubPattern]] = []
     match_arms: [ast.MatchArm]
     match_expr_arms: [ast.MatchExprArm]
+    // How many loops of the function being parsed are open.
+    loops: int64 = 0
     // Where the last statement of the block parsed last begins, or -1.
     last_stmt_at: int64 = -1
     func_decls: [ast.FuncDecl]
@@ -3325,7 +3328,7 @@ type Parser = shared struct {
                     self.advance()
                     self.parse_expr()
                 }
-                let body: [int64] = self.parse_block()
+                let body: [int64] = self.parse_loop_block()
                 return self.for_numbered(index, :name, :iter, :body)
             }
             if self.at(.Identifier) and self.peek_kind_at(1) == .KwIn {
@@ -3334,16 +3337,16 @@ type Parser = shared struct {
                 let iter: int64 = self.parse_expr()
                 if self.try_consume(.DotDot) {
                     let stop: int64 = self.parse_expr()
-                    let body: [int64] = self.parse_block()
+                    let body: [int64] = self.parse_loop_block()
                     return self.for_range(name, start: iter, :stop, :body)
                 }
-                mut body: [int64] = self.parse_block()
+                mut body: [int64] = self.parse_loop_block()
                 return self.alloc_stmt(ast.Stmt.ForEach(:name, :iter, :body))
             }
             let cond: int64 = self.parse_expr()
             let ops: [int64] = self.and_operands(cond)
             let pats: [int64] = self.chain_patterns(ops)
-            mut body: [int64] = self.parse_block()
+            mut body: [int64] = self.parse_loop_block()
             if self.any_pattern(pats) {
                 // `for true { if cond { body } else { break } }`: `continue`
                 // tests the condition again, and `break` is the loop's own.
@@ -3358,6 +3361,12 @@ type Parser = shared struct {
         }
 
         // break / continue
+        if (self.at(.KwBreak) or self.at(.KwContinue)) and self.loops == 0 {
+            self.record_error(f"error: {self.peek_kind().name()} is only for the body of a `for` loop", got: self.peek())
+            self.advance()
+            self.skip_newlines()
+            return self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.unreachable_value()))
+        }
         if self.try_consume(.KwBreak) {
             self.skip_newlines()
             return self.alloc_stmt(ast.Stmt.Break)
@@ -3483,7 +3492,8 @@ type Parser = shared struct {
     // Starts a function's body: the outer one's yields and returns, for
     // leave_function.
     func enter_function(self) -> SavedFunction {
-        let outer = SavedFunction(yields: self.yields, yield_values: self.yield_values, value_returns: self.value_returns, value_return_stmts: self.value_return_stmts)
+        let outer = SavedFunction(yields: self.yields, yield_values: self.yield_values, value_returns: self.value_returns, value_return_stmts: self.value_return_stmts, loops: self.loops)
+        self.loops = 0
         self.yields = []
         self.yield_values = []
         self.value_returns = []
@@ -3496,6 +3506,15 @@ type Parser = shared struct {
         self.yield_values = outer.yield_values
         self.value_returns = outer.value_returns
         self.value_return_stmts = outer.value_return_stmts
+        self.loops = outer.loops
+    }
+
+    // The block a `for` runs.
+    func parse_loop_block(self) -> [int64] {
+        self.loops += 1
+        let body = self.parse_block()
+        self.loops -= 1
+        return body
     }
 
     // After an error, each `yield` just evaluates its value, so that it reports

@@ -169,7 +169,8 @@ of value is an error.
 
 ## `break` and `continue`
 
-Works inside both loop forms:
+Both work inside every form of `for`, and nowhere else; a function literal in a loop's
+body is outside of it:
 
 ```kod
 mut i: int64 = 0
