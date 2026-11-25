@@ -1361,7 +1361,7 @@ func inline_stmt_size(anon p: parsing.Parser, anon id: int64) -> int64 {
         .Let(_name, _typ, value, _mutable) -> return inline_size_sum(1, inline_expr_size(p, value))
         .Assign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
         .PlusAssign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
-        .MinusAssign(lhs, rhs) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
+        .OpAssign(lhs, rhs, _op) -> return inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs))
         .Return(value) -> {
             if value == 0 {
                 return 1
@@ -4469,7 +4469,7 @@ type Codegen = shared struct {
             }
             .Assign(lhs, _r) -> return self.p.expr_spans[lhs].start
             .PlusAssign(lhs, _r) -> return self.p.expr_spans[lhs].start
-            .MinusAssign(lhs, _r) -> return self.p.expr_spans[lhs].start
+            .OpAssign(lhs, _r, _op) -> return self.p.expr_spans[lhs].start
             .Return(value) -> {
                 if value != 0 {
                     return self.p.expr_spans[value].start
@@ -10648,7 +10648,7 @@ type Codegen = shared struct {
                 self.collect_expr_vars(rhs)
                 self.collect_expr_vars(lhs)
             }
-            .MinusAssign(lhs, rhs) -> {
+            .OpAssign(lhs, rhs, _op) -> {
                 self.note_assigned(lhs)
                 self.collect_expr_vars(rhs)
                 self.collect_expr_vars(lhs)
@@ -16724,9 +16724,9 @@ type Codegen = shared struct {
                     self.bind_var(name)
                 }
             }
-            .Assign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 0)
-            .PlusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 1)
-            .MinusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: 2)
+            .Assign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: none)
+            .PlusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: .Add)
+            .OpAssign(lhs, rhs, op) -> self.compile_update(lhs, :rhs, :op)
             .Return(value) -> self.compile_return(value)
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
             .For(cond, body) -> {
@@ -19170,14 +19170,19 @@ type Codegen = shared struct {
     // bad operand type surfaces as a normal binary-op error.
     // `target = rhs` (op 0), `+=` (1) or `-=` (2), through compile_entry_update
     // when the target is or is in a struct's entry, `s[k]` or `s[k, default: d]`.
-    func compile_update(self, anon target: int64, rhs: int64, op: int64) -> none {
+    // `target = rhs`, or with `op` `target op= rhs`.
+    func compile_update(self, anon target: int64, rhs: int64, op: ast.Op?) -> none {
         if self.compile_entry_update(target, :rhs, :op) {
             return
         }
-        match op {
-            0 -> self.compile_assign(lhs_id: target, rhs_id: rhs)
-            1 -> self.compile_plus_assign(lhs_id: target, rhs_id: rhs)
-            else self.compile_minus_assign(lhs_id: target, rhs_id: rhs)
+        if op is Some(by) {
+            if by is .Add {
+                self.compile_plus_assign(lhs_id: target, rhs_id: rhs)
+            } else {
+                self.compile_op_assign(lhs_id: target, rhs_id: rhs, op: by)
+            }
+        } else {
+            self.compile_assign(lhs_id: target, rhs_id: rhs)
         }
     }
 
@@ -19235,14 +19240,14 @@ type Codegen = shared struct {
     // changed there, and put back (op_index_set). Nothing else holds the value
     // meanwhile, so changing it copies nothing. False when `target` has no
     // entry, or when it's an entry `=` assigns, which op_index_set does.
-    func compile_entry_update(self, anon target: int64, rhs: int64, op: int64) -> bool {
+    func compile_entry_update(self, anon target: int64, rhs: int64, op: ast.Op?) -> bool {
         let entry = self.entry_root(target)
         if entry == 0 {
             return false
         }
         let parts = self.entry_parts(entry)
         let span = self.p.expr_spans[target]
-        if op == 0 and entry == target {
+        if op is none and entry == target {
             if parts[2] == 0 {
                 return false
             }
@@ -19267,7 +19272,7 @@ type Codegen = shared struct {
         let new_target = self.entry_target(target, :entry, replacement: local)
         mut value = rhs
         if not self.is_stable(rhs) {
-            if op == 0 {
+            if op is none {
                 value = self.stash_operand_as(rhs, kind: self.infer_kind(new_target))
             } else {
                 value = self.stash_chain_operand(rhs)
@@ -19418,11 +19423,11 @@ type Codegen = shared struct {
         return self.p.alloc_expr(ast.Expr.Call(:callee, args: call_args), :span)
     }
 
-    func compile_minus_assign(self, lhs_id: int64, rhs_id: int64) -> none {
+    func compile_op_assign(self, lhs_id: int64, rhs_id: int64, op: ast.Op) -> none {
         let target = self.stash_store_target(lhs_id, value: rhs_id)
         let span = self.p.expr_spans[target]
-        let diff_id = self.p.alloc_expr(ast.Expr.Binary(lhs: target, op: .Sub, rhs: rhs_id), :span)
-        self.compile_assign(lhs_id: target, rhs_id: diff_id)
+        let value_id = self.p.alloc_expr(ast.Expr.Binary(lhs: target, :op, rhs: rhs_id), :span)
+        self.compile_assign(lhs_id: target, rhs_id: value_id)
     }
 
     // Leaves the function with the value in x0. A reference the frame would give up

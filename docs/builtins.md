@@ -56,6 +56,18 @@ else doesn't hide the builtin, so `panic(msg)` after
 
 As a value, `len` is its string form: `let n: func(str) -> int64 = len`.
 
+## Smaller and larger
+
+`min(a, b)` and `max(a, b)` give the smaller and the larger of two values of one type
+that `<` compares: numbers, `str`s, `bytes` and structs that declare
+[`op_lt`](structs.md#operators). When neither is smaller, as with equal values or a NaN, both
+give `a`.
+
+```kod
+min(3, 5)                  // 3
+max("pear", "apple")       // "pear"
+```
+
 ## Bytes
 
 | Function | Signature | Description |

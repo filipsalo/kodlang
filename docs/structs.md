@@ -498,8 +498,8 @@ if total > Money(cents: 500) { ... }
 ```
 
 `!=` is `not op_eq`. The four orderings come from `op_lt` alone: `a > b` is
-`b < a`, `a <= b` is `not (b < a)` and `a >= b` is `not (a < b)`. `a += b` and
-`a -= b` are `a = a + b` and `a = a - b`, and `a < b < c` chains as it does for
+`b < a`, `a <= b` is `not (b < a)` and `a >= b` is `not (a < b)`. `a += b` is
+`a = a + b`, and so on for the other compound assignments, and `a < b < c` chains as it does for
 numbers. The operators keep their usual precedence, and the operands are
 evaluated left to right whichever one the method belongs to.
 

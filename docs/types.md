@@ -23,8 +23,8 @@ unknown type, doesn't produce further errors where it's used.
 ## Bindings and mutability
 
 A `let` binding is immutable: once set, reassigning the name is a compile
-error. Use `mut` for a binding you need to reassign. `+=` and `-=` count as
-reassignment, so they require `mut` too.
+error. Use `mut` for a binding you need to reassign. `+=` and the other compound
+assignments count as reassignment, so they require `mut` too.
 
 ```kod
 let max: int64 = 100
@@ -227,9 +227,10 @@ and its digits, with or without a space between them:
 `-9223372036854775808.to_str()` it negates the call, so in both the literal
 stands alone and is an error; the second suggests `(-9223372036854775808)`.
 
-Arithmetic operators: `+`, `-`, `*`, `/`, `%`. Compound assignment
-`+=` and `-=` update a variable, field, or array element in place
-(`n -= 3` is `n = n - 3`). An assignment binds looser than every
+Arithmetic operators: `+`, `-`, `*`, `/`, `%`. A compound assignment, `+=`, `-=`,
+`*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=` or `>>=`, updates a variable, field, or
+array element in place: `n -= 3` is `n = n - 3`, and `n *= a + b` is
+`n = n * (a + b)`. An assignment binds looser than every
 operator, so `ok = a and b` assigns `a and b`. A prefix `-` negates the whole call, field
 access, index or `?` after it, and binds tighter than any binary
 operator: `-xs[0]` is `-(xs[0])`, `-p.get()` is `-(p.get())`, and
@@ -245,13 +246,14 @@ doesn't fit, the smallest `int64` divided by `-1`, wraps around to the smallest
 `int64`, and its remainder is `0`.
 
 `>>` shifts in zeros, so it treats an `int64` as 64 bits rather than a signed
-number, and so do these methods, each a single instruction:
+number, and so do the counting methods here. Each method is a few instructions at most:
 
 | Method | Gives |
 |--------|-------|
 | `n.leading_zeros()` | how many zero bits are above the highest one bit; 64 for `0` |
 | `n.trailing_zeros()` | how many zero bits are below the lowest one bit; 64 for `0` |
 | `n.count_ones()` | how many bits are one; 64 for `-1` |
+| `n.abs()` | `n` without its sign; the smallest `int64`, whose positive twin doesn't fit, gives itself |
 | `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n * m` is the bottom 64 |
 
 ```kod
@@ -315,7 +317,8 @@ So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
 `"n = " + str(5)` or `f"n = {5}"`. `s - t` on two strings, `xs * "2"` on an
 array (an array repeats by an `int64`: see
 [Repetition](arrays.md#repetition)), `-s` on a string, `s + b` with
-`b: bytes` and `red < blue` on an enum are errors too. `+=` and `-=` follow the rules of `+` and `-`. An index,
+`b: bytes` and `red < blue` on an enum are errors too. A compound assignment follows
+the rules of its operator. An index,
 as in `xs[i]`, `s[i]` and `xs[i] = v`, and the bounds of a slice must be
 `int64`, so `xs["a"]` and `xs[true]` are errors, and so is an `int64?`
 index; unwrap it first.
