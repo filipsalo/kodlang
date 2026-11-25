@@ -248,8 +248,10 @@ func main() -> int64 {
 
 The styles are `bold`, `dim`, `red`, `green` and `yellow`.
 
-The older `io.read_file` and `io.write_file` keep their behavior: an empty
-string or `-1` on failure, with no reason.
+`io.read_file` gives `str or Error`: an `IoError` that says why the file can't
+be opened or read, such as `open data.txt: No such file or directory`. Where a
+missing file means no text, `io.read_file(path)? or ""` gives the empty string.
+The older `io.write_file` keeps its behavior: `-1` on failure, with no reason.
 
 ## TCP
 

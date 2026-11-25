@@ -258,8 +258,9 @@ The `io` module wraps the filesystem primitives. Both calls require
 import "io"
 
 // Read the whole file. Pipes and FIFOs (e.g. "/dev/stdin") are read
-// until EOF. Returns "" if the file can't be opened or read.
-let contents: str = io.read_file("data.txt")
+// until EOF. A file that can't be opened or read gives an IoError that
+// says why, so `must` panics with the reason.
+let contents: str = must io.read_file("data.txt")
 
 // Write a file, replacing it if it exists. Returns 0 on success,
 // -1 on failure. The parent directory must already exist.
