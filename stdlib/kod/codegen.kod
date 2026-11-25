@@ -3545,21 +3545,11 @@ type Codegen = shared struct {
             return false
         }
         for k in from..len(slots) {
-            if slots[k] >= 0 and not self.leaves_locals(args[slots[k]].value) {
+            if slots[k] >= 0 and (args[slots[k]].by_ref or self.may_change(args[slots[k]].value, name)) {
                 return true
             }
         }
         return false
-    }
-
-    // Whether working out `expr_id` assigns no local: no call is in it, which could take
-    // one as `mut`, and no block.
-    func leaves_locals(self, anon expr_id: int64) -> bool {
-        match self.p.exprs[expr_id] {
-            .IntLit(_) | .BoolLit(_) | .StrLit(_) | .FloatLit(_) | .Ident(_) -> return true
-            .Binary(lhs, _op, rhs) -> return self.leaves_locals(lhs) and self.leaves_locals(rhs)
-            else return false
-        }
     }
 
     // A frame slot for an inlined call's argument or result.
@@ -9371,34 +9361,244 @@ type Codegen = shared struct {
         return 0
     }
 
-    func rc_hold(self, anon expr_id: int64, reg: str) -> none {
+    func rc_hold(self, anon expr_id: int64, reg: str, args: [ast.CallArg]) -> none {
         if (self.rc_pending and self.rc_pending_reg == reg) {
             return
         }
         match self.p.exprs[expr_id] {
-            .Ident(_n) -> return
+            .Ident(name) -> {
+                // A local keeps its value, unless it is changed meanwhile.
+                if not self.changed_by_args(name, :expr_id, :args) {
+                    return
+                }
+            }
             .Call(_c, _a) -> return
             .IntLit(_v) -> return
             .StrLit(_v) -> return
             else none
         }
         if self.rc_heap_kind(self.infer_kind(expr_id)) {
-            self.rc_retain(reg)
-            // Held in a slot of its own until the call returns (release_holds):
-            // held to the statement's end, a value in a field would have two
-            // holders while an `if`'s body changes it, and be copied.
-            mut slot = 0
-            if len(self.hold_free) > 0 {
-                slot = self.hold_free[-1]
-                self.hold_free = self.hold_free[0..len(self.hold_free) - 1]
-            } else {
-                // Empty when the function starts, and let go of at its exit
-                // if a jump out of the call's statement left it full.
-                slot = self.rc_new_slot()
-            }
-            self.emit_str_raw(slot, :reg)
-            self.holds += [slot]
+            let _slot = self.hold_reg(reg)
         }
+    }
+
+    // Holds what `reg` refers to in a slot of its own until the call returns
+    // (release_holds): held to the statement's end, a value in a field would have two
+    // holders while an `if`'s body changes it, and be copied.
+    func hold_reg(self, anon reg: str) -> int64 {
+        self.rc_retain(reg)
+        mut slot = 0
+        if len(self.hold_free) > 0 {
+            slot = self.hold_free[-1]
+            self.hold_free = self.hold_free[0..len(self.hold_free) - 1]
+        } else {
+            // Empty when the function starts, and let go of at its exit
+            // if a jump out of the call's statement left it full.
+            slot = self.rc_new_slot()
+        }
+        self.emit_str_raw(slot, :reg)
+        self.holds += [slot]
+        return slot
+    }
+
+    // Whether `name`, an argument or the receiver of a call with `args`, may be changed
+    // before the call returns: a module's variable by the function, a `mut` local by what
+    // an argument does or by being passed as `mut` too.
+    func changed_by_args(self, anon name: str, expr_id: int64, args: [ast.CallArg]) -> bool {
+        if not self.var_bound(name) {
+            return self.var_signature(expr_id) is Some(_)
+        }
+        if not self.find_var_mutable(name) {
+            return false
+        }
+        for arg in args {
+            if arg.value == expr_id {
+                continue
+            }
+            if (arg.by_ref and self.root_name(arg.value) == name) or self.may_change(arg.value, name) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The local a name or a path of fields and elements starts at, or "".
+    func root_name(self, anon expr_id: int64) -> str {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> return name
+            .Binary(lhs, op, _rhs) -> {
+                if op is .Dot or op is .Index {
+                    return self.root_name(lhs)
+                }
+            }
+            else none
+        }
+        return ""
+    }
+
+    // Whether working out `expr_id` may assign the local `name`, or change it in place: by
+    // passing it as `mut`, by a method of it, or in a block.
+    func may_change(self, anon expr_id: int64, anon name: str) -> bool {
+        match self.p.exprs[expr_id] {
+            .IntLit(_) | .FloatLit(_) | .StrLit(_) | .BytesLit(_) | .BoolLit(_) | .NoneLit | .Ident(_) | .ImplicitVariant(_) | .FuncLit(_) -> return false
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    return self.may_change(lhs, name)
+                }
+                return self.may_change(lhs, name) or self.may_change(rhs, name)
+            }
+            .Call(callee, args) -> {
+                if self.p.exprs[callee] is .Binary(recv, op, _method) and op is .Dot and self.root_name(recv) == name {
+                    return true
+                }
+                for arg in args {
+                    if (arg.by_ref and self.root_name(arg.value) == name) or self.may_change(arg.value, name) {
+                        return true
+                    }
+                }
+                return self.may_change(callee, name)
+            }
+            .ArrayLit(elements) -> {
+                for e in elements {
+                    if self.may_change(e, name) {
+                        return true
+                    }
+                }
+                return false
+            }
+            .Chain(exprs, _ops) -> {
+                for e in exprs {
+                    if self.may_change(e, name) {
+                        return true
+                    }
+                }
+                return false
+            }
+            .Slice(s, lo, hi) -> return self.may_change(s, name) or self.may_change(lo, name) or (hi != 0 and self.may_change(hi, name))
+            .Try(inner) -> return self.may_change(inner, name)
+            .Must(inner) -> return self.may_change(inner, name)
+            .UnwrapOpt(value, default) -> return self.may_change(value, name) or (default != 0 and self.may_change(default, name))
+            .OptionalDot(value, _field) -> return self.may_change(value, name)
+            else return true
+        }
+    }
+
+    // Whether working out `expr_id` may run other code: a call, or a block.
+    func runs_code(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .IntLit(_) | .FloatLit(_) | .StrLit(_) | .BytesLit(_) | .BoolLit(_) | .NoneLit | .Ident(_) | .ImplicitVariant(_) | .FuncLit(_) -> return false
+            .Binary(lhs, op, rhs) -> {
+                if op is .Dot {
+                    return self.runs_code(lhs)
+                }
+                return self.runs_code(lhs) or self.runs_code(rhs)
+            }
+            .Call(callee, args) -> {
+                // Text of a number or a string is made by the runtime.
+                if self.p.exprs[callee] is .Ident(name) and name == "$str" and len(args) == 1 and not self.runs_code(args[0].value) {
+                    match self.infer_kind(args[0].value) {
+                        .KInt64 | .KBool | .KFloat64 | .KStr | .KBytes -> return false
+                        else return true
+                    }
+                }
+                return true
+            }
+            .ArrayLit(elements) -> {
+                for e in elements {
+                    if self.runs_code(e) {
+                        return true
+                    }
+                }
+                return false
+            }
+            .Slice(s, lo, hi) -> return self.runs_code(s) or self.runs_code(lo) or (hi != 0 and self.runs_code(hi))
+            .Must(inner) -> return self.runs_code(inner)
+            .UnwrapOpt(value, default) -> return self.runs_code(value) or (default != 0 and self.runs_code(default))
+            .OptionalDot(value, _field) -> return self.runs_code(value)
+            else return true
+        }
+    }
+
+    // Whether what `expr_id` gives is another's, which working out `later` may take
+    // away: an operand to hold meanwhile.
+    func disturbed(self, anon expr_id: int64, anon later: [int64]) -> bool {
+        for l in later {
+            if self.runs_code(l) {
+                return self.borrowed_from(expr_id, later) and self.rc_heap_kind(self.infer_kind(expr_id))
+            }
+        }
+        return false
+    }
+
+    func borrowed_from(self, anon expr_id: int64, anon later: [int64]) -> bool {
+        match self.p.exprs[expr_id] {
+            .Ident(name) -> {
+                if not self.var_bound(name) {
+                    return self.var_signature(expr_id) is Some(_)
+                }
+                if not self.find_var_mutable(name) {
+                    return false
+                }
+                for l in later {
+                    if self.may_change(l, name) {
+                        return true
+                    }
+                }
+                return false
+            }
+            .Binary(lhs, op, _rhs) -> {
+                match op {
+                    .Dot -> {
+                        if self.var_signature(expr_id) is Some(_) {
+                            return true
+                        }
+                        // Anyone may change what's in a shared struct.
+                        if self.infer_kind(lhs) is .KStruct(idx, _args) and self.structs[idx].shared {
+                            return true
+                        }
+                        return self.borrowed_from(lhs, later)
+                    }
+                    .Index -> return self.borrowed_from(lhs, later)
+                    else return false
+                }
+            }
+            .Call(callee, args) -> {
+                // `str(x)` of a `str` is the same object.
+                if self.p.exprs[callee] is .Ident(name) and name == "$str" and len(args) == 1 and self.infer_kind(args[0].value).is_str_or_bytes() {
+                    return self.borrowed_from(args[0].value, later)
+                }
+                return false
+            }
+            .Must(inner) -> return self.borrowed_from(inner, later)
+            .UnwrapOpt(value, default) -> return self.borrowed_from(value, later) or (default != 0 and self.borrowed_from(default, later))
+            .MatchExpr(_subject, _arms) -> return true
+            else return false
+        }
+    }
+
+    // `expr_id`, worked out and held until release_holds, as a name for it.
+    func held_operand(self, anon expr_id: int64) -> int64 {
+        let kind = self.infer_kind(expr_id)
+        let reg = self.load(self.compile_expr(expr_id))
+        let slot = self.hold_reg(reg)
+        self.pool.free_reg(reg)
+        let name = self.fresh("__held")
+        self.vars += [VarSlot(:name, offset: slot, :kind, mutable: false, bound: true, seen: true)]
+        return self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[expr_id])
+    }
+
+    // The value of something held, its own now that what held it is let go.
+    func own_value(self, anon val: Val, kind: TypeKind) -> Val {
+        if not self.rc_heap_kind(kind) {
+            return val
+        }
+        let reg = self.load(val)
+        if self.rc_pending and self.rc_pending_reg == reg {
+            return .VReg(name: reg)
+        }
+        self.rc_retain(reg)
+        self.rc_temp(reg)
+        return .VReg(name: reg)
     }
 
     // Lets go of what rc_hold held since `mark`, once the call has returned.
@@ -11560,6 +11760,21 @@ type Codegen = shared struct {
         match op {
             .Dot -> return self.compile_dot(:lhs, :rhs)
             .Index -> {
+                if self.disturbed(lhs, [rhs]) {
+                    // As for a store: from the place as the index has left it.
+                    if not self.runs_code(lhs) {
+                        return self.compile_binary(:lhs, :op, rhs: self.stash_chain_operand(rhs))
+                    }
+                    let mark = len(self.holds)
+                    let held = self.held_operand(lhs)
+                    mut val = self.compile_index(lhs: held, :rhs)
+                    let kind = self.infer_kind(held)
+                    if kind.is_array() {
+                        val = self.own_value(val, kind: kind.array_elem())
+                    }
+                    self.release_holds(mark)
+                    return val
+                }
                 // An element that is not an array can't share the array it came from.
                 let share = self.share_begin(lhs)
                 let val = self.compile_index(:lhs, :rhs)
@@ -11571,6 +11786,12 @@ type Codegen = shared struct {
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
             .IsNot -> return self.compile_is(:lhs, :rhs, negate: true)
             else {
+                if self.disturbed(lhs, [rhs]) {
+                    let mark = len(self.holds)
+                    let val = self.compile_binary(lhs: self.held_operand(lhs), :op, :rhs)
+                    self.release_holds(mark)
+                    return val
+                }
                 if self.is_comparison_op(op) {
                     mut lhs = lhs
                     mut lhs_kind = self.infer_kind(lhs)
@@ -13308,6 +13529,20 @@ type Codegen = shared struct {
                 }
                 return .VImm(value: 0)
             }
+        }
+        if self.disturbed(s_id, [lo_id, hi_id]) {
+            if not self.runs_code(s_id) {
+                let lo = self.stash_chain_operand(lo_id)
+                mut hi = hi_id
+                if hi != 0 {
+                    hi = self.stash_chain_operand(hi)
+                }
+                return self.compile_slice(:s_id, lo_id: lo, hi_id: hi)
+            }
+            let mark = len(self.holds)
+            let val = self.compile_slice(s_id: self.held_operand(s_id), :lo_id, :hi_id)
+            self.release_holds(mark)
+            return val
         }
         // Each part waits on the stack while the later ones, which may call, are computed.
         self.emit_op(.Sub, a: "sp", b: "sp", c: "#32")
@@ -15096,7 +15331,7 @@ type Codegen = shared struct {
             // with the arg registers x0-x7).
             let callee_reg: str = self.pool.alloc_reg()
             self.mov_to(callee_val, dest: callee_reg)
-            self.rc_hold(callee_id, reg: callee_reg)
+            self.rc_hold(callee_id, reg: callee_reg, :args)
             let spilled: bool = self.spill_across(callee_reg)
             // Function-pointer types don't carry defaults — the
             // sig isn't accessible at the indirect-call site, only
@@ -15490,7 +15725,7 @@ type Codegen = shared struct {
         // Load cell ptr -> x0; data_ptr -> sp[0]; vtable -> x1; method ptr -> sp[n*8].
         let recv_val = self.compile_expr(receiver_id)
         self.mov_to(recv_val, dest: "x0")
-        self.rc_hold(receiver_id, reg: "x0")
+        self.rc_hold(receiver_id, reg: "x0", :args)
         let cell_r = self.pool.alloc_reg()
         let tmp_r = self.pool.alloc_reg()
         // Use two distinct pool regs: hard-coding x9 here would clobber
@@ -15522,9 +15757,11 @@ type Codegen = shared struct {
             } else {
                 if param_idx < len(sig_params) {
                     arg_reg = self.compile_into(args[ai].value, expected: sig_params[param_idx])
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 }
             }
             self.emit_store(arg_reg, base: "sp", off: (i + 1) * 8)
@@ -15776,7 +16013,7 @@ type Codegen = shared struct {
         } else {
             let recv_val = self.compile_expr(receiver_id)
             self.mov_to(recv_val, dest: "x0")
-            self.rc_hold(receiver_id, reg: "x0")
+            self.rc_hold(receiver_id, reg: "x0", :args)
             self.emit_store("x0", base: "sp")
         }
         for i in 0..total_user {
@@ -15795,9 +16032,11 @@ type Codegen = shared struct {
                     // The callee takes the value over from the slot and puts it back.
                 } else if param_idx < len(sig_params) {
                     arg_reg = self.compile_into(args[ai].value, expected: sig_params[param_idx])
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 }
             } else {
                 arg_reg = self.compile_default(sig_defaults[param_idx], expected: sig_params[param_idx], src_p: sig_src_p)
@@ -16329,13 +16568,13 @@ type Codegen = shared struct {
                 } else if i < len(expected_kinds) {
                     arg_reg = self.compile_into(args[ai].value, expected: expected_kinds[i])
                     if hold_args {
-                        self.rc_hold(args[ai].value, reg: arg_reg)
+                        self.rc_hold(args[ai].value, reg: arg_reg, :args)
                     }
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
                     if hold_args {
-                        self.rc_hold(args[ai].value, reg: arg_reg)
+                        self.rc_hold(args[ai].value, reg: arg_reg, :args)
                     }
                 }
             } else {
@@ -21709,9 +21948,11 @@ type Codegen = shared struct {
             } else {
                 if param_idx < len(sig_params) {
                     arg_reg = self.compile_into(args[ai].value, expected: sig_params[param_idx])
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 } else {
                     let arg_val = self.compile_expr(args[ai].value)
                     arg_reg = self.load(arg_val)
+                    self.rc_hold(args[ai].value, reg: arg_reg, :args)
                 }
             }
             self.emit_store(arg_reg, base: "sp", off: (i + 1) * 8)

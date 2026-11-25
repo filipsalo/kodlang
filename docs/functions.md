@@ -30,7 +30,10 @@ them in a struct.
 let result: int64 = add(a: 1, b: 2)
 ```
 
-The arguments are worked out left to right, each once, before the body runs.
+The arguments are worked out left to right, each once, before the body runs. Each is the
+value it was then, whatever working out a later one changes: in `f(xs, add(mut xs))`, `f`'s
+first argument is `xs` as it was before `add`.
+
 A small function or method whose whole body is `return` of an expression made
 of its parameters, literals, operators and field reads, with `int64`, `bool`
 or `float64` parameters (a method's `self` may be a struct) and result, like
