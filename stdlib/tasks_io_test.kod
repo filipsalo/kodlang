@@ -795,3 +795,202 @@ test "closing what nobody waits for any more" {
     time.sleep(Duration(ms: 10))
     must ends[1].close()
 }
+
+// As `connected`, the server's end not blocking.
+func half_nonblocking() -> [Fd] {
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let c = must tcp.connect("127.0.0.1", port: l.port())
+    let s = must l.accept(nonblocking: true)
+    must l.close()
+    return [c, s]
+}
+
+func send_digits(anon f: Fd, anon n: int64) -> str {
+    let piece = kod_str_to_bytes("0123456789".repeat(10000))
+    mut left = n
+    for left > 0 {
+        must f.write_all(piece)
+        left -= len(piece)
+    }
+    must f.close()
+    return "sent"
+}
+
+// How much comes until the end, each read after a pause of `ms`.
+func receive_digits(anon f: Fd, ms: int64) -> int64 {
+    mut n: int64 = 0
+    for true {
+        if ms > 0 {
+            time.sleep(Duration(:ms))
+        }
+        let got = must f.read(65536)
+        if len(got) == 0 {
+            return n
+        }
+        // All of it in order.
+        assert got[0] == 48 + n % 10
+        n += len(got)
+    }
+    return n
+}
+
+test "a nonblocking connection, in tasks" {
+    let ends = half_nonblocking()
+    let sent = spawn send_digits(ends[1], 5000000)
+    assert receive_digits(ends[0], ms: 1) == 5000000
+    assert sent.wait() == "sent"
+    must ends[0].close()
+    let others = half_nonblocking()
+    let got = spawn receive_digits(others[1], ms: 0)
+    assert send_digits(others[0], 5000000) == "sent"
+    assert got.wait() == 5000000
+    must others[1].close()
+}
+
+test "a nonblocking connection, with no other task" {
+    let ends = half_nonblocking()
+    must ends[0].write_str("hello")
+    assert len(must ends[1].read(10)) == 5
+    must ends[1].write_str("back")
+    assert len(must ends[0].read(10)) == 4
+    must ends[0].close()
+    assert len(must ends[1].read(10)) == 0
+    must ends[1].close()
+    // What is yet to come, and a reader that is slow.
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let child = must process.start(["sh", "-c", f"(sleep 0.1; printf hello) | nc 127.0.0.1 {l.port()} | (sleep 0.1; wc -c)"], stdout: .Pipe)
+    let conn = must l.accept(nonblocking: true)
+    assert len(must conn.read(10)) == 5
+    must conn.write_all(kod_str_to_bytes("x".repeat(3000000)))
+    must conn.close()
+    assert kod_bytes_to_str(must child.stdout.read(100)).trim() == "3000000"
+    let _ = child.wait()
+    must l.close()
+}
+
+test "a write that could go on is given up when its task is cancelled" {
+    let ends = half_nonblocking()
+    let taking = spawn receive_any(ends[0])
+    let w = spawn filling(ends[1])
+    time.sleep(Duration(ms: 30))
+    w.cancel()
+    assert w.wait() == "write: Operation canceled"
+    must ends[1].close()
+    assert taking.wait() > 0
+    must ends[0].close()
+}
+
+func receive_any(anon f: Fd) -> int64 {
+    mut n: int64 = 0
+    for true {
+        let got = must f.read(65536)
+        if len(got) == 0 {
+            return n
+        }
+        n += len(got)
+    }
+    return n
+}
+
+test "a nonblocking connection that is closed or goes away" {
+    let ends = half_nonblocking()
+    let w = spawn filling(ends[1])
+    let r = spawn reading(ends[1])
+    time.sleep(Duration(ms: 20))
+    must ends[1].close()
+    assert w.wait() == f"write: {GONE}" and r.wait() == f"read: {GONE}"
+    must ends[0].close()
+    let more = half_nonblocking()
+    let w2 = spawn filling(more[1])
+    time.sleep(Duration(ms: 20))
+    must more[0].close()
+    assert w2.wait().starts_with("write: ")
+    must more[1].close()
+}
+
+test "waiting for what isn't open, or can't be waited for" {
+    let r = spawn reading(Fd(fd: 4321))
+    let w = spawn filling(Fd(fd: 4321))
+    assert r.wait() == f"read: {GONE}" and w.wait() == f"write: {GONE}"
+    // Closed by C, between the wait's beginning and the next look for events.
+    let ends = connected()
+    let late = spawn reading(ends[0])
+    tasks.give_way()
+    libc.close(ends[0].fd)
+    assert late.wait() == f"read: {GONE}"
+    must ends[1].close()
+}
+
+test "closed at once, its number taken by another that is read too" {
+    for _i in 0..20 {
+        let ends = connected()
+        let r = spawn reading(ends[0])
+        tasks.give_way()
+        let number = ends[0].fd
+        must ends[0].close()
+        let others = connected()
+        let again = spawn reading(others[0])
+        tasks.give_way()
+        must others[1].write_str("hello")
+        assert again.wait() == "5 bytes"
+        assert r.wait() == f"read: {GONE}"
+        assert number > 0
+        must others[0].close()
+        must others[1].close()
+        must ends[1].close()
+    }
+}
+
+test "more tasks begin to wait at once than go along with one look" {
+    mut pairs: [[Fd]] = []
+    mut readers: [tasks.Task[str]] = []
+    for _i in 0..100 {
+        let ends = connected()
+        pairs += [ends]
+        readers += [spawn reading(ends[0])]
+    }
+    tasks.give_way()
+    for ends in pairs {
+        must ends[1].write_str("hi")
+    }
+    for r in readers {
+        assert r.wait() == "2 bytes"
+    }
+    for ends in pairs {
+        must ends[0].close()
+        must ends[1].close()
+    }
+}
+
+func nothing() -> int64 {
+    return 0
+}
+
+test "a wait given up before the next look, among many" {
+    mut pairs: [[Fd]] = []
+    mut readers: [tasks.Task[str]] = []
+    for _i in 0..80 {
+        pairs += [connected()]
+    }
+    for ends in pairs {
+        readers += [spawn reading(ends[0])]
+    }
+    // Lets them begin, without a look for events (as give_way would be).
+    let _ = (spawn nothing()).wait()
+    for i in [0, 40, 63, 64, 79] {
+        readers[i].cancel()
+        assert readers[i].wait() == "read: Operation canceled"
+        readers[i] = spawn reading(pairs[i][0])
+        let _ = (spawn nothing()).wait()
+    }
+    for ends in pairs {
+        must ends[1].write_str("hi")
+    }
+    for r in readers {
+        assert r.wait() == "2 bytes"
+    }
+    for ends in pairs {
+        must ends[0].close()
+        must ends[1].close()
+    }
+}

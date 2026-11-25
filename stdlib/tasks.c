@@ -125,6 +125,10 @@ __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
  * its udata the key the scheduler finds the waiting task by. */
 static int kod_kq = -1;
 static struct kevent kod_events[64];
+/* Registrations of descriptors that go along with the next wait, so that most cost
+ * no call of their own. One that kevent doesn't take comes back as an event. */
+static struct kevent kod_changes[64];
+static int kod_changes_n = 0;
 
 extern int kod_wait_file;
 
@@ -133,9 +137,16 @@ extern int kod_wait_file;
 static int64_t *kod_fd_keys = NULL;
 static int64_t kod_fd_keys_n = 0;
 
-/* The key for reading (0) or writing (1) the descriptor, which is forgotten; 0
- * for none. */
+/* The key for reading (0) or writing (1) the descriptor, which is forgotten, as is
+ * a registration still to be made; 0 for none. */
 int64_t kod_task_fd_key(int64_t fd, int64_t writes) {
+    int kept = 0;
+    for (int i = 0; i < kod_changes_n; i++) {
+        struct kevent *ev = &kod_changes[i];
+        if ((int64_t)ev->ident == fd && ev->filter == (writes ? EVFILT_WRITE : EVFILT_READ)) continue;
+        kod_changes[kept++] = *ev;
+    }
+    kod_changes_n = kept;
     int64_t at = 2 * fd + writes;
     if (fd < 0 || at >= kod_fd_keys_n) return 0;
     int64_t key = kod_fd_keys[at];
@@ -158,8 +169,9 @@ static void kod_fd_keys_set(int64_t fd, int64_t writes, int64_t key) {
 }
 
 /* Registers `filter` on `ident` (a timer is named by `key`, as its ident is
- * free); 0 when kevent took it, -1 when it can't come, as for a child that
- * has already exited, a file, or a descriptor that isn't open. */
+ * free); -1 when it can't come, as for a child that has already exited or a
+ * file. Whether a descriptor's can is only known at the next wait
+ * (kod_task_kq_failed). */
 int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key) {
     if ((filter == EVFILT_READ || filter == EVFILT_WRITE) && kod_wait_file) return -1;
     if (kod_kq < 0) kod_kq = kqueue();
@@ -172,6 +184,18 @@ int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key
     }
     struct kevent ev, out;
     EV_SET(&ev, (uintptr_t)ident, (int16_t)filter, EV_ADD | EV_ONESHOT | EV_RECEIPT, fflags, data, (void *)key);
+    if (filter == EVFILT_READ || filter == EVFILT_WRITE) {
+        /* In place of one that a cancelled task left: made later, that would undo this. */
+        int at = 0;
+        while (at < kod_changes_n && (kod_changes[at].ident != ev.ident || kod_changes[at].filter != ev.filter)) at++;
+        if (at < 64) {
+            kod_changes[at] = ev;
+            kod_changes[at].flags = EV_ADD | EV_ONESHOT;
+            if (at == kod_changes_n) kod_changes_n++;
+            kod_fd_keys_set(ident, filter == EVFILT_WRITE, key);
+            return 0;
+        }
+    }
     int n;
     do {
         n = kevent(kod_kq, &ev, 1, &out, 1, NULL);
@@ -196,13 +220,20 @@ int64_t kod_task_kq_wait(int64_t block) {
     struct timespec zero = {0, 0};
     int n;
     do {
-        n = kevent(kod_kq, NULL, 0, kod_events, 64, block ? NULL : &zero);
+        n = kevent(kod_kq, kod_changes, kod_changes_n, kod_events, 64, block ? NULL : &zero);
+        /* Whatever it returns, it has been through them all. */
+        kod_changes_n = 0;
     } while (n < 0 && errno == EINTR);
     return n < 0 ? 0 : n;
 }
 
 int64_t kod_task_kq_key(int64_t i) {
     return (int64_t)kod_events[i].udata;
+}
+
+/* Whether event `i` says that its registration wasn't taken. */
+int64_t kod_task_kq_failed(int64_t i) {
+    return (kod_events[i].flags & EV_ERROR) != 0;
 }
 
 int64_t kod_task_kq_data(int64_t i) {

@@ -807,7 +807,8 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * waited for the event while others ran, 0 that the caller should just block,
  * as it does without tasks, 2 that the task is cancelled, 3 that the time
  * ran out first, and 4 that another task has closed the descriptor. A socket's own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the
- * limit for a descriptor given none, as it is for a read that blocks. */
+ * limit for a descriptor given 0, as it is for a read that blocks; one given -1
+ * is a socket without a limit. A filter of 0 only asks whether the task is cancelled. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
 // After kod_wait_event gave 1 for a write: how many bytes the descriptor has

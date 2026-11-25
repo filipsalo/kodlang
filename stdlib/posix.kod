@@ -5,6 +5,7 @@ import "time" { Duration, monotonic_ns }
 import "unsafe"
 
 let EINTR: int64 = 4
+let EAGAIN: int64 = 35
 let O_RDONLY: int64 = 0
 let O_WRONLY: int64 = 1
 let O_APPEND: int64 = 8
@@ -24,6 +25,11 @@ mut _read_buf: int64 = 0
 
 type Fd = shared struct {
     fd: int64
+    // O_NONBLOCK is set: a write waits only when there is no room, and there is no
+    // timeout of its own to look up (tcp.Listener.accept).
+    nonblocking: bool = false
+    // The last write had no room for all of it.
+    full: bool = false
 
     func read(self, anon max: int64) -> bytes or Error {
         if max <= 0 {
@@ -36,29 +42,20 @@ type Fd = shared struct {
         if _read_buf == 0 {
             _read_buf = unsafe.alloc(READ_MAX)
         }
-        // With tasks, until there is something to read, the others run (EVFILT_READ);
-        // a cancelled task gives up (ECANCELED, 89), and so does one whose socket
-        // timeout passes (EAGAIN, 35).
-        let waited = kod_wait_event(self.fd, -1, 0)
-        if waited == 2 {
-            throw os_error("read", errno: 89)
-        }
-        // The descriptor's timeout passed first: EAGAIN, as a blocking read gives.
-        if waited == 3 {
-            throw os_error("read", errno: 35)
-        }
-        // Another task has closed it: EBADF.
-        if waited == 4 {
-            throw os_error("read", errno: 9)
-        }
         for true {
-            let n = libc.read(self.fd, _read_buf, want)
-            if n >= 0 {
-                return unsafe.copy_out(_read_buf, n)
-            }
-            let err = unsafe.errno()
-            if err != EINTR {
-                throw os_error("read", errno: err)
+            let _ = try self._wait(-1, "read")
+            for true {
+                let n = libc.read(self.fd, _read_buf, want)
+                if n >= 0 {
+                    return unsafe.copy_out(_read_buf, n)
+                }
+                let err = unsafe.errno()
+                if err == EAGAIN and self.nonblocking {
+                    break
+                }
+                if err != EINTR {
+                    throw os_error("read", errno: err)
+                }
             }
         }
         return kod_str_to_bytes("")
@@ -69,35 +66,68 @@ type Fd = shared struct {
             return 0
         }
         for true {
-            // With tasks, until there is room to write, the others run (EVFILT_WRITE).
-            let waited = kod_wait_event(self.fd, -2, 0)
-            if waited == 2 {
-                throw os_error("write", errno: 89)
-            }
-            if waited == 3 {
-                throw os_error("write", errno: 35)
-            }
-            if waited == 4 {
-                throw os_error("write", errno: 9)
-            }
-            // As much as there is room for: the rest would hold up every task.
             mut most = len(data)
-            if waited == 1 {
-                let room = kod_wait_room()
-                if room > 0 and room < most {
-                    most = room
+            if not self.nonblocking {
+                // As much as there is room for: the rest would hold up every task.
+                if try self._wait(-2, "write") {
+                    let room = kod_wait_room()
+                    if 0 < room < most {
+                        most = room
+                    }
                 }
+            } else if self.full {
+                let _ = try self._wait(-2, "write")
+            } else if kod_wait_event(self.fd, 0, -1) == 2 {
+                throw os_error("write", errno: 89)
             }
             let n = libc.write(self.fd, unsafe.data(data), most)
             if n >= 0 {
+                self.full = n < most
                 return n
             }
             let err = unsafe.errno()
-            if err != EINTR {
+            if err == EAGAIN and self.nonblocking {
+                self.full = true
+            } else if err != EINTR {
                 throw os_error("write", errno: err)
             }
         }
         return 0
+    }
+
+    // With tasks, until there is something to read (EVFILT_READ, -1) or room to
+    // write (EVFILT_WRITE, -2), the others run; whether they have. Without, the
+    // call that follows blocks, or this does when that call can't.
+    func _wait(self, anon filter: int64, anon op: str) -> bool or Error {
+        mut limit = 0
+        if self.nonblocking {
+            limit = -1
+        }
+        let waited = kod_wait_event(self.fd, filter, limit)
+        // The task is cancelled: ECANCELED.
+        if waited == 2 {
+            throw os_error(op, errno: 89)
+        }
+        // The descriptor's timeout passed first: EAGAIN, as a blocking read gives.
+        if waited == 3 {
+            throw os_error(op, errno: EAGAIN)
+        }
+        // Another task has closed it: EBADF.
+        if waited == 4 {
+            throw os_error(op, errno: 9)
+        }
+        if waited == 0 and self.nonblocking {
+            let p = unsafe.alloc(8)
+            unsafe.store32(p, self.fd)
+            if filter == -1 {
+                unsafe.store32(p + 4, POLLIN)
+            } else {
+                unsafe.store32(p + 4, POLLOUT)
+            }
+            libc.poll(p, 1, -1)
+            unsafe.free(p)
+        }
+        return waited == 1
     }
 
     // Closes it and sets `fd` to -1, so a second close fails instead of

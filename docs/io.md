@@ -282,7 +282,7 @@ func fetch_status_line(host: str) -> str or Error {
 | `connect(host, port, timeout = Duration(seconds: 10))` | resolve `host` (a name or an IP literal, IPv4 or IPv6) and connect to the first address that answers; `Fd or Error` |
 | `set_timeout(f, timeout)` | make a read or a write on `f` fail with `TimedOut` after a [`Duration`](time.md) without progress; zero means wait forever; `none or Error` |
 | `listen(host, port, backlog = 128)` | a `Listener` bound to `host:port`; an empty `host` means every IPv4 interface and port 0 picks a free port; `Listener or Error` |
-| `l.accept()` | the next connection, waiting for one; `Fd or Error` |
+| `l.accept(nonblocking = false)` | the next connection, waiting for one; `Fd or Error`. A `nonblocking` one is written to without waiting first, which is faster when there are other tasks; `set_timeout` doesn't apply to it |
 | `l.wait()` | waits until there is a connection for `accept` to take; `none or Error` |
 | `peer(f)` | the address at the other end, as `127.0.0.1:50123` or `[::1]:50123`; `""` when there is none |
 | `shutdown(f, read = false, write = false)` | ends one direction of the connection, or both: a read of it gives the end of the stream, also one a task waits in, and a write fails |
