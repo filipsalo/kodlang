@@ -1158,7 +1158,7 @@ type TlsLink = shared struct {
     }
 
     func idle(self) -> bool {
-        return tcp.is_idle(Fd(fd: self.conn.fd))
+        return self.conn.is_idle()
     }
 
     func arm(self, anon timeout_ms: int64, anon deadline_ns: int64) -> none {
@@ -1712,6 +1712,8 @@ type Request = shared struct {
     minor: int64 = 1
     // The route it fits, once that has been looked up (Router.find).
     found: Found? = none
+    // It came over HTTPS.
+    secure: bool = false
     // The server compresses responses.
     packs: bool = false
     // Its body, when the handler is to read it.
@@ -2846,6 +2848,8 @@ type Phase = enum {
 type ServerConn = shared struct {
     fd: Fd
     server: Server
+    // TLS over `fd`, when the server speaks that.
+    secured: TlsStream? = none
     phase: Phase = .Waiting
     // When its phase is to end (a monotonic time), 0 for no such time.
     deadline_ns: int64 = 0
@@ -2877,7 +2881,7 @@ type ServerConn = shared struct {
     }
 
     func read(self, anon max: int64) -> bytes or Error {
-        let data = try self.fd.read(max)
+        let data = try self.read_some(max)
         if self.phase is .Waiting and len(data) > 0 and not self.expired {
             // A first request's headers have had their time since it connected.
             self.phase = .Head
@@ -2888,8 +2892,28 @@ type ServerConn = shared struct {
         return data
     }
 
+    func read_some(self, anon max: int64) -> bytes or Error {
+        if self.secured is TlsStream(s) {
+            return try s.read(max)
+        }
+        return try self.fd.read(max)
+    }
+
     func write(self, anon data: bytes) -> int64 or Error {
+        if self.secured is TlsStream(s) {
+            return try s.write(data)
+        }
         return try self.fd.write(data)
+    }
+
+    func close(self) -> none {
+        if self.secured is TlsStream(s) {
+            // Its number may be another's from here on.
+            self.fd.fd = -1
+            let _ = s.close()
+            return
+        }
+        let _ = self.fd.close()
     }
 
     // Ends what it waits for: a read gives the end of the stream.
@@ -2898,6 +2922,9 @@ type ServerConn = shared struct {
         self.expired = true
         self.deadline_ns = 0
         self.send_by_ns = 0
+        if self.secured is TlsStream(s) {
+            s.cut = true
+        }
         tcp.shutdown(self.fd, read: true, write: sending)
     }
 
@@ -2906,6 +2933,11 @@ type ServerConn = shared struct {
         let server = self.server
         let br = BufReader(inner: self, limit: server.limits.max_header_bytes)
         let remote = tcp.peer(self.fd)
+        if server.identity is tls.Identity(identity) {
+            // A handshake is a request's first part, as far as time goes.
+            self.enter(.Waiting, server.header_timeout)
+            self.secured = try tls.accept(self.fd, identity)
+        }
         for true {
             self.wait_for_request(br)
             let got = read_head(br, server.limits)
@@ -2918,6 +2950,7 @@ type ServerConn = shared struct {
                 return
             }
             req.remote = remote
+            req.secure = self.secured is not none
             if self.receive(br, req) is Err(e) {
                 self.refuse(e)
                 return
@@ -2962,7 +2995,9 @@ type ServerConn = shared struct {
         if self.served == 0 {
             limit = self.server.header_timeout
         }
-        self.enter(.Waiting, limit)
+        if self.served > 0 or self.deadline_ns == 0 {
+            self.enter(.Waiting, limit)
+        }
         // The next request came along with the last one.
         if br.pos < len(br.buf) {
             self.enter(.Head, self.server.header_timeout)
@@ -3138,6 +3173,9 @@ type ServerConn = shared struct {
             time.sleep(Duration(ms: 250))
             return
         }
+        if self.secured is TlsStream(s) {
+            s.end()
+        }
         tcp.shutdown(self.fd, write: true)
         self.enter(.Ending, Duration(seconds: 1))
         mut left: int64 = 1048576
@@ -3196,6 +3234,8 @@ type Server = shared struct {
     routes: Router? = none
     // Answers the requests when there are no routes.
     handler: func(Request) -> Response or Error = answer_404
+    // Speaks HTTPS with it.
+    identity: tls.Identity? = none
     host: str = "127.0.0.1"
     port: int64 = 8080
     header_timeout: Duration = Duration(seconds: 10)
@@ -3371,7 +3411,7 @@ type Server = shared struct {
         }
         conn.forget_body()
         let _ = self.conns.remove(id)
-        let _ = conn.fd.close()
+        conn.close()
         if self.full and len(self.room.items) == self.room.head {
             self.room.send(true)
         }

@@ -441,6 +441,7 @@ handler, without the body, where there is no handler for `HEAD` itself.
 | `method`, `target` | as sent; `target` is the path and the query |
 | `headers`, `body` | `Headers`, and the body's `bytes` |
 | `remote` | the client's address, such as `127.0.0.1:50123` |
+| `secure` | whether it came over [HTTPS](#https) |
 | `path()` | `target` up to `?`; of a whole URL, as a proxy may send, its path |
 | `param(name)` | the part of the path `{name}` in the pattern stands for; panics when the pattern has no such name |
 | `query(name)` | the first value of `name` in the query, decoded (`+` is a space); `str?` |
@@ -462,6 +463,27 @@ handler, without the body, where there is no handler for `HEAD` itself.
 | `http.stream(write, status = 200, content_type = "application/octet-stream", length = none)` | a body that `write` [writes piece by piece](#streaming) |
 | `http.file(path, req = none, content_type = none)` | a [file](#files)'s content, streamed; `Response or Error`, a 404 `HttpError` when there is no such file (or it is a directory). Its type is the one its name's ending says, when left out |
 | `resp.with_header(name, value)` | `resp`, with a header added |
+
+### HTTPS
+
+With an `identity`, a [certificate and its key](io.md#tls), a `Server` speaks HTTPS, and
+nothing else, on its port:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+import "net/tls"
+let routes = http.Router()
+-->
+```kod
+let identity = try tls.load_identity("cert.pem", "key.pem")
+try http.Server(host: "", port: 443, :routes, :identity).run()
+```
+
+The handshake is part of what `header_timeout` limits; a client that fails it is closed
+without a word. Everything else is as over plain HTTP. `req.secure` says which it was. Setting
+`server.identity` to a newly loaded one, as when a certificate is renewed, is for
+connections from then on.
 
 ### Files
 
@@ -620,6 +642,7 @@ func main() -> none or Error {
 |-------|---------|---------|
 | `routes` | none | the `Router` that answers requests |
 | `handler` | | answers them all instead, when there are no `routes` |
+| `identity` | none | a certificate and key, to speak [HTTPS](#https) |
 | `host`, `port` | `127.0.0.1`, 8080 | where `run` listens; an empty `host` means every IPv4 interface |
 | `header_timeout` | 10 s | how long a client may take to send a request's headers, from when it connects or, on a kept-alive connection, from their first byte |
 | `body_timeout` | 60 s | how long it may take to send the body after them; of a [streamed](#streaming) body, how long until the next of it comes |
