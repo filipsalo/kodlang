@@ -608,8 +608,8 @@ let size: int64 = match shape {
 The block is an ordinary block, so it may `return`, `throw` or `try` (they leave
 the function, not just the arm), and an arm without braces is still one
 expression. `else { ... }` takes a block too. A block that is empty, or whose
-last statement is not an expression (`let`, `if`, an assignment), is an error:
-the arm would have no value. A match *statement* needs none of this, since its
+last statement is not an expression (`let`, an `if` without an `else`, an
+assignment), is an error: the arm would have no value. A match *statement* needs none of this, since its
 arms are blocks already.
 
 ## `if X is .Variant(bindings) { ... }`

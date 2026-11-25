@@ -21,6 +21,45 @@ The condition must be a `bool`. There's no truthiness, so `if n` on an
 `int64` is an error (write `if n != 0`), and so is `if x` on an optional
 (write `if x is not none`, or `if x is Some(v)` to bind the value).
 
+### `if` as a value
+
+Where a value goes, an `if` with an `else` gives one: that of the branch that runs.
+
+<!-- kod:
+let n = -4
+let line = "L12"
+-->
+```kod
+let step = if line.starts_with("L") { -1 } else { 1 }
+let size = if n < 0 {
+    "negative"
+} else if n < 10 {
+    "small"
+} else {
+    "large"
+}
+print(f"{size}, {if n % 2 == 0 { "even" } else { "odd" }}")
+```
+
+A branch is a block whose last statement is an expression (or another `if` with an
+`else`), the branch's value, as in
+[a match's arm](pattern-matching.md#arms-with-several-statements). One that ends in
+`return`, `throw` or a call that never returns needs no value. The `else` can't be
+left out, and the branches' types follow the rules of
+[`match` as an expression](pattern-matching.md#match-as-expression): they are one type, or
+convert to the one that the value goes to, and a `none` makes it optional.
+
+The condition can bind names and narrow them as in an `if` statement:
+
+<!-- kod:
+let text = "12"
+-->
+```kod
+let doubled = if text.parse_int() is int64(n) and n > 0 { 2 * n } else { 0 }
+```
+
+At the start of a statement, `if` is always the statement.
+
 ## `for` (while-style)
 
 `for` with a condition loops until the condition is false:

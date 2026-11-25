@@ -355,6 +355,12 @@ func string_body(anon raw: str) -> str {
 // `expect()` finds a token kind that doesn't match. Same field shape
 // as codegen.Diagnostic so callers can fold parser errors into the codegen's
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
+// A block that gives a value: the statements before it, and the value.
+type ValueBlock = struct {
+    pre: [int64]
+    body: int64
+}
+
 // An early exit parse_block folds the rest of the block into (see fold_guards):
 // `at` is where the rest starts in the block's statements and `from` in its tokens.
 // A `try x` or `must x` statement, which narrows `x` from token `from` on.
@@ -435,6 +441,8 @@ type Parser = shared struct {
     pattern_subs: [[ast.SubPattern]] = []
     match_arms: [ast.MatchArm]
     match_expr_arms: [ast.MatchExprArm]
+    // Where the last statement of the block parsed last begins, or -1.
+    last_stmt_at: int64 = -1
     func_decls: [ast.FuncDecl]
 
     // Errors accumulated by `expect`/`expect_identifier` when the
@@ -2115,6 +2123,10 @@ type Parser = shared struct {
         if self.try_consume(.KwMatch) {
             return self.parse_match_expr(span)
         }
+        if self.at(.KwIf) {
+            let if_tok = self.advance()
+            return self.parse_if_expr(if_tok, :span)
+        }
         if self.try_consume(.KwSpawn) {
             return self.parse_spawn(span)
         }
@@ -2184,37 +2196,151 @@ type Parser = shared struct {
 
     func parse_match_expr_arm(self, anon pat: int64, guarded: bool) -> int64 {
         let guard = self.parse_arm_guard(guarded)
-        mut body: int64 = 0
-        mut pre: [int64] = []
         if self.at(.OpenCurly) {
-            // A block arm: its last statement is the arm's value.
-            let open_tok: lexing.Token = self.peek()
-            pre = self.parse_block()
-            mut valued = false
-            if len(pre) > 0 {
-                let last_id: int64 = pre[len(pre) - 1]
-                if self.stmts[last_id] is ast.Stmt.ExprStmt(last) {
-                    body = last
-                    pre = pre[0..len(pre) - 1]
-                    valued = true
-                }
-                if self.stmts[last_id] is ast.Stmt.Return(_value) {
-                    body = self.unreachable_value()
-                    valued = true
-                }
-                if self.stmts[last_id] is ast.Stmt.Throw(_thrown) {
-                    body = self.unreachable_value()
-                    valued = true
-                }
-            }
-            if not valued {
-                self.record_error("error: a match arm's block must end with an expression, the arm's value", got: open_tok)
-                body = self.alloc_expr(ast.Expr.IntLit(value: 0), span: self.here())
-            }
-        } else {
-            body = self.parse_expr()
+            let value = self.parse_value_block("a match arm's block must end with an expression, the arm's value")
+            return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, body: value.body, pre: value.pre, :guard))
         }
-        return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, :body, :pre, :guard))
+        return self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, body: self.parse_expr(), :guard))
+    }
+
+    // A block whose last statement is its value; `need` says so when it isn't.
+    func parse_value_block(self, anon need: str) -> ValueBlock {
+        let open_tok = self.peek()
+        let errors_before = len(self.errors)
+        let pre = self.parse_block()
+        if len(self.errors) == errors_before and len(pre) > 0 and self.last_stmt_at >= 0 and self.tokens[self.last_stmt_at].kind is .KwIf {
+            // An `if` at the end is the value: read it again, as that.
+            self.pos = self.last_stmt_at
+            let body = self.parse_expr()
+            self.skip_newlines()
+            self.expect(.CloseCurly)
+            return ValueBlock(pre: pre[0..len(pre) - 1], :body)
+        }
+        if len(pre) > 0 {
+            let before = pre[0..len(pre) - 1]
+            match self.stmts[pre[-1]] {
+                .ExprStmt(last) -> return ValueBlock(pre: before, body: last)
+                .Return(_value) -> return ValueBlock(:pre, body: self.unreachable_value())
+                .Throw(_thrown) -> return ValueBlock(:pre, body: self.unreachable_value())
+                else none
+            }
+        }
+        self.record_error(f"error: {need}", got: open_tok)
+        return ValueBlock(:pre, body: self.unreachable_value())
+    }
+
+    // `if cond { a } else { b }` as a value, after the `if`: a match of the condition, or
+    // of what it tests with `is`. An `and` that binds or narrows is a match in a match,
+    // each with the `else` parsed for itself, as for the statement.
+    func parse_if_expr(self, anon if_tok: lexing.Token, span: ast.Span) -> int64 {
+        self.binding_exprs += 1
+        let cond = self.parse_expr()
+        let ops = self.and_operands(cond)
+        mut patterned = false
+        for op in ops {
+            if self.binds_names(op) or self.narrows_op(op) {
+                patterned = true
+            }
+        }
+        if len(ops) == 1 and self.exprs[cond] is .Binary(subject, is_op, rhs) and (is_op is .Is or is_op is .IsNot) {
+            let pattern = self.pattern_of_expr(rhs)
+            if pattern >= 0 {
+                return self.parse_if_is(if_tok, subject, :pattern, negated: is_op is .IsNot, :span)
+            }
+            patterned = false
+        }
+        if not patterned {
+            let yes = self.parse_branch()
+            let no = self.parse_else_branch(if_tok)
+            return self.if_expr(cond, pattern: self.alloc_pattern(ast.Pattern.BoolPat(value: true)), :yes, other: self.alloc_pattern(ast.Pattern.Wildcard), :no, :span)
+        }
+        let pats = self.chain_patterns(ops, narrow: true)
+        let from = self.pos
+        let yes = self.parse_branch()
+        self.narrow_chain(ops, :pats, :from, to: self.pos)
+        let else_pos = self.pos
+        let errors_before = len(self.errors)
+        mut elses = [self.parse_else_branch(if_tok)]
+        let end_pos = self.pos
+        for len(elses) < len(ops) {
+            if len(self.errors) > errors_before {
+                elses += [elses[0]]
+            } else {
+                self.pos = else_pos
+                elses += [self.parse_else_branch(if_tok)]
+            }
+        }
+        self.pos = end_pos
+        mut inner = yes
+        mut k = len(ops) - 1
+        for k >= 0 {
+            mut subject = ops[k]
+            mut pattern = pats[k]
+            if pattern < 0 {
+                pattern = self.alloc_pattern(ast.Pattern.BoolPat(value: true))
+            } else if self.exprs[subject] is .Binary(tested, _op, _rhs) {
+                subject = tested
+            }
+            let body = self.if_expr(subject, :pattern, yes: inner, other: self.alloc_pattern(ast.Pattern.Wildcard), no: elses[k], :span)
+            inner = ValueBlock(pre: [], :body)
+            k -= 1
+        }
+        return inner.body
+    }
+
+    // `if subject is pattern { a } else { b }`, or with `is not`, from the first block on.
+    func parse_if_is(self, anon if_tok: lexing.Token, anon subject: int64, pattern: int64, negated: bool, span: ast.Span) -> int64 {
+        let from = self.pos
+        let yes = self.parse_branch()
+        let to = self.pos
+        let no = self.parse_else_branch(if_tok)
+        let end = self.pos
+        mut other = self.alloc_pattern(ast.Pattern.Wildcard)
+        let name = self.narrow_name(subject)
+        if len(name) > 0 {
+            // What the pattern fits is in the first block, and with `is not` in the other.
+            let fits = not self.assigns(name, :from, :to)
+            let rest = not self.assigns(name, from: to, to: end)
+            if self.narrows(pattern) {
+                if (not negated and fits) or (negated and rest) {
+                    self.narrow_to(pattern, :name)
+                }
+            } else if self.patterns[pattern] is .NonePat {
+                if (not negated and rest) or (negated and fits) {
+                    other = self.alloc_pattern(ast.Pattern.SomePat(binding: name))
+                }
+            }
+        }
+        if negated {
+            return self.if_expr(subject, :pattern, yes: no, :other, no: yes, :span)
+        }
+        return self.if_expr(subject, :pattern, :yes, :other, :no, :span)
+    }
+
+    func if_expr(self, anon subject: int64, pattern: int64, yes: ValueBlock, other: int64, no: ValueBlock, span: ast.Span) -> int64 {
+        let arms = [
+            self.alloc_match_expr_arm(ast.MatchExprArm(:pattern, body: yes.body, pre: yes.pre, is_if: true)),
+            self.alloc_match_expr_arm(ast.MatchExprArm(pattern: other, body: no.body, pre: no.pre, is_if: true)),
+        ]
+        return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
+    }
+
+    func parse_branch(self) -> ValueBlock {
+        return self.parse_value_block("a branch of an `if` used as a value must end with an expression, its value")
+    }
+
+    func parse_else_branch(self, anon if_tok: lexing.Token) -> ValueBlock {
+        let pos = self.pos
+        self.skip_newlines()
+        if not self.try_consume(.KwElse) {
+            self.pos = pos
+            self.record_error("error: an `if` used as a value needs an `else`", got: if_tok)
+            return ValueBlock(pre: [], body: self.unreachable_value())
+        }
+        if self.at(.KwIf) {
+            return ValueBlock(pre: [], body: self.parse_expr())
+        }
+        return self.parse_branch()
     }
 
     func parse_match_stmt_arm(self, anon pat: int64, guarded: bool) -> int64 {
@@ -2781,6 +2907,7 @@ type Parser = shared struct {
         mut stmts: [int64] = []
         mut guards: [Guard] = []
         mut unwraps: [Unwrap] = []
+        mut last_at = -1
         for self.peek_kind() != .CloseCurly and self.peek_kind() != .EOF {
             self.skip_newlines()
             if self.peek_kind() == .CloseCurly {
@@ -2796,6 +2923,7 @@ type Parser = shared struct {
             let errors_before = len(self.errors)
             self.quiet = false
             let start = self.pos
+            last_at = start
             self.guard_arm = -1
             let stmt_id = self.parse_stmt()
             stmts += [stmt_id]
@@ -2814,6 +2942,11 @@ type Parser = shared struct {
             self.skip_newlines()
         }
         let stmts_end = self.pos
+        // After the blocks inside, which set it too.
+        self.last_stmt_at = last_at
+        if len(guards) > 0 {
+            self.last_stmt_at = -1
+        }
         self.expect(.CloseCurly)
         self.narrow_unwraps(unwraps, to: stmts_end)
         return self.fold_guards(stmts, :guards, to: stmts_end)
@@ -4656,11 +4789,6 @@ func make_parser(anon tokens: [lexing.Token], path: str, source: str) -> Parser 
     return Parser(:path, :source, :tokens, pos: 0, :exprs, :expr_spans, :stmts, :type_exprs, :patterns, :pattern_subs, :match_arms, :match_expr_arms, :func_decls, :errors, :line_starts, :type_spans, :pattern_ends)
 }
 
-// The precedence of the comparisons and `is` (Parser.bin_op_prec): what a
-// chained comparison's operands and `not`'s operand are parsed above.
-func comparison_prec() -> int64 {
-    return 4
-}
 // The operator of a compound assignment, but for `+=`.
 func update_op(anon kind: lexing.TokenKind) -> ast.Op? {
     match kind {
@@ -4675,4 +4803,10 @@ func update_op(anon kind: lexing.TokenKind) -> ast.Op? {
         .ShiftRightEqual -> return .Shr
         else return none
     }
+}
+
+// The precedence of the comparisons and `is` (Parser.bin_op_prec): what a
+// chained comparison's operands and `not`'s operand are parsed above.
+func comparison_prec() -> int64 {
+    return 4
 }
