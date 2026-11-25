@@ -28,7 +28,7 @@ typedef struct { uint32_t count; uint32_t info; } RcHdr;
 
 #define RC_CLASS_MASK 0x7fu
 #define RC_WEAK_BIT 0x80u
-static void rc_weak_clear(void *p);
+__attribute__((preserve_most, noinline)) static void rc_weak_clear(void *p);
 
 static char *rc_cur, *rc_end;
 __attribute__((used)) void *rc_free_lists[128];
@@ -117,9 +117,11 @@ void *rc_alloc_raw(int64_t size, int64_t mask) {
 void *rc_alloc(int64_t size, int64_t mask) {
     uint64_t *w = (uint64_t *)rc_alloc_raw(size, mask);
     /* Mostly a few words, and a call to memset would cost more. */
-    for (int64_t i = 0; i < (size + 7) >> 3; i++) {
-        w[i] = 0;
-        __asm__ volatile("" : : : "memory");
+    if (size > 0) w[0] = 0;
+    /* Pairs from then on, the last of which may end past the object, but within
+     * its block. */
+    for (int64_t i = 1; i < (size + 7) >> 3; i += 2) {
+        __asm__ volatile("stp xzr, xzr, [%0]" : : "r"(w + i) : "memory");
     }
     return w;
 }
@@ -135,11 +137,48 @@ void *rc_alloc_big(int64_t size, const int64_t *desc) {
     return p;
 }
 
+/* Puts a block that nothing refers to on its free list. */
+static inline void rc_give_back(RcHdr *h) {
+    int cls = (int)(h->info & RC_CLASS_MASK);
+#ifdef RC_STATS
+    rc_n_free++;
+    rc_live -= rc_class_size(cls);
+#endif
+#ifdef RC_POISON
+    /* Never reused, and any later read sees rubbish. */
+    h->count = 0;
+    memset(h + 1, 0xDD, (size_t)rc_class_size(cls) - 8);
+    rc_poisoned += rc_class_size(cls);
+#else
+    *(void **)(h + 1) = rc_free_lists[cls];
+    rc_free_lists[cls] = h;
+#endif
+}
+
+/* Drops one reference to c, from an object being freed: when it was the last, c is
+ * freed at once if it has no references inside and none weak to it, else it is put
+ * before `pending`. The list's new start. */
+static inline RcHdr *rc_drop(void *c, RcHdr *pending) {
+    if (!rc_is_counted(c)) return pending;
+    RcHdr *h = (RcHdr *)c - 1;
+    uint32_t left = h->count - 1;
+    if (left != 0) {
+        h->count = left;
+        return pending;
+    }
+    if (h->info >> 7 == 0) {
+        rc_give_back(h);
+        return pending;
+    }
+    h->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
+    return h;
+}
+
 /* Frees p, whose count reached 0, and whatever only it kept alive. Iterative:
  * a long list must not take the C stack with it. The pending list links
  * through the count word, as an offset (0 ends it: the first header in the
  * heap is never on the list twice, and offset 0 is reserved by a dummy). */
-void rc_free_object(void *p) {
+__attribute__((preserve_most)) void rc_free_object(void *p) {
     RcHdr *pending = (RcHdr *)p - 1;
     pending->count = 0;
     while (pending) {
@@ -148,70 +187,26 @@ void rc_free_object(void *p) {
         if (h->info & RC_WEAK_BIT) rc_weak_clear(h + 1);
         void **slots = (void **)(h + 1);
         uint32_t mask = h->info >> 8;
-        if (mask & RC_BIG_BIT) {
-            const int64_t *desc =
-                *(const int64_t **)((char *)h + rc_class_size((int)(h->info & RC_CLASS_MASK)) - 8);
-            for (int64_t w = 0; w < desc[0]; w++) {
-                uint64_t bits = (uint64_t)desc[w + 1];
-                for (int i = 0; bits; i++, bits >>= 1) {
-                    if (!(bits & 1)) continue;
-                    void *c = slots[w * 64 + i];
-                    if (!rc_is_counted(c)) continue;
-                    RcHdr *ch = (RcHdr *)c - 1;
-                    if (--ch->count == 0) {
-                        ch->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
-                        pending = ch;
-                    }
-                }
-            }
-            mask = 0;
-        } else if (mask & (1u << 22)) {
+        if (mask & (1u << 22) && !(mask & RC_BIG_BIT)) {
             /* An array: { ptr, len, cap }. Its buffer has one owner. */
             void **buf = (void **)slots[0];
             if ((mask & (1u << 21)) && buf) {
                 int64_t n = (int64_t)slots[1];
-                for (int64_t i = 0; i < n; i++) {
-                    void *c = buf[i];
-                    if (!rc_is_counted(c)) continue;
-                    RcHdr *ch = (RcHdr *)c - 1;
-                    if (--ch->count == 0) {
-                        ch->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
-                        pending = ch;
-                    }
+                for (int64_t i = 0; i < n; i++) pending = rc_drop(buf[i], pending);
+            }
+            pending = rc_drop(buf, pending);
+        } else if (mask & RC_BIG_BIT) {
+            const int64_t *desc =
+                *(const int64_t **)((char *)h + rc_class_size((int)(h->info & RC_CLASS_MASK)) - 8);
+            for (int64_t w = 0; w < desc[0]; w++) {
+                for (uint64_t bits = (uint64_t)desc[w + 1]; bits; bits &= bits - 1) {
+                    pending = rc_drop(slots[w * 64 + __builtin_ctzll(bits)], pending);
                 }
             }
-            if (rc_is_counted(buf)) {
-                RcHdr *bh = (RcHdr *)buf - 1;
-                if (--bh->count == 0) {
-                    bh->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
-                    pending = bh;
-                }
-            }
-            mask = 0;
+        } else {
+            for (; mask; mask &= mask - 1) pending = rc_drop(slots[__builtin_ctz(mask)], pending);
         }
-        for (int i = 0; mask; i++, mask >>= 1) {
-            if (!(mask & 1)) continue;
-            void *c = slots[i];
-            if (!rc_is_counted(c)) continue;
-            RcHdr *ch = (RcHdr *)c - 1;
-            if (--ch->count == 0) {
-                ch->count = pending ? (uint32_t)(((char *)pending - (char *)RC_BASE) >> 4) : 0;
-                pending = ch;
-            }
-        }
-        int cls = (int)(h->info & RC_CLASS_MASK);
-#ifdef RC_STATS
-        rc_n_free++;
-        rc_live -= rc_class_size(cls);
-#endif
-#ifdef RC_POISON
-        /* Never reused, and any later read sees rubbish. */
-        memset(h + 1, 0xDD, (size_t)rc_class_size(cls) - 8);
-        rc_poisoned += rc_class_size(cls);
-#else
-        *(void **)(h + 1) = rc_free_lists[cls];
-        rc_free_lists[cls] = h;
-#endif
+        rc_give_back(h);
     }
 }
 
@@ -224,26 +219,21 @@ void rc_release_c(void *p) {
 }
 
 /* Called from generated code with the object in x17: everything but x16, x17
- * and lr survives, so a release can sit anywhere in an expression. */
+ * and lr survives, so a release can sit anywhere in an expression. What isn't
+ * kept here, rc_free_object keeps (preserve_most), as far as it uses it. */
 __attribute__((naked)) void rc_free_stub(void) {
     __asm__(
         "stp x0, x1, [sp, #-16]!\n"
         "stp x2, x3, [sp, #-16]!\n"
         "stp x4, x5, [sp, #-16]!\n"
         "stp x6, x7, [sp, #-16]!\n"
-        "stp x8, x9, [sp, #-16]!\n"
-        "stp x10, x11, [sp, #-16]!\n"
-        "stp x12, x13, [sp, #-16]!\n"
-        "stp x14, x15, [sp, #-16]!\n"
+        "str x8, [sp, #-16]!\n"
         "stp fp, lr, [sp, #-16]!\n"
         "mov fp, sp\n"
         "mov x0, x17\n"
         "bl _rc_free_object\n"
         "ldp fp, lr, [sp], #16\n"
-        "ldp x14, x15, [sp], #16\n"
-        "ldp x12, x13, [sp], #16\n"
-        "ldp x10, x11, [sp], #16\n"
-        "ldp x8, x9, [sp], #16\n"
+        "ldr x8, [sp], #16\n"
         "ldp x6, x7, [sp], #16\n"
         "ldp x4, x5, [sp], #16\n"
         "ldp x2, x3, [sp], #16\n"
@@ -444,7 +434,7 @@ static void rc_weak_grow(void) {
 
 /* `p` is being freed: empty its box and take it out of the table, moving the
  * entries after it back so no probe stops early. */
-static void rc_weak_clear(void *p) {
+__attribute__((preserve_most, noinline)) static void rc_weak_clear(void *p) {
     int64_t i = rc_weak_slot(p);
     if (rc_weak_keys[i] != p) return;
     void *box = rc_weak_boxes[i];
