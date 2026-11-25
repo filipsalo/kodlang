@@ -19,6 +19,26 @@ import "tasks"
 import "time"
 import "time" { Duration, Time }
 
+// The 8 bytes from `at`, lowest first, as it reads them from bytes.
+extern func kod_bytes_le64(anon s: str, anon at: int64) -> int64
+
+// Whether `a` and `b` differ at most in the case of ASCII letters, as two spellings
+// of one header's name do.
+func same_name(anon a: str, anon b: str) -> bool {
+    let n = len(a)
+    if n != len(b) {
+        return false
+    }
+    for i in 0..n {
+        let x = a[i]
+        let y = b[i]
+        if x != y and (x ^ y != 32 or not is_alpha(x)) {
+            return false
+        }
+    }
+    return true
+}
+
 type Header = shared struct {
     name: str
     value: str
@@ -28,9 +48,8 @@ type Headers = shared struct {
     items: [Header] = []
 
     func get(self, anon name: str) -> str? {
-        let want = name.lower()
         for h in self.items {
-            if h.name.lower() == want {
+            if same_name(h.name, name) {
                 return h.value
             }
         }
@@ -38,10 +57,9 @@ type Headers = shared struct {
     }
 
     func all(self, anon name: str) -> [str] {
-        let want = name.lower()
         mut out: [str] = []
         for h in self.items {
-            if h.name.lower() == want {
+            if same_name(h.name, name) {
                 out += [h.value]
             }
         }
@@ -58,11 +76,10 @@ type Headers = shared struct {
 
     // Replaces the first header of that name in place and drops the others.
     func set(self, anon name: str, anon value: str) -> none {
-        let want = name.lower()
         mut out: [Header] = []
         mut placed = false
         for h in self.items {
-            if h.name.lower() != want {
+            if not same_name(h.name, name) {
                 out += [h]
             } else if not placed {
                 out += [Header(name: name, value: value)]
@@ -188,12 +205,18 @@ func is_alpha(anon c: int64) -> bool {
     return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
 }
 
+// What `trim` takes off: a space, a tab or a line end.
+func is_blank(anon c: int64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
 // A token character, as RFC 9110 defines it: names of methods and headers.
 func is_token_char(anon c: int64) -> bool {
-    if is_digit(c) or is_alpha(c) {
-        return true
+    // A bit for each: letters, digits and !#$%&'*+-.^_`|~.
+    if c < 64 {
+        return 0x03ff6cfa00000000 >> c & 1 != 0
     }
-    return "!#$%&'*+-.^_`|~".find(kod_bytes_to_str(kod_bytes_from_array([c]))) is not none
+    return c < 128 and 0x57ffffffc7fffffe >> c - 64 & 1 != 0
 }
 
 func is_token(anon s: str) -> bool {
@@ -215,6 +238,16 @@ func is_token(anon s: str) -> bool {
 func is_clean(anon s: str, tab_ok: bool) -> bool {
     let n = len(s)
     mut i: int64 = 0
+    let ones = 0x0101010101010101
+    for i + 8 <= n {
+        let w = kod_bytes_le64(s, i)
+        let del = w ^ 0x7f7f7f7f7f7f7f7f
+        // The lowest byte below 32, or that is 127, has its high bit here.
+        if ((w - 32 * ones) & (w ^ -1) | (del - ones) & (del ^ -1)) & ones << 7 != 0 {
+            break
+        }
+        i += 8
+    }
     for i < n {
         let c = s[i]
         if c == 127 or (c < 32 and (c != 9 or not tab_ok)) {
@@ -459,6 +492,9 @@ func percent_encode(anon s: str) -> str {
 }
 
 func percent_decode(anon s: str) -> str or Error {
+    if not s.contains("%") {
+        return s
+    }
     let out = StrBuilder()
     let n = len(s)
     mut i: int64 = 0
@@ -545,8 +581,7 @@ func is_post_like(anon method: str) -> bool {
 }
 
 func own_header(anon name: str) -> bool {
-    let n = name.lower()
-    return n == "host" or n == "connection" or n == "content-length" or n == "transfer-encoding"
+    return same_name(name, "host") or same_name(name, "connection") or same_name(name, "content-length") or same_name(name, "transfer-encoding")
 }
 
 func write_request(anon w: Writer, anon req: Outgoing, keep_alive: bool = false, accept_gzip: bool = false) -> none or Error {
@@ -726,16 +761,27 @@ func read_headers(anon br: BufReader, anon budget: Budget, anon into: Headers, m
         if line[0] == 32 or line[0] == 9 {
             throw protocol("header continuation lines are not supported")
         }
-        let colon = line.find(":")
-        if colon is none {
-            throw protocol("malformed header line")
+        mut end = len(line)
+        mut c: int64 = 0
+        for c < end and is_token_char(line[c]) {
+            c += 1
         }
-        let c = colon
-        let name = line[0..c]
-        if not is_token(name) {
+        if c == 0 or c == end or line[c] != 58 {
+            if not line.contains(":") {
+                throw protocol("malformed header line")
+            }
             throw protocol("bad header name")
         }
-        let value = line[c + 1..len(line)].trim()
+        // Without the blanks around it (a str's `trim` would copy it again).
+        mut start = c + 1
+        for start < end and is_blank(line[start]) {
+            start += 1
+        }
+        for end > start and is_blank(line[end - 1]) {
+            end -= 1
+        }
+        let name = line[0..c]
+        let value = line[start..end]
         if not is_clean(value, tab_ok: true) {
             throw protocol("bad header value")
         }
@@ -881,7 +927,7 @@ func response_frames(anon br: BufReader, anon method: str, status: int64, header
     let codings = headers.all("transfer-encoding")
     if len(codings) > 0 {
         for v in codings {
-            if v.trim().lower() != "chunked" {
+            if not same_name(v.trim(), "chunked") {
                 throw protocol(f"unsupported Transfer-Encoding {v}")
             }
         }
@@ -920,7 +966,7 @@ func read_body(anon br: BufReader, anon method: str, status: int64, headers: Hea
 func has_token(anon headers: Headers, anon name: str, anon token: str) -> bool {
     for v in headers.all(name) {
         for part in v.split(",") {
-            if part.trim().lower() == token {
+            if same_name(part.trim(), token) {
                 return true
             }
         }
@@ -1650,7 +1696,7 @@ func without(anon headers: Headers, anon names: [str]) -> Headers {
     for h in headers.items {
         mut drop = false
         for n in names {
-            if h.name.lower() == n {
+            if same_name(h.name, n) {
                 drop = true
             }
         }
@@ -2113,13 +2159,8 @@ func read_head(anon br: BufReader, anon limits: Limits) -> Request? or Error {
     let start = try parse_request_line(line)
     let headers = Headers()
     try read_headers(br, budget, headers, max_headers: limits.max_headers)
-    mut keep_alive = has_token(headers, "connection", "keep-alive")
-    if start.minor >= 1 {
-        keep_alive = true
-    }
-    if has_token(headers, "connection", "close") {
-        keep_alive = false
-    }
+    let asked = start.minor >= 1 or has_token(headers, "connection", "keep-alive")
+    let keep_alive = asked and not has_token(headers, "connection", "close")
     return Request(method: start.method, target: start.target, :headers, body: kod_str_to_bytes(""), :keep_alive, minor: start.minor)
 }
 
@@ -2128,7 +2169,7 @@ func sent_in_chunks(anon req: Request) -> bool or Error {
     let codings = req.headers.all("transfer-encoding")
     if len(codings) > 0 {
         for v in codings {
-            if v.trim().lower() != "chunked" {
+            if not same_name(v.trim(), "chunked") {
                 throw protocol(f"unsupported Transfer-Encoding {v}")
             }
         }
@@ -3014,7 +3055,7 @@ type ServerConn = shared struct {
         }
         self.enter(.Body, self.server.body_timeout)
         if req.headers.get("expect") is str(expect) {
-            if expect.lower() != "100-continue" {
+            if not same_name(expect, "100-continue") {
                 throw protocol("unknown Expect")
             }
             // Before it is told to go on, so that it needn't send too much.
@@ -3027,7 +3068,7 @@ type ServerConn = shared struct {
     func open_body(self, anon br: BufReader, anon req: Request) -> none or Error {
         mut expected = false
         if req.headers.get("expect") is str(expect) {
-            if expect.lower() != "100-continue" {
+            if not same_name(expect, "100-continue") {
                 throw protocol("unknown Expect")
             }
             expected = true
