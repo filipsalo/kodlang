@@ -109,10 +109,10 @@ let suffix: [int64] = nums[3..]  // from index 3 onward
 let all: [int64] = nums[..]      // all of it
 ```
 
-Both endpoints clamp to `[0, len]`: a negative bound becomes 0 and a bound past
-the end becomes `len`, so `[1, 2, 3][1..10]` is `[2, 3]`. An end before the
-start yields an empty slice. Unlike indexing, slice bounds never wrap.
-Both bounds must be `int64`.
+A negative bound counts from the end, as an index does: `nums[..-1]` is all but the
+last and `nums[-2..]` the last two. Then both endpoints clamp to `[0, len]`, so
+`[1, 2, 3][1..10]` is `[2, 3]` and `[1, 2, 3][-9..1]` is `[1]`. An end before the
+start yields an empty slice. Both bounds must be `int64`.
 
 ## Concatenation
 

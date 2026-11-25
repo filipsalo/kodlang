@@ -402,7 +402,10 @@ __attribute__((weak)) void kod_test_fail(KodStr *msg) {
     kod_panic(msg);
 }
 
+// A negative bound counts from the end, as an index does; then both clamp to 0..len.
 static int64_t clamp_slice(int64_t len, int64_t *start, int64_t end) {
+    if (*start < 0) *start += len;
+    if (end < 0) end += len;
     if (*start < 0) *start = 0;
     if (*start > len) *start = len;
     if (end > len) end = len;
