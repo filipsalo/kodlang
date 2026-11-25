@@ -4,7 +4,10 @@
 // a `JsonError` that says where. Numbers that don't fit an int64 (or that have
 // a fraction or an exponent) are kept as their text in `Decimal`, since Kod has
 // no floating-point type.
-import "strbuilder" { StrBuilder }
+import "bytebuffer" { ByteBuffer }
+
+// The 8 bytes from `at`, lowest first, as it reads them from bytes.
+extern func kod_bytes_le64(anon s: str, anon at: int64) -> int64
 
 type Value = enum {
     Null
@@ -89,15 +92,15 @@ type Value = enum {
     }
 
     func emit(self) -> str {
-        let out = StrBuilder()
+        let out = ByteBuffer()
         write_value(out, self, indent: -1, level: 0)
-        return out.to_str()
+        return kod_sb_to_str(out.handle)
     }
 
     func emit_pretty(self, indent: int64 = 2) -> str {
-        let out = StrBuilder()
-        write_value(out, self, indent: indent, level: 0)
-        return out.to_str()
+        let out = ByteBuffer()
+        write_value(out, self, :indent, level: 0)
+        return kod_sb_to_str(out.handle)
     }
 }
 
@@ -190,339 +193,536 @@ func is_digit(anon c: int64) -> bool {
     return c >= 48 and c <= 57
 }
 
+// What the hex digit `c` stands for, or -1.
 func hex_value(anon c: int64) -> int64 {
-    if is_digit(c) {
-        return c - 48
+    // A bit for each digit, from 48 on.
+    if c < 48 or c > 102 or 0x7e0000007e03ff >> c - 48 & 1 == 0 {
+        return -1
     }
-    if c >= 97 and c <= 102 {
-        return c - 87
-    }
-    if c >= 65 and c <= 70 {
-        return c - 55
-    }
-    return -1
+    return (c & 15) + (c >> 6) * 9
 }
 
-// Append the UTF-8 encoding of code point `cp`.
-func append_code_point(anon out: StrBuilder, anon cp: int64) -> none {
+// What the four hex digits at `at` stand for, or -1.
+func hex4(anon s: str, anon at: int64) -> int64 {
+    if at + 4 > len(s) {
+        return -1
+    }
+    let a = hex_value(s[at])
+    let b = hex_value(s[at + 1])
+    let c = hex_value(s[at + 2])
+    let d = hex_value(s[at + 3])
+    // Of which any -1 leaves the sign.
+    if a | b | c | d < 0 {
+        return -1
+    }
+    return a << 12 | b << 8 | c << 4 | d
+}
+
+// Adds the UTF-8 encoding of code point `cp`.
+func add_code_point(anon out: ByteBuffer, anon cp: int64) -> none {
     if cp < 128 {
-        out.append_byte(cp)
+        out.push(cp)
     } else if cp < 2048 {
-        out.append_byte(192 + (cp >> 6))
-        out.append_byte(128 + (cp & 63))
+        out.push_le(0x80c0 | cp >> 6 | (cp & 63) << 8, size: 2)
     } else if cp < 65536 {
-        out.append_byte(224 + (cp >> 12))
-        out.append_byte(128 + ((cp >> 6) & 63))
-        out.append_byte(128 + (cp & 63))
+        out.push_le(0x8080e0 | cp >> 12 | (cp >> 6 & 63) << 8 | (cp & 63) << 16, size: 3)
     } else {
-        out.append_byte(240 + (cp >> 18))
-        out.append_byte(128 + ((cp >> 12) & 63))
-        out.append_byte(128 + ((cp >> 6) & 63))
-        out.append_byte(128 + (cp & 63))
+        out.push_le(0x808080f0 | cp >> 18 | (cp >> 12 & 63) << 8 | (cp >> 6 & 63) << 16 | (cp & 63) << 24, size: 4)
     }
 }
 
+// The end of the run of plain characters from `from`: where the next quote, backslash
+// or control character is, or the length.
+func plain_end(anon s: str, anon from: int64) -> int64 {
+    let n = len(s)
+    let ones = 0x0101010101010101
+    mut i = from
+    for i + 8 <= n {
+        let w = kod_bytes_le64(s, i)
+        // A byte's high bit is set in one of these where it is below 32, or 0 in `quote`
+        // or `slash`; maybe above such a one too, never below.
+        let quote = w ^ 0x2222222222222222
+        let slash = w ^ 0x5c5c5c5c5c5c5c5c
+        let hits = ((w - 32 * ones) & (w ^ -1) | (quote - ones) & (quote ^ -1) | (slash - ones) & (slash ^ -1)) & ones << 7
+        if hits != 0 {
+            return i + (hits.trailing_zeros() >> 3)
+        }
+        i += 8
+    }
+    for i < n {
+        let c = s[i]
+        if c == 34 or c == 92 or c < 32 {
+            return i
+        }
+        i += 1
+    }
+    return n
+}
+
+// Whether the string that begins at `at`, after its quote, is `key`, which has none of
+// the characters that have to be escaped.
+func is_key(anon src: str, anon at: int64, anon key: str) -> bool {
+    let m = len(key)
+    if at + m >= len(src) or src[at + m] != 34 {
+        return false
+    }
+    mut i: int64 = 0
+    for i + 8 <= m {
+        if kod_bytes_le64(src, at + i) != kod_bytes_le64(key, i) {
+            return false
+        }
+        i += 8
+    }
+    for i < m {
+        if src[at + i] != key[i] {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Adds the bytes of `s` from `from` up to `to`.
+func add_part(anon out: ByteBuffer, anon s: str, anon from: int64, anon to: int64) -> none {
+    mut i = from
+    for i + 8 <= to {
+        out.push_le(kod_bytes_le64(s, i), size: 8)
+        i += 8
+    }
+    let left = to - i
+    if left == 0 {
+        return
+    }
+    mut w: int64 = 0
+    if to >= 8 {
+        // The last of the 8 bytes that end there.
+        w = kod_bytes_le64(s, to - 8) >> 8 * (8 - left)
+    } else {
+        for at in i..to {
+            w = w | s[at] << 8 * (at - i)
+        }
+    }
+    out.push_le(w, size: left)
+}
+
+// The deepest objects whose keys are kept to compare with the next one's.
+let SHAPES: int64 = 32
+
+// The methods below give `.Null`, "" or 0 once one has failed, with the error in
+// `error`: one to return would be made, and looked into, for every value. Their `src`
+// is the parser's, which would be counted each time it is read from there.
 type JsonParser = shared struct {
     src: str
     pos: int64
     depth: int64
     max_depth: int64
+    failed: bool = false
+    error: JsonError? = none
+    // The last object's keys at each depth: one with the same keys shares them.
+    shapes: [[str]] = []
+    // The last string had an escape.
+    escaped: bool = false
+    // What such a string is put together in.
+    text: ByteBuffer = ByteBuffer()
+    yes: Value = .Bool(value: true)
+    no: Value = .Bool(value: false)
 
-    func fail(self, anon message: str) -> JsonError {
-        return make_error(self.src, self.pos, message)
+    func fail(self, anon message: str) -> none {
+        self.failed = true
+        self.error = make_error(self.src, self.pos, message)
     }
 
     // The byte at `pos`, or -1 at the end.
-    func peek(self) -> int64 {
-        if self.pos >= len(self.src) {
+    func peek(self, anon src: str) -> int64 {
+        if self.pos >= len(src) {
             return -1
         }
-        return self.src[self.pos]
+        return src[self.pos]
     }
 
-    func skip_ws(self) -> none {
-        for self.pos < len(self.src) {
-            let c: int64 = self.src[self.pos]
-            if c == 32 or c == 9 or c == 10 or c == 13 {
-                self.pos = self.pos + 1
-            } else {
-                return none
+    // The byte after the whitespace there may be, at `pos` then; -1 at the end.
+    func next(self, anon src: str) -> int64 {
+        let n = len(src)
+        mut pos = self.pos
+        for pos < n {
+            let c = src[pos]
+            if c > 32 or (c != 32 and c != 10 and c != 13 and c != 9) {
+                self.pos = pos
+                return c
             }
+            pos += 1
         }
+        self.pos = pos
+        return -1
     }
 
     // Consume `lit` if it is next.
-    func consume_literal(self, anon lit: str) -> bool {
-        if self.pos + len(lit) > len(self.src) {
+    func consume_literal(self, anon src: str, anon lit: str) -> bool {
+        let m = len(lit)
+        if self.pos + m > len(src) {
             return false
         }
-        mut i: int64 = 0
-        for i < len(lit) {
-            if self.src[self.pos + i] != lit[i] {
+        for i in 0..m {
+            if src[self.pos + i] != lit[i] {
                 return false
             }
-            i = i + 1
         }
-        self.pos = self.pos + len(lit)
+        self.pos += m
         return true
     }
 
-    func enter(self) -> none or Error {
-        self.depth = self.depth + 1
+    func enter(self) -> none {
+        self.depth += 1
         if self.depth > self.max_depth {
-            throw self.fail("nesting too deep")
+            self.fail("nesting too deep")
         }
     }
 
-    func parse_value(self) -> Value or Error {
-        self.skip_ws()
-        let c: int64 = self.peek()
-        if c < 0 {
-            throw self.fail("unexpected end of input")
-        }
+    func parse_value(self, anon src: str) -> Value {
+        let c = self.next(src)
         if c == 34 {
-            return .Str(value: try self.parse_string())
-        }
-        if c == 123 {
-            return try self.parse_object()
-        }
-        if c == 91 {
-            return try self.parse_array()
-        }
-        if c == 116 {
-            if self.consume_literal("true") {
-                return .Bool(value: true)
-            }
-            throw self.fail("invalid literal")
-        }
-        if c == 102 {
-            if self.consume_literal("false") {
-                return .Bool(value: false)
-            }
-            throw self.fail("invalid literal")
-        }
-        if c == 110 {
-            if self.consume_literal("null") {
-                return .Null
-            }
-            throw self.fail("invalid literal")
+            return .Str(value: self.parse_string(src))
         }
         if c == 45 or is_digit(c) {
-            return try self.parse_number()
+            return self.parse_number(src)
         }
-        throw self.fail("unexpected character")
+        if c == 123 {
+            return self.parse_object(src)
+        }
+        if c == 91 {
+            return self.parse_array(src)
+        }
+        if c == 116 and self.consume_literal(src, "true") {
+            return self.yes
+        }
+        if c == 102 and self.consume_literal(src, "false") {
+            return self.no
+        }
+        if c == 110 and self.consume_literal(src, "null") {
+            return .Null
+        }
+        if c < 0 {
+            self.fail("unexpected end of input")
+        } else if c == 116 or c == 102 or c == 110 {
+            self.fail("invalid literal")
+        } else {
+            self.fail("unexpected character")
+        }
+        return .Null
     }
 
     // Four hex digits at `pos`.
-    func parse_hex4(self) -> int64 or Error {
+    func parse_hex4(self) -> int64 {
         if self.pos + 4 > len(self.src) {
-            throw self.fail("bad \\u escape")
+            self.fail("bad \\u escape")
+            return 0
         }
         mut n: int64 = 0
-        mut i: int64 = 0
-        for i < 4 {
+        for i in 0..4 {
             let d = hex_value(self.src[self.pos + i])
             if d < 0 {
-                self.pos = self.pos + i
-                throw self.fail("bad \\u escape")
+                self.pos += i
+                self.fail("bad \\u escape")
+                return 0
             }
             n = n * 16 + d
-            i = i + 1
         }
-        self.pos = self.pos + 4
+        self.pos += 4
         return n
     }
 
     // After `\u`: one code point, joining a surrogate pair into one.
-    func parse_unicode_escape(self, anon out: StrBuilder) -> none or Error {
+    func parse_unicode_escape(self) -> none {
         let start = self.pos - 2
-        let first = try self.parse_hex4()
-        if first >= 55296 and first <= 56319 {
-            if self.pos + 1 < len(self.src) and self.src[self.pos] == 92 and self.src[self.pos + 1] == 117 {
-                self.pos = self.pos + 2
-                let second = try self.parse_hex4()
-                if second < 56320 or second > 57343 {
-                    self.pos = start
-                    throw self.fail("unpaired surrogate")
+        mut cp = self.parse_hex4()
+        if self.failed {
+            return
+        }
+        if 55296 <= cp <= 57343 {
+            mut low: int64 = 0
+            let more = cp <= 56319 and self.pos + 1 < len(self.src) and self.src[self.pos] == 92 and self.src[self.pos + 1] == 117
+            if more {
+                self.pos += 2
+                low = self.parse_hex4()
+                if self.failed {
+                    return
                 }
-                append_code_point(out, 65536 + ((first - 55296) << 10) + (second - 56320))
+            }
+            if low < 56320 or low > 57343 {
+                self.pos = start
+                self.fail("unpaired surrogate")
                 return
             }
-            self.pos = start
-            throw self.fail("unpaired surrogate")
+            cp = 65536 + ((cp - 55296) << 10) + (low - 56320)
         }
-        if first >= 56320 and first <= 57343 {
-            self.pos = start
-            throw self.fail("unpaired surrogate")
-        }
-        append_code_point(out, first)
+        add_code_point(self.text, cp)
     }
 
-    func parse_string(self) -> str or Error {
-        self.pos = self.pos + 1
-        let out = StrBuilder()
-        let n = len(self.src)
+    func parse_string(self, anon src: str) -> str {
+        let start = self.pos + 1
+        let at = plain_end(src, start)
+        self.escaped = false
+        if at < len(src) and src[at] == 34 {
+            self.pos = at + 1
+            return src[start..at]
+        }
+        return self.parse_escaped(src, start, at)
+    }
+
+    // The rest of a string that begins at `start`, plain up to `at`.
+    func parse_escaped(self, anon src: str, anon start: int64, anon at: int64) -> str {
+        let n = len(src)
+        let out = self.text
+        out.drop_front(out.len())
+        self.escaped = true
+        mut from = start
+        mut pos = at
         for true {
-            let start = self.pos
-            for self.pos < n {
-                let c = self.src[self.pos]
-                if c == 34 or c == 92 or c < 32 {
-                    break
-                }
-                self.pos = self.pos + 1
+            if from < pos {
+                add_part(out, src, from, pos)
             }
-            out.append(self.src[start..self.pos])
-            if self.pos >= n {
-                throw self.fail("unterminated string")
+            self.pos = pos
+            if pos >= n {
+                self.fail("unterminated string")
+                return ""
             }
-            let c = self.src[self.pos]
+            let c = src[pos]
             if c == 34 {
-                self.pos = self.pos + 1
-                return out.to_str()
+                self.pos = pos + 1
+                return kod_sb_to_str(out.handle)
             }
             if c < 32 {
-                throw self.fail("control character in string")
+                self.fail("control character in string")
+                return ""
             }
-            self.pos = self.pos + 1
-            if self.pos >= n {
-                throw self.fail("unterminated string")
+            if pos + 1 >= n {
+                self.pos = n
+                self.fail("unterminated string")
+                return ""
             }
-            let e = self.src[self.pos]
-            self.pos = self.pos + 1
-            if e == 34 or e == 92 or e == 47 {
-                out.append_byte(e)
-            } else if e == 98 {
-                out.append_byte(8)
-            } else if e == 102 {
-                out.append_byte(12)
-            } else if e == 110 {
-                out.append_byte(10)
-            } else if e == 114 {
-                out.append_byte(13)
-            } else if e == 116 {
-                out.append_byte(9)
+            let e = src[pos + 1]
+            self.pos = pos + 2
+            if e == 110 {
+                out.push(10)
+            } else if e == 34 or e == 92 or e == 47 {
+                out.push(e)
             } else if e == 117 {
-                let unicode = try self.parse_unicode_escape(out)
+                let cp = hex4(src, pos + 2)
+                if cp >= 0 and (cp < 55296 or cp > 57343) {
+                    add_code_point(out, cp)
+                    self.pos = pos + 6
+                } else {
+                    self.parse_unicode_escape()
+                    if self.failed {
+                        return ""
+                    }
+                }
+            } else if e == 116 {
+                out.push(9)
+            } else if e == 114 {
+                out.push(13)
+            } else if e == 98 {
+                out.push(8)
+            } else if e == 102 {
+                out.push(12)
             } else {
-                self.pos = self.pos - 2
-                throw self.fail("invalid escape")
+                self.pos = pos
+                self.fail("invalid escape")
+                return ""
             }
+            from = self.pos
+            pos = plain_end(src, from)
         }
-        throw self.fail("unterminated string")
+        return ""
     }
 
-    func skip_digits(self) -> int64 {
+    func skip_digits(self, anon src: str) -> int64 {
+        let n = len(src)
         let start = self.pos
-        for self.pos < len(self.src) and is_digit(self.src[self.pos]) {
-            self.pos = self.pos + 1
+        mut pos = start
+        for pos < n and is_digit(src[pos]) {
+            pos += 1
         }
-        return self.pos - start
+        self.pos = pos
+        return pos - start
     }
 
-    func parse_number(self) -> Value or Error {
+    func parse_number(self, anon src: str) -> Value {
+        let n = len(src)
         let start = self.pos
-        if self.peek() == 45 {
-            self.pos = self.pos + 1
+        mut pos = start
+        let negative = src[pos] == 45
+        if negative {
+            pos += 1
         }
-        let first = self.peek()
-        if first == 48 {
-            self.pos = self.pos + 1
-        } else if first >= 49 and first <= 57 {
-            self.skip_digits()
-        } else {
-            throw self.fail("expected a digit")
-        }
-        mut integer = true
-        if self.peek() == 46 {
-            integer = false
-            self.pos = self.pos + 1
-            if self.skip_digits() == 0 {
-                throw self.fail("expected a digit after the decimal point")
+        let digits = pos
+        mut value: int64 = 0
+        mut c: int64 = -1
+        for pos < n {
+            c = src[pos]
+            if not is_digit(c) {
+                break
             }
+            // Wraps when there are too many: then it isn't used.
+            value = value * 10 + (c - 48)
+            pos += 1
         }
-        if self.peek() == 101 or self.peek() == 69 {
-            integer = false
-            self.pos = self.pos + 1
-            if self.peek() == 43 or self.peek() == 45 {
-                self.pos = self.pos + 1
-            }
-            if self.skip_digits() == 0 {
-                throw self.fail("expected a digit in the exponent")
-            }
+        self.pos = pos
+        if pos == digits {
+            self.fail("expected a digit")
+            return .Null
         }
-        let text = self.src[start..self.pos]
-        if integer {
-            let n = text.parse_int()
-            if n is not none {
-                return .Number(value: n)
-            }
+        if src[digits] == 48 and pos > digits + 1 {
+            // A zero by itself, and what comes after it.
+            self.pos = digits + 1
+            return .Number(value: 0)
         }
-        return .Decimal(text: text)
+        if pos < n and (c == 46 or c == 101 or c == 69) {
+            return self.parse_fraction(src, start)
+        }
+        if pos - digits > 18 {
+            let text = src[start..pos]
+            if text.parse_int() is int64(big) {
+                return .Number(value: big)
+            }
+            return .Decimal(:text)
+        }
+        if negative {
+            value = -value
+        }
+        return .Number(:value)
     }
 
-    func parse_array(self) -> Value or Error {
-        let entered = try self.enter()
-        self.pos = self.pos + 1
+    // The number that begins at `start`, from its point or exponent on.
+    func parse_fraction(self, anon src: str, anon start: int64) -> Value {
+        if self.peek(src) == 46 {
+            self.pos += 1
+            if self.skip_digits(src) == 0 {
+                self.fail("expected a digit after the decimal point")
+                return .Null
+            }
+        }
+        let c = self.peek(src)
+        if c == 101 or c == 69 {
+            self.pos += 1
+            let sign = self.peek(src)
+            if sign == 43 or sign == 45 {
+                self.pos += 1
+            }
+            if self.skip_digits(src) == 0 {
+                self.fail("expected a digit in the exponent")
+                return .Null
+            }
+        }
+        return .Decimal(text: src[start..self.pos])
+    }
+
+    func parse_array(self, anon src: str) -> Value {
+        self.enter()
+        if self.failed {
+            return .Null
+        }
+        self.pos += 1
         mut items: [Value] = []
-        self.skip_ws()
-        if self.peek() == 93 {
-            self.pos = self.pos + 1
-            self.depth = self.depth - 1
+        if self.next(src) == 93 {
+            self.pos += 1
+            self.depth -= 1
             return .Array(:items)
         }
         for true {
-            items += [try self.parse_value()]
-            self.skip_ws()
-            let c = self.peek()
-            if c == 44 {
-                self.pos = self.pos + 1
-            } else if c == 93 {
-                self.pos = self.pos + 1
-                self.depth = self.depth - 1
+            let v = self.parse_value(src)
+            if self.failed {
+                return .Null
+            }
+            items += [v]
+            let c = self.next(src)
+            if c != 44 and c != 93 {
+                self.fail("expected `,` or `]`")
+                return .Null
+            }
+            self.pos += 1
+            if c == 93 {
+                self.depth -= 1
                 return .Array(:items)
-            } else {
-                throw self.fail("expected `,` or `]`")
             }
         }
-        return .Array(:items)
+        return .Null
     }
 
-    func parse_object(self) -> Value or Error {
-        let entered = try self.enter()
-        self.pos = self.pos + 1
+    func parse_object(self, anon src: str) -> Value {
+        self.enter()
+        if self.failed {
+            return .Null
+        }
+        self.pos += 1
+        let depth = self.depth
         mut keys: [str] = []
         mut values: [Value] = []
-        self.skip_ws()
-        if self.peek() == 125 {
-            self.pos = self.pos + 1
-            self.depth = self.depth - 1
+        if self.next(src) == 125 {
+            self.pos += 1
+            self.depth -= 1
             return .Object(:keys, :values)
         }
+        // While `shared`, its keys are those that `shape` begins with, and `keys` is
+        // yet to be made.
+        mut shape: [str] = []
+        if depth < len(self.shapes) {
+            shape = self.shapes[depth]
+        }
+        mut shared = true
+        mut plain = true
         for true {
-            self.skip_ws()
-            if self.peek() != 34 {
-                throw self.fail("expected a string key")
+            if self.next(src) != 34 {
+                self.fail("expected a string key")
+                return .Null
             }
-            let key = try self.parse_string()
-            self.skip_ws()
-            if self.peek() != 58 {
-                throw self.fail("expected `:`")
-            }
-            self.pos = self.pos + 1
-            let v = try self.parse_value()
-            keys += [key]
-            values += [v]
-            self.skip_ws()
-            let c = self.peek()
-            if c == 44 {
-                self.pos = self.pos + 1
-            } else if c == 125 {
-                self.pos = self.pos + 1
-                self.depth = self.depth - 1
-                return .Object(:keys, :values)
+            let i = len(values)
+            if shared and i < len(shape) and is_key(src, self.pos + 1, shape[i]) {
+                self.pos += len(shape[i]) + 2
             } else {
-                throw self.fail("expected `,` or `}`")
+                if shared {
+                    shared = false
+                    keys = shape[0..i]
+                }
+                let key = self.parse_string(src)
+                if self.failed {
+                    return .Null
+                }
+                plain = plain and not self.escaped
+                keys += [key]
             }
+            if self.next(src) != 58 {
+                self.fail("expected `:`")
+                return .Null
+            }
+            self.pos += 1
+            let v = self.parse_value(src)
+            if self.failed {
+                return .Null
+            }
+            values += [v]
+            let c = self.next(src)
+            if c != 44 and c != 125 {
+                self.fail("expected `,` or `}`")
+                return .Null
+            }
+            self.pos += 1
+            if c == 125 {
+                break
+            }
+        }
+        self.depth -= 1
+        if shared {
+            if len(values) < len(shape) {
+                shape = shape[0..len(values)]
+            }
+            return .Object(keys: shape, :values)
+        }
+        if plain and depth < SHAPES {
+            for len(self.shapes) <= depth {
+                self.shapes += [[]]
+            }
+            self.shapes[depth] = keys
         }
         return .Object(:keys, :values)
     }
@@ -533,11 +733,13 @@ func parse(anon src: str, max_depth: int64 = 512) -> Value or Error {
     if len(src) >= 3 and src[0] == 239 and src[1] == 187 and src[2] == 191 {
         start = 3
     }
-    let p = JsonParser(src: src, pos: start, depth: 0, max_depth: max_depth)
-    let v = try p.parse_value()
-    p.skip_ws()
-    if p.pos < len(src) {
-        throw p.fail("unexpected text after the value")
+    let p = JsonParser(:src, pos: start, depth: 0, :max_depth)
+    let v = p.parse_value(src)
+    if not p.failed and p.next(src) >= 0 {
+        p.fail("unexpected text after the value")
+    }
+    if p.error is JsonError(e) {
+        throw e
     }
     return v
 }
@@ -551,40 +753,48 @@ func hex_digit(anon n: int64) -> int64 {
     return 87 + n
 }
 
-func write_string(anon out: StrBuilder, anon s: str) -> none {
-    out.append_byte(34)
+func write_string(anon out: ByteBuffer, anon s: str) -> none {
+    out.push(34)
     let n = len(s)
-    mut i: int64 = 0
-    mut run: int64 = 0
-    for i < n {
-        let c = s[i]
-        if c == 34 or c == 92 or c < 32 {
-            out.append(s[run..i])
-            run = i + 1
-            if c == 34 {
-                out.append("\\\"")
-            } else if c == 92 {
-                out.append("\\\\")
-            } else if c == 10 {
-                out.append("\\n")
-            } else if c == 13 {
-                out.append("\\r")
-            } else if c == 9 {
-                out.append("\\t")
-            } else if c == 8 {
-                out.append("\\b")
-            } else if c == 12 {
-                out.append("\\f")
-            } else {
-                out.append("\\u00")
-                out.append_byte(hex_digit(c >> 4))
-                out.append_byte(hex_digit(c & 15))
-            }
+    mut from: int64 = 0
+    for true {
+        let i = plain_end(s, from)
+        if i - from == n and n >= 32 {
+            kod_sb_append(out.handle, s)
+            break
         }
-        i = i + 1
+        add_part(out, s, from, i)
+        if i == n {
+            break
+        }
+        write_escaped(out, s[i])
+        from = i + 1
     }
-    out.append(s[run..n])
-    out.append_byte(34)
+    out.push(34)
+}
+
+// A quote, a backslash or a control character.
+func write_escaped(anon out: ByteBuffer, anon c: int64) -> none {
+    mut short = c
+    if c == 10 {
+        short = 110
+    } else if c == 13 {
+        short = 114
+    } else if c == 9 {
+        short = 116
+    } else if c == 8 {
+        short = 98
+    } else if c == 12 {
+        short = 102
+    } else if c < 32 {
+        // \u00
+        out.push_le(0x3030755c, size: 4)
+        out.push(hex_digit(c >> 4))
+        out.push(hex_digit(c & 15))
+        return
+    }
+    out.push(92)
+    out.push(short)
 }
 
 // Is `text` a JSON number: -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
@@ -633,82 +843,79 @@ func is_number_text(anon text: str) -> bool {
 }
 
 // A line break and `level * indent` spaces; nothing when `indent` is negative.
-func write_break(anon out: StrBuilder, indent: int64, level: int64) -> none {
+func write_break(anon out: ByteBuffer, indent: int64, level: int64) -> none {
     if indent < 0 {
         return
     }
-    out.append_byte(10)
-    for _ in 0..indent * level {
-        out.append_byte(32)
+    out.push(10)
+    mut left = indent * level
+    for left >= 8 {
+        out.push_le(0x2020202020202020, size: 8)
+        left -= 8
     }
+    out.push_le(0x2020202020202020, size: left)
 }
 
 // `indent < 0` writes compact JSON.
-func write_value(anon out: StrBuilder, anon v: Value, indent: int64, level: int64) -> none {
+func write_value(anon out: ByteBuffer, anon v: Value, indent: int64, level: int64) -> none {
     match v {
-        .Null -> out.append("null")
+        .Null -> out.push_le(0x6c6c756e, size: 4)
         .Bool(b) -> {
             if b {
-                out.append("true")
+                out.push_le(0x65757274, size: 4)
             } else {
-                out.append("false")
+                out.push_le(0x65736c6166, size: 5)
             }
         }
-        .Number(n) -> out.append(n.to_str())
+        .Number(n) -> kod_sb_append_int(out.handle, n)
         .Decimal(text) -> {
             if is_number_text(text) {
-                out.append(text)
+                add_part(out, text, 0, len(text))
             } else {
-                out.append("null")
+                out.push_le(0x6c6c756e, size: 4)
             }
         }
         .Str(s) -> write_string(out, s)
         .Array(items) -> {
             if len(items) == 0 {
-                out.append("[]")
+                out.push_le(0x5d5b, size: 2)
                 return
             }
-            out.append_byte(91)
-            mut i: int64 = 0
-            for i < len(items) {
-                if i > 0 {
-                    out.append_byte(44)
-                }
-                write_break(out, indent: indent, level: level + 1)
-                write_value(out, items[i], indent: indent, level: level + 1)
-                i = i + 1
+            mut before = 91
+            for item in items {
+                out.push(before)
+                before = 44
+                write_break(out, :indent, level: level + 1)
+                write_value(out, item, :indent, level: level + 1)
             }
-            write_break(out, indent: indent, level: level)
-            out.append_byte(93)
+            write_break(out, :indent, :level)
+            out.push(93)
         }
         .Object(keys, values) -> {
             if len(keys) == 0 {
-                out.append("{}")
+                out.push_le(0x7d7b, size: 2)
                 return
             }
-            out.append_byte(123)
-            mut i: int64 = 0
-            for i < len(keys) {
-                if i > 0 {
-                    out.append_byte(44)
-                }
-                write_break(out, indent: indent, level: level + 1)
-                write_string(out, keys[i])
-                out.append_byte(58)
+            mut before = 123
+            for i, key in keys {
+                out.push(before)
+                before = 44
+                write_break(out, :indent, level: level + 1)
+                write_string(out, key)
+                out.push(58)
                 if indent >= 0 {
-                    out.append_byte(32)
+                    out.push(32)
                 }
-                write_value(out, values[i], indent: indent, level: level + 1)
-                i = i + 1
+                write_value(out, values[i], :indent, level: level + 1)
             }
-            write_break(out, indent: indent, level: level)
-            out.append_byte(125)
+            write_break(out, :indent, :level)
+            out.push(125)
         }
     }
 }
 
 func escape_string(anon s: str) -> str {
-    let out = StrBuilder()
+    let out = ByteBuffer()
     write_string(out, s)
-    return out.to_str()
+    return kod_sb_to_str(out.handle)
 }

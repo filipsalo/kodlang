@@ -89,7 +89,8 @@ decoded into UTF-8, with a surrogate pair giving one four-byte character, and
 
 Object entries are stored as parallel arrays (`keys[i]` is the key of
 `values[i]`), in the order they were written. A repeated key is kept, and
-`get` finds the first.
+`get` finds the first. Objects parsed one after another with the same
+keys share one `keys` array.
 
 ## Accessors
 
