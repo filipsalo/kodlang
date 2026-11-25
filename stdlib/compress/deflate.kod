@@ -11,6 +11,7 @@ import "compress/tables" { LEN_BASE, LEN_EXTRA, DIST_BASE, DIST_EXTRA }
 import "hash/crc32"
 import "sort"
 import "strbuilder" { StrBuilder }
+import "stream" { IoError, Writer }
 
 // How hard a level looks for matches; the numbers are zlib's.
 type Level = struct {
@@ -98,6 +99,10 @@ func distance_codes() -> [int64] {
     }
     return out
 }
+
+// Worked out once.
+mut _length_codes: [int64] = length_codes()
+mut _distance_codes: [int64] = distance_codes()
 
 // `code`'s low `n` bits in reverse order: deflate sends a Huffman code's bits
 // from the top, into a stream that fills each byte from the bottom.
@@ -318,6 +323,13 @@ func block_symbols() -> int64 {
     return 16384
 }
 
+// As far back as a match may be.
+let WINDOW: int64 = 32768
+// More than a match is long.
+let LOOKAHEAD: int64 = 300
+// How much input is compressed at a time.
+let PIECE: int64 = 65536
+
 type Encoder = shared struct {
     data: bytes
     level: int64
@@ -332,8 +344,8 @@ type Encoder = shared struct {
     dists: [int64] = []
     block_start: int64 = 0
     covered: int64 = 0
-    len_code: [int64] = length_codes()
-    dist_code: [int64] = distance_codes()
+    len_code: [int64] = _length_codes
+    dist_code: [int64] = _distance_codes
     // Hash chains: `head` holds the latest position of each hash, `prev` the one
     // before a position with the same hash, both -1 for none. Both are a power of
     // two in size, at most the 32 KB window.
@@ -341,6 +353,12 @@ type Encoder = shared struct {
     prev: [int64] = []
     mask: int64 = 0
     match_dist: int64 = 0
+    // The next position, whether the byte before it is still to be written, and
+    // the match found there (`lazy`).
+    next: int64 = 0
+    pending: bool = false
+    prev_len: int64 = 0
+    prev_dist: int64 = 0
 
     func bits(self, anon value: int64, anon n: int64) -> none {
         self.acc = self.acc | (value << self.nbits)
@@ -552,7 +570,7 @@ type Encoder = shared struct {
         }
         mut found: int64 = 0
         mut p = self.prev[i & self.mask]
-        for p >= 0 and i - p <= 32768 and chain > 0 {
+        for p >= 0 and i - p <= WINDOW and chain > 0 {
             if self.data[p + best] == self.data[i + best] and self.data[p] == self.data[i] and self.data[p + 1] == self.data[i + 1] {
                 mut l: int64 = 2
                 for l < most and self.data[p + l] == self.data[i + l] {
@@ -581,11 +599,10 @@ type Encoder = shared struct {
         return found
     }
 
-    // Take the first match at each position.
-    func greedy(self, anon cfg: Level) -> none {
-        let n = len(self.data)
-        mut i: int64 = 0
-        for i < n {
+    // Take the first match at each position, up to `end`.
+    func greedy(self, anon cfg: Level, anon end: int64) -> none {
+        mut i = self.next
+        for i < end {
             self.insert(i)
             let l = self.longest(i, 0, cfg)
             if l >= 3 {
@@ -601,18 +618,19 @@ type Encoder = shared struct {
                 i += 1
             }
         }
+        self.next = i
     }
 
     // Hold each match back a byte, and take a literal instead when the next
-    // position starts a longer one.
-    func lazy(self, anon cfg: Level) -> none {
+    // position starts a longer one. Up to `stop`; at the end of the input nothing
+    // is held back.
+    func lazy(self, anon cfg: Level, anon stop: int64) -> none {
         let n = len(self.data)
-        mut i: int64 = 0
-        // Whether the byte before `i` is still to be written, and the match found there.
-        mut pending = false
-        mut prev_len: int64 = 0
-        mut prev_dist: int64 = 0
-        for i < n {
+        mut i = self.next
+        mut pending = self.pending
+        mut prev_len = self.prev_len
+        mut prev_dist = self.prev_dist
+        for i < stop {
             self.insert(i)
             mut l: int64 = 0
             if prev_len < cfg.lazy {
@@ -637,9 +655,106 @@ type Encoder = shared struct {
                 i += 1
             }
         }
-        if pending {
+        if pending and stop == n {
             self.literal(n - 1)
+            pending = false
+            prev_len = 0
         }
+        self.next = i
+        self.pending = pending
+        self.prev_len = prev_len
+        self.prev_dist = prev_dist
+    }
+
+    func search(self, anon stop: int64) -> none {
+        let cfg = level_config(self.level)
+        if cfg.greedy {
+            self.greedy(cfg, stop)
+        } else {
+            self.lazy(cfg, stop)
+        }
+    }
+
+    // Makes the hash chains as long as the data, if the window isn't longer.
+    func size_chains(self) -> none {
+        mut size: int64 = 256
+        for size < len(self.data) and size < WINDOW {
+            size = size << 1
+        }
+        if size <= len(self.head) {
+            return
+        }
+        self.mask = size - 1
+        self.head = filled(size, -1)
+        self.prev = filled(size, -1)
+        mut p = self.next - WINDOW
+        if p < 0 {
+            p = 0
+        }
+        for p < self.next {
+            self.insert(p)
+            p += 1
+        }
+    }
+
+    // Takes up `more` input. Without `all`, what comes next is needed to look for
+    // matches at the last of it, which is left for then.
+    func feed(self, anon more: bytes, all: bool) -> none {
+        if self.level == 0 {
+            if len(more) > 0 {
+                self.data = more
+                self.stored(0, len(more), false)
+            }
+            return
+        }
+        // Whole windows: a position's place in the chains stays the same.
+        let windows = self.next / WINDOW - 1
+        mut drop: int64 = 0
+        if windows >= 4 {
+            drop = windows * WINDOW
+            self.drop_front(drop)
+        }
+        self.data = self.data[drop..len(self.data)] + more
+        self.size_chains()
+        mut stop = len(self.data)
+        if not all {
+            stop -= LOOKAHEAD
+        }
+        self.search(stop)
+    }
+
+    // Counts positions from `n` on.
+    func drop_front(self, anon n: int64) -> none {
+        // A block may be written as it is, so its input is kept until then.
+        if len(self.syms) > 0 {
+            self.block(false)
+        }
+        self.next -= n
+        self.block_start -= n
+        self.covered -= n
+        for k in 0..len(self.head) {
+            // Below 0 for none.
+            self.head[k] -= n
+            self.prev[k] -= n
+        }
+    }
+
+    // Writes out what there is, up to a byte's end, for what comes before it to be decoded.
+    func sync(self) -> none {
+        if len(self.syms) > 0 {
+            self.block(false)
+        }
+        self.stored(0, 0, false)
+    }
+
+    // The end of the stream.
+    func end(self) -> none {
+        if self.level == 0 {
+            self.stored(0, 0, true)
+        } else {
+            self.block(true)
+        }
+        self.align()
     }
 
     // The whole deflate stream, ending on a byte boundary.
@@ -650,21 +765,9 @@ type Encoder = shared struct {
             self.align()
             return
         }
-        mut size: int64 = 256
-        for size < n and size < 32768 {
-            size = size << 1
-        }
-        self.mask = size - 1
-        self.head = filled(size, -1)
-        self.prev = filled(size, -1)
-        let cfg = level_config(self.level)
-        if cfg.greedy {
-            self.greedy(cfg)
-        } else {
-            self.lazy(cfg)
-        }
-        self.block(true)
-        self.align()
+        self.size_chains()
+        self.search(n)
+        self.end()
     }
 }
 
@@ -681,36 +784,41 @@ func raw(anon data: bytes, level: int64 = 6) -> bytes {
     return e.out.to_bytes()
 }
 
-// A gzip file of one member, with no name and a zero modification time.
-func gzip(anon data: bytes, level: int64 = 6) -> bytes {
-    let e = Encoder(data: data, level: clamp_level(level))
+// The header of a gzip file of one member, with no name and a zero
+// modification time.
+func gzip_head(anon e: Encoder) -> none {
     for b in [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3] {
         e.out.append_byte(b)
     }
+}
+
+func gzip(anon data: bytes, level: int64 = 6) -> bytes {
+    let e = Encoder(data: data, level: clamp_level(level))
+    gzip_head(e)
     e.run()
     le32(e.out, crc32.compute(data))
     le32(e.out, len(data) & 0xffffffff)
     return e.out.to_bytes()
 }
 
-// A zlib stream: a two-byte header that names the level, then the Adler-32 of
-// the data, high byte first.
-func zlib(anon data: bytes, level: int64 = 6) -> bytes {
-    let lv = clamp_level(level)
-    let e = Encoder(data: data, level: lv)
+// A zlib stream's header, two bytes which name the level.
+func zlib_head(anon e: Encoder) -> none {
     e.out.append_byte(0x78)
-    if lv <= 1 {
+    if e.level <= 1 {
         e.out.append_byte(0x01)
-    } else if lv <= 5 {
+    } else if e.level <= 5 {
         e.out.append_byte(0x5e)
-    } else if lv == 6 {
+    } else if e.level == 6 {
         e.out.append_byte(0x9c)
     } else {
         e.out.append_byte(0xda)
     }
-    e.run()
-    mut a: int64 = 1
-    mut b: int64 = 0
+}
+
+// The Adler-32 sum of what `sum` is the sum of, and `data` after it.
+func adler32(anon sum: int64, anon data: bytes) -> int64 {
+    mut a = sum & 0xffff
+    mut b = sum >> 16
     for k in 0..len(data) {
         a += data[k]
         b += a
@@ -719,11 +827,142 @@ func zlib(anon data: bytes, level: int64 = 6) -> bytes {
             b = b % 65521
         }
     }
-    a = a % 65521
-    b = b % 65521
-    let sum = (b << 16) | a
+    return ((b % 65521) << 16) | (a % 65521)
+}
+
+func be32(anon out: StrBuilder, anon v: int64) -> none {
     for k in 0..4 {
-        e.out.append_byte((sum >> (24 - 8 * k)) & 255)
+        out.append_byte((v >> (24 - 8 * k)) & 255)
     }
+}
+
+// A zlib stream: its header and the data, then the Adler-32 of that, high byte
+// first.
+func zlib(anon data: bytes, level: int64 = 6) -> bytes {
+    let e = Encoder(data: data, level: clamp_level(level))
+    zlib_head(e)
+    e.run()
+    be32(e.out, adler32(1, data))
     return e.out.to_bytes()
+}
+
+// What frames a deflate stream.
+type Format = enum {
+    Gzip
+    Zlib
+    Raw
+}
+
+// Compresses what is written to it: see docs/encoding.md#compressing-piece-by-piece.
+type DeflateWriter = shared struct {
+    to: Writer
+    format: Format
+    encoder: Encoder
+    // Written and not compressed.
+    waiting: StrBuilder = StrBuilder()
+    crc: crc32.Crc32 = crc32.make_crc32()
+    adler: int64 = 1
+    total: int64 = 0
+    finished: bool = false
+    // Why nothing more can be written to `to`.
+    failed: Error? = none
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        if self.finished {
+            throw IoError(kind: .InvalidInput, op: "deflate", errno: 0, detail: "written to after it was finished")
+        }
+        mut at: int64 = 0
+        for at < len(data) {
+            mut end = at + PIECE - self.waiting.len()
+            if end > len(data) {
+                end = len(data)
+            }
+            if at == 0 and end == len(data) {
+                self.waiting.append_bytes(data)
+            } else {
+                self.waiting.append_bytes(data[at..end])
+            }
+            at = end
+            if self.waiting.len() >= PIECE {
+                self.pack(all: false)
+                try self.send()
+            }
+        }
+        return len(data)
+    }
+
+    // Sends what has been written.
+    func flush(self) -> none or Error {
+        if self.finished {
+            return
+        }
+        self.pack(all: true)
+        self.encoder.sync()
+        try self.send()
+    }
+
+    // Ends the stream.
+    func finish(self) -> none or Error {
+        if self.finished {
+            return
+        }
+        self.pack(all: true)
+        self.encoder.end()
+        self.finished = true
+        let out = self.encoder.out
+        match self.format {
+            .Gzip -> {
+                le32(out, self.crc.final())
+                le32(out, self.total & 0xffffffff)
+            }
+            .Zlib -> be32(out, self.adler)
+            .Raw -> none
+        }
+        try self.send()
+    }
+
+    // Compresses what waits.
+    func pack(self, all: bool) -> none {
+        let data = self.waiting.to_bytes()
+        self.waiting.clear()
+        match self.format {
+            .Gzip -> self.crc.update_bytes(data)
+            .Zlib -> self.adler = adler32(self.adler, data)
+            .Raw -> none
+        }
+        self.total += len(data)
+        self.encoder.feed(data, :all)
+    }
+
+    func send(self) -> none or Error {
+        if self.failed is Some(e) {
+            throw e
+        }
+        let out = self.encoder.out
+        if out.len() == 0 {
+            return
+        }
+        let packed = out.to_bytes()
+        out.clear()
+        if self.to.write_all(packed) is Err(e) {
+            self.failed = e
+            throw e
+        }
+    }
+}
+
+func gzip_writer(anon to: Writer, level: int64 = 6) -> DeflateWriter {
+    let encoder = Encoder(data: kod_str_to_bytes(""), level: clamp_level(level))
+    gzip_head(encoder)
+    return DeflateWriter(:to, format: .Gzip, :encoder)
+}
+
+func zlib_writer(anon to: Writer, level: int64 = 6) -> DeflateWriter {
+    let encoder = Encoder(data: kod_str_to_bytes(""), level: clamp_level(level))
+    zlib_head(encoder)
+    return DeflateWriter(:to, format: .Zlib, :encoder)
+}
+
+func raw_writer(anon to: Writer, level: int64 = 6) -> DeflateWriter {
+    return DeflateWriter(:to, format: .Raw, encoder: Encoder(data: kod_str_to_bytes(""), level: clamp_level(level)))
 }

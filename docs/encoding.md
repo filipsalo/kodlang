@@ -73,6 +73,37 @@ whichever way is smallest: stored, with the standard codes, or with Huffman code
 made for its own data, so data that doesn't compress grows by only about 5 bytes
 every 16 KB.
 
+### Compressing piece by piece
+
+Data that is made a piece at a time, or is too long to hold, is compressed into a
+[`Writer`](io.md#reader-and-writer) as it is written:
+
+<!-- kod:
+import "posix"
+func rows() -> [str] {
+    return ["a", "b"]
+}
+-->
+```kod
+let out = try posix.create("rows.gz")
+let packed = deflate.gzip_writer(out)
+for row in rows() {
+    try packed.write_str(row)
+}
+try packed.finish()
+try out.close()
+```
+
+`gzip_writer(to: Writer, level: int64 = 6)`, `zlib_writer` and `raw_writer` give a
+`DeflateWriter`, itself a `Writer`. What is written goes to `to` as it is
+compressed, 64 KB at a time, and takes a megabyte of memory or less however long it
+is.
+
+| Method | Meaning |
+|---|---|
+| `flush() -> none or Error` | sends all that has been written, so that it can be decompressed, though the stream goes on; each costs a few bytes and some of the compression |
+| `finish() -> none or Error` | ends the stream, with its checksum; `to` isn't closed. Without it the data isn't whole. After it, writing is an `InvalidInput` error, and another does nothing |
+
 ## Decompression
 
 `stdlib/compress/inflate.kod` decompresses gzip, zlib and raw deflate data. It is

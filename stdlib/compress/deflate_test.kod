@@ -1,5 +1,7 @@
 import "compress/deflate"
 import "compress/inflate"
+import "strbuilder" { StrBuilder }
+import "stream" { IoError, MemReader, MemWriter }
 
 func numbered_lines() -> bytes {
     mut out = ""
@@ -106,4 +108,154 @@ test "headers" {
         assert z[0] == 0x78
         assert (z[0] * 256 + z[1]) % 31 == 0
     }
+}
+
+// Writes `input` to `w`, `step` bytes at a time, with a flush after every
+// `flush_each` writes (0 for none), and finishes it.
+func pour(anon w: deflate.DeflateWriter, anon input: bytes, step: int64, flush_each: int64) -> none {
+    mut at: int64 = 0
+    mut writes: int64 = 0
+    for at < len(input) {
+        mut end = at + step
+        if end > len(input) {
+            end = len(input)
+        }
+        must w.write_all(input[at..end])
+        at = end
+        writes += 1
+        if flush_each > 0 and writes % flush_each == 0 {
+            must w.flush()
+        }
+    }
+    must w.finish()
+}
+
+test "writers: every level and format reads back as the input, in pieces of any size" {
+    for input in inputs() {
+        for level in [0, 1, 3, 4, 6, 9] {
+            for step in [7, 1000, 70000] {
+                for flush_each in [0, 5] {
+                    if step == 7 and len(input) > 20000 {
+                        continue
+                    }
+                    let g = MemWriter(buf: StrBuilder())
+                    pour(deflate.gzip_writer(g, :level), input, :step, :flush_each)
+                    assert (must inflate.gunzip(g.to_bytes())) == input
+                    let z = MemWriter(buf: StrBuilder())
+                    pour(deflate.zlib_writer(z, :level), input, :step, :flush_each)
+                    assert (must inflate.inflate_zlib(z.to_bytes())) == input
+                    let r = MemWriter(buf: StrBuilder())
+                    pour(deflate.raw_writer(r, :level), input, :step, :flush_each)
+                    assert (must inflate.inflate_raw(r.to_bytes())) == input
+                }
+            }
+        }
+    }
+}
+
+// Text that repeats itself at distances around the window's and the buffer's.
+func long_text() -> bytes {
+    let out = StrBuilder()
+    let parts = [words(), noise(30000), numbered_lines(), noise(1000)]
+    mut x: int64 = 5
+    for out.len() < 1500000 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let part = parts[(x >> 16) % 4]
+        x = (x * 1103515245 + 12345) % 2147483648
+        let from = (x >> 8) % len(part)
+        out.append_bytes(part[from..len(part)])
+    }
+    return out.to_bytes()
+}
+
+test "writers: input far past the window, as small as compressed whole" {
+    let input = long_text()
+    for level in [1, 4, 6] {
+        for step in [1000, 65536, 2000000] {
+            let g = MemWriter(buf: StrBuilder())
+            let w = deflate.gzip_writer(g, :level)
+            pour(w, input, :step, flush_each: 0)
+            let packed = g.to_bytes()
+            assert (must inflate.gunzip(packed, max_output: 10000000)) == input
+            assert len(packed) <= len(deflate.gzip(input, :level)) * 101 / 100
+            // All it keeps of it.
+            assert len(w.encoder.data) < 400000
+        }
+    }
+    // As much as it can be packed.
+    let zeros = kod_bytes_from_array([0] * 3000000)
+    let g = MemWriter(buf: StrBuilder())
+    pour(deflate.gzip_writer(g), zeros, step: 100000, flush_each: 0)
+    assert (must inflate.gunzip(g.to_bytes())) == zeros
+    assert len(g.to_bytes()) < 6000
+}
+
+test "writers: what is flushed can be decompressed" {
+    for level in [0, 1, 4, 6, 9] {
+        let g = MemWriter(buf: StrBuilder())
+        let w = deflate.gzip_writer(g, :level)
+        mut want = ""
+        for i in 0..50 {
+            let event = f"event {i} of fifty\n"
+            must w.write_str(event)
+            want += event
+            let before = g.buf.len()
+            must w.flush()
+            assert g.buf.len() - before < 60
+            let r = inflate.gunzip_reader(MemReader(data: g.to_bytes(), pos: 0))
+            mut got = ""
+            for true {
+                let piece = r.read(1000)
+                if piece is Err(_) {
+                    break
+                }
+                got += kod_bytes_to_str(piece)
+            }
+            assert got == want
+        }
+        must w.flush()
+        must w.finish()
+        assert kod_bytes_to_str(must inflate.gunzip(g.to_bytes())) == want
+    }
+}
+
+test "writers: finish, and what comes after it" {
+    let g = MemWriter(buf: StrBuilder())
+    let w = deflate.gzip_writer(g)
+    must w.finish()
+    assert (must inflate.gunzip(g.to_bytes())) == kod_str_to_bytes("")
+    let size = g.buf.len()
+    must w.finish()
+    must w.flush()
+    assert g.buf.len() == size
+    if w.write_str("x") is Err(IoError(e)) {
+        assert e.kind == .InvalidInput
+    } else {
+        fail("wrote after the end")
+    }
+}
+
+type Broken = shared struct {
+    left: int64
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        if self.left <= 0 {
+            throw IoError(kind: .BrokenPipe, op: "write", errno: 32, detail: "broken")
+        }
+        self.left -= len(data)
+        return len(data)
+    }
+}
+
+test "writers: an error of what they write to" {
+    let w = deflate.gzip_writer(Broken(left: 50000), level: 1)
+    mut failed = false
+    for _i in 0..4 {
+        if w.write_all(noise(100000)) is Err(_) {
+            failed = true
+        }
+    }
+    assert failed
+    assert w.flush() is Err(_)
+    assert w.finish() is Err(_)
 }
