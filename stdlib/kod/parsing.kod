@@ -355,6 +355,13 @@ func string_body(anon raw: str) -> str {
 // `expect()` finds a token kind that doesn't match. Same field shape
 // as codegen.Diagnostic so callers can fold parser errors into the codegen's
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
+// What `(a, (b, _))` binds: a name, or a hidden one and the parts taken from it.
+type TupleNames = shared struct {
+    name: str
+    span: ast.Span
+    parts: [TupleNames]
+}
+
 // A block that gives a value: the statements before it, and the value.
 type ValueBlock = struct {
     pre: [int64]
@@ -381,6 +388,11 @@ type Guard = shared struct {
 }
 
 // The name a payload position binds when it holds pattern `pattern_id`.
+// The most elements a tuple has: builtins.kod declares a struct for each number of them.
+let MAX_TUPLE: int64 = 8
+// What the hidden name of the tuple a pattern takes apart begins with.
+let TUPLE_PATTERN: str = "__pattuple"
+
 func hidden_binding(anon pattern_id: int64) -> str {
     return f"__pat{pattern_id}"
 }
@@ -442,6 +454,8 @@ type Parser = shared struct {
     pattern_subs: [[ast.SubPattern]] = []
     match_arms: [ast.MatchArm]
     match_expr_arms: [ast.MatchExprArm]
+    // The statements that go after the one just parsed, in its place (see first_of).
+    more_stmts: [int64] = []
     // How many loops of the function being parsed are open.
     loops: int64 = 0
     // Where the last statement of the block parsed last begins, or -1.
@@ -645,6 +659,14 @@ type Parser = shared struct {
         let name = self.expect_identifier()
         self.binding_names += [name]
         return name
+    }
+
+    // A field's name, or a tuple element's number.
+    func expect_field(self) -> str {
+        if self.at(.IntegerLit) {
+            return self.advance().value
+        }
+        return self.expect_identifier()
     }
 
     func expect_identifier(self) -> str {
@@ -859,7 +881,10 @@ type Parser = shared struct {
         mut span: ast.Span = self.here()
         // A group: `(T)`, as in `(A | B)?` or `(func() -> int64) | str`.
         if self.try_consume(.OpenParen) {
-            let inner: int64 = self.parse_type_expr()
+            mut inner: int64 = self.parse_type_expr()
+            if self.at(.Comma) {
+                inner = self.parse_tuple_type(inner, :span)
+            }
             self.expect(.CloseParen)
             if self.try_consume(.Question) {
                 return self.alloc_type(ast.TypeExpr.Optional(:inner), :span)
@@ -961,6 +986,31 @@ type Parser = shared struct {
             return self.alloc_type(ast.TypeExpr.Optional(inner: others[0]), :span)
         }
         return self.alloc_type(ast.TypeExpr.Union(:members), :span)
+    }
+
+    // The rest of `(A, B)`, after its first type.
+    func parse_tuple_type(self, anon first: int64, span: ast.Span) -> int64 {
+        mut args = [first]
+        for self.try_consume(.Comma) {
+            if self.at(.CloseParen) {
+                break
+            }
+            args += [self.parse_type_expr()]
+        }
+        if not self.check_tuple_len(len(args), :span) {
+            return first
+        }
+        return self.alloc_type(ast.TypeExpr.Generic(name: f"_Tuple{len(args)}", :args), :span)
+    }
+
+    func check_tuple_len(self, anon n: int64, span: ast.Span) -> bool {
+        let at = lexing.Token(kind: .OpenParen, value: "", start: span.start, end: span.start + 1)
+        if n < 2 {
+            self.record_error("error: a tuple has at least two elements; `(x)` is just `x`", got: at)
+        } else if n > MAX_TUPLE {
+            self.record_error(f"error: a tuple has at most {MAX_TUPLE} elements; declare a struct for more", got: at)
+        }
+        return 2 <= n <= MAX_TUPLE
     }
 
     func parse_type_expr(self) -> int64 {
@@ -1117,6 +1167,27 @@ type Parser = shared struct {
         return pat
     }
 
+    // As parse_tuple_pattern, of an expression's elements.
+    func tuple_pattern(self, anon elements: [int64], span: ast.Span) -> int64 {
+        let whole = f"{TUPLE_PATTERN}{span.start}"
+        mut subs: [ast.SubPattern] = []
+        for e in elements {
+            mut sub = -1
+            if self.exprs[e] is .Ident(name) {
+                sub = self.field_binding(name, span: self.expr_spans[e])
+            } else {
+                sub = self.pattern_of_expr(e)
+            }
+            if sub < 0 {
+                return -1
+            }
+            subs += [ast.SubPattern(binding: whole, pattern: sub, field: f"{len(subs)}")]
+        }
+        let pat = self.alloc_pattern(ast.Pattern.BindPat(binding: whole))
+        self.pattern_subs[pat] = subs
+        return pat
+    }
+
     func pattern_of_expr(self, anon expr_id: int64) -> int64 {
         let none_bindings: [str] = []
         match self.exprs[expr_id] {
@@ -1139,6 +1210,10 @@ type Parser = shared struct {
                     if len(arg.label) > 0 {
                         return self.struct_pattern(callee, :args, :expr_id)
                     }
+                }
+                let elements = self.tuple_elements(expr_id)
+                if len(elements) > 0 {
+                    return self.tuple_pattern(elements, span: self.expr_spans[expr_id])
                 }
                 mut bindings: [str] = []
                 mut subs: [ast.SubPattern] = []
@@ -1541,6 +1616,9 @@ type Parser = shared struct {
         if self.try_consume(.KwNone) {
             return self.alloc_pattern(ast.Pattern.NonePat)
         }
+        if self.at(.OpenParen) {
+            return self.parse_tuple_pattern()
+        }
         // Some(binding)
         if self.at(.Identifier) and self.peek().value == "Some" {
             self.advance()
@@ -1656,6 +1734,32 @@ type Parser = shared struct {
         }
         self.expect(.CloseParen)
         return fields
+    }
+
+    // `(p, q)`: the whole tuple under a hidden name, and a sub-pattern for each element.
+    func parse_tuple_pattern(self) -> int64 {
+        let span = self.here()
+        self.advance()
+        let whole = f"{TUPLE_PATTERN}{span.start}"
+        mut subs: [ast.SubPattern] = []
+        for not self.at(.CloseParen) and not self.at(.EOF) {
+            mut sub = -1
+            if self.at(.Identifier) and self.peek_kind_at(1) != .OpenParen and self.peek_kind_at(1) != .Dot {
+                let name_span = self.here()
+                sub = self.field_binding(self.expect_identifier(), span: name_span)
+            } else {
+                sub = self.parse_pattern()
+            }
+            subs += [ast.SubPattern(binding: whole, pattern: sub, field: f"{len(subs)}")]
+            if not self.try_consume(.Comma) {
+                break
+            }
+        }
+        self.expect(.CloseParen)
+        self.check_tuple_len(len(subs), :span)
+        let pat = self.alloc_pattern(ast.Pattern.BindPat(binding: whole))
+        self.pattern_subs[pat] = subs
+        return pat
     }
 
     // What a field bound to `name` in a struct pattern is: `_` ignores it.
@@ -2117,7 +2221,13 @@ type Parser = shared struct {
         }
         // Parenthesized expression
         if self.try_consume(.OpenParen) {
+            if self.at(.EOL) and self.tuple_ahead() {
+                self.skip_newlines()
+            }
             let expr: int64 = self.parse_expr()
+            if self.at(.Comma) {
+                return self.parse_tuple(expr, :span)
+            }
             self.expect(.CloseParen)
             self.grouped += [expr]
             return expr
@@ -2161,6 +2271,65 @@ type Parser = shared struct {
         // Identifier
         mut name: str = self.expect_identifier()
         return self.alloc_expr(ast.Expr.Ident(:name), :span)
+    }
+
+    // Whether the `(` just passed opens a list with a comma of its own.
+    func tuple_ahead(self) -> bool {
+        mut depth = 0
+        mut i = self.pos
+        for i < len(self.tokens) {
+            match self.tokens[i].kind {
+                .OpenParen | .OpenBracket | .OpenCurly -> depth += 1
+                .CloseParen | .CloseBracket | .CloseCurly -> {
+                    if depth == 0 {
+                        return false
+                    }
+                    depth -= 1
+                }
+                .Comma -> {
+                    if depth == 0 {
+                        return true
+                    }
+                }
+                .EOF -> return false
+                else none
+            }
+            i += 1
+        }
+        return false
+    }
+
+    // The rest of `(a, b)`, after its first element: a call of `$tuple`.
+    func parse_tuple(self, anon first: int64, span: ast.Span) -> int64 {
+        mut args = [ast.CallArg(label: "", label_span: self.expr_spans[first], value: first)]
+        for self.try_consume(.Comma) {
+            self.skip_newlines()
+            if self.at(.CloseParen) {
+                break
+            }
+            let value = self.parse_expr()
+            args += [ast.CallArg(label: "", label_span: self.expr_spans[value], :value)]
+            if self.at(.EOL) {
+                self.skip_newlines()
+            }
+        }
+        self.expect(.CloseParen)
+        if not self.check_tuple_len(len(args), :span) {
+            return first
+        }
+        let callee = self.alloc_expr(ast.Expr.Ident(name: "$tuple"), :span)
+        return self.alloc_expr(ast.Expr.Call(:callee, :args), :span)
+    }
+
+    // The elements of the tuple literal `expr_id`, or none of them.
+    func tuple_elements(self, anon expr_id: int64) -> [int64] {
+        mut out: [int64] = []
+        if self.exprs[expr_id] is .Call(callee, args) and self.exprs[callee] is .Ident(name) and name == "$tuple" {
+            for arg in args {
+                out += [arg.value]
+            }
+        }
+        return out
     }
 
     func parse_match_expr(self, anon span: ast.Span) -> int64 {
@@ -2355,7 +2524,7 @@ type Parser = shared struct {
             if self.at(.OpenCurly) {
                 body = self.parse_block()
             } else {
-                body += [self.parse_stmt()]
+                body += self.parse_stmts()
             }
         }
         return self.alloc_match_arm(ast.MatchArm(pattern: pat, :body, :guard))
@@ -2589,7 +2758,7 @@ type Parser = shared struct {
             if self.at(.Dot) {
                 self.advance()
                 let field_span: ast.Span = self.here()
-                let field: str = self.expect_identifier()
+                let field: str = self.expect_field()
                 let rhs: int64 = self.alloc_expr(ast.Expr.Ident(name: field), span: field_span)
                 lhs = self.alloc_expr(ast.Expr.Binary(:lhs, op: ast.Op.Dot, :rhs), span: lhs_span)
             }
@@ -2680,7 +2849,7 @@ type Parser = shared struct {
                     // is none; otherwise the field/method runs on the
                     // unwrapped value and the result is wrapped as Some.
                     self.advance()
-                    let name: str = self.expect_identifier()
+                    let name: str = self.expect_field()
                     if self.at(.OpenParen) {
                         self.advance()
                         mut args: [ast.CallArg] = []
@@ -2930,6 +3099,8 @@ type Parser = shared struct {
             self.guard_arm = -1
             let stmt_id = self.parse_stmt()
             stmts += [stmt_id]
+            stmts += self.more_stmts
+            self.more_stmts = []
             self.expect_stmt_end(:stmt_id, :errors_before)
             if self.pos == start {
                 self.advance()
@@ -3081,11 +3252,250 @@ type Parser = shared struct {
         }
     }
 
+    // The names `(a, (b, _))` binds, from the `(` on.
+    func parse_tuple_names(self) -> TupleNames {
+        let span = self.here()
+        self.expect(.OpenParen)
+        mut parts: [TupleNames] = []
+        for not self.at(.CloseParen) and not self.at(.EOF) {
+            if self.at(.OpenParen) {
+                parts += [self.parse_tuple_names()]
+            } else {
+                let name_span = self.here()
+                parts += [TupleNames(name: self.binding_identifier(), span: name_span, parts: [])]
+            }
+            if not self.try_consume(.Comma) {
+                break
+            }
+        }
+        self.expect(.CloseParen)
+        self.check_tuple_len(len(parts), :span)
+        return TupleNames(name: f"__tuple{span.start}", :span, :parts)
+    }
+
+    // A name, or the names a tuple is taken apart into, where a `for` binds one.
+    func parse_for_names(self) -> TupleNames {
+        if self.at(.OpenParen) {
+            return self.parse_tuple_names()
+        }
+        let span = self.here()
+        return TupleNames(name: self.binding_identifier(), :span, parts: [])
+    }
+
+    // What a `for`'s body begins with, to take its variable apart.
+    func bind_for(self, anon names: TupleNames, span: ast.Span) -> [int64] {
+        if len(names.parts) == 0 {
+            return []
+        }
+        self.check_twice(names)
+        return self.bind_parts(names, :span, mutable: false)
+    }
+
+    // How many tokens the names at `offset` take, or 0 when none can be there.
+    func for_names_len(self, anon offset: int64) -> int64 {
+        if self.peek_kind_at(offset) == .Identifier {
+            return 1
+        }
+        if self.peek_kind_at(offset) != .OpenParen {
+            return 0
+        }
+        mut depth = 0
+        mut i = offset
+        for true {
+            match self.peek_kind_at(i) {
+                .OpenParen -> depth += 1
+                .CloseParen -> {
+                    depth -= 1
+                    if depth == 0 {
+                        return i + 1 - offset
+                    }
+                }
+                .Identifier | .Comma -> none
+                else return 0
+            }
+            i += 1
+        }
+        return 0
+    }
+
+    // `let (a, b) = value`, after the `let` or `mut`.
+    func parse_let_tuple(self, mutable: bool) -> int64 {
+        let names = self.parse_tuple_names()
+        mut typ = 0
+        if self.try_consume(.Colon) {
+            typ = self.parse_type_expr()
+        }
+        self.expect(.Equal)
+        let from = self.pos
+        let value = self.parse_expr()
+        let to = self.pos
+        self.skip_newlines()
+        self.check_twice(names)
+        let elements = self.tuple_elements(value)
+        if typ != 0 or len(elements) != len(names.parts) {
+            return self.first_of(self.bind_tuple(names, :value, :typ, :mutable))
+        }
+        // A tuple to be taken apart at once isn't made. An element that reads a name
+        // bound here before it means the one outside.
+        mut stmts: [int64] = []
+        mut values = elements
+        if self.mentions(self.names_of(names), :from, :to) {
+            values = []
+            for i, e in elements {
+                let held = f"{names.name}_{i}"
+                stmts += [self.alloc_stmt(ast.Stmt.Let(name: held, typ: 0, value: e, mutable: false))]
+                values += [self.alloc_expr(ast.Expr.Ident(name: held), span: self.expr_spans[e])]
+            }
+        }
+        for i, part in names.parts {
+            stmts += self.bind_tuple(part, value: values[i], typ: 0, :mutable)
+        }
+        return self.first_of(stmts)
+    }
+
+    // `let` statements that bind `names` to `value`, or what it holds.
+    func bind_tuple(self, anon names: TupleNames, value: int64, typ: int64, mutable: bool) -> [int64] {
+        if len(names.parts) == 0 {
+            return [self.alloc_stmt(ast.Stmt.Let(name: names.name, :typ, :value, mutable: mutable and names.name != "_"))]
+        }
+        mut stmts = [self.alloc_stmt(ast.Stmt.Let(name: names.name, :typ, :value, mutable: false))]
+        stmts += self.bind_parts(names, span: self.expr_spans[value], :mutable)
+        return stmts
+    }
+
+    // The `let`s of a tuple's parts, the tuple itself being in `names.name`.
+    func bind_parts(self, anon names: TupleNames, span: ast.Span, mutable: bool) -> [int64] {
+        mut stmts = [self.count_parts(names.name, len(names.parts), :span)]
+        for i, part in names.parts {
+            if part.name != "_" {
+                stmts += self.bind_tuple(part, value: self.tuple_part(names.name, i, :span), typ: 0, :mutable)
+            }
+        }
+        return stmts
+    }
+
+    // A statement that does nothing, and is an error unless `name` is a tuple of `n`.
+    func count_parts(self, anon name: str, anon n: int64, span: ast.Span) -> int64 {
+        let callee = self.alloc_expr(ast.Expr.Ident(name: f"$parts{n}"), :span)
+        let arg = ast.CallArg(label: "", label_span: span, value: self.alloc_expr(ast.Expr.Ident(:name), :span))
+        return self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.alloc_expr(ast.Expr.Call(:callee, args: [arg]), :span)))
+    }
+
+    // `name.i`
+    func tuple_part(self, anon name: str, anon i: int64, span: ast.Span) -> int64 {
+        let whole = self.alloc_expr(ast.Expr.Ident(:name), :span)
+        return self.alloc_expr(ast.Expr.Binary(lhs: whole, op: .Dot, rhs: self.alloc_expr(ast.Expr.Ident(name: f"{i}"), :span)), :span)
+    }
+
+    func names_of(self, anon names: TupleNames) -> [str] {
+        if len(names.parts) == 0 {
+            return [names.name]
+        }
+        mut out: [str] = []
+        for part in names.parts {
+            out += self.names_of(part)
+        }
+        return out
+    }
+
+    func check_twice(self, anon names: TupleNames) -> none {
+        mut seen: [str] = []
+        for name in self.names_of(names) {
+            if name != "_" and arrays.contains(seen, name) {
+                self.record_error(f"error: `{name}` is bound twice", got: lexing.Token(kind: .Identifier, value: name, start: names.span.start, end: names.span.start + 1))
+            }
+            seen += [name]
+        }
+    }
+
+    // Whether the tokens from `from` up to `to` have one of `names`, or text that may.
+    func mentions(self, anon names: [str], from: int64, to: int64) -> bool {
+        for i in from..to {
+            match self.tokens[i].kind {
+                .Identifier -> {
+                    if arrays.contains(names, self.tokens[i].value) {
+                        return true
+                    }
+                }
+                .FStringLit -> return true
+                else none
+            }
+        }
+        return false
+    }
+
+    // `(a, b) = rhs`: the right side is worked out before any of it is stored.
+    func assign_tuple(self, anon lhs: int64, anon rhs: int64, from: int64, to: int64) -> [int64] {
+        let targets = self.tuple_elements(lhs)
+        if len(targets) == 0 {
+            if self.exprs[lhs] is .Ident(name) and name == "_" {
+                return [self.alloc_stmt(ast.Stmt.Let(:name, typ: 0, value: rhs, mutable: false))]
+            }
+            return [self.alloc_stmt(ast.Stmt.Assign(:lhs, :rhs))]
+        }
+        let span = self.expr_spans[lhs]
+        let hidden = f"__tuple{span.start}"
+        mut stmts: [int64] = []
+        mut values: [int64] = []
+        let elements = self.tuple_elements(rhs)
+        if len(elements) == len(targets) {
+            for i, e in elements {
+                if self.reads_nothing(e) {
+                    values += [e]
+                    continue
+                }
+                let held = f"{hidden}_{i}"
+                stmts += [self.alloc_stmt(ast.Stmt.Let(name: held, typ: 0, value: e, mutable: false))]
+                values += [self.alloc_expr(ast.Expr.Ident(name: held), span: self.expr_spans[e])]
+            }
+        } else {
+            stmts += [self.alloc_stmt(ast.Stmt.Let(name: hidden, typ: 0, value: rhs, mutable: false)), self.count_parts(hidden, len(targets), :span)]
+            for i in 0..len(targets) {
+                values += [self.tuple_part(hidden, i, :span)]
+            }
+        }
+        for i, target in targets {
+            stmts += self.assign_tuple(target, values[i], from: 0, to: 0)
+        }
+        return stmts
+    }
+
+    // A value that stays what it is whatever is assigned, and may need to know where it
+    // goes: a literal, `none`, `[]` or `.Variant`.
+    func reads_nothing(self, anon expr_id: int64) -> bool {
+        match self.exprs[expr_id] {
+            .IntLit(_) | .StrLit(_) | .BoolLit(_) | .FloatLit(_) | .ImplicitVariant(_) | .NoneLit -> return true
+            .ArrayLit(elements) -> return len(elements) == 0
+            else return false
+        }
+    }
+
+    // The first of some statements in the place of one; the block takes the rest after it.
+    func first_of(self, anon stmts: [int64]) -> int64 {
+        if len(stmts) == 0 {
+            // After an error.
+            return self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.unreachable_value()))
+        }
+        self.more_stmts = stmts[1..]
+        return stmts[0]
+    }
+
+    // What a statement stands for: itself, and those that come with it.
+    func parse_stmts(self) -> [int64] {
+        let first = self.parse_stmt()
+        let all = [first] + self.more_stmts
+        self.more_stmts = []
+        return all
+    }
+
     func parse_stmt(self) -> int64 {
         self.skip_newlines()
 
         // let declaration (with optional refutable-pattern form)
         if self.try_consume(.KwLet) {
+            if self.at(.OpenParen) {
+                return self.parse_let_tuple(mutable: false)
+            }
             // `let .Pat(...) = expr else { ... }` — refutable destructure, as is
             // `let T(...) =`, `let Some(...) =` and `let E.V(...) =`.
             if self.at(.Dot) or (self.at(.Identifier) and (self.peek_kind_at(1) == .OpenParen or self.peek_kind_at(1) == .Dot)) {
@@ -3110,6 +3520,9 @@ type Parser = shared struct {
         // mut declaration — a mutable local binding. Irrefutable only
         // (`mut .Pat` is rejected: expect_identifier errors on the `.`).
         if self.try_consume(.KwMut) {
+            if self.at(.OpenParen) {
+                return self.parse_let_tuple(mutable: true)
+            }
             mut name: str = self.binding_identifier()
             mut typ: int64 = 0
             if self.try_consume(.Colon) {
@@ -3317,10 +3730,15 @@ type Parser = shared struct {
         // for (with foreach detection)
         if self.try_consume(.KwFor) {
             self.skip_newlines()
-            if self.at(.Identifier) and self.peek_kind_at(1) == .Comma and self.peek_kind_at(2) == .Identifier and self.peek_kind_at(3) == .KwIn {
-                let index: str = self.binding_identifier()
+            let first_len = self.for_names_len(0)
+            mut second_len = 0
+            if first_len > 0 and self.peek_kind_at(first_len) == .Comma {
+                second_len = self.for_names_len(first_len + 1)
+            }
+            if second_len > 0 and self.peek_kind_at(first_len + 1 + second_len) == .KwIn {
+                let index = self.parse_for_names()
                 self.expect(.Comma)
-                let name: str = self.binding_identifier()
+                let name = self.parse_for_names()
                 self.expect(.KwIn)
                 let iter: int64 = self.parse_expr()
                 if self.at(.DotDot) {
@@ -3328,11 +3746,13 @@ type Parser = shared struct {
                     self.advance()
                     self.parse_expr()
                 }
-                let body: [int64] = self.parse_loop_block()
-                return self.for_numbered(index, :name, :iter, :body)
+                let span = self.expr_spans[iter]
+                let body = self.bind_for(index, :span) + self.bind_for(name, :span) + self.parse_loop_block()
+                return self.for_numbered(index.name, name: name.name, :iter, :body)
             }
-            if self.at(.Identifier) and self.peek_kind_at(1) == .KwIn {
-                mut name: str = self.binding_identifier()
+            if first_len > 0 and self.peek_kind_at(first_len) == .KwIn {
+                let names = self.parse_for_names()
+                let name = names.name
                 self.expect(.KwIn)
                 let iter: int64 = self.parse_expr()
                 if self.try_consume(.DotDot) {
@@ -3340,7 +3760,7 @@ type Parser = shared struct {
                     let body: [int64] = self.parse_loop_block()
                     return self.for_range(name, start: iter, :stop, :body)
                 }
-                mut body: [int64] = self.parse_loop_block()
+                let body = self.bind_for(names, span: self.expr_spans[iter]) + self.parse_loop_block()
                 return self.alloc_stmt(ast.Stmt.ForEach(:name, :iter, :body))
             }
             let cond: int64 = self.parse_expr()
@@ -3413,8 +3833,13 @@ type Parser = shared struct {
         // Expression, assignment, or +=
         let expr: int64 = self.parse_expr()
         if self.try_consume(.Equal) {
+            let from = self.pos
             let rhs: int64 = self.parse_expr()
+            let to = self.pos
             self.skip_newlines()
+            if len(self.tuple_elements(expr)) > 0 {
+                return self.first_of(self.assign_tuple(expr, rhs, :from, :to))
+            }
             return self.alloc_stmt(ast.Stmt.Assign(lhs: expr, :rhs))
         }
         if self.try_consume(.PlusEqual) {
@@ -3859,6 +4284,12 @@ type Parser = shared struct {
                 self.expect(.OpenCurly)
                 self.skip_newlines()
                 mut fields: [ast.StructField] = self.parse_struct_fields()
+                if name.starts_with("_Tuple") and self.path.ends_with("stdlib/builtins.kod") {
+                    // `e0` is the element `p.0` names, which no field can be declared as.
+                    for i, f in fields {
+                        f.name = f"{i}"
+                    }
+                }
                 mut methods: [int64] = []
                 self.in_generic = len(type_params) > 0
                 for self.at(.KwFunc) {

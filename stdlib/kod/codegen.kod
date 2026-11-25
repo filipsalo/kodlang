@@ -1783,6 +1783,10 @@ type Codegen = shared struct {
     open_defaults: [str] = []
     // The structs whose fields odd_field is looking at.
     open_structs: [int64] = []
+    // The tuple each tuple literal, by its id and module, was built as last.
+    built_tuples: Map[str, int64] = Map[str, int64]()
+    // Where check_parts last found something other than a tuple.
+    bad_parts_at: int64 = -1
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
     cur_owner: int64 = -1
     // Frame slots an inlined call's arguments used, free for the next one.
@@ -1896,6 +1900,10 @@ type Codegen = shared struct {
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
         if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) or self.checking_default {
+            return
+        }
+        // A part of what isn't a tuple, as check_parts has said.
+        if self.p.expr_spans[expr_id].start == self.bad_parts_at {
             return
         }
         mut hint = "; add a type annotation"
@@ -2397,6 +2405,158 @@ type Codegen = shared struct {
         }
     }
 
+    // Whether the struct is a tuple: an instance of one of builtins' `_Tuple2` and so on.
+    func is_tuple(self, anon idx: int64) -> bool {
+        let template = self.structs[idx].template_idx
+        return template >= 0 and self.structs[template].name.starts_with("_Tuple") and self.structs[template].def_path == self.builtins_path
+    }
+
+    // The tuple of `kinds`, or -1.
+    func tuple_of(self, anon kinds: [TypeKind], span: ast.Span) -> int64 {
+        let template_idx = self.find_struct_idx(f"_Tuple{len(kinds)}")
+        if template_idx < 0 {
+            return -1
+        }
+        let idx = self.instantiate_struct(kinds, :template_idx, arg_spans: [span] * len(kinds), whole: span)
+        if idx == template_idx {
+            return -1
+        }
+        return idx
+    }
+
+    // The type of a tuple literal by itself.
+    func tuple_lit_kind(self, anon elements: [int64], span: ast.Span) -> TypeKind {
+        mut kinds: [TypeKind] = []
+        for e in elements {
+            let kind = self.infer_kind(e)
+            if self.kind_has_unknown(kind) or kind.is_void() or self.is_none_kind(kind) {
+                return .KUnknown
+            }
+            kinds += [kind]
+        }
+        let idx = self.tuple_of(kinds, :span)
+        if idx < 0 {
+            return .KUnknown
+        }
+        return .KStruct(:idx, type_args: [])
+    }
+
+    // The tuple that the literal `value_id` is built as where a `kind` goes, or -1.
+    func tuple_lit_for(self, anon value_id: int64, kind: TypeKind) -> int64 {
+        let .KStruct(idx, _args) = kind else { return -1 }
+        let n = len(self.p.tuple_elements(value_id))
+        if n == 0 or not self.is_tuple(idx) or len(self.structs[idx].fields) != n {
+            return -1
+        }
+        return idx
+    }
+
+    func compile_tuple(self, anon expr_id: int64, idx: int64) -> Val {
+        let span = self.p.expr_spans[expr_id]
+        let elements = self.p.tuple_elements(expr_id)
+        mut args: [ast.CallArg] = []
+        for i, e in elements {
+            args += [ast.CallArg(label: f"{i}", label_span: self.p.expr_spans[e], value: e)]
+        }
+        self.built_tuples[f"{expr_id} {self.p.path}"] = idx
+        return self.compile_struct_construct(args, struct_idx: idx, :span)
+    }
+
+    // A tuple literal where nothing says its type.
+    func compile_tuple_lit(self, anon expr_id: int64) -> Val {
+        let elements = self.p.tuple_elements(expr_id)
+        let span = self.p.expr_spans[expr_id]
+        if self.tuple_lit_kind(elements, :span) is .KStruct(idx, _args) {
+            return self.compile_tuple(expr_id, :idx)
+        }
+        for e in elements {
+            let kind = self.infer_kind(e)
+            self.compile_discard(e)
+            if kind.is_void() or self.is_none_kind(kind) or self.kind_has_unknown(kind) {
+                self.report_cannot_infer(e, what: "this element")
+            }
+        }
+        return .VImm(value: 0)
+    }
+
+    // `$parts2(x)`: that what is taken apart into two is a tuple of two.
+    func check_parts(self, anon value_id: int64, anon n: int64) -> none {
+        let kind = self.infer_kind(value_id)
+        if self.kind_has_unknown(kind) {
+            self.report_cannot_infer(value_id, what: "this value")
+            return
+        }
+        if kind is .KStruct(idx, _args) and self.is_tuple(idx) {
+            let has = len(self.structs[idx].fields)
+            if has != n {
+                self.report_error(f"error: `{self.kind_display(kind)}` has {has} elements, not {n}", span: self.p.expr_spans[value_id])
+            }
+            return
+        }
+        self.bad_parts_at = self.p.expr_spans[value_id].start
+        self.report_error(f"error: `{self.kind_display(kind)}` isn't a tuple, so it can't be taken apart", span: self.p.expr_spans[value_id])
+    }
+
+    // Whether `<` takes two values of `kind`, as the elements of a tuple.
+    func orderable_kind(self, anon kind: TypeKind) -> bool {
+        match kind {
+            .KInt64 | .KFloat64 | .KStr | .KBytes -> return true
+            .KStruct(idx, _args) -> {
+                if self.is_tuple(idx) {
+                    return self.unordered_element(idx) < 0
+                }
+                return self.structs[idx].method_idx.contains("op_lt") and self.equatable_kind(kind)
+            }
+            .KEnum(idx) -> return self.enum_method(idx, name: "op_lt") >= 0 and self.equatable_kind(kind)
+            else return false
+        }
+    }
+
+    // The first element of a tuple that `<` doesn't take, or -1.
+    func unordered_element(self, anon idx: int64) -> int64 {
+        for i, f in self.structs[idx].fields {
+            if not self.orderable_kind(f.kind) and not self.kind_has_unknown(f.kind) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    // What orders two tuples by `op`: a builtin's name, or "".
+    func tuple_order(self, anon op: ast.Op, anon lhs_kind: TypeKind, anon rhs_kind: TypeKind) -> str {
+        let .KStruct(idx, _args) = lhs_kind else { return "" }
+        if not self.is_tuple(idx) or not self.same_kind(lhs_kind, rhs_kind) or self.unordered_element(idx) >= 0 {
+            return ""
+        }
+        match op {
+            .Lt -> return "_tuple_lt"
+            .Gt -> return "_tuple_gt"
+            .Le -> return "_tuple_le"
+            .Ge -> return "_tuple_ge"
+            else return ""
+        }
+    }
+
+    // `a.0 < b.0 or (a.0 == b.0 and (...))`
+    func fields_lt_expr(self, anon idx: int64, anon a: int64, anon b: int64) -> int64 {
+        let span = self.p.expr_spans[a]
+        mut all = -1
+        mut i = len(self.structs[idx].fields) - 1
+        for i >= 0 {
+            let x = self.field_expr(a, name: f"{i}")
+            let y = self.field_expr(b, name: f"{i}")
+            let less = self.p.alloc_expr(.Binary(lhs: x, op: .Lt, rhs: y), :span)
+            if all < 0 {
+                all = less
+            } else {
+                let same = self.p.alloc_expr(.Binary(lhs: x, op: .Eq, rhs: y), :span)
+                all = self.p.alloc_expr(.Binary(lhs: less, op: .Or, rhs: self.p.alloc_expr(.Binary(lhs: same, op: .And, rhs: all), :span)), :span)
+            }
+            i -= 1
+        }
+        return all
+    }
+
     // Whether the struct is a value that its fields make: one that compares, hashes and
     // prints by them, where it has no method of its own. `Map` and `Set` hold more than that.
     func by_fields(self, anon idx: int64) -> bool {
@@ -2441,10 +2601,14 @@ type Codegen = shared struct {
     func odd_field_text(self, anon idx: int64, anon name: str) -> str {
         for f in self.structs[idx].fields {
             if f.name == name {
-                return f"`{name}`, a `{self.kind_display(f.kind)}`,"
+                mut what = f"field `{name}`"
+                if self.is_tuple(idx) {
+                    what = f"element {name}"
+                }
+                return f"{what}, a `{self.kind_display(f.kind)}`,"
             }
         }
-        return f"`{name}`"
+        return f"field `{name}`"
     }
 
     // What `==` doesn't compare, when that is structs of `idx`; "" when it does.
@@ -2463,7 +2627,11 @@ type Codegen = shared struct {
         if len(odd) == 0 {
             return ""
         }
-        return f"`{shown}` values, whose field {self.odd_field_text(idx, odd)} has no `==`; compare their other fields, or declare `op_eq` on `{shown}`"
+        let why = f"`{shown}` values, whose {self.odd_field_text(idx, odd)} has no `==`"
+        if self.is_tuple(idx) {
+            return why
+        }
+        return f"{why}; compare their other fields, or declare `op_eq` on `{shown}`"
     }
 
     // `a == b` and `a != b` on a struct that compares by its fields.
@@ -2495,6 +2663,7 @@ type Codegen = shared struct {
         match name {
             "_fields_eq" -> expr = self.fields_eq_expr(idx, a, args[1].value)
             "_fields_hash" -> expr = self.fields_hash_expr(idx, a)
+            "_fields_lt" -> expr = self.fields_lt_expr(idx, a, args[1].value)
             else expr = self.fields_str_expr(idx, a)
         }
         let val = self.compile_expr(expr)
@@ -2547,14 +2716,21 @@ type Codegen = shared struct {
 
     func fields_str_expr(self, anon idx: int64, anon a: int64) -> int64 {
         let span = self.p.expr_spans[a]
+        let tuple = self.is_tuple(idx)
         mut before = self.structs[self.struct_root(idx)].name + "("
+        if tuple {
+            before = "("
+        }
         mut all = -1
         for f in self.structs[idx].fields {
             mut callee = "$str"
             if f.kind is .KOptional(_inner) {
                 callee = "_opt_str"
             }
-            let text = self.p.alloc_expr(.StrLit(value: before + f.name + ": "), :span)
+            if not tuple {
+                before += f.name + ": "
+            }
+            let text = self.p.alloc_expr(.StrLit(value: before), :span)
             let shown = self.array_helper_call(callee, args: [self.field_expr(a, name: f.name)], :span)
             if all < 0 {
                 all = text
@@ -2762,7 +2938,7 @@ type Codegen = shared struct {
             }
             let odd = self.odd_field(idx, need: 1)
             if len(odd) > 0 {
-                return f"; its field {self.odd_field_text(idx, odd)} can't be hashed"
+                return f"; its {self.odd_field_text(idx, odd)} can't be hashed"
             }
         }
         return ""
@@ -6982,6 +7158,10 @@ type Codegen = shared struct {
         if self.has_field(field_name, :struct_idx) {
             return self.check_private(field_name, :struct_idx, :span)
         }
+        if self.is_tuple(struct_idx) {
+            self.report_error(f"error: `{self.struct_display_name(struct_idx)}` has no element `{field_name}`; its elements are `.0` to `.{len(self.structs[struct_idx].fields) - 1}`", :span)
+            return false
+        }
         mut field_names: [str] = []
         for f in self.structs[struct_idx].fields {
             field_names += [f.name]
@@ -6993,6 +7173,13 @@ type Codegen = shared struct {
 
     func report_field_on_non_struct(self, anon field_name: str, kind: TypeKind, span: ast.Span, optional_hint: str) -> none {
         if self.kind_has_unknown(kind) {
+            return
+        }
+        if len(field_name) > 0 and '0' <= field_name[0] <= '9' {
+            // check_parts may have said so.
+            if span.start != self.bad_parts_at {
+                self.report_error(f"error: `{self.kind_display(kind)}` isn't a tuple, so it has no element `{field_name}`{optional_hint}", :span)
+            }
             return
         }
         mut msg: str = f"error: cannot access field `{field_name}` on a value of type `{self.kind_display(kind)}`"
@@ -7075,6 +7262,13 @@ type Codegen = shared struct {
         let info = self.structs[idx]
         if info.template_idx < 0 {
             return self.shown_type_name(info.name, def_path: info.def_path)
+        }
+        if self.is_tuple(idx) {
+            mut shown: [str] = []
+            for arg in info.template_args {
+                shown += [self.kind_display(arg)]
+            }
+            return f"({", ".join(shown)})"
         }
         let template = self.structs[info.template_idx]
         return self.instance_display(self.shown_type_name(template.name, def_path: template.def_path), args: info.template_args)
@@ -7689,6 +7883,21 @@ type Codegen = shared struct {
             }
             return found
         }
+        if len(self.p.tuple_elements(value_id)) > 0 {
+            mut found = -1
+            for j, v in self.enums[enum_idx].variants {
+                if self.tuple_lit_for(value_id, kind: v.field_kinds[0]) >= 0 {
+                    if found >= 0 {
+                        found = -1
+                        break
+                    }
+                    found = j
+                }
+            }
+            if found >= 0 {
+                return found
+            }
+        }
         let actual = self.infer_kind(value_id)
         if actual is .KEnum(a_idx) and self.enums_compatible(enum_idx, :a_idx) {
             return -1
@@ -8245,6 +8454,14 @@ type Codegen = shared struct {
         match self.p.exprs[expr_id] {
             .NoneLit -> return true
             .ArrayLit(elements) -> return len(elements) == 0 or self.lacks_own_type(elements[0])
+            .Call(_callee, _args) -> {
+                for e in self.p.tuple_elements(expr_id) {
+                    if self.lacks_own_type(e) {
+                        return true
+                    }
+                }
+                return self.is_implicit_variant_value(expr_id)
+            }
             else return self.is_implicit_variant_value(expr_id)
         }
     }
@@ -10009,6 +10226,12 @@ type Codegen = shared struct {
             for i, name in self.pattern_binding_names(pattern) {
                 if name == sub.binding and i < len(kinds) {
                     mut holder = kinds[i]
+                    if name.starts_with(parsing.TUPLE_PATTERN) {
+                        if sub.field == "0" {
+                            self.check_tuple_pattern(holder, n: len(self.p.pattern_subs[pattern_id]), span: self.p.expr_spans[subject_id])
+                        }
+                        continue
+                    }
                     if holder is .KOptional(inner) {
                         holder = inner
                     }
@@ -10025,6 +10248,24 @@ type Codegen = shared struct {
                 }
             }
         }
+    }
+
+    func check_tuple_pattern(self, anon kind: TypeKind, n: int64, span: ast.Span) -> none {
+        if self.kind_has_unknown(kind) {
+            return
+        }
+        if kind is .KStruct(idx, _args) and self.is_tuple(idx) {
+            let has = len(self.structs[idx].fields)
+            if has != n {
+                self.report_error(f"error: `{self.kind_display(kind)}` has {has} elements, not {n}", :span)
+            }
+            return
+        }
+        mut hint = ""
+        if kind is .KOptional(_inner) {
+            hint = "; write `Some((...))` for the one it may hold"
+        }
+        self.report_error(f"error: `{self.kind_display(kind)}` isn't a tuple, so a tuple's pattern doesn't fit it{hint}", :span)
     }
 
     func field_names(self, anon struct_idx: int64) -> [str] {
@@ -10119,7 +10360,7 @@ type Codegen = shared struct {
                 self.emit_load(val, base: ptr, off: off)
                 self.pool.free_reg(ptr)
             }
-            if self.p.patterns[sub.pattern] is .BindPat(name) {
+            if self.p.patterns[sub.pattern] is .BindPat(name) and len(self.p.pattern_subs[sub.pattern]) == 0 {
                 self.update_var_kind(:name, :kind)
                 self.emit_str(self.find_var_offset(name), reg: val)
                 self.pool.free_reg(val)
@@ -11259,6 +11500,11 @@ type Codegen = shared struct {
             .Chain(exprs, ops) -> return self.compile_chain(:exprs, :ops)
             .Call(callee, args) -> {
                 let hold_mark = len(self.holds)
+                if len(self.p.tuple_elements(expr_id)) > 0 {
+                    let tuple = self.compile_tuple_lit(expr_id)
+                    self.release_holds(hold_mark)
+                    return self.rc_call_result(expr_id, :callee, val: tuple)
+                }
                 let val = self.compile_call(args, callee_id: callee)
                 self.release_holds(hold_mark)
                 self.report_unchecked_mut_args(args)
@@ -11325,14 +11571,31 @@ type Codegen = shared struct {
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
             .IsNot -> return self.compile_is(:lhs, :rhs, negate: true)
             else {
-                if op is .Eq or op is .Ne {
-                    let lhs_kind = self.infer_kind(lhs)
-                    if lhs_kind.is_array() {
-                        return self.compile_array_eq(lhs, :op, :rhs)
+                if self.is_comparison_op(op) {
+                    mut lhs = lhs
+                    mut lhs_kind = self.infer_kind(lhs)
+                    mut rhs_kind = self.infer_kind(rhs)
+                    // A tuple literal is built as what it's compared with.
+                    if self.tuple_lit_for(rhs, kind: lhs_kind) >= 0 {
+                        rhs_kind = lhs_kind
+                    } else if self.tuple_lit_for(lhs, kind: rhs_kind) >= 0 {
+                        lhs = self.stash_operand_as(lhs, kind: rhs_kind)
+                        lhs_kind = rhs_kind
                     }
-                    if lhs_kind is .KStruct(_idx, _args) and self.compares_by_fields(lhs_kind, self.infer_kind(rhs)) {
-                        return self.compile_struct_eq(lhs, :op, :rhs)
+                    if op is .Eq or op is .Ne {
+                        if lhs_kind.is_array() {
+                            return self.compile_array_eq(lhs, :op, :rhs)
+                        }
+                        if lhs_kind is .KStruct(_idx, _args) and self.compares_by_fields(lhs_kind, rhs_kind) {
+                            return self.compile_struct_eq(lhs, :op, :rhs)
+                        }
+                    } else {
+                        let order = self.tuple_order(op, lhs_kind, rhs_kind)
+                        if len(order) > 0 {
+                            return self.compile_expr(self.array_helper_call(order, args: [lhs, rhs], span: self.p.expr_spans[lhs]))
+                        }
                     }
+                    return self.compile_arith_cmp(lhs_id: lhs, :op, rhs_id: rhs)
                 }
                 return self.compile_arith_cmp(lhs_id: lhs, :op, rhs_id: rhs)
             }
@@ -12773,7 +13036,7 @@ type Codegen = shared struct {
                 note = f"; `{shown}` has no `to_str` method"
                 let odd = self.odd_field(idx, need: 2)
                 if self.by_fields(idx) and len(odd) > 0 {
-                    note += f", and its field {self.odd_field_text(idx, odd)} has no text"
+                    note += f", and its {self.odd_field_text(idx, odd)} has no text"
                 }
             }
             .KInterface(_idx) -> note = f"; `{shown}` doesn't declare `to_str`"
@@ -13103,6 +13366,7 @@ type Codegen = shared struct {
             .KEnum(_idx) -> return true
             .KInterface(_idx) -> return true
             .KOptional(_inner) -> return true
+            .KStruct(idx, _args) -> return self.is_tuple(idx)
             else return self.array_needs_conversion(kind)
         }
     }
@@ -13125,6 +13389,7 @@ type Codegen = shared struct {
             .KArrayInterface(_idx) -> return true
             .KArrayOptional(_inner) -> return true
             .KArrayArray(inner) -> return self.array_needs_conversion(inner)
+            .KArrayStruct(idx) -> return self.is_tuple(idx)
             else return false
         }
     }
@@ -13475,6 +13740,23 @@ type Codegen = shared struct {
                     return self.resolve_type(parsing.str_to_int(name[2..]))
                 }
                 return self.type_arg_name_kind(self.source_name(name), span: self.p.expr_spans[expr_id], :report)
+            }
+            .Call(_callee, _args) -> {
+                let elements = self.p.tuple_elements(expr_id)
+                if len(elements) > 0 {
+                    mut kinds: [TypeKind] = []
+                    for e in elements {
+                        match self.type_kind_of_expr(e, :report) {
+                            Some(k) -> kinds += [k]
+                            none -> return none
+                        }
+                    }
+                    let idx = self.tuple_of(kinds, span: self.p.expr_spans[expr_id])
+                    if idx >= 0 {
+                        return .KStruct(:idx, type_args: [])
+                    }
+                    return none
+                }
             }
             .ArrayLit(elements) -> {
                 if len(elements) == 1 {
@@ -14868,6 +15150,10 @@ type Codegen = shared struct {
                 // struct.to_str). Used by f-strings and any explicit cast.
                 if name == "$str" or (name == "str" and len(args) == 1 and builtin) {
                     return self.compile_as_str(args[0].value)
+                }
+                if name.starts_with("$parts") {
+                    self.check_parts(args[0].value, parsing.str_to_int(name[6..]))
+                    return .VImm(value: 0)
                 }
                 if name == "$fmt" {
                     return self.compile_format(args[0].value, spec_id: args[1].value)
@@ -16592,6 +16878,12 @@ type Codegen = shared struct {
                         if name == "$str" or name == "$fmt" or (name == "str" and self.is_builtin_call(key)) {
                             return .KStr
                         }
+                        if name == "$tuple" {
+                            return self.tuple_lit_kind(self.p.tuple_elements(expr_id), span: self.p.expr_spans[expr_id])
+                        }
+                        if name.starts_with("$parts") {
+                            return .KVoid
+                        }
                         if name == "hash" and self.is_builtin_call(key) {
                             return .KInt64
                         }
@@ -17409,6 +17701,27 @@ type Codegen = shared struct {
         if self.report_attempts > self.stmt_error_mark {
             return
         }
+        let tuple_idx = self.tuple_lit_for(value_id, kind: expected)
+        if tuple_idx >= 0 {
+            match self.built_tuples.get(f"{value_id} {self.p.path}") {
+                // Its elements were checked as it was built (compile_tuple).
+                Some(built) -> {
+                    if built == tuple_idx {
+                        return
+                    }
+                }
+                none -> {
+                    for i, e in self.p.tuple_elements(value_id) {
+                        self.check_value_kind(e, expected: self.structs[tuple_idx].fields[i].kind)
+                    }
+                    return
+                }
+            }
+            if not self.same_kind(self.infer_kind(value_id), expected) {
+                self.report_error(f"error: expected `{self.kind_display(slot)}`, got `{self.kind_display(self.infer_kind(value_id))}`", span: self.p.expr_spans[value_id])
+            }
+            return
+        }
         if self.is_ctor_for(value_id, kind: expected) {
             return
         }
@@ -17419,6 +17732,13 @@ type Codegen = shared struct {
         if self.wraps_into_optional(value_id, :expected) {
             self.check_value_as(value_id, expected: expected.optional_inner(), :slot)
             return
+        }
+        if expected is .KEnum(tuple_union) and self.enums[tuple_union].is_union and len(self.p.tuple_elements(value_id)) > 0 {
+            let vi = self.union_variant_for(value_id, enum_idx: tuple_union)
+            if vi >= 0 {
+                self.check_value_as(value_id, expected: self.enums[tuple_union].variants[vi].field_kinds[0], :slot)
+                return
+            }
         }
         if expected is .KEnum(array_union) and self.enums[array_union].is_union and self.p.exprs[value_id] is .ArrayLit(elements) and len(elements) == 0 {
             if self.union_variant_for(value_id, enum_idx: array_union) < 0 {
@@ -17502,6 +17822,9 @@ type Codegen = shared struct {
     func wraps_into_result(self, anon value_id: int64, expected: TypeKind) -> bool {
         if not self.is_result_kind(expected) or self.is_match_expr(value_id) or self.is_ctor_for(value_id, kind: expected) {
             return false
+        }
+        if len(self.p.tuple_elements(value_id)) > 0 {
+            return self.is_ctor_for(value_id, kind: self.result_inner_kind(expected))
         }
         if self.is_implicit_variant_value(value_id) {
             let inner = self.result_inner_kind(expected)
@@ -17623,6 +17946,10 @@ type Codegen = shared struct {
         if self.wraps_into_result(value_id, :expected) {
             return self.compile_ok_value(value_id, kind: expected)
         }
+        let tuple_idx = self.tuple_lit_for(value_id, kind: expected)
+        if tuple_idx >= 0 {
+            return self.load(self.compile_tuple(value_id, idx: tuple_idx))
+        }
         match expected {
             .KEnum(idx) -> {
                 if self.widens(self.infer_kind(value_id), into: expected) {
@@ -17692,6 +18019,12 @@ type Codegen = shared struct {
                 return self.maybe_box_for_iface(reg, :actual, expected: .KInterface(idx: iface_idx), span: self.p.expr_spans[value_id])
             }
             .KArrayEnum(elem_idx) -> return self.load(self.compile_typed_array_value(value_id, expected_elem: .KEnum(idx: elem_idx)))
+            .KArrayStruct(elem_idx) -> {
+                if self.is_tuple(elem_idx) {
+                    return self.load(self.compile_typed_array_value(value_id, expected_elem: .KStruct(idx: elem_idx, type_args: [])))
+                }
+                return self.load(self.compile_expr(value_id))
+            }
             .KArrayInterface(elem_idx) -> return self.load(self.compile_typed_array_value(value_id, expected_elem: .KInterface(idx: elem_idx)))
             .KArrayOptional(inner_kind) -> return self.load(self.compile_typed_array_value(value_id, expected_elem: .KOptional(inner: inner_kind)))
             .KArrayArray(inner) -> {
@@ -17738,8 +18071,12 @@ type Codegen = shared struct {
             }
             .KStruct(_idx, _struct_type_args) -> {
                 // A struct value is a pointer; storing it keeps reference semantics.
-                let val = self.compile_expr(value_id)
-                mut reg = self.load(val)
+                mut reg = ""
+                if self.tuple_lit_for(value_id, :kind) >= 0 {
+                    reg = self.compile_value_for_kind(value_id, expected: kind)
+                } else {
+                    reg = self.load(self.compile_expr(value_id))
+                }
                 self.emit_str(dest_off, :reg)
                 self.pool.free_reg(reg)
             }
@@ -17750,8 +18087,12 @@ type Codegen = shared struct {
                 self.pool.free_reg(reg)
             }
             .KArrayStruct(elem_idx) -> {
-                let val = self.compile_expr(value_id)
-                mut reg = self.load(val)
+                mut reg = ""
+                if self.is_tuple(elem_idx) {
+                    reg = self.load(self.compile_typed_array_value(value_id, expected_elem: .KStruct(idx: elem_idx, type_args: [])))
+                } else {
+                    reg = self.load(self.compile_expr(value_id))
+                }
                 self.emit_str(dest_off, :reg)
                 self.pool.free_reg(reg)
             }
@@ -17891,6 +18232,13 @@ type Codegen = shared struct {
                 return ""
             }
             name = "op_r" + name[3..]
+        }
+        if kind is .KStruct(tuple_idx, _tuple_args) and self.is_tuple(tuple_idx) {
+            let odd = self.unordered_element(tuple_idx)
+            if name == "op_lt" and odd >= 0 {
+                return f"; its element {odd}, a `{self.kind_display(self.structs[tuple_idx].fields[odd].kind)}`, has no `<`"
+            }
+            return ""
         }
         if kind is .KStruct(_idx, _args) {
             return f"; declare `{name}` on `{self.kind_display(kind)}` to use it"
@@ -18467,7 +18815,7 @@ type Codegen = shared struct {
                 return vi >= 0 and not self.ok_enum_takes(value_id, result_idx: idx, variant_idx: vi)
             }
             .KOptional(inner) -> return self.is_ctor_for(value_id, kind: inner)
-            else return false
+            else return self.tuple_lit_for(value_id, :kind) >= 0
         }
     }
 
