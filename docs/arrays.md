@@ -197,8 +197,8 @@ the same place in the other.
 [[1], [2, 3]] == [[1], [2, 3]]
 ```
 
-The elements must have an `==` of their own, so an array of structs without
-`op_eq`, interface values or functions doesn't compare (see
+The elements must have an `==` of their own, so an array of interface values,
+functions or `shared struct`s without `op_eq` doesn't compare (see
 [Operators](types.md)).
 
 ## As text
@@ -213,7 +213,7 @@ print([[1], []])             // [[1], []]
 ```
 
 A `str` element shows as its text, without quotes. The elements must have a
-text of their own: an array of structs without `to_str` can't be shown.
+text of their own: an array of functions can't be shown.
 
 ## Iterating
 

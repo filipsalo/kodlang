@@ -1756,6 +1756,8 @@ type Codegen = shared struct {
     checking_default: bool = false
     // The defaults being compiled, one inside the other.
     open_defaults: [str] = []
+    // The structs whose fields odd_field is looking at.
+    open_structs: [int64] = []
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
     cur_owner: int64 = -1
     // Frame slots an inlined call's arguments used, free for the next one.
@@ -2350,7 +2352,7 @@ type Codegen = shared struct {
             return f"arrays of `{shown}`, which has no `==`; compare their elements"
         }
         match kind {
-            .KStruct(_idx, _type_args) -> return "structs; compare their fields, or declare `op_eq`"
+            .KStruct(idx, _type_args) -> return self.no_struct_eq_note(idx)
             .KInterface(_idx) -> return "interface values"
             .KFunc(_params, _ret) -> return "function values"
             else return ""
@@ -2364,10 +2366,183 @@ type Codegen = shared struct {
         }
         match kind {
             .KInt64 | .KStr | .KBytes | .KBool | .KFloat64 -> return true
-            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx)
-            .KStruct(idx, _args) -> return self.structs[idx].method_idx.get("op_eq") is Some(_)
+            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0
+            .KStruct(idx, _args) -> return self.structs[idx].method_idx.contains("op_eq") or (self.by_fields(idx) and len(self.odd_field(idx, need: 0)) == 0)
             else return false
         }
+    }
+
+    // Whether the struct is a value that its fields make: one that compares, hashes and
+    // prints by them, where it has no method of its own. `Map` and `Set` hold more than that.
+    func by_fields(self, anon idx: int64) -> bool {
+        return not self.structs[idx].shared and len(self.hashed_arg_noun(self.structs[idx].template_idx)) == 0
+    }
+
+    // The first field by which the struct can't be compared (`need` 0), hashed (1) or
+    // shown (2), or "". A struct met again inside itself is as the rest of it is.
+    func odd_field(self, anon idx: int64, need: int64) -> str {
+        let open = 4 * idx + need
+        if arrays.contains(self.open_structs, open) {
+            return ""
+        }
+        self.open_structs += [open]
+        mut odd = ""
+        for f in self.structs[idx].fields {
+            mut kind = f.kind
+            if kind is .KOptional(inner) {
+                kind = inner
+            }
+            if self.kind_has_unknown(kind) {
+                continue
+            }
+            mut fine = not f.weak
+            if fine {
+                match need {
+                    0 -> fine = self.equatable_kind(kind)
+                    1 -> fine = self.is_hashable(kind)
+                    else fine = self.printable_kind(kind)
+                }
+            }
+            if not fine {
+                odd = f.name
+                break
+            }
+        }
+        self.open_structs = self.open_structs[..len(self.open_structs) - 1]
+        return odd
+    }
+
+    // `f`, a field, as messages name it.
+    func odd_field_text(self, anon idx: int64, anon name: str) -> str {
+        for f in self.structs[idx].fields {
+            if f.name == name {
+                return f"`{name}`, a `{self.kind_display(f.kind)}`,"
+            }
+        }
+        return f"`{name}`"
+    }
+
+    // What `==` doesn't compare, when that is structs of `idx`; "" when it does.
+    func no_struct_eq_note(self, anon idx: int64) -> str {
+        if self.structs[idx].method_idx.contains("op_eq") {
+            return ""
+        }
+        let shown = self.struct_display_name(idx)
+        if self.structs[idx].shared {
+            return f"`{shown}` values, as a `shared struct` has no `==`; compare their fields, or declare `op_eq`"
+        }
+        if not self.by_fields(idx) {
+            return f"`{shown}` values; compare what they hold"
+        }
+        let odd = self.odd_field(idx, need: 0)
+        if len(odd) == 0 {
+            return ""
+        }
+        return f"`{shown}` values, whose field {self.odd_field_text(idx, odd)} has no `==`; compare their other fields, or declare `op_eq` on `{shown}`"
+    }
+
+    // `a == b` and `a != b` on a struct that compares by its fields.
+    func compile_struct_eq(self, anon lhs: int64, op: ast.Op, rhs: int64) -> Val {
+        let span = self.p.expr_spans[lhs]
+        mut call = self.array_helper_call("_struct_eq", args: [lhs, rhs], :span)
+        if op is .Ne {
+            let no = self.p.alloc_expr(.BoolLit(value: false), :span)
+            call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: no), :span)
+        }
+        return self.compile_expr(call)
+    }
+
+    // Whether `lhs_kind == rhs_kind` is two values of a struct that compares by its fields.
+    func compares_by_fields(self, anon lhs_kind: TypeKind, anon rhs_kind: TypeKind) -> bool {
+        let .KStruct(idx, _args) = lhs_kind else { return false }
+        return not self.structs[idx].method_idx.contains("op_eq") and self.by_fields(idx) and self.same_kind(lhs_kind, rhs_kind) and len(self.odd_field(idx, need: 0)) == 0
+    }
+
+    // `_fields_eq(a, b)`, `_fields_hash(a)` and `_fields_str(a)`, which the builtins call
+    // for a struct that compares, hashes or prints by its fields: an expression of these.
+    func compile_fields(self, anon name: str, args: [ast.CallArg]) -> Val {
+        let a = args[0].value
+        let .KStruct(idx, _args) = self.infer_kind(a) else { return .VImm(value: 0) }
+        // The fields are the struct's own to see.
+        let saved_owner = self.cur_owner
+        self.cur_owner = idx
+        mut expr = -1
+        match name {
+            "_fields_eq" -> expr = self.fields_eq_expr(idx, a, args[1].value)
+            "_fields_hash" -> expr = self.fields_hash_expr(idx, a)
+            else expr = self.fields_str_expr(idx, a)
+        }
+        let val = self.compile_expr(expr)
+        self.cur_owner = saved_owner
+        return val
+    }
+
+    func field_expr(self, anon of: int64, name: str) -> int64 {
+        let span = self.p.expr_spans[of]
+        return self.p.alloc_expr(.Binary(lhs: of, op: .Dot, rhs: self.p.alloc_expr(.Ident(:name), :span)), :span)
+    }
+
+    func fields_eq_expr(self, anon idx: int64, anon a: int64, anon b: int64) -> int64 {
+        let span = self.p.expr_spans[a]
+        mut all = -1
+        for f in self.structs[idx].fields {
+            let x = self.field_expr(a, name: f.name)
+            let y = self.field_expr(b, name: f.name)
+            mut same = -1
+            if f.kind is .KOptional(_inner) {
+                same = self.array_helper_call("_opt_eq", args: [x, y], :span)
+            } else {
+                same = self.p.alloc_expr(.Binary(lhs: x, op: .Eq, rhs: y), :span)
+            }
+            if all < 0 {
+                all = same
+            } else {
+                all = self.p.alloc_expr(.Binary(lhs: all, op: .And, rhs: same), :span)
+            }
+        }
+        if all < 0 {
+            return self.p.alloc_expr(.BoolLit(value: true), :span)
+        }
+        return all
+    }
+
+    func fields_hash_expr(self, anon idx: int64, anon a: int64) -> int64 {
+        let span = self.p.expr_spans[a]
+        mut all = self.p.alloc_expr(.IntLit(value: 0), :span)
+        for f in self.structs[idx].fields {
+            mut callee = "hash"
+            if f.kind is .KOptional(_inner) {
+                callee = "_opt_hash"
+            }
+            let hashed = self.array_helper_call(callee, args: [self.field_expr(a, name: f.name)], :span)
+            all = self.array_helper_call("_mix", args: [all, hashed], :span)
+        }
+        return all
+    }
+
+    func fields_str_expr(self, anon idx: int64, anon a: int64) -> int64 {
+        let span = self.p.expr_spans[a]
+        mut before = self.structs[self.struct_root(idx)].name + "("
+        mut all = -1
+        for f in self.structs[idx].fields {
+            mut callee = "$str"
+            if f.kind is .KOptional(_inner) {
+                callee = "_opt_str"
+            }
+            let text = self.p.alloc_expr(.StrLit(value: before + f.name + ": "), :span)
+            let shown = self.array_helper_call(callee, args: [self.field_expr(a, name: f.name)], :span)
+            if all < 0 {
+                all = text
+            } else {
+                all = self.p.alloc_expr(.Binary(lhs: all, op: .Add, rhs: text), :span)
+            }
+            all = self.p.alloc_expr(.Binary(lhs: all, op: .Add, rhs: shown), :span)
+            before = ", "
+        }
+        if all < 0 {
+            return self.p.alloc_expr(.StrLit(value: before + ")"), :span)
+        }
+        return self.p.alloc_expr(.Binary(lhs: all, op: .Add, rhs: self.p.alloc_expr(.StrLit(value: ")"), :span)), :span)
     }
 
     // For a `Map` or `Set` instance, the first of its type arguments that has
@@ -2398,7 +2573,9 @@ type Codegen = shared struct {
         match kind {
             .KInt64 | .KStr | .KBytes | .KBool | .KFloat64 -> return true
             .KStruct(idx, _args) -> {
-                let .Some(mi) = self.structs[idx].method_idx.get("to_str") else { return false }
+                let .Some(mi) = self.structs[idx].method_idx.get("to_str") else {
+                    return self.by_fields(idx) and len(self.odd_field(idx, need: 2)) == 0
+                }
                 return self.is_to_str_sig(self.structs[idx].methods[mi].sig) and self.unprintable_arg(kind) is none
             }
             .KEnum(idx) -> {
@@ -2507,8 +2684,24 @@ type Codegen = shared struct {
                 }
                 return not self.enum_has_payload(idx)
             }
-            else return false
+            .KStruct(idx, _args) -> {
+                if not self.equatable_kind(kind) {
+                    return false
+                }
+                if self.hash_method(idx) {
+                    return true
+                }
+                return self.by_fields(idx) and not self.structs[idx].method_idx.contains("op_eq") and len(self.odd_field(idx, need: 1)) == 0
+            }
+            else return kind.is_array() and self.is_hashable(kind.array_elem())
         }
+    }
+
+    // Whether the struct declares `hash(self) -> int64`.
+    func hash_method(self, anon idx: int64) -> bool {
+        let .Some(mi) = self.structs[idx].method_idx.get("hash") else { return false }
+        let sig = self.structs[idx].methods[mi].sig
+        return len(sig.param_kinds) <= 1 and sig.return_kind is .KInt64
     }
 
     // The first member of the union `idx` that can't be hashed, as shown, or "".
@@ -2531,6 +2724,21 @@ type Codegen = shared struct {
         }
         if kind is .KEnum(_idx) {
             return "; some of its variants have payloads"
+        }
+        if kind is .KStruct(idx, _args) {
+            if len(self.hashed_arg_noun(self.structs[idx].template_idx)) > 0 {
+                return ""
+            }
+            if self.structs[idx].shared {
+                return "; a `shared struct` must declare `op_eq` and `hash`"
+            }
+            if self.structs[idx].method_idx.contains("op_eq") {
+                return "; it declares `op_eq`, so it must declare `func hash(self) -> int64` too"
+            }
+            let odd = self.odd_field(idx, need: 1)
+            if len(odd) > 0 {
+                return f"; its field {self.odd_field_text(idx, odd)} can't be hashed"
+            }
         }
         return ""
     }
@@ -2588,7 +2796,7 @@ type Codegen = shared struct {
                 }
                 i += 1
             }
-            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool`, enums without payloads or unions of those{suffix}", span: site)
+            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool`, enums without payloads, and arrays, structs and unions of those{suffix}", span: site)
         }
         let none_pending: [int64] = []
         self.pending_bad_keys = none_pending
@@ -7547,9 +7755,9 @@ type Codegen = shared struct {
 
     func member_has_eq(self, anon kind: TypeKind) -> bool {
         match kind {
-            .KStruct(idx, _args) -> return self.structs[idx].method_idx.contains("op_eq")
-            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0
-            else return len(self.equality_scalar(kind)) > 0
+            .KStruct(_idx, _args) -> return self.equatable_kind(kind)
+            .KEnum(_idx) -> return self.equatable_kind(kind)
+            else return (kind.is_array() and self.equatable_kind(kind)) or len(self.equality_scalar(kind)) > 0
         }
     }
 
@@ -8869,8 +9077,9 @@ type Codegen = shared struct {
         // `str(x)` of a `bytes` or a `str` is the same object.
         if self.p.exprs[callee] is .Ident(key) {
             let name = self.source_name(key)
-            // `$fmt` is a method call, which counts its own result.
-            if name == "str" or name == "$str" or name == "$fmt" {
+            // `$fmt` is a method call and `_fields_str` a concatenation, which count their
+            // own results.
+            if name == "str" or name == "$str" or name == "$fmt" or name == "_fields_str" {
                 return val
             }
         }
@@ -11063,8 +11272,14 @@ type Codegen = shared struct {
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
             .IsNot -> return self.compile_is(:lhs, :rhs, negate: true)
             else {
-                if (op is .Eq or op is .Ne) and self.infer_kind(lhs).is_array() {
-                    return self.compile_array_eq(lhs, :op, :rhs)
+                if op is .Eq or op is .Ne {
+                    let lhs_kind = self.infer_kind(lhs)
+                    if lhs_kind.is_array() {
+                        return self.compile_array_eq(lhs, :op, :rhs)
+                    }
+                    if lhs_kind is .KStruct(_idx, _args) and self.compares_by_fields(lhs_kind, self.infer_kind(rhs)) {
+                        return self.compile_struct_eq(lhs, :op, :rhs)
+                    }
                 }
                 return self.compile_arith_cmp(lhs_id: lhs, :op, rhs_id: rhs)
             }
@@ -12444,6 +12659,8 @@ type Codegen = shared struct {
                         self.rc_temp("x0")
                         return .VReg(name: "x0")
                     }
+                } else if self.printable_kind(k) {
+                    return self.compile_expr(self.array_helper_call("_struct_str", args: [expr_id], span: self.p.expr_spans[expr_id]))
                 }
             }
             .KInterface(iface_idx) -> {
@@ -12499,7 +12716,13 @@ type Codegen = shared struct {
                     note = self.unwrap_hint(expr_id)
                 }
             }
-            .KStruct(_idx, _type_args) -> note = f"; `{shown}` has no `to_str` method"
+            .KStruct(idx, _type_args) -> {
+                note = f"; `{shown}` has no `to_str` method"
+                let odd = self.odd_field(idx, need: 2)
+                if self.by_fields(idx) and len(odd) > 0 {
+                    note += f", and its field {self.odd_field_text(idx, odd)} has no text"
+                }
+            }
             .KInterface(_idx) -> note = f"; `{shown}` doesn't declare `to_str`"
             else none
         }
@@ -14570,6 +14793,9 @@ type Codegen = shared struct {
                 if name == "_take_at" and len(args) == 2 and self.p.path.ends_with("stdlib/builtins.kod") {
                     return self.compile_take_at(args[0].value, index_id: args[1].value)
                 }
+                if name.starts_with("_fields_") and self.p.path.ends_with("stdlib/builtins.kod") {
+                    return self.compile_fields(name, :args)
+                }
                 if name == "len" and len(args) == 1 and builtin {
                     let share = self.share_begin(args[0].value)
                     let val = self.compile_len(args[0].value)
@@ -14604,7 +14830,7 @@ type Codegen = shared struct {
                     if not self.is_hashable(arg_kind) {
                         self.compile_discard(args[0].value)
                         if not self.kind_has_unknown(arg_kind) and self.report_attempts == self.stmt_error_mark {
-                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool`, enums without payloads or unions of those", span: self.p.expr_spans[args[0].value])
+                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool`, enums without payloads, and arrays, structs and unions of those", span: self.p.expr_spans[args[0].value])
                         }
                         return .VImm(value: 0)
                     }
@@ -14613,6 +14839,15 @@ type Codegen = shared struct {
                         self.mov_to(val, dest: "x0")
                         self.emit_call("$primitives$str$hash")
                         return .VReg(name: "x0")
+                    }
+                    if arg_kind.is_array() {
+                        return self.compile_expr(self.array_helper_call("_array_hash", args: [args[0].value], span: self.p.expr_spans[args[0].value]))
+                    }
+                    if arg_kind is .KStruct(hashed_idx, _type_args) {
+                        if self.hash_method(hashed_idx) {
+                            return self.compile_expr(self.method_call_expr(args[0].value, method: "hash"))
+                        }
+                        return self.compile_expr(self.array_helper_call("_struct_hash", args: [args[0].value], span: self.p.expr_spans[args[0].value]))
                     }
                     if arg_kind is .KEnum(union_idx) and self.enums[union_idx].is_union {
                         return self.compile_expr(self.union_hash(args[0].value, union_idx: union_idx))

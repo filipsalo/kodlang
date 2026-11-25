@@ -457,6 +457,45 @@ instances.
 
 The built-in `Map[K, V]` is the canonical example.
 
+## Structs are values
+
+A plain `struct` compares, prints and hashes by its fields, with nothing declared:
+
+```kod
+type Place = struct {
+    x: int64
+    y: int64
+    name: str? = none
+}
+
+let a = Place(x: 1, y: 2)
+assert a == Place(x: 1, y: 2) and a != Place(x: 1, y: 2, name: "home")
+print(a)                                // Place(x: 1, y: 2, name: none)
+
+mut steps = Map[Place, int64]()         // a key of a Map, an element of a Set
+steps[a, default: 0] += 1
+assert (steps[Place(x: 1, y: 2)]? or 0) == 1
+```
+
+- **`==` and `!=`** compare two values of the same struct: they are equal when each
+  field of one is `==` to the other's. Two optional fields are equal when both are
+  `none` or what they hold is. A struct with a field that has no `==` (a function, an
+  interface value, an enum with payloads, a `Map`) has none either, which the error
+  names.
+- **As text**, in an f-string, `str(x)` or `print(x)`, it is its name and its fields,
+  each as an f-string shows it, with `none` for an optional that holds nothing. Every
+  field must have a text.
+- **`hash(x)`**, and so a place as a `Map`'s key or a `Set`'s element, needs fields that
+  can all be [hashed](builtins.md#hashing), or optionals of such. A `float64` can't.
+
+All fields count, private ones too. A method of the struct's own comes first: `op_eq`
+for `==` (see [Operators](#operators)), `func to_str(self) -> str` for its text, and
+`func hash(self) -> int64` for its hash. A struct that declares `op_eq` must declare
+`hash` to be hashed, as equal values must have the same hash.
+
+A `shared struct` is one object rather than a value, so it has none of these but by
+such methods, nor do `Map` and `Set` have `==` or a hash.
+
 ## Operators
 
 A struct gives the arithmetic and comparison operators a meaning by declaring
@@ -530,8 +569,8 @@ comparison.
 A method that implements an operator takes `self` and one more parameter, and
 the comparison methods return `bool`; otherwise it is an error where the
 operator is used. A struct that doesn't declare the method still can't use the
-operator, so `a + b` on a plain struct is the same error as before, and
-`a == b` still tells you to compare the fields. A prefix minus is `0 - x`,
+operator, so `a + b` on one without `op_add` is an error; only `==` and `!=` need no
+method, on a plain struct (see [above](#structs-are-values)). A prefix minus is `0 - x`,
 so `-price` calls `op_rsub` with `0`. `not`, `and`, `or` and `is` are never
 overloaded.
 

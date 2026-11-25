@@ -310,7 +310,7 @@ and of the same type:
 | `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `float64`, two `str` or two `bytes` | `bool` |
-| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum, an enum value and a unit variant, an optional and `none`, or a [union](#union-types) and a value that goes into it | `bool` |
+| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum or of a plain struct, an enum value and a unit variant, two arrays of one type, an optional and `none`, or a [union](#union-types) and a value that goes into it | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
@@ -324,10 +324,11 @@ as in `xs[i]`, `s[i]` and `xs[i] = v`, and the bounds of a slice must be
 index; unwrap it first.
 
 `==` and `!=` compare `str` and `bytes` by content, enums by variant (see
-[Equality](enums.md#equality)) and arrays by their elements (see
-[Comparing](arrays.md#comparing)). Nothing else has an `==`: comparing two
-structs, interface values or function values is an error, so compare a
-struct's fields instead, or declare `op_eq` on it.
+[Equality](enums.md#equality)), arrays by their elements (see
+[Comparing](arrays.md#comparing)) and plain structs by their fields (see
+[Structs are values](structs.md#structs-are-values)). Nothing else has an `==`:
+comparing two interface values, function values or `shared struct`s without an `op_eq`
+is an error.
 Comparing values of two different types, like an `int64` with a `str` or
 values of two different enums, is an error too.
 
@@ -714,10 +715,10 @@ A union prints as the member it holds, with `print(x)`, `f"{x}"` or `str(x)`,
 when every member can be printed. `==` and `!=` compare two unions, or a union
 and a value that goes into it (`x == 3`, `x == "a"`, `x == .Red`): they're equal
 when they hold the same member and those members are `==`. Every member needs a
-`==` of its own, so a union with a struct member that doesn't declare `op_eq`,
-or an array member, can't be compared. A union widens for `==` as it does
+`==` of its own, so a union with a function or a `shared struct` without `op_eq` as a
+member can't be compared. A union widens for `==` as it does
 elsewhere, so an `A | B` compares with an `A | B | C`. A union whose members can
-all be hashed (`int64`, `str`, `bytes`, `bool`, enums without payloads) can be
+all be [hashed](builtins.md#hashing) can be
 hashed and be a `Map` key: `Map[int64 | str, V]` (see [`hash`](builtins.md)).
 Otherwise a union has no fields, methods or operators of its own.
 

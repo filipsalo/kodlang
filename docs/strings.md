@@ -77,7 +77,10 @@ What can be interpolated:
 
 - `str`, and `bytes` as-is
 - `int64` and `bool`
-- a struct that declares `func to_str(self) -> str`
+- a struct, by its `func to_str(self) -> str` if it declares one; otherwise a plain
+  `struct` as its name and fields, `Point(x: 1, y: 2)` (see
+  [Structs are values](structs.md#structs-are-values))
+- an array, as its elements in brackets (see [As text](arrays.md#as-text))
 - a value of an interface that declares the same `to_str`, such as
   `Stringable` or `Error`; the call goes to the concrete type's `to_str`
 - an enum, by its `func to_str(self) -> str` if it declares one, and
@@ -86,10 +89,9 @@ What can be interpolated:
 
 `print(x)` takes the same values as `{x}` does.
 
-Anything else is a compile error for now: an optional (`T?`), an
-array, a function value, and a struct or interface without a
-`func to_str(self) -> str`, including one whose `to_str` takes arguments
-or returns something else.
+Anything else is a compile error: an optional (`T?`), a function value, and a
+`shared struct` or interface without a `func to_str(self) -> str`, including one whose
+`to_str` takes arguments or returns something else.
 Unwrap an optional first, e.g. `f"{n? or 0}"`.
 
 The braces hold one expression, which may be followed by a format spec.
@@ -390,7 +392,7 @@ let t: str = true.to_str()         // "true"
 let u: str = "hi".to_str()         // identity
 ```
 
-Structs can opt in by declaring `func to_str(self) -> str`. F-string interpolation calls `to_str` automatically.
+A struct can have its own by declaring `func to_str(self) -> str`. F-string interpolation calls `to_str` automatically.
 `str(x)` converts the same values an f-string interpolates, and rejects the
 same ones.
 
