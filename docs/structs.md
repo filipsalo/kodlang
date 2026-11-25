@@ -118,7 +118,8 @@ default must have its field's type, which is checked where it is declared,
 so `count: int64 = "x"` is an error even if no construction omits `count`.
 Anything else wrong in it, such as an unknown name or variant, is reported
 where a construction omits the field, and a generic struct's default is
-checked only at each construction that omits it.
+checked only at each construction that omits it. A default that builds its own
+struct without giving the field needs itself, and is an error.
 
 This is what lets the built-in `Map[K, V]` be created with no arguments —
 all three of its fields default to `[]`:
