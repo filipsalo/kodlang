@@ -235,6 +235,8 @@ __attribute__((noreturn)) static void kod_panic_text(const char *msg, size_t len
         kod_unwind(to, fp);
     }
     kod_err_keep = 0;
+    // No other task runs while it is printed.
+    kod_no_preempt = 1;
     // Stdout is flushed first, so what the program printed comes out before
     // the message when both end up in one pipe or log.
     fflush(stdout);
