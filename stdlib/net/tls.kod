@@ -6,7 +6,7 @@ import "encoding/base64"
 import "libc"
 import "net/tcp"
 import "posix" { Fd, open_read }
-import "stream" { IoError, os_error }
+import "stream" { IoError }
 import "time" { Duration }
 import "unsafe"
 
@@ -255,7 +255,8 @@ func check_trust(anon ctx: int64, anchors: int64, op: str) -> none or Error {
 }
 
 type TlsStream = shared struct {
-    fd: int64
+    // The connection, which is the stream's to close.
+    conn: Fd
     // The SSLContext, and the memory its callbacks share with it.
     ctx: int64
     link: int64
@@ -271,7 +272,7 @@ type TlsStream = shared struct {
 
     // Waits for more ciphertext.
     func fill(self, op: str) -> none or Error {
-        let got = Fd(fd: self.fd).read(READ_MAX)
+        let got = self.conn.read(READ_MAX)
         // Closed, and its memory freed, while this task waited.
         if not self.open {
             throw closed(op)
@@ -304,7 +305,7 @@ type TlsStream = shared struct {
             let data = unsafe.copy_out(unsafe.load64(self.link + LINK_OUT), unsafe.load64(self.link + LINK_OUT_LEN))
             unsafe.store64(self.link + LINK_OUT_LEN, 0)
             self.flushing = true
-            let sent = Fd(fd: self.fd).write_all(data)
+            let sent = self.conn.write_all(data)
             self.flushing = false
             if not self.open {
                 throw closed(op)
@@ -453,11 +454,11 @@ type TlsStream = shared struct {
         SSLGetBufferedReadSize(self.ctx, size)
         let buffered = unsafe.load64(size)
         unsafe.free(size)
-        return buffered == 0 and tcp.is_idle(Fd(fd: self.fd))
+        return buffered == 0 and tcp.is_idle(self.conn)
     }
 
     func set_timeout(self, timeout: Duration) -> none or Error {
-        try tcp.set_timeout(Fd(fd: self.fd), timeout: timeout)
+        try tcp.set_timeout(self.conn, :timeout)
     }
 
     // Send the close notice, as far as that doesn't have to wait.
@@ -465,10 +466,15 @@ type TlsStream = shared struct {
         SSLClose(self.ctx)
         let n = unsafe.load64(self.link + LINK_OUT_LEN)
         if n > 0 and not self.flushing {
-            let flags = libc.fcntl(self.fd, F_GETFL, 0)
-            libc.fcntl(self.fd, F_SETFL, flags | O_NONBLOCK)
-            libc.write(self.fd, unsafe.load64(self.link + LINK_OUT), n)
-            libc.fcntl(self.fd, F_SETFL, flags)
+            let fd = self.conn.fd
+            if self.conn.nonblocking {
+                libc.write(fd, unsafe.load64(self.link + LINK_OUT), n)
+            } else {
+                let flags = libc.fcntl(fd, F_GETFL, 0)
+                libc.fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+                libc.write(fd, unsafe.load64(self.link + LINK_OUT), n)
+                libc.fcntl(fd, F_SETFL, flags)
+            }
             unsafe.store64(self.link + LINK_OUT_LEN, 0)
         }
     }
@@ -481,10 +487,7 @@ type TlsStream = shared struct {
         self.open = false
         self.end()
         self.free_session()
-        kod_closing(self.fd)
-        if unsafe.c_int(libc.close(self.fd)) < 0 {
-            throw os_error("close", errno: unsafe.errno())
-        }
+        try self.conn.close()
     }
 
     func free_session(self) -> none {
@@ -497,8 +500,8 @@ type TlsStream = shared struct {
 }
 
 // A stream on `fd`, before its handshake, and the status of setting it up.
-func new_stream(anon fd: int64, side: int64) -> TlsStream {
-    return TlsStream(:fd, ctx: SSLCreateContext(0, side, STREAM_TYPE), link: unsafe.alloc(LINK_SIZE))
+func new_stream(anon conn: Fd, side: int64) -> TlsStream {
+    return TlsStream(:conn, ctx: SSLCreateContext(0, side, STREAM_TYPE), link: unsafe.alloc(LINK_SIZE))
 }
 
 // What both sides set up: an OSStatus.
@@ -544,7 +547,7 @@ func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duratio
         }
         anchors = loaded
     }
-    let s = new_stream(conn.fd, side: CLIENT_SIDE)
+    let s = new_stream(conn, side: CLIENT_SIDE)
     let shaken = handshake(s, :host, :anchors, :op)
     if anchors != 0 {
         CFRelease(anchors)
@@ -836,10 +839,10 @@ func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op:
     return Identity(certs: array)
 }
 
-// The server's handshake on an accepted connection.
+// The server's handshake on an accepted connection, which is the stream's from then on.
 func accept(anon fd: Fd, anon identity: Identity) -> TlsStream or Error {
     let op = "tls accept"
-    let s = new_stream(fd.fd, side: SERVER_SIDE)
+    let s = new_stream(fd, side: SERVER_SIDE)
     let shaken = shake_as_server(s, identity, :op)
     if shaken is Err(e) {
         s.open = false

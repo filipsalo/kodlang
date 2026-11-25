@@ -268,8 +268,8 @@ test "keys that are cut short or changed are refused, not trusted" {
     }
 }
 
-func echo_once(anon l: tcp.Listener, anon identity: Identity) -> str {
-    let got = accept(must l.accept(), identity)
+func echo_once(anon l: tcp.Listener, anon identity: Identity, nonblocking: bool = false) -> str {
+    let got = accept(must l.accept(:nonblocking), identity)
     if got is Err(e) {
         return e.to_str()
     }
@@ -298,19 +298,47 @@ test "accept and connect, reading and writing at the same time" {
     make_certificate()
     let identity = must load_identity(cert_path(), key_path())
     let l = must tcp.listen("127.0.0.1", port: 0)
-    let serving = spawn echo_once(l, identity)
-    let c = must connect("localhost", port: l.port(), trust_file: cert_path())
     mut piece = "0123456789"
     for len(piece) < 100000 {
         piece += piece
     }
-    let reading = spawn read_so_many(c, 30 * len(piece))
-    for _i in 0..30 {
-        must c.write_str(piece)
+    for nonblocking in [false, true] {
+        let serving = spawn echo_once(l, identity, :nonblocking)
+        let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+        let reading = spawn read_so_many(c, 30 * len(piece))
+        for _i in 0..30 {
+            must c.write_str(piece)
+        }
+        assert reading.wait() == 30 * len(piece)
+        must c.close()
+        assert serving.wait() == f"{30 * len(piece)}"
     }
-    assert reading.wait() == 30 * len(piece)
+    identity.close()
+    must l.close()
+}
+
+func accept_and_close(anon l: tcp.Listener, anon identity: Identity) -> str {
+    let conn = must l.accept(nonblocking: true)
+    let s = must accept(conn, identity)
+    must s.close()
+    // The connection was the stream's: its number may be another's now.
+    let again = conn.close()
+    if again is Err(e) {
+        return e.to_str()
+    }
+    return "closed twice"
+}
+
+test "a stream closes its connection, once" {
+    make_certificate()
+    let identity = must load_identity(cert_path(), key_path())
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let serving = spawn accept_and_close(l, identity)
+    let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+    assert len(must c.read(10)) == 0
     must c.close()
-    assert serving.wait() == f"{30 * len(piece)}"
+    assert c.close() is Err(_)
+    assert serving.wait() == "close: Bad file descriptor"
     identity.close()
     must l.close()
 }

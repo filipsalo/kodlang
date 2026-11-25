@@ -359,7 +359,7 @@ func main() -> none or Error {
 |----------|---------|
 | `load_identity(cert_file, key_file)` | a certificate and its private key, from PEM files; `Identity or Error`. `cert_file` holds the server's certificate first and then those it was signed by, up to the root (which can be left out); `key_file` an RSA or EC key that isn't encrypted (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`). They are kept in memory: no keychain is used |
 | `identity.close()` | frees it; connections made with it go on |
-| `accept(fd, identity)` | run the handshake as the server; `TlsStream or Error`. On an error `fd` is closed. How long it may take is `fd`'s `tcp.set_timeout` |
+| `accept(fd, identity)` | run the handshake as the server; `TlsStream or Error`. The connection is the stream's from then on, which closes it; on an error it is closed at once. How long the handshake may take is `fd`'s `tcp.set_timeout`, which a `nonblocking` one has not |
 
 A key that isn't the certificate's is a `Tls` error. Only TLS 1.2 with forward secrecy
 and authenticated encryption is spoken (ECDHE with AES-GCM or ChaCha20-Poly1305), which clients since about 2014
