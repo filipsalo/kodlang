@@ -56,11 +56,31 @@ static inline KodStr *kod_str_new(int64_t len) {
     return s;
 }
 
+// As memcpy, without a call for the short pieces most strings are.
+static inline void kod_copy(char *to, const char *from, int64_t n) {
+    if (n > 32) {
+        memcpy(to, from, (size_t)n);
+    } else if (n >= 16) {
+        memcpy(to, from, 16);
+        memcpy(to + n - 16, from + n - 16, 16);
+    } else if (n >= 8) {
+        memcpy(to, from, 8);
+        memcpy(to + n - 8, from + n - 8, 8);
+    } else if (n >= 4) {
+        memcpy(to, from, 4);
+        memcpy(to + n - 4, from + n - 4, 4);
+    } else if (n > 0) {
+        to[0] = from[0];
+        to[n >> 1] = from[n >> 1];
+        to[n - 1] = from[n - 1];
+    }
+}
+
 // A Kod `str` holding a copy of the `n` bytes at `p`, which may include NUL
 // bytes (unlike a copy made with strlen).
 static inline KodStr *kod_str_from_bytes(const char *p, int64_t n) {
     KodStr *s = kod_str_new(n);
-    memcpy(s->buf, p, (size_t)n);
+    kod_copy(s->buf, p, n);
     return s;
 }
 

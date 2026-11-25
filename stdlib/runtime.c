@@ -412,14 +412,14 @@ static int64_t clamp_slice(int64_t len, int64_t *start, int64_t end) {
 KodStr *kod_str_slice(KodStr *s, int64_t start, int64_t end) {
     int64_t len = clamp_slice(s->len, &start, end);
     KodStr *out = kod_str_alloc(len);
-    memcpy(out->buf, s->buf + start, len);
+    kod_copy(out->buf, s->buf + start, len);
     return out;
 }
 
 KodStr *kod_str_concat(KodStr *a, KodStr *b) {
     KodStr *out = kod_str_alloc(a->len + b->len);
-    memcpy(out->buf, a->buf, a->len);
-    memcpy(out->buf + a->len, b->buf, b->len);
+    kod_copy(out->buf, a->buf, a->len);
+    kod_copy(out->buf + a->len, b->buf, b->len);
     return out;
 }
 
@@ -475,7 +475,7 @@ void kod_sb_reserve_extra(int64_t handle, int64_t extra) {
 void kod_sb_append(int64_t handle, KodStr *s) {
     KodStrBuilder *sb = (KodStrBuilder *)handle;
     kod_sb_reserve(sb, s->len);
-    memcpy(sb->buf + sb->len, s->buf, (size_t)s->len);
+    kod_copy(sb->buf + sb->len, s->buf, s->len);
     sb->len += s->len;
 }
 
