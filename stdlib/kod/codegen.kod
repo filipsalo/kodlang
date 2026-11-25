@@ -1383,6 +1383,31 @@ func inline_stmt_size(anon p: parsing.Parser, anon id: int64) -> int64 {
     }
 }
 
+// Whether one of `stmts`, of those inline_stmt_size takes, binds `name`.
+func binds_name(anon p: parsing.Parser, anon stmts: [int64], anon name: str) -> bool {
+    for id in stmts {
+        match p.stmts[id] {
+            .Let(bound, _typ, _value, _mutable) -> {
+                if bound == name {
+                    return true
+                }
+            }
+            .If(_cond, then_body, else_body) -> {
+                if binds_name(p, then_body, name) or binds_name(p, else_body, name) {
+                    return true
+                }
+            }
+            .For(_cond, body) -> {
+                if binds_name(p, body, name) {
+                    return true
+                }
+            }
+            else none
+        }
+    }
+    return false
+}
+
 // `a + b`, or -1 if either is.
 func inline_size_sum(anon a: int64, anon b: int64) -> int64 {
     if a < 0 or b < 0 {
@@ -3086,7 +3111,7 @@ type Codegen = shared struct {
         mut recv_name = ""
         if owner >= 0 {
             let .Ident(name) = self.p.exprs[recv] else { return none }
-            if not self.inline_local(name) {
+            if not self.inline_local(name) or self.changes_later(name, :args, :slots, from: 0) {
                 return none
             }
             recv_name = name
@@ -3105,7 +3130,7 @@ type Codegen = shared struct {
         for i in 0..len(slots) {
             let arg = args[slots[i]].value
             let kind = sig.param_kinds[i + skip]
-            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) {
+            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) and not self.changes_later(name, :args, :slots, from: i + 1) {
                 offsets += [self.find_var_offset(name)]
             } else {
                 let reg = self.compile_into(arg, expected: kind)
@@ -3196,7 +3221,7 @@ type Codegen = shared struct {
         mut recv_name = ""
         if owner >= 0 {
             let .Ident(name) = self.p.exprs[recv] else { return none }
-            if not self.inline_local(name) {
+            if not self.inline_local(name) or self.changes_later(name, :args, :slots, from: 0) {
                 return none
             }
             recv_name = name
@@ -3213,6 +3238,9 @@ type Codegen = shared struct {
                 }
                 let .Ident(name) = self.p.exprs[args[slots[i]].value] else { return none }
                 if not self.inline_local(name) or not self.same_kind(self.find_var_kind(name), kind) {
+                    return none
+                }
+                if binds_name(sig.src_p, fd.body, fd.params[i + skip].name) or self.changes_later(name, :args, :slots, from: i + 1) {
                     return none
                 }
             }
@@ -3270,7 +3298,9 @@ type Codegen = shared struct {
         for i in 0..len(slots) {
             let arg = args[slots[i]].value
             let kind = sig.param_kinds[i + skip]
-            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) {
+            // Read where it is, unless the body binds the parameter's name again, which would
+            // be the same slot, or a later argument changes it.
+            if self.p.exprs[arg] is .Ident(name) and self.inline_local(name) and self.same_kind(self.find_var_kind(name), kind) and not binds_name(sig.src_p, fd.body, names[i + skip]) and not self.changes_later(name, :args, :slots, from: i + 1) {
                 offsets += [self.find_var_offset(name)]
             } else {
                 let reg = self.compile_into(arg, expected: kind)
@@ -3331,6 +3361,29 @@ type Codegen = shared struct {
         self.emit_ldr(ret_off, :reg)
         self.inline_free_slots += [ret_off]
         return .VReg(name: reg)
+    }
+
+    // Whether working out the arguments from `from` on may change the local `name`.
+    func changes_later(self, anon name: str, args: [ast.CallArg], slots: [int64], from: int64) -> bool {
+        if not self.find_var_mutable(name) {
+            return false
+        }
+        for k in from..len(slots) {
+            if slots[k] >= 0 and not self.leaves_locals(args[slots[k]].value) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Whether working out `expr_id` assigns no local: no call is in it, which could take
+    // one as `mut`, and no block.
+    func leaves_locals(self, anon expr_id: int64) -> bool {
+        match self.p.exprs[expr_id] {
+            .IntLit(_) | .BoolLit(_) | .StrLit(_) | .FloatLit(_) | .Ident(_) -> return true
+            .Binary(lhs, _op, rhs) -> return self.leaves_locals(lhs) and self.leaves_locals(rhs)
+            else return false
+        }
     }
 
     // A frame slot for an inlined call's argument or result.
