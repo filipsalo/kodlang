@@ -240,6 +240,7 @@ the negation of a `str`, an error whose hint suggests `(-n).to_str()`.
 
 Integer `/` rounds toward zero and `%` takes the sign of its left operand, so
 `-7 / 2` is `-3` and `-7 % 2` is `-1`, and `(a / b) * b + a % b` is always `a`.
+For a remainder that counts as a clock does, `(-7).mod(2)` is `1` (see `n.mod(m)` below).
 Dividing by zero, with `/` or `%`, panics:
 `panic: integer division by zero`, with a backtrace. The one quotient that
 doesn't fit, the smallest `int64` divided by `-1`, wraps around to the smallest
@@ -253,6 +254,7 @@ number, and so do the counting methods here. Each method is a few instructions a
 | `n.leading_zeros()` | how many zero bits are above the highest one bit; 64 for `0` |
 | `n.trailing_zeros()` | how many zero bits are below the lowest one bit; 64 for `0` |
 | `n.count_ones()` | how many bits are one; 64 for `-1` |
+| `n.mod(m)` | `n % m` moved into `0..m` (or `m..0` for a negative `m`): `(-1).mod(100)` is `99`, where `-1 % 100` is `-1`; panics for `m` 0 as `%` does |
 | `n.abs()` | `n` without its sign; the smallest `int64`, whose positive twin doesn't fit, gives itself |
 | `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n * m` is the bottom 64 |
 
