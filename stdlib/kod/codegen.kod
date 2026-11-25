@@ -1785,6 +1785,8 @@ type Codegen = shared struct {
     open_structs: [int64] = []
     // The tuple each tuple literal, by its id and module, was built as last.
     built_tuples: Map[str, int64] = Map[str, int64]()
+    // What the arrays of the comprehensions being compiled go to, by `$acc` and function.
+    acc_kinds: Map[str, TypeKind] = Map[str, TypeKind]()
     // Where check_parts last found something other than a tuple.
     bad_parts_at: int64 = -1
     // The struct whose method is being compiled, or -1: only its functions may use the field constructor of a struct that declares `init`.
@@ -1900,6 +1902,10 @@ type Codegen = shared struct {
     // Quiet for a cascade: an earlier error in the statement or a KUnknown variable.
     func report_cannot_infer(self, anon expr_id: int64, what: str, typed_slot: bool = false) -> none {
         if self.report_attempts > self.stmt_error_mark or self.unknown_var_root(expr_id) or self.checking_default {
+            return
+        }
+        // A comprehension's own array: whatever is around it has no type either.
+        if what.starts_with("`__comp") {
             return
         }
         // A part of what isn't a tuple, as check_parts has said.
@@ -9339,7 +9345,7 @@ type Codegen = shared struct {
             let name = self.source_name(key)
             // `$fmt` is a method call and `_fields_str` a concatenation, which count their
             // own results.
-            if name == "str" or name == "$str" or name == "$fmt" or name == "_fields_str" {
+            if name == "str" or name == "$str" or name == "$fmt" or name == "_fields_str" or name == "$moved" {
                 return val
             }
         }
@@ -11582,6 +11588,10 @@ type Codegen = shared struct {
                 return .VStrLbl(page: lbl)
             }
             .Ident(name) -> {
+                if name.starts_with("$acc") {
+                    let no_elements: [int64] = []
+                    return self.compile_array_lit_typed(no_elements, expected_elem: self.acc_kind(name).array_elem())
+                }
                 if self.const_signature(expr_id) is Some(const_sig) {
                     return self.read_const(expr_id, sig: const_sig)
                 }
@@ -12479,7 +12489,7 @@ type Codegen = shared struct {
     func is_rhs_binding(self, anon rhs: int64) -> str {
         if self.p.exprs[rhs] is .Call(_callee, args) {
             for arg in args {
-                if self.p.exprs[arg.value] is .Ident(name) and name[0] != '_' and not self.type_name_known(name) {
+                if self.p.exprs[arg.value] is .Ident(name) and len(name) > 0 and name[0] != '_' and not self.type_name_known(name) {
                     return name
                 }
             }
@@ -15386,6 +15396,9 @@ type Codegen = shared struct {
                 if name == "$str" or (name == "str" and len(args) == 1 and builtin) {
                     return self.compile_as_str(args[0].value)
                 }
+                if name == "$moved" {
+                    return self.compile_moved(args[0].value)
+                }
                 if name.starts_with("$parts") {
                     self.check_parts(args[0].value, parsing.str_to_int(name[6..]))
                     return .VImm(value: 0)
@@ -16667,6 +16680,9 @@ type Codegen = shared struct {
     }
 
     func compile_match_expr_for(self, anon arms: [int64], subject_id: int64, expected: TypeKind, ok_wrap: bool) -> Val {
+        if len(arms) > 0 and self.p.match_expr_arms[arms[0]].is_comp {
+            return self.compile_comprehension(arms[0], :expected, :ok_wrap)
+        }
         if len(arms) > 0 and self.p.match_expr_arms[arms[0]].is_if and self.p.patterns[self.p.match_expr_arms[arms[0]].pattern] is .BoolPat(_) {
             return self.compile_if_expr(arms, cond_id: subject_id, :expected, :ok_wrap)
         }
@@ -16829,6 +16845,112 @@ type Codegen = shared struct {
         self.emit_label(done_lbl)
         self.pool.free_reg(disc_r)
         return .VReg(name: result_r)
+    }
+
+    func compile_comprehension(self, anon arm_id: int64, expected: TypeKind, ok_wrap: bool) -> Val {
+        let arm = self.p.match_expr_arms[arm_id]
+        // The array is made as what it goes to, if that is one.
+        mut target = expected
+        if ok_wrap or self.is_result_kind(target) {
+            target = self.result_inner_kind(expected)
+        }
+        if target is .KOptional(inner) {
+            target = inner
+        }
+        if target.is_array() and self.p.stmts[arm.pre[0]] is .Let(_name, _typ, value, _mutable) and self.p.exprs[value] is .Ident(acc) {
+            self.acc_kinds[f"{acc} {self.ret_lbl}"] = target
+        }
+        let result_r = self.pool.alloc_reg()
+        let skip_lbl = self.fresh("Lcomp")
+        // What is wrong in it is the whole statement's error.
+        let error_mark = self.stmt_error_mark
+        self.compile_arm_value(arm, tests: ArmTests(subject_kind: .KBool, subject_id: arm.body, :skip_lbl), :expected, :ok_wrap, :result_r)
+        self.stmt_error_mark = error_mark
+        return .VReg(name: result_r)
+    }
+
+    // The type of the array a comprehension begins with, `$acc` and the statement that
+    // fills it: an array of what that appends.
+    func acc_kind(self, anon name: str) -> TypeKind {
+        if self.acc_kinds.get(f"{name} {self.ret_lbl}") is Some(kind) {
+            return kind
+        }
+        let mark = len(self.bound_log)
+        let kinds_mark = len(self.walk_slots)
+        mut saved: [TypeKind] = []
+        for v in self.vars {
+            saved += [v.kind]
+        }
+        let elem = self.appended_kind([parsing.str_to_int(name[4..])])
+        self.unbind_to(mark)
+        self.drop_walk_kinds(kinds_mark)
+        if not self.untyped_walk {
+            for i, kind in saved {
+                self.vars[i].kind = kind
+            }
+        }
+        if elem.is_void() or self.is_none_kind(elem) or self.kind_has_unknown(elem) {
+            return .KUnknown
+        }
+        return self.array_kind_of(elem)
+    }
+
+    // The type of what `stmts`, a comprehension's, append, with what they bind in force
+    // from then on; void when none of them appends.
+    func appended_kind(self, anon stmts: [int64]) -> TypeKind {
+        for id in stmts {
+            mut kind: TypeKind = .KVoid
+            match self.p.stmts[id] {
+                .ForEach(name, iter, body) -> kind = self.appended_by_loop(name, iter: iter, body: body)
+                .For(_cond, body) -> kind = self.appended_kind(body)
+                .If(_cond, then_body, _else_body) -> kind = self.appended_kind(then_body)
+                .MatchStmt(subject, arms) -> {
+                    let subject_kind = self.infer_kind(subject)
+                    for arm_id in arms {
+                        let arm = self.p.match_arms[arm_id]
+                        if len(arm.body) > 0 and kind.is_void() {
+                            self.retype_pattern_bindings(arm.pattern, :subject_kind)
+                            self.bind_pattern(arm.pattern)
+                            kind = self.appended_kind(arm.body)
+                        }
+                    }
+                }
+                .PlusAssign(_lhs, rhs) -> {
+                    if self.p.exprs[rhs] is .ArrayLit(elements) and len(elements) == 1 {
+                        return self.infer_kind(elements[0])
+                    }
+                }
+                else self.bind_stmt_names(id)
+            }
+            if not kind.is_void() {
+                return kind
+            }
+        }
+        return .KVoid
+    }
+
+    func appended_by_loop(self, anon name: str, iter: int64, body: [int64]) -> TypeKind {
+        let iter_kind = self.infer_kind(iter)
+        mut elem: TypeKind = .KUnknown
+        if iter_kind.is_array() {
+            elem = iter_kind.array_elem()
+        } else if iter_kind.is_str_or_bytes() {
+            elem = .KInt64
+        } else if iter_kind is .KStruct(idx, _args) and self.structs[idx].template_idx >= 0 {
+            let args = self.structs[idx].template_args
+            elem = args[0]
+            // `for k, v in m` is a numbered loop whose number is the key.
+            if self.hashed_arg_noun(self.structs[idx].template_idx) == "key" and len(body) >= 2 and self.p.stmts[body[0]] is .Let(key, _typ, value, _mutable) and self.p.exprs[value] is .Ident(counter) and counter.starts_with("__for_index_") {
+                self.update_var_kind(:name, kind: args[1])
+                self.bind_var(name)
+                self.update_var_kind(name: key, kind: args[0])
+                self.bind_var(key)
+                return self.appended_kind(body[2..])
+            }
+        }
+        self.update_var_kind(:name, kind: elem)
+        self.bind_var(name)
+        return self.appended_kind(body)
     }
 
     // An `if` used as a value, whose condition is a `bool`.
@@ -17061,6 +17183,9 @@ type Codegen = shared struct {
             .BytesLit(value) -> return .KBytes
             .NoneLit -> return .KOptional(inner: .KVoid)
             .Ident(name) -> {
+                if name.starts_with("$acc") {
+                    return self.acc_kind(name)
+                }
                 let i = self.var_index(name)
                 if i >= 0 and (not self.reads_scoped or self.vars[i].bound) {
                     return self.slot_kind(i)
@@ -17116,6 +17241,9 @@ type Codegen = shared struct {
                         let name = self.source_name(key)
                         if name == "$str" or name == "$fmt" or (name == "str" and self.is_builtin_call(key)) {
                             return .KStr
+                        }
+                        if name == "$moved" {
+                            return self.infer_kind(args[0].value)
                         }
                         if name == "$tuple" {
                             return self.tuple_lit_kind(self.p.tuple_elements(expr_id), span: self.p.expr_spans[expr_id])
@@ -22071,6 +22199,16 @@ type Codegen = shared struct {
         self.emit_label(end_lbl)
         self.release_temps(temps)
         self.end_loop()
+    }
+
+    // The value of the local `id`, which gives it up: whoever takes it is its only holder.
+    func compile_moved(self, anon id: int64) -> Val {
+        let .Ident(name) = self.p.exprs[id] else { return self.compile_expr(id) }
+        let off = self.find_var_offset(name)
+        self.emit_ldr(off, reg: "x0")
+        self.emit_str_raw(off, reg: "xzr")
+        self.rc_temp("x0")
+        return .VReg(name: "x0")
     }
 
     // The slots of what a condition computed since `mark`, which nothing reads

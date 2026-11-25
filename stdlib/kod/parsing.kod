@@ -355,6 +355,14 @@ func string_body(anon raw: str) -> str {
 // `expect()` finds a token kind that doesn't match. Same field shape
 // as codegen.Diagnostic so callers can fold parser errors into the codegen's
 // error list without re-formatting (see kodc.kod / tools/lsp.kod).
+// A `for` of a comprehension, or an `if`, which has a `cond`.
+type CompClause = struct {
+    names: [TupleNames] = []
+    iter: int64 = 0
+    stop: int64 = 0
+    cond: int64 = 0
+}
+
 // What `(a, (b, _))` binds: a name, or a hidden one and the parts taken from it.
 type TupleNames = shared struct {
     name: str
@@ -2209,8 +2217,12 @@ type Parser = shared struct {
             mut elements: [int64] = []
             self.skip_newlines()
             for self.peek_kind() != .CloseBracket and self.peek_kind() != .EOF {
+                let from = self.pos
                 elements += [self.parse_expr()]
                 self.skip_newlines()
+                if len(elements) == 1 and self.at(.KwFor) {
+                    return self.parse_comprehension(elements[0], :from, :span)
+                }
                 if not self.try_consume(.Comma) {
                     break
                 }
@@ -2271,6 +2283,91 @@ type Parser = shared struct {
         // Identifier
         mut name: str = self.expect_identifier()
         return self.alloc_expr(ast.Expr.Ident(:name), :span)
+    }
+
+    // The rest of `[elem for x in xs if cond]`, after `elem`, which begins at token `from`:
+    // the loops and tests as statements around an append to a hidden array. Its type is
+    // the elements', which codegen works out from the statement named in `$acc`.
+    func parse_comprehension(self, anon elem: int64, from: int64, span: ast.Span) -> int64 {
+        self.binding_exprs += 1
+        let to = self.pos
+        mut clauses: [CompClause] = []
+        for self.at(.KwFor) or self.at(.KwIf) {
+            let tok = self.advance()
+            self.skip_newlines()
+            if tok.kind == .KwIf {
+                clauses += [CompClause(cond: self.parse_expr())]
+                self.skip_newlines()
+                continue
+            }
+            let first_len = self.for_names_len(0)
+            mut second_len = 0
+            if first_len > 0 and self.peek_kind_at(first_len) == .Comma {
+                second_len = self.for_names_len(first_len + 1)
+            }
+            if first_len == 0 or not (self.peek_kind_at(first_len) == .KwIn or (second_len > 0 and self.peek_kind_at(first_len + 1 + second_len) == .KwIn)) {
+                self.record_error("error: a comprehension's `for` is as a loop's, `for x in xs`", got: tok)
+                break
+            }
+            mut names = [self.parse_for_names()]
+            if self.try_consume(.Comma) {
+                names += [self.parse_for_names()]
+            }
+            self.expect(.KwIn)
+            let iter = self.parse_expr()
+            mut stop = 0
+            if self.at(.DotDot) {
+                if len(names) == 2 {
+                    self.record_error("error: `for i, x in` numbers an array; a range is already numbers, so write `for x in a..b`", got: self.peek())
+                    names = [names[1]]
+                }
+                self.advance()
+                stop = self.parse_expr()
+            }
+            clauses += [CompClause(:names, :iter, :stop)]
+            self.skip_newlines()
+        }
+        self.expect(.CloseBracket)
+        let acc = f"__comp{len(self.exprs)}"
+        let target = self.alloc_expr(ast.Expr.Ident(name: acc), :span)
+        let item = self.alloc_expr(ast.Expr.ArrayLit(elements: [elem]), span: self.expr_spans[elem])
+        mut inner = [self.alloc_stmt(ast.Stmt.PlusAssign(lhs: target, rhs: item))]
+        mut k = len(clauses) - 1
+        for k >= 0 {
+            inner = [self.comp_clause(clauses[k], :inner, :from, :to)]
+            k -= 1
+        }
+        let start = self.alloc_expr(ast.Expr.Ident(name: f"$acc{inner[0]}"), :span)
+        let pre = [self.alloc_stmt(ast.Stmt.Let(name: acc, typ: 0, value: start, mutable: true))] + inner
+        let arg = ast.CallArg(label: "", label_span: span, value: self.alloc_expr(ast.Expr.Ident(name: acc), :span))
+        let body = self.alloc_expr(ast.Expr.Call(callee: self.alloc_expr(ast.Expr.Ident(name: "$moved"), :span), args: [arg]), :span)
+        let arm = self.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.alloc_pattern(ast.Pattern.Wildcard), :body, :pre, is_comp: true))
+        let subject = self.alloc_expr(ast.Expr.BoolLit(value: true), :span)
+        return self.alloc_expr(ast.Expr.MatchExpr(:subject, arms: [arm]), :span)
+    }
+
+    // One `for` or `if` of a comprehension around `inner`; its element spans tokens `from`
+    // up to `to`.
+    func comp_clause(self, anon clause: CompClause, inner: [int64], from: int64, to: int64) -> int64 {
+        if clause.cond != 0 {
+            let ops = self.and_operands(clause.cond)
+            let pats = self.chain_patterns(ops, narrow: true)
+            if not self.any_pattern(pats) {
+                return self.alloc_stmt(ast.Stmt.If(cond: clause.cond, then_body: inner, else_body: []))
+            }
+            self.narrow_chain(ops, :pats, :from, :to)
+            return self.chain_stmt(ops, :pats, from: 0, body: inner, elses: [])
+        }
+        let span = self.expr_spans[clause.iter]
+        let name = clause.names[-1]
+        if len(clause.names) == 2 {
+            let index = clause.names[0]
+            return self.for_numbered(index.name, name: name.name, iter: clause.iter, body: self.bind_for(index, :span) + self.bind_for(name, :span) + inner)
+        }
+        if clause.stop != 0 {
+            return self.for_range(name.name, start: clause.iter, stop: clause.stop, body: self.bind_for(name, :span) + inner)
+        }
+        return self.alloc_stmt(ast.Stmt.ForEach(name: name.name, iter: clause.iter, body: self.bind_for(name, :span) + inner))
     }
 
     // Whether the `(` just passed opens a list with a comma of its own.

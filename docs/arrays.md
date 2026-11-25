@@ -188,6 +188,41 @@ allocation and a copy, much faster than appending in a loop. Each element is
 a value of its own, so the rows of `mut grid = [[0] * 3] * 3` can be changed
 one at a time.
 
+## Comprehensions
+
+`[elem for x in xs]` makes an array of what `elem` is for each `x`:
+
+```kod
+let words = ["pear", "fig", "apple"]
+let sizes = [len(w) for w in words]               // [4, 3, 5]
+let long = [w.upper() for w in words if len(w) > 3]
+let pairs = [(i, j) for i in 0..3 for j in i + 1..3]    // [(0, 1), (0, 2), (1, 2)]
+```
+
+The `for` goes over what a [`for` loop](control-flow.md#for-in-foreach) does, and binds
+what that does: `for i, x in xs`, `for k, v in m`, `for (a, b) in pairs`. Any number of
+`for`s and `if`s may follow each other, each inside the one before it. An `if` can bind
+names and narrow them as an `if` statement's condition does:
+
+<!-- kod:
+let fields = ["1", "x", "3"]
+let maybe: [int64?] = [1, none]
+-->
+```kod
+let nums = [n for f in fields if f.parse_int() is Some(n)]     // [1, 3]
+let next = [n + 1 for n in maybe if n is not none]             // [2]
+let table = [
+    (i, f)
+    for i, f in fields
+    if i > 0
+]
+```
+
+The names are the comprehension's own. `elem` is worked out after the `for`s and `if`s, in
+their order, as if it were appended in the loops' body, and what it is converts to the type
+the array goes to: `let ids: [int64?] = [i for i in 0..3]`. Where the array goes nowhere that
+says its type, it's an array of `elem`'s.
+
 ## Comparing
 
 `==` and `!=` compare two arrays of the same type element by element: they are
@@ -277,6 +312,24 @@ arrays.equal([1, 2], [1, 2])         // true
 
 Elements compare with `==`, so `str`s by content, and a type that `==` doesn't
 take is an error (see [Generic functions](functions.md#checking)).
+
+| Function | Gives |
+|----------|-------|
+| `sum(xs)`, `sum_floats(xs)` | what `int64`s, or `float64`s, come to; 0 for none |
+| `min(xs)`, `max(xs)` | the first of the smallest, or largest, elements by `<`; a `T?`, `none` when there are none |
+| `any(xs)`, `all(xs)` | whether one of some `bool`s, or all of them, are true |
+
+With a comprehension, these are over anything:
+
+<!-- kod:
+import "arrays"
+let words = ["pear", "fig"]
+-->
+```kod
+let total = arrays.sum([len(w) for w in words])
+let longest = arrays.max([len(w) for w in words])? or 0
+assert arrays.all([w != "" for w in words])
+```
 
 ## Sorting
 
