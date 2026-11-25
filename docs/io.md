@@ -340,6 +340,34 @@ connect and, separately, the handshake. A server that can't speak TLS 1.2 is a
 those certificates are the only trusted roots, in place of the keychain: use it
 for a private CA or a self-signed server. The host name is still checked.
 
+The server's side is `accept`, on a connection that [`net/tcp`](#tcp) accepted:
+
+```kod
+import "net/tcp"
+import "net/tls"
+
+func main() -> none or Error {
+    let identity = try tls.load_identity("cert.pem", "key.pem")
+    let l = try tcp.listen("127.0.0.1", port: 8443)
+    let conn = try tls.accept(try l.accept(), identity)
+    try conn.write_str("hello\n")
+    try conn.close()
+}
+```
+
+| Function | Meaning |
+|----------|---------|
+| `load_identity(cert_file, key_file)` | a certificate and its private key, from PEM files; `Identity or Error`. `cert_file` holds the server's certificate first and then those it was signed by, up to the root (which can be left out); `key_file` an RSA or EC key that isn't encrypted (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`). They are kept in memory: no keychain is used |
+| `identity.close()` | frees it; connections made with it go on |
+| `accept(fd, identity)` | run the handshake as the server; `TlsStream or Error`. On an error `fd` is closed. How long it may take is `fd`'s `tcp.set_timeout` |
+
+A key that isn't the certificate's is a `Tls` error. Only TLS 1.2 with forward secrecy
+and authenticated encryption is spoken (ECDHE with AES-GCM or ChaCha20-Poly1305), which clients since about 2014
+do. The client isn't asked for a certificate.
+
+Several tasks can use streams at the same time, and one may read a stream while another
+writes to it; two writing to one stream at the same time isn't supported.
+
 A server that closes the connection without a close notice reads as an
 ordinary end of stream, since plain HTTP/1.0 servers do that; a response that
 carries its own length (`Content-Length` or chunked) shows a truncation

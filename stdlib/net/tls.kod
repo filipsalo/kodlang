@@ -2,6 +2,7 @@
 // Kod through unsafe. See docs/io.md.
 // kod:link -framework Security -framework CoreFoundation
 
+import "encoding/base64"
 import "libc"
 import "net/tcp"
 import "posix" { Fd, open_read }
@@ -29,12 +30,29 @@ extern func SecTrustSetAnchorCertificates(anon trust: int64, anon anchors: int64
 extern func SecTrustSetAnchorCertificatesOnly(anon trust: int64, anon only: int64) -> int64
 extern func SecTrustEvaluateWithError(anon trust: int64, anon error: int64) -> int64
 extern func CFDataCreate(anon alloc: int64, anon data: int64, anon len: int64) -> int64
+extern func SSLSetCertificate(anon ctx: int64, anon certs: int64) -> int64
+extern func SSLSetEnabledCiphers(anon ctx: int64, anon ciphers: int64, anon count: int64) -> int64
+extern func SecCertificateCreateWithData(anon alloc: int64, anon data: int64) -> int64
+extern func SecKeyCreateWithData(anon data: int64, anon attributes: int64, anon error: int64) -> int64
+extern func SecIdentityCreate(anon alloc: int64, anon certificate: int64, anon key: int64) -> int64
+extern func CFDictionaryCreate(anon alloc: int64, anon keys: int64, anon values: int64, anon count: int64, anon key_callbacks: int64, anon value_callbacks: int64) -> int64
+extern func CFArrayCreate(anon alloc: int64, anon values: int64, anon count: int64, anon callbacks: int64) -> int64
+// CFStrings, as a C variable holds them.
+extern let kSecAttrKeyType: int64
+extern let kSecAttrKeyTypeRSA: int64
+extern let kSecAttrKeyTypeECSECPrimeRandom: int64
+extern let kSecAttrKeyClass: int64
+extern let kSecAttrKeyClassPrivate: int64
+extern func dlsym(anon handle: int64, anon name: int64) -> int64
 extern func CFArrayGetCount(anon array: int64) -> int64
 extern func CFStringGetCString(anon s: int64, anon buf: int64, anon size: int64, anon encoding: int64) -> int64
 extern func CFErrorCopyDescription(anon error: int64) -> int64
+extern func memcpy(anon dst: int64, anon src: int64, anon n: int64) -> int64
+extern func realloc(anon addr: int64, anon size: int64) -> int64
 extern func CFRelease(anon ref: int64) -> none
 
 // The macOS values of the constants used here.
+let SERVER_SIDE: int64 = 0
 let CLIENT_SIDE: int64 = 1
 let STREAM_TYPE: int64 = 0
 let TLS_1_2: int64 = 8
@@ -44,27 +62,36 @@ let WOULD_BLOCK: int64 = -9803
 let CLOSED_GRACEFUL: int64 = -9805
 let CLOSED_ABORT: int64 = -9806
 let CLOSED_NO_NOTIFY: int64 = -9816
-let SEC_IO: int64 = -36
 let SEC_ALLOCATE: int64 = -108
 let PEM_SEQUENCE: int64 = 10
 let ITEM_CERTIFICATE: int64 = 4
 let UTF8: int64 = 134217984
-let EINTR: int64 = 4
-let EPIPE: int64 = 32
-let EAGAIN: int64 = 35
+let F_GETFL: int64 = 3
+let F_SETFL: int64 = 4
+let O_NONBLOCK: int64 = 4
 // The most one read takes in, and the largest trust file read.
 let READ_MAX: int64 = 65536
 let TRUST_FILE_MAX: int64 = 16777216
+// The most room for ciphertext to be sent that a stream keeps while it has none.
+let OUT_KEPT: int64 = 20000
 
 // What the I/O callbacks share with the session, in C memory SecureTransport
-// hands back to them: the descriptor, then what the last callback ran into.
-let LINK_FD: int64 = 0
-let LINK_ERRNO: int64 = 8
-let LINK_TIMED_OUT: int64 = 16
-let LINK_CLEAN_EOF: int64 = 24
-let LINK_SIZE: int64 = 32
+// hands back to them: where the ciphertext to read is, how much of it has been
+// read and how much there is, and whether no more will come; whether the session
+// met that end between two reads; and the ciphertext to be sent, how much there
+// is and how much there is room for.
+let LINK_IN: int64 = 0
+let LINK_POS: int64 = 8
+let LINK_LEN: int64 = 16
+let LINK_ENDED: int64 = 24
+let LINK_CLEAN_EOF: int64 = 32
+let LINK_OUT: int64 = 40
+let LINK_OUT_LEN: int64 = 48
+let LINK_ROOM: int64 = 56
+let LINK_SIZE: int64 = 64
 
-// Where every read lands before it is copied out: allocated once, and kept.
+// Where every read lands before it is copied out: allocated once, and kept. No
+// task is preempted in this module, so none sees another's.
 mut _read_buf: int64 = 0
 
 func tls_error(anon op: str, anon detail: str) -> IoError {
@@ -102,112 +129,67 @@ func status_text(anon what: str, status: int64) -> str {
     return out
 }
 
-// The error for a SecureTransport call that failed with `status`: what a
-// callback ran into, else the TLS failure.
-func failure(anon link: int64, status: int64, what: str, op: str) -> IoError {
-    if unsafe.load64(link + LINK_TIMED_OUT) != 0 {
-        unsafe.store64(link + LINK_TIMED_OUT, 0)
-        return os_error(op, errno: EAGAIN)
-    }
-    let err = unsafe.load64(link + LINK_ERRNO)
-    if status == SEC_IO and err != 0 {
-        unsafe.store64(link + LINK_ERRNO, 0)
-        return os_error(op, errno: err)
-    }
+// The error for a SecureTransport call that failed with `status`.
+func failure(status: int64, what: str, op: str) -> IoError {
     if is_closed(status) {
         return tls_error(op, "connection closed")
     }
     return tls_error(op, status_text(what, :status))
 }
 
-// SecureTransport's read callback: the `*len_at` bytes it wants at `data`,
-// from the descriptor in `link`. C calls it inside SSLHandshake and SSLRead,
-// on this thread. It returns an OSStatus and leaves in `*len_at` what it got.
-func _read_cb(anon link: int64, anon data: int64, anon len_at: int64) -> int64 {
-    let fd = unsafe.load64(link + LINK_FD)
-    let want = unsafe.load64(len_at)
-    mut got = 0
-    for got < want {
-        // With tasks, the others run until there is something to read; cancelled,
-        // the read fails with ECANCELED.
-        let waited = kod_wait_event(fd, -1, 0)
-        if waited == 2 {
-            unsafe.store64(len_at, got)
-            unsafe.store64(link + LINK_ERRNO, 89)
-            return SEC_IO
-        }
-        // The socket's timeout passed first, as when a blocking call gives EAGAIN.
-        if waited == 3 {
-            unsafe.store64(len_at, got)
-            unsafe.store64(link + LINK_TIMED_OUT, 1)
-            return WOULD_BLOCK
-        }
-        let n = libc.read(fd, data + got, want - got)
-        if n > 0 {
-            got += n
-        } else if n == 0 {
-            if got == 0 {
-                unsafe.store64(link + LINK_CLEAN_EOF, 1)
-            }
-            unsafe.store64(len_at, got)
-            return CLOSED_GRACEFUL
-        } else {
-            let err = unsafe.errno()
-            if err != EINTR {
-                unsafe.store64(len_at, got)
-                if err == EAGAIN {
-                    unsafe.store64(link + LINK_TIMED_OUT, 1)
-                    return WOULD_BLOCK
-                }
-                unsafe.store64(link + LINK_ERRNO, err)
-                return SEC_IO
-            }
-        }
+// `e`, as an error of `op`.
+func named(anon e: Error, op: str) -> Error {
+    if e is IoError(io) {
+        return IoError(kind: io.kind, :op, errno: io.errno, detail: io.detail)
     }
-    unsafe.store64(len_at, got)
-    return 0
+    return e
 }
 
-// SecureTransport's write callback, the same way round.
-func _write_cb(anon link: int64, anon data: int64, anon len_at: int64) -> int64 {
-    let fd = unsafe.load64(link + LINK_FD)
+// SecureTransport's read callback: the `*len_at` bytes it wants at `data`, of the
+// ciphertext in `link`. C calls it inside SSLHandshake and SSLRead, so it
+// doesn't wait: whoever called those does, when it says there isn't enough. It
+// returns an OSStatus and leaves in `*len_at` what it gave.
+func _read_cb(anon link: int64, anon data: int64, anon len_at: int64) -> int64 {
     let want = unsafe.load64(len_at)
-    mut put = 0
-    for put < want {
-        // With tasks, the others run until there is room to write; cancelled, the
-        // write fails with ECANCELED.
-        let waited = kod_wait_event(fd, -2, 0)
-        if waited == 2 {
-            unsafe.store64(len_at, put)
-            unsafe.store64(link + LINK_ERRNO, 89)
-            return SEC_IO
-        }
-        // The socket's timeout passed first, as when a blocking call gives EAGAIN.
-        if waited == 3 {
-            unsafe.store64(len_at, put)
-            unsafe.store64(link + LINK_TIMED_OUT, 1)
-            return WOULD_BLOCK
-        }
-        let n = libc.write(fd, data + put, want - put)
-        if n > 0 {
-            put += n
-        } else {
-            mut err = EPIPE
-            if n < 0 {
-                err = unsafe.errno()
-            }
-            if err != EINTR {
-                unsafe.store64(len_at, put)
-                if err == EAGAIN {
-                    unsafe.store64(link + LINK_TIMED_OUT, 1)
-                    return WOULD_BLOCK
-                }
-                unsafe.store64(link + LINK_ERRNO, err)
-                return SEC_IO
-            }
-        }
+    let pos = unsafe.load64(link + LINK_POS)
+    mut n = unsafe.load64(link + LINK_LEN) - pos
+    if n > want {
+        n = want
     }
-    unsafe.store64(len_at, put)
+    if n > 0 {
+        let _to = memcpy(data, unsafe.load64(link + LINK_IN) + pos, n)
+        unsafe.store64(link + LINK_POS, pos + n)
+    }
+    unsafe.store64(len_at, n)
+    if n == want {
+        return 0
+    }
+    if unsafe.load64(link + LINK_ENDED) == 0 {
+        return WOULD_BLOCK
+    }
+    if n == 0 {
+        unsafe.store64(link + LINK_CLEAN_EOF, 1)
+    }
+    return CLOSED_GRACEFUL
+}
+
+// SecureTransport's write callback, the same way round: it keeps the ciphertext
+// for `flush`.
+func _write_cb(anon link: int64, anon data: int64, anon len_at: int64) -> int64 {
+    let n = unsafe.load64(len_at)
+    let used = unsafe.load64(link + LINK_OUT_LEN)
+    if used + n > unsafe.load64(link + LINK_ROOM) {
+        let room = 2 * (used + n)
+        let grown = realloc(unsafe.load64(link + LINK_OUT), room)
+        if grown == 0 {
+            unsafe.store64(len_at, 0)
+            return SEC_ALLOCATE
+        }
+        unsafe.store64(link + LINK_OUT, grown)
+        unsafe.store64(link + LINK_ROOM, room)
+    }
+    let _to = memcpy(unsafe.load64(link + LINK_OUT) + used, data, n)
+    unsafe.store64(link + LINK_OUT_LEN, used + n)
     return 0
 }
 
@@ -272,48 +254,92 @@ func check_trust(anon ctx: int64, anchors: int64, op: str) -> none or Error {
     }
 }
 
-// Set the session up for `host` and shake hands.
-func handshake(anon ctx: int64, link: int64, host: str, anchors: int64, op: str) -> none or Error {
-    mut status = SEC_ALLOCATE
-    if ctx != 0 {
-        status = unsafe.c_int(SSLSetIOFuncs(ctx, unsafe.c_function(_read_cb), unsafe.c_function(_write_cb)))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetConnection(ctx, link))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetProtocolVersionMin(ctx, TLS_1_2))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetPeerDomainName(ctx, unsafe.c_str(host), len(host)))
-    }
-    if status == 0 and anchors != 0 {
-        status = unsafe.c_int(SSLSetSessionOption(ctx, BREAK_ON_SERVER_AUTH, 1))
-    }
-    if status != 0 {
-        throw tls_error(op, status_text("could not set up the session", :status))
-    }
-    for true {
-        status = unsafe.c_int(SSLHandshake(ctx))
-        if status == SERVER_AUTH_COMPLETED {
-            try check_trust(ctx, :anchors, :op)
-            continue
-        }
-        if status != 0 {
-            throw failure(link, :status, what: "TLS handshake failed", :op)
-        }
-        return none
-    }
-}
-
 type TlsStream = shared struct {
     fd: int64
     // The SSLContext, and the memory its callbacks share with it.
     ctx: int64
     link: int64
+    // The ciphertext at LINK_IN.
+    incoming: bytes = kod_str_to_bytes("")
+    // A task is sending what is at LINK_OUT.
+    flushing: bool = false
     // The stream has ended: reads give nothing.
     eof: bool = false
+    // It is to be read no more, which the session needn't know: it can still write.
+    cut: bool = false
     open: bool = true
+
+    // Waits for more ciphertext.
+    func fill(self, op: str) -> none or Error {
+        let got = Fd(fd: self.fd).read(READ_MAX)
+        if got is Err(e) {
+            throw named(e, :op)
+        }
+        // Closed, and its memory freed, while this task waited.
+        if not self.open {
+            throw closed(op)
+        }
+        if len(got) == 0 and not self.cut {
+            unsafe.store64(self.link + LINK_ENDED, 1)
+            return
+        }
+        // While this task waited, another may have read for both of them.
+        let left = unsafe.load64(self.link + LINK_LEN) - unsafe.load64(self.link + LINK_POS)
+        if left > 0 {
+            self.incoming = self.incoming[len(self.incoming) - left..len(self.incoming)] + got
+        } else {
+            self.incoming = got
+        }
+        unsafe.store64(self.link + LINK_IN, unsafe.data(self.incoming))
+        unsafe.store64(self.link + LINK_POS, 0)
+        unsafe.store64(self.link + LINK_LEN, len(self.incoming))
+    }
+
+    // Sends the ciphertext there is.
+    func flush(self, op: str) -> none or Error {
+        if self.flushing {
+            return
+        }
+        for unsafe.load64(self.link + LINK_OUT_LEN) > 0 {
+            let data = unsafe.copy_out(unsafe.load64(self.link + LINK_OUT), unsafe.load64(self.link + LINK_OUT_LEN))
+            unsafe.store64(self.link + LINK_OUT_LEN, 0)
+            self.flushing = true
+            let sent = Fd(fd: self.fd).write_all(data)
+            self.flushing = false
+            if sent is Err(e) {
+                throw named(e, :op)
+            }
+            if not self.open {
+                throw closed(op)
+            }
+        }
+        if unsafe.load64(self.link + LINK_ROOM) > OUT_KEPT {
+            unsafe.free(unsafe.load64(self.link + LINK_OUT))
+            unsafe.store64(self.link + LINK_OUT, 0)
+            unsafe.store64(self.link + LINK_ROOM, 0)
+        }
+    }
+
+    // Shakes hands; a client with `anchors` checks the server's certificate by them.
+    func shake(self, anchors: int64, op: str) -> none or Error {
+        for true {
+            let status = unsafe.c_int(SSLHandshake(self.ctx))
+            let sent = self.flush(:op)
+            if status == 0 {
+                return try sent
+            }
+            if status == SERVER_AUTH_COMPLETED {
+                try sent
+                try check_trust(self.ctx, :anchors, :op)
+                continue
+            }
+            if status != WOULD_BLOCK {
+                throw failure(:status, what: "TLS handshake failed", :op)
+            }
+            try sent
+            try self.fill(:op)
+        }
+    }
 
     // At most `max` bytes, never more than 64 KiB; empty at the end of the
     // stream. SSLRead gets one byte first, so it returns as soon as a record
@@ -336,40 +362,66 @@ type TlsStream = shared struct {
         if _read_buf == 0 {
             _read_buf = unsafe.alloc(READ_MAX)
         }
+        let buf = _read_buf
         // How many bytes SSLRead processed, then how many it holds.
         let sizes = unsafe.alloc(16)
-        let status = unsafe.c_int(SSLRead(self.ctx, _read_buf, 1, sizes))
-        mut got = unsafe.load64(sizes)
-        SSLGetBufferedReadSize(self.ctx, sizes + 8)
-        let buffered = unsafe.load64(sizes + 8)
-        if got + buffered > 0 {
-            mut ask = want - got
-            if buffered < ask {
-                ask = buffered
+        for true {
+            if self.cut {
+                unsafe.free(sizes)
+                return kod_str_to_bytes("")
             }
             unsafe.store64(sizes, 0)
-            if ask > 0 and unsafe.c_int(SSLRead(self.ctx, _read_buf + got, ask, sizes)) == 0 {
-                got += unsafe.load64(sizes)
+            let status = unsafe.c_int(SSLRead(self.ctx, buf, 1, sizes))
+            mut got = unsafe.load64(sizes)
+            SSLGetBufferedReadSize(self.ctx, sizes + 8)
+            mut buffered = unsafe.load64(sizes + 8)
+            if got + buffered > 0 {
+                // The rest of the first record, and the whole ones that came with it.
+                for buffered > 0 and got < want {
+                    mut ask = want - got
+                    if buffered < ask {
+                        ask = buffered
+                    }
+                    unsafe.store64(sizes, 0)
+                    if unsafe.c_int(SSLRead(self.ctx, buf + got, ask, sizes)) != 0 or unsafe.load64(sizes) == 0 {
+                        break
+                    }
+                    got += unsafe.load64(sizes)
+                    SSLGetBufferedReadSize(self.ctx, sizes + 8)
+                    buffered = unsafe.load64(sizes + 8)
+                }
+                unsafe.free(sizes)
+                if is_closed(status) {
+                    self.eof = true
+                }
+                return unsafe.copy_out(buf, got)
+            }
+            if status == WOULD_BLOCK {
+                mut waited = self.flush(op: "read")
+                if waited is Ok(_) {
+                    waited = self.fill(op: "read")
+                }
+                if waited is Err(e) {
+                    unsafe.free(sizes)
+                    throw e
+                }
+                continue
             }
             unsafe.free(sizes)
-            if is_closed(status) {
+            let clean = unsafe.load64(self.link + LINK_CLEAN_EOF) != 0
+            if status == CLOSED_GRACEFUL or status == CLOSED_NO_NOTIFY or (status == CLOSED_ABORT and clean) {
                 self.eof = true
+                return kod_str_to_bytes("")
             }
-            return unsafe.copy_out(_read_buf, got)
+            if status == CLOSED_ABORT {
+                throw tls_error("read", "connection closed in the middle of a record")
+            }
+            throw failure(:status, what: "TLS read failed", op: "read")
         }
-        unsafe.free(sizes)
-        let clean = unsafe.load64(self.link + LINK_CLEAN_EOF) != 0
-        if status == CLOSED_GRACEFUL or status == CLOSED_NO_NOTIFY or (status == CLOSED_ABORT and clean) {
-            self.eof = true
-            return kod_str_to_bytes("")
-        }
-        if status == CLOSED_ABORT {
-            throw tls_error("read", "connection closed in the middle of a record")
-        }
-        throw failure(self.link, :status, what: "TLS read failed", op: "read")
     }
 
-    // Bytes written: all of `data`.
+    // Bytes written, at most 64 KiB of `data`: encrypted, they are held until
+    // they have been sent.
     func write(self, anon data: bytes) -> int64 or Error {
         if not self.open {
             throw closed("write")
@@ -377,18 +429,48 @@ type TlsStream = shared struct {
         if len(data) == 0 {
             return 0
         }
+        mut n = len(data)
+        if n > READ_MAX {
+            n = READ_MAX
+        }
         let done = unsafe.alloc(8)
-        let status = unsafe.c_int(SSLWrite(self.ctx, unsafe.data(data), len(data), done))
-        let n = unsafe.load64(done)
+        let status = unsafe.c_int(SSLWrite(self.ctx, unsafe.data(data), n, done))
+        n = unsafe.load64(done)
         unsafe.free(done)
         if status != 0 {
-            throw failure(self.link, :status, what: "TLS write failed", op: "write")
+            throw failure(:status, what: "TLS write failed", op: "write")
         }
+        try self.flush(op: "write")
         return n
+    }
+
+    // Nothing is waiting to be read, and the peer hasn't closed it.
+    func is_idle(self) -> bool {
+        if not self.open or unsafe.load64(self.link + LINK_POS) < unsafe.load64(self.link + LINK_LEN) {
+            return false
+        }
+        let size = unsafe.alloc(8)
+        SSLGetBufferedReadSize(self.ctx, size)
+        let buffered = unsafe.load64(size)
+        unsafe.free(size)
+        return buffered == 0 and tcp.is_idle(Fd(fd: self.fd))
     }
 
     func set_timeout(self, timeout: Duration) -> none or Error {
         try tcp.set_timeout(Fd(fd: self.fd), timeout: timeout)
+    }
+
+    // Send the close notice, as far as that doesn't have to wait.
+    func end(self) -> none {
+        SSLClose(self.ctx)
+        let n = unsafe.load64(self.link + LINK_OUT_LEN)
+        if n > 0 and not self.flushing {
+            let flags = libc.fcntl(self.fd, F_GETFL, 0)
+            libc.fcntl(self.fd, F_SETFL, flags | O_NONBLOCK)
+            libc.write(self.fd, unsafe.load64(self.link + LINK_OUT), n)
+            libc.fcntl(self.fd, F_SETFL, flags)
+            unsafe.store64(self.link + LINK_OUT_LEN, 0)
+        }
     }
 
     // Send the close notice, free the session and close the connection.
@@ -397,13 +479,55 @@ type TlsStream = shared struct {
             throw closed("close")
         }
         self.open = false
-        SSLClose(self.ctx)
-        CFRelease(self.ctx)
-        unsafe.free(self.link)
+        self.end()
+        self.free_session()
         if unsafe.c_int(libc.close(self.fd)) < 0 {
             throw os_error("close", errno: unsafe.errno())
         }
     }
+
+    func free_session(self) -> none {
+        if self.ctx != 0 {
+            CFRelease(self.ctx)
+        }
+        unsafe.free(unsafe.load64(self.link + LINK_OUT))
+        unsafe.free(self.link)
+    }
+}
+
+// A stream on `fd`, before its handshake, and the status of setting it up.
+func new_stream(anon fd: int64, side: int64) -> TlsStream {
+    return TlsStream(:fd, ctx: SSLCreateContext(0, side, STREAM_TYPE), link: unsafe.alloc(LINK_SIZE))
+}
+
+// What both sides set up: an OSStatus.
+func set_up(anon s: TlsStream) -> int64 {
+    if s.ctx == 0 {
+        return SEC_ALLOCATE
+    }
+    mut status = unsafe.c_int(SSLSetIOFuncs(s.ctx, unsafe.c_function(_read_cb), unsafe.c_function(_write_cb)))
+    if status == 0 {
+        status = unsafe.c_int(SSLSetConnection(s.ctx, s.link))
+    }
+    if status == 0 {
+        status = unsafe.c_int(SSLSetProtocolVersionMin(s.ctx, TLS_1_2))
+    }
+    return status
+}
+
+// Set the session up for `host` and shake hands.
+func handshake(anon s: TlsStream, host: str, anchors: int64, op: str) -> none or Error {
+    mut status = set_up(s)
+    if status == 0 {
+        status = unsafe.c_int(SSLSetPeerDomainName(s.ctx, unsafe.c_str(host), len(host)))
+    }
+    if status == 0 and anchors != 0 {
+        status = unsafe.c_int(SSLSetSessionOption(s.ctx, BREAK_ON_SERVER_AUTH, 1))
+    }
+    if status != 0 {
+        throw tls_error(op, status_text("could not set up the session", :status))
+    }
+    try s.shake(:anchors, :op)
 }
 
 func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duration = Duration(seconds: 10)) -> TlsStream or Error {
@@ -419,21 +543,333 @@ func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duratio
         }
         anchors = loaded
     }
-    let link = unsafe.alloc(LINK_SIZE)
-    unsafe.store64(link + LINK_FD, conn.fd)
-    let ctx = SSLCreateContext(0, CLIENT_SIDE, STREAM_TYPE)
-    let shaken = handshake(ctx, :link, :host, :anchors, :op)
+    let s = new_stream(conn.fd, side: CLIENT_SIDE)
+    let shaken = handshake(s, :host, :anchors, :op)
     if anchors != 0 {
         CFRelease(anchors)
     }
     if shaken is Err(e) {
-        if ctx != 0 {
-            CFRelease(ctx)
-        }
-        unsafe.free(link)
+        s.open = false
+        s.free_session()
         libc.close(conn.fd)
         throw e
     }
     try tcp.set_timeout(conn, timeout: Duration())
-    return TlsStream(fd: conn.fd, :ctx, :link)
+    return s
+}
+
+// ---- the server's side ----
+
+// ECDHE with AES-GCM or ChaCha20-Poly1305, those for an EC key and for an RSA one.
+let CIPHERS: [int64] = [0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8]
+let RTLD_DEFAULT: int64 = -2
+
+// A certificate, those it was signed by, and its private key.
+type Identity = shared struct {
+    // A CFArray for SSLSetCertificate, 0 once closed.
+    certs: int64
+
+    func close(self) -> none {
+        if self.certs != 0 {
+            CFRelease(self.certs)
+            self.certs = 0
+        }
+    }
+}
+
+// One block of a PEM file.
+type PemBlock = struct {
+    label: str
+    data: bytes
+}
+
+// The blocks of a PEM file; what is around them is left out.
+func parse_pem(anon text: str, op: str) -> [PemBlock] or Error {
+    mut out: [PemBlock] = []
+    mut label = ""
+    mut lines: [str] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if label == "" {
+            if line.starts_with("-----BEGIN ") and line.ends_with("-----") and len(line) > 16 {
+                label = line[11..len(line) - 5]
+                lines = []
+            }
+        } else if line == f"-----END {label}-----" {
+            let data = base64.decode("".join(lines))
+            if data is Err(_) {
+                throw tls_error(op, f"the {label} isn't base64")
+            }
+            out += [PemBlock(:label, :data)]
+            label = ""
+        } else {
+            lines += [line]
+        }
+    }
+    if label != "" {
+        throw tls_error(op, f"the {label} has no end")
+    }
+    return out
+}
+
+// What is at the start of some DER: its tag, where its content is, and where it ends.
+type Der = struct {
+    tag: int64
+    from: int64
+    to: int64
+}
+
+// The element of `data` at `at`, which ends by `end`; none when that isn't one.
+func der_at(anon data: bytes, anon at: int64, anon end: int64) -> Der? {
+    if at + 2 > end or end > len(data) {
+        return none
+    }
+    mut from = at + 2
+    mut size = data[at + 1]
+    if size >= 128 {
+        let n = size - 128
+        if n < 1 or n > 4 or from + n > end {
+            return none
+        }
+        size = 0
+        for k in 0..n {
+            size = size << 8 | data[from + k]
+        }
+        from += n
+    }
+    if size > end - from {
+        return none
+    }
+    return Der(tag: data[at], :from, to: from + size)
+}
+
+// The elements inside a sequence that is all of `data`.
+func der_sequence(anon data: bytes) -> [Der] {
+    if der_at(data, 0, len(data)) is Der(seq) and seq.tag == 0x30 {
+        return der_parts(data, seq)
+    }
+    return []
+}
+
+// The elements inside `outer`, as far as they are whole.
+func der_parts(anon data: bytes, anon outer: Der) -> [Der] {
+    mut out: [Der] = []
+    mut at = outer.from
+    for at < outer.to {
+        let Some(d) = der_at(data, at, outer.to) else {
+            return out
+        }
+        out += [d]
+        at = d.to
+    }
+    return out
+}
+
+// A private key as SecKeyCreateWithData takes it: PKCS#1 for RSA; for EC, the public
+// point and then the number.
+type KeyData = struct {
+    is_ec: bool
+    data: bytes
+}
+
+// The key in a PKCS#8, PKCS#1 or SEC 1 block; none when it isn't one.
+func key_data(anon block: PemBlock) -> KeyData? {
+    if block.label == "RSA PRIVATE KEY" {
+        return KeyData(is_ec: false, data: block.data)
+    }
+    if block.label == "EC PRIVATE KEY" {
+        return ec_key(block.data)
+    }
+    // PKCS#8: a version, the algorithm, and the key in the form above.
+    let data = block.data
+    let parts = der_sequence(data)
+    if len(parts) < 3 or parts[1].tag != 0x30 or parts[2].tag != 0x04 {
+        return none
+    }
+    let algorithm = der_parts(data, parts[1])
+    if len(algorithm) == 0 or algorithm[0].tag != 0x06 {
+        return none
+    }
+    let oid = data[algorithm[0].from..algorithm[0].to]
+    let inner = data[parts[2].from..parts[2].to]
+    if oid == b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01" {
+        return KeyData(is_ec: false, data: inner)
+    }
+    if oid == b"\x2a\x86\x48\xce\x3d\x02\x01" {
+        return ec_key(inner)
+    }
+    return none
+}
+
+// SEC 1: a version, the number, and (tagged 1) the public point.
+func ec_key(anon data: bytes) -> KeyData? {
+    let parts = der_sequence(data)
+    if len(parts) < 2 or parts[1].tag != 0x04 {
+        return none
+    }
+    for part in parts {
+        if part.tag != 0xa1 {
+            continue
+        }
+        let inner = der_parts(data, part)
+        // A bit string of whole bytes, uncompressed: 4 and then two coordinates.
+        if len(inner) != 1 or inner[0].tag != 0x03 or inner[0].to - inner[0].from < 4 or data[inner[0].from] != 0 {
+            return none
+        }
+        let point = data[inner[0].from + 1..inner[0].to]
+        let number = data[parts[1].from..parts[1].to]
+        let size = (len(point) - 1) / 2
+        if point[0] != 4 or len(number) > size {
+            return none
+        }
+        return KeyData(is_ec: true, data: point + kod_bytes_from_array([0] * (size - len(number))) + number)
+    }
+    return none
+}
+
+func read_pem(anon path: str, op: str) -> [PemBlock] or Error {
+    let file = try open_read(path)
+    let data = file.read_all()
+    try file.close()
+    let pem = try data
+    if len(pem) > TRUST_FILE_MAX {
+        throw tls_error(op, "the file is too large")
+    }
+    return try parse_pem(kod_bytes_to_str(pem), :op)
+}
+
+// A CFData of `data`.
+func cf_data(anon data: bytes) -> int64 {
+    return CFDataCreate(0, unsafe.data(data), len(data))
+}
+
+// A SecKey of `key`, or 0.
+func make_key(anon key: KeyData) -> int64 {
+    let slots = unsafe.alloc(32)
+    unsafe.store64(slots, kSecAttrKeyType)
+    unsafe.store64(slots + 8, kSecAttrKeyClass)
+    unsafe.store64(slots + 16, kSecAttrKeyTypeRSA)
+    if key.is_ec {
+        unsafe.store64(slots + 16, kSecAttrKeyTypeECSECPrimeRandom)
+    }
+    unsafe.store64(slots + 24, kSecAttrKeyClassPrivate)
+    let keys = dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeDictionaryKeyCallBacks"))
+    let values = dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeDictionaryValueCallBacks"))
+    let attributes = CFDictionaryCreate(0, slots, slots + 16, 2, keys, values)
+    unsafe.free(slots)
+    let data = cf_data(key.data)
+    let made = SecKeyCreateWithData(data, attributes, 0)
+    CFRelease(data)
+    CFRelease(attributes)
+    return made
+}
+
+// A certificate and its private key, from PEM files: see docs/io.md#tls.
+func load_identity(anon cert_file: str, anon key_file: str) -> Identity or Error {
+    let cert_op = f"certificate {cert_file}"
+    mut certs: [bytes] = []
+    for block in try read_pem(cert_file, op: cert_op) {
+        if block.label == "CERTIFICATE" {
+            certs += [block.data]
+        }
+    }
+    if len(certs) == 0 {
+        throw tls_error(cert_op, "holds no certificate")
+    }
+    let key_op = f"key {key_file}"
+    mut found: KeyData? = none
+    for block in try read_pem(key_file, op: key_op) {
+        if block.label == "ENCRYPTED PRIVATE KEY" {
+            throw tls_error(key_op, "is encrypted")
+        }
+        if found is none and block.label.ends_with("PRIVATE KEY") {
+            found = key_data(block)
+            if found is none {
+                throw tls_error(key_op, "isn't an RSA or EC private key")
+            }
+        }
+    }
+    let Some(key) = found else {
+        throw tls_error(key_op, "holds no private key")
+    }
+    return try make_identity(certs, key, :cert_op, :key_op)
+}
+
+func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op: str) -> Identity or Error {
+    // The identity, then the certificates after the first, for the array.
+    let slots = unsafe.alloc(8 * len(certs))
+    mut made: [int64] = []
+    for der in certs {
+        let data = cf_data(der)
+        let cert = SecCertificateCreateWithData(0, data)
+        CFRelease(data)
+        if cert == 0 {
+            break
+        }
+        unsafe.store64(slots + 8 * len(made), cert)
+        made += [cert]
+    }
+    mut array = 0
+    mut wrong = tls_error(cert_op, "isn't an X.509 certificate")
+    if len(made) == len(certs) {
+        wrong = tls_error(key_op, "isn't a valid key")
+        let sec_key = make_key(key)
+        if sec_key != 0 {
+            wrong = tls_error(key_op, "isn't the key of the certificate")
+            let identity = SecIdentityCreate(0, made[0], sec_key)
+            if identity != 0 {
+                unsafe.store64(slots, identity)
+                array = CFArrayCreate(0, slots, len(certs), dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeArrayCallBacks")))
+                CFRelease(identity)
+            }
+            CFRelease(sec_key)
+        }
+    }
+    for cert in made {
+        CFRelease(cert)
+    }
+    unsafe.free(slots)
+    if array == 0 {
+        throw wrong
+    }
+    return Identity(certs: array)
+}
+
+// The server's handshake on an accepted connection.
+func accept(anon fd: Fd, anon identity: Identity) -> TlsStream or Error {
+    let op = "tls accept"
+    let s = new_stream(fd.fd, side: SERVER_SIDE)
+    let shaken = shake_as_server(s, identity, :op)
+    if shaken is Err(e) {
+        s.open = false
+        s.end()
+        s.free_session()
+        let _ = fd.close()
+        throw e
+    }
+    return s
+}
+
+func shake_as_server(anon s: TlsStream, anon identity: Identity, op: str) -> none or Error {
+    if identity.certs == 0 {
+        throw closed(op)
+    }
+    mut status = set_up(s)
+    if status == 0 {
+        status = unsafe.c_int(SSLSetCertificate(s.ctx, identity.certs))
+    }
+    if status == 0 {
+        // Two bytes each.
+        let list = unsafe.alloc(2 * len(CIPHERS) + 8)
+        for k, cipher in CIPHERS {
+            unsafe.store8(list + 2 * k, cipher & 255)
+            unsafe.store8(list + 2 * k + 1, cipher >> 8)
+        }
+        status = unsafe.c_int(SSLSetEnabledCiphers(s.ctx, list, len(CIPHERS)))
+        unsafe.free(list)
+    }
+    if status != 0 {
+        throw tls_error(op, status_text("could not set up the session", :status))
+    }
+    try s.shake(anchors: 0, :op)
 }

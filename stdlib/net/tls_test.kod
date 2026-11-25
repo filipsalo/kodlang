@@ -1,6 +1,6 @@
 import "io"
 import "net/tcp"
-import "net/tls" { connect, TlsStream }
+import "net/tls" { Identity, PemBlock, TlsStream, accept, connect, key_data, load_identity, parse_pem }
 import "process"
 import "stream" { IoError, IoKind, BufReader }
 import "time" { Duration }
@@ -177,4 +177,151 @@ test "closing twice or writing after close is an error, not a crash" {
     assert conn.write(kod_str_to_bytes("x")) is Err(_)
     assert conn.read(10) is Err(_)
     stop(sv)
+}
+
+// ---- the server's side ----
+
+func run_openssl(anon args: [str]) -> none {
+    let r = process.run(["/usr/bin/openssl"] + args)
+    assert r.status == 0
+}
+
+func write(anon path: str, anon content: str) -> none {
+    assert io.write_file(path, content) == 0
+}
+
+// Why `load_identity` fails, or "ok".
+func loading(anon cert: str, anon key: str) -> str {
+    let got = load_identity(cert, key)
+    if got is Err(e) {
+        if e is IoError(io_err) {
+            return io_err.detail
+        }
+        return e.to_str()
+    }
+    got.close()
+    got.close()
+    return "ok"
+}
+
+test "load_identity: the forms a key comes in, and what isn't one" {
+    make_certificate()
+    let dir = "build/tls_identity"
+    let _ = process.run(["mkdir", "-p", dir])
+    run_openssl(["rsa", "-in", key_path(), "-out", f"{dir}/pkcs1.pem"])
+    run_openssl(["rsa", "-in", key_path(), "-aes128", "-passout", "pass:abcd", "-out", f"{dir}/locked1.pem"])
+    run_openssl(["pkcs8", "-topk8", "-in", key_path(), "-passout", "pass:abcd", "-out", f"{dir}/locked8.pem"])
+    for curve in ["prime256v1", "secp384r1", "secp521r1"] {
+        run_openssl(["ecparam", "-name", curve, "-genkey", "-noout", "-out", f"{dir}/{curve}.sec1"])
+        run_openssl(["pkcs8", "-topk8", "-nocrypt", "-in", f"{dir}/{curve}.sec1", "-out", f"{dir}/{curve}.key"])
+        run_openssl(["req", "-x509", "-new", "-key", f"{dir}/{curve}.key", "-out", f"{dir}/{curve}.crt", "-subj", "/CN=localhost", "-days", "30"])
+        assert loading(f"{dir}/{curve}.crt", f"{dir}/{curve}.sec1") == "ok"
+        assert loading(f"{dir}/{curve}.crt", f"{dir}/{curve}.key") == "ok"
+        assert loading(f"{dir}/{curve}.crt", key_path()) == "isn't the key of the certificate"
+    }
+    assert loading(cert_path(), key_path()) == "ok"
+    assert loading(cert_path(), f"{dir}/pkcs1.pem") == "ok"
+    assert loading(cert_path(), f"{dir}/prime256v1.key") == "isn't the key of the certificate"
+    assert loading(cert_path(), f"{dir}/locked8.pem") == "is encrypted"
+    assert loading(cert_path(), f"{dir}/locked1.pem") != "ok"
+    assert loading(cert_path(), cert_path()) == "holds no private key"
+    assert loading(key_path(), key_path()) == "holds no certificate"
+    assert loading("build/none.pem", key_path()).contains("No such file")
+    // One file with it all, among other text.
+    write(f"{dir}/all.pem", "some words\n" + io.read_file(key_path()) + "\nmore\n" + io.read_file(cert_path()).replace("\n", to: "\r\n"))
+    assert loading(f"{dir}/all.pem", f"{dir}/all.pem") == "ok"
+    write(f"{dir}/cut.pem", io.read_file(key_path())[0..200])
+    assert loading(cert_path(), f"{dir}/cut.pem") == "the PRIVATE KEY has no end"
+    write(f"{dir}/bad64.pem", "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n")
+    assert loading(f"{dir}/bad64.pem", key_path()) == "the CERTIFICATE isn't base64"
+    write(f"{dir}/notx509.pem", "-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n")
+    assert loading(f"{dir}/notx509.pem", key_path()) == "isn't an X.509 certificate"
+    write(f"{dir}/notkey.pem", "-----BEGIN PRIVATE KEY-----\naGVsbG8=\n-----END PRIVATE KEY-----\n")
+    assert loading(cert_path(), f"{dir}/notkey.pem") == "isn't an RSA or EC private key"
+    write(f"{dir}/notrsa.pem", "-----BEGIN RSA PRIVATE KEY-----\naGVsbG8=\n-----END RSA PRIVATE KEY-----\n")
+    assert loading(cert_path(), f"{dir}/notrsa.pem") == "isn't a valid key"
+}
+
+test "keys that are cut short or changed are refused, not trusted" {
+    make_certificate()
+    let _ = process.run(["mkdir", "-p", "build/tls_identity"])
+    run_openssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "build/tls_identity/f.sec1"])
+    run_openssl(["pkcs8", "-topk8", "-nocrypt", "-in", "build/tls_identity/f.sec1", "-out", "build/tls_identity/f.key"])
+    mut seed: int64 = 3
+    for path in [key_path(), "build/tls_identity/f.sec1", "build/tls_identity/f.key"] {
+        for block in must parse_pem(io.read_file(path), op: "test") {
+            let whole = key_data(block)
+            assert block.label == "EC PARAMETERS" or whole is not none
+            for n in 0..len(block.data) {
+                if n < 80 or n % 37 == 0 {
+                    let _ = key_data(PemBlock(label: block.label, data: block.data[0..n]))
+                }
+            }
+            for _i in 0..2000 {
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                let at = (seed / 65536) % len(block.data)
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                let changed = block.data[0..at] + kod_bytes_from_array([(seed / 65536) % 256]) + block.data[at + 1..len(block.data)]
+                let _ = key_data(PemBlock(label: block.label, data: changed))
+            }
+        }
+    }
+}
+
+func echo_once(anon l: tcp.Listener, anon identity: Identity) -> str {
+    let got = accept(must l.accept(), identity)
+    if got is Err(e) {
+        return e.to_str()
+    }
+    mut n = 0
+    for true {
+        let data = must got.read(65536)
+        if len(data) == 0 {
+            break
+        }
+        n += len(data)
+        must got.write_all(data)
+    }
+    must got.close()
+    return f"{n}"
+}
+
+func read_so_many(anon c: TlsStream, anon want: int64) -> int64 {
+    mut n: int64 = 0
+    for n < want {
+        n += len(must c.read(65536))
+    }
+    return n
+}
+
+test "accept and connect, reading and writing at the same time" {
+    make_certificate()
+    let identity = must load_identity(cert_path(), key_path())
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let serving = spawn echo_once(l, identity)
+    let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+    mut piece = "0123456789"
+    for len(piece) < 100000 {
+        piece += piece
+    }
+    let reading = spawn read_so_many(c, 30 * len(piece))
+    for _i in 0..30 {
+        must c.write_str(piece)
+    }
+    assert reading.wait() == 30 * len(piece)
+    must c.close()
+    assert serving.wait() == f"{30 * len(piece)}"
+    identity.close()
+    must l.close()
+}
+
+test "accept without an identity, or with one that is closed" {
+    make_certificate()
+    let identity = must load_identity(cert_path(), key_path())
+    identity.close()
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let serving = spawn echo_once(l, identity)
+    assert connect("localhost", port: l.port(), trust_file: cert_path()) is Err(_)
+    assert serving.wait() == "tls accept: connection is closed"
+    must l.close()
 }
