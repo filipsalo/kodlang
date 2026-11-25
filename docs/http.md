@@ -460,8 +460,41 @@ handler, without the body, where there is no handler for `HEAD` itself.
 | `http.status(code)` | only a status, with its reason as the body where it can have one |
 | `respond(status, body, content_type = "text/plain; charset=utf-8")` | any of them |
 | `http.stream(write, status = 200, content_type = "application/octet-stream", length = none)` | a body that `write` [writes piece by piece](#streaming) |
-| `http.file(path, content_type = none)` | a file's content, streamed; `Response or Error`, a 404 `HttpError` when there is no such file (or it is a directory). Its type is the one its name's ending says, when left out |
+| `http.file(path, req = none, content_type = none)` | a [file](#files)'s content, streamed; `Response or Error`, a 404 `HttpError` when there is no such file (or it is a directory). Its type is the one its name's ending says, when left out |
 | `resp.with_header(name, value)` | `resp`, with a header added |
+
+### Files
+
+`routes.files(prefix, dir)` serves the files below the directory `dir`, for paths
+below `prefix`:
+
+<!-- kod:
+import "net/http"
+import "net/http" { Request, Response, get }
+import "time" { Duration }
+let routes = http.Router()
+-->
+```kod
+routes.files("/static", "public", max_age: Duration(hours: 1))   // /static/css/a.css is public/css/a.css
+routes.files("/", "site")                                        // and everything no other route fits
+```
+
+- A directory is its `index` (`index.html` when left out), and a `404` when it has
+  none; its path without the slash at the end is redirected to the one with it.
+- A part of the path that starts with a dot, such as `..` or `.git`, is a `404`, and
+  so is an empty one or one with a `\` or a NUL in it. (`/.well-known` needs a
+  `routes.files` of its own.) Symbolic links are followed, out of `dir` too.
+- `max_age` is sent as `Cache-Control: max-age`.
+
+Files have `Last-Modified`, and a request with `If-Modified-Since` that is as new
+gets a `304`. A `GET` with a `Range` of bytes (one range, in any of its three forms) gets
+those as a `206`, or a `416` when the file is shorter; `If-Range` with a date makes
+that depend on the file being unchanged. Anything else in a `Range` is ignored, and the
+whole file sent. There is no `ETag`. `http.file(path, req: req)` does the same in a
+handler; without `req` it always sends the whole file.
+
+When the response would be [compressed](#compressing) for the client, a `Range` is ignored: it
+would be of the bytes compressed, which aren't kept.
 
 ### Streaming
 

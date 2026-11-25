@@ -1,0 +1,307 @@
+// Files a server sends (docs/http.md#files).
+import "compress/inflate"
+import "libc"
+import "net/http" { Request, Response, Router, Server, file, http_date, parse_http_date, parse_range, text }
+import "net/tcp"
+import "posix"
+import "process"
+import "strbuilder" { StrBuilder }
+import "tasks"
+import "time"
+import "time" { Duration, Time }
+
+test "dates" {
+    assert http_date(Time(seconds: 784111777)) == "Sun, 06 Nov 1994 08:49:37 GMT"
+    assert http_date(Time(seconds: 0)) == "Thu, 01 Jan 1970 00:00:00 GMT"
+    assert http_date(Time(seconds: 1709251199, nanos: 5)) == "Thu, 29 Feb 2024 23:59:59 GMT"
+    for seconds in [0, 784111777, 951782400, 1709251199, 4102444800] {
+        assert (parse_http_date(http_date(Time(:seconds)))? or Time(seconds: -1)) == Time(:seconds)
+    }
+    for bad in ["", "yesterday", "Sun, 06 Nov 1994 08:49:37", "Sun, 06 Nov 1994 08:49:37 CET", "Sun, 31 Feb 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, x6 Nov 1994 08:49:37 GMT"] {
+        assert parse_http_date(bad) is none
+    }
+}
+
+func range_text(anon s: str, anon size: int64) -> str {
+    let r = parse_range(s, size)
+    if r is none {
+        return "ignored"
+    }
+    if r.from >= size {
+        return "not there"
+    }
+    return f"{r.from}-{r.to}"
+}
+
+test "ranges" {
+    assert range_text("bytes=0-9", 100) == "0-10"
+    assert range_text("bytes=0-0", 100) == "0-1"
+    assert range_text("bytes=90-", 100) == "90-100"
+    assert range_text("bytes=90-200", 100) == "90-100"
+    assert range_text("bytes=-10", 100) == "90-100"
+    assert range_text("bytes=-200", 100) == "0-100"
+    assert range_text("BYTES = 5-6 ", 100) == "5-7"
+    assert range_text("bytes=99-99", 100) == "99-100"
+    assert range_text("bytes=100-", 100) == "not there"
+    assert range_text("bytes=100-200", 100) == "not there"
+    assert range_text("bytes=-0", 100) == "not there"
+    assert range_text("bytes=0-", 0) == "not there"
+    assert range_text("bytes=-5", 0) == "not there"
+    for bad in ["", "bytes", "bytes=", "bytes=-", "bytes=a-b", "bytes=5-4", "bytes=1-2,4-5", "lines=1-2", "bytes=+1-2", "bytes=1--2", "bytes=99999999999999999999-", "bytes=0x1-2"] {
+        assert range_text(bad, 100) == "ignored"
+    }
+}
+
+func letters(anon n: int64) -> str {
+    let out = StrBuilder()
+    for i in 0..n {
+        out.append_byte('a' + i % 26)
+    }
+    return out.to_str()
+}
+
+type Fixture = shared struct {
+    dir: str
+    l: tcp.Listener
+    server: Server
+
+    func init(compress: bool = false) -> Fixture {
+        let dir = f"/tmp/kod-http-files-{libc.getpid()}"
+        let _ = process.run(["rm", "-rf", dir])
+        for d in ["", "/css", "/empty", "/sub.d", "/.git"] {
+            let _ = process.run(["mkdir", "-p", dir + d])
+        }
+        let l = must tcp.listen("127.0.0.1", port: 0)
+        let routes = Router()
+        let f = Fixture(:dir, :l, server: Server(:routes, :compress, log: func(anon line: str) { print(line) }))
+        f.put("/index.html", "<p>home</p>")
+        f.put("/css/a.css", "p \{}")
+        f.put("/css/index.html", "css")
+        f.put("/sub.d/README", "read me")
+        f.put("/html", "no ending")
+        f.put("/a b%.txt", "spaced")
+        f.put("/.secret", "hidden")
+        f.put("/.git/config", "hidden")
+        f.put("/big.txt", letters(200000))
+        f.put("/zero.bin", "")
+        f.put("/../kod-http-files-outside", "outside")
+        routes.files("/", dir)
+        routes.files("/s/", dir, index: "README", max_age: Duration(minutes: 2))
+        routes.get("/api", func(anon _req: Request) -> Response or Error { return text("api") })
+        routes.get("/one", func(anon req: Request) -> Response or Error { return try file(dir + "/big.txt", :req) })
+        routes.get("/whole", func(anon _req: Request) -> Response or Error { return try file(dir + "/big.txt") })
+        return f
+    }
+
+    func put(self, anon name: str, anon content: str) -> none {
+        let out = must posix.create(self.dir + name)
+        must out.write_str(content)
+        must out.close()
+    }
+
+    func raw(self, anon path: str, headers: str = "", method: str = "GET") -> str {
+        let conn = must tcp.connect("127.0.0.1", port: self.l.port())
+        must conn.write_all(kod_str_to_bytes(f"{method} {path} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n{headers}\r\n"))
+        let got = kod_bytes_to_str(must conn.read_all())
+        must conn.close()
+        return got
+    }
+
+    func end(self, anon serving: tasks.Task[str]) -> none {
+        self.server.stop()
+        assert serving.wait() == "ok"
+        must self.l.close()
+        let _ = process.run(["rm", "-rf", self.dir, "/tmp/kod-http-files-outside"])
+    }
+}
+
+func serve(anon f: Fixture) -> str {
+    if f.server.serve(f.l) is Err(e) {
+        return e.to_str()
+    }
+    return "ok"
+}
+
+func status_of(anon resp: str) -> str {
+    return resp[9..12]
+}
+
+func head_of(anon resp: str) -> str {
+    let Some(at) = resp.find("\r\n\r\n") else {
+        return "no end"
+    }
+    return resp[0..at + 2]
+}
+
+func body_of(anon resp: str) -> str {
+    return resp[len(head_of(resp)) + 2..len(resp)]
+}
+
+func header_of(anon resp: str, anon name: str) -> str {
+    for line in head_of(resp).split("\r\n") {
+        if line.starts_with(name + ": ") {
+            return line[len(name) + 2..len(line)]
+        }
+    }
+    return ""
+}
+
+test "files and directories" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    assert body_of(f.raw("/css/a.css")) == "p \{}"
+    assert header_of(f.raw("/css/a.css"), "Content-Type") == "text/css; charset=utf-8"
+    assert body_of(f.raw("/")) == "<p>home</p>"
+    assert header_of(f.raw("/"), "Content-Type") == "text/html; charset=utf-8"
+    assert body_of(f.raw("/index.html")) == "<p>home</p>"
+    assert body_of(f.raw("/css/")) == "css"
+    assert body_of(f.raw("/css/?q=1")) == "css"
+    assert body_of(f.raw("/a%20b%25.txt")) == "spaced"
+    assert header_of(f.raw("/html"), "Content-Type") == "application/octet-stream"
+    assert header_of(f.raw("/sub.d/README"), "Content-Type") == "application/octet-stream"
+    assert status_of(f.raw("/zero.bin")) == "200" and body_of(f.raw("/zero.bin")) == ""
+    assert body_of(f.raw("/api")) == "api"
+    for gone in ["/none", "/css/none", "/empty/", "/css/a.css/", "/css/a.css/b"] {
+        assert status_of(f.raw(gone)) == "404"
+    }
+    let moved = f.raw("/css?q=1")
+    assert status_of(moved) == "301" and header_of(moved, "Location") == "/css/?q=1"
+    // Under a prefix, with another index.
+    assert body_of(f.raw("/s/sub.d/")) == "read me"
+    assert body_of(f.raw("/s/css/a.css")) == "p \{}"
+    assert header_of(f.raw("/s/css/a.css"), "Cache-Control") == "max-age=120"
+    assert header_of(f.raw("/css/a.css"), "Cache-Control") == ""
+    assert status_of(f.raw("/s/css/")) == "404"
+    assert header_of(f.raw("/s"), "Location") == "/s/"
+    assert header_of(f.raw("/s/css"), "Location") == "/s/css/"
+    let head = f.raw("/big.txt", method: "HEAD")
+    assert header_of(head, "Content-Length") == "200000" and body_of(head) == ""
+    assert status_of(f.raw("/big.txt", method: "POST")) == "405"
+    f.end(serving)
+}
+
+test "nothing outside the directory, and nothing hidden" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    for path in [
+        "/../kod-http-files-outside",
+        "/css/../../kod-http-files-outside",
+        "/%2e%2e/kod-http-files-outside",
+        "/%2e%2e%2fkod-http-files-outside",
+        "/..%2fkod-http-files-outside",
+        "/css/..%2f..%2fkod-http-files-outside",
+        "/css/../index.html",
+        "/./index.html",
+        "/css//a.css",
+        "//css/a.css",
+        "//css",
+        "/.secret",
+        "/.git/config",
+        "/.git/",
+        "/css/%00",
+        "/index.html%00.css",
+        "/..%5cindex.html",
+        "/css%5ca.css",
+        "/s/../.secret",
+        "/s/.secret",
+        "/s//etc/hosts",
+        "/%2fetc/hosts",
+        "//etc/hosts",
+    ] {
+        let got = f.raw(path)
+        assert status_of(got) == "404"
+        assert not got.contains("outside") and not got.contains("hidden") and not got.contains("Location")
+    }
+    // Encoded slashes are slashes.
+    assert body_of(f.raw("/css%2fa.css")) == "p \{}"
+    f.end(serving)
+}
+
+test "If-Modified-Since" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let first = f.raw("/big.txt")
+    let modified = header_of(first, "Last-Modified")
+    let Some(t) = parse_http_date(modified) else {
+        fail("no Last-Modified")
+        return
+    }
+    let again = f.raw("/big.txt", headers: f"If-Modified-Since: {modified}\r\n")
+    assert status_of(again) == "304"
+    assert body_of(again) == "" and header_of(again, "Content-Length") == ""
+    assert header_of(again, "Last-Modified") == modified
+    assert status_of(f.raw("/big.txt", headers: f"If-Modified-Since: {http_date(t + Duration(hours: 1))}\r\n")) == "304"
+    assert status_of(f.raw("/big.txt", headers: f"If-Modified-Since: {modified}\r\n", method: "HEAD")) == "304"
+    assert status_of(f.raw("/s/big.txt", headers: f"If-Modified-Since: {modified}\r\n")) == "304"
+    assert header_of(f.raw("/s/big.txt", headers: f"If-Modified-Since: {modified}\r\n"), "Cache-Control") == "max-age=120"
+    for fresh in [f"If-Modified-Since: {http_date(t + Duration(seconds: -1))}", "If-Modified-Since: soon", f"If-Modified-Since: {modified}\r\nIf-None-Match: \"x\""] {
+        let got = f.raw("/big.txt", headers: fresh + "\r\n")
+        assert status_of(got) == "200" and len(body_of(got)) == 200000
+    }
+    // Changed.
+    let _ = process.run(["touch", "-t", "203001010000", f.dir + "/big.txt"])
+    assert status_of(f.raw("/big.txt", headers: f"If-Modified-Since: {modified}\r\n")) == "200"
+    f.end(serving)
+}
+
+test "Range" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let all = letters(200000)
+    assert header_of(f.raw("/big.txt"), "Accept-Ranges") == "bytes"
+    let _ = process.run(["touch", "-t", "202001010000", f.dir + "/big.txt"])
+    let got = f.raw("/big.txt", headers: "Range: bytes=10-19\r\n")
+    assert status_of(got) == "206"
+    assert header_of(got, "Content-Range") == "bytes 10-19/200000"
+    assert header_of(got, "Content-Length") == "10"
+    assert body_of(got) == all[10..20]
+    assert body_of(f.raw("/big.txt", headers: "Range: bytes=199990-\r\n")) == all[199990..200000]
+    assert body_of(f.raw("/big.txt", headers: "Range: bytes=-5\r\n")) == all[199995..200000]
+    assert body_of(f.raw("/big.txt", headers: "Range: bytes=1000-180000\r\n")) == all[1000..180001]
+    let past = f.raw("/big.txt", headers: "Range: bytes=200000-\r\n")
+    assert status_of(past) == "416" and header_of(past, "Content-Range") == "bytes */200000"
+    for ignored in ["Range: bytes=1-2,5-6", "Range: lines=1-2", "Range: bytes=9-1"] {
+        assert status_of(f.raw("/big.txt", headers: ignored + "\r\n")) == "200"
+    }
+    let head = f.raw("/big.txt", headers: "Range: bytes=10-19\r\n", method: "HEAD")
+    assert status_of(head) == "200" and header_of(head, "Content-Length") == "200000"
+    // Only if it hasn't changed.
+    let modified = header_of(f.raw("/big.txt"), "Last-Modified")
+    assert status_of(f.raw("/big.txt", headers: f"Range: bytes=1-2\r\nIf-Range: {modified}\r\n")) == "206"
+    for other in ["Sun, 06 Nov 1994 08:49:37 GMT", "\"tag\"", "Thu, 01 Jan 2099 00:00:00 GMT"] {
+        assert status_of(f.raw("/big.txt", headers: f"Range: bytes=1-2\r\nIf-Range: {other}\r\n")) == "200"
+    }
+    // A date too fresh to tell two changes apart.
+    f.put("/new.txt", "fresh")
+    let fresh = header_of(f.raw("/new.txt"), "Last-Modified")
+    assert status_of(f.raw("/new.txt", headers: f"Range: bytes=1-2\r\nIf-Range: {fresh}\r\n")) == "200"
+    // 304 goes first.
+    assert status_of(f.raw("/big.txt", headers: f"Range: bytes=1-2\r\nIf-Modified-Since: {modified}\r\n")) == "304"
+    assert status_of(f.raw("/zero.bin", headers: "Range: bytes=0-\r\n")) == "416"
+    // From a handler.
+    assert body_of(f.raw("/one", headers: "Range: bytes=10-19\r\n")) == all[10..20]
+    assert body_of(f.raw("/whole", headers: "Range: bytes=10-19\r\n")) == all
+    f.end(serving)
+}
+
+test "files, compressed" {
+    let f = Fixture(compress: true)
+    let serving = spawn serve(f)
+    let gzip = "Accept-Encoding: gzip\r\n"
+    let got = f.raw("/big.txt", headers: gzip)
+    assert header_of(got, "Content-Encoding") == "gzip" and header_of(got, "Vary") == "Accept-Encoding"
+    assert header_of(got, "Accept-Ranges") == ""
+    // Not a part of what isn't what it had.
+    let part = f.raw("/big.txt", headers: gzip + "Range: bytes=10-19\r\n")
+    assert status_of(part) == "200" and header_of(part, "Content-Encoding") == "gzip"
+    let modified = header_of(got, "Last-Modified")
+    assert status_of(f.raw("/big.txt", headers: gzip + f"If-Modified-Since: {modified}\r\n")) == "304"
+    // A client that doesn't take it, and a file that isn't compressed.
+    let plain = f.raw("/big.txt", headers: "Range: bytes=10-19\r\n")
+    assert status_of(plain) == "206" and body_of(plain) == letters(20)[10..20]
+    f.put("/b.bin", letters(5000))
+    assert status_of(f.raw("/b.bin", headers: gzip + "Range: bytes=10-19\r\n")) == "206"
+    f.put("/short.txt", letters(500))
+    assert status_of(f.raw("/short.txt", headers: gzip + "Range: bytes=10-19\r\n")) == "206"
+    f.end(serving)
+}

@@ -4,7 +4,7 @@ import "arrays"
 import "compress/deflate"
 import "compress/inflate"
 import "encoding/base64"
-import "io" { file_size }
+import "io" { FileInfo, file_info }
 import "net/tcp"
 import "net/tls"
 import "net/tls" { TlsStream }
@@ -17,7 +17,7 @@ import "strbuilder" { StrBuilder }
 import "stream" { IoError, BufReader, MemReader, MemWriter, Reader, Writer }
 import "tasks"
 import "time"
-import "time" { Duration }
+import "time" { Duration, Time }
 
 type Header = shared struct {
     name: str
@@ -1712,6 +1712,8 @@ type Request = shared struct {
     minor: int64 = 1
     // The route it fits, once that has been looked up (Router.find).
     found: Found? = none
+    // The server compresses responses.
+    packs: bool = false
     // Its body, when the handler is to read it.
     stream: BodyReader? = none
 
@@ -1823,24 +1825,66 @@ func stream(anon write: func(BodyWriter) -> none or Error, status: int64 = 200, 
     return Response(:status, reason: "", :headers, body: kod_str_to_bytes(""), writer: write, :length)
 }
 
-// The file's content, streamed.
-func file(anon path: str, content_type: str? = none) -> Response or Error {
-    let length = file_size(path)
-    if length is none {
-        throw HttpError(status: 404)
+// The file's content, streamed; with `req`, only what that asks for of it (docs/http.md#files).
+func file(anon path: str, req: Request? = none, content_type: str? = none) -> Response or Error {
+    if file_info(path) is FileInfo(info) and info.is_file {
+        return file_response(path, info, :req, content_type: content_type? or type_of_file(path))
     }
-    let size = length
-    return stream(func(anon w: BodyWriter) -> none or Error {
-        let f = try posix.open_read(path)
-        let copied = copy_file(f, w, size)
-        try f.close()
-        try copied
-    }, content_type: content_type? or type_of_file(path), :length)
+    throw HttpError(status: 404)
 }
 
-// Its first `size` bytes: no more, when it has grown since its size was asked for.
-func copy_file(anon f: Fd, anon w: BodyWriter, anon size: int64) -> none or Error {
-    mut left = size
+func file_response(anon path: str, anon info: FileInfo, req: Request?, content_type: str) -> Response {
+    let modified = Time(seconds: info.modified_ns / 1000000000)
+    let size = info.size
+    let whole = file_part(path, 0, size, :content_type)
+    whole.headers.add("Last-Modified", http_date(modified))
+    whole.headers.add("Accept-Ranges", "bytes")
+    if req is none {
+        return whole
+    }
+    let r = req
+    if (r.method == "GET" or r.method == "HEAD") and not r.headers.has("if-none-match") and parse_http_date(r.headers.get("if-modified-since")? or "") is Time(since) and not since < modified {
+        return status(304).with_header("Last-Modified", http_date(modified))
+    }
+    // Of a body sent compressed, a range would be of that.
+    if r.method != "GET" or (r.packs and size >= COMPRESS_FROM and compressible(whole) and takes_gzip(r)) {
+        return whole
+    }
+    if r.headers.get("if-range") is str(unchanged) {
+        // A date that another change may share, in the same second, says nothing.
+        let settled = time.unix_ns() - info.modified_ns > 2000000000
+        if not settled or parse_http_date(unchanged) is none or unchanged != http_date(modified) {
+            return whole
+        }
+    }
+    let range = parse_range(r.headers.get("range")? or "", size)
+    if range is none {
+        return whole
+    }
+    if range.from >= size {
+        return status(416).with_header("Content-Range", f"bytes */{size}")
+    }
+    let part = file_part(path, range.from, range.to, :content_type)
+    part.status = 206
+    part.headers.add("Last-Modified", http_date(modified))
+    return part.with_header("Content-Range", f"bytes {range.from}-{range.to - 1}/{size}")
+}
+
+// The bytes of a file from `from` up to `to`: no more, when it has grown.
+func file_part(anon path: str, anon from: int64, anon to: int64, content_type: str) -> Response {
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        let f = try posix.open_read(path)
+        let copied = copy_part(f, w, from, to)
+        try f.close()
+        try copied
+    }, :content_type, length: to - from)
+}
+
+func copy_part(anon f: Fd, anon w: BodyWriter, anon from: int64, anon to: int64) -> none or Error {
+    if from > 0 {
+        try f.seek(from)
+    }
+    mut left = to - from
     for left > 0 {
         mut want = left
         if want > STREAM_PIECE {
@@ -1855,9 +1899,90 @@ func copy_file(anon f: Fd, anon w: BodyWriter, anon size: int64) -> none or Erro
     }
 }
 
+// The bytes from `from` up to `to`.
+type ByteRange = struct {
+    from: int64
+    to: int64
+}
+
+// The one range of bytes that a `Range` header asks for, of `size`; `from` is at least
+// `size` when there are none of them. None for anything else in it.
+func parse_range(anon text: str, anon size: int64) -> ByteRange? {
+    let eq = text.find("=")
+    if eq is none {
+        return none
+    }
+    let spec = text[eq + 1..len(text)].trim()
+    let dash = spec.find("-")
+    if dash is none {
+        return none
+    }
+    if text[0..eq].trim().lower() != "bytes" {
+        return none
+    }
+    let first = spec[0..dash]
+    let last = spec[dash + 1..len(spec)]
+    if len(first) > 18 or len(last) > 18 or not (len(first) == 0 or all_digits(first)) or not (len(last) == 0 or all_digits(last)) {
+        return none
+    }
+    if len(first) == 0 {
+        if len(last) == 0 {
+            return none
+        }
+        // The last so many.
+        let n = last.parse_int()? or 0
+        if n == 0 {
+            return ByteRange(from: size, to: size)
+        }
+        if n > size {
+            return ByteRange(from: 0, to: size)
+        }
+        return ByteRange(from: size - n, to: size)
+    }
+    let from = first.parse_int()? or 0
+    mut to = size
+    if len(last) > 0 {
+        let end = last.parse_int()? or 0
+        if end < from {
+            return none
+        }
+        if end + 1 < size {
+            to = end + 1
+        }
+    }
+    return ByteRange(:from, :to)
+}
+
+let DAYS: [str] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
+let MONTHS: [str] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// A time as HTTP writes it: `Sun, 06 Nov 1994 08:49:37 GMT`.
+func http_date(anon t: Time) -> str {
+    let u = t.utc()
+    let day = ((t.seconds / 86400) % 7 + 7) % 7
+    return f"{DAYS[day]}, {u.day:02} {MONTHS[u.month - 1]} {u.year:04} {u.hour:02}:{u.minute:02}:{u.second:02} GMT"
+}
+
+// The time that http_date gave; none for anything else, the older forms included.
+func parse_http_date(anon s: str) -> Time? {
+    if len(s) != 29 or s[25..29] != " GMT" or s[3..5] != ", " {
+        return none
+    }
+    for i, month in MONTHS {
+        if s[7..12] == f" {month} " {
+            return time.parse(f"{s[12..16]}-{i + 1:02}-{s[5..7]}T{s[17..25]}Z")
+        }
+    }
+    return none
+}
+
 // The type that the ending of a file's name says it is.
 func type_of_file(anon path: str) -> str {
-    let parts = path.split(".")
+    let names = path.split("/")
+    let parts = names[len(names) - 1].split(".")
+    if len(parts) == 1 {
+        return "application/octet-stream"
+    }
     match parts[len(parts) - 1].lower() {
         "html" | "htm" -> return "text/html; charset=utf-8"
         "css" -> return "text/css; charset=utf-8"
@@ -1916,6 +2041,7 @@ func reason_phrase(anon status: int64) -> str {
         200 -> return "OK"
         201 -> return "Created"
         204 -> return "No Content"
+        206 -> return "Partial Content"
         301 -> return "Moved Permanently"
         302 -> return "Found"
         303 -> return "See Other"
@@ -1929,6 +2055,7 @@ func reason_phrase(anon status: int64) -> str {
         405 -> return "Method Not Allowed"
         408 -> return "Request Timeout"
         413 -> return "Content Too Large"
+        416 -> return "Range Not Satisfiable"
         417 -> return "Expectation Failed"
         431 -> return "Request Header Fields Too Large"
         500 -> return "Internal Server Error"
@@ -2165,6 +2292,12 @@ func with_vary(anon resp: Response) -> Response {
     return Response(status: resp.status, reason: resp.reason, :headers, body: resp.body, writer: resp.writer, length: resp.length)
 }
 
+// Headers of a body sent compressed: a range would not be of the bytes sent.
+func say_packed(anon headers: Headers) -> none {
+    headers.items = without(headers, ["accept-ranges"]).items
+    headers.add("Content-Encoding", "gzip")
+}
+
 // Whether a response is one to compress for clients that take that.
 func compressible(anon resp: Response) -> bool {
     if not may_have_body(resp.status) or resp.status == 206 or resp.headers.has("content-encoding") or resp.headers.has("etag") or has_token(resp.headers, "cache-control", "no-transform") {
@@ -2328,7 +2461,7 @@ type BodyWriter = shared struct {
         } else {
             self.packer = deflate.gzip_writer(self.packed, level: self.level)
         }
-        self.resp.headers.add("Content-Encoding", "gzip")
+        say_packed(self.resp.headers)
     }
 
     // The headers, now that the first piece goes out, which may be the last.
@@ -2570,6 +2703,32 @@ type Router = shared struct {
         node.routes += [Route(:stream_body, :method, :names, :handler)]
     }
 
+    // Serves the files below `dir` for the paths below `prefix`: see docs/http.md#files.
+    func files(self, anon prefix: str, anon dir: str, index: str = "index.html", max_age: Duration? = none) -> none {
+        mut under = prefix
+        if not under.ends_with("/") {
+            under += "/"
+        }
+        let answer = func(anon req: Request, anon path: str) -> Response {
+            let resp = file_below(dir, req, path, :index)
+            if max_age is Duration(d) and resp.status < 400 and resp.status != 301 {
+                resp.headers.add("Cache-Control", f"max-age={d.as_seconds()}")
+            }
+            return resp
+        }
+        self.get(under, func(anon req: Request) -> Response or Error {
+            return answer(req, "")
+        })
+        self.get(under + "{path...}", func(anon req: Request) -> Response or Error {
+            return answer(req, req.param("path"))
+        })
+        if len(under) > 1 {
+            self.get(under[0..len(under) - 1], func(anon req: Request) -> Response or Error {
+                return redirect_below(req)
+            })
+        }
+    }
+
     // Looks up the route `req` fits, which is kept with it.
     func find(self, anon req: Request) -> Found {
         if req.found is Found(f) {
@@ -2624,6 +2783,42 @@ type Router = shared struct {
         }
         return status(405).with_header("Allow", ", ".join(sort.sorted(search.allowed)))
     }
+}
+
+// The file at `path` below `dir`, in response to `req`.
+func file_below(anon dir: str, anon req: Request, anon path: str, index: str) -> Response {
+    let parts = path.split("/")
+    let last = len(parts) - 1
+    for i, part in parts {
+        // The last is empty for a directory.
+        if (len(part) == 0 and i < last) or part.starts_with(".") or part.contains("\\") or part.contains("\0") {
+            return status(404)
+        }
+    }
+    mut at = dir + "/" + path
+    let is_dir = len(parts[last]) == 0
+    if is_dir {
+        at += index
+    }
+    let Some(info) = file_info(at) else {
+        return status(404)
+    }
+    if info.is_dir and not is_dir {
+        return redirect_below(req)
+    }
+    if not info.is_file {
+        return status(404)
+    }
+    return file_response(at, info, req: req, content_type: type_of_file(at))
+}
+
+// To the path with a slash at its end.
+func redirect_below(anon req: Request) -> Response {
+    mut to = req.path() + "/"
+    if req.target.find("?") is int64(q) {
+        to += req.target[q..len(req.target)]
+    }
+    return redirect(to, status: 301)
 }
 
 // What looking up a request's route gave.
@@ -2729,6 +2924,7 @@ type ServerConn = shared struct {
             }
             self.enter(.Handling, Duration())
             let began = time.monotonic_ns()
+            req.packs = server.compress
             let resp = server.answer(req)
             if self.gone {
                 return
@@ -2842,13 +3038,13 @@ type ServerConn = shared struct {
             }
             if level >= 0 and resp.length is not none {
                 resp.length = none
-                resp.headers.add("Content-Encoding", "gzip")
+                say_packed(resp.headers)
             }
         } else if level >= 0 and len(resp.body) >= COMPRESS_FROM {
             let packed = deflate.gzip(resp.body, :level)
             if len(packed) < len(resp.body) {
                 resp.body = packed
-                resp.headers.add("Content-Encoding", "gzip")
+                say_packed(resp.headers)
             }
         }
         mut goes_on = keep_alive

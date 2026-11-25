@@ -180,6 +180,7 @@ A `BufReader` doesn't close its inner stream.
 | `stdin()`, `stdout()`, `stderr()` | descriptors 0, 1 and 2 |
 | `Fd(fd: n)` | wrap a descriptor from elsewhere |
 | `f.close()` | close it and set `f.fd` to -1, so closing it again fails; `none or Error` |
+| `f.seek(pos)` | goes on reading or writing `pos` bytes from the start of a file; `none or Error` |
 | `f.is_terminal()` | whether it is a terminal, rather than a file or a pipe |
 | `signal(pid, sig)` | send the signal numbered `sig` to the process `pid`, as C's `kill`; `none or Error` (for a child of this program, `process.Child.kill` is the easier way) |
 
