@@ -6,6 +6,7 @@
 // written stored, with the fixed codes or with its own Huffman codes, whichever
 // is smallest.
 
+import "bytebuffer" { ByteBuffer }
 // The length and distance tables of RFC 1951 §3.2.5.
 import "compress/tables" { LEN_BASE, LEN_EXTRA, DIST_BASE, DIST_EXTRA }
 import "hash/crc32"
@@ -323,6 +324,57 @@ func block_symbols() -> int64 {
     return 16384
 }
 
+// The longest match for position `i` among the first `chain` of those before `p`
+// and `p` itself that its chain in `prev` goes on to, none of them before `far`:
+// longer than `best`, which is 2 or more, and at most `most`, which is more. Its
+// length, and from bit 16 up its distance; 0 for none. One of `nice` is enough.
+func longest_of(anon data: bytes, anon prev: [int64], anon i: int64, best: int64, most: int64, nice: int64, chain: int64, first: int64) -> int64 {
+    let mask = len(prev) - 1
+    let far = i - WINDOW
+    mut length = best
+    mut distance: int64 = 0
+    mut p = first
+    mut left = chain
+    // What a longer match has to have at its end, and at its start.
+    mut last = data[i + length]
+    let start = data[i] | data[i + 1] << 8
+    for p >= far and p >= 0 and left > 0 {
+        if data[p + length] == last and (data[p] | data[p + 1] << 8) == start {
+            mut l: int64 = 2
+            for l + 8 <= most {
+                let x = kod_bytes_le64(data, p + l) ^ kod_bytes_le64(data, i + l)
+                if x != 0 {
+                    // The first byte that differs holds the lowest bit that does.
+                    l += x.trailing_zeros() >> 3
+                    break
+                }
+                l += 8
+            }
+            for l < most and data[p + l] == data[i + l] {
+                l += 1
+            }
+            if l > length {
+                length = l
+                distance = i - p
+                if l >= nice {
+                    break
+                }
+                last = data[i + length]
+            }
+        }
+        let next = prev[p & mask]
+        if next >= p {
+            break
+        }
+        p = next
+        left -= 1
+    }
+    if distance == 0 {
+        return 0
+    }
+    return length | distance << 16
+}
+
 // As far back as a match may be.
 let WINDOW: int64 = 32768
 // More than a match is long.
@@ -333,15 +385,14 @@ let PIECE: int64 = 65536
 type Encoder = shared struct {
     data: bytes
     level: int64
-    out: StrBuilder = StrBuilder()
+    out: ByteBuffer = ByteBuffer()
     // Bits not yet written out, the oldest lowest.
     acc: int64 = 0
     nbits: int64 = 0
     // The block being collected: a symbol is a literal byte, or 256 + the length
-    // of a match whose distance is in `dists` (0 for a literal). `block_start` is
-    // where the block's input starts and `covered` where the symbols so far end.
+    // of a match and, from bit 16 up, its distance. `block_start` is where the
+    // block's input starts and `covered` where the symbols so far end.
     syms: [int64] = []
-    dists: [int64] = []
     block_start: int64 = 0
     covered: int64 = 0
     len_code: [int64] = _length_codes
@@ -363,20 +414,18 @@ type Encoder = shared struct {
     func bits(self, anon value: int64, anon n: int64) -> none {
         self.acc = self.acc | (value << self.nbits)
         self.nbits += n
-        for self.nbits >= 8 {
-            self.out.append_byte(self.acc & 255)
-            self.acc = self.acc >> 8
-            self.nbits -= 8
+        if self.nbits >= 32 {
+            self.out.push_le(self.acc, size: 4)
+            self.acc = self.acc >> 32
+            self.nbits -= 32
         }
     }
 
     // Pad with zero bits to the next byte.
     func align(self) -> none {
-        if self.nbits > 0 {
-            self.out.append_byte(self.acc & 255)
-            self.acc = 0
-            self.nbits = 0
-        }
+        self.out.push_le(self.acc, size: (self.nbits + 7) >> 3)
+        self.acc = 0
+        self.nbits = 0
     }
 
     func dcode(self, anon d: int64) -> int64 {
@@ -388,7 +437,6 @@ type Encoder = shared struct {
 
     func literal(self, anon at: int64) -> none {
         self.syms += [self.data[at]]
-        self.dists += [0]
         self.covered = at + 1
         if len(self.syms) >= block_symbols() {
             self.block(false)
@@ -396,8 +444,7 @@ type Encoder = shared struct {
     }
 
     func matched(self, anon at: int64, anon length: int64, anon distance: int64) -> none {
-        self.syms += [256 + length]
-        self.dists += [distance]
+        self.syms += [256 + length | distance << 16]
         self.covered = at + length
         if len(self.syms) >= block_symbols() {
             self.block(false)
@@ -421,7 +468,8 @@ type Encoder = shared struct {
             self.align()
             self.bits(n, 16)
             self.bits(n ^ 0xffff, 16)
-            self.out.append_bytes(self.data[at..at + n])
+            self.align()
+            self.out.push_bytes(self.data[at..at + n])
             at += n
         }
     }
@@ -431,18 +479,21 @@ type Encoder = shared struct {
         mut lit_freq = zeros(286)
         mut dist_freq = zeros(30)
         lit_freq[256] = 1
-        mut extra: int64 = 0
-        for k, symbol in self.syms {
+        let len_code = self.len_code
+        for symbol in self.syms {
             if symbol < 256 {
                 lit_freq[symbol] += 1
             } else {
-                let c = self.len_code[symbol - 256]
-                lit_freq[257 + c] += 1
-                extra += LEN_EXTRA[c]
-                let dc = self.dcode(self.dists[k])
-                dist_freq[dc] += 1
-                extra += DIST_EXTRA[dc]
+                lit_freq[257 + len_code[(symbol & 0xffff) - 256]] += 1
+                dist_freq[self.dcode(symbol >> 16)] += 1
             }
+        }
+        mut extra: int64 = 0
+        for c in 0..29 {
+            extra += lit_freq[257 + c] * LEN_EXTRA[c]
+        }
+        for dc, f in dist_freq {
+            extra += f * DIST_EXTRA[dc]
         }
         let lit_len = code_lengths(lit_freq, 15)
         let dist_len = code_lengths(dist_freq, 15)
@@ -511,7 +562,6 @@ type Encoder = shared struct {
             self.symbols(lit_len, dist_len)
         }
         self.syms = []
-        self.dists = []
         self.block_start = self.covered
     }
 
@@ -519,20 +569,43 @@ type Encoder = shared struct {
     func symbols(self, anon lit_len: [int64], anon dist_len: [int64]) -> none {
         let lit_code = codes_of(lit_len)
         let dist_code = codes_of(dist_len)
-        for k, symbol in self.syms {
+        let len_code = self.len_code
+        let out = self.out
+        mut acc = self.acc
+        mut nbits = self.nbits
+        for symbol in self.syms {
             if symbol < 256 {
-                self.bits(lit_code[symbol], lit_len[symbol])
-                continue
+                acc = acc | lit_code[symbol] << nbits
+                nbits += lit_len[symbol]
+            } else {
+                let length = (symbol & 0xffff) - 256
+                let c = len_code[length]
+                acc = acc | lit_code[257 + c] << nbits
+                nbits += lit_len[257 + c]
+                // At most 15 + 5 bits, after 31.
+                acc = acc | (length - LEN_BASE[c]) << nbits
+                nbits += LEN_EXTRA[c]
+                if nbits >= 32 {
+                    out.push_le(acc, size: 4)
+                    acc = acc >> 32
+                    nbits -= 32
+                }
+                let d = symbol >> 16
+                let dc = self.dcode(d)
+                acc = acc | dist_code[dc] << nbits
+                nbits += dist_len[dc]
+                // At most 15 + 13 bits, after 31.
+                acc = acc | (d - DIST_BASE[dc]) << nbits
+                nbits += DIST_EXTRA[dc]
             }
-            let length = symbol - 256
-            let c = self.len_code[length]
-            self.bits(lit_code[257 + c], lit_len[257 + c])
-            self.bits(length - LEN_BASE[c], LEN_EXTRA[c])
-            let d = self.dists[k]
-            let dc = self.dcode(d)
-            self.bits(dist_code[dc], dist_len[dc])
-            self.bits(d - DIST_BASE[dc], DIST_EXTRA[dc])
+            if nbits >= 32 {
+                out.push_le(acc, size: 4)
+                acc = acc >> 32
+                nbits -= 32
+            }
         }
+        self.acc = acc
+        self.nbits = nbits
         self.bits(lit_code[256], lit_len[256])
     }
 
@@ -568,35 +641,17 @@ type Encoder = shared struct {
         if shorter >= cfg.good {
             chain = chain >> 2
         }
-        mut found: int64 = 0
-        mut p = self.prev[i & self.mask]
-        for p >= 0 and i - p <= WINDOW and chain > 0 {
-            if self.data[p + best] == self.data[i + best] and self.data[p] == self.data[i] and self.data[p + 1] == self.data[i + 1] {
-                mut l: int64 = 2
-                for l < most and self.data[p + l] == self.data[i + l] {
-                    l += 1
-                }
-                if l > best {
-                    best = l
-                    found = l
-                    self.match_dist = i - p
-                    if l >= nice {
-                        break
-                    }
-                }
-            }
-            let next = self.prev[p & self.mask]
-            if next >= p {
-                break
-            }
-            p = next
-            chain -= 1
-        }
-        // A short match far back costs more than its literals, as zlib judges.
-        if found == 3 and self.match_dist > 4096 {
+        let first = self.prev[i & self.mask]
+        if first < 0 {
             return 0
         }
-        return found
+        let got = longest_of(self.data, self.prev, i, :best, :most, :nice, :chain, :first)
+        self.match_dist = got >> 16
+        // A short match far back costs more than its literals, as zlib judges.
+        if (got & 0xffff) == 3 and self.match_dist > 4096 {
+            return 0
+        }
+        return got & 0xffff
     }
 
     // Take the first match at each position, up to `end`.
@@ -771,9 +826,9 @@ type Encoder = shared struct {
     }
 }
 
-func le32(anon out: StrBuilder, anon v: int64) -> none {
+func le32(anon out: ByteBuffer, anon v: int64) -> none {
     for k in 0..4 {
-        out.append_byte((v >> (8 * k)) & 255)
+        out.push((v >> (8 * k)) & 255)
     }
 }
 
@@ -788,7 +843,7 @@ func raw(anon data: bytes, level: int64 = 6) -> bytes {
 // modification time.
 func gzip_head(anon e: Encoder) -> none {
     for b in [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3] {
-        e.out.append_byte(b)
+        e.out.push(b)
     }
 }
 
@@ -803,15 +858,15 @@ func gzip(anon data: bytes, level: int64 = 6) -> bytes {
 
 // A zlib stream's header, two bytes which name the level.
 func zlib_head(anon e: Encoder) -> none {
-    e.out.append_byte(0x78)
+    e.out.push(0x78)
     if e.level <= 1 {
-        e.out.append_byte(0x01)
+        e.out.push(0x01)
     } else if e.level <= 5 {
-        e.out.append_byte(0x5e)
+        e.out.push(0x5e)
     } else if e.level == 6 {
-        e.out.append_byte(0x9c)
+        e.out.push(0x9c)
     } else {
-        e.out.append_byte(0xda)
+        e.out.push(0xda)
     }
 }
 
@@ -830,9 +885,9 @@ func adler32(anon sum: int64, anon data: bytes) -> int64 {
     return ((b % 65521) << 16) | (a % 65521)
 }
 
-func be32(anon out: StrBuilder, anon v: int64) -> none {
+func be32(anon out: ByteBuffer, anon v: int64) -> none {
     for k in 0..4 {
-        out.append_byte((v >> (24 - 8 * k)) & 255)
+        out.push((v >> (24 - 8 * k)) & 255)
     }
 }
 
@@ -943,7 +998,7 @@ type DeflateWriter = shared struct {
             return
         }
         let packed = out.to_bytes()
-        out.clear()
+        out.drop_front(out.len())
         if self.to.write_all(packed) is Err(e) {
             self.failed = e
             throw e

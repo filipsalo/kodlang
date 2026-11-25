@@ -545,8 +545,8 @@ A response is left as it is when it has a `Content-Encoding`, an `ETag` (which
 names the bytes sent) or a `Cache-Control` of `no-transform`, when its status is
 `206`, and when it is streamed to a client that speaks HTTP/1.0.
 
-It is off unless asked for: it takes 15 to 25 µs for each KB, as long as several
-requests without it. Don't compress a page that has both a secret
+It is off unless asked for: it takes 10 to 20 µs for each KB, as long as a request
+or two without it. Don't compress a page that has both a secret
 (such as a CSRF token) and text the client chose: the length then tells about the
 secret (the BREACH attack). A `Cache-Control` of `no-transform` leaves it out.
 
