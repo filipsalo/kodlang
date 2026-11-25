@@ -11,6 +11,8 @@ let _LIMB_MASK: int64 = 1073741823
 // 2^52: the bit a normal float64 has above its stored fraction.
 let _HIDDEN: int64 = 4503599627370496
 let _POW10: [int64] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+// 5^n for n from 0 to 27: those that fit an int64.
+let _POW5_SMALL: [int64] = [1, 5, 25, 125, 625, 3125, 15625, 78125, 390625, 1953125, 9765625, 48828125, 244140625, 1220703125, 6103515625, 30517578125, 152587890625, 762939453125, 3814697265625, 19073486328125, 95367431640625, 476837158203125, 2384185791015625, 11920928955078125, 59604644775390625, 298023223876953125, 1490116119384765625, 7450580596923828125]
 // Every power of ten up to 10^22 is exact in a float64.
 let _POW10F: [float64] = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0, 1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0, 1000000000000000000000.0, 10000000000000000000000.0]
 
@@ -375,6 +377,152 @@ func format(anon x: float64) -> str {
         f = frac + _HIDDEN
         e = biased - 1075
     }
+    // The digits, with zeros maybe at their end, and the power of ten of the first.
+    mut digits = ""
+    mut exp10: int64 = 0
+    let k = _floor_div(_log10_of(e, f == _HIDDEN and biased > 1), 4194304)
+    if e < 0 and e > -53 and (f & ((1 << -e) - 1)) == 0 {
+        // A whole number.
+        digits = str(f >> -e)
+        exp10 = len(digits) - 1
+    } else if k >= -308 {
+        let got = _shortest(f, e, closer: f == _HIDDEN and biased > 1, :k)
+        digits = str(got >> 1)
+        exp10 = len(digits) - 1 + k + (got & 1)
+    } else {
+        digits = shortest_exact(f, e)
+        let colon = digits.find(":")? or 0
+        exp10 = digits[colon + 1..len(digits)].parse_int()? or 0
+        digits = digits[0..colon]
+    }
+    mut nd = len(digits)
+    for nd > 1 and digits[nd - 1] == '0' {
+        nd -= 1
+    }
+    let sb = kod_sb_new()
+    if negative {
+        kod_sb_append_byte(sb, '-')
+    }
+    if exp10 >= -6 and exp10 < 21 {
+        if exp10 >= 0 {
+            for i in 0..exp10 + 1 {
+                if i < nd {
+                    kod_sb_append_byte(sb, digits[i])
+                } else {
+                    kod_sb_append_byte(sb, '0')
+                }
+            }
+            kod_sb_append_byte(sb, '.')
+            if nd > exp10 + 1 {
+                for i in exp10 + 1..nd {
+                    kod_sb_append_byte(sb, digits[i])
+                }
+            } else {
+                kod_sb_append_byte(sb, '0')
+            }
+        } else {
+            kod_sb_append(sb, "0.")
+            for _ in 0..-exp10 - 1 {
+                kod_sb_append_byte(sb, '0')
+            }
+            for i in 0..nd {
+                kod_sb_append_byte(sb, digits[i])
+            }
+        }
+    } else {
+        kod_sb_append_byte(sb, digits[0])
+        if nd > 1 {
+            kod_sb_append_byte(sb, '.')
+            for i in 1..nd {
+                kod_sb_append_byte(sb, digits[i])
+            }
+        }
+        if exp10 < 0 {
+            kod_sb_append(sb, f"e-{0 - exp10}")
+        } else {
+            kod_sb_append(sb, f"e+{exp10}")
+        }
+    }
+    return kod_sb_to_str(sb)
+}
+
+// What the Schubfach method takes the power of ten from: e × log10(2), and log10(3/4)
+// off when the float below is closer than the one above, in units of 2^-22.
+func _log10_of(anon e: int64, anon closer: bool) -> int64 {
+    if closer {
+        return e * 1262611 - 524031
+    }
+    return e * 1262611
+}
+
+// The fewest digits that read back as f × 2^e, as a number to be multiplied by 10^k, or
+// by 10^(k+1) when the lowest bit is set, which comes after the digits: Giulietti's
+// Schubfach method, with 128 bits of the power of ten (10^-k, so -k is at most 308).
+func _shortest(anon f: int64, anon e: int64, closer: bool, k: int64) -> int64 {
+    let out = f & 1
+    mut left = 4 * f - 2
+    if closer {
+        left += 1
+    }
+    let at = 2 * (342 - k)
+    let hi = _POW5[at]
+    mut lo = _POW5[at + 1]
+    // The table's power, rounded down where it isn't exact: the method's is one above.
+    if k > 27 or k < -55 {
+        lo += 1
+    }
+    let h = e + _floor_div(-k * 1741647, 524288) + 1
+    let vl = _mul_odd(hi, lo, left << h)
+    let v = _mul_odd(hi, lo, 4 * f << h)
+    let vr = _mul_odd(hi, lo, 4 * f + 2 << h)
+    let lower = vl + out
+    let upper = vr - out
+    let s = v >> 2
+    if s >= 10 {
+        let t = s / 10
+        let down = lower <= 40 * t
+        let up = 40 * t + 40 <= upper
+        if down != up {
+            if up {
+                return (t + 1) << 1 | 1
+            }
+            return t << 1 | 1
+        }
+    }
+    let down = lower <= 4 * s
+    let up = 4 * s + 4 <= upper
+    if down != up {
+        if up {
+            return (s + 1) << 1
+        }
+        return s << 1
+    }
+    // Both in or both out: the nearer, or the even one.
+    let mid = 4 * s + 2
+    if v > mid or (v == mid and (s & 1) == 1) {
+        return (s + 1) << 1
+    }
+    return s << 1
+}
+
+// The high 64 bits of n × (hi, lo), which is 192 bits, with the lowest of them set when
+// what is below isn't 0 (but for an error of the last place).
+func _mul_odd(anon hi: int64, anon lo: int64, anon n: int64) -> int64 {
+    let low = n * hi
+    let sum = low + n.mul_high(lo)
+    mut top = n.mul_high(hi)
+    if _below(sum, low) {
+        top += 1
+    }
+    if sum != 0 and sum != 1 {
+        return top | 1
+    }
+    return top
+}
+
+// The same with big numbers, for f × 2^e of any size: the digits, a colon and the power of
+// ten of the first.
+func shortest_exact(anon f: int64, anon e: int64) -> str {
     // x is r / s; the values that read back as x are those within mm below it
     // and mp above it, on the same scale. The ends count when f is even, since
     // a tie rounds to the even neighbour.
@@ -438,15 +586,16 @@ func format(anon x: float64) -> str {
             d += 1
         }
         digits += [d]
-        let half = _big_cmp(_big_shl(r, 1), s)
-        let up = half > 0 or (half == 0 and d % 2 == 1)
-        mut close = false
-        if up {
-            let c = _big_cmp(_big_add(r, mp), s)
-            close = c > 0 or (c == 0 and even)
-        } else {
-            let c = _big_cmp(r, mm)
-            close = c < 0 or (c == 0 and even)
+        // Whether the digits so far, and the next above them, read back as x.
+        let c = _big_cmp(r, mm)
+        let down_ok = c < 0 or (c == 0 and even)
+        let c2 = _big_cmp(_big_add(r, mp), s)
+        let up_ok = c2 > 0 or (c2 == 0 and even)
+        let close = down_ok or up_ok
+        mut up = up_ok
+        if down_ok and up_ok {
+            let half = _big_cmp(_big_shl(r, 1), s)
+            up = half > 0 or (half == 0 and d % 2 == 1)
         }
         if close {
             if up {
@@ -465,56 +614,11 @@ func format(anon x: float64) -> str {
             break
         }
     }
-    mut nd = len(digits)
-    for nd > 1 and digits[nd - 1] == 0 {
-        nd -= 1
+    mut out = ""
+    for d in digits {
+        out += str(d)
     }
-    let exp10 = k - 1
-    let sb = kod_sb_new()
-    if negative {
-        kod_sb_append_byte(sb, '-')
-    }
-    if exp10 >= -6 and exp10 < 21 {
-        if exp10 >= 0 {
-            for i in 0..exp10 + 1 {
-                if i < nd {
-                    kod_sb_append_byte(sb, '0' + digits[i])
-                } else {
-                    kod_sb_append_byte(sb, '0')
-                }
-            }
-            kod_sb_append_byte(sb, '.')
-            if nd > exp10 + 1 {
-                for i in exp10 + 1..nd {
-                    kod_sb_append_byte(sb, '0' + digits[i])
-                }
-            } else {
-                kod_sb_append_byte(sb, '0')
-            }
-        } else {
-            kod_sb_append(sb, "0.")
-            for _ in 0..-exp10 - 1 {
-                kod_sb_append_byte(sb, '0')
-            }
-            for i in 0..nd {
-                kod_sb_append_byte(sb, '0' + digits[i])
-            }
-        }
-    } else {
-        kod_sb_append_byte(sb, '0' + digits[0])
-        if nd > 1 {
-            kod_sb_append_byte(sb, '.')
-            for i in 1..nd {
-                kod_sb_append_byte(sb, '0' + digits[i])
-            }
-        }
-        if exp10 < 0 {
-            kod_sb_append(sb, f"e-{0 - exp10}")
-        } else {
-            kod_sb_append(sb, f"e+{exp10}")
-        }
-    }
-    return kod_sb_to_str(sb)
+    return f"{out}:{k - 1}"
 }
 
 // `s` as the nearest float64 (a tie goes to the even one) when it is a
@@ -948,8 +1052,8 @@ func fixed(anon x: float64, digits: int64, scale: int64 = 0) -> str {
         return d
     }
     mut padded = d
-    for len(padded) <= digits {
-        padded = "0" + padded
+    if len(d) <= digits {
+        padded = "0".repeat(digits + 1 - len(d)) + d
     }
     let cut = len(padded) - digits
     return padded[0..cut] + "." + padded[cut..len(padded)]
@@ -1020,6 +1124,15 @@ func _scaled(anon x: float64, anon s: int64) -> str {
         f = frac + _HIDDEN
         e = biased - 1075
     }
+    let q = scaled_small(f, e, s)
+    if q >= 0 {
+        return str(q)
+    }
+    return scaled_exact(f, e, s)
+}
+
+// The same with big numbers, for any size.
+func scaled_exact(anon f: int64, anon e: int64, anon s: int64) -> str {
     mut num = _big(f)
     mut den = _big(1)
     if e >= 0 {
@@ -1042,6 +1155,92 @@ func _scaled(anon x: float64, anon s: int64) -> str {
         q = _big_add(q, _big(1))
     }
     return _big_decimal(q)
+}
+
+// f × 2^e × 10^s rounded to an integer, ties to even, where that is below 2^62 and can
+// be worked out exactly in 128 bits; -1 otherwise.
+func scaled_small(anon f: int64, anon e: int64, anon s: int64) -> int64 {
+    // Right by this much, after times or divided by 5^|s|.
+    let shift = -(e + s)
+    if s < -27 or s > 27 {
+        return -1
+    }
+    if s < 0 {
+        if shift <= 0 {
+            return -1
+        }
+        if shift >= 64 {
+            // f is less than 2^53.
+            return 0
+        }
+        let d = _POW5_SMALL[-s]
+        let whole = f >> shift
+        let below = f - (whole << shift)
+        mut q = whole / d
+        // Twice what is left, against d: the bits shifted out count for less than one.
+        let twice = 2 * (whole - q * d)
+        if d - twice == 1 {
+            // Odd, as d is: so half of that one decides.
+            let half = 1 << shift - 1
+            if below > half or (below == half and (q & 1) == 1) {
+                q += 1
+            }
+        } else if twice > d {
+            q += 1
+        }
+        return q
+    }
+    let p = _POW5_SMALL[s]
+    let hi = f.mul_high(p)
+    let lo = f * p
+    if shift <= 0 {
+        if hi != 0 or shift < -61 or lo.leading_zeros() < 2 - shift {
+            return -1
+        }
+        return lo << -shift
+    }
+    mut q: int64 = 0
+    // Where what is shifted out lies against a half: -1 below, 0 at it, 1 above.
+    mut side = -1
+    if shift < 64 {
+        if hi >> shift - 1 != 0 {
+            return -1
+        }
+        q = lo >> shift | hi << 64 - shift
+        let left = lo & (1 << shift) - 1
+        let half = 1 << shift - 1
+        if left == half {
+            side = 0
+        } else if _below(half, left) {
+            side = 1
+        }
+    } else if shift < 128 {
+        mut left = hi
+        if shift > 64 {
+            q = hi >> shift - 64
+            left = hi & (1 << shift - 64) - 1
+            let half = 1 << shift - 65
+            if left == half and lo == 0 {
+                side = 0
+            } else if left >= half {
+                side = 1
+            }
+        } else {
+            q = hi
+            if lo == 1 << 63 {
+                side = 0
+            } else if lo < 0 {
+                side = 1
+            }
+        }
+    }
+    if q < 0 or q >= 1 << 62 {
+        return -1
+    }
+    if side > 0 or (side == 0 and (q & 1) == 1) {
+        q += 1
+    }
+    return q
 }
 
 // The quotient and remainder of a ÷ b, for b > 0, by binary long division.
