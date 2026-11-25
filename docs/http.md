@@ -530,6 +530,26 @@ goes away, a read fails; a handler that passes the error on answers with the
 leaves unread is read and dropped when it is short (64 KB); otherwise the
 connection ends after the response.
 
+### Compressing
+
+With `Server(compress: true)`, responses are compressed with gzip for clients that
+take it (`Accept-Encoding`), where that is worth it: a `Content-Type` of text, JSON,
+JavaScript, XML, SVG or WebAssembly, and a body of 1 KB or more. They then have
+`Content-Encoding: gzip`. Such a response has `Vary: Accept-Encoding` for other
+clients too, for caches to tell them apart. A
+[streamed](#streaming) body is compressed as it is written, and sent in chunks; `flush` sends
+what there is, so events still come at once. `compress_level` is
+[`deflate`](encoding.md#compression)'s.
+
+A response is left as it is when it has a `Content-Encoding`, an `ETag` (which
+names the bytes sent) or a `Cache-Control` of `no-transform`, when its status is
+`206`, and when it is streamed to a client that speaks HTTP/1.0.
+
+It is off unless asked for: it takes 15 to 25 µs for each KB, as long as several
+requests without it. Don't compress a page that has both a secret
+(such as a CSRF token) and text the client chose: the length then tells about the
+secret (the BREACH attack). A `Cache-Control` of `no-transform` leaves it out.
+
 ### Connections
 
 A connection carries requests one after another, until the client sends
@@ -575,6 +595,7 @@ func main() -> none or Error {
 | `stop_timeout` | 10 s | how long requests may go on after `stop` |
 | `max_connections` | 10000 | how many connections are open at once |
 | `stop_on_signals` | true | whether `run` stops on `SIGINT` and `SIGTERM`; when false it leaves [signals](tasks.md#signals) alone too |
+| `compress`, `compress_level` | false, 4 | whether [responses are compressed](#compressing), and how much |
 | `stream_bodies` | false | whether `handler` reads the [bodies](#streaming) of requests itself |
 | `limits` | `Limits()` | caps each request's headers and body, as for a response |
 | `log` | stderr | a `func(str) -> none` that gets a line or more for each handler that fails |

@@ -1,6 +1,7 @@
 // HTTP/1.1: URLs, headers, writing a request and reading a response, and a
 // Client that sends requests over TCP or TLS, with redirects. See docs/http.md.
 import "arrays"
+import "compress/deflate"
 import "compress/inflate"
 import "encoding/base64"
 import "io" { file_size }
@@ -13,7 +14,7 @@ import "posix" { Fd }
 import "signals"
 import "sort"
 import "strbuilder" { StrBuilder }
-import "stream" { IoError, BufReader, MemReader, Reader, Writer }
+import "stream" { IoError, BufReader, MemReader, MemWriter, Reader, Writer }
 import "tasks"
 import "time"
 import "time" { Duration }
@@ -2105,7 +2106,7 @@ func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = fals
             try w.write_all((try response_head(resp, :framing, :keep_alive)).to_bytes())
             return
         }
-        let body = BodyWriter(to: w, :resp, :keep_alive)
+        let body = BodyWriter(to: w, :resp, :keep_alive, length: resp.length)
         try write(body)
         try body.finish()
         return
@@ -2125,6 +2126,60 @@ func write_response(anon w: Writer, anon resp: Response, keep_alive: bool = fals
     try w.write_all(resp.body)
 }
 
+// The shortest body that is compressed.
+let COMPRESS_FROM: int64 = 1024
+
+// Whether the client takes gzip.
+func takes_gzip(anon req: Request) -> bool {
+    mut any = false
+    for line in req.headers.all("accept-encoding") {
+        for item in line.lower().split(",") {
+            let parts = item.split(";")
+            let name = parts[0].trim()
+            if name != "gzip" and name != "x-gzip" and name != "*" {
+                continue
+            }
+            mut refused = false
+            for p in parts[1..len(parts)] {
+                let value = p.trim()
+                // 0, 0., 0.0 and so on.
+                if value.starts_with("q=") and value[2..len(value)].replace("0", to: "").replace(".", to: "") == "" {
+                    refused = true
+                }
+            }
+            if name != "*" {
+                return not refused
+            }
+            any = not refused
+        }
+    }
+    return any
+}
+
+// A copy of `resp` that says it depends on what encodings the client takes.
+func with_vary(anon resp: Response) -> Response {
+    let headers = merged(resp.headers, Headers())
+    if not has_token(headers, "vary", "accept-encoding") and not has_token(headers, "vary", "*") {
+        headers.add("Vary", "Accept-Encoding")
+    }
+    return Response(status: resp.status, reason: resp.reason, :headers, body: resp.body, writer: resp.writer, length: resp.length)
+}
+
+// Whether a response is one to compress for clients that take that.
+func compressible(anon resp: Response) -> bool {
+    if not may_have_body(resp.status) or resp.status == 206 or resp.headers.has("content-encoding") or resp.headers.has("etag") or has_token(resp.headers, "cache-control", "no-transform") {
+        return false
+    }
+    let kind = (resp.headers.get("content-type")? or "").split(";")[0].trim().lower()
+    if kind.starts_with("text/") or kind.ends_with("+json") or kind.ends_with("+xml") {
+        return true
+    }
+    match kind {
+        "application/json" | "application/x-ndjson" | "application/javascript" | "application/xml" | "application/wasm" -> return true
+        else -> return false
+    }
+}
+
 // How much of a streamed body is sent, and of a file read, at a time.
 let STREAM_PIECE: int64 = 65536
 
@@ -2133,6 +2188,8 @@ type BodyWriter = shared struct {
     to: Writer
     resp: Response
     keep_alive: bool
+    // How long it is to be, when that is known.
+    length: int64?
     // The client takes chunks (HTTP/1.1).
     chunks: bool = true
     // Whose connection it is: for the time it may take.
@@ -2142,13 +2199,21 @@ type BodyWriter = shared struct {
     // The headers have been sent, and say the body comes in chunks.
     begun: bool = false
     chunked: bool = false
-    // How much has been written to it.
+    // How much has been written to it, and how much of a body has been sent.
     total: int64 = 0
+    sent: int64 = 0
+    // The level to compress it at, -1 for not at all; and, once it goes on past
+    // its first piece, what does so, and where that puts it.
+    level: int64 = -1
+    packer: deflate.DeflateWriter? = none
+    packed: MemWriter = MemWriter(buf: StrBuilder())
+    // Something has been written since the last flush.
+    unflushed: bool = false
     // Why nothing more can be sent.
     failed: Error? = none
 
     func write(self, anon data: bytes) -> int64 or Error {
-        if self.resp.length is int64(n) and self.total + len(data) > n {
+        if self.length is int64(n) and self.total + len(data) > n {
             throw self.wrong_length(self.total + len(data), n)
         }
         mut at: int64 = 0
@@ -2165,51 +2230,54 @@ type BodyWriter = shared struct {
             self.total += end - at
             at = end
             if self.buf.len() >= STREAM_PIECE {
-                try self.send(last: false)
+                try self.send(last: false, all: false)
             }
         }
+        self.unflushed = self.unflushed or len(data) > 0
         return len(data)
     }
 
     // Sends what has been written.
     func flush(self) -> none or Error {
-        try self.send(last: false)
+        if self.unflushed or not self.begun {
+            try self.send(last: false, all: true)
+            self.unflushed = false
+        }
     }
 
     // Ends the body.
     func finish(self) -> none or Error {
-        if self.resp.length is int64(n) and self.total != n {
+        if self.length is int64(n) and self.total != n {
             throw self.wrong_length(self.total, n)
         }
-        try self.send(last: true)
+        try self.send(last: true, all: true)
     }
 
     func wrong_length(self, anon got: int64, anon want: int64) -> IoError {
         return invalid("write", f"{got} bytes of a body of {want}")
     }
 
-    func send(self, last: bool) -> none or Error {
+    // Sends what waits; with `all`, what is still being compressed too.
+    func send(self, last: bool, all: bool) -> none or Error {
         if self.failed is Some(e) {
             throw e
         }
-        let size = self.buf.len()
         mut out = StrBuilder()
         if not self.begun {
             out = try self.head(:last)
         }
+        let body = try self.take(:last, :all)
         // A chunk of no bytes would be the last.
-        if self.chunked and size > 0 {
-            out.append(f"{size:x}\r\n")
-        }
-        out.append(self.buf.to_str())
-        if self.chunked and size > 0 {
-            out.append("\r\n")
+        if self.chunked and len(body) > 0 {
+            add_chunk(out, body)
+        } else {
+            out.append_bytes(body)
         }
         if self.chunked and last {
-            out.append("0\r\n\r\n")
+            add_chunk(out, kod_str_to_bytes(""))
         }
-        self.buf.clear()
         self.begun = true
+        self.sent += len(body)
         if out.len() == 0 {
             return
         }
@@ -2226,13 +2294,51 @@ type BodyWriter = shared struct {
         }
     }
 
+    // What waits, compressed if it is to be.
+    func take(self, last: bool, all: bool) -> bytes or Error {
+        let data = self.buf.to_bytes()
+        self.buf.clear()
+        let Some(packer) = self.packer else {
+            return data
+        }
+        try packer.write_all(data)
+        if last {
+            try packer.finish()
+        } else if all {
+            try packer.flush()
+        }
+        let packed = self.packed.to_bytes()
+        self.packed.buf.clear()
+        return packed
+    }
+
+    // Compresses the first piece, which is the only one, if that makes it shorter;
+    // or sees to it that all of them are.
+    func begin_packing(self, last: bool) -> none {
+        if self.level < 0 or (last and self.buf.len() < COMPRESS_FROM) {
+            return
+        }
+        if last {
+            let packed = deflate.gzip(self.buf.to_bytes(), level: self.level)
+            if len(packed) >= self.buf.len() {
+                return
+            }
+            self.buf.clear()
+            self.buf.append_bytes(packed)
+        } else {
+            self.packer = deflate.gzip_writer(self.packed, level: self.level)
+        }
+        self.resp.headers.add("Content-Encoding", "gzip")
+    }
+
     // The headers, now that the first piece goes out, which may be the last.
     func head(self, last: bool) -> StrBuilder or Error {
         mut framing = ""
-        if self.resp.length is int64(n) {
-            framing = length_header(n)
-        } else if last {
+        self.begin_packing(:last)
+        if last {
             framing = length_header(self.buf.len())
+        } else if self.length is int64(n) and self.packer is none {
+            framing = length_header(n)
         } else if self.chunks {
             self.chunked = true
             framing = CHUNKED
@@ -2715,8 +2821,35 @@ type ServerConn = shared struct {
     // Sends the response; whether the connection can go on after it.
     func reply(self, anon req: Request, anon resp: Response, keep_alive: bool) -> bool or Error {
         let head = req.method == "HEAD"
-        if resp.writer is Some(write) and not head and may_have_body(resp.status) {
-            return try self.reply_stream(req, resp, write, :keep_alive)
+        mut resp = resp
+        mut level: int64 = -1
+        // A short body is the same for every client.
+        let long = len(resp.body) >= COMPRESS_FROM or resp.writer is not none
+        if self.server.compress and long and compressible(resp) {
+            resp = with_vary(resp)
+            if takes_gzip(req) {
+                level = self.server.compress_level
+            }
+        }
+        if resp.writer is Some(write) {
+            // Not without chunks, its length then not being known.
+            let length = resp.length? or COMPRESS_FROM
+            if req.minor == 0 or length < COMPRESS_FROM {
+                level = -1
+            }
+            if not head and may_have_body(resp.status) {
+                return try self.reply_stream(req, resp, write, :keep_alive, :level)
+            }
+            if level >= 0 and resp.length is not none {
+                resp.length = none
+                resp.headers.add("Content-Encoding", "gzip")
+            }
+        } else if level >= 0 and len(resp.body) >= COMPRESS_FROM {
+            let packed = deflate.gzip(resp.body, :level)
+            if len(packed) < len(resp.body) {
+                resp.body = packed
+                resp.headers.add("Content-Encoding", "gzip")
+            }
         }
         mut goes_on = keep_alive
         if self.body is BodyReader(b) and not b.done() {
@@ -2742,15 +2875,15 @@ type ServerConn = shared struct {
         return goes_on
     }
 
-    func reply_stream(self, anon req: Request, anon resp: Response, anon write: func(BodyWriter) -> none or Error, keep_alive: bool) -> bool or Error {
-        let body = BodyWriter(to: self, :resp, :keep_alive, chunks: req.minor >= 1, conn: self)
+    func reply_stream(self, anon req: Request, anon resp: Response, anon write: func(BodyWriter) -> none or Error, keep_alive: bool, level: int64) -> bool or Error {
+        let body = BodyWriter(to: self, :resp, :keep_alive, length: resp.length, chunks: req.minor >= 1, conn: self, :level)
         self.status = resp.status
         let got = panics.catch(func() -> bool or Error {
             try write(body)
             try body.finish()
             return true
         })
-        self.sent = body.total
+        self.sent = body.sent
         if got is Err(e) {
             if body.failed is not none {
                 throw e
@@ -2880,6 +3013,8 @@ type Server = shared struct {
     access_log: bool = false
     stop_on_signals: bool = true
     stream_bodies: bool = false
+    compress: bool = false
+    compress_level: int64 = 4
     // The open connections, by a number of their own.
     conns: Map[int64, ServerConn] = Map[int64, ServerConn]()
     last_conn: int64 = 0

@@ -1,0 +1,334 @@
+// Responses a server compresses (docs/http.md#compressing).
+import "compress/inflate"
+import "net/http" { BodyWriter, Client, Options, Request, Response, Router, Server, html, json, open, respond, status, stream, text }
+import "net/tcp"
+import "posix" { Fd }
+import "strbuilder" { StrBuilder }
+import "stream" { MemReader }
+import "tasks"
+import "time"
+import "time" { Duration, monotonic_ns }
+
+// `n` bytes of text.
+func prose(anon n: int64) -> str {
+    let out = StrBuilder()
+    mut i: int64 = 0
+    for out.len() < n {
+        out.append(f"line {i} of the text\n")
+        i += 1
+    }
+    return out.to_str()[0..n]
+}
+
+func sized(anon req: Request) -> Response or Error {
+    return text(prose(req.param("n").parse_int()? or 0))
+}
+
+func typed(anon req: Request) -> Response or Error {
+    return respond(200, prose(5000), content_type: req.query("type")? or "")
+}
+
+func with(anon req: Request) -> Response or Error {
+    return text(prose(5000)).with_header(req.query("name")? or "", req.query("value")? or "")
+}
+
+func noise(anon _req: Request) -> Response or Error {
+    let out = StrBuilder()
+    mut x: int64 = 88172645463325252
+    for _i in 0..3000 {
+        x = x ^ (x << 13)
+        x = x ^ ((x >> 7) & 0x1ffffffffffffff)
+        x = x ^ (x << 17)
+        out.append_byte(x & 255)
+    }
+    return text(out.to_str())
+}
+
+func with_status(anon req: Request) -> Response or Error {
+    let resp = text(prose(5000))
+    resp.status = req.param("status").parse_int()? or 200
+    return resp
+}
+
+func streamed(anon req: Request) -> Response or Error {
+    let n = req.param("n").parse_int()? or 0
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        let all = prose(n)
+        mut at: int64 = 0
+        for at < n {
+            mut end = at + 777
+            if end > n {
+                end = n
+            }
+            try w.write_str(all[at..end])
+            at = end
+        }
+    }, content_type: "text/plain", length: req.query("length")?.parse_int())
+}
+
+func events(anon _req: Request) -> Response or Error {
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        for i in 0..3 {
+            try w.write_str(f"data: {i}\n\n")
+            try w.flush()
+            try w.flush()
+            time.sleep(Duration(ms: 60))
+        }
+    }, content_type: "text/event-stream")
+}
+
+func broken(anon req: Request) -> Response or Error {
+    let after = req.param("n").parse_int()? or 0
+    return stream(func(anon w: BodyWriter) -> none or Error {
+        try w.write_str(prose(after))
+        panic("no more")
+    }, content_type: "text/plain")
+}
+
+type Log = shared struct {
+    lines: [str] = []
+}
+
+type Fixture = shared struct {
+    l: tcp.Listener
+    server: Server
+    log: Log = Log()
+
+    func init(compress: bool = true) -> Fixture {
+        let routes = Router()
+        routes.get("/sized/{n}", sized)
+        routes.get("/typed", typed)
+        routes.get("/with", with)
+        routes.get("/noise", noise)
+        routes.get("/status/{status}", with_status)
+        routes.get("/streamed/{n}", streamed)
+        routes.get("/events", events)
+        routes.get("/broken/{n}", broken)
+        let log = Log()
+        let server = Server(:routes, :compress, log: func(anon line: str) { log.lines += [line] })
+        return Fixture(l: must tcp.listen("127.0.0.1", port: 0), :server, :log)
+    }
+
+    func url(self, anon path: str) -> str {
+        return f"http://127.0.0.1:{self.l.port()}{path}"
+    }
+
+    // The response to a request with these headers, as sent.
+    func raw(self, anon path: str, headers: str = "Accept-Encoding: gzip\r\n", method: str = "GET", version: str = "1.1") -> str {
+        let conn = must tcp.connect("127.0.0.1", port: self.l.port())
+        must conn.write_all(kod_str_to_bytes(f"{method} {path} HTTP/{version}\r\nHost: a\r\nConnection: close\r\n{headers}\r\n"))
+        let got = kod_bytes_to_str(must conn.read_all())
+        must conn.close()
+        return got
+    }
+
+    func end(self, anon serving: tasks.Task[str]) -> none {
+        self.server.stop()
+        assert serving.wait() == "ok"
+        must self.l.close()
+    }
+}
+
+func serve(anon f: Fixture) -> str {
+    if f.server.serve(f.l) is Err(e) {
+        return e.to_str()
+    }
+    return "ok"
+}
+
+func head_of(anon resp: str) -> str {
+    let Some(at) = resp.find("\r\n\r\n") else {
+        return "no end"
+    }
+    return resp[0..at + 2]
+}
+
+func body_of(anon resp: str) -> str {
+    return resp[len(head_of(resp)) + 2..len(resp)]
+}
+
+func packed(anon resp: str) -> bool {
+    return head_of(resp).contains("\r\nContent-Encoding: gzip\r\n")
+}
+
+func varies(anon resp: str) -> bool {
+    return head_of(resp).contains("\r\nVary: Accept-Encoding\r\n")
+}
+
+test "a body is compressed for a client that takes it" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    for n in [1024, 5000, 200000] {
+        let got = f.raw(f"/sized/{n}")
+        assert packed(got) and varies(got)
+        assert len(got) < n / 2
+        assert head_of(got).contains(f"\r\nContent-Length: {len(body_of(got))}\r\n")
+        assert kod_bytes_to_str(must inflate.gunzip(kod_str_to_bytes(body_of(got)))) == prose(n)
+        let plain = f.raw(f"/sized/{n}", headers: "")
+        assert not packed(plain) and varies(plain)
+        assert body_of(plain) == prose(n)
+        let head = f.raw(f"/sized/{n}", method: "HEAD")
+        assert head == head_of(got) + "\r\n"
+    }
+    // Too short.
+    let short = f.raw("/sized/1023")
+    assert not packed(short) and not varies(short)
+    assert body_of(short) == prose(1023)
+    f.end(serving)
+}
+
+test "which clients take it" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    for yes in ["gzip", "GZIP", "deflate, gzip", "gzip;q=0.5", "br;q=1.0, gzip;q=0.8, *;q=0.1", "x-gzip", "*", "identity, *;q=0.5"] {
+        assert packed(f.raw("/sized/5000", headers: f"Accept-Encoding: {yes}\r\n"))
+    }
+    for no in ["", "identity", "br, deflate", "gzip;q=0", "gzip; q=0.000", "*;q=0", "gzip;q=0, *", "notgzip"] {
+        assert not packed(f.raw("/sized/5000", headers: f"Accept-Encoding: {no}\r\n"))
+    }
+    assert packed(f.raw("/sized/5000", headers: "Accept-Encoding: br\r\nAccept-Encoding: gzip\r\n"))
+    f.end(serving)
+}
+
+test "which responses are compressed" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    for yes in ["text/html; charset=utf-8", "TEXT/css", "application/json", "application/problem+json", "application/javascript", "image/svg+xml", "application/xml"] {
+        assert packed(f.raw("/typed?type=" + yes.replace("+", to: "%2b").replace(" ", to: "")))
+    }
+    for no in ["image/png", "application/octet-stream", "application/zip", "video/mp4"] {
+        let got = f.raw("/typed?type=" + no)
+        assert not packed(got) and not varies(got)
+        assert body_of(got) == prose(5000)
+    }
+    for pair in ["name=Content-Encoding&value=br", "name=ETag&value=%22a%22", "name=Cache-Control&value=max-age=1,no-transform"] {
+        let got = f.raw("/with?" + pair)
+        assert not packed(got) and not varies(got)
+    }
+    // What doesn't get smaller.
+    let noisy = f.raw("/noise")
+    assert not packed(noisy) and varies(noisy)
+    assert packed(f.raw("/status/404"))
+    for code in [204, 206, 304] {
+        assert not packed(f.raw(f"/status/{code}"))
+    }
+    // A Vary of its own.
+    assert head_of(f.raw("/with?name=Vary&value=Cookie")).contains("\r\nVary: Cookie\r\nVary: Accept-Encoding\r\n")
+    assert len(f.raw("/with?name=Vary&value=accept-encoding").split("Vary")) == 2
+    f.end(serving)
+}
+
+test "a streamed body is compressed as it is written" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let client = Client()
+    client.limits.max_body = 10000000
+    for n in [0, 1, 1023, 1024, 60000, 65536, 70000, 3000000] {
+        for query in ["", f"?length={n}"] {
+            let path = f"/streamed/{n}{query}"
+            let got = f.raw(path)
+            assert packed(got) == (n >= 1024)
+            assert varies(got)
+            if n >= 1024 {
+                assert len(got) < n / 2
+            }
+            assert (must client.get(f.url(path))).text() == prose(n)
+            assert kod_bytes_to_str(must (must client.open("GET", f.url(path))).reader().read_all()) == prose(n)
+            let plain = f.raw(path, headers: "")
+            assert not packed(plain)
+            assert plain.ends_with(prose(n)) or head_of(plain).contains("chunked")
+            // HTTP/1.0 has no chunks.
+            let old = f.raw(path, version: "1.0")
+            assert not packed(old)
+            assert body_of(old) == prose(n)
+        }
+    }
+    assert len(client.pool) == 1
+    let head = f.raw("/streamed/5000?length=5000", method: "HEAD")
+    assert packed(head) and not head.contains("Content-Length")
+    // One that says it is longer than it is.
+    assert f.raw("/streamed/5000?length=5001").starts_with("HTTP/1.1 500 ")
+    // Too late to say so.
+    for wrong in [199999, 200001] {
+        let late = f.raw(f"/streamed/200000?length={wrong}")
+        assert packed(late) and not late.ends_with("0\r\n\r\n")
+    }
+    assert len(f.log.lines) == 3
+    client.close()
+    f.end(serving)
+}
+
+test "events come as they are flushed, compressed" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    let resp = must open("GET", f.url("/events"))
+    let body = resp.reader()
+    let t0 = monotonic_ns()
+    assert kod_bytes_to_str(must body.read(1000)) == "data: 0\n\n"
+    assert monotonic_ns() - t0 < 50000000
+    assert kod_bytes_to_str(must body.read(1000)) == "data: 1\n\n"
+    assert kod_bytes_to_str(must body.read_all()) == "data: 2\n\n"
+    let raw = f.raw("/events")
+    assert packed(raw)
+    assert raw.ends_with("\r\n0\r\n\r\n")
+    f.end(serving)
+}
+
+test "a failure in a compressed body" {
+    let f = Fixture()
+    let serving = spawn serve(f)
+    // Nothing has been sent yet.
+    let early = f.raw("/broken/5000")
+    assert early.starts_with("HTTP/1.1 500 ") and not packed(early)
+    let late = f.raw("/broken/200000")
+    assert packed(late)
+    assert not late.ends_with("0\r\n\r\n")
+    let client = Client()
+    let got = (must client.open("GET", f.url("/broken/200000"))).reader().read_all()
+    assert got is Err(_)
+    assert len(f.log.lines) == 3
+    assert f.log.lines[1].contains("(after 200000 bytes of the body)")
+    client.close()
+    f.end(serving)
+}
+
+func shared_page(anon _req: Request) -> Response or Error {
+    return _page
+}
+
+mut _page: Response = text(prose(5000))
+
+test "a response given back twice isn't changed" {
+    let server = Server(handler: shared_page, compress: true)
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let serving = spawn server.serve(l)
+    let client = Client()
+    for _i in 0..3 {
+        assert (must client.get(f"http://127.0.0.1:{l.port()}/")).text() == prose(5000)
+    }
+    assert _page.text() == prose(5000)
+    assert len(_page.headers.items) == 1
+    client.close()
+    server.stop()
+    assert serving.wait() is Ok(_)
+    must l.close()
+}
+
+test "off, and logged" {
+    let f = Fixture(compress: false)
+    let serving = spawn serve(f)
+    let got = f.raw("/sized/5000")
+    assert not packed(got) and not varies(got)
+    f.end(serving)
+    let g = Fixture()
+    g.server.access_log = true
+    let again = spawn serve(g)
+    let small = f"{len(body_of(g.raw("/sized/5000")))}"
+    let _ = g.raw("/streamed/200000")
+    time.sleep(Duration(ms: 20))
+    assert g.log.lines[0].contains(f" 200 {small} B ")
+    let parts = g.log.lines[1].split(" ")
+    let sent = parts[4].parse_int()? or -1
+    assert 1000 < sent < 100000
+    g.end(again)
+}
