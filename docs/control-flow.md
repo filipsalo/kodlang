@@ -132,6 +132,27 @@ for i in 0..3 {
 }
 ```
 
+`a..=b` includes `b`. `step k` after the range counts by `k` instead of 1, and a
+negative `k` counts down, while the counter is above the end (or, with `..=`,
+not below it):
+
+```kod
+for i in 1..=3 {
+    print_int(i)    // 1, 2, 3
+}
+for i in 0..10 step 4 {
+    print_int(i)    // 0, 4, 8
+}
+for i in 3..=0 step -1 {
+    print_int(i)    // 3, 2, 1, 0
+}
+```
+
+The step is evaluated once too, and must be an `int64`. A step of 0 is an error
+when it is a literal and a panic (`a range's step is 0`) when it isn't. These
+forms work in a comprehension's `for` as well. `arrays.reversed(xs)` gives an
+array's elements last first.
+
 Either form can take `_` for a name it doesn't use.
 
 A `str` or `bytes` value is iterated byte by byte, each byte an `int64` from 0 to

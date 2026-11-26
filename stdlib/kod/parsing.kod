@@ -359,8 +359,16 @@ func string_body(anon raw: str) -> str {
 type CompClause = struct {
     names: [TupleNames] = []
     iter: int64 = 0
-    stop: int64 = 0
+    range: RangeTail = RangeTail()
     cond: int64 = 0
+}
+
+// The rest of a range after its start: `..b`, `..=b`, and `step k`. `stop` is 0
+// when there is no range.
+type RangeTail = struct {
+    stop: int64 = 0
+    inclusive: bool = false
+    step: int64 = 0
 }
 
 // What `(a, (b, _))` binds: a name, or a hidden one and the parts taken from it.
@@ -1451,10 +1459,13 @@ type Parser = shared struct {
 
     // `let name = counter` and `counter += 1`, ahead of a loop's body, so that
     // `continue` has already moved on.
-    func take_counter(self, anon name: str, counter: str, span: ast.Span) -> [int64] {
+    func take_counter(self, anon name: str, counter: str, span: ast.Span, by: int64 = 0) -> [int64] {
         let value: int64 = self.alloc_expr(ast.Expr.Ident(name: counter), :span)
         let lhs: int64 = self.alloc_expr(ast.Expr.Ident(name: counter), :span)
-        let rhs: int64 = self.alloc_expr(ast.Expr.IntLit(value: 1), :span)
+        mut rhs = by
+        if rhs == 0 {
+            rhs = self.alloc_expr(ast.Expr.IntLit(value: 1), :span)
+        }
         return [
             self.alloc_stmt(ast.Stmt.Let(:name, typ: 0, :value, mutable: false)),
             self.alloc_stmt(ast.Stmt.PlusAssign(:lhs, :rhs)),
@@ -1467,22 +1478,97 @@ type Parser = shared struct {
         return self.alloc_stmt(ast.Stmt.If(cond: always, then_body: stmts, else_body: []))
     }
 
-    // `for i in a..b`, with the bounds evaluated once and typed `int64`.
-    func for_range(self, anon name: str, start: int64, stop: int64, body: [int64]) -> int64 {
+    // `..=` is for a `for` range only: a slice is reported, then read as `..`.
+    func no_inclusive_slice(self) -> none {
+        if self.at(.DotDotEq) {
+            self.record_error("error: a slice takes `a..b`, which leaves `b` out; `..=` is for a `for` range", got: self.peek())
+        }
+    }
+
+    // After a range's start, at `..` or `..=`: the stop and any `step`.
+    func parse_range_tail(self) -> RangeTail {
+        let inclusive = self.at(.DotDotEq)
+        self.advance()
+        let stop = self.parse_expr()
+        mut step = 0
+        if self.at(.Identifier) and self.peek().value == "step" {
+            self.advance()
+            let step_tok = self.peek()
+            step = self.parse_expr()
+            if self.int_literal(step) is Some(k) and k == 0 {
+                self.record_error("error: a range's step can't be 0", got: step_tok)
+            }
+        }
+        return RangeTail(:stop, :inclusive, :step)
+    }
+
+    // An `int64` literal, `5` or `-5`.
+    func int_literal(self, anon e: int64) -> int64? {
+        match self.exprs[e] {
+            .IntLit(v) -> return v
+            .Binary(lhs, op, rhs) -> {
+                if op is .Sub and self.exprs[lhs] is .IntLit(zero) and zero == 0 and self.exprs[rhs] is .IntLit(v) {
+                    return 0 - v
+                }
+                return none
+            }
+            else return none
+        }
+    }
+
+    // `for i in a..b`, `a..=b` and either with `step k`: the bounds and the step
+    // evaluated once and typed `int64`. A literal step picks the comparison here;
+    // another is tested for its sign on each pass, and panics when it's 0.
+    func for_range(self, anon name: str, start: int64, range: RangeTail, body: [int64]) -> int64 {
         let span: ast.Span = self.expr_spans[start]
         let next_name: str = f"__for_next_{start}"
         let stop_name: str = f"__for_stop_{start}"
+        let step_name: str = f"__for_step_{start}"
         let typ: int64 = self.alloc_type(ast.TypeExpr.Named(name: "int64"), :span)
+        mut up: ast.Op = .Lt
+        mut down: ast.Op = .Gt
+        if range.inclusive {
+            up = .Le
+            down = .Ge
+        }
+        mut stmts = [
+            self.alloc_stmt(ast.Stmt.Let(name: next_name, :typ, value: start, mutable: true)),
+            self.alloc_stmt(ast.Stmt.Let(name: stop_name, :typ, value: range.stop, mutable: false)),
+        ]
+        mut cond = self.range_test(next_name, op: up, stop_name: stop_name, :span)
+        mut by = 0
+        if range.step != 0 {
+            if self.int_literal(range.step) is Some(k) {
+                if k < 0 {
+                    cond = self.range_test(next_name, op: down, stop_name: stop_name, :span)
+                }
+                by = range.step
+            } else {
+                stmts += [self.alloc_stmt(ast.Stmt.Let(name: step_name, :typ, value: range.step, mutable: false))]
+                let zero_test = self.alloc_expr(ast.Expr.Binary(lhs: self.alloc_expr(ast.Expr.Ident(name: step_name), :span), op: .Eq, rhs: self.alloc_expr(ast.Expr.IntLit(value: 0), :span)), :span)
+                let panic_fn = self.alloc_expr(ast.Expr.Ident(name: "panic"), :span)
+                let msg = self.alloc_expr(ast.Expr.StrLit(value: "a range's step is 0"), :span)
+                let call = self.alloc_expr(ast.Expr.Call(callee: panic_fn, args: [ast.CallArg(label: "", label_span: span, value: msg)]), :span)
+                stmts += [self.alloc_stmt(ast.Stmt.If(cond: zero_test, then_body: [self.alloc_stmt(ast.Stmt.ExprStmt(expr: call))], else_body: []))]
+                let rising = self.alloc_expr(ast.Expr.Binary(lhs: self.alloc_expr(ast.Expr.Ident(name: step_name), :span), op: .Gt, rhs: self.alloc_expr(ast.Expr.IntLit(value: 0), :span)), :span)
+                let up_test = self.alloc_expr(ast.Expr.Binary(lhs: rising, op: .And, rhs: cond), :span)
+                let falling = self.alloc_expr(ast.Expr.Binary(lhs: self.alloc_expr(ast.Expr.Ident(name: step_name), :span), op: .Lt, rhs: self.alloc_expr(ast.Expr.IntLit(value: 0), :span)), :span)
+                let down_test = self.alloc_expr(ast.Expr.Binary(lhs: falling, op: .And, rhs: self.range_test(next_name, op: down, stop_name: stop_name, :span)), :span)
+                cond = self.alloc_expr(ast.Expr.Binary(lhs: up_test, op: .Or, rhs: down_test), :span)
+                by = self.alloc_expr(ast.Expr.Ident(name: step_name), :span)
+            }
+        }
+        mut inner: [int64] = self.take_counter(name, counter: next_name, :span, :by)
+        inner += body
+        stmts += [self.alloc_stmt(ast.Stmt.For(:cond, body: inner))]
+        return self.hidden_block(stmts, :span)
+    }
+
+    // `next op stop` on a range loop's hidden locals.
+    func range_test(self, anon next_name: str, op: ast.Op, stop_name: str, span: ast.Span) -> int64 {
         let next: int64 = self.alloc_expr(ast.Expr.Ident(name: next_name), :span)
         let last: int64 = self.alloc_expr(ast.Expr.Ident(name: stop_name), :span)
-        let cond: int64 = self.alloc_expr(ast.Expr.Binary(lhs: next, op: .Lt, rhs: last), :span)
-        mut inner: [int64] = self.take_counter(name, counter: next_name, :span)
-        inner += body
-        return self.hidden_block([
-            self.alloc_stmt(ast.Stmt.Let(name: next_name, :typ, value: start, mutable: true)),
-            self.alloc_stmt(ast.Stmt.Let(name: stop_name, :typ, value: stop, mutable: false)),
-            self.alloc_stmt(ast.Stmt.For(:cond, body: inner)),
-        ], :span)
+        return self.alloc_expr(ast.Expr.Binary(lhs: next, op: op, rhs: last), :span)
     }
 
     // `for i, x in xs`.
@@ -2327,16 +2413,15 @@ type Parser = shared struct {
             }
             self.expect(.KwIn)
             let iter = self.parse_expr()
-            mut stop = 0
-            if self.at(.DotDot) {
+            mut range = RangeTail()
+            if self.at(.DotDot) or self.at(.DotDotEq) {
                 if len(names) == 2 {
                     self.record_error("error: `for i, x in` numbers an array; a range is already numbers, so write `for x in a..b`", got: self.peek())
                     names = [names[1]]
                 }
-                self.advance()
-                stop = self.parse_expr()
+                range = self.parse_range_tail()
             }
-            clauses += [CompClause(:names, :iter, :stop)]
+            clauses += [CompClause(:names, :iter, :range)]
             self.skip_newlines()
         }
         self.expect(.CloseBracket)
@@ -2376,8 +2461,8 @@ type Parser = shared struct {
             let index = clause.names[0]
             return self.for_numbered(index.name, name: name.name, iter: clause.iter, body: self.bind_for(index, :span) + self.bind_for(name, :span) + inner)
         }
-        if clause.stop != 0 {
-            return self.for_range(name.name, start: clause.iter, stop: clause.stop, body: self.bind_for(name, :span) + inner)
+        if clause.range.stop != 0 {
+            return self.for_range(name.name, start: clause.iter, range: clause.range, body: self.bind_for(name, :span) + inner)
         }
         return self.alloc_stmt(ast.Stmt.ForEach(name: name.name, iter: clause.iter, body: self.bind_for(name, :span) + inner))
     }
@@ -2876,7 +2961,8 @@ type Parser = shared struct {
             if self.at(.OpenBracket) {
                 self.advance()
                 // `expr[..hi]` / `expr[..]`: omitted lo, default to 0.
-                if self.at(.DotDot) {
+                self.no_inclusive_slice()
+                if self.at(.DotDot) or self.at(.DotDotEq) {
                     let zero_span: ast.Span = self.here()
                     let lo: int64 = self.alloc_expr(ast.Expr.IntLit(value: 0), span: zero_span)
                     self.advance()
@@ -2888,7 +2974,8 @@ type Parser = shared struct {
                     lhs = self.alloc_expr(ast.Expr.Slice(s: lhs, :lo, :hi), span: lhs_span)
                 } else {
                     let lo: int64 = self.parse_expr()
-                    if self.try_consume(.DotDot) {
+                    self.no_inclusive_slice()
+                    if self.try_consume(.DotDot) or self.try_consume(.DotDotEq) {
                         mut hi: int64 = 0
                         if self.peek_kind() != .CloseBracket {
                             hi = self.parse_expr()
@@ -3887,10 +3974,9 @@ type Parser = shared struct {
                 let name = self.parse_for_names()
                 self.expect(.KwIn)
                 let iter: int64 = self.parse_expr()
-                if self.at(.DotDot) {
+                if self.at(.DotDot) or self.at(.DotDotEq) {
                     self.record_error("error: `for i, x in` numbers an array; a range is already numbers, so write `for x in a..b`", got: self.peek())
-                    self.advance()
-                    self.parse_expr()
+                    self.parse_range_tail()
                 }
                 let span = self.expr_spans[iter]
                 let body = self.bind_for(index, :span) + self.bind_for(name, :span) + self.parse_loop_block()
@@ -3901,10 +3987,10 @@ type Parser = shared struct {
                 let name = names.name
                 self.expect(.KwIn)
                 let iter: int64 = self.parse_expr()
-                if self.try_consume(.DotDot) {
-                    let stop: int64 = self.parse_expr()
+                if self.at(.DotDot) or self.at(.DotDotEq) {
+                    let range = self.parse_range_tail()
                     let body: [int64] = self.parse_loop_block()
-                    return self.for_range(name, start: iter, :stop, :body)
+                    return self.for_range(name, start: iter, :range, :body)
                 }
                 let body = self.bind_for(names, span: self.expr_spans[iter]) + self.parse_loop_block()
                 return self.alloc_stmt(ast.Stmt.ForEach(:name, :iter, :body))
