@@ -6,7 +6,8 @@ icon: lucide/lock
 
 The modules under `stdlib/crypto/` are the pieces TLS 1.3 is built from,
 written in Kod: hashes, HMAC and HKDF, two AEAD ciphers, a key exchange,
-checking RSA and ECDSA signatures, and the operating system's random numbers. Each is checked against the test vectors
+checking RSA and ECDSA signatures and certificates, and the operating system's
+random numbers. Each is checked against the test vectors
 of the standard that defines it.
 
 ```kod
@@ -190,6 +191,53 @@ signature has one encoding.
 Both modules are checked against Wycheproof's test vectors, which aim at the
 mistakes signature checks are known for. Checking takes about 1 ms for an RSA
 signature of 2048 or 3072 bits, 2 ms for P-256 and 6 ms for P-384.
+
+## Certificates: `crypto/x509`
+
+`x509.parse(der)` reads an X.509 certificate (RFC 5280), and `x509.verify`
+checks the chain a server sent:
+
+<!-- kod:
+import "io"
+let text = must io.read_file("stdlib/crypto/testdata/github_chain.pem")
+let now = 1795651200
+-->
+```kod
+import "crypto/x509"
+
+let chain = [must x509.parse(d) for d in must x509.pem_certificates(text)]
+let path = x509.verify(chain, host: "github.com", roots: must x509.system_roots(), now: now)
+```
+
+`chain` is the server's certificates in the order TLS sends them, its own
+first; `now` is seconds since 1970. `verify` gives the path it found, from the
+server's certificate up to the root, or an error that says what is wrong. It
+checks that:
+
+- every certificate on the path is valid at `now`, and signed by the next one's
+  key, with RSA (PKCS #1 v1.5) or ECDSA on P-256 or P-384 and SHA-2;
+- each certificate above the server's is a CA (basicConstraints), may sign
+  certificates (keyUsage, if it has one), allows as many CAs below it as there
+  are (pathLenConstraint), and allows a server (extKeyUsage, if it has one);
+- the server's certificate names `host` in its subjectAltName, as a DNS name
+  (ignoring case and a trailing dot; `*.example.com` stands for one label, so
+  it matches `www.example.com` but not `example.com` or `a.b.example.com`) or,
+  for an IPv4 address, as an IP address; the common name isn't used, as browsers
+  don't;
+- the server's certificate allows a server and a signature;
+- no certificate sent has a critical extension this module doesn't know (such
+  as name constraints), which RFC 5280 says to refuse.
+
+The certificates may come in any order after the first, with extra ones; it
+tries each that could be next. A root is trusted as it is, so only its validity
+and signature over the certificate below it count. Revocation isn't checked.
+
+`system_roots()` reads the operating system's bundle of trusted roots once
+(`/etc/ssl/cert.pem` on macOS, the usual paths on Linux), and
+`load_roots(path)` reads another PEM file; a certificate in it that can't be read
+(an unusual key, say) is left out. A `Certificate` has its fields as read
+(`dns_names`, `not_after`, `is_ca`, `key`, ...) and `common_name()` for
+messages. `crypto/der` is the DER reader underneath.
 
 ## Random bytes: `crypto/random`
 

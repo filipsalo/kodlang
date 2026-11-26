@@ -1,0 +1,597 @@
+// X.509 certificates (RFC 5280): reading them, checking a chain up to a
+// trusted root for a server's host name, and the system's roots. See
+// docs/crypto.md.
+import "crypto/der" { Value }
+import "crypto/der"
+import "crypto/ecdsa"
+import "crypto/rsa"
+import "crypto/sha2" { Algo }
+import "encoding/base64"
+import "io"
+import "stream" { IoError }
+
+// A certificate's public key.
+type Key = enum {
+    Rsa(key: rsa.PublicKey)
+    Ec(key: ecdsa.PublicKey)
+    // A kind of key this module doesn't check signatures with.
+    Other(oid: str)
+}
+
+// How a certificate is signed.
+type Signature = enum {
+    RsaPkcs1(algo: Algo)
+    Ecdsa(algo: Algo)
+    Other(oid: str)
+}
+
+let OID_RSA: str = "1.2.840.113549.1.1.1"
+let OID_EC: str = "1.2.840.10045.2.1"
+let OID_P256: str = "1.2.840.10045.3.1.7"
+let OID_P384: str = "1.3.132.0.34"
+let OID_CN: str = "2.5.4.3"
+let OID_KEY_USAGE: str = "2.5.29.15"
+let OID_SAN: str = "2.5.29.17"
+let OID_BASIC: str = "2.5.29.19"
+let OID_EKU: str = "2.5.29.37"
+let OID_ANY_EKU: str = "2.5.29.37.0"
+let OID_SERVER_AUTH: str = "1.3.6.1.5.5.7.3.1"
+
+// keyUsage bits, numbered as RFC 5280 does from the first bit.
+let USAGE_DIGITAL_SIGNATURE: int64 = 0
+let USAGE_KEY_CERT_SIGN: int64 = 5
+
+type Certificate = struct {
+    // The whole certificate, and the part its signature covers.
+    raw: bytes
+    tbs: bytes
+    signature_algorithm: Signature
+    signature: bytes
+    // The issuer's and the subject's names, as DER.
+    issuer: bytes
+    subject: bytes
+    // Seconds since 1970, UTC.
+    not_before: int64
+    not_after: int64
+    key: Key
+    dns_names: [str]
+    ip_addresses: [bytes]
+    // basicConstraints: whether it is a CA, and how many CAs may come
+    // below it (-1: no limit).
+    is_ca: bool
+    path_len: int64
+    // keyUsage as a set of bit numbers, or none when it has none.
+    key_usage: [int64]?
+    // extKeyUsage's OIDs, or none when it has none.
+    ext_key_usage: [str]?
+    // A critical extension this module doesn't know, which makes the
+    // certificate unusable.
+    unknown_critical: str
+
+    // The subject's common name, for messages, or "".
+    func common_name(self) -> str {
+        return name_cn(self.subject)
+    }
+
+    func has_usage(self, anon bit: int64) -> bool {
+        let Some(usage) = self.key_usage else { return true }
+        return bit in usage
+    }
+
+    // Whether `signature` is this certificate's key's signature of `message`.
+    func verifies(self, anon how: Signature, message: bytes, signature: bytes) -> bool {
+        match how {
+            .RsaPkcs1(algo) -> {
+                if self.key is .Rsa(key) {
+                    return rsa.verify_pkcs1(key, algo: algo, message: message, signature: signature)
+                }
+                return false
+            }
+            .Ecdsa(algo) -> {
+                if self.key is .Ec(key) {
+                    return key.verify(algo: algo, message: message, signature: signature)
+                }
+                return false
+            }
+            .Other(_oid) -> return false
+        }
+    }
+
+    // Whether this certificate's key signed `child`.
+    func signed(self, anon child: Certificate) -> bool {
+        return self.verifies(child.signature_algorithm, message: child.tbs, signature: child.signature)
+    }
+}
+
+func bad(anon detail: str) -> IoError {
+    return IoError(kind: .InvalidInput, op: "x509 parse", errno: 0, detail: detail)
+}
+
+func refused(anon detail: str) -> IoError {
+    return IoError(kind: .Tls, op: "x509 verify", errno: 0, detail: detail)
+}
+
+// The values inside `v`, which must have tag `tag`, or an error.
+func expect(anon data: bytes, anon v: Value, anon tag: int64, anon what: str) -> [Value] or Error {
+    if v.tag != tag {
+        throw bad(f"{what} has tag {v.tag:#x}")
+    }
+    let Some(parts) = der.inside(data, v) else { throw bad(f"{what} is not DER") }
+    return parts
+}
+
+func oid_of(anon data: bytes, anon v: Value) -> str {
+    if v.tag != der.OID {
+        return ""
+    }
+    return der.oid_text(der.content(data, v))
+}
+
+func hash_of(anon oid: str) -> Algo? {
+    return match oid {
+        "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" -> Algo.Sha256
+        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" -> Algo.Sha384
+        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" -> Algo.Sha512
+        else -> none
+    }
+}
+
+// An AlgorithmIdentifier as a signature algorithm.
+func signature_of(anon data: bytes, anon v: Value) -> Signature or Error {
+    let parts = try expect(data, v, der.SEQUENCE, "an algorithm")
+    if len(parts) == 0 {
+        throw bad("an empty algorithm")
+    }
+    let oid = oid_of(data, parts[0])
+    let Some(algo) = hash_of(oid) else { return .Other(oid: oid) }
+    if oid.starts_with("1.2.840.10045.") {
+        // ECDSA's parameters are absent.
+        if len(parts) != 1 {
+            throw bad("ECDSA with parameters")
+        }
+        return .Ecdsa(algo: algo)
+    }
+    // RSA's are NULL, or (wrongly, but seen) absent.
+    if len(parts) > 2 or (len(parts) == 2 and (parts[1].tag != der.NULL or parts[1].end != parts[1].start)) {
+        throw bad("RSA with parameters")
+    }
+    return .RsaPkcs1(algo: algo)
+}
+
+// A SubjectPublicKeyInfo as a key.
+func key_of(anon data: bytes, anon v: Value) -> Key or Error {
+    let parts = try expect(data, v, der.SEQUENCE, "the public key")
+    if len(parts) != 2 or parts[1].tag != der.BIT_STRING {
+        throw bad("the public key isn't an algorithm and bits")
+    }
+    let alg = try expect(data, parts[0], der.SEQUENCE, "the key's algorithm")
+    if len(alg) == 0 {
+        throw bad("the key's algorithm is empty")
+    }
+    let oid = oid_of(data, alg[0])
+    let Some(bits) = der.bits(der.content(data, parts[1])) else { throw bad("the key's bits") }
+    if oid == OID_RSA {
+        let Some(seq) = der.parse(bits) else { throw bad("the RSA key isn't DER") }
+        let nums = try expect(bits, seq, der.SEQUENCE, "the RSA key")
+        if len(nums) != 2 or nums[0].tag != der.INTEGER or nums[1].tag != der.INTEGER {
+            throw bad("the RSA key isn't two integers")
+        }
+        let key = try rsa.PublicKey(n: der.content(bits, nums[0]), e: der.content(bits, nums[1]))
+        return .Rsa(key: key)
+    }
+    if oid == OID_EC {
+        if len(alg) != 2 {
+            throw bad("an EC key without its curve")
+        }
+        let curve = oid_of(data, alg[1])
+        if curve == OID_P256 {
+            return .Ec(key: try ecdsa.PublicKey(.P256, point: bits))
+        }
+        if curve == OID_P384 {
+            return .Ec(key: try ecdsa.PublicKey(.P384, point: bits))
+        }
+        return .Other(oid: curve)
+    }
+    return .Other(oid: oid)
+}
+
+func digits(anon s: bytes, anon at: int64, anon n: int64) -> int64? {
+    mut v = 0
+    for i in at..at + n {
+        let c = s[i]
+        if c < '0' or c > '9' {
+            return none
+        }
+        v = v * 10 + c - '0'
+    }
+    return v
+}
+
+func days_from_civil(anon y0: int64, anon m: int64, anon d: int64) -> int64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let yoe = y - era * 400
+    let mp = if m > 2 { m - 3 } else { m + 9 }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// A UTCTime or GeneralizedTime, which RFC 5280 says end in Z and give
+// seconds, as seconds since 1970.
+func time_of(anon data: bytes, anon v: Value) -> int64 or Error {
+    let s = der.content(data, v)
+    mut year = 0
+    mut at = 0
+    if v.tag == der.UTC_TIME and len(s) == 13 {
+        let Some(yy) = digits(s, 0, 2) else { throw bad("a bad time") }
+        year = if yy < 50 { 2000 + yy } else { 1900 + yy }
+        at = 2
+    } else if v.tag == der.GENERALIZED_TIME and len(s) == 15 {
+        let Some(yyyy) = digits(s, 0, 4) else { throw bad("a bad time") }
+        year = yyyy
+        at = 4
+    } else {
+        throw bad("a time that isn't UTCTime or GeneralizedTime in seconds")
+    }
+    if s[len(s) - 1] != 'Z' {
+        throw bad("a time not in UTC")
+    }
+    let Some(month) = digits(s, at, 2) else { throw bad("a bad time") }
+    let Some(day) = digits(s, at + 2, 2) else { throw bad("a bad time") }
+    let Some(hour) = digits(s, at + 4, 2) else { throw bad("a bad time") }
+    let Some(minute) = digits(s, at + 6, 2) else { throw bad("a bad time") }
+    let Some(second) = digits(s, at + 8, 2) else { throw bad("a bad time") }
+    if month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59 {
+        throw bad("a time out of range")
+    }
+    return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+// The first common name in a Name, or "".
+func name_cn(anon name: bytes) -> str {
+    let Some(top) = der.parse(name) else { return "" }
+    let Some(sets) = der.inside(name, top) else { return "" }
+    for set in sets {
+        let Some(attrs) = der.inside(name, set) else { return "" }
+        for attr in attrs {
+            let Some(pair) = der.inside(name, attr) else { return "" }
+            if len(pair) == 2 and oid_of(name, pair[0]) == OID_CN {
+                return kod_bytes_to_str(der.content(name, pair[1]))
+            }
+        }
+    }
+    return ""
+}
+
+// The certificate in `data`, DER.
+func parse(anon data: bytes) -> Certificate or Error {
+    let Some(top) = der.parse(data) else { throw bad("not one DER value") }
+    let outer = try expect(data, top, der.SEQUENCE, "the certificate")
+    if len(outer) != 3 or outer[2].tag != der.BIT_STRING {
+        throw bad("the certificate isn't the signed part, an algorithm and a signature")
+    }
+    let Some(signature) = der.bits(der.content(data, outer[2])) else { throw bad("the signature's bits") }
+    let how = try signature_of(data, outer[1])
+    let tbs_v = outer[0]
+    let tbs = try expect(data, tbs_v, der.SEQUENCE, "the signed part")
+    // [0] EXPLICIT version, which only v3 certificates have here.
+    mut i = 0
+    if len(tbs) > 0 and tbs[0].tag == 0xa0 {
+        i = 1
+    }
+    if len(tbs) < i + 6 {
+        throw bad("the signed part is short")
+    }
+    let inner_how = try signature_of(data, tbs[i + 1])
+    if inner_how != how {
+        throw bad("the two signature algorithms differ")
+    }
+    let validity = try expect(data, tbs[i + 3], der.SEQUENCE, "the validity")
+    if len(validity) != 2 {
+        throw bad("the validity isn't two times")
+    }
+    let issuer = tbs[i + 2]
+    let subject = tbs[i + 4]
+    if issuer.tag != der.SEQUENCE or subject.tag != der.SEQUENCE {
+        throw bad("a name isn't a SEQUENCE")
+    }
+    mut cert = Certificate(raw: data, tbs: data[tbs_v.header..tbs_v.end], signature_algorithm: how, signature: signature, issuer: data[issuer.header..issuer.end], subject: data[subject.header..subject.end], not_before: try time_of(data, validity[0]), not_after: try time_of(data, validity[1]), key: try key_of(data, tbs[i + 5]), dns_names: [], ip_addresses: [], is_ca: false, path_len: -1, key_usage: none, ext_key_usage: none, unknown_critical: "")
+    // The issuer and subject unique IDs ([1], [2]) are skipped; extensions are [3].
+    for part in tbs[i + 6..] {
+        if part.tag == 0xa3 {
+            try read_extensions(data, part, mut cert)
+        } else if part.tag != 0x81 and part.tag != 0x82 {
+            throw bad(f"an unknown part of the signed part, tag {part.tag:#x}")
+        }
+    }
+    return cert
+}
+
+func read_extensions(anon data: bytes, anon v: Value, anon mut cert: Certificate) -> none or Error {
+    let wrapped = try expect(data, v, 0xa3, "the extensions")
+    if len(wrapped) != 1 {
+        throw bad("the extensions aren't one SEQUENCE")
+    }
+    mut seen: [str] = []
+    for ext in try expect(data, wrapped[0], der.SEQUENCE, "the extensions") {
+        let parts = try expect(data, ext, der.SEQUENCE, "an extension")
+        if len(parts) < 2 or len(parts) > 3 {
+            throw bad("an extension isn't an OID, maybe critical, and a value")
+        }
+        let oid = oid_of(data, parts[0])
+        if oid in seen {
+            throw bad(f"extension {oid} is there twice")
+        }
+        seen += [oid]
+        mut critical = false
+        if len(parts) == 3 {
+            let c = der.content(data, parts[1])
+            if parts[1].tag != der.BOOLEAN or len(c) != 1 or (c[0] != 0 and c[0] != 255) {
+                throw bad("an extension's critical flag")
+            }
+            critical = c[0] == 255
+        }
+        let value_v = parts[len(parts) - 1]
+        if value_v.tag != der.OCTET_STRING {
+            throw bad("an extension's value isn't an OCTET STRING")
+        }
+        let value = der.content(data, value_v)
+        let Some(inner) = der.parse(value) else { throw bad(f"extension {oid} isn't DER") }
+        match oid {
+            "2.5.29.17" -> {
+                for name in try expect(value, inner, der.SEQUENCE, "subjectAltName") {
+                    if name.tag == 0x82 {
+                        cert.dns_names += [kod_bytes_to_str(der.content(value, name))]
+                    } else if name.tag == 0x87 {
+                        cert.ip_addresses += [der.content(value, name)]
+                    }
+                }
+            }
+            "2.5.29.19" -> {
+                let parts_bc = try expect(value, inner, der.SEQUENCE, "basicConstraints")
+                mut at = 0
+                if at < len(parts_bc) and parts_bc[at].tag == der.BOOLEAN {
+                    let c = der.content(value, parts_bc[at])
+                    cert.is_ca = len(c) == 1 and c[0] == 255
+                    at += 1
+                }
+                if at < len(parts_bc) {
+                    let Some(n) = der.small_int(der.content(value, parts_bc[at])) else { throw bad("basicConstraints' path length") }
+                    if parts_bc[at].tag != der.INTEGER {
+                        throw bad("basicConstraints' path length")
+                    }
+                    cert.path_len = n
+                }
+            }
+            "2.5.29.15" -> {
+                let c = der.content(value, inner)
+                if inner.tag != der.BIT_STRING or len(c) < 1 or c[0] > 7 {
+                    throw bad("keyUsage")
+                }
+                mut usage: [int64] = []
+                for byte_i in 1..len(c) {
+                    for b in 0..8 {
+                        if (c[byte_i] >> (7 - b)) & 1 == 1 {
+                            usage += [(byte_i - 1) * 8 + b]
+                        }
+                    }
+                }
+                cert.key_usage = usage
+            }
+            "2.5.29.37" -> {
+                mut ekus: [str] = []
+                for e in try expect(value, inner, der.SEQUENCE, "extKeyUsage") {
+                    ekus += [oid_of(value, e)]
+                }
+                cert.ext_key_usage = ekus
+            }
+            else -> {
+                // Known and harmless to skip: key identifiers, policies,
+                // where to find the issuer and revocation lists, embedded
+                // certificate transparency stamps.
+                if critical and len(cert.unknown_critical) == 0 {
+                    cert.unknown_critical = oid
+                }
+            }
+        }
+    }
+}
+
+// The DER of each certificate in PEM text, in order.
+func pem_certificates(anon text: str) -> [bytes] or Error {
+    mut out: [bytes] = []
+    let begin = "-----BEGIN CERTIFICATE-----"
+    let end = "-----END CERTIFICATE-----"
+    mut rest = text
+    for true {
+        let Some(at) = rest.find(begin) else { break }
+        let after = rest[at + len(begin)..]
+        let Some(stop) = after.find(end) else { throw bad("a PEM certificate without its END line") }
+        mut b64 = ""
+        for line in after[..stop].lines() {
+            b64 += line.trim()
+        }
+        out += [try base64.decode(b64)]
+        rest = after[stop + len(end)..]
+    }
+    return out
+}
+
+// The certificates in a PEM file that this module can read; others are left out.
+func load_roots(anon path: str) -> [Certificate] or Error {
+    let text = try io.read_file(path)
+    mut roots: [Certificate] = []
+    for d in try pem_certificates(text) {
+        if parse(d) is Certificate(c) {
+            roots += [c]
+        }
+    }
+    return roots
+}
+
+mut SYSTEM_ROOTS: [Certificate]? = none
+
+// The operating system's trusted roots, read once.
+func system_roots() -> [Certificate] or Error {
+    if SYSTEM_ROOTS is none {
+        mut found: [Certificate] = []
+        for path in ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"] {
+            let loaded = load_roots(path)
+            if loaded is Error {
+                continue
+            }
+            found = must loaded
+            break
+        }
+        if len(found) == 0 {
+            throw refused("found no system root certificates")
+        }
+        SYSTEM_ROOTS = found
+    }
+    return must SYSTEM_ROOTS
+}
+
+// Whether `host` (a DNS name, lowercase) matches `pattern` from a certificate:
+// the same, ignoring case, or `*.rest` with the `*` standing for one whole
+// leftmost label.
+func host_matches(anon pattern: str, anon host: str) -> bool {
+    let p = pattern.lower()
+    if p == host {
+        return true
+    }
+    if not p.starts_with("*.") or len(p) < 4 {
+        return false
+    }
+    let Some(dot) = host.find(".") else { return false }
+    // The rest has at least two labels, so `*.com` matches nothing.
+    let rest = p[1..]
+    if dot == 0 or rest[1..].find(".") is none {
+        return false
+    }
+    return host[dot..] == rest
+}
+
+// `host` as the bytes of an IPv4 address, or none.
+func ipv4(anon host: str) -> bytes? {
+    let parts = host.split(".")
+    if len(parts) != 4 {
+        return none
+    }
+    mut out: [int64] = []
+    for p in parts {
+        if len(p) == 0 or len(p) > 3 {
+            return none
+        }
+        let Some(n) = digits(kod_str_to_bytes(p), 0, len(p)) else { return none }
+        if n > 255 {
+            return none
+        }
+        out += [n]
+    }
+    return kod_bytes_from_array(out)
+}
+
+// Whether the certificate is for `host`, by its subjectAltName.
+func for_host(anon cert: Certificate, anon host: str) -> bool {
+    mut h = host.lower()
+    if h.ends_with(".") {
+        h = h[..len(h) - 1]
+    }
+    if ipv4(h) is bytes(ip) {
+        return ip in cert.ip_addresses
+    }
+    for name in cert.dns_names {
+        if host_matches(name, h) {
+            return true
+        }
+    }
+    return false
+}
+
+func allows_server(anon cert: Certificate) -> bool {
+    let Some(ekus) = cert.ext_key_usage else { return true }
+    return OID_SERVER_AUTH in ekus or OID_ANY_EKU in ekus
+}
+
+func in_date(anon cert: Certificate, anon now: int64) -> bool {
+    return now >= cert.not_before and now <= cert.not_after
+}
+
+func check_time(anon cert: Certificate, anon now: int64) -> none or Error {
+    if now < cert.not_before {
+        throw refused(f"the certificate for {cert.common_name()} isn't valid yet")
+    }
+    if now > cert.not_after {
+        throw refused(f"the certificate for {cert.common_name()} has expired")
+    }
+}
+
+// Whether `issuer` may sign certificates with `below` CAs under it.
+func can_issue(anon issuer: Certificate, anon below: int64) -> bool {
+    if not issuer.is_ca or not issuer.has_usage(USAGE_KEY_CERT_SIGN) or not allows_server(issuer) {
+        return false
+    }
+    return issuer.path_len < 0 or below <= issuer.path_len
+}
+
+// A chain from `cert` up to one of `roots`, through `others`, with `cas` CAs
+// already below `cert`: the certificates above `cert`, or none.
+func chain_from(anon cert: Certificate, anon cas: int64, anon others: [Certificate], anon roots: [Certificate], anon now: int64, anon depth: int64) -> [Certificate]? {
+    if depth > 8 {
+        return none
+    }
+    for root in roots {
+        if root.raw == cert.raw {
+            return []
+        }
+    }
+    // Roots are trusted as they are: their own constraints aren't checked
+    // beyond the validity and the signature, as other clients do.
+    for root in roots {
+        if root.subject == cert.issuer and in_date(root, now) and root.signed(cert) {
+            return [root]
+        }
+    }
+    for i, other in others {
+        if other.subject == cert.issuer and other.raw != cert.raw and can_issue(other, cas) and in_date(other, now) and other.signed(cert) {
+            let rest = others[..i] + others[i + 1..]
+            if chain_from(other, cas + 1, rest, roots, now, depth + 1) is Some(above) {
+                return [other] + above
+            }
+        }
+    }
+    return none
+}
+
+// Checks that `chain` (a server's certificates, its own first, as TLS sends
+// them) leads up to one of `roots` for `host` at `now` (seconds since
+// 1970): every certificate in it is in date and signed by the next, each
+// one above the first may sign certificates, and the first is for `host`.
+// The certificates that lead up, from the server's to the root, or an error
+// saying what is wrong.
+func verify(anon chain: [Certificate], host: str, roots: [Certificate], now: int64) -> [Certificate] or Error {
+    if len(chain) == 0 {
+        throw refused("the server sent no certificate")
+    }
+    let leaf = chain[0]
+    for c in chain {
+        if len(c.unknown_critical) > 0 {
+            throw refused(f"the certificate for {c.common_name()} has an unknown critical extension {c.unknown_critical}")
+        }
+    }
+    try check_time(leaf, now)
+    if not for_host(leaf, host) {
+        throw refused(f"the certificate is for {leaf.common_name()}, not {host}")
+    }
+    if not allows_server(leaf) {
+        throw refused("the certificate isn't for a server")
+    }
+    if not leaf.has_usage(USAGE_DIGITAL_SIGNATURE) {
+        throw refused("the certificate's key may not sign")
+    }
+    let Some(above) = chain_from(leaf, 0, chain[1..], roots, now, 0) else {
+        throw refused(f"the certificate for {leaf.common_name()} doesn't lead to a trusted root")
+    }
+    return [leaf] + above
+}

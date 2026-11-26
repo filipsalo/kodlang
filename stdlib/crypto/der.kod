@@ -1,0 +1,150 @@
+// Reading DER (X.690), the encoding of X.509 certificates. See
+// docs/crypto.md.
+//
+// A value is a tag, a length and that many bytes of content. Only DER's own
+// forms are read: a definite length, in the short form below 128 and in the
+// fewest bytes above.
+
+// One value: its tag, and where its content and the whole value are in the
+// bytes it was read from.
+type Value = struct {
+    tag: int64
+    start: int64
+    end: int64
+    // Where the value's tag is, so that `data[header..end]` is the whole value.
+    header: int64
+}
+
+// Tags.
+let BOOLEAN: int64 = 0x01
+let INTEGER: int64 = 0x02
+let BIT_STRING: int64 = 0x03
+let OCTET_STRING: int64 = 0x04
+let NULL: int64 = 0x05
+let OID: int64 = 0x06
+let UTF8_STRING: int64 = 0x0c
+let PRINTABLE_STRING: int64 = 0x13
+let IA5_STRING: int64 = 0x16
+let UTC_TIME: int64 = 0x17
+let GENERALIZED_TIME: int64 = 0x18
+let SEQUENCE: int64 = 0x30
+let SET: int64 = 0x31
+
+// The value at `at` in `data`, which must end by `limit`, or none.
+func read(anon data: bytes, at: int64, limit: int64) -> Value? {
+    if at + 2 > limit {
+        return none
+    }
+    let tag = data[at]
+    // A tag number of 31 or more takes more bytes; X.509 has none.
+    if tag & 0x1f == 0x1f {
+        return none
+    }
+    let first = data[at + 1]
+    mut start = at + 2
+    mut size = first
+    if first >= 0x80 {
+        let n = first & 0x7f
+        if n == 0 or n > 4 or start + n > limit or data[start] == 0 {
+            return none
+        }
+        size = 0
+        for i in 0..n {
+            size = (size << 8) | data[start + i]
+        }
+        start += n
+        if size < 0x80 or (n > 1 and size < (1 << (8 * (n - 1)))) {
+            return none
+        }
+    }
+    if size > limit - start {
+        return none
+    }
+    return Value(tag: tag, start: start, end: start + size, header: at)
+}
+
+// The values one after another in `data[from..to]`, or none when they
+// don't fill it exactly.
+func children(anon data: bytes, from: int64, to: int64) -> [Value]? {
+    mut out: [Value] = []
+    mut at = from
+    for at < to {
+        let Some(v) = read(data, at: at, limit: to) else { return none }
+        out += [v]
+        at = v.end
+    }
+    return out
+}
+
+// The values inside `v`, a constructed value such as a SEQUENCE.
+func inside(anon data: bytes, anon v: Value) -> [Value]? {
+    return children(data, from: v.start, to: v.end)
+}
+
+// The one value in all of `data`, or none.
+func parse(anon data: bytes) -> Value? {
+    let Some(v) = read(data, at: 0, limit: len(data)) else { return none }
+    if v.end != len(data) {
+        return none
+    }
+    return v
+}
+
+func content(anon data: bytes, anon v: Value) -> bytes {
+    return data[v.start..v.end]
+}
+
+// An OID's content as dotted text, `1.2.840.113549.1.1.11`, or "" when it
+// isn't well-formed.
+func oid_text(anon b: bytes) -> str {
+    if len(b) == 0 {
+        return ""
+    }
+    mut parts: [int64] = []
+    mut n = 0
+    mut fresh = true
+    for x in b {
+        if fresh and x == 0x80 {
+            return ""
+        }
+        if n > (1 << 50) {
+            return ""
+        }
+        n = (n << 7) | (x & 0x7f)
+        fresh = x & 0x80 == 0
+        if fresh {
+            parts += [n]
+            n = 0
+        }
+    }
+    if not fresh {
+        return ""
+    }
+    let first = parts[0]
+    mut text = if first < 40 { f"0.{first}" } else if first < 80 { f"1.{first - 40}" } else { f"2.{first - 80}" }
+    for p in parts[1..] {
+        text += f".{p}"
+    }
+    return text
+}
+
+// A non-negative INTEGER's content as a number, or none when it is negative,
+// not minimal or too big for an int64.
+func small_int(anon b: bytes) -> int64? {
+    if len(b) == 0 or len(b) > 8 or b[0] >= 0x80 or (len(b) > 1 and b[0] == 0 and b[1] < 0x80) {
+        return none
+    }
+    mut n = 0
+    for x in b {
+        n = (n << 8) | x
+    }
+    return n
+}
+
+// A BIT STRING's content without its count of unused bits, which must be 0.
+func bits(anon b: bytes) -> bytes? {
+    if len(b) == 0 or b[0] != 0 {
+        return none
+    }
+    return b[1..]
+}
