@@ -170,6 +170,16 @@ last, so the data isn't known to be whole until the end has been read. An error 
 given as it is. A gzip file is read to the end of `from`; after the others, `from`
 may have been read past their end, by as much as it gave.
 
+## Hex
+
+`stdlib/encoding/hex.kod` writes bytes as two hex digits each and reads them
+back.
+
+| Function | Meaning |
+|---|---|
+| `encode(data: bytes) -> str` | the lowercase hex text of `data`: `hex.encode(b"\x01\xab")` is `"01ab"` |
+| `decode(text: str) -> bytes or Error` | the bytes `text` stands for; upper and lower case digits are both read, and an odd length or another character is an error |
+
 ## Percent-encoding
 
 For URLs and query strings, see [HTTP client](http.md#query-strings-and-percent-encoding).
