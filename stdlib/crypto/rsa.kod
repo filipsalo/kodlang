@@ -2,7 +2,10 @@
 // docs/crypto.md.
 import "crypto/bignum" { Modulus }
 import "crypto/bignum"
+import "crypto/der" { Value }
+import "crypto/der"
 import "crypto/hmac"
+import "crypto/random"
 import "crypto/sha2" { Algo }
 import "crypto/sha2"
 import "stream" { IoError }
@@ -130,4 +133,128 @@ func verify_pss(anon key: PublicKey, algo: Algo, message: bytes, signature: byte
     let salt = kod_bytes_from_array(db[zeros + 1..])
     let m2 = kod_bytes_from_array([0] * 8) + sha2.digest(algo, message) + salt
     return hmac.equal(sha2.digest(algo, m2), h)
+}
+
+// ---- signing ----
+
+// An RSA private key, from its PKCS #1 form: it signs by the Chinese
+// remainder theorem, with exponentiations that take the same steps whatever
+// the key is (bignum's pow_secret), and checks each signature with the public
+// key before giving it out, so that a fault in either half can't give the key
+// away.
+type PrivateKey = struct {
+    public: PublicKey
+    _p: Modulus
+    _q: Modulus
+    _dp: [int64]
+    _dq: [int64]
+    // 1 / q mod p, in p's Montgomery form.
+    _q_inv: [int64]
+    _q_limbs: [int64]
+
+    // The key in a PKCS #1 RSAPrivateKey (DER), the form of an `RSA PRIVATE
+    // KEY` block and of what a PKCS #8 `PRIVATE KEY` holds for RSA.
+    func init(anon key_der: bytes) -> PrivateKey or Error {
+        let bad = IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "not an RSA private key")
+        let Some(top) = der.parse(key_der) else { throw bad }
+        let Some(parts) = der.inside(key_der, top) else { throw bad }
+        if top.tag != der.SEQUENCE or len(parts) < 9 {
+            throw bad
+        }
+        for part in parts[..9] {
+            if part.tag != der.INTEGER {
+                throw bad
+            }
+        }
+        let n = der_number(key_der, parts[1])
+        let e = der_number(key_der, parts[2])
+        let p = der_number(key_der, parts[4])
+        let q = der_number(key_der, parts[5])
+        let dp = der_number(key_der, parts[6])
+        let dq = der_number(key_der, parts[7])
+        let qinv = der_number(key_der, parts[8])
+        let public = try PublicKey(n: n, e: e)
+        if len(p) == 0 or len(q) == 0 or p[len(p) - 1] & 1 == 0 or q[len(q) - 1] & 1 == 0 {
+            throw bad
+        }
+        let pm = Modulus(p)
+        let qm = Modulus(q)
+        let Some(dp_n) = bignum.from_bytes(dp, k: pm.k) else { throw bad }
+        let Some(dq_n) = bignum.from_bytes(dq, k: qm.k) else { throw bad }
+        let Some(qinv_n) = pm.number(qinv) else { throw bad }
+        let q_limbs = qm.m
+        // n must be p q.
+        let product = bignum.mul_plain(pm.m, q_limbs)
+        let Some(n_limbs) = bignum.from_bytes(n, k: len(product)) else { throw bad }
+        if product != n_limbs {
+            throw IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "the modulus isn't p q")
+        }
+        let key = PrivateKey(public: public, _p: pm, _q: qm, _dp: dp_n, _dq: dq_n, _q_inv: pm.to_mont(qinv_n), _q_limbs: q_limbs)
+        // A key whose exponents don't fit its modulus signs nothing that checks.
+        let probe = kod_bytes_from_array([0] + [7] * (public.size() - 1))
+        if key.raw_sign(probe) is none {
+            throw IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "the exponents don't match the modulus")
+        }
+        return key
+    }
+
+    // m^d mod n for the big-endian `m` below n, as the modulus's bytes, or
+    // none when the result doesn't check with the public key.
+    func raw_sign(self, anon m: bytes) -> bytes? {
+        let size = self.public.size()
+        let Some(c) = bignum.from_bytes(m, k: 2 * self._p.k + 1) else { return none }
+        let p = self._p
+        let q = self._q
+        // m1 = c^dp mod p, m2 = c^dq mod q.
+        let m1 = p.pow_secret(p.reduce_wide(c), self._dp, bits: p.k * 30)
+        let m2 = q.pow_secret(q.reduce_wide(c), self._dq, bits: q.k * 30)
+        // h = (m1 - m2) / q mod p, and the signature is m2 + h q.
+        let m2_in_p = p.reduce_wide(q.from_mont(m2))
+        let h = p.from_mont(p.mul(p.sub(m1, m2_in_p), self._q_inv))
+        let s = bignum.add_plain(bignum.mul_plain(h, self._q_limbs), q.from_mont(m2))
+        let sig = bignum.to_bytes(s, size: size)
+        let Some(back) = self.public.open_signature(sig) else { return none }
+        if not hmac.equal(back, m) {
+            return none
+        }
+        return sig
+    }
+
+    // The PKCS #1 v1.5 signature of `message` hashed with `algo`.
+    func sign_pkcs1(self, algo: Algo, message: bytes) -> bytes {
+        let t = digest_info(algo) + sha2.digest(algo, message)
+        let pad = self.public.size() - 3 - len(t)
+        let em = b"\x00\x01" + kod_bytes_from_array([255] * pad) + b"\x00" + t
+        return must self.raw_sign(em)
+    }
+
+    // The PSS signature of `message`, with `algo` for the hash and MGF1 and a
+    // random salt of the digest's size, as TLS 1.3 wants.
+    func sign_pss(self, algo: Algo, message: bytes, salt: bytes = b"") -> bytes {
+        let h_len = algo.size()
+        let s = if len(salt) > 0 { salt } else { random.secure_bytes(h_len) }
+        let em_bits = self.public.bits() - 1
+        let em_len = (em_bits + 7) / 8
+        let m2 = kod_bytes_from_array([0] * 8) + sha2.digest(algo, message) + s
+        let h = sha2.digest(algo, m2)
+        let db_len = em_len - h_len - 1
+        let db = kod_bytes_from_array([0] * (db_len - len(s) - 1)) + b"\x01" + s
+        let mask = mgf1(algo, h, db_len)
+        mut masked = [db[i] ^ mask[i] for i in 0..db_len]
+        masked[0] = masked[0] & (255 >> (8 * em_len - em_bits))
+        let em = kod_bytes_from_array(masked) + h + b"\xbc"
+        // The encoded message is a byte shorter than the modulus when its
+        // bits are a multiple of 8 plus 1.
+        let full = if em_len < self.public.size() { b"\x00" + em } else { em }
+        return must self.raw_sign(full)
+    }
+}
+
+// An INTEGER's content, without a leading 0 byte.
+func der_number(anon b: bytes, anon v: Value) -> bytes {
+    mut start = v.start
+    for start < v.end - 1 and b[start] == 0 {
+        start += 1
+    }
+    return b[start..v.end]
 }

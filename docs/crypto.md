@@ -174,6 +174,24 @@ exponent that is even or 1 is an error. Two kinds of signature are checked
 
 `key.bits()` is the modulus's size and `key.size()` a signature's length in bytes.
 
+`rsa.PrivateKey(der)` is a private key from its PKCS #1 form (the DER of an
+`RSA PRIVATE KEY` block, which a PKCS #8 `PRIVATE KEY` holds for RSA). A key
+whose modulus isn't the product of its primes, or whose exponents don't fit it,
+is an error.
+
+| Function | Gives |
+|---|---|
+| `key.sign_pkcs1(algo: Algo, message: bytes) -> bytes` | the PKCS #1 v1.5 signature, the same each time |
+| `key.sign_pss(algo: Algo, message: bytes) -> bytes` | the PSS signature, with MGF1 of `algo` and a random salt of the digest's size |
+| `key.public` | the `PublicKey` |
+
+Signing works by the Chinese remainder theorem, with exponentiations that look
+at the secret exponents 4 bits at a time and pick each multiplier by masks from
+all 16, so they take the same steps for every key. Each signature is checked
+with the public key before it is given out, since a fault in one of the two
+halves would otherwise give the key away. A 2048-bit signature takes about
+12 ms (OpenSSL's, 0.4 ms).
+
 ## ECDSA signatures: `crypto/ecdsa`
 
 ECDSA (FIPS 186-5) on the curves `ecdsa.Curve.P256` and `.P384`.
