@@ -3,6 +3,7 @@
 // kod:link -framework Security -framework CoreFoundation
 
 import "crypto/ecdsa"
+import "crypto/rsa"
 import "crypto/x509"
 import "encoding/base64"
 import "libc"
@@ -364,7 +365,12 @@ type TlsStream = shared struct {
             if self.cut {
                 return b""
             }
-            return k.read(min(max, READ_MAX))
+            let got = k.read(min(max, READ_MAX))
+            // Closed, and its connection with it, while this task waited.
+            if not self.open {
+                throw closed("read")
+            }
+            return try got
         }
         if max <= 0 or self.eof {
             return kod_str_to_bytes("")
@@ -444,7 +450,11 @@ type TlsStream = shared struct {
             return 0
         }
         if self.kod is tls13.Session(k) {
-            return k.write(data[..min(len(data), READ_MAX)])
+            let sent = k.write(data[..min(len(data), READ_MAX)])
+            if not self.open {
+                throw closed("write")
+            }
+            return try sent
         }
         mut n = len(data)
         if n > READ_MAX {
@@ -652,10 +662,10 @@ let RTLD_DEFAULT: int64 = -2
 type Identity = shared struct {
     // A CFArray for SSLSetCertificate, 0 once closed.
     certs: int64
-    // The certificates, DER, and for an EC key on P-256 or P-384 the key as
-    // Kod's own TLS 1.3 server takes it.
+    // The certificates, DER, and the key as Kod's own TLS 1.3 server takes
+    // it: RSA, or EC on P-256 or P-384.
     chain: [bytes] = []
-    ec_key: ecdsa.PrivateKey? = none
+    kod_key: tls13.SigningKey? = none
 
     func close(self) -> none {
         if self.certs != 0 {
@@ -887,29 +897,44 @@ func load_identity(anon cert_file: str, anon key_file: str) -> Identity or Error
     }
     let identity = try make_identity(certs, key, :cert_op, :key_op)
     identity.chain = certs
-    identity.ec_key = ec_private_key(key, certs[0])
+    identity.kod_key = kod_private_key(key, certs[0])
     return identity
 }
 
-// The EC key of `key` (the point, then the scalar), when it is on P-256 or
-// P-384 and is the key of the certificate `cert`.
-func ec_private_key(anon key: KeyData, anon cert: bytes) -> ecdsa.PrivateKey? {
-    if not key.is_ec {
+// `key` as Kod's TLS 1.3 server signs with it, when it is RSA, or EC on
+// P-256 or P-384, and is the key of the certificate `cert`.
+func kod_private_key(anon key: KeyData, anon cert: bytes) -> tls13.SigningKey? {
+    let parsed = x509.parse(cert)
+    if parsed is Error {
         return none
     }
+    let leaf = must parsed
+    if not key.is_ec {
+        let made = rsa.PrivateKey(key.data)
+        if made is Error {
+            return none
+        }
+        let private = must made
+        // The certificate's key must check what this one signs.
+        let probe = private.sign_pkcs1(algo: .Sha256, message: b"key check")
+        if leaf.key is .Rsa(public) and rsa.verify_pkcs1(public, algo: .Sha256, message: b"key check", signature: probe) {
+            return .Rsa(key: private)
+        }
+        return none
+    }
+    // An EC key: the point, then the scalar.
     let size = (len(key.data) - 1) / 3
     let curve = if size == 32 { ecdsa.Curve.P256 } else if size == 48 { ecdsa.Curve.P384 } else { return none }
     let point = key.data[..1 + 2 * size]
     let made = ecdsa.PrivateKey(curve, scalar: key.data[1 + 2 * size..])
-    let parsed = x509.parse(cert)
-    if made is Error or parsed is Error {
+    if made is Error {
         return none
     }
     let private = must made
-    if not ((must parsed).key is .Ec(public) and public.point() == point and private.public_key().point() == point) {
+    if not (leaf.key is .Ec(public) and public.point() == point and private.public_key().point() == point) {
         return none
     }
-    return private
+    return .Ec(key: private)
 }
 
 func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op: str) -> Identity or Error {
@@ -956,7 +981,7 @@ func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op:
 func accept(anon fd: Fd, anon identity: Identity) -> TlsStream or Error {
     let op = "tls accept"
     mut replay = b""
-    if identity.certs != 0 and identity.ec_key is ecdsa.PrivateKey(key) {
+    if identity.certs != 0 and identity.kod_key is tls13.SigningKey(key) {
         let session = tls13.server_session(fd, chain: identity.chain, key: key, op: op)
         let shaken = session.handshake(op)
         let Err(e) = shaken else {
