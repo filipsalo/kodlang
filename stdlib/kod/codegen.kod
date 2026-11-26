@@ -544,6 +544,8 @@ type VarSlot = shared struct {
     bound: bool = false
     // Bound at some point before, so a block that bound it may have ended.
     seen: bool = false
+    // Declared `func name(...)` in a body: errors call it a declaration, not a `let`.
+    local_fn: bool = false
 }
 
 // ── Expression result (what compile_expr returns) ─────────────────────────────
@@ -3778,7 +3780,21 @@ type Codegen = shared struct {
         if self.var_seen(name) {
             return f"error: `{name}` is declared in a block that has ended; declare it outside the block to use it here"
         }
+        if self.var_is_local_fn(name) {
+            return f"error: `{self.source_name(name)}` is {verb} before its declaration"
+        }
         return f"error: `{name}` is {verb} before its `let`"
+    }
+
+    func var_is_local_fn(self, anon name: str) -> bool {
+        mut i = len(self.vars) - 1
+        for i >= 0 {
+            if self.vars[i].name == name {
+                return self.vars[i].local_fn
+            }
+            i -= 1
+        }
+        return false
     }
 
     // Where a name is no local, a type that only another module declares gets its hint.
@@ -4641,7 +4657,7 @@ type Codegen = shared struct {
     // An unknown name, which in a function literal may be the literal's own `let`.
     func unknown_name_msg(self, anon msg: str, name: str, candidates: [str]) -> str {
         if self.in_func_literal and name == self.lit_let_name {
-            return f"{msg}; a function literal can't see its own `let`, so use a named function to recurse"
+            return f"{msg}; a function literal can't see its own `let`, so declare it `func {name}(...)` to recurse"
         }
         return self.with_suggestion(msg, typo: name, :candidates)
     }
@@ -11397,6 +11413,9 @@ type Codegen = shared struct {
                         kind = self.infer_kind(value)
                     }
                     self.alloc_var(:name, :kind)
+                    if self.p.exprs[value] is .FuncLit(decl_id) and self.p.func_decls[decl_id].local_func {
+                        self.vars[-1].local_fn = true
+                    }
                 }
                 self.collect_expr_vars(value)
             }
@@ -15428,8 +15447,28 @@ type Codegen = shared struct {
             // form silently dropped a wrong label before this
             // check). Reject any label so the mistake surfaces
             // instead of getting positionally dropped.
+            // A local function's call has its labels.
+            if self.p.local_fn_calls.get(callee_id) is Some(decl_id) {
+                let fd = self.p.func_decls[decl_id]
+                mut labels: [str] = []
+                mut no_defaults: [int64] = []
+                for param in fd.params {
+                    if param.anonymous {
+                        labels += [""]
+                    } else {
+                        labels += [param.label]
+                    }
+                    no_defaults += [0]
+                }
+                if len(args) == len(labels) {
+                    let plan = self.plan_call(args, param_labels: labels, param_defaults: no_defaults, skip: 0, call_name: self.source_name(fd.let_name))
+                    for k, msg in plan.messages {
+                        self.report_error(msg, span: plan.spans[k])
+                    }
+                }
+            }
             for arg in args {
-                if len(arg.label) > 0 {
+                if len(arg.label) > 0 and self.p.local_fn_calls.get(callee_id) is none {
                     self.report_error(f"error: indirect call through a function-pointer value can't take labelled arguments (drop `{arg.label}:`); the function-type syntax `func(T) -> R` doesn't carry parameter names", span: arg.label_span)
                 }
             }
@@ -15640,6 +15679,9 @@ type Codegen = shared struct {
                 if len(hint) == 0 {
                     if self.find_var_kind(key) is .KFunc(_pk, _rk) {
                         mut msg = f"error: `{name}` is called before its `let`"
+                        if self.var_is_local_fn(key) {
+                            msg = f"error: `{name}` is called before its declaration"
+                        }
                         if self.var_seen(key) {
                             msg = f"error: `{name}` is declared in a block that has ended; declare it outside the block to call it here"
                         }
@@ -23271,6 +23313,13 @@ type Codegen = shared struct {
             }
             self.check_param_count(func_decl.params, :what, span: func_decl.name_span)
             self.check_param_names(func_decl.params)
+            if func_decl.local_func {
+                for param in func_decl.params {
+                    if param.default_expr != 0 {
+                        self.report_error(f"error: a local function's parameter can't have a default value; give `{self.source_name(func_decl.let_name)}` the argument at each call", span: param.span)
+                    }
+                }
+            }
         }
         self.vars = []
         self.limit_fn_locals = []
@@ -23360,6 +23409,26 @@ type Codegen = shared struct {
                 self.vars[-1].mutable = false
                 self.vars[-1].bound = true
                 self.rc_param_offs += [capture_offs[-1]]
+            }
+        }
+        // A local function's own name is the cell it was called through, in x17,
+        // borrowed like a capture.
+        mut self_fn_off = -1
+        if len(func_decl.self_key) > 0 {
+            mut sig_slot = -1
+            if not func_decl.in_generic {
+                sig_slot = self.lookup_lambda(fd_id)
+            }
+            if func_decl.in_generic or sig_slot != -1 {
+                mut sig = self.generic_lit_sig(fd_id)
+                if not func_decl.in_generic {
+                    sig = self.fn_sig(sig_slot)
+                }
+                self_fn_off = self.alloc_var(name: func_decl.self_key, kind: .KFunc(param_kinds: sig.param_kinds, return_kind: sig.return_kind))
+                self.vars[-1].mutable = false
+                self.vars[-1].bound = true
+                self.rc_param_offs += [self_fn_off]
+                capture_offs += [self_fn_off]
             }
         }
 
@@ -23591,8 +23660,12 @@ type Codegen = shared struct {
         }
         // Before anything that counts: those use x17.
         for i, off in capture_offs {
-            self.emit_load("x9", base: "x17", off: (i + 1) * 8)
-            self.emit_str_raw(off, reg: "x9")
+            if off == self_fn_off {
+                self.emit_str_raw(off, reg: "x17")
+            } else {
+                self.emit_load("x9", base: "x17", off: (i + 1) * 8)
+                self.emit_str_raw(off, reg: "x9")
+            }
         }
         // A parameter the body stores to owns its value after all; a `mut`
         // one already took the caller's over, and its register is an address.

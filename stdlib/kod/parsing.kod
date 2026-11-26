@@ -539,6 +539,11 @@ type Parser = shared struct {
     // Per statement, the `let` locals of its block it uses last (the Renamer
     // works it out), for codegen to release after it.
     release_after: Map[int64, [str]] = Map[int64, [str]]()
+    // A call's callee that names a local function, and that function's literal:
+    // codegen checks the call's labels against its parameters.
+    local_fn_calls: Map[int64, int64] = Map[int64, int64]()
+    // Whether the file declares a local function: only then are calls looked up.
+    has_local_fns: bool = false
     // Match expressions parsed so far, so a FuncDecl can tell whether its body has one.
     binding_exprs: int64 = 0
     // Whether the parameter list parse_param_list read last ended in `...`.
@@ -2263,28 +2268,33 @@ type Parser = shared struct {
         // top-level entry during its registration pass.
         if self.at(.KwFunc) {
             self.advance()
-            let params: [ast.Param] = self.parse_param_list()
-            mut return_typ: int64 = 0
-            if self.try_consume(.Arrow) {
-                return_typ = self.parse_type_expr()
-            }
-            self.binding_exprs += 1
-            let binding_mark = self.binding_exprs
-            let outer = self.enter_function()
-            let body_tok = self.peek()
-            let body: [int64] = self.parse_block()
-            if len(self.yields) > 0 {
-                self.record_error("error: `yield` goes in a named function or method that gives back a `tasks.Channel[T]`, not in a function literal", got: body_tok)
-                self.drop_yields()
-            }
-            self.leave_function(outer)
-            let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark, in_generic: self.in_generic)
-            let decl_id: int64 = self.alloc_func_decl(fd)
-            return self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
+            return self.parse_func_literal(span)
         }
         // Identifier
         mut name: str = self.expect_identifier()
         return self.alloc_expr(ast.Expr.Ident(:name), :span)
+    }
+
+    // The rest of a function literal, after `func`.
+    func parse_func_literal(self, anon span: ast.Span) -> int64 {
+        let params: [ast.Param] = self.parse_param_list()
+        mut return_typ: int64 = 0
+        if self.try_consume(.Arrow) {
+            return_typ = self.parse_type_expr()
+        }
+        self.binding_exprs += 1
+        let binding_mark = self.binding_exprs
+        let outer = self.enter_function()
+        let body_tok = self.peek()
+        let body: [int64] = self.parse_block()
+        if len(self.yields) > 0 {
+            self.record_error("error: `yield` goes in a named function or method that gives back a `tasks.Channel[T]`, not in a function literal", got: body_tok)
+            self.drop_yields()
+        }
+        self.leave_function(outer)
+        let fd: ast.FuncDecl = ast.FuncDecl(name: "", name_span: span, :params, :return_typ, :body, doc: "", expr_binds: self.binding_exprs > binding_mark, in_generic: self.in_generic)
+        let decl_id: int64 = self.alloc_func_decl(fd)
+        return self.alloc_expr(ast.Expr.FuncLit(:decl_id), :span)
     }
 
     // The rest of `[elem for x in xs if cond]`, after `elem`, which begins at token `from`:
@@ -3186,8 +3196,9 @@ type Parser = shared struct {
             }
             // A declaration can't be a statement: the block's `}` is missing.
             // Each block it is in ends here, and the declaration is parsed.
-            if self.at_decl_keyword() {
-                self.record_error(f"error: expected `}}` before {self.peek_kind().name()}, which starts a declaration", got: self.peek(), desync: true)
+            // A `func name` to the right of the module's declarations is a local function.
+            if self.at_decl_keyword() and not (self.at(.KwFunc) and not self.at_decl_start()) {
+                self.record_error(f"error: expected `}` before {self.peek_kind().name()}, which starts a declaration", got: self.peek(), desync: true)
                 self.narrow_unwraps(unwraps, to: self.pos)
                 return self.fold_guards(stmts, :guards, to: self.pos)
             }
@@ -3631,6 +3642,30 @@ type Parser = shared struct {
             let value: int64 = self.parse_expr()
             self.skip_newlines()
             return self.alloc_stmt(ast.Stmt.Let(:name, :typ, :value, mutable: true))
+        }
+
+        // `func name(...) -> T { ... }`: a local function, `let name = func(...)`
+        // whose body sees `name` too.
+        if self.at(.KwFunc) and self.peek_kind_at(1) == .Identifier {
+            self.advance()
+            let span = self.here()
+            let name = self.binding_identifier()
+            if self.at(.OpenBracket) {
+                self.record_error("error: a local function can't take type parameters; declare it at the module's top level", got: self.peek())
+                for not self.at(.CloseBracket) and not self.structural(self.peek_kind()) {
+                    self.advance()
+                }
+                if self.at(.CloseBracket) {
+                    self.advance()
+                }
+            }
+            let value = self.parse_func_literal(span)
+            if self.exprs[value] is .FuncLit(decl_id) {
+                self.func_decls[decl_id].local_func = true
+                self.has_local_fns = true
+            }
+            self.skip_newlines()
+            return self.alloc_stmt(ast.Stmt.Let(:name, typ: 0, :value, mutable: false))
         }
 
         // return
@@ -4810,6 +4845,8 @@ type Renamer = shared struct {
     caps: [bool] = []
     parents: [int64] = []
     live_lets: int64 = 0
+    // For each binding in force, the literal of the local function it names, or -1.
+    fn_decls: [int64] = []
 
     func run(self, anon decls: [ast.Decl]) -> none {
         // Last first: a literal's id is below the function it's in, so it's walked in place.
@@ -4911,6 +4948,11 @@ type Renamer = shared struct {
         for param in fd.params {
             param.name = self.bind(param.name)
         }
+        // A local function's own name, which its prologue binds.
+        if fd.local_func {
+            fd.self_key = self.bind(fd.let_name)
+            self.fn_decls[self.top - 1] = decl_id
+        }
         self.depth -= 1
         self.block(fd.body)
         self.end_scope(mark)
@@ -4991,6 +5033,7 @@ type Renamer = shared struct {
             self.lasts[self.top] = -1
             self.caps[self.top] = false
             self.parents[self.top] = -1
+            self.fn_decls[self.top] = -1
         } else {
             self.names += [name]
             self.keys += [key]
@@ -5001,6 +5044,7 @@ type Renamer = shared struct {
             self.lasts += [-1]
             self.caps += [false]
             self.parents += [-1]
+            self.fn_decls += [-1]
         }
         if mutable {
             self.live_muts += 1
@@ -5135,6 +5179,9 @@ type Renamer = shared struct {
                 if key != name {
                     self.p.stmts[stmt_id] = ast.Stmt.Let(name: key, :typ, :value, :mutable)
                 }
+                if self.p.exprs[value] is .FuncLit(decl_id) and self.p.func_decls[decl_id].local_func {
+                    self.fn_decls[self.top - 1] = decl_id
+                }
                 if len(name) > 0 {
                     self.lets[self.top - 1] = len(self.cur_stmts)
                     self.lasts[self.top - 1] = stmt_id
@@ -5260,6 +5307,12 @@ type Renamer = shared struct {
                 }
             }
             .Call(callee, args) -> {
+                if self.p.has_local_fns and self.p.exprs[callee] is .Ident(name) {
+                    let i = self.find(name)
+                    if i >= 0 and self.fn_decls[i] >= 0 {
+                        self.p.local_fn_calls[callee] = self.fn_decls[i]
+                    }
+                }
                 self.expr(callee)
                 self.args(args)
             }

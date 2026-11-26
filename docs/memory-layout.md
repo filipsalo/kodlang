@@ -229,7 +229,9 @@ closure cell:  [code, capture 0, capture 1, ...]
 A call through a function value is `ldr x16, [f]; mov x17, f; blr x16`, so a
 function reached that way finds its cell in `x17`. One that captures copies the
 values into its frame on entry and borrows them, like parameters, since its caller
-keeps the cell alive for the call. Other functions ignore `x17`.
+keeps the cell alive for the call. A [local function](functions.md#local-functions)
+also keeps `x17` itself as the value of its own name, so a call to itself passes
+the same cell on. Other functions ignore `x17`.
 
 A `mut` that a literal captures is kept in a counted one-word struct from its
 declaration on (`_MutCell[T]` in `builtins.kod`). The function's slot and each

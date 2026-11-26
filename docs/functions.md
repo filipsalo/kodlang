@@ -473,12 +473,49 @@ literal captures stays in the frame.
 
 Other limits:
 
-- A literal can't see its own `let`, so it can't call itself through it. Use a
-  named function to recurse: `` unknown function `fact`; a function literal can't
-  see its own `let`, so use a named function to recurse ``.
+- A literal can't see its own `let`, so it can't call itself through it. Declare
+  a [local function](#local-functions) to recurse: `` unknown function `fact`; a
+  function literal can't see its own `let`, so declare it `func fact(...)` to
+  recurse ``.
 - A default value sees no locals, so a literal used as one captures nothing.
 - A closure kept in a struct that it captures is a cycle, and a cycle is never
   freed (see [Reclaiming memory](memory-layout.md#reclaiming-memory)).
+
+## Local functions
+
+A function declared in a function's body is a local function. It can call
+itself, and it reads the locals around it the way a [closure](#closures) does:
+
+```kod
+func count_ways(coins: [int64], total: int64) -> int64 {
+    func ways(anon left: int64, from: int64) -> int64 {
+        if left == 0 {
+            return 1
+        }
+        mut n = 0
+        for i in from..len(coins) {
+            if coins[i] <= left {
+                n += ways(left - coins[i], from: i)
+            }
+        }
+        return n
+    }
+    return ways(total, from: 0)
+}
+
+print_int(count_ways(coins: [1, 2, 5], total: 5))   // 4
+```
+
+`func ways(...) -> T { ... }` is `let ways = func(...) -> T { ... }` whose body
+can also see `ways`. It is a function value like any other: it can be passed and
+returned, and it's called only from its declaration to the end of its block. A
+local function sees the ones declared before it, not those after, so two can't
+call each other. It can't take type parameters.
+
+Inside its body, `ways` is the function value the call came through, so calling
+itself makes no new closure and keeps no extra reference. A call to itself
+makes a call even as the last thing it does; only a module's own functions jump
+back to their start (see [Recursion](#recursion)).
 
 ## Generic functions
 
