@@ -1,0 +1,774 @@
+// A TLS 1.3 client (RFC 8446) written in Kod, on stdlib/crypto. See
+// docs/io.md.
+//
+// `Client` is the handshake and the record protection, fed bytes and giving
+// bytes to send, so it can be driven without a network (as the RFC 8448
+// test does); `Session` runs it over a TCP connection.
+//
+// It offers x25519 for the key exchange and TLS_AES_128_GCM_SHA256,
+// TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, and accepts ECDSA
+// (P-256, P-384) and RSA-PSS signatures from the server. A server that wants
+// something else, or another version, is told apart by an IoError of kind
+// Protocol, which net/tls takes as a reason to use the system's TLS instead.
+import "crypto/aesgcm"
+import "crypto/chacha20poly1305"
+import "crypto/hkdf"
+import "crypto/hmac"
+import "crypto/random"
+import "crypto/rsa"
+import "crypto/sha2" { Algo, Hasher }
+import "crypto/sha2"
+import "crypto/x25519"
+import "crypto/x509" { Certificate }
+import "crypto/x509"
+import "posix" { Fd }
+import "stream" { IoError }
+
+// Record content types.
+let CHANGE_CIPHER_SPEC: int64 = 20
+let ALERT: int64 = 21
+let HANDSHAKE: int64 = 22
+let APPLICATION_DATA: int64 = 23
+
+// Handshake message types.
+let CLIENT_HELLO: int64 = 1
+let SERVER_HELLO: int64 = 2
+let NEW_SESSION_TICKET: int64 = 4
+let ENCRYPTED_EXTENSIONS: int64 = 8
+let CERTIFICATE: int64 = 11
+let CERTIFICATE_REQUEST: int64 = 13
+let CERTIFICATE_VERIFY: int64 = 15
+let FINISHED: int64 = 20
+let KEY_UPDATE: int64 = 24
+
+let AES_128_GCM_SHA256: int64 = 0x1301
+let AES_256_GCM_SHA384: int64 = 0x1302
+let CHACHA20_POLY1305_SHA256: int64 = 0x1303
+let X25519: int64 = 0x001d
+
+// Signature schemes, those for the handshake first; RSA PKCS #1 v1.5 only
+// for certificates.
+let SCHEMES: [int64] = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+
+// A ServerHello with this random is a HelloRetryRequest.
+let RETRY_RANDOM: str = "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"
+
+// The most plaintext a record holds.
+let MAX_PLAIN: int64 = 16384
+
+func failed(anon op: str, anon detail: str) -> IoError {
+    return IoError(kind: .Tls, op: op, errno: 0, detail: detail)
+}
+
+// The server can't do TLS 1.3 as this client does.
+func unsupported(anon op: str, anon detail: str) -> IoError {
+    return IoError(kind: .Protocol, op: op, errno: 0, detail: detail)
+}
+
+func u8(anon n: int64) -> bytes {
+    return kod_bytes_from_array([n & 255])
+}
+
+func u16(anon n: int64) -> bytes {
+    return kod_bytes_from_array([(n >> 8) & 255, n & 255])
+}
+
+func u24(anon n: int64) -> bytes {
+    return kod_bytes_from_array([(n >> 16) & 255, (n >> 8) & 255, n & 255])
+}
+
+func vec8(anon b: bytes) -> bytes {
+    return u8(len(b)) + b
+}
+
+func vec16(anon b: bytes) -> bytes {
+    return u16(len(b)) + b
+}
+
+func get16(anon b: bytes, anon at: int64) -> int64 {
+    return (b[at] << 8) | b[at + 1]
+}
+
+func get24(anon b: bytes, anon at: int64) -> int64 {
+    return (b[at] << 16) | (b[at + 1] << 8) | b[at + 2]
+}
+
+// HKDF-Expand-Label and Derive-Secret (RFC 8446 7.1).
+func expand_label(anon algo: Algo, secret: bytes, label: str, context: bytes, length: int64) -> bytes {
+    let info = u16(length) + vec8(kod_str_to_bytes("tls13 " + label)) + vec8(context)
+    return hkdf.expand(algo, prk: secret, info: info, length: length)
+}
+
+func derive_secret(anon algo: Algo, secret: bytes, label: str, transcript: bytes) -> bytes {
+    return expand_label(algo, secret: secret, label: label, context: transcript, length: algo.size())
+}
+
+type Cipher = enum {
+    Aes(key: aesgcm.Key)
+    Chacha(key: bytes)
+}
+
+// One direction's keys and record count.
+type Protection = struct {
+    cipher: Cipher
+    iv: bytes
+    seq: int64
+
+    // The IV with the record number XORed into its end.
+    func nonce(self) -> bytes {
+        mut n = [b for b in self.iv]
+        for i in 0..8 {
+            n[11 - i] = n[11 - i] ^ ((self.seq >> (8 * i)) & 255)
+        }
+        return kod_bytes_from_array(n)
+    }
+
+    // A whole record of `plaintext`, which is of type `kind`.
+    func seal(mut self, anon kind: int64, anon plaintext: bytes) -> bytes {
+        let inner = plaintext + u8(kind)
+        let header = u8(APPLICATION_DATA) + u16(0x0303) + u16(len(inner) + 16)
+        let nonce = self.nonce()
+        self.seq += 1
+        let sealed = match self.cipher {
+            .Aes(key) -> key.seal(inner, nonce: nonce, aad: header)
+            .Chacha(key) -> chacha20poly1305.seal(inner, key: key, nonce: nonce, aad: header)
+        }
+        return header + sealed
+    }
+
+    // The type and plaintext of the record with `header` and `body`, or none
+    // when it doesn't open.
+    func open(mut self, anon header: bytes, anon body: bytes) -> (int64, bytes)? {
+        let nonce = self.nonce()
+        self.seq += 1
+        let opened = match self.cipher {
+            .Aes(key) -> key.open(body, nonce: nonce, aad: header)
+            .Chacha(key) -> chacha20poly1305.open(body, key: key, nonce: nonce, aad: header)
+        }
+        let Some(inner) = opened else { return none }
+        // The type is the last byte that isn't padding.
+        mut end = len(inner)
+        for end > 0 and inner[end - 1] == 0 {
+            end -= 1
+        }
+        if end == 0 {
+            return none
+        }
+        return (inner[end - 1], inner[..end - 1])
+    }
+}
+
+func suite_hash(anon suite: int64) -> Algo {
+    return if suite == AES_256_GCM_SHA384 { Algo.Sha384 } else { Algo.Sha256 }
+}
+
+// The keys for `suite` from a traffic secret.
+func protection(anon suite: int64, secret: bytes) -> Protection {
+    let algo = suite_hash(suite)
+    let size = if suite == AES_128_GCM_SHA256 { 16 } else { 32 }
+    let key = expand_label(algo, secret: secret, label: "key", context: b"", length: size)
+    let iv = expand_label(algo, secret: secret, label: "iv", context: b"", length: 12)
+    let cipher = if suite == CHACHA20_POLY1305_SHA256 { Cipher.Chacha(key: key) } else { Cipher.Aes(key: aesgcm.Key(key)) }
+    return Protection(cipher: cipher, iv: iv, seq: 0)
+}
+
+// What the handshake waits for next.
+type Wait = enum {
+    ServerHello
+    EncryptedExtensions
+    Certificate
+    CertificateVerify
+    Finished
+    // The handshake is over; application data, tickets and key updates.
+    Done
+}
+
+// One handshake and connection, without the I/O: `client_hello` gives the
+// first record, and `receive` takes each record the server sends.
+type Client = shared struct {
+    op: str
+    host: str
+    roots: [Certificate]
+    now: int64
+    // Whether to check the server's certificates (the RFC 8448 test can't).
+    check_certificates: bool = true
+    private_key: bytes
+    hello: bytes = b""
+    session_id: bytes = b""
+    wait: Wait = .ServerHello
+    suite: int64 = 0
+    algo: Algo = .Sha256
+    transcript: Hasher = Hasher(.Sha256)
+    // Handshake bytes that aren't a whole message yet.
+    pending: bytes = b""
+    handshake_secret: bytes = b""
+    client_hs: bytes = b""
+    server_hs: bytes = b""
+    client_ap: bytes = b""
+    server_ap: bytes = b""
+    read: Protection? = none
+    write: Protection? = none
+    certificates: [Certificate] = []
+    // The server asked for a client certificate, with this context.
+    asked: bytes? = none
+    // Records to send, in order, and application data received.
+    out: [bytes] = []
+    data: bytes = b""
+    // The server sent close_notify.
+    closed: bool = false
+
+    // The ClientHello, from `random` and our key, with `session_id` (32
+    // bytes, for middleboxes that expect TLS 1.2 to resume).
+    func client_hello(self, nonce: bytes, session_id: bytes) -> bytes {
+        let public = x25519.public_key(self.private_key)
+        mut exts = b""
+        if x509.ipv4(self.host) is none and len(self.host) > 0 {
+            let name = kod_str_to_bytes(self.host)
+            exts = exts + extension(0, vec16(u8(0) + vec16(name)))
+        }
+        exts = exts + extension(10, vec16(u16(X25519)))
+        mut schemes = b""
+        for s in SCHEMES {
+            schemes = schemes + u16(s)
+        }
+        exts = exts + extension(13, vec16(schemes))
+        exts = exts + extension(43, vec8(u16(0x0304)))
+        exts = exts + extension(51, vec16(u16(X25519) + vec16(public)))
+        let suites = u16(AES_128_GCM_SHA256) + u16(AES_256_GCM_SHA384) + u16(CHACHA20_POLY1305_SHA256)
+        let body = u16(0x0303) + nonce + vec8(session_id) + vec16(suites) + vec8(u8(0)) + vec16(exts)
+        return u8(CLIENT_HELLO) + u24(len(body)) + body
+    }
+
+    // The first record to send: the ClientHello, made fresh or as given.
+    func start(self) -> bytes {
+        if len(self.hello) == 0 {
+            self.session_id = random.secure_bytes(32)
+            self.hello = self.client_hello(nonce: random.secure_bytes(32), session_id: self.session_id)
+        } else if len(self.session_id) == 0 {
+            self.session_id = self.hello[39..39 + self.hello[38]]
+        }
+        return u8(HANDSHAKE) + u16(0x0301) + u16(len(self.hello)) + self.hello
+    }
+
+    // A record from the server, header and body: what it holds is handled,
+    // and what to send in reply is put on `out`.
+    func receive(self, anon header: bytes, anon body: bytes) -> none or Error {
+        let kind = header[0]
+        if len(body) > MAX_PLAIN + 256 {
+            throw failed(self.op, "a record is too long")
+        }
+        if kind == CHANGE_CIPHER_SPEC {
+            // Sent for middleboxes during the handshake, and nothing else.
+            if self.wait is .Done or body != b"\x01" {
+                throw failed(self.op, "an unexpected change_cipher_spec")
+            }
+            return
+        }
+        let Some(keys) = self.read else {
+            // Before the server's keys: its hello in the clear, or an alert.
+            if kind == ALERT {
+                try self.alert(body)
+                return
+            }
+            if kind != HANDSHAKE {
+                throw failed(self.op, f"an unexpected record of type {kind} before the keys")
+            }
+            try self.handshake_bytes(body)
+            return
+        }
+        if kind != APPLICATION_DATA {
+            throw failed(self.op, f"a record of type {kind} in the clear after the keys")
+        }
+        mut k = keys
+        let Some((inner_kind, plaintext)) = k.open(header, body) else {
+            throw failed(self.op, "a record didn't decrypt (bad_record_mac)")
+        }
+        self.read = k
+        if len(plaintext) > MAX_PLAIN {
+            throw failed(self.op, "a record's plaintext is too long")
+        }
+        if inner_kind == HANDSHAKE {
+            try self.handshake_bytes(plaintext)
+        } else if inner_kind == APPLICATION_DATA {
+            if not (self.wait is .Done) {
+                throw failed(self.op, "application data during the handshake")
+            }
+            self.data = self.data + plaintext
+        } else if inner_kind == ALERT {
+            try self.alert(plaintext)
+        } else {
+            throw failed(self.op, f"a record of inner type {inner_kind}")
+        }
+    }
+
+    func alert(self, anon body: bytes) -> none or Error {
+        if len(body) != 2 {
+            throw failed(self.op, "a malformed alert")
+        }
+        let description = body[1]
+        if description == 0 {
+            self.closed = true
+            return
+        }
+        // protocol_version, handshake_failure, insufficient_security: the
+        // server wants what this client doesn't offer.
+        if self.wait is .ServerHello and (description == 70 or description == 40 or description == 71) {
+            throw unsupported(self.op, f"the server refused the handshake (alert {description})")
+        }
+        throw failed(self.op, f"the server sent alert {description}")
+    }
+
+    // Handshake bytes: each whole message they complete is handled.
+    func handshake_bytes(self, anon b: bytes) -> none or Error {
+        self.pending = self.pending + b
+        for len(self.pending) >= 4 {
+            let size = get24(self.pending, 1)
+            if size > 1 << 17 {
+                throw failed(self.op, "a handshake message is too long")
+            }
+            if len(self.pending) < 4 + size {
+                break
+            }
+            let msg = self.pending[..4 + size]
+            self.pending = self.pending[4 + size..]
+            let before = self.read
+            try self.message(msg[0], msg[4..], msg)
+            // The keys may not change in the middle of a record's messages.
+            if len(self.pending) > 0 and (before is none) != (self.read is none) {
+                throw failed(self.op, "handshake data across a change of keys")
+            }
+        }
+    }
+
+    func message(self, anon kind: int64, anon body: bytes, anon whole: bytes) -> none or Error {
+        match self.wait {
+            .ServerHello -> {
+                if kind != SERVER_HELLO {
+                    throw failed(self.op, f"expected a ServerHello, got handshake message {kind}")
+                }
+                try self.server_hello(body, whole)
+            }
+            .EncryptedExtensions -> {
+                if kind != ENCRYPTED_EXTENSIONS {
+                    throw failed(self.op, f"expected EncryptedExtensions, got handshake message {kind}")
+                }
+                let Some(_exts) = extensions(body, 0) else { throw failed(self.op, "malformed EncryptedExtensions") }
+                self.transcript.update(whole)
+                self.wait = .Certificate
+            }
+            .Certificate -> {
+                if kind == CERTIFICATE_REQUEST {
+                    if len(body) < 1 or len(body) < 1 + body[0] {
+                        throw failed(self.op, "malformed CertificateRequest")
+                    }
+                    self.asked = body[1..1 + body[0]]
+                    self.transcript.update(whole)
+                    return
+                }
+                if kind != CERTIFICATE {
+                    throw failed(self.op, f"expected a Certificate, got handshake message {kind}")
+                }
+                try self.certificate(body)
+                self.transcript.update(whole)
+                self.wait = .CertificateVerify
+            }
+            .CertificateVerify -> {
+                if kind != CERTIFICATE_VERIFY {
+                    throw failed(self.op, f"expected CertificateVerify, got handshake message {kind}")
+                }
+                try self.certificate_verify(body)
+                self.transcript.update(whole)
+                self.wait = .Finished
+            }
+            .Finished -> {
+                if kind != FINISHED {
+                    throw failed(self.op, f"expected Finished, got handshake message {kind}")
+                }
+                try self.finished(body, whole)
+            }
+            .Done -> {
+                if kind == NEW_SESSION_TICKET {
+                    return
+                }
+                if kind == KEY_UPDATE {
+                    try self.key_update(body)
+                    return
+                }
+                throw failed(self.op, f"an unexpected handshake message {kind} after the handshake")
+            }
+        }
+    }
+
+    func server_hello(self, anon body: bytes, anon whole: bytes) -> none or Error {
+        if len(body) < 38 {
+            throw failed(self.op, "a short ServerHello")
+        }
+        let server_random = body[2..34]
+        let sid_len = body[34]
+        mut at = 35 + sid_len
+        if len(body) < at + 3 {
+            throw failed(self.op, "a short ServerHello")
+        }
+        let suite = get16(body, at)
+        let compression = body[at + 2]
+        let Some(exts) = extensions(body, at + 3) else { throw failed(self.op, "malformed ServerHello extensions") }
+        mut version = 0
+        mut share: bytes? = none
+        for (t, data) in exts {
+            if t == 43 and len(data) == 2 {
+                version = get16(data, 0)
+            } else if t == 51 {
+                share = data
+            }
+        }
+        if version != 0x0304 {
+            throw unsupported(self.op, "the server doesn't speak TLS 1.3")
+        }
+        if server_random == must_hex(RETRY_RANDOM) {
+            throw unsupported(self.op, "the server wants a key exchange this client doesn't offer (HelloRetryRequest)")
+        }
+        if body[35..35 + sid_len] != self.session_id or compression != 0 {
+            throw failed(self.op, "the ServerHello doesn't echo the ClientHello")
+        }
+        if suite != AES_128_GCM_SHA256 and suite != AES_256_GCM_SHA384 and suite != CHACHA20_POLY1305_SHA256 {
+            throw failed(self.op, f"the server chose cipher suite {suite:#06x}, which wasn't offered")
+        }
+        let Some(ks) = share else { throw unsupported(self.op, "the ServerHello has no key share") }
+        if len(ks) != 36 or get16(ks, 0) != X25519 or get16(ks, 2) != 32 {
+            throw failed(self.op, "the server's key share isn't x25519")
+        }
+        let Some(shared) = x25519.shared(self.private_key, ks[4..]) else {
+            throw failed(self.op, "the server's x25519 key is of small order")
+        }
+        self.suite = suite
+        self.algo = suite_hash(suite)
+        self.transcript = Hasher(self.algo)
+        self.transcript.update(self.hello)
+        self.transcript.update(whole)
+        let zeros = kod_bytes_from_array([0] * self.algo.size())
+        let early = hkdf.extract(self.algo, salt: b"", ikm: zeros)
+        let empty = sha2.digest(self.algo, b"")
+        let derived = derive_secret(self.algo, secret: early, label: "derived", transcript: empty)
+        self.handshake_secret = hkdf.extract(self.algo, salt: derived, ikm: shared)
+        let h = self.transcript.finish()
+        self.client_hs = derive_secret(self.algo, secret: self.handshake_secret, label: "c hs traffic", transcript: h)
+        self.server_hs = derive_secret(self.algo, secret: self.handshake_secret, label: "s hs traffic", transcript: h)
+        self.read = protection(suite, secret: self.server_hs)
+        self.write = protection(suite, secret: self.client_hs)
+        self.wait = .EncryptedExtensions
+    }
+
+    func certificate(self, anon body: bytes) -> none or Error {
+        if len(body) < 4 {
+            throw failed(self.op, "a short Certificate")
+        }
+        let ctx = body[0]
+        mut at = 1 + ctx
+        if len(body) < at + 3 or get24(body, at) != len(body) - at - 3 {
+            throw failed(self.op, "a malformed Certificate")
+        }
+        at += 3
+        mut ders: [bytes] = []
+        for at < len(body) {
+            if at + 3 > len(body) {
+                throw failed(self.op, "a malformed Certificate")
+            }
+            let size = get24(body, at)
+            if size == 0 or at + 3 + size + 2 > len(body) {
+                throw failed(self.op, "a malformed Certificate")
+            }
+            ders += [body[at + 3..at + 3 + size]]
+            at += 3 + size
+            let ext_size = get16(body, at)
+            at += 2 + ext_size
+        }
+        if at != len(body) or len(ders) == 0 {
+            throw failed(self.op, "a malformed or empty Certificate")
+        }
+        mut certs: [Certificate] = []
+        for i, d in ders {
+            let parsed = x509.parse(d)
+            if parsed is Error(e) {
+                if i == 0 {
+                    throw failed(self.op, f"the server's certificate: {e.to_str()}")
+                }
+                continue
+            }
+            certs += [must parsed]
+        }
+        if self.check_certificates {
+            let checked = x509.verify(certs, host: self.host, roots: self.roots, now: self.now)
+            if checked is Error(e) {
+                throw failed(self.op, e.to_str())
+            }
+        }
+        self.certificates = certs
+    }
+
+    func certificate_verify(self, anon body: bytes) -> none or Error {
+        if len(body) < 4 or get16(body, 2) != len(body) - 4 {
+            throw failed(self.op, "a malformed CertificateVerify")
+        }
+        let scheme = get16(body, 0)
+        let signature = body[4..]
+        let content = kod_bytes_from_array([32] * 64) + b"TLS 1.3, server CertificateVerify\x00" + self.transcript.finish()
+        let leaf = self.certificates[0]
+        mut good = false
+        if scheme == 0x0403 or scheme == 0x0503 {
+            if leaf.key is .Ec(key) {
+                let curve_ok = if scheme == 0x0403 { key.curve is .P256 } else { key.curve is .P384 }
+                let algo = if scheme == 0x0403 { Algo.Sha256 } else { Algo.Sha384 }
+                good = curve_ok and key.verify(algo: algo, message: content, signature: signature)
+            }
+        } else if scheme == 0x0804 or scheme == 0x0805 or scheme == 0x0806 {
+            if leaf.key is .Rsa(key) {
+                let algo = match scheme {
+                    0x0804 -> Algo.Sha256
+                    0x0805 -> Algo.Sha384
+                    else -> Algo.Sha512
+                }
+                good = rsa.verify_pss(key, algo: algo, message: content, signature: signature)
+            }
+        } else {
+            throw failed(self.op, f"the server signed with scheme {scheme:#06x}, which wasn't offered")
+        }
+        if not good {
+            throw failed(self.op, "the server's CertificateVerify signature doesn't verify")
+        }
+    }
+
+    // HMAC of the transcript so far under the finished key of `secret`.
+    func verify_data(self, anon secret: bytes) -> bytes {
+        let key = expand_label(self.algo, secret: secret, label: "finished", context: b"", length: self.algo.size())
+        return hmac.mac(self.algo, key: key, data: self.transcript.finish())
+    }
+
+    func finished(self, anon body: bytes, anon whole: bytes) -> none or Error {
+        if not hmac.equal(body, self.verify_data(self.server_hs)) {
+            throw failed(self.op, "the server's Finished doesn't match (decrypt_error)")
+        }
+        self.transcript.update(whole)
+        let after_server = self.transcript.finish()
+        let zeros = kod_bytes_from_array([0] * self.algo.size())
+        let derived = derive_secret(self.algo, secret: self.handshake_secret, label: "derived", transcript: sha2.digest(self.algo, b""))
+        let master = hkdf.extract(self.algo, salt: derived, ikm: zeros)
+        self.client_ap = derive_secret(self.algo, secret: master, label: "c ap traffic", transcript: after_server)
+        self.server_ap = derive_secret(self.algo, secret: master, label: "s ap traffic", transcript: after_server)
+        // Ours: a change_cipher_spec for middleboxes, an empty Certificate
+        // when one was asked for, and Finished, under the handshake keys.
+        if len(self.session_id) > 0 {
+            self.out += [b"\x14\x03\x03\x00\x01\x01"]
+        }
+        mut w = must self.write
+        if self.asked is bytes(ctx) {
+            let cert_msg = u8(CERTIFICATE) + u24(len(ctx) + 4) + vec8(ctx) + u24(0)
+            self.transcript.update(cert_msg)
+            self.out += [w.seal(HANDSHAKE, cert_msg)]
+        }
+        let fin = self.verify_data(self.client_hs)
+        let fin_msg = u8(FINISHED) + u24(len(fin)) + fin
+        self.transcript.update(fin_msg)
+        self.out += [w.seal(HANDSHAKE, fin_msg)]
+        self.read = protection(self.suite, secret: self.server_ap)
+        self.write = protection(self.suite, secret: self.client_ap)
+        self.wait = .Done
+    }
+
+    func key_update(self, anon body: bytes) -> none or Error {
+        if len(body) != 1 or body[0] > 1 {
+            throw failed(self.op, "a malformed KeyUpdate")
+        }
+        self.server_ap = expand_label(self.algo, secret: self.server_ap, label: "traffic upd", context: b"", length: self.algo.size())
+        self.read = protection(self.suite, secret: self.server_ap)
+        if body[0] == 1 {
+            mut w = must self.write
+            self.out += [w.seal(HANDSHAKE, u8(KEY_UPDATE) + u24(1) + u8(0))]
+            self.client_ap = expand_label(self.algo, secret: self.client_ap, label: "traffic upd", context: b"", length: self.algo.size())
+            self.write = protection(self.suite, secret: self.client_ap)
+        }
+    }
+
+    // Records holding `data` as application data.
+    func seal_data(self, anon data: bytes) -> [bytes] {
+        mut w = must self.write
+        mut records: [bytes] = []
+        mut at = 0
+        for at < len(data) {
+            let end = min(at + MAX_PLAIN, len(data))
+            records += [w.seal(APPLICATION_DATA, data[at..end])]
+            at = end
+        }
+        self.write = w
+        return records
+    }
+
+    // The close_notify alert, as a record.
+    func close_notify(self) -> bytes {
+        mut w = must self.write
+        let record = w.seal(ALERT, b"\x01\x00")
+        self.write = w
+        return record
+    }
+}
+
+func must_hex(anon s: str) -> bytes {
+    mut out: [int64] = []
+    for i in 0..len(s) step 2 {
+        out += [hex_digit(s[i]) * 16 + hex_digit(s[i + 1])]
+    }
+    return kod_bytes_from_array(out)
+}
+
+func hex_digit(anon c: int64) -> int64 {
+    return if c <= '9' { c - '0' } else { c - 'a' + 10 }
+}
+
+func extension(anon kind: int64, anon data: bytes) -> bytes {
+    return u16(kind) + vec16(data)
+}
+
+// The extensions of a message from `at`: a 2-byte length, then each type
+// and data; or none when they don't fill the message exactly.
+func extensions(anon body: bytes, anon at: int64) -> [(int64, bytes)]? {
+    if at == len(body) {
+        return []
+    }
+    if at + 2 > len(body) or get16(body, at) != len(body) - at - 2 {
+        return none
+    }
+    mut out: [(int64, bytes)] = []
+    mut i = at + 2
+    for i < len(body) {
+        if i + 4 > len(body) {
+            return none
+        }
+        let size = get16(body, i + 2)
+        if i + 4 + size > len(body) {
+            return none
+        }
+        out += [(get16(body, i), body[i + 4..i + 4 + size])]
+        i += 4 + size
+    }
+    return out
+}
+
+// The handshake and its records over a TCP connection.
+type Session = shared struct {
+    conn: Fd
+    client: Client
+    // Bytes read from the connection that aren't a whole record yet.
+    incoming: bytes = b""
+    // How far `client.data` has been read.
+    data_at: int64 = 0
+    // Ciphertext waiting to be sent, and whether a task is sending it.
+    unsent: bytes = b""
+    flushing: bool = false
+    eof: bool = false
+
+    // Waits for one whole record and hands it to the client; false at the
+    // end of the connection between records.
+    func next_record(self, anon op: str) -> bool or Error {
+        for len(self.incoming) < 5 or len(self.incoming) < 5 + get16(self.incoming, 3) {
+            if len(self.incoming) >= 5 and get16(self.incoming, 3) > MAX_PLAIN + 256 {
+                throw failed(op, "a record is too long")
+            }
+            let got = try self.conn.read(65536)
+            if len(got) == 0 {
+                if len(self.incoming) == 0 {
+                    return false
+                }
+                throw failed(op, "the connection closed in the middle of a record")
+            }
+            self.incoming = self.incoming + got
+        }
+        let size = get16(self.incoming, 3)
+        let header = self.incoming[..5]
+        let body = self.incoming[5..5 + size]
+        self.incoming = self.incoming[5 + size..]
+        try self.client.receive(header, body)
+        return true
+    }
+
+    // Sends what the client has for the server.
+    func flush(self, anon op: str) -> none or Error {
+        for record in self.client.out {
+            self.unsent = self.unsent + record
+        }
+        self.client.out = []
+        if self.flushing {
+            return
+        }
+        for len(self.unsent) > 0 {
+            let data = self.unsent
+            self.unsent = b""
+            self.flushing = true
+            let sent = self.conn.write_all(data)
+            self.flushing = false
+            if sent is Error(e) {
+                throw e
+            }
+        }
+    }
+
+    func handshake(self) -> none or Error {
+        let op = self.client.op
+        self.client.out += [self.client.start()]
+        try self.flush(op)
+        for not (self.client.wait is .Done) {
+            if not try self.next_record(op) {
+                if self.client.wait is .ServerHello {
+                    throw unsupported(op, "the server closed the connection at the ClientHello")
+                }
+                throw failed(op, "the server closed the connection during the handshake")
+            }
+            try self.flush(op)
+        }
+    }
+
+    // At most `max` bytes of application data; empty at the end.
+    func read(self, anon max: int64) -> bytes or Error {
+        for true {
+            let have = len(self.client.data) - self.data_at
+            if have > 0 {
+                let n = min(have, max)
+                let out = self.client.data[self.data_at..self.data_at + n]
+                self.data_at += n
+                if self.data_at == len(self.client.data) {
+                    self.client.data = b""
+                    self.data_at = 0
+                }
+                return out
+            }
+            if self.eof or self.client.closed or max <= 0 {
+                return b""
+            }
+            if not try self.next_record("read") {
+                // A close without close_notify between records: the end.
+                self.eof = true
+                return b""
+            }
+            try self.flush("read")
+        }
+        return b""
+    }
+
+    func write(self, anon data: bytes) -> int64 or Error {
+        self.client.out += self.client.seal_data(data)
+        try self.flush("write")
+        return len(data)
+    }
+
+    // Whether there is nothing to read without waiting.
+    func buffered(self) -> bool {
+        return len(self.client.data) > self.data_at or len(self.incoming) > 0
+    }
+}
+
+// A session for `host` on `conn`, its handshake done: the server's
+// certificates are checked against `roots` at `now` (seconds since 1970).
+func connect(anon conn: Fd, host: str, roots: [Certificate], now: int64, op: str) -> Session or Error {
+    let client = Client(op: op, host: host, roots: roots, now: now, private_key: random.secure_bytes(32))
+    let s = Session(conn: conn, client: client)
+    try s.handshake()
+    return s
+}

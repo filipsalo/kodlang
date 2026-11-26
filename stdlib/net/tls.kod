@@ -2,12 +2,15 @@
 // Kod through unsafe. See docs/io.md.
 // kod:link -framework Security -framework CoreFoundation
 
+import "crypto/x509"
 import "encoding/base64"
 import "libc"
 import "net/tcp"
+import "net/tls13"
 import "posix" { Fd, open_read }
 import "stream" { IoError }
 import "time" { Duration }
+import "time"
 import "unsafe"
 
 // SecureTransport and the Security and CoreFoundation calls it needs.
@@ -269,6 +272,9 @@ type TlsStream = shared struct {
     // It is to be read no more, which the session needn't know: it can still write.
     cut: bool = false
     open: bool = true
+    // The TLS 1.3 session written in Kod, when it is that rather than
+    // SecureTransport's.
+    kod: tls13.Session? = none
 
     // Waits for more ciphertext.
     func fill(self, op: str) -> none or Error {
@@ -353,6 +359,12 @@ type TlsStream = shared struct {
         if not self.open {
             throw closed("read")
         }
+        if self.kod is tls13.Session(k) {
+            if self.cut {
+                return b""
+            }
+            return k.read(min(max, READ_MAX))
+        }
         if max <= 0 or self.eof {
             return kod_str_to_bytes("")
         }
@@ -430,6 +442,9 @@ type TlsStream = shared struct {
         if len(data) == 0 {
             return 0
         }
+        if self.kod is tls13.Session(k) {
+            return k.write(data[..min(len(data), READ_MAX)])
+        }
         mut n = len(data)
         if n > READ_MAX {
             n = READ_MAX
@@ -447,6 +462,9 @@ type TlsStream = shared struct {
 
     // Nothing is waiting to be read, and the peer hasn't closed it.
     func is_idle(self) -> bool {
+        if self.kod is tls13.Session(k) {
+            return self.open and not k.buffered() and tcp.is_idle(self.conn)
+        }
         if not self.open or unsafe.load64(self.link + LINK_POS) < unsafe.load64(self.link + LINK_LEN) {
             return false
         }
@@ -463,6 +481,18 @@ type TlsStream = shared struct {
 
     // Send the close notice, as far as that doesn't have to wait.
     func end(self) -> none {
+        if self.kod is tls13.Session(k) {
+            // close_notify, as far as that doesn't have to wait.
+            if k.client.wait is .Done and not k.flushing {
+                let record = k.client.close_notify()
+                let fd = self.conn.fd
+                let flags = libc.fcntl(fd, F_GETFL, 0)
+                libc.fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+                libc.write(fd, unsafe.data(record), len(record))
+                libc.fcntl(fd, F_SETFL, flags)
+            }
+            return
+        }
         SSLClose(self.ctx)
         let n = unsafe.load64(self.link + LINK_OUT_LEN)
         if n > 0 and not self.flushing {
@@ -491,6 +521,9 @@ type TlsStream = shared struct {
     }
 
     func free_session(self) -> none {
+        if self.link == 0 {
+            return
+        }
         if self.ctx != 0 {
             CFRelease(self.ctx)
         }
@@ -534,7 +567,26 @@ func handshake(anon s: TlsStream, host: str, anchors: int64, op: str) -> none or
     try s.shake(:anchors, :op)
 }
 
-func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duration = Duration(seconds: 10)) -> TlsStream or Error {
+// Which TLS a client connection uses: Kod's own TLS 1.3, falling back to the
+// system's for a server that can't do TLS 1.3 as it does (Auto); only Kod's;
+// or only the system's (SecureTransport, at most TLS 1.2).
+type Engine = enum {
+    Auto
+    Kod
+    System
+}
+
+func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duration = Duration(seconds: 10), engine: Engine = .Auto) -> TlsStream or Error {
+    if not (engine is .System) {
+        let own = connect_kod(host, :port, :trust_file, :timeout)
+        if own is Error(e) {
+            if engine is .Kod or not (e is IoError(io) and io.kind is .Protocol) {
+                throw e
+            }
+        } else {
+            return must own
+        }
+    }
     let conn = try tcp.connect(host, port: port, timeout: timeout)
     try tcp.set_timeout(conn, timeout: timeout)
     let op = f"tls {host}:{port}"
@@ -560,6 +612,33 @@ func connect(anon host: str, port: int64, trust_file: str = "", timeout: Duratio
     }
     try tcp.set_timeout(conn, timeout: Duration())
     return s
+}
+
+func connect_kod(anon host: str, port: int64, trust_file: str, timeout: Duration) -> TlsStream or Error {
+    let op = f"tls {host}:{port}"
+    mut roots: [x509.Certificate] = []
+    if len(trust_file) > 0 {
+        let loaded = x509.load_roots(trust_file)
+        if loaded is Error(e) {
+            throw tls_error(op, f"could not read {trust_file}: {e.to_str()}")
+        }
+        roots = must loaded
+        if len(roots) == 0 {
+            throw tls_error(op, f"{trust_file} has no certificates")
+        }
+    } else {
+        roots = try x509.system_roots()
+    }
+    let conn = try tcp.connect(host, port: port, timeout: timeout)
+    try tcp.set_timeout(conn, timeout: timeout)
+    let now = time.unix_ns() / 1000000000
+    let session = tls13.connect(conn, host: host, roots: roots, now: now, op: op)
+    if session is Error(e) {
+        libc.close(conn.fd)
+        throw e
+    }
+    try tcp.set_timeout(conn, timeout: Duration())
+    return TlsStream(conn: conn, ctx: 0, link: 0, kod: must session)
 }
 
 // ---- the server's side ----

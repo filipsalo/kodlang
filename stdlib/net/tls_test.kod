@@ -1,6 +1,7 @@
 import "io"
 import "net/tcp"
 import "net/tls" { Identity, PemBlock, TlsStream, accept, connect, key_data, load_identity, parse_pem }
+import "net/tls13"
 import "process"
 import "stream" { IoError, IoKind, BufReader }
 import "time" { Duration }
@@ -126,10 +127,39 @@ test "a trust_file that is missing or holds no certificate is an error" {
     stop(sv)
 }
 
-test "a server that only speaks TLS 1.3 fails with a Tls error" {
+// Kod's own TLS 1.3 client (net/tls13.kod) takes these; the -tls1_2 server
+// above falls back to SecureTransport.
+test "TLS 1.3: a request gets the server's answer" {
     let sv = start_server("-tls1_3")
-    let r = connect("localhost", port: sv.port, trust_file: cert_path())
-    assert is_kind(r, .Tls)
+    let conn = must connect("localhost", port: sv.port, trust_file: cert_path(), engine: .Kod)
+    assert conn.kod is tls13.Session
+    must conn.write_str("GET / HTTP/1.0\r\n\r\n")
+    let answer = s(must conn.read_all())
+    assert answer.starts_with("HTTP/1.0 200 ok")
+    assert answer.contains("</HTML>")
+    must conn.close()
+    let br_conn = must connect("localhost", port: sv.port, trust_file: cert_path())
+    must br_conn.write_str("GET / HTTP/1.0\r\n\r\n")
+    let br = BufReader(inner: br_conn)
+    assert ((must br.read_line())? or "!") == "HTTP/1.0 200 ok"
+    must br_conn.close()
+    stop(sv)
+}
+
+test "TLS 1.3: an untrusted certificate or another name fails with a Tls error" {
+    let sv = start_server("-tls1_3")
+    assert is_kind(connect("localhost", port: sv.port, engine: .Kod), .Tls)
+    assert is_kind(connect("127.0.0.1", port: sv.port, trust_file: cert_path(), engine: .Kod), .Tls)
+    assert is_kind(connect("localhost", port: sv.port), .Tls)
+    stop(sv)
+}
+
+test "TLS 1.2 only: Kod's client says Protocol, and Auto falls back" {
+    let sv = start_server("-tls1_2")
+    assert is_kind(connect("localhost", port: sv.port, trust_file: cert_path(), engine: .Kod), .Protocol)
+    let conn = must connect("localhost", port: sv.port, trust_file: cert_path())
+    assert conn.kod is none
+    must conn.close()
     stop(sv)
 }
 
@@ -294,6 +324,8 @@ func read_so_many(anon c: TlsStream, anon want: int64) -> int64 {
     return n
 }
 
+// `accept` is still SecureTransport, which speaks TLS 1.2 at most, so these
+// connect with it too: Auto would try TLS 1.3 on a connection of its own first.
 test "accept and connect, reading and writing at the same time" {
     make_certificate()
     let identity = must load_identity(cert_path(), key_path())
@@ -304,7 +336,7 @@ test "accept and connect, reading and writing at the same time" {
     }
     for nonblocking in [false, true] {
         let serving = spawn echo_once(l, identity, :nonblocking)
-        let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+        let c = must connect("localhost", port: l.port(), trust_file: cert_path(), engine: .System)
         let reading = spawn read_so_many(c, 30 * len(piece))
         for _i in 0..30 {
             must c.write_str(piece)
@@ -334,7 +366,7 @@ test "a stream closes its connection, once" {
     let identity = must load_identity(cert_path(), key_path())
     let l = must tcp.listen("127.0.0.1", port: 0)
     let serving = spawn accept_and_close(l, identity)
-    let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+    let c = must connect("localhost", port: l.port(), trust_file: cert_path(), engine: .System)
     assert len(must c.read(10)) == 0
     must c.close()
     assert c.close() is Err(_)
@@ -356,7 +388,7 @@ test "a stream closed by another task while it is read" {
     let identity = must load_identity(cert_path(), key_path())
     let l = must tcp.listen("127.0.0.1", port: 0)
     let serving = spawn echo_once(l, identity)
-    let c = must connect("localhost", port: l.port(), trust_file: cert_path())
+    let c = must connect("localhost", port: l.port(), trust_file: cert_path(), engine: .System)
     let reading = spawn read_error(c)
     time.sleep(Duration(ms: 30))
     must c.close()
@@ -372,7 +404,7 @@ test "accept without an identity, or with one that is closed" {
     identity.close()
     let l = must tcp.listen("127.0.0.1", port: 0)
     let serving = spawn echo_once(l, identity)
-    assert connect("localhost", port: l.port(), trust_file: cert_path()) is Err(_)
+    assert connect("localhost", port: l.port(), trust_file: cert_path(), engine: .System) is Err(_)
     assert serving.wait() == "tls accept: connection is closed"
     must l.close()
 }

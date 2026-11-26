@@ -301,12 +301,15 @@ doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
 
 ## TLS
 
-`stdlib/net/tls.kod` runs TLS over a TCP connection, using the system's
-SecureTransport (the Security framework), so it needs nothing installed and
-checks certificates against the macOS keychain. It is Kod throughout, calling
-the framework through [`unsafe`](unsafe.md), its I/O callbacks included. A
-program that imports it links `-framework Security -framework CoreFoundation`;
-no other program does.
+`stdlib/net/tls.kod` runs TLS over a TCP connection. A client speaks TLS 1.3
+with Kod's own implementation (`stdlib/net/tls13.kod`, on the modules of
+[Cryptography](crypto.md)), and checks the server's certificates against the
+system's roots (`/etc/ssl/cert.pem`). For a server that can't speak TLS 1.3 as
+it does, it falls back to the system's SecureTransport (the Security
+framework), which also runs the server's side for now; Kod calls it through
+[`unsafe`](unsafe.md), its I/O callbacks included. A program that imports
+`net/tls` links `-framework Security -framework CoreFoundation`; no other
+program does.
 
 ```kod
 import "net/tls" { connect }
@@ -327,7 +330,7 @@ as on a plain connection.
 
 | Function | Meaning |
 |----------|---------|
-| `connect(host, port, trust_file = "", timeout = Duration(seconds: 10))` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
+| `connect(host, port, trust_file = "", timeout = Duration(seconds: 10), engine = .Auto)` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
 | `s.read(max)`, `s.write(data)` | as for any stream |
 | `s.set_timeout(timeout)` | as `net/tcp.set_timeout`: a read or write fails with `TimedOut` after a `Duration` without progress |
 | `s.close()` | send a close notice, then close the connection; `none or Error` |
@@ -335,12 +338,30 @@ as on a plain connection.
 The server's certificate must be valid for `host`, chain to a trusted root and
 be in date; otherwise `connect` throws an `IoError` of kind `Tls` whose
 `detail` says why, and the connection is closed. `timeout` limits the TCP
-connect and, separately, the handshake. A server that can't speak TLS 1.2 is a
-`Tls` error: SecureTransport has no TLS 1.3, and the minimum version is 1.2.
+connect and, separately, the handshake. What is checked is in
+[Certificates](crypto.md#certificates-cryptox509).
 
 `trust_file` is the path of a PEM file of certificates. When it isn't empty,
-those certificates are the only trusted roots, in place of the keychain: use it
+those certificates are the only trusted roots, in place of the system's: use it
 for a private CA or a self-signed server. The host name is still checked.
+
+`engine` is a `tls.Engine`:
+
+| `Engine` | Meaning |
+|---|---|
+| `.Auto` | Kod's TLS 1.3, and the system's on a new connection when the server refuses TLS 1.3, asks for a key exchange other than x25519 or answers with an older version; a certificate that doesn't verify never falls back |
+| `.Kod` | only Kod's TLS 1.3; a server that can't speak it is an `IoError` of kind `Protocol` |
+| `.System` | only SecureTransport, which speaks TLS 1.2 (and not 1.3) |
+
+Kod's client offers the x25519 key exchange and the TLS 1.3 cipher suites with
+AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, and takes ECDSA (P-256 and P-384)
+and RSA-PSS signatures from the server. It doesn't resume sessions or send early
+data; a server that asks for a client certificate gets none. `s.kod` is its
+session (`tls13.Session?`), whose `client` holds what the handshake found, such
+as the server's `certificates` and the cipher `suite`. Its handshake costs
+about 10 to 20 ms of CPU, against a millisecond or two for the system's, mostly
+in X25519 and the ECDSA checks; the first in a program also reads the system's
+roots, another 80 ms.
 
 The server's side is `accept`, on a connection that [`net/tcp`](#tcp) accepted:
 
