@@ -1564,6 +1564,14 @@ type Codegen = shared struct {
     rc_stmt_temps: [int64] = []
     // The value just compiled already has its slot: a constructor's, not a call's.
     rc_ctor_mark: int64 = -1
+    // The expression compile_expr_now (or compile_tuple) last started on, and
+    // a struct literal that is to be built in frame slots at `flat_dest_off`
+    // instead of a cell: see compile_pushed_elem.
+    last_expr: int64 = -1
+    flat_dest_expr: int64 = -1
+    flat_dest_idx: int64 = -1
+    flat_dest_off: int64 = 0
+    flat_dest_path: str = ""
     // While the prologue is emitted: the frame's size when x28 points at its bottom, else 0.
     frame_base: int64 = 0
     // Temporary slots no open statement uses.
@@ -2533,6 +2541,7 @@ type Codegen = shared struct {
             args += [ast.CallArg(label: f"{i}", label_span: self.p.expr_spans[e], value: e)]
         }
         self.built_tuples[f"{expr_id} {self.p.path}"] = idx
+        self.last_expr = expr_id
         return self.compile_struct_construct(args, struct_idx: idx, :span)
     }
 
@@ -12159,6 +12168,7 @@ type Codegen = shared struct {
     }
 
     func compile_expr_now(self, anon expr_id: int64) -> Val {
+        self.last_expr = expr_id
         if len(self.record_path) > 0 and self.p.path == self.record_path and self.recordable(expr_id) {
             self.infer_kind(expr_id)
         }
@@ -14206,6 +14216,7 @@ type Codegen = shared struct {
             .KArrayEnum(_idx) -> return true
             .KArrayInterface(_idx) -> return true
             .KArrayOptional(_inner) -> return true
+            .KArrayStruct(idx) -> return self.is_tuple(idx)
             else return false
         }
     }
@@ -14215,14 +14226,7 @@ type Codegen = shared struct {
     func compile_push(self, anon lhs_val: Val, elem_id: int64, literal_id: int64, kind: TypeKind) -> Val {
         let expected_elem = kind.array_elem()
         let parked = self.park_lhs(lhs_val)
-        mut elem_reg = ""
-        if self.elem_needs_conversion(expected_elem) {
-            elem_reg = self.compile_value_for_kind(elem_id, expected: expected_elem)
-        } else {
-            let elem_val = self.compile_expr(elem_id)
-            self.report_if_unknown(elem_id)
-            elem_reg = self.load(elem_val)
-        }
+        let elem_reg = self.compile_pushed_elem(elem_id, :kind)
         mut rc_elem = expected_elem
         if rc_elem.is_void() {
             rc_elem = self.infer_kind(elem_id)
@@ -18615,6 +18619,34 @@ type Codegen = shared struct {
         return cell
     }
 
+    // `elem_id`, pushed onto an array of `kind`'s elements, in a register. For a
+    // flat array, an element of another one is its address there, and a struct
+    // or tuple literal is built in frame slots of its own, so neither makes a
+    // cell; the array copies the fields from where they are.
+    func compile_pushed_elem(self, anon elem_id: int64, kind: TypeKind) -> str {
+        if self.flat_copy_source(elem_id, :kind) {
+            return self.flat_elem_addr(self.index_base(elem_id), index: self.index_of_expr(elem_id))
+        }
+        if self.flat_elems(kind) and kind is .KArrayStruct(idx) and self.p.exprs[elem_id] is .Call(_callee, _args) {
+            self.frame_slots += self.flat_width(idx) / 8
+            self.flat_dest_expr = elem_id
+            self.flat_dest_idx = idx
+            self.flat_dest_path = self.p.path
+            self.flat_dest_off = 0 - self.frame_slots * 8
+        }
+        let expected_elem = kind.array_elem()
+        mut elem_reg = ""
+        if self.elem_needs_conversion(expected_elem) {
+            elem_reg = self.compile_value_for_kind(elem_id, expected: expected_elem)
+        } else {
+            let elem_val = self.compile_expr(elem_id)
+            self.report_if_unknown(elem_id)
+            elem_reg = self.load(elem_val)
+        }
+        self.flat_dest_expr = -1
+        return elem_reg
+    }
+
     // Whether `elem_id` is an element of a flat array of `kind`'s elements,
     // which a push copies from where it is.
     func flat_copy_source(self, anon elem_id: int64, kind: TypeKind) -> bool {
@@ -19924,6 +19956,12 @@ type Codegen = shared struct {
     }
 
     func compile_struct_construct(self, anon field_args: [ast.CallArg], struct_idx: int64, span: ast.Span) -> Val {
+        // Built in the frame slots a push asked for, when this is its literal.
+        mut dest = 0
+        if self.flat_dest_expr >= 0 and self.flat_dest_expr == self.last_expr and self.flat_dest_idx == struct_idx and self.flat_dest_path == self.p.path {
+            dest = self.flat_dest_off
+        }
+        self.flat_dest_expr = -1
         let init_idx = self.custom_init(struct_idx)
         if init_idx >= 0 {
             return self.compile_init_call(field_args, :struct_idx, :init_idx, :span)
@@ -19941,10 +19979,15 @@ type Codegen = shared struct {
             self.report_error(f"error: generic struct `{name}` needs type arguments: write `{name}[{spelled}](...)`", :span)
         }
         let data_width = self.structs[struct_idx].data_width
-        self.emit_load_imm("x0", value: data_width)
-        let rc_cell = self.rc_alloc_slots(self.rc_struct_slots(struct_idx))
+        mut rc_cell = 0
         let ptr_r = self.pool.alloc_reg()
-        self.emit_mov(ptr_r, src: "x0")
+        if dest != 0 {
+            self.emit_op(.Sub, a: ptr_r, b: "fp", c: f"#{-dest}")
+        } else {
+            self.emit_load_imm("x0", value: data_width)
+            rc_cell = self.rc_alloc_slots(self.rc_struct_slots(struct_idx))
+            self.emit_mov(ptr_r, src: "x0")
+        }
         mut provided: [str] = []
         mut argn = 0
         mut unlabelled = 0
@@ -20036,6 +20079,9 @@ type Codegen = shared struct {
         self.leave(saved_ctx)
         self.emit_mov("x0", src: ptr_r)
         self.pool.free_reg(ptr_r)
+        if dest != 0 {
+            return .VReg(name: "x0")
+        }
         self.rc_mark_owned("x0", slot: rc_cell)
         self.rc_ctor_mark = self.out_buf.len()
         return .VReg(name: "x0")
@@ -21295,17 +21341,7 @@ type Codegen = shared struct {
         mut parked = ""
         if push {
             let expected_elem = kind.array_elem()
-            mut elem_reg = ""
-            if self.flat_copy_source(elem_id, :kind) {
-                // Copied from the other array's element where it is.
-                elem_reg = self.flat_elem_addr(self.index_base(elem_id), index: self.index_of_expr(elem_id))
-            } else if self.elem_needs_conversion(expected_elem) {
-                elem_reg = self.compile_value_for_kind(elem_id, expected: expected_elem)
-            } else {
-                let elem_val = self.compile_expr(elem_id)
-                self.report_if_unknown(elem_id)
-                elem_reg = self.load(elem_val)
-            }
+            let elem_reg = self.compile_pushed_elem(elem_id, :kind)
             mut rc_elem = expected_elem
             if rc_elem.is_void() {
                 rc_elem = self.infer_kind(elem_id)

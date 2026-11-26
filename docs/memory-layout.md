@@ -78,7 +78,8 @@ so finding a key reads the fields where they are instead of following a pointer.
 
 Reading a field (`xs[i].x`), comparing or hashing an element, storing one, and
 appending one from another such array (`ys += [xs[i]]`) work on the fields in
-place. Reading an element whole, to pass it to a function or keep it, makes a
+place, and `xs += [Cell(x: 1, y: 2)]` or `ts += [(a, b)]` builds the new
+element's fields in the function's frame and copies them onto the end. Reading an element whole, to pass it to a function or keep it, makes a
 cell holding a copy of it. Inside a loop each such read and each `for x in xs`
 keeps one cell, used again on the next pass unless something kept the last
 one, so a loop over the elements allocates nothing in the usual case. A struct
