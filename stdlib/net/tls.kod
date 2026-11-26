@@ -2,6 +2,7 @@
 // Kod through unsafe. See docs/io.md.
 // kod:link -framework Security -framework CoreFoundation
 
+import "crypto/ecdsa"
 import "crypto/x509"
 import "encoding/base64"
 import "libc"
@@ -483,8 +484,8 @@ type TlsStream = shared struct {
     func end(self) -> none {
         if self.kod is tls13.Session(k) {
             // close_notify, as far as that doesn't have to wait.
-            if k.client.wait is .Done and not k.flushing {
-                let record = k.client.close_notify()
+            if k.peer.done() and not k.flushing {
+                let record = k.peer.close_notify()
                 let fd = self.conn.fd
                 let flags = libc.fcntl(fd, F_GETFL, 0)
                 libc.fcntl(fd, F_SETFL, flags | O_NONBLOCK)
@@ -651,6 +652,10 @@ let RTLD_DEFAULT: int64 = -2
 type Identity = shared struct {
     // A CFArray for SSLSetCertificate, 0 once closed.
     certs: int64
+    // The certificates, DER, and for an EC key on P-256 or P-384 the key as
+    // Kod's own TLS 1.3 server takes it.
+    chain: [bytes] = []
+    ec_key: ecdsa.PrivateKey? = none
 
     func close(self) -> none {
         if self.certs != 0 {
@@ -875,7 +880,36 @@ func load_identity(anon cert_file: str, anon key_file: str) -> Identity or Error
     let Some(key) = found else {
         throw tls_error(key_op, "holds no private key")
     }
-    return try make_identity(certs, key, :cert_op, :key_op)
+    // SecureTransport aborts the program on an EC key whose curve is given
+    // by its parameters rather than its name.
+    if key.is_ec and x509.parse(certs[0]) is x509.Certificate(leaf) and leaf.key is .Other(oid) and len(oid) == 0 {
+        throw tls_error(cert_op, "has an EC key whose curve isn't named")
+    }
+    let identity = try make_identity(certs, key, :cert_op, :key_op)
+    identity.chain = certs
+    identity.ec_key = ec_private_key(key, certs[0])
+    return identity
+}
+
+// The EC key of `key` (the point, then the scalar), when it is on P-256 or
+// P-384 and is the key of the certificate `cert`.
+func ec_private_key(anon key: KeyData, anon cert: bytes) -> ecdsa.PrivateKey? {
+    if not key.is_ec {
+        return none
+    }
+    let size = (len(key.data) - 1) / 3
+    let curve = if size == 32 { ecdsa.Curve.P256 } else if size == 48 { ecdsa.Curve.P384 } else { return none }
+    let point = key.data[..1 + 2 * size]
+    let made = ecdsa.PrivateKey(curve, scalar: key.data[1 + 2 * size..])
+    let parsed = x509.parse(cert)
+    if made is Error or parsed is Error {
+        return none
+    }
+    let private = must made
+    if not ((must parsed).key is .Ec(public) and public.point() == point and private.public_key().point() == point) {
+        return none
+    }
+    return private
 }
 
 func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op: str) -> Identity or Error {
@@ -921,7 +955,28 @@ func make_identity(anon certs: [bytes], anon key: KeyData, cert_op: str, key_op:
 // The server's handshake on an accepted connection, which is the stream's from then on.
 func accept(anon fd: Fd, anon identity: Identity) -> TlsStream or Error {
     let op = "tls accept"
+    mut replay = b""
+    if identity.certs != 0 and identity.ec_key is ecdsa.PrivateKey(key) {
+        let session = tls13.server_session(fd, chain: identity.chain, key: key, op: op)
+        let shaken = session.handshake(op)
+        let Err(e) = shaken else {
+            return TlsStream(conn: fd, ctx: 0, link: 0, kod: session)
+        }
+        if not (e is IoError(io) and io.kind is .Protocol) {
+            let _ = fd.close()
+            throw e
+        }
+        // A client without TLS 1.3 as Kod's server speaks it: the system's
+        // TLS takes over from the records read so far.
+        replay = (must session.server).seen + session.incoming
+    }
     let s = new_stream(fd, side: SERVER_SIDE)
+    if len(replay) > 0 {
+        s.incoming = replay
+        unsafe.store64(s.link + LINK_IN, unsafe.data(s.incoming))
+        unsafe.store64(s.link + LINK_POS, 0)
+        unsafe.store64(s.link + LINK_LEN, len(s.incoming))
+    }
     let shaken = shake_as_server(s, identity, :op)
     if shaken is Err(e) {
         s.open = false

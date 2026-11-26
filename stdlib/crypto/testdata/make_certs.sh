@@ -3,13 +3,16 @@
 # (for -not_before and -not_after): run from this directory. They are
 # checked in, so this runs only to change them. Every certificate is valid
 # from 2025 to 2035 unless its name says otherwise; the test's "now" is
-# 2026-06-01.
+# 2026-06-01. leaf.key.pem and leaf_sha512.key.pem are the keys of leaf.pem
+# and leaf_sha512.pem: test keys, for nothing else.
 set -e
 OPENSSL=${OPENSSL:-openssl}
 FROM=20250101000000Z
 TO=20350101000000Z
 cd "$(dirname "$0")"
-rm -f *.pem *.key *.csr *.ext *.srl
+# Everything but github.com's chain, which was fetched, not made.
+find . -name '*.pem' ! -name github_chain.pem ! -name usertrust_ecc_root.pem -delete
+rm -f *.key *.csr *.ext *.srl
 
 key() {
     case $2 in
@@ -61,4 +64,7 @@ cert not_ca p256 inter sha256 $FROM $TO "subjectAltName=DNS:notca.example.test" 
 cert under_not_ca p256 not_ca sha256 $FROM $TO "subjectAltName=DNS:example.test" "$LEAF_EXT"
 cert inter2 p256 inter sha256 $FROM $TO "$CA_EXT" "$SIGN"
 cert under_inter2 p256 inter2 sha256 $FROM $TO "subjectAltName=DNS:example.test" "$LEAF_EXT"
+# The keys of two server certificates stay, for the TLS server's tests.
+mv leaf.key leaf.key.pem
+mv leaf_sha512.key leaf_sha512.key.pem
 rm -f *.key *.csr *.ext *.srl

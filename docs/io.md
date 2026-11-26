@@ -304,9 +304,10 @@ doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
 `stdlib/net/tls.kod` runs TLS over a TCP connection. A client speaks TLS 1.3
 with Kod's own implementation (`stdlib/net/tls13.kod`, on the modules of
 [Cryptography](crypto.md)), and checks the server's certificates against the
-system's roots (`/etc/ssl/cert.pem`). For a server that can't speak TLS 1.3 as
-it does, it falls back to the system's SecureTransport (the Security
-framework), which also runs the server's side for now; Kod calls it through
+system's roots (`/etc/ssl/cert.pem`). A server with an EC key on P-256 or P-384
+speaks TLS 1.3 with it too. For a peer that can't speak TLS 1.3 as Kod
+does, and for a server with an RSA key for now, it falls back to the system's
+SecureTransport (the Security framework); Kod calls it through
 [`unsafe`](unsafe.md), its I/O callbacks included. A program that imports
 `net/tls` links `-framework Security -framework CoreFoundation`; no other
 program does.
@@ -359,9 +360,9 @@ and RSA-PSS signatures from the server. It doesn't resume sessions or send early
 data; a server that asks for a client certificate gets none. `s.kod` is its
 session (`tls13.Session?`), whose `client` holds what the handshake found, such
 as the server's `certificates` and the cipher `suite`. Its handshake costs
-about 10 to 20 ms of CPU, against a millisecond or two for the system's, mostly
-in X25519 and the ECDSA checks; the first in a program also reads the system's
-roots, another 80 ms.
+about 5 to 15 ms of CPU, against a millisecond or two for the system's: 2 ms
+for X25519 and the rest checking signatures, 2 ms each on P-256 and 6 ms on
+P-384. The first in a program also reads the system's roots, another 80 ms.
 
 The server's side is `accept`, on a connection that [`net/tcp`](#tcp) accepted:
 
@@ -384,9 +385,24 @@ func main() -> none or Error {
 | `identity.close()` | frees it; connections made with it go on |
 | `accept(fd, identity)` | run the handshake as the server; `TlsStream or Error`. The connection is the stream's from then on, which closes it; on an error it is closed at once. How long the handshake may take is `fd`'s `tcp.set_timeout`, which a `nonblocking` one has not |
 
-A key that isn't the certificate's is a `Tls` error. Only TLS 1.2 with forward secrecy
-and authenticated encryption is spoken (ECDHE with AES-GCM or ChaCha20-Poly1305), which clients since about 2014
-do. The client isn't asked for a certificate.
+A key that isn't the certificate's is a `Tls` error, and so is an EC key whose curve
+the certificate gives by its parameters rather than by name (which SecureTransport
+can't take).
+
+With an EC key on P-256 or P-384, `accept` runs Kod's TLS 1.3 server: x25519 (asking a
+client that sent another key share for an x25519 one), the three TLS 1.3 cipher
+suites, and the key's ECDSA signature. A client that offers no TLS 1.3, or can't
+take that key or key exchange, is handed, with what it has sent so far, to
+SecureTransport, which then shakes hands with it as if from the start. `s.kod`
+says which ran: a Kod session's `server` holds what its handshake found, such as
+the `server_name` the client asked for. With an RSA key, SecureTransport runs
+every handshake. SecureTransport speaks TLS 1.2 with forward secrecy and
+authenticated encryption (ECDHE with AES-GCM or ChaCha20-Poly1305), which clients since
+about 2014 do. The client isn't asked for a certificate.
+
+A Kod server handshake costs about 3.5 ms of CPU: 1.3 ms for the signature and
+2 ms for X25519, against about 1 ms for SecureTransport's. The first in a program also makes a table of multiples of
+the curve's generator, about 18 ms, which the signatures after it use.
 
 Several tasks can use streams at the same time, and one may read a stream while another
 writes to it; two writing to one stream at the same time isn't supported.

@@ -408,3 +408,101 @@ test "accept without an identity, or with one that is closed" {
     assert serving.wait() == "tls accept: connection is closed"
     must l.close()
 }
+
+// ---- Kod's own TLS 1.3 server, which takes an EC identity ----
+
+func ec_cert_path() -> str {
+    return "build/tls_test_ec_cert.pem"
+}
+
+func ec_key_path() -> str {
+    return "build/tls_test_ec_key.pem"
+}
+
+func make_ec_certificate() -> none {
+    if io.is_file(ec_cert_path()) and io.is_file(ec_key_path()) {
+        return
+    }
+    // A named curve: `req -newkey ec` writes the curve's parameters out.
+    assert process.run(["/usr/bin/openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ec_key_path()]).status == 0
+    let r = process.run(["/usr/bin/openssl", "req", "-new", "-x509", "-key", ec_key_path(), "-nodes", "-out", ec_cert_path(), "-subj", "/CN=localhost", "-days", "30", "-addext", "subjectAltName=DNS:localhost", "-addext", "extendedKeyUsage=serverAuth"])
+    assert r.status == 0
+}
+
+// Accepts one connection, echoes a line on it and says which TLS ran it.
+func echo_line(anon l: tcp.Listener, anon identity: Identity) -> str {
+    let conn = must l.accept()
+    let r = accept(conn, identity)
+    if r is Err(e) {
+        return e.to_str()
+    }
+    let s = r
+    let br = BufReader(inner: s)
+    let line = (must br.read_line())? or ""
+    must s.write_str(line + "\n")
+    must s.close()
+    return if s.kod is tls13.Session { f"kod {line}" } else { f"system {line}" }
+}
+
+// Runs `openssl s_client` with `flags` against our server on `l`, which this
+// task runs, sending it a line: what the server said, and what s_client printed.
+func s_client(anon l: tcp.Listener, anon identity: Identity, anon flags: [str]) -> (str, str) {
+    let argv = ["perl", "-e", "alarm 20; exec @ARGV", "/usr/bin/openssl", "s_client", "-connect", f"127.0.0.1:{l.port()}", "-servername", "localhost", "-CAfile", ec_cert_path(), "-verify_return_error", "-quiet"] + flags
+    let child = must process.start(argv, stdin: .Pipe, stdout: .Pipe, stderr: .Null)
+    must child.stdin.write_all(b"hello there\n")
+    let served = echo_line(l, identity)
+    let printed = kod_bytes_to_str(must child.stdout.read_all())
+    let _ = child.wait()
+    return (served, printed.trim())
+}
+
+test "Kod's server: an EC identity, with Kod's client" {
+    make_ec_certificate()
+    let identity = must load_identity(ec_cert_path(), ec_key_path())
+    assert identity.ec_key is not none
+    // A curve given by its parameters isn't taken (SecureTransport would abort).
+    let _ = process.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "build/tls_test_explicit_key.pem", "-out", "build/tls_test_explicit_cert.pem", "-subj", "/CN=localhost", "-days", "30"])
+    assert load_identity("build/tls_test_explicit_cert.pem", "build/tls_test_explicit_key.pem") is Err(_)
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    for nonblocking in [false, true] {
+        let serving = spawn echo_once(l, identity, :nonblocking)
+        let c = must connect("localhost", port: l.port(), trust_file: ec_cert_path(), engine: .Kod)
+        let reading = spawn read_so_many(c, 300000)
+        let piece = kod_bytes_from_array([120] * 100000)
+        for _i in 0..3 {
+            must c.write_all(piece)
+        }
+        assert reading.wait() == 300000
+        must c.close()
+        assert serving.wait() == "300000"
+    }
+    identity.close()
+    must l.close()
+}
+
+test "Kod's server: openssl s_client with TLS 1.3, a retry for the key share, and TLS 1.2" {
+    make_ec_certificate()
+    let identity = must load_identity(ec_cert_path(), ec_key_path())
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    for (flags, want) in [(["-tls1_3"], "kod hello there"), (["-tls1_3", "-groups", "P-256:X25519"], "kod hello there"), (["-tls1_2"], "system hello there")] {
+        let (served, printed) = s_client(l, identity, flags)
+        assert served == want and printed == "hello there"
+    }
+    identity.close()
+    must l.close()
+}
+
+test "Kod's server: a client it can't serve is refused" {
+    make_ec_certificate()
+    let identity = must load_identity(ec_cert_path(), ec_key_path())
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    // Not TLS at all, then a client that hangs up at once.
+    let serving = spawn echo_line(l, identity)
+    let plain = must tcp.connect("127.0.0.1", port: l.port())
+    must plain.write_all(b"GET / HTTP/1.0\r\n\r\n")
+    let _ = plain.read(100)
+    must plain.close()
+    assert serving.wait().starts_with("tls accept")
+    identity.close()
+    must l.close()
+}

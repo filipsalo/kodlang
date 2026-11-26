@@ -12,6 +12,7 @@
 // Protocol, which net/tls takes as a reason to use the system's TLS instead.
 import "crypto/aesgcm"
 import "crypto/chacha20poly1305"
+import "crypto/ecdsa"
 import "crypto/hkdf"
 import "crypto/hmac"
 import "crypto/random"
@@ -192,6 +193,8 @@ type Client = shared struct {
     now: int64
     // Whether to check the server's certificates (the RFC 8448 test can't).
     check_certificates: bool = true
+    // The cipher suites offered, most wanted first.
+    suites: [int64] = [AES_128_GCM_SHA256, AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256]
     private_key: bytes
     hello: bytes = b""
     session_id: bytes = b""
@@ -234,7 +237,10 @@ type Client = shared struct {
         exts = exts + extension(13, vec16(schemes))
         exts = exts + extension(43, vec8(u16(0x0304)))
         exts = exts + extension(51, vec16(u16(X25519) + vec16(public)))
-        let suites = u16(AES_128_GCM_SHA256) + u16(AES_256_GCM_SHA384) + u16(CHACHA20_POLY1305_SHA256)
+        mut suites = b""
+        for suite in self.suites {
+            suites = suites + u16(suite)
+        }
         let body = u16(0x0303) + nonce + vec8(session_id) + vec16(suites) + vec8(u8(0)) + vec16(exts)
         return u8(CLIENT_HELLO) + u24(len(body)) + body
     }
@@ -430,7 +436,7 @@ type Client = shared struct {
         if body[35..35 + sid_len] != self.session_id or compression != 0 {
             throw failed(self.op, "the ServerHello doesn't echo the ClientHello")
         }
-        if suite != AES_128_GCM_SHA256 and suite != AES_256_GCM_SHA384 and suite != CHACHA20_POLY1305_SHA256 {
+        if not (suite in self.suites) {
             throw failed(self.op, f"the server chose cipher suite {suite:#06x}, which wasn't offered")
         }
         let Some(ks) = share else { throw unsupported(self.op, "the ServerHello has no key share") }
@@ -609,6 +615,30 @@ type Client = shared struct {
         self.write = w
         return record
     }
+
+    func take_out(self) -> [bytes] {
+        let records = self.out
+        self.out = []
+        return records
+    }
+
+    func take_data(self) -> bytes {
+        let got = self.data
+        self.data = b""
+        return got
+    }
+
+    func done(self) -> bool {
+        return self.wait is .Done
+    }
+
+    func peer_closed(self) -> bool {
+        return self.closed
+    }
+
+    func first_flight(self) -> bool {
+        return self.wait is .ServerHello
+    }
 }
 
 func must_hex(anon s: str) -> bytes {
@@ -652,25 +682,435 @@ func extensions(anon body: bytes, anon at: int64) -> [(int64, bytes)]? {
     return out
 }
 
+// What a Session runs: a Client or a Server.
+interface Peer {
+    func receive(self, anon header: bytes, anon body: bytes) -> none or Error
+    // The records to send, which it no longer holds.
+    func take_out(self) -> [bytes]
+    // The application data received, which it no longer holds.
+    func take_data(self) -> bytes
+    func seal_data(self, anon data: bytes) -> [bytes]
+    func close_notify(self) -> bytes
+    func done(self) -> bool
+    func peer_closed(self) -> bool
+    // Whether nothing of the other side's has been taken yet.
+    func first_flight(self) -> bool
+}
+
+// What the server waits for next.
+type ServerWait = enum {
+    ClientHello
+    // The second, after a HelloRetryRequest.
+    ClientHello2
+    Finished
+    Done
+}
+
+// The server's side of one handshake and connection, without the I/O, as
+// Client is the client's.
+type Server = shared struct {
+    op: str
+    // The certificate chain, DER, the server's own first, and its key.
+    chain: [bytes]
+    key: ecdsa.PrivateKey
+    private_key: bytes
+    wait: ServerWait = .ClientHello
+    suite: int64 = 0
+    algo: Algo = .Sha256
+    transcript: Hasher = Hasher(.Sha256)
+    pending: bytes = b""
+    // The records received before any keys, header and body, for the
+    // system's TLS to take over when the client can't do TLS 1.3 this way.
+    seen: bytes = b""
+    session_id: bytes = b""
+    // The first ClientHello, when a HelloRetryRequest followed it.
+    first_hello: bytes = b""
+    handshake_secret: bytes = b""
+    client_hs: bytes = b""
+    server_hs: bytes = b""
+    client_ap: bytes = b""
+    server_ap: bytes = b""
+    read: Protection? = none
+    write: Protection? = none
+    out: [bytes] = []
+    data: bytes = b""
+    closed: bool = false
+    // The name the client asked for (server_name), or "".
+    server_name: str = ""
+
+    func receive(self, anon header: bytes, anon body: bytes) -> none or Error {
+        let kind = header[0]
+        if len(body) > MAX_PLAIN + 256 {
+            throw failed(self.op, "a record is too long")
+        }
+        if kind == CHANGE_CIPHER_SPEC {
+            if self.wait is .Done or body != b"\x01" {
+                throw failed(self.op, "an unexpected change_cipher_spec")
+            }
+            return
+        }
+        let Some(keys) = self.read else {
+            self.seen = self.seen + header + body
+            if kind == ALERT {
+                try self.alert(body)
+                return
+            }
+            if kind != HANDSHAKE {
+                throw unsupported(self.op, f"a record of type {kind} before the handshake")
+            }
+            try self.handshake_bytes(body)
+            return
+        }
+        if kind != APPLICATION_DATA {
+            throw failed(self.op, f"a record of type {kind} in the clear after the keys")
+        }
+        mut k = keys
+        let Some((inner_kind, plaintext)) = k.open(header, body) else {
+            throw failed(self.op, "a record didn't decrypt (bad_record_mac)")
+        }
+        self.read = k
+        if len(plaintext) > MAX_PLAIN {
+            throw failed(self.op, "a record's plaintext is too long")
+        }
+        if inner_kind == HANDSHAKE {
+            try self.handshake_bytes(plaintext)
+        } else if inner_kind == APPLICATION_DATA {
+            if not (self.wait is .Done) {
+                throw failed(self.op, "application data during the handshake")
+            }
+            self.data = self.data + plaintext
+        } else if inner_kind == ALERT {
+            try self.alert(plaintext)
+        } else {
+            throw failed(self.op, f"a record of inner type {inner_kind}")
+        }
+    }
+
+    func alert(self, anon body: bytes) -> none or Error {
+        if len(body) != 2 {
+            throw failed(self.op, "a malformed alert")
+        }
+        if body[1] == 0 {
+            self.closed = true
+            return
+        }
+        throw failed(self.op, f"the client sent alert {body[1]}")
+    }
+
+    func handshake_bytes(self, anon b: bytes) -> none or Error {
+        self.pending = self.pending + b
+        for len(self.pending) >= 4 {
+            let size = get24(self.pending, 1)
+            if size > 1 << 17 {
+                throw failed(self.op, "a handshake message is too long")
+            }
+            if len(self.pending) < 4 + size {
+                break
+            }
+            let msg = self.pending[..4 + size]
+            self.pending = self.pending[4 + size..]
+            try self.message(msg[0], msg[4..], msg)
+        }
+    }
+
+    func message(self, anon kind: int64, anon body: bytes, anon whole: bytes) -> none or Error {
+        match self.wait {
+            .ClientHello | .ClientHello2 -> {
+                if kind != CLIENT_HELLO {
+                    throw unsupported(self.op, f"expected a ClientHello, got handshake message {kind}")
+                }
+                if len(self.pending) > 0 {
+                    throw failed(self.op, "handshake data after the ClientHello")
+                }
+                try self.client_hello(body, whole)
+            }
+            .Finished -> {
+                if kind != FINISHED {
+                    throw failed(self.op, f"expected Finished, got handshake message {kind}")
+                }
+                if not hmac.equal(body, self.verify_data(self.client_hs)) {
+                    throw failed(self.op, "the client's Finished doesn't match (decrypt_error)")
+                }
+                self.transcript.update(whole)
+                self.read = protection(self.suite, secret: self.client_ap)
+                self.wait = .Done
+            }
+            .Done -> {
+                if kind != KEY_UPDATE {
+                    throw failed(self.op, f"an unexpected handshake message {kind} after the handshake")
+                }
+                if len(body) != 1 or body[0] > 1 {
+                    throw failed(self.op, "a malformed KeyUpdate")
+                }
+                self.client_ap = expand_label(self.algo, secret: self.client_ap, label: "traffic upd", context: b"", length: self.algo.size())
+                self.read = protection(self.suite, secret: self.client_ap)
+                if body[0] == 1 {
+                    mut w = must self.write
+                    self.out += [w.seal(HANDSHAKE, u8(KEY_UPDATE) + u24(1) + u8(0))]
+                    self.server_ap = expand_label(self.algo, secret: self.server_ap, label: "traffic upd", context: b"", length: self.algo.size())
+                    self.write = protection(self.suite, secret: self.server_ap)
+                }
+            }
+        }
+    }
+
+    // The signature scheme of the key, which the client must accept.
+    func scheme(self) -> int64 {
+        return if self.key.curve is .P256 { 0x0403 } else { 0x0503 }
+    }
+
+    func client_hello(self, anon body: bytes, anon whole: bytes) -> none or Error {
+        if len(body) < 35 {
+            throw unsupported(self.op, "a short ClientHello")
+        }
+        let sid_len = body[34]
+        mut at = 35 + sid_len
+        if sid_len > 32 or at + 2 > len(body) {
+            throw unsupported(self.op, "a malformed ClientHello")
+        }
+        let session_id = body[35..at]
+        let suites_len = get16(body, at)
+        at += 2
+        if suites_len % 2 != 0 or at + suites_len + 1 > len(body) {
+            throw unsupported(self.op, "a malformed ClientHello")
+        }
+        let suites = [get16(body, at + 2 * i) for i in 0..suites_len / 2]
+        at += suites_len
+        let comp_len = body[at]
+        if at + 1 + comp_len > len(body) {
+            throw unsupported(self.op, "a malformed ClientHello")
+        }
+        let compression = body[at + 1..at + 1 + comp_len]
+        at += 1 + comp_len
+        let Some(exts) = extensions(body, at) else { throw unsupported(self.op, "malformed ClientHello extensions") }
+        mut versions: [int64] = []
+        mut groups: [int64] = []
+        mut schemes: [int64] = []
+        mut share: bytes? = none
+        for (t, data) in exts {
+            if t == 43 and len(data) >= 1 and len(data) == 1 + data[0] {
+                versions = [get16(data, 1 + 2 * i) for i in 0..data[0] / 2]
+            } else if t == 10 and len(data) >= 2 {
+                groups = [get16(data, 2 + 2 * i) for i in 0..(len(data) - 2) / 2]
+            } else if t == 13 and len(data) >= 2 {
+                schemes = [get16(data, 2 + 2 * i) for i in 0..(len(data) - 2) / 2]
+            } else if t == 51 and len(data) >= 2 {
+                mut i = 2
+                for i + 4 <= len(data) {
+                    let size = get16(data, i + 2)
+                    if i + 4 + size > len(data) {
+                        break
+                    }
+                    if get16(data, i) == X25519 and size == 32 {
+                        share = data[i + 4..i + 4 + size]
+                    }
+                    i += 4 + size
+                }
+            } else if t == 0 and len(data) > 5 and data[2] == 0 {
+                self.server_name = kod_bytes_to_str(data[5..5 + min(get16(data, 3), len(data) - 5)])
+            }
+        }
+        if not (0x0304 in versions) {
+            throw unsupported(self.op, "the client doesn't offer TLS 1.3")
+        }
+        if compression != b"\x00" {
+            throw failed(self.op, "a TLS 1.3 ClientHello with compression")
+        }
+        mut suite = 0
+        for c in suites {
+            if suite == 0 and (c == AES_128_GCM_SHA256 or c == AES_256_GCM_SHA384 or c == CHACHA20_POLY1305_SHA256) {
+                suite = c
+            }
+        }
+        if suite == 0 {
+            throw unsupported(self.op, "the client offers no cipher suite in common")
+        }
+        if not (self.scheme() in schemes) {
+            throw unsupported(self.op, "the client doesn't accept the key's signature scheme")
+        }
+        if self.wait is .ClientHello2 and suite != self.suite {
+            throw failed(self.op, "the second ClientHello changed the cipher suite")
+        }
+        self.suite = suite
+        self.algo = suite_hash(suite)
+        self.session_id = session_id
+        let Some(client_key) = share else {
+            if X25519 in groups and self.wait is .ClientHello {
+                self.retry(whole)
+                return
+            }
+            throw unsupported(self.op, "the client offers no x25519 key share")
+        }
+        let Some(shared) = x25519.shared(self.private_key, client_key) else {
+            throw failed(self.op, "the client's x25519 key is of small order")
+        }
+        try self.reply(shared, whole)
+    }
+
+    // Asks for an x25519 key share: a HelloRetryRequest.
+    func retry(self, anon hello: bytes) -> none {
+        self.first_hello = hello
+        let exts = extension(43, u16(0x0304)) + extension(51, u16(X25519))
+        let body = u16(0x0303) + must_hex(RETRY_RANDOM) + vec8(self.session_id) + u16(self.suite) + u8(0) + vec16(exts)
+        let hrr = u8(SERVER_HELLO) + u24(len(body)) + body
+        self.first_hello = hello + hrr
+        self.out += [u8(HANDSHAKE) + u16(0x0303) + u16(len(hrr)) + hrr]
+        if len(self.session_id) > 0 {
+            self.out += [b"\x14\x03\x03\x00\x01\x01"]
+        }
+        self.wait = .ClientHello2
+    }
+
+    // The ServerHello and the encrypted flight after it.
+    func reply(self, anon shared: bytes, anon hello: bytes) -> none or Error {
+        let public = x25519.public_key(self.private_key)
+        let exts = extension(43, u16(0x0304)) + extension(51, u16(X25519) + vec16(public))
+        let body = u16(0x0303) + random.secure_bytes(32) + vec8(self.session_id) + u16(self.suite) + u8(0) + vec16(exts)
+        let sh = u8(SERVER_HELLO) + u24(len(body)) + body
+        self.transcript = Hasher(self.algo)
+        if len(self.first_hello) > 0 {
+            // The first ClientHello stands in as a message_hash, then the HRR.
+            let ch1_len = 4 + get24(self.first_hello, 1)
+            let ch1 = self.first_hello[..ch1_len]
+            let hrr = self.first_hello[ch1_len..]
+            self.transcript.update(u8(254) + u24(self.algo.size()) + sha2.digest(self.algo, ch1))
+            self.transcript.update(hrr)
+        }
+        self.transcript.update(hello)
+        self.transcript.update(sh)
+        self.out += [u8(HANDSHAKE) + u16(0x0303) + u16(len(sh)) + sh]
+        if len(self.session_id) > 0 and len(self.first_hello) == 0 {
+            self.out += [b"\x14\x03\x03\x00\x01\x01"]
+        }
+        let zeros = kod_bytes_from_array([0] * self.algo.size())
+        let early = hkdf.extract(self.algo, salt: b"", ikm: zeros)
+        let empty = sha2.digest(self.algo, b"")
+        let derived = derive_secret(self.algo, secret: early, label: "derived", transcript: empty)
+        self.handshake_secret = hkdf.extract(self.algo, salt: derived, ikm: shared)
+        let h = self.transcript.finish()
+        self.client_hs = derive_secret(self.algo, secret: self.handshake_secret, label: "c hs traffic", transcript: h)
+        self.server_hs = derive_secret(self.algo, secret: self.handshake_secret, label: "s hs traffic", transcript: h)
+        self.read = protection(self.suite, secret: self.client_hs)
+        mut w = protection(self.suite, secret: self.server_hs)
+        // EncryptedExtensions (none), Certificate, CertificateVerify, Finished.
+        mut flight = b""
+        let ee = u8(ENCRYPTED_EXTENSIONS) + u24(2) + u16(0)
+        self.transcript.update(ee)
+        flight = flight + ee
+        mut list = b""
+        for der in self.chain {
+            list = list + u24(len(der)) + der + u16(0)
+        }
+        let cert_body = u8(0) + u24(len(list)) + list
+        let cert = u8(CERTIFICATE) + u24(len(cert_body)) + cert_body
+        self.transcript.update(cert)
+        flight = flight + cert
+        let content = kod_bytes_from_array([32] * 64) + b"TLS 1.3, server CertificateVerify\x00" + self.transcript.finish()
+        let algo = if self.key.curve is .P256 { Algo.Sha256 } else { Algo.Sha384 }
+        let signature = self.key.sign(algo: algo, message: content)
+        let cv_body = u16(self.scheme()) + vec16(signature)
+        let cv = u8(CERTIFICATE_VERIFY) + u24(len(cv_body)) + cv_body
+        self.transcript.update(cv)
+        flight = flight + cv
+        let fin = self.verify_data(self.server_hs)
+        let fin_msg = u8(FINISHED) + u24(len(fin)) + fin
+        self.transcript.update(fin_msg)
+        flight = flight + fin_msg
+        mut at = 0
+        for at < len(flight) {
+            let end = min(at + MAX_PLAIN, len(flight))
+            self.out += [w.seal(HANDSHAKE, flight[at..end])]
+            at = end
+        }
+        let after_server = self.transcript.finish()
+        let derived2 = derive_secret(self.algo, secret: self.handshake_secret, label: "derived", transcript: empty)
+        let master = hkdf.extract(self.algo, salt: derived2, ikm: zeros)
+        self.client_ap = derive_secret(self.algo, secret: master, label: "c ap traffic", transcript: after_server)
+        self.server_ap = derive_secret(self.algo, secret: master, label: "s ap traffic", transcript: after_server)
+        self.write = protection(self.suite, secret: self.server_ap)
+        self.wait = .Finished
+    }
+
+    func verify_data(self, anon secret: bytes) -> bytes {
+        let key = expand_label(self.algo, secret: secret, label: "finished", context: b"", length: self.algo.size())
+        return hmac.mac(self.algo, key: key, data: self.transcript.finish())
+    }
+
+    func seal_data(self, anon data: bytes) -> [bytes] {
+        mut w = must self.write
+        mut records: [bytes] = []
+        mut at = 0
+        for at < len(data) {
+            let end = min(at + MAX_PLAIN, len(data))
+            records += [w.seal(APPLICATION_DATA, data[at..end])]
+            at = end
+        }
+        self.write = w
+        return records
+    }
+
+    func close_notify(self) -> bytes {
+        mut w = must self.write
+        let record = w.seal(ALERT, b"\x01\x00")
+        self.write = w
+        return record
+    }
+
+    func take_out(self) -> [bytes] {
+        let records = self.out
+        self.out = []
+        return records
+    }
+
+    func take_data(self) -> bytes {
+        let got = self.data
+        self.data = b""
+        return got
+    }
+
+    func done(self) -> bool {
+        return self.wait is .Done
+    }
+
+    func peer_closed(self) -> bool {
+        return self.closed
+    }
+
+    func first_flight(self) -> bool {
+        return self.wait is .ClientHello
+    }
+}
+
 // The handshake and its records over a TCP connection.
 type Session = shared struct {
     conn: Fd
-    client: Client
+    peer: Peer
+    // The same as `peer`, as what it is, for what the handshake found.
+    client: Client? = none
+    server: Server? = none
     // Bytes read from the connection that aren't a whole record yet.
     incoming: bytes = b""
-    // How far `client.data` has been read.
+    // Application data received and not yet read, from `data_at`.
+    data: bytes = b""
     data_at: int64 = 0
     // Ciphertext waiting to be sent, and whether a task is sending it.
     unsent: bytes = b""
     flushing: bool = false
     eof: bool = false
 
-    // Waits for one whole record and hands it to the client; false at the
-    // end of the connection between records.
+    // Waits for one whole record and hands it to the peer; false at the end
+    // of the connection between records.
     func next_record(self, anon op: str) -> bool or Error {
         for len(self.incoming) < 5 or len(self.incoming) < 5 + get16(self.incoming, 3) {
-            if len(self.incoming) >= 5 and get16(self.incoming, 3) > MAX_PLAIN + 256 {
-                throw failed(op, "a record is too long")
+            if len(self.incoming) >= 5 {
+                // A content type TLS has and a version of 3.x, or this isn't TLS.
+                let kind = self.incoming[0]
+                if kind < CHANGE_CIPHER_SPEC or kind > APPLICATION_DATA or self.incoming[1] != 3 {
+                    throw failed(op, "what came isn't TLS")
+                }
+                if get16(self.incoming, 3) > MAX_PLAIN + 256 {
+                    throw failed(op, "a record is too long")
+                }
             }
             let got = try self.conn.read(65536)
             if len(got) == 0 {
@@ -685,16 +1125,20 @@ type Session = shared struct {
         let header = self.incoming[..5]
         let body = self.incoming[5..5 + size]
         self.incoming = self.incoming[5 + size..]
-        try self.client.receive(header, body)
+        try self.peer.receive(header, body)
+        let got = self.peer.take_data()
+        if len(got) > 0 {
+            self.data = self.data[self.data_at..] + got
+            self.data_at = 0
+        }
         return true
     }
 
-    // Sends what the client has for the server.
+    // Sends what the peer has to send.
     func flush(self, anon op: str) -> none or Error {
-        for record in self.client.out {
+        for record in self.peer.take_out() {
             self.unsent = self.unsent + record
         }
-        self.client.out = []
         if self.flushing {
             return
         }
@@ -710,16 +1154,14 @@ type Session = shared struct {
         }
     }
 
-    func handshake(self) -> none or Error {
-        let op = self.client.op
-        self.client.out += [self.client.start()]
+    func handshake(self, anon op: str) -> none or Error {
         try self.flush(op)
-        for not (self.client.wait is .Done) {
+        for not self.peer.done() {
             if not try self.next_record(op) {
-                if self.client.wait is .ServerHello {
-                    throw unsupported(op, "the server closed the connection at the ClientHello")
+                if self.peer.first_flight() {
+                    throw unsupported(op, "the other side closed the connection at the start of the handshake")
                 }
-                throw failed(op, "the server closed the connection during the handshake")
+                throw failed(op, "the other side closed the connection during the handshake")
             }
             try self.flush(op)
         }
@@ -728,18 +1170,18 @@ type Session = shared struct {
     // At most `max` bytes of application data; empty at the end.
     func read(self, anon max: int64) -> bytes or Error {
         for true {
-            let have = len(self.client.data) - self.data_at
+            let have = len(self.data) - self.data_at
             if have > 0 {
                 let n = min(have, max)
-                let out = self.client.data[self.data_at..self.data_at + n]
+                let out = self.data[self.data_at..self.data_at + n]
                 self.data_at += n
-                if self.data_at == len(self.client.data) {
-                    self.client.data = b""
+                if self.data_at == len(self.data) {
+                    self.data = b""
                     self.data_at = 0
                 }
                 return out
             }
-            if self.eof or self.client.closed or max <= 0 {
+            if self.eof or self.peer.peer_closed() or max <= 0 {
                 return b""
             }
             if not try self.next_record("read") {
@@ -753,14 +1195,16 @@ type Session = shared struct {
     }
 
     func write(self, anon data: bytes) -> int64 or Error {
-        self.client.out += self.client.seal_data(data)
+        for record in self.peer.seal_data(data) {
+            self.unsent = self.unsent + record
+        }
         try self.flush("write")
         return len(data)
     }
 
-    // Whether there is nothing to read without waiting.
+    // Whether there is something to read without waiting.
     func buffered(self) -> bool {
-        return len(self.client.data) > self.data_at or len(self.incoming) > 0
+        return len(self.data) > self.data_at or len(self.incoming) > 0
     }
 }
 
@@ -768,7 +1212,18 @@ type Session = shared struct {
 // certificates are checked against `roots` at `now` (seconds since 1970).
 func connect(anon conn: Fd, host: str, roots: [Certificate], now: int64, op: str) -> Session or Error {
     let client = Client(op: op, host: host, roots: roots, now: now, private_key: random.secure_bytes(32))
-    let s = Session(conn: conn, client: client)
-    try s.handshake()
+    client.out += [client.start()]
+    let s = Session(conn: conn, peer: client, client: client)
+    try s.handshake(op)
     return s
+}
+
+// The server's session on an accepted `conn`, with the certificate `chain`
+// (DER, its own first) and `key`, before its handshake. When `handshake`
+// fails with an error of kind Protocol, the client can't do TLS 1.3 this way;
+// what it has sent so far is `server.seen` and then `incoming`, for another
+// TLS to take over.
+func server_session(anon conn: Fd, chain: [bytes], key: ecdsa.PrivateKey, op: str) -> Session {
+    let server = Server(op: op, chain: chain, key: key, private_key: random.secure_bytes(32))
+    return Session(conn: conn, peer: server, server: server)
 }

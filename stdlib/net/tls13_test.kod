@@ -1,8 +1,15 @@
 // The handshake of RFC 8448 section 3, byte for byte: the client's key and
 // ClientHello as given there, the server's records fed in, and what the
 // client derives and sends compared with the RFC's.
+import "crypto/ecdsa" { PrivateKey }
+import "crypto/ecdsa"
+import "crypto/random"
+import "crypto/x509"
 import "encoding/hex"
-import "net/tls13" { Client }
+import "io"
+import "net/tls" { key_data, parse_pem }
+import "net/tls13" { Client, Server }
+import "net/tls13"
 
 func h(anon s: str) -> bytes {
     return must hex.decode(s)
@@ -44,4 +51,123 @@ test "RFC 8448: a changed byte stops the handshake" {
     let flipped = kod_bytes_from_array(changed)
     let got = c.receive(flipped[..5], flipped[5..])
     assert got is Err(_)
+}
+
+// ---- Kod's client against Kod's server, with no network ----
+
+func testdata(anon name: str) -> str {
+    return must io.read_file(f"stdlib/crypto/testdata/{name}")
+}
+
+func test_key(anon name: str) -> PrivateKey {
+    let blocks = must parse_pem(testdata(name), op: "test")
+    let Some(kd) = key_data(blocks[0]) else { panic("no key") }
+    let size = (len(kd.data) - 1) / 3
+    let curve = if size == 32 { ecdsa.Curve.P256 } else { ecdsa.Curve.P384 }
+    return must PrivateKey(curve, scalar: kd.data[1 + 2 * size..])
+}
+
+func chain(anon names: [str]) -> [bytes] {
+    mut out: [bytes] = []
+    for n in names {
+        out += must x509.pem_certificates(testdata(n))
+    }
+    return out
+}
+
+// Hands each side's records to the other until neither has more.
+func pump(anon c: Client, anon s: Server) -> none or Error {
+    for _round in 0..10 {
+        let to_server = c.take_out()
+        let to_client = s.take_out()
+        if len(to_server) == 0 and len(to_client) == 0 {
+            return
+        }
+        for r in to_server {
+            try s.receive(r[..5], r[5..])
+        }
+        for r in to_client {
+            try c.receive(r[..5], r[5..])
+        }
+    }
+}
+
+func pair(anon host: str, anon key: PrivateKey, anon certs: [bytes], anon suites: [int64]) -> (Client, Server) {
+    let roots = [must x509.parse(d) for d in must x509.pem_certificates(testdata("root_rsa.pem") + testdata("root_ec.pem"))]
+    let c = Client(op: "client", host: host, roots: roots, now: x509.days_from_civil(2026, 6, 1) * 86400, private_key: random.secure_bytes(32), suites: suites)
+    let s = Server(op: "server", chain: certs, key: key, private_key: random.secure_bytes(32))
+    c.out += [c.start()]
+    return (c, s)
+}
+
+test "every cipher suite, with a P-256 key and an intermediate" {
+    for suite in [tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384, tls13.CHACHA20_POLY1305_SHA256] {
+        let (c, s) = pair("www.example.test", test_key("leaf.key.pem"), chain(["leaf.pem", "inter.pem"]), [suite])
+        must pump(c, s)
+        assert c.done() and s.done() and c.suite == suite and s.suite == suite
+        assert c.certificates[0].common_name() == "leaf" and s.server_name == "www.example.test"
+        // Data both ways, a key update the client asks to be answered, and the close.
+        for r in c.seal_data(b"ping") {
+            must s.receive(r[..5], r[5..])
+        }
+        assert s.take_data() == b"ping"
+        for r in s.seal_data(kod_bytes_from_array([7] * 40000)) {
+            must c.receive(r[..5], r[5..])
+        }
+        assert len(c.take_data()) == 40000
+        mut w = must c.write
+        let update = w.seal(tls13.HANDSHAKE, b"\x18\x00\x00\x01\x01")
+        c.write = w
+        c.client_ap = tls13.expand_label(c.algo, secret: c.client_ap, label: "traffic upd", context: b"", length: c.algo.size())
+        c.write = tls13.protection(c.suite, secret: c.client_ap)
+        must s.receive(update[..5], update[5..])
+        must pump(c, s)
+        for r in c.seal_data(b"after") {
+            must s.receive(r[..5], r[5..])
+        }
+        assert s.take_data() == b"after"
+        for r in s.seal_data(b"back") {
+            must c.receive(r[..5], r[5..])
+        }
+        assert c.take_data() == b"back"
+        let bye = s.close_notify()
+        must c.receive(bye[..5], bye[5..])
+        assert c.peer_closed()
+    }
+}
+
+test "a P-384 key, and a server certificate the client doesn't take" {
+    let (c, s) = pair("big.example.test", test_key("leaf_sha512.key.pem"), chain(["leaf_sha512.pem"]), [tls13.AES_128_GCM_SHA256])
+    must pump(c, s)
+    assert c.done() and s.done()
+    let (c2, s2) = pair("other.test", test_key("leaf_sha512.key.pem"), chain(["leaf_sha512.pem"]), [tls13.AES_128_GCM_SHA256])
+    let r = pump(c2, s2)
+    assert r is Err(_) and not c2.done()
+}
+
+test "a changed Finished from the client is refused" {
+    let (c, s) = pair("example.test", test_key("leaf.key.pem"), chain(["leaf.pem", "inter.pem"]), [tls13.AES_128_GCM_SHA256])
+    for r in c.take_out() {
+        must s.receive(r[..5], r[5..])
+    }
+    for r in s.take_out() {
+        must c.receive(r[..5], r[5..])
+    }
+    let fin = c.take_out()
+    let last = fin[len(fin) - 1]
+    mut changed = [b for b in last]
+    changed[10] = changed[10] ^ 1
+    let bad = kod_bytes_from_array(changed)
+    assert s.receive(bad[..5], bad[5..]) is Err(_)
+    assert not s.done()
+}
+
+test "a client without TLS 1.3 is told apart" {
+    let s = Server(op: "server", chain: chain(["leaf.pem"]), key: test_key("leaf.key.pem"), private_key: random.secure_bytes(32))
+    // A TLS 1.2 ClientHello: no supported_versions.
+    let body = b"\x03\x03" + kod_bytes_from_array([1] * 32) + b"\x00\x00\x02\xc0\x2b\x01\x00\x00\x00"
+    let hello = b"\x01" + kod_bytes_from_array([0, 0, len(body)]) + body
+    let record = b"\x16\x03\x01" + kod_bytes_from_array([0, len(hello)]) + hello
+    let r = s.receive(record[..5], record[5..])
+    assert r is Err(_) and s.seen == record
 }
