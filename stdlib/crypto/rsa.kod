@@ -1,0 +1,133 @@
+// Checking RSA signatures: PKCS #1 v1.5 and PSS (RFC 8017). See
+// docs/crypto.md.
+import "crypto/bignum" { Modulus }
+import "crypto/bignum"
+import "crypto/hmac"
+import "crypto/sha2" { Algo }
+import "crypto/sha2"
+import "stream" { IoError }
+
+type PublicKey = struct {
+    _n: Modulus
+    _e: [int64]
+    // The modulus's length in bytes, which a signature has, and in bits.
+    _size: int64
+    _bits: int64
+
+    // The key of modulus `n` and exponent `e`, both big-endian.
+    func init(n: bytes, e: bytes) -> PublicKey or Error {
+        mut at = 0
+        for at < len(n) and n[at] == 0 {
+            at += 1
+        }
+        let modulus = n[at..]
+        if len(modulus) < 64 or modulus[len(modulus) - 1] & 1 == 0 {
+            throw IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "the modulus is too short or even")
+        }
+        let Some(exponent) = bignum.from_bytes(e, k: (len(e) * 8 + 29) / 30 + 1) else {
+            throw IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "bad exponent")
+        }
+        if exponent[0] & 1 == 0 or bignum.bit_length(exponent) < 2 {
+            throw IoError(kind: .InvalidInput, op: "rsa key", errno: 0, detail: "the exponent is even or 1")
+        }
+        let m = Modulus(modulus)
+        return PublicKey(_n: m, _e: exponent, _size: len(modulus), _bits: bignum.bit_length(m.m))
+    }
+
+    func bits(self) -> int64 {
+        return self._bits
+    }
+
+    // A signature's length in bytes: the modulus's.
+    func size(self) -> int64 {
+        return self._size
+    }
+
+    // signature^e mod n as bytes of the modulus's length, or none when the
+    // signature isn't a number below n of that length.
+    func open_signature(self, anon signature: bytes) -> bytes? {
+        if len(signature) != self._size {
+            return none
+        }
+        let Some(s) = self._n.number(signature) else { return none }
+        let m = self._n.from_mont(self._n.pow(self._n.to_mont(s), self._e))
+        return bignum.to_bytes(m, size: self._size)
+    }
+}
+
+// The DER DigestInfo that comes before a digest of `algo` in PKCS #1 v1.5.
+func digest_info(anon algo: Algo) -> bytes {
+    return match algo {
+        .Sha256 -> b"\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+        .Sha384 -> b"\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
+        .Sha512 -> b"\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
+    }
+}
+
+// Whether `signature` is `key`'s PKCS #1 v1.5 signature of `message` hashed with `algo`.
+func verify_pkcs1(anon key: PublicKey, algo: Algo, message: bytes, signature: bytes) -> bool {
+    let Some(em) = key.open_signature(signature) else { return false }
+    let t = digest_info(algo) + sha2.digest(algo, message)
+    let pad = key.size() - 3 - len(t)
+    if pad < 8 {
+        return false
+    }
+    let want = b"\x00\x01" + kod_bytes_from_array([255] * pad) + b"\x00" + t
+    return hmac.equal(em, want)
+}
+
+// MGF1: `size` bytes from `seed`.
+func mgf1(anon algo: Algo, anon seed: bytes, anon size: int64) -> bytes {
+    mut out = b""
+    mut counter = 0
+    for len(out) < size {
+        let c = kod_bytes_from_array([(counter >> 24) & 255, (counter >> 16) & 255, (counter >> 8) & 255, counter & 255])
+        out = out + sha2.digest(algo, seed + c)
+        counter += 1
+    }
+    return out[..size]
+}
+
+// Whether `signature` is `key`'s PSS signature of `message`, with `algo` for
+// the hash and MGF1 and a salt of `salt_size` bytes (-1: the digest's size,
+// as TLS 1.3 requires).
+func verify_pss(anon key: PublicKey, algo: Algo, message: bytes, signature: bytes, salt_size: int64 = -1) -> bool {
+    let Some(full) = key.open_signature(signature) else { return false }
+    let h_len = algo.size()
+    let s_len = if salt_size < 0 { h_len } else { salt_size }
+    let em_bits = key.bits() - 1
+    let em_len = (em_bits + 7) / 8
+    // The encoded message is em_len bytes; any byte above them is 0.
+    mut em = full
+    if em_len < len(full) {
+        if full[0] != 0 {
+            return false
+        }
+        em = full[len(full) - em_len..]
+    }
+    if em_len < h_len + s_len + 2 or em[em_len - 1] != 0xbc {
+        return false
+    }
+    let db_len = em_len - h_len - 1
+    let masked = em[..db_len]
+    let h = em[db_len..em_len - 1]
+    let top_mask = 255 >> (8 * em_len - em_bits)
+    if masked[0] & (255 ^ top_mask) != 0 {
+        return false
+    }
+    let mask = mgf1(algo, h, db_len)
+    mut db = [masked[i] ^ mask[i] for i in 0..db_len]
+    db[0] = db[0] & top_mask
+    let zeros = db_len - s_len - 1
+    for i in 0..zeros {
+        if db[i] != 0 {
+            return false
+        }
+    }
+    if db[zeros] != 1 {
+        return false
+    }
+    let salt = kod_bytes_from_array(db[zeros + 1..])
+    let m2 = kod_bytes_from_array([0] * 8) + sha2.digest(algo, message) + salt
+    return hmac.equal(sha2.digest(algo, m2), h)
+}

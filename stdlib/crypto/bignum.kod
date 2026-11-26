@@ -1,0 +1,254 @@
+// Arithmetic on big non-negative numbers modulo an odd modulus, for checking
+// RSA and ECDSA signatures (crypto/rsa, crypto/ecdsa).
+//
+// A number is an array of 30-bit limbs, the lowest first, as long as its
+// modulus's: a product of two limbs and a couple of carries stays below
+// 2^61. Multiplication is Montgomery's. This works on public values only,
+// so it branches on them freely; it is not for secrets.
+
+let BITS: int64 = 30
+let MASK: int64 = (1 << 30) - 1
+
+// The number `b` holds, big-endian, in `k` limbs, or none when it needs more.
+func from_bytes(anon b: bytes, k: int64) -> [int64]? {
+    mut out = [0] * k
+    mut bit = 0
+    for i in len(b) - 1..=0 step -1 {
+        let byte = b[i]
+        if byte != 0 {
+            let limb = bit / BITS
+            let shift = bit % BITS
+            if limb >= k {
+                return none
+            }
+            out[limb] = out[limb] | ((byte << shift) & MASK)
+            if shift > BITS - 8 {
+                if limb + 1 >= k {
+                    if (byte >> (BITS - shift)) != 0 {
+                        return none
+                    }
+                } else {
+                    out[limb + 1] = out[limb + 1] | (byte >> (BITS - shift))
+                }
+            }
+        }
+        bit += 8
+    }
+    return out
+}
+
+// `x` as `size` big-endian bytes; its high bits beyond those are dropped.
+func to_bytes(anon x: [int64], size: int64) -> bytes {
+    mut out = [0] * size
+    for i in 0..size {
+        let bit = i * 8
+        let limb = bit / BITS
+        let shift = bit % BITS
+        mut v = 0
+        if limb < len(x) {
+            v = x[limb] >> shift
+            if shift > BITS - 8 and limb + 1 < len(x) {
+                v = v | (x[limb + 1] << (BITS - shift))
+            }
+        }
+        out[size - 1 - i] = v & 255
+    }
+    return kod_bytes_from_array(out)
+}
+
+// -1, 0 or 1 as `a` is below, equal to or above `b` (of one length).
+func compare(anon a: [int64], anon b: [int64]) -> int64 {
+    for i in len(a) - 1..=0 step -1 {
+        if a[i] != b[i] {
+            return if a[i] < b[i] { -1 } else { 1 }
+        }
+    }
+    return 0
+}
+
+func is_zero(anon a: [int64]) -> bool {
+    for x in a {
+        if x != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// a - b, for a >= b.
+func sub(anon a: [int64], anon b: [int64]) -> [int64] {
+    mut out = a
+    mut borrow = 0
+    for i in 0..len(a) {
+        mut t = a[i] - b[i] - borrow
+        borrow = 0
+        if t < 0 {
+            t += 1 << BITS
+            borrow = 1
+        }
+        out[i] = t
+    }
+    return out
+}
+
+// a + b and the carry out of the top limb.
+func add_carry(anon a: [int64], anon b: [int64]) -> ([int64], int64) {
+    mut out = a
+    mut carry = 0
+    for i in 0..len(a) {
+        let t = a[i] + b[i] + carry
+        out[i] = t & MASK
+        carry = t >> BITS
+    }
+    return (out, carry)
+}
+
+// The number of bits up to the highest one bit.
+func bit_length(anon a: [int64]) -> int64 {
+    for i in len(a) - 1..=0 step -1 {
+        if a[i] != 0 {
+            return i * BITS + 64 - a[i].leading_zeros()
+        }
+    }
+    return 0
+}
+
+func bit(anon a: [int64], anon i: int64) -> int64 {
+    return (a[i / BITS] >> (i % BITS)) & 1
+}
+
+// An odd modulus and what Montgomery multiplication by it needs. Numbers
+// "in the Montgomery form" are x * R mod m, R = 2^(30 k).
+type Modulus = struct {
+    m: [int64]
+    k: int64
+    // -1 / m mod 2^30.
+    m_inv: int64
+    // R^2 mod m, to bring a number into the form.
+    r2: [int64]
+
+    func init(anon m: bytes) -> Modulus {
+        let k = (len(m) * 8 + BITS - 1) / BITS
+        let limbs = must from_bytes(m, k: k)
+        if limbs[0] & 1 == 0 {
+            panic("bignum: the modulus is even")
+        }
+        // Newton's iteration doubles the bits that are right each time.
+        mut inv = 1
+        for _i in 0..5 {
+            inv = (inv * ((2 - limbs[0] * inv) & MASK)) & MASK
+        }
+        // R^2 mod m by doubling 1, 2 * 30 k times.
+        mut r = [0] * k
+        r[0] = 1
+        for _i in 0..2 * BITS * k {
+            let (twice, carry) = add_carry(r, r)
+            r = twice
+            if carry != 0 or compare(r, limbs) >= 0 {
+                r = sub(r, limbs)
+            }
+        }
+        return Modulus(m: limbs, k: k, m_inv: (0 - inv) & MASK, r2: r)
+    }
+
+    // a * b / R mod m, for a and b below m.
+    func mul(self, anon a: [int64], anon b: [int64]) -> [int64] {
+        let k = self.k
+        let m = self.m
+        mut t = [0] * (k + 2)
+        for i in 0..k {
+            let bi = b[i]
+            mut carry = 0
+            for j in 0..k {
+                let x = t[j] + a[j] * bi + carry
+                t[j] = x & MASK
+                carry = x >> BITS
+            }
+            let top = t[k] + carry
+            t[k] = top & MASK
+            t[k + 1] = top >> BITS
+            // Add u * m, which makes the lowest limb 0, and shift it out.
+            let u = (t[0] * self.m_inv) & MASK
+            carry = (t[0] + u * m[0]) >> BITS
+            for j in 1..k {
+                let x = t[j] + u * m[j] + carry
+                t[j - 1] = x & MASK
+                carry = x >> BITS
+            }
+            let last = t[k] + carry
+            t[k - 1] = last & MASK
+            t[k] = t[k + 1] + (last >> BITS)
+        }
+        let out = t[..k]
+        if t[k] != 0 or compare(out, m) >= 0 {
+            return sub(out, m)
+        }
+        return out
+    }
+
+    func to_mont(self, anon a: [int64]) -> [int64] {
+        return self.mul(a, self.r2)
+    }
+
+    func from_mont(self, anon a: [int64]) -> [int64] {
+        mut one = [0] * self.k
+        one[0] = 1
+        return self.mul(a, one)
+    }
+
+    // 1 in the Montgomery form.
+    func one(self) -> [int64] {
+        mut one = [0] * self.k
+        one[0] = 1
+        return self.to_mont(one)
+    }
+
+    func add(self, anon a: [int64], anon b: [int64]) -> [int64] {
+        let (sum, carry) = add_carry(a, b)
+        if carry != 0 or compare(sum, self.m) >= 0 {
+            return sub(sum, self.m)
+        }
+        return sum
+    }
+
+    func sub(self, anon a: [int64], anon b: [int64]) -> [int64] {
+        if compare(a, b) >= 0 {
+            return sub(a, b)
+        }
+        let (sum, _carry) = add_carry(a, self.m)
+        return sub(sum, b)
+    }
+
+    // base^e (base in the form, e an ordinary number of any length), in the form.
+    func pow(self, anon base: [int64], anon e: [int64]) -> [int64] {
+        mut r = self.one()
+        for i in bit_length(e) - 1..=0 step -1 {
+            r = self.mul(r, r)
+            if bit(e, i) == 1 {
+                r = self.mul(r, base)
+            }
+        }
+        return r
+    }
+
+    // 1 / a mod m for a prime m (a in the form), by Fermat: a^(m - 2).
+    func inverse(self, anon a: [int64]) -> [int64] {
+        mut two = [0] * self.k
+        two[0] = 2
+        return self.pow(a, sub(self.m, two))
+    }
+
+    // `b`, big-endian and below m, as a number, or none when it is m or more.
+    func number(self, anon b: bytes) -> [int64]? {
+        let Some(x) = from_bytes(b, k: self.k) else { return none }
+        if compare(x, self.m) >= 0 {
+            return none
+        }
+        return x
+    }
+
+    // The bytes of m's length.
+    func byte_size(self) -> int64 {
+        return (bit_length(self.m) + 7) / 8
+    }
+}

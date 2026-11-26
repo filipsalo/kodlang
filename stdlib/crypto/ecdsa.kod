@@ -1,0 +1,239 @@
+// Checking ECDSA signatures (FIPS 186-5) on P-256 and P-384. See
+// docs/crypto.md.
+//
+// Points are in Jacobian coordinates (x / z^2, y / z^3), with every
+// coordinate in Montgomery form; z = 0 is the point at infinity. This works
+// on public values only (a key, a message and a signature), so it branches
+// on them freely.
+import "crypto/bignum" { Modulus }
+import "crypto/bignum"
+import "crypto/sha2" { Algo }
+import "crypto/sha2"
+import "encoding/hex"
+import "stream" { IoError }
+
+type Curve = enum {
+    P256
+    P384
+
+    // The length in bytes of a coordinate, and of a scalar.
+    func size(self) -> int64 {
+        return match self {
+            .P256 -> 32
+            .P384 -> 48
+        }
+    }
+}
+
+// A curve's numbers: y^2 = x^3 - 3x + b over the integers mod p, and the
+// order n of its generator g.
+type CurveData = struct {
+    p: Modulus
+    n: Modulus
+    b: [int64]
+    g: Point
+    size: int64
+}
+
+type Point = struct {
+    x: [int64]
+    y: [int64]
+    z: [int64]
+}
+
+func curve_data(anon size: int64, p: str, n: str, b: str, gx: str, gy: str) -> CurveData {
+    let pm = Modulus(must hex.decode(p))
+    let field = func(anon text: str) -> [int64] {
+        return pm.to_mont(must pm.number(must hex.decode(text)))
+    }
+    return CurveData(p: pm, n: Modulus(must hex.decode(n)), b: field(b), g: Point(x: field(gx), y: field(gy), z: pm.one()), size: size)
+}
+
+mut P256_DATA: CurveData = curve_data(32, p: "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", n: "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", b: "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", gx: "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", gy: "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+mut P384_DATA: CurveData = curve_data(48, p: "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff", n: "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973", b: "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef", gx: "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7", gy: "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+
+func data(anon curve: Curve) -> CurveData {
+    return match curve {
+        .P256 -> P256_DATA
+        .P384 -> P384_DATA
+    }
+}
+
+func double(anon c: CurveData, anon q: Point) -> Point {
+    let f = c.p
+    if bignum.is_zero(q.z) {
+        return q
+    }
+    let delta = f.mul(q.z, q.z)
+    let gamma = f.mul(q.y, q.y)
+    let beta = f.mul(q.x, gamma)
+    let t = f.mul(f.sub(q.x, delta), f.add(q.x, delta))
+    let alpha = f.add(f.add(t, t), t)
+    let beta2 = f.add(beta, beta)
+    let beta4 = f.add(beta2, beta2)
+    let beta8 = f.add(beta4, beta4)
+    let x3 = f.sub(f.mul(alpha, alpha), beta8)
+    let yz = f.add(q.y, q.z)
+    let z3 = f.sub(f.sub(f.mul(yz, yz), gamma), delta)
+    let g2 = f.mul(gamma, gamma)
+    let g4 = f.add(g2, g2)
+    let g8 = f.add(f.add(g4, g4), f.add(g4, g4))
+    let y3 = f.sub(f.mul(alpha, f.sub(beta4, x3)), g8)
+    return Point(x: x3, y: y3, z: z3)
+}
+
+func add(anon c: CurveData, anon a: Point, anon b: Point) -> Point {
+    let f = c.p
+    if bignum.is_zero(a.z) {
+        return b
+    }
+    if bignum.is_zero(b.z) {
+        return a
+    }
+    let z1z1 = f.mul(a.z, a.z)
+    let z2z2 = f.mul(b.z, b.z)
+    let u1 = f.mul(a.x, z2z2)
+    let u2 = f.mul(b.x, z1z1)
+    let s1 = f.mul(f.mul(a.y, b.z), z2z2)
+    let s2 = f.mul(f.mul(b.y, a.z), z1z1)
+    let h = f.sub(u2, u1)
+    let d = f.sub(s2, s1)
+    if bignum.is_zero(h) {
+        if bignum.is_zero(d) {
+            return double(c, a)
+        }
+        return Point(x: f.one(), y: f.one(), z: [0] * f.k)
+    }
+    let r = f.add(d, d)
+    let h2 = f.add(h, h)
+    let i = f.mul(h2, h2)
+    let j = f.mul(h, i)
+    let v = f.mul(u1, i)
+    let x3 = f.sub(f.sub(f.mul(r, r), j), f.add(v, v))
+    let s1j = f.mul(s1, j)
+    let y3 = f.sub(f.mul(r, f.sub(v, x3)), f.add(s1j, s1j))
+    let zz = f.add(a.z, b.z)
+    let z3 = f.mul(f.sub(f.sub(f.mul(zz, zz), z1z1), z2z2), h)
+    return Point(x: x3, y: y3, z: z3)
+}
+
+type PublicKey = struct {
+    curve: Curve
+    _q: Point
+
+    // The key whose point is `point`, uncompressed (0x04, then x and y).
+    func init(anon curve: Curve, point: bytes) -> PublicKey or Error {
+        let c = data(curve)
+        let f = c.p
+        let size = c.size
+        if len(point) != 1 + 2 * size or point[0] != 4 {
+            throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "not an uncompressed point")
+        }
+        let Some(x) = f.number(point[1..1 + size]) else { throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "x is out of range") }
+        let Some(y) = f.number(point[1 + size..]) else { throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "y is out of range") }
+        let xm = f.to_mont(x)
+        let ym = f.to_mont(y)
+        // y^2 = x^3 - 3x + b
+        let x3 = f.mul(f.mul(xm, xm), xm)
+        let rhs = f.add(f.sub(x3, f.add(f.add(xm, xm), xm)), c.b)
+        if f.mul(ym, ym) != rhs {
+            throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "the point is not on the curve")
+        }
+        return PublicKey(curve: curve, _q: Point(x: xm, y: ym, z: f.one()))
+    }
+
+    // Whether `r` and `s`, big-endian, are this key's signature of `message`
+    // hashed with `algo`.
+    func verify_rs(self, algo: Algo, message: bytes, r: bytes, s: bytes) -> bool {
+        let c = data(self.curve)
+        let n = c.n
+        let Some(rn) = n.number(r) else { return false }
+        let Some(sn) = n.number(s) else { return false }
+        if bignum.is_zero(rn) or bignum.is_zero(sn) {
+            return false
+        }
+        // The digest's leftmost bits, as many as n has; below 2n, so one
+        // subtraction brings it below n.
+        let digest = sha2.digest(algo, message)
+        let e_bytes = if len(digest) > c.size { digest[..c.size] } else { digest }
+        mut e = must bignum.from_bytes(e_bytes, k: n.k)
+        if bignum.compare(e, n.m) >= 0 {
+            e = bignum.sub(e, n.m)
+        }
+        let w = n.inverse(n.to_mont(sn))
+        let u1 = n.from_mont(n.mul(n.to_mont(e), w))
+        let u2 = n.from_mont(n.mul(n.to_mont(rn), w))
+        // u1 g + u2 q, both at once.
+        let both = add(c, c.g, self._q)
+        mut acc = Point(x: c.p.one(), y: c.p.one(), z: [0] * c.p.k)
+        let top = max(bignum.bit_length(u1), bignum.bit_length(u2))
+        for i in top - 1..=0 step -1 {
+            acc = double(c, acc)
+            let b1 = bignum.bit(u1, i)
+            let b2 = bignum.bit(u2, i)
+            if b1 == 1 and b2 == 1 {
+                acc = add(c, acc, both)
+            } else if b1 == 1 {
+                acc = add(c, acc, c.g)
+            } else if b2 == 1 {
+                acc = add(c, acc, self._q)
+            }
+        }
+        if bignum.is_zero(acc.z) {
+            return false
+        }
+        let f = c.p
+        let zinv = f.inverse(acc.z)
+        let x = f.from_mont(f.mul(acc.x, f.mul(zinv, zinv)))
+        // x mod n: x is below p, which is below 2n.
+        mut v = x
+        if bignum.compare(v, n.m) >= 0 {
+            v = bignum.sub(v, n.m)
+        }
+        return v == rn
+    }
+
+    // Whether `signature`, DER (a SEQUENCE of the INTEGERs r and s), is this
+    // key's signature of `message` hashed with `algo`.
+    func verify(self, algo: Algo, message: bytes, signature: bytes) -> bool {
+        let Some((r, s)) = parse_signature(signature) else { return false }
+        return self.verify_rs(algo: algo, message: message, r: r, s: s)
+    }
+}
+
+// r and s from a DER signature, or none when it isn't strict DER.
+func parse_signature(anon der: bytes) -> (bytes, bytes)? {
+    if len(der) < 8 or der[0] != 0x30 or der[1] != len(der) - 2 or der[1] >= 0x80 {
+        return none
+    }
+    let Some((r, after_r)) = der_integer(der, 2) else { return none }
+    let Some((s, after_s)) = der_integer(der, after_r) else { return none }
+    if after_s != len(der) {
+        return none
+    }
+    return (r, s)
+}
+
+// A positive DER INTEGER at `at`, without its sign byte, and where it ends.
+func der_integer(anon der: bytes, anon at: int64) -> (bytes, int64)? {
+    if at + 2 > len(der) or der[at] != 2 {
+        return none
+    }
+    let size = der[at + 1]
+    let start = at + 2
+    if size == 0 or size >= 0x80 or start + size > len(der) {
+        return none
+    }
+    // Negative, or a 0 byte that isn't needed for the sign.
+    if der[start] >= 0x80 {
+        return none
+    }
+    if der[start] == 0 and size > 1 and der[start + 1] < 0x80 {
+        return none
+    }
+    mut from = start
+    if der[start] == 0 and size > 1 {
+        from += 1
+    }
+    return (der[from..start + size], start + size)
+}

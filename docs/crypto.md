@@ -5,8 +5,8 @@ icon: lucide/lock
 # Cryptography
 
 The modules under `stdlib/crypto/` are the pieces TLS 1.3 is built from,
-written in Kod: hashes, HMAC and HKDF, two AEAD ciphers, a key exchange and the
-operating system's random numbers. Each is checked against the test vectors
+written in Kod: hashes, HMAC and HKDF, two AEAD ciphers, a key exchange,
+checking RSA and ECDSA signatures, and the operating system's random numbers. Each is checked against the test vectors
 of the standard that defines it.
 
 ```kod
@@ -20,10 +20,11 @@ print(hex.encode(sha2.sha256(b"abc")))
 let tag = hmac.mac(.Sha256, key: b"key", data: b"The quick brown fox")
 ```
 
-The code that handles secrets (the cipher, the MAC, the key exchange and
+The code that handles secrets (the ciphers, the MAC, the key exchange and
 `hmac.equal`) does the same work whatever the secret is: it doesn't branch on a
 secret or use one to pick an array element. That is how it keeps secrets from
-showing in how long it takes. It hasn't been audited.
+showing in how long it takes. Checking a signature uses only public values, so
+that code doesn't need to. None of it has been audited.
 
 ## Hashes: `crypto/sha2`
 
@@ -157,6 +158,38 @@ let Some(secret) = x25519.shared(mine, theirs) else { return ... }
 | `scalar_mult(scalar: bytes, point: bytes) -> bytes` | the function itself, with no check |
 
 A key of another length panics.
+
+## RSA signatures: `crypto/rsa`
+
+`rsa.PublicKey(n:, e:)` is a key from its modulus and exponent, big-endian
+bytes as a certificate holds them; a modulus under 512 bits, an even one, or an
+exponent that is even or 1 is an error. Two kinds of signature are checked
+(RFC 8017):
+
+| Function | Gives |
+|---|---|
+| `verify_pkcs1(key: PublicKey, algo: Algo, message: bytes, signature: bytes) -> bool` | whether `signature` is the key's PKCS #1 v1.5 signature of `message` hashed with `algo`, the kind most certificates carry |
+| `verify_pss(key: PublicKey, algo: Algo, message: bytes, signature: bytes, salt_size: int64 = -1) -> bool` | the same for a PSS signature, with `algo` for MGF1 too and a salt of `salt_size` bytes; `-1` is the digest's size, which TLS 1.3 requires |
+
+`key.bits()` is the modulus's size and `key.size()` a signature's length in bytes.
+
+## ECDSA signatures: `crypto/ecdsa`
+
+ECDSA (FIPS 186-5) on the curves `ecdsa.Curve.P256` and `.P384`.
+
+| Function | Gives |
+|---|---|
+| `PublicKey(curve: Curve, point: bytes) -> PublicKey or Error` | the key whose point is `point`, uncompressed (`0x04`, then x and y); a point not on the curve is an error |
+| `key.verify(algo: Algo, message: bytes, signature: bytes) -> bool` | whether `signature`, DER as X.509 and TLS carry it, is the key's signature of `message` hashed with `algo` |
+| `key.verify_rs(algo: Algo, message: bytes, r: bytes, s: bytes) -> bool` | the same with `r` and `s` given as big-endian numbers |
+
+A signature must be strict DER: a length in long form, an integer with a 0 byte
+it doesn't need, a negative one, or bytes after the end is refused, so that a
+signature has one encoding.
+
+Both modules are checked against Wycheproof's test vectors, which aim at the
+mistakes signature checks are known for. Checking takes about 1 ms for an RSA
+signature of 2048 or 3072 bits, 2 ms for P-256 and 6 ms for P-384.
 
 ## Random bytes: `crypto/random`
 
