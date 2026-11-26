@@ -294,7 +294,8 @@ the count is 1; if it isn't, `_kod_arr_unique` copies the header and the
 elements, stores the copy where the array was, and lets go of the original.
 
 `xs = xs[..n]`, which keeps the first elements of the array in `xs`, drops
-the rest where the array is, through `_kod_arr_truncate_at`, rather than making
+the rest where the array is (a field written the same on both sides, as in
+`s.items = s.items[..n]`, too), through `_kod_arr_truncate_at`, rather than making
 a copy; `arrays.pop` uses it.
 
 Appending (`+=`) goes through `_kod_arr_concat` in the runtime, which
@@ -382,3 +383,47 @@ let people = [Person(name: "ann", age: 41), Person(name: "bo", age: 29)]
 ```kod
 sort.sorted_by_key(people, key: func(anon p: Person) -> int64 { return p.age })
 ```
+
+## Heaps and deques
+
+`Heap[T]` from the `heaps` module keeps its elements so that the smallest by `<`
+comes out first, as a priority queue does. `push` and `pop` take O(log n), and
+`peek` gives the smallest without taking it out. Both `pop` and `peek` give a
+`T?`, `none` when the heap is empty. Elements that compare equal come out in
+no particular order.
+
+<!-- kod: import "heaps" { Heap } -->
+```kod
+mut todo = Heap[(int64, str)]()
+todo.push((3, "c"))
+todo.push((1, "a"))
+todo.push((2, "b"))
+assert (todo.pop()? or (0, "")) == (1, "a")
+assert len(todo) == 2
+```
+
+A tuple compares its elements in order, so `(distance, node)` pairs come out
+nearest first, as a shortest-path search wants them. For the largest first,
+push the negated number or give the element type an `op_lt` that says so.
+
+`Deque[T]` from the `deques` module is a queue open at both ends:
+`push_back` and `push_front` add, `pop_front` and `pop_back` take an element
+out and give it as a `T?`, and `front` and `back` look without taking. Each
+takes O(1), counting the occasional doubling of its storage.
+
+<!-- kod: import "deques" { Deque } -->
+```kod
+mut queue = Deque[int64]()
+queue.push_back(1)
+queue.push_back(2)
+queue.push_front(0)
+assert queue.pop_front() == 0
+assert queue.pop_back() == 2
+assert len(queue) == 1
+```
+
+Both are values, like arrays: a copy, `let saved = queue`, keeps what the queue
+held when it was made. `len(h)` and `h.is_empty()` say how much is in either,
+`h.values()` gives the elements as an array (a heap's in no particular order,
+a deque's front to back), so `for x in d.values()` goes over a deque front to
+back.
