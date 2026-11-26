@@ -281,6 +281,7 @@ string.
 
 ```kod
 "a,b,,c".split(",")                    // ["a", "b", "", "c"]
+"3-5".split_once("-")                  // ("3", "5"), as a (str, str)?
 "".split(",")                          // [""]
 "abc".split("")                        // ["abc"]
 "a\r\nb\n".lines()                      // ["a", "b"]
@@ -295,7 +296,9 @@ string.
 
 `split` always returns at least one element and keeps empty pieces, so
 `sep.join(s.split(sep)) == s` for a non-empty `sep`. An empty separator
-doesn't split. `lines` splits at each `\n` and drops a `\r` before it; a newline at
+doesn't split. `split_once` gives what is before the first `sep` and what is after
+it, or `none` when `sep` isn't there, so `let (k, v) = must line.split_once(": ")`
+takes a line apart. `lines` splits at each `\n` and drops a `\r` before it; a newline at
 the end makes no empty line after it, so `"".lines()` is `[]`. `split_whitespace`
 gives the pieces between runs of space, tab, `\n` and `\r`, with no empty ones.
 `trim` removes space, tab, `\n`, `\r` from the ends. `replace`

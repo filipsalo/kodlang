@@ -325,6 +325,7 @@ take is an error (see [Generic functions](functions.md#checking)).
 | `sum(xs)`, `sum_floats(xs)` | what `int64`s, or `float64`s, come to; 0 for none |
 | `min(xs)`, `max(xs)` | the first of the smallest, or largest, elements by `<`; a `T?`, `none` when there are none |
 | `any(xs)`, `all(xs)` | whether one of some `bool`s, or all of them, are true |
+| `index_of(xs, x)` | where the first element `==` to `x` is; a `T?`, `none` when none is |
 | `reversed(xs)` | the elements, last first, in a new array |
 | `pop(mut xs)` | the last element, taken off `xs`; a `T?`, `none` when there are none |
 
