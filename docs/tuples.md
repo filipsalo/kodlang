@@ -80,6 +80,10 @@ assert p == (2, "b")
 A tuple is a value, as a plain struct is: assigning or passing it gives the other place the
 tuple as it is.
 
+An array of tuples of two to four numbers, `bool`s or payload-free enums keeps the elements'
+values in the array itself (see [Arrays of small structs](memory-layout.md#arrays-of-small-structs)),
+so a `[(int64, int64)]` or a `Set[(int64, int64)]` costs no allocation per element.
+
 ## Where a tuple goes
 
 Each element of a literal takes its type from where the tuple goes, as it would by itself:

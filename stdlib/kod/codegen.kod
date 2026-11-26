@@ -584,6 +584,8 @@ type LoopLbl = shared struct {
     entry_mark: int64 = 0
     // `name: for ...`, or "".
     label: str = ""
+    // The slots of flat element reads in the loop (see box_flat), emptied after it.
+    flat_slots: [int64] = []
 }
 
 // A single compiler diagnostic. `path`/`line`/`col`/`message` is the
@@ -9963,6 +9965,10 @@ type Codegen = shared struct {
         if (self.rc_pending and self.rc_pending_reg == reg) {
             return
         }
+        // A flat element read is a cell a slot of the caller's keeps.
+        if self.p.exprs[expr_id] is .Binary(held_arr, held_op, _held_index) and held_op is .Index and self.flat_elems(self.infer_kind(held_arr)) {
+            return
+        }
         match self.p.exprs[expr_id] {
             .Ident(name) -> {
                 // A local keeps its value, unless it is changed meanwhile.
@@ -12111,6 +12117,11 @@ type Codegen = shared struct {
     // Ends the innermost loop, saving `sp` at its start if a jump in it reads that.
     func end_loop(self) -> none {
         let lp = self.loop_stack[-1]
+        for slot in lp.flat_slots {
+            self.emit_ldr(slot, reg: "x17")
+            self.emit_str_raw(slot, reg: "xzr")
+            self.rc_release_x17()
+        }
         self.loop_stack = self.loop_stack[0..len(self.loop_stack) - 1]
         if len(self.cold_stack) > 0 {
             self.cold = self.cold_stack[-1] + self.cold
@@ -12561,6 +12572,18 @@ type Codegen = shared struct {
         if self.try_two_part_unit_variant(dot_lhs: lhs, dot_rhs: rhs) is Some(val) {
             return val
         }
+        // A field of a flat element is read where it is.
+        if self.p.exprs[lhs] is .Binary(arr, op, index) and op is .Index and self.flat_elems(self.infer_kind(arr)) and self.p.exprs[rhs] is .Ident(flat_field) and self.infer_kind(lhs) is .KStruct(flat_idx, _flat_args) {
+            if not self.check_field(flat_field, struct_idx: flat_idx, span: self.p.expr_spans[rhs]) {
+                self.compile_discard(lhs)
+                return .VImm(value: 0)
+            }
+            let addr = self.flat_elem_addr(arr, :index)
+            let result = self.pool.alloc_reg()
+            self.emit_load(result, base: addr, off: self.find_field_offset(flat_field, struct_idx: flat_idx))
+            self.pool.free_reg(addr)
+            return .VReg(name: result)
+        }
         let attempts_before = self.report_attempts
         let ptr_v = self.compile_expr(lhs)
         let ptr_r = self.load(ptr_v)
@@ -12609,6 +12632,38 @@ type Codegen = shared struct {
             .Ident(name) -> return self.find_var_offset(name)
             else return -8
         }
+    }
+
+    // The address of `arr[index]` in a flat array: where its fields are.
+    // Nothing else holds the array while the caller reads them.
+    func flat_elem_addr(self, anon arr: int64, index: int64) -> str {
+        let ptr_v = self.compile_expr(arr)
+        mut ptr_r = ""
+        mut idx_r = ""
+        if self.emits_nothing(arr) or self.emits_nothing(index) {
+            let idx_v = self.compile_expr(index)
+            self.check_int_operand(index, what: "an index")
+            ptr_r = self.load(ptr_v)
+            idx_r = self.load(idx_v)
+        } else {
+            let parked = self.park_value(ptr_v)
+            let idx_v = self.compile_expr(index)
+            self.check_int_operand(index, what: "an index")
+            idx_r = self.load(idx_v)
+            ptr_r = self.unpark_value(parked)
+        }
+        if not self.is_safe_index(arr, index_id: index) {
+            let len_r = self.pool.alloc_reg()
+            self.emit_load(len_r, base: ptr_r, off: 8)
+            self.emit_index_check(idx_r, len: len_r)
+            self.pool.free_reg(len_r)
+        }
+        let addr = self.pool.alloc_reg()
+        self.emit_load(addr, base: ptr_r)
+        self.emit_elem_addr(addr, buf: addr, idx: idx_r, width: self.elem_width(self.infer_kind(arr)))
+        self.pool.free_reg(ptr_r)
+        self.pool.free_reg(idx_r)
+        return addr
     }
 
     func compile_index(self, lhs: int64, rhs: int64) -> Val {
@@ -12661,6 +12716,10 @@ type Codegen = shared struct {
                 }
                 return .VImm(value: 0)
             }
+        }
+        if self.flat_elems(lhs_kind) and lhs_kind is .KArrayStruct(elem_idx) {
+            // Read whole, a flat element becomes a cell of its own.
+            return self.box_flat(self.flat_elem_addr(lhs, index: rhs), idx: elem_idx)
         }
         let ptr_v = self.compile_expr(lhs)
         mut ptr_r = ""
@@ -14168,14 +14227,20 @@ type Codegen = shared struct {
         if rc_elem.is_void() {
             rc_elem = self.infer_kind(elem_id)
         }
-        // The array's reference; the C side only stores it.
-        self.rc_retain_kind(elem_reg, kind: rc_elem)
+        // The array's reference; the C side only stores it. A flat element is
+        // copied, and a fresh cell of it let go of when the statement ends.
+        let flat = self.flat_elems(kind)
+        if flat {
+            self.rc_flush_pending()
+        } else {
+            self.rc_retain_kind(elem_reg, kind: rc_elem)
+        }
         self.emit_mov("x1", src: elem_reg)
         self.pool.free_reg(elem_reg)
         self.check_value_kind(literal_id, expected: kind)
         self.unpark_lhs(parked)
         mut refs = 0
-        if self.rc_heap_kind(rc_elem) {
+        if self.rc_heap_kind(rc_elem) and not flat {
             refs = 1
         }
         self.emit_op(.Move, a: "x2", b: f"#{refs}")
@@ -14386,6 +14451,8 @@ type Codegen = shared struct {
         mut item_sz = 8
         if width_elem is .KBool {
             item_sz = 1
+        } else if width_elem is .KStruct(width_idx, _width_args) {
+            item_sz = self.flat_width(width_idx)
         }
         // Allocate header (24 bytes) and buf, saving both pointers on
         // the stack so element compilation (which may bl) doesn't
@@ -14397,7 +14464,7 @@ type Codegen = shared struct {
         if rc_elem.is_void() and n > 0 {
             rc_elem = self.infer_kind(elements[0])
         }
-        if self.rc_heap_kind(rc_elem) {
+        if self.rc_heap_kind(rc_elem) and item_sz <= 8 {
             rc_mask = rc_mask | (1 << 21)
         }
         let rc_cell = self.rc_alloc_cell(mask: rc_mask)
@@ -14447,8 +14514,21 @@ type Codegen = shared struct {
             if rc_elem.is_void() {
                 rc_elem = self.infer_kind(elements[0])
             }
-            self.rc_retain_kind(elem_reg, kind: rc_elem)
-            if item_sz == 1 {
+            if item_sz > 8 {
+                // A flat element's fields are copied; a fresh cell is let go of later.
+                self.rc_flush_pending()
+                let t = self.pool.alloc_reg()
+                for off in 0..item_sz step 8 {
+                    self.emit_load(t, base: elem_reg, :off)
+                    self.emit_store(t, base: buf_r, off: i * item_sz + off)
+                }
+                self.pool.free_reg(t)
+            } else {
+                self.rc_retain_kind(elem_reg, kind: rc_elem)
+            }
+            if item_sz > 8 {
+                // Stored above.
+            } else if item_sz == 1 {
                 let view = self.byte_view(elem_reg)
                 self.emit_store(view[0], base: buf_r, off: i, width: 1)
                 if len(view[1]) > 0 {
@@ -16742,7 +16822,30 @@ type Codegen = shared struct {
         }
         self.emit_op(.Sub, a: "sp", b: "sp", c: f"#{padded}")
         mut recv_place = ""
-        if mut_self {
+        // A flat element has no word to change in place: the method changes a
+        // cell of it in a frame slot, whose fields go back after the call.
+        mut flat_width = 0
+        mut flat_cell_off = 0
+        mut flat_addr_off = 0
+        if mut_self and self.p.exprs[receiver_id] is .Binary(flat_base, flat_op, _flat_rhs) and flat_op is .Index and self.flat_elems(self.infer_kind(flat_base)) {
+            flat_width = self.elem_width(self.infer_kind(flat_base))
+            let addr = self.array_place(receiver_id)
+            self.frame_slots = self.frame_slots + 1
+            flat_addr_off = 0 - self.frame_slots * 8
+            self.emit_str_raw(flat_addr_off, reg: addr)
+            self.pool.free_reg(addr)
+            self.emit_load_imm("x0", value: flat_width)
+            self.emit_op(.Move, a: "x1", b: "#0")
+            self.emit_call("_rc_alloc")
+            let src = self.pool.alloc_reg()
+            self.emit_ldr(flat_addr_off, reg: src)
+            self.emit_copy_fields("x0", :src, width: flat_width)
+            self.pool.free_reg(src)
+            flat_cell_off = self.rc_new_slot()
+            self.emit_str_raw(flat_cell_off, reg: "x0")
+            recv_place = self.pool.alloc_reg()
+            self.emit_op(.Sub, a: recv_place, b: "fp", c: f"#{-flat_cell_off}")
+        } else if mut_self {
             recv_place = self.array_place(receiver_id)
             if len(recv_place) == 0 {
                 self.report_error("error: a `mut self` method changes its receiver where it's kept; assign it to a `mut` local first", span: self.p.expr_spans[receiver_id])
@@ -16795,10 +16898,25 @@ type Codegen = shared struct {
             self.push_intrinsic(method_lbl)
             return .VReg(name: "x0")
         }
-        if tail and self.tail_jump(label: method_lbl, :args, slots: call_slots, recv: receiver_id) {
+        if flat_width == 0 and tail and self.tail_jump(label: method_lbl, :args, slots: call_slots, recv: receiver_id) {
             return .VReg(name: "x0")
         }
         self.emit_call(method_lbl)
+        if flat_width > 0 {
+            let res = self.pool.alloc_reg()
+            self.emit_mov(res, src: "x0")
+            let cell = self.pool.alloc_reg()
+            let dst = self.pool.alloc_reg()
+            self.emit_ldr(flat_cell_off, reg: cell)
+            self.emit_ldr(flat_addr_off, reg: dst)
+            self.emit_copy_fields(dst, src: cell, width: flat_width)
+            self.pool.free_reg(dst)
+            self.pool.free_reg(cell)
+            self.emit_ldr(flat_cell_off, reg: "x17")
+            self.emit_str_raw(flat_cell_off, reg: "xzr")
+            self.rc_release_x17()
+            return .VReg(name: res)
+        }
         return .VReg(name: "x0")
     }
 
@@ -18356,12 +18474,172 @@ type Codegen = shared struct {
     }
 
     // How many bytes an element of an array of `kind` takes: 1 for a
-    // `[bool]`, 8 for anything else.
+    // `[bool]`, a flat struct's fields for an array of one, 8 for anything else.
     func elem_width(self, anon kind: TypeKind) -> int64 {
         if kind is .KArrayBool {
             return 1
         }
+        if kind is .KArrayStruct(idx) {
+            return self.flat_width(idx)
+        }
         return 8
+    }
+
+    // The bytes an array keeps struct `idx` in, its fields where the element
+    // is, when it's a value struct of two to four fields that are numbers,
+    // `bool`s or enums without payloads; 8, for a reference, otherwise. Such an
+    // element holds no references, and reading one whole makes a cell of it.
+    func flat_width(self, anon idx: int64) -> int64 {
+        if idx < 0 or idx >= len(self.structs) or self.structs[idx].shared {
+            return 8
+        }
+        let fields = self.structs[idx].fields
+        if len(fields) < 2 or len(fields) > 4 {
+            return 8
+        }
+        // `xs[i][k] = v` passes the element as a `mut self` place (setter_receiver).
+        if self.structs[idx].method_idx.contains("op_index_set") {
+            return 8
+        }
+        for f in fields {
+            if f.weak {
+                return 8
+            }
+            match f.kind {
+                .KInt64 | .KBool | .KFloat64 -> none
+                .KEnum(e) -> {
+                    if self.enums[e].is_union or self.enum_has_payload(e) {
+                        return 8
+                    }
+                }
+                else return 8
+            }
+        }
+        return 8 * len(fields)
+    }
+
+    // Whether an array of `kind` keeps its elements' fields where they are.
+    func flat_elems(self, anon kind: TypeKind) -> bool {
+        return self.elem_width(kind) > 8
+    }
+
+    // Whether the elements of an array of `kind` are references.
+    func elem_refs(self, anon kind: TypeKind) -> bool {
+        return self.rc_heap_kind(kind.array_elem()) and not self.flat_elems(kind)
+    }
+
+    // `dst` = the address of element `idx` of the buffer `buf`, `width` bytes each.
+    func emit_elem_addr(self, anon dst: str, buf: str, idx: str, width: int64) -> none {
+        if width == 16 or width == 32 or width == 8 {
+            mut shift = 3
+            if width == 16 {
+                shift = 4
+            } else if width == 32 {
+                shift = 5
+            }
+            let off = self.pool.alloc_reg()
+            self.emit_op(.ShiftLeft, a: off, b: idx, c: f"#{shift}")
+            self.emit_op(.Add, a: dst, b: buf, c: off)
+            self.pool.free_reg(off)
+            return
+        }
+        let w = self.pool.alloc_reg()
+        self.emit_load_imm(w, value: width)
+        self.emit_op(.Mul, a: w, b: idx, c: w)
+        self.emit_op(.Add, a: dst, b: buf, c: w)
+        self.pool.free_reg(w)
+    }
+
+    // Copies `width` bytes, a flat struct's fields, from `src` to `dst`.
+    func emit_copy_fields(self, anon dst: str, src: str, width: int64) -> none {
+        let t = self.pool.alloc_reg()
+        for off in 0..width step 8 {
+            self.emit_load(t, base: src, off: off)
+            self.emit_store(t, base: dst, off: off)
+        }
+        self.pool.free_reg(t)
+    }
+
+    // A cell of struct `idx` holding a copy of the flat element at `addr`. In a
+    // loop, a frame slot of this read's own keeps it, emptied after the loop,
+    // and whoever keeps the value counts it.
+    func box_flat(self, anon addr: str, idx: int64) -> Val {
+        let width = self.flat_width(idx)
+        if len(self.loop_stack) == 0 {
+            // Read once: a fresh cell the statement owns.
+            let parked = self.preserve_begin(addr)
+            self.emit_load_imm("x0", value: width)
+            let temp = self.rc_alloc_cell(mask: 0)
+            let src = self.preserve_end(addr, spilled: parked)
+            let fresh = self.pool.alloc_reg()
+            self.emit_mov(fresh, src: "x0")
+            self.emit_copy_fields(fresh, :src, :width)
+            self.pool.free_reg(src)
+            self.rc_mark_owned(fresh, slot: temp)
+            return .VReg(name: fresh)
+        }
+        let slot = self.rc_new_slot()
+        self.loop_stack[-1].flat_slots += [slot]
+        return .VReg(name: self.emit_flat_cell(addr, :width, :slot))
+    }
+
+    // A register with the cell in frame slot `slot`, holding the `width` bytes at
+    // `addr` (which it frees): the cell already there when nothing else counts it,
+    // so a read each pass of a loop allocates nothing, else a new one.
+    func emit_flat_cell(self, anon addr: str, width: int64, slot: int64) -> str {
+        let cell = self.pool.alloc_reg()
+        let fresh_lbl = self.fresh("Lflatnew")
+        let done_lbl = self.fresh("Lflatok")
+        self.emit_ldr(slot, reg: cell)
+        self.emit_jump_zero(cell, target: fresh_lbl)
+        let count = self.pool.alloc_reg()
+        self.emit_load(f"w{count[1..len(count)]}", base: cell, off: -8)
+        self.emit_op(.Compare, a: count, b: "#1")
+        self.pool.free_reg(count)
+        self.emit_jump_if(.Ne, target: fresh_lbl)
+        self.emit_copy_fields(cell, src: addr, :width)
+        self.emit_jump(done_lbl)
+        self.emit_label(fresh_lbl)
+        let parked = self.preserve_begin(addr)
+        self.emit_load_imm("x0", value: width)
+        self.emit_op(.Move, a: "x1", b: "#0")
+        self.emit_call("_rc_alloc")
+        let src = self.preserve_end(addr, spilled: parked)
+        self.emit_copy_fields("x0", :src, :width)
+        self.pool.free_reg(src)
+        self.emit_ldr(slot, reg: "x17")
+        self.emit_str_raw(slot, reg: "x0")
+        self.rc_release_x17()
+        self.emit_mov(cell, src: "x0")
+        self.emit_label(done_lbl)
+        return cell
+    }
+
+    // Whether `elem_id` is an element of a flat array of `kind`'s elements,
+    // which a push copies from where it is.
+    func flat_copy_source(self, anon elem_id: int64, kind: TypeKind) -> bool {
+        if not self.flat_elems(kind) {
+            return false
+        }
+        let .Binary(arr, op, _index) = self.p.exprs[elem_id] else { return false }
+        if not (op is .Index) {
+            return false
+        }
+        let have = self.infer_kind(arr)
+        if have is .KArrayStruct(a) and kind is .KArrayStruct(b) {
+            return a == b
+        }
+        return false
+    }
+
+    func index_base(self, anon e: int64) -> int64 {
+        let .Binary(arr, _op, _index) = self.p.exprs[e] else { return 0 }
+        return arr
+    }
+
+    func index_of_expr(self, anon e: int64) -> int64 {
+        let .Binary(_arr, _op, index) = self.p.exprs[e] else { return 0 }
+        return index
     }
 
     // `reg` as a register a byte store can name: a pool register's `w` view.
@@ -20325,7 +20603,14 @@ type Codegen = shared struct {
                     self.emit_index_check(reloaded_idx_r, len: len_r)
                 }
                 self.pool.free_reg(len_r)
-                if self.elem_width(lhs_kind) == 1 {
+                if self.flat_elems(lhs_kind) {
+                    // The fields go into the element; a fresh cell is let go of later.
+                    self.rc_flush_pending()
+                    let addr = self.pool.alloc_reg()
+                    self.emit_elem_addr(addr, buf: buf_r, idx: reloaded_idx_r, :width)
+                    self.emit_copy_fields(addr, src: reloaded_rhs_r, :width)
+                    self.pool.free_reg(addr)
+                } else if self.elem_width(lhs_kind) == 1 {
                     let view = self.byte_view(reloaded_rhs_r)
                     self.emit_indexed(load: false, reg: view[0], base: buf_r, index: reloaded_idx_r, width: 1)
                     if len(view[1]) > 0 {
@@ -20454,8 +20739,7 @@ type Codegen = shared struct {
                     self.pool.free_reg(len_r)
                     let r = self.pool.alloc_reg()
                     self.emit_load(r, base: arr_r)
-                    self.emit_op(.ShiftLeft, a: idx, b: idx, c: "#3")
-                    self.emit_op(.Add, a: r, b: r, c: idx)
+                    self.emit_elem_addr(r, buf: r, :idx, width: self.elem_width(self.infer_kind(base)))
                     self.pool.free_reg(idx)
                     self.pool.free_reg(arr_r)
                     return r
@@ -20483,6 +20767,10 @@ type Codegen = shared struct {
         let place = self.array_place(arr_id)
         if len(place) == 0 {
             return ""
+        }
+        // A flat element is kept where its fields are: the place is the struct.
+        if self.p.exprs[arr_id] is .Binary(flat_base, flat_op, _flat_rhs) and flat_op is .Index and self.flat_elems(self.infer_kind(flat_base)) {
+            return place
         }
         let arr = self.pool.alloc_reg()
         self.emit_load(arr, base: place)
@@ -21008,7 +21296,10 @@ type Codegen = shared struct {
         if push {
             let expected_elem = kind.array_elem()
             mut elem_reg = ""
-            if self.elem_needs_conversion(expected_elem) {
+            if self.flat_copy_source(elem_id, :kind) {
+                // Copied from the other array's element where it is.
+                elem_reg = self.flat_elem_addr(self.index_base(elem_id), index: self.index_of_expr(elem_id))
+            } else if self.elem_needs_conversion(expected_elem) {
                 elem_reg = self.compile_value_for_kind(elem_id, expected: expected_elem)
             } else {
                 let elem_val = self.compile_expr(elem_id)
@@ -21019,12 +21310,17 @@ type Codegen = shared struct {
             if rc_elem.is_void() {
                 rc_elem = self.infer_kind(elem_id)
             }
-            // The array's reference; the C side only stores it.
-            self.rc_retain_kind(elem_reg, kind: rc_elem)
-            self.check_value_kind(rhs_id, expected: kind)
-            if self.rc_heap_kind(rc_elem) {
-                refs = 1
+            // The array's reference; the C side only stores it. A flat element is
+            // copied, and a fresh cell of it let go of when the statement ends.
+            if self.flat_elems(kind) {
+                self.rc_flush_pending()
+            } else {
+                self.rc_retain_kind(elem_reg, kind: rc_elem)
+                if self.rc_heap_kind(rc_elem) {
+                    refs = 1
+                }
             }
+            self.check_value_kind(rhs_id, expected: kind)
             parked = self.park_value(.VReg(name: elem_reg))
         } else {
             parked = self.park_value(self.compile_concat_operand(rhs_id, :kind, typed_anchor: 0))
@@ -21266,6 +21562,22 @@ type Codegen = shared struct {
         let buf = self.pool.alloc_reg()
         self.emit_load(buf, base: arr_r)
         self.pool.free_reg(arr_r)
+        if self.flat_elems(kind) {
+            // A copy, which the caller owns as a call's result; the element stays.
+            let width = self.elem_width(kind)
+            let addr = self.pool.alloc_reg()
+            self.emit_elem_addr(addr, :buf, :idx, :width)
+            self.pool.free_reg(buf)
+            self.pool.free_reg(idx)
+            let parked = self.preserve_begin(addr)
+            self.emit_load_imm("x0", value: width)
+            self.emit_op(.Move, a: "x1", b: "#0")
+            self.emit_call("_rc_alloc")
+            let src = self.preserve_end(addr, spilled: parked)
+            self.emit_copy_fields("x0", :src, :width)
+            self.pool.free_reg(src)
+            return .VReg(name: "x0")
+        }
         let result = self.pool.alloc_reg()
         if self.elem_width(kind) == 1 {
             self.emit_indexed(load: true, reg: f"w{result[1..len(result)]}", base: buf, index: idx, width: 1)
@@ -23163,6 +23475,7 @@ type Codegen = shared struct {
         self.cold_stack += [self.cold]
         self.cold = []
 
+        mut flat_cell_off = 0
         let idx_name = f"__fi_{name}"
         let idx_off = self.find_var_offset(idx_name)
         let elem_off = self.find_var_offset(name)
@@ -23201,7 +23514,20 @@ type Codegen = shared struct {
 
         mut elem_reg = self.pool.alloc_reg()
         self.emit_load(elem_reg, base: hdr_reg)
-        if by_byte {
+        let flat = self.flat_elems(iter_kind)
+        if flat {
+            // A flat element goes into a cell the loop keeps in a slot of its
+            // own and the binding borrows: the same cell every pass, unless the
+            // body kept the last one, when it's a new one.
+            let width = self.elem_width(iter_kind)
+            if flat_cell_off == 0 {
+                flat_cell_off = self.rc_new_slot()
+            }
+            let addr = self.pool.alloc_reg()
+            self.emit_elem_addr(addr, buf: elem_reg, idx: idx_reg, :width)
+            self.pool.free_reg(elem_reg)
+            elem_reg = self.emit_flat_cell(addr, :width, slot: flat_cell_off)
+        } else if by_byte {
             self.emit_indexed(load: true, reg: f"w{elem_reg[1..len(elem_reg)]}", base: elem_reg, index: idx_reg, width: 1)
         } else {
             self.emit_indexed(load: true, reg: elem_reg, base: elem_reg, index: idx_reg, scaled: true)
@@ -23209,7 +23535,7 @@ type Codegen = shared struct {
         // The loop holds the array, which keeps each element alive while the
         // body runs, so the binding borrows it, as a pattern borrows a payload
         // (settle_borrows counts it after all if the slot is owned elsewhere).
-        if self.rc_heap_kind(elem_kind) and arrays.contains(self.rc_slots, hdr_off) and not arrays.contains(self.assigned_names, name) and not arrays.contains(self.rc_slots, elem_off) and self.inline_depth == 0 and not self.dry_run {
+        if self.rc_heap_kind(elem_kind) and (flat or arrays.contains(self.rc_slots, hdr_off)) and not arrays.contains(self.assigned_names, name) and not arrays.contains(self.rc_slots, elem_off) and self.inline_depth == 0 and not self.dry_run {
             self.emit_str_raw(elem_off, reg: elem_reg)
             let mark = self.fresh("Lborrow")
             self.out_buf.push_label(mark)
@@ -23235,6 +23561,11 @@ type Codegen = shared struct {
         self.pool.free_reg(bump_reg)
         self.emit_jump(start_lbl)
         self.emit_label(end_lbl)
+        if flat_cell_off != 0 {
+            self.emit_ldr(flat_cell_off, reg: "x17")
+            self.emit_str_raw(flat_cell_off, reg: "xzr")
+            self.rc_release_x17()
+        }
         // The loop's hold on the array ends with it, so changing the array after
         // the loop doesn't copy it.
         if arrays.contains(self.rc_slots, hdr_off) {

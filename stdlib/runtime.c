@@ -664,7 +664,8 @@ static inline int rc_arr_refs(const void *a) {
 static inline void rc_arr_set_refs(void *a) {
     if (rc_arr_counted(a)) ((uint32_t *)a)[-1] |= (uint32_t)(RC_REFS_BIT << 8);
 }
-// An array's elements are `width` bytes each: 1 for a `[bool]`, else 8. The
+// An array's elements are `width` bytes each: 1 for a `[bool]`, 16 to 32 for
+// a flat struct's fields (see flat_width in codegen.kod), else 8. The
 // compiler knows the element type at every call and passes it.
 static KodArray *rc_arr_new(int64_t cap, int refs, int64_t width) {
     KodArray *out = (KodArray *)rc_alloc(sizeof(KodArray), (int64_t)(RC_ARRAY_BIT | (refs ? RC_REFS_BIT : 0)));
@@ -723,14 +724,30 @@ void *kod_arr_concat(void *lhs_raw, void *rhs_raw, int64_t width) {
 
 // `xs += [x]` without the one-element array: `value` goes on the end of `arr` in
 // place. When `refs` is set it is a counted reference the caller has already
-// retained for the array.
+// retained for the array. An element wider than 8 bytes, a flat struct's
+// fields, is copied from where `value` points: a cell, or another element.
 void *kod_arr_push(void *arr_raw, int64_t value, int64_t refs, int64_t width) {
     KodArray *arr = (KodArray *)arr_raw;
-    rc_arr_reserve(arr, arr->len + 1, width, 4);
-    if (width == 1) {
-        ((uint8_t *)arr->ptr)[arr->len] = (uint8_t)value;
+    if (__builtin_expect(width <= 8, 1)) {
+        rc_arr_reserve(arr, arr->len + 1, width, 4);
+        if (__builtin_expect(width == 8, 1)) {
+            ((int64_t *)arr->ptr)[arr->len] = value;
+        } else {
+            ((uint8_t *)arr->ptr)[arr->len] = (uint8_t)value;
+        }
     } else {
-        ((int64_t *)arr->ptr)[arr->len] = value;
+        // Read first: `value` may point into the buffer that growing frees.
+        int64_t words = width / 8;
+        const int64_t *src = (const int64_t *)value;
+        int64_t f0 = src[0], f1 = src[1];
+        int64_t f2 = words > 2 ? src[2] : 0;
+        int64_t f3 = words > 3 ? src[3] : 0;
+        rc_arr_reserve(arr, arr->len + 1, width, 4);
+        int64_t *dst = (int64_t *)((char *)arr->ptr + arr->len * width);
+        dst[0] = f0;
+        dst[1] = f1;
+        if (words > 2) dst[2] = f2;
+        if (words > 3) dst[3] = f3;
     }
     if (refs && arr->len == 0) rc_arr_set_refs(arr);
     arr->len++;
@@ -743,7 +760,7 @@ void *kod_arr_repeat(void *arr_raw, int64_t n, int64_t width) {
     KodArray *arr = (KodArray *)arr_raw;
     int64_t len = arr->len;
     if (n < 0) n = 0;
-    if (len > 0 && n > INT64_MAX / 8 / len) {
+    if (len > 0 && n > INT64_MAX / width / len) {
         static KodStr too_big = {"array repetition too large", 26};
         kod_panic(&too_big);
     }

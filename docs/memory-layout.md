@@ -63,6 +63,31 @@ The same holds for any expression that yields a struct, such as a call, a
 `match` expression, `x? or fallback` or `try f()`: the binding stores the
 pointer the expression produced.
 
+### Arrays of small structs
+
+An array whose elements are a plain struct or a tuple of two to four fields,
+each an `int64`, a `float64`, a `bool` or an enum whose variants carry
+nothing, keeps each element's fields in its own buffer, one after another,
+instead of a pointer to a cell per element. A `[(int64, int64)]` element is 16
+bytes in the array and nothing else; a `Map` or `Set` keeps its keys in an array,
+so finding a key reads the fields where they are instead of following a pointer.
+
+```
+[(1, 2), (3, 4)]     buffer:  1 | 2 | 3 | 4        (8 bytes each)
+```
+
+Reading a field (`xs[i].x`), comparing or hashing an element, storing one, and
+appending one from another such array (`ys += [xs[i]]`) work on the fields in
+place. Reading an element whole, to pass it to a function or keep it, makes a
+cell holding a copy of it. Inside a loop each such read and each `for x in xs`
+keeps one cell, used again on the next pass unless something kept the last
+one, so a loop over the elements allocates nothing in the usual case. A struct
+with a `mut self` method still has it: the method changes a copy, which goes
+back into the array when it returns.
+
+A struct with a field of another kind, a `shared struct`, or one with an
+`op_index_set` method is kept as a pointer, as before.
+
 ## Enum values
 
 Enums are **heap-allocated**, like structs. A stack slot holds an 8-byte
