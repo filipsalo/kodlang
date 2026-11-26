@@ -185,8 +185,9 @@ for name, age in ages {
 A `Set` from the `sets` module is iterated the same way, `for x in s`, over its
 elements in the order they were first added.
 
-Arrays, `str`, `bytes`, `Map`, `Set` and `a..b` can be iterated; any other kind
-of value is an error.
+Arrays, `str`, `bytes`, `Map`, `Set` and `a..b` can be iterated, and so can a
+struct with a `values(self) -> [T]` method, such as a `Deque` or a `Heap`: the
+loop goes over the array `values()` gives. Any other kind of value is an error.
 
 ## `break` and `continue`
 

@@ -427,5 +427,4 @@ assert len(queue) == 1
 Both are values, like arrays: a copy, `let saved = queue`, keeps what the queue
 held when it was made. `len(h)` and `h.is_empty()` say how much is in either,
 `h.values()` gives the elements as an array (a heap's in no particular order,
-a deque's front to back), so `for x in d.values()` goes over a deque front to
-back.
+a deque's front to back), which is what `for x in d` goes over.
