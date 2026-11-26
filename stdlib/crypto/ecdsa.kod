@@ -7,6 +7,7 @@
 // on them freely.
 import "crypto/bignum" { Modulus }
 import "crypto/bignum"
+import "crypto/hmac"
 import "crypto/sha2" { Algo }
 import "crypto/sha2"
 import "encoding/hex"
@@ -142,6 +143,12 @@ type PublicKey = struct {
         return PublicKey(curve: curve, _q: Point(x: xm, y: ym, z: f.one()))
     }
 
+    // The point, uncompressed: 0x04, then x and y.
+    func point(self) -> bytes {
+        let c = data(self.curve)
+        return b"\x04" + bignum.to_bytes(c.p.from_mont(self._q.x), size: c.size) + bignum.to_bytes(c.p.from_mont(self._q.y), size: c.size)
+    }
+
     // Whether `r` and `s`, big-endian, are this key's signature of `message`
     // hashed with `algo`.
     func verify_rs(self, algo: Algo, message: bytes, r: bytes, s: bytes) -> bool {
@@ -236,4 +243,179 @@ func der_integer(anon der: bytes, anon at: int64) -> (bytes, int64)? {
         from += 1
     }
     return (der[from..start + size], start + size)
+}
+
+// ---- signing ----
+//
+// Everything below works on the private key or the nonce, so it does the same
+// steps whatever they are: bignum's Modulus arithmetic, the complete
+// addition formulas of Renes, Costello and Batina (2016, algorithm 4, for a =
+// -3) in homogeneous coordinates (x / z, y / z), which have no special cases,
+// and a ladder that adds at every bit and keeps the sum or not by a mask.
+
+// p + q, for any two points (equal ones, or the point at infinity (0, 1, 0)).
+func complete_add(anon c: CurveData, anon p1: Point, anon p2: Point) -> Point {
+    let f = c.p
+    let b = c.b
+    mut t0 = f.mul(p1.x, p2.x)
+    mut t1 = f.mul(p1.y, p2.y)
+    mut t2 = f.mul(p1.z, p2.z)
+    mut t3 = f.add(p1.x, p1.y)
+    mut t4 = f.add(p2.x, p2.y)
+    t3 = f.mul(t3, t4)
+    t4 = f.add(t0, t1)
+    t3 = f.sub(t3, t4)
+    t4 = f.add(p1.y, p1.z)
+    mut x3 = f.add(p2.y, p2.z)
+    t4 = f.mul(t4, x3)
+    x3 = f.add(t1, t2)
+    t4 = f.sub(t4, x3)
+    x3 = f.add(p1.x, p1.z)
+    mut y3 = f.add(p2.x, p2.z)
+    x3 = f.mul(x3, y3)
+    y3 = f.add(t0, t2)
+    y3 = f.sub(x3, y3)
+    mut z3 = f.mul(b, t2)
+    x3 = f.sub(y3, z3)
+    z3 = f.add(x3, x3)
+    x3 = f.add(x3, z3)
+    z3 = f.sub(t1, x3)
+    x3 = f.add(t1, x3)
+    y3 = f.mul(b, y3)
+    t1 = f.add(t2, t2)
+    t2 = f.add(t1, t2)
+    y3 = f.sub(y3, t2)
+    y3 = f.sub(y3, t0)
+    t1 = f.add(y3, y3)
+    y3 = f.add(t1, y3)
+    t1 = f.add(t0, t0)
+    t0 = f.add(t1, t0)
+    t0 = f.sub(t0, t2)
+    t1 = f.mul(t4, y3)
+    t2 = f.mul(t0, y3)
+    y3 = f.mul(x3, z3)
+    y3 = f.add(y3, t2)
+    x3 = f.mul(x3, t3)
+    x3 = f.sub(x3, t1)
+    z3 = f.mul(t4, z3)
+    t1 = f.mul(t3, t0)
+    z3 = f.add(z3, t1)
+    return Point(x: x3, y: y3, z: z3)
+}
+
+// k times the generator, k an ordinary number below n, as affine (x, y),
+// both ordinary numbers.
+func base_mult(anon c: CurveData, anon k: [int64]) -> ([int64], [int64]) {
+    let f = c.p
+    let zero = [0] * f.k
+    mut r = Point(x: zero, y: f.one(), z: zero)
+    for i in c.size * 8 - 1..=0 step -1 {
+        r = complete_add(c, r, r)
+        let sum = complete_add(c, r, c.g)
+        let bit = bignum.bit(k, i)
+        r = Point(x: bignum.choose(bit, sum.x, r.x), y: bignum.choose(bit, sum.y, r.y), z: bignum.choose(bit, sum.z, r.z))
+    }
+    let zinv = f.inverse(r.z)
+    return (f.from_mont(f.mul(r.x, zinv)), f.from_mont(f.mul(r.y, zinv)))
+}
+
+// The leftmost bits of `digest`, as many as n has, as a number below n.
+func digest_number(anon c: CurveData, anon digest: bytes) -> [int64] {
+    let e_bytes = if len(digest) > c.size { digest[..c.size] } else { digest }
+    let e = must bignum.from_bytes(e_bytes, k: c.n.k)
+    let (less, borrow) = bignum.sub_borrow(e, c.n.m)
+    return bignum.choose(borrow, e, less)
+}
+
+// A DER INTEGER of the big-endian `b`, which is positive.
+func der_int(anon b: bytes) -> bytes {
+    mut at = 0
+    for at < len(b) - 1 and b[at] == 0 {
+        at += 1
+    }
+    mut body = b[at..]
+    if body[0] >= 0x80 {
+        body = b"\x00" + body
+    }
+    return kod_bytes_from_array([2, len(body)]) + body
+}
+
+type PrivateKey = struct {
+    curve: Curve
+    _d: [int64]
+    _d_bytes: bytes
+
+    // The key whose scalar is `scalar`, big-endian and the curve's size,
+    // above 0 and below n.
+    func init(anon curve: Curve, scalar: bytes) -> PrivateKey or Error {
+        let c = data(curve)
+        if len(scalar) != c.size {
+            throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: f"the scalar is {len(scalar)} bytes, not {c.size}")
+        }
+        let Some(d) = c.n.number(scalar) else { throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "the scalar is n or more") }
+        if bignum.is_zero(d) {
+            throw IoError(kind: .InvalidInput, op: "ecdsa key", errno: 0, detail: "the scalar is 0")
+        }
+        return PrivateKey(curve: curve, _d: d, _d_bytes: scalar)
+    }
+
+    func public_key(self) -> PublicKey {
+        let c = data(self.curve)
+        let (x, y) = base_mult(c, self._d)
+        let point = b"\x04" + bignum.to_bytes(x, size: c.size) + bignum.to_bytes(y, size: c.size)
+        return must PublicKey(self.curve, point: point)
+    }
+
+    // The signature of `message` hashed with `algo`, DER, with the nonce of
+    // RFC 6979 (so the same message always gets the same signature, and a
+    // bad random generator can't give the key away).
+    func sign(self, algo: Algo, message: bytes) -> bytes {
+        let (r, s) = self.sign_rs(algo: algo, message: message)
+        let seq = der_int(r) + der_int(s)
+        return kod_bytes_from_array([0x30, len(seq)]) + seq
+    }
+
+    // r and s, each the curve's size, big-endian.
+    func sign_rs(self, algo: Algo, message: bytes) -> (bytes, bytes) {
+        let c = data(self.curve)
+        let n = c.n
+        let digest = sha2.digest(algo, message)
+        let e = digest_number(c, digest)
+        let e_bytes = bignum.to_bytes(e, size: c.size)
+        // HMAC_DRBG seeded with the key and the digest (RFC 6979 3.2).
+        let hlen = algo.size()
+        mut v = kod_bytes_from_array([1] * hlen)
+        mut key = kod_bytes_from_array([0] * hlen)
+        key = hmac.mac(algo, key: key, data: v + b"\x00" + self._d_bytes + e_bytes)
+        v = hmac.mac(algo, key: key, data: v)
+        key = hmac.mac(algo, key: key, data: v + b"\x01" + self._d_bytes + e_bytes)
+        v = hmac.mac(algo, key: key, data: v)
+        let dm = n.to_mont(self._d)
+        let em = n.to_mont(e)
+        for true {
+            mut t = b""
+            for len(t) < c.size {
+                v = hmac.mac(algo, key: key, data: v)
+                t = t + v
+            }
+            let candidate = must bignum.from_bytes(t[..c.size], k: n.k)
+            if not bignum.is_zero(candidate) and bignum.compare(candidate, n.m) < 0 {
+                let (x, _y) = base_mult(c, candidate)
+                let (less, borrow) = bignum.sub_borrow(x, n.m)
+                let r = bignum.choose(borrow, x, less)
+                if not bignum.is_zero(r) {
+                    // s = (e + r d) / k mod n
+                    let km = n.to_mont(candidate)
+                    let sm = n.mul(n.inverse(km), n.add(em, n.mul(n.to_mont(r), dm)))
+                    let s = n.from_mont(sm)
+                    if not bignum.is_zero(s) {
+                        return (bignum.to_bytes(r, size: c.size), bignum.to_bytes(s, size: c.size))
+                    }
+                }
+            }
+            key = hmac.mac(algo, key: key, data: v + b"\x00")
+            v = hmac.mac(algo, key: key, data: v)
+        }
+        return (b"", b"")
+    }
 }

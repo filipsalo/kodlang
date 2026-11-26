@@ -3,8 +3,12 @@
 //
 // A number is an array of 30-bit limbs, the lowest first, as long as its
 // modulus's: a product of two limbs and a couple of carries stays below
-// 2^61. Multiplication is Montgomery's. This works on public values only,
-// so it branches on them freely; it is not for secrets.
+// 2^61. Multiplication is Montgomery's.
+//
+// `from_bytes`, `to_bytes` and the arithmetic of a `Modulus` (mul, add, sub,
+// and pow with a public exponent) do the same steps whatever the numbers are,
+// so ECDSA signing can use them on a private key; `compare`, `is_zero`,
+// `bit_length` and `number` look at the values, and are for public ones.
 
 let BITS: int64 = 30
 let MASK: int64 = (1 << 30) - 1
@@ -12,27 +16,28 @@ let MASK: int64 = (1 << 30) - 1
 // The number `b` holds, big-endian, in `k` limbs, or none when it needs more.
 func from_bytes(anon b: bytes, k: int64) -> [int64]? {
     mut out = [0] * k
+    // The bits that would go above the top limb.
+    mut over = 0
     mut bit = 0
     for i in len(b) - 1..=0 step -1 {
         let byte = b[i]
-        if byte != 0 {
-            let limb = bit / BITS
-            let shift = bit % BITS
-            if limb >= k {
-                return none
-            }
+        let limb = bit / BITS
+        let shift = bit % BITS
+        if limb < k {
             out[limb] = out[limb] | ((byte << shift) & MASK)
-            if shift > BITS - 8 {
-                if limb + 1 >= k {
-                    if (byte >> (BITS - shift)) != 0 {
-                        return none
-                    }
-                } else {
-                    out[limb + 1] = out[limb + 1] | (byte >> (BITS - shift))
-                }
+            let high = byte >> (BITS - shift)
+            if limb + 1 < k {
+                out[limb + 1] = out[limb + 1] | high
+            } else {
+                over = over | high
             }
+        } else {
+            over = over | byte
         }
         bit += 8
+    }
+    if over != 0 {
+        return none
     }
     return out
 }
@@ -77,16 +82,30 @@ func is_zero(anon a: [int64]) -> bool {
 
 // a - b, for a >= b.
 func sub(anon a: [int64], anon b: [int64]) -> [int64] {
+    let (out, _borrow) = sub_borrow(a, b)
+    return out
+}
+
+// a - b mod 2^(30 k), and 1 when that borrowed (a < b), else 0.
+func sub_borrow(anon a: [int64], anon b: [int64]) -> ([int64], int64) {
     mut out = a
     mut borrow = 0
     for i in 0..len(a) {
-        mut t = a[i] - b[i] - borrow
-        borrow = 0
-        if t < 0 {
-            t += 1 << BITS
-            borrow = 1
-        }
-        out[i] = t
+        let t = a[i] - b[i] - borrow
+        // The sign bit: 1 when t went below 0.
+        borrow = t >> 63
+        out[i] = t + (borrow << BITS)
+    }
+    return (out, borrow)
+}
+
+// x where `take_x` is 1, y where it is 0, by masks.
+func choose(anon take_x: int64, anon x: [int64], anon y: [int64]) -> [int64] {
+    let mask = 0 - take_x
+    let keep = mask ^ -1
+    mut out = y
+    for i in 0..len(x) {
+        out[i] = (x[i] & mask) | (y[i] & keep)
     }
     return out
 }
@@ -197,11 +216,10 @@ type Modulus = struct {
             t[k - 1] = last & MASK
             t[k] = t[k + 1] + (last >> BITS)
         }
+        // Below 2m: take m off unless that borrows (and nothing is above).
         let out = t[..k]
-        if t[k] != 0 or compare(out, m) >= 0 {
-            return sub(out, m)
-        }
-        return out
+        let (less, borrow) = sub_borrow(out, m)
+        return choose(t[k] | (borrow ^ 1), less, out)
     }
 
     func to_mont(self, anon a: [int64]) -> [int64] {
@@ -223,18 +241,15 @@ type Modulus = struct {
 
     func add(self, anon a: [int64], anon b: [int64]) -> [int64] {
         let (sum, carry) = add_carry(a, b)
-        if carry != 0 or compare(sum, self.m) >= 0 {
-            return sub(sum, self.m)
-        }
-        return sum
+        let (less, borrow) = sub_borrow(sum, self.m)
+        return choose(carry | (borrow ^ 1), less, sum)
     }
 
     func sub(self, anon a: [int64], anon b: [int64]) -> [int64] {
-        if compare(a, b) >= 0 {
-            return sub(a, b)
-        }
-        let (sum, _carry) = add_carry(a, self.m)
-        return sub(sum, b)
+        let (diff, borrow) = sub_borrow(a, b)
+        // Below 0 it wrapped by 2^(30 k); adding m and wrapping again gives a - b + m.
+        let (plus, _carry) = add_carry(diff, self.m)
+        return choose(borrow, plus, diff)
     }
 
     // base^e (base in the form, e an ordinary number of any length), in the form.

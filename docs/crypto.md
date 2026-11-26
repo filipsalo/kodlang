@@ -21,8 +21,8 @@ print(hex.encode(sha2.sha256(b"abc")))
 let tag = hmac.mac(.Sha256, key: b"key", data: b"The quick brown fox")
 ```
 
-The code that handles secrets (the ciphers, the MAC, the key exchange and
-`hmac.equal`) does the same work whatever the secret is: it doesn't branch on a
+The code that handles secrets (the ciphers, the MAC, the key exchange, ECDSA
+signing and `hmac.equal`) does the same work whatever the secret is: it doesn't branch on a
 secret or use one to pick an array element. That is how it keeps secrets from
 showing in how long it takes. Checking a signature uses only public values, so
 that code doesn't need to. None of it has been audited.
@@ -183,6 +183,24 @@ ECDSA (FIPS 186-5) on the curves `ecdsa.Curve.P256` and `.P384`.
 | `PublicKey(curve: Curve, point: bytes) -> PublicKey or Error` | the key whose point is `point`, uncompressed (`0x04`, then x and y); a point not on the curve is an error |
 | `key.verify(algo: Algo, message: bytes, signature: bytes) -> bool` | whether `signature`, DER as X.509 and TLS carry it, is the key's signature of `message` hashed with `algo` |
 | `key.verify_rs(algo: Algo, message: bytes, r: bytes, s: bytes) -> bool` | the same with `r` and `s` given as big-endian numbers |
+
+`key.point()` gives the point back, uncompressed.
+
+`ecdsa.PrivateKey(curve, scalar:)` is a private key from its scalar, big-endian
+and the curve's size (32 or 48 bytes), above 0 and below the curve's order:
+
+| Function | Gives |
+|---|---|
+| `key.public_key() -> PublicKey` | its public key |
+| `key.sign(algo: Algo, message: bytes) -> bytes` | the DER signature of `message` hashed with `algo` |
+| `key.sign_rs(algo: Algo, message: bytes) -> (bytes, bytes)` | r and s, each the curve's size |
+
+The nonce is RFC 6979's, made from the key and the message, so the same
+message always gets the same signature and no random number can be bad
+enough to give the key away. Signing does the same steps whatever the key and
+nonce are: the multiplication by the nonce adds at every bit and keeps the sum
+or not by a mask, with formulas that have no special cases (Renes, Costello and
+Batina, 2016). It takes about 11 ms on P-256.
 
 A signature must be strict DER: a length in long form, an integer with a 0 byte
 it doesn't need, a negative one, or bytes after the end is refused, so that a
