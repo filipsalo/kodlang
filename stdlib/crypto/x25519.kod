@@ -1,53 +1,75 @@
 // X25519 (RFC 7748). See docs/crypto.md.
 //
-// A field element mod p = 2^255 - 19 is 16 limbs of 16 bits, lowest first,
-// as in TweetNaCl: a product of two limbs is at most 32 bits, so a whole
-// multiplication's sums stay far inside an int64. Limbs may go negative
-// between carries. The ladder swaps with masks, so nothing branches on, or
-// indexes by, the private key.
+// A field element mod p = 2^255 - 19 is 10 limbs of 26 and 25 bits in turn,
+// lowest first, as in ref10: a multiplication's sums of products stay below
+// 2^62. Limbs may go negative between carries. The ladder swaps with masks,
+// so nothing branches on, or indexes by, the private key.
 
 // `x >> n` with the sign kept (Kod's `>>` shifts in zeros).
 func asr(anon x: int64, anon n: int64) -> int64 {
     return (x >> n) | ((0 - (x >> 63)) << (64 - n))
 }
 
-// Each limb back to 16 bits, the carry out of the top one coming back in
-// at the bottom times 38 (2^256 = 38 mod p).
+// The width of limb i: 26 bits for an even one, 25 for an odd one, so that
+// limb i starts at bit ceil(25.5 i).
+func width(anon i: int64) -> int64 {
+    return 26 - (i & 1)
+}
+
+// Each limb back to its width (rounding, so limbs may be negative), the
+// carry out of the top one coming back in at the bottom times 19 (2^255 =
+// 19 mod p), in ref10's order.
 func carry(anon a: [int64]) -> [int64] {
-    mut o = a
-    for i in 0..16 {
-        o[i] += 1 << 16
-        let c = asr(o[i], 16)
-        if i < 15 {
-            o[i + 1] += c - 1
+    mut h = a
+    for i in [0, 4, 1, 5, 2, 6, 3, 7, 4, 8, 9, 0] {
+        let w = width(i)
+        let c = asr(h[i] + (1 << (w - 1)), w)
+        h[i] -= c << w
+        if i == 9 {
+            h[0] += 19 * c
         } else {
-            o[0] += 38 * (c - 1)
+            h[i + 1] += c
         }
-        o[i] -= c << 16
     }
-    return o
+    return h
 }
 
 func add(anon a: [int64], anon b: [int64]) -> [int64] {
-    return [a[i] + b[i] for i in 0..16]
+    return [a[i] + b[i] for i in 0..10]
 }
 
 func sub(anon a: [int64], anon b: [int64]) -> [int64] {
-    return [a[i] - b[i] for i in 0..16]
+    return [a[i] - b[i] for i in 0..10]
 }
 
+// a b mod p: limb i of a times limb j of b lands at limb i + j, times 2 when
+// both are odd (their offsets add up to half a bit more), and above limb 9
+// it comes back at i + j - 10 times 19. With limbs of 27 bits at most, each
+// sum stays below 2^62.
 func mul(anon a: [int64], anon b: [int64]) -> [int64] {
-    mut t = [0] * 31
-    for i in 0..16 {
+    mut b19 = [0] * 10
+    for j in 0..10 {
+        b19[j] = 19 * b[j]
+    }
+    mut h = [0] * 10
+    for i in 0..10 {
         let ai = a[i]
-        for j in 0..16 {
-            t[i + j] += ai * b[j]
+        let ai2 = ai * (1 + (i & 1))
+        for j in 0..10 - i {
+            let x = if (i & j & 1) == 1 { ai2 } else { ai }
+            h[i + j] += x * b[j]
+        }
+        for j in 10 - i..10 {
+            let x = if (i & j & 1) == 1 { ai2 } else { ai }
+            h[i + j - 10] += x * b19[j]
         }
     }
-    for i in 0..15 {
-        t[i] += 38 * t[i + 16]
-    }
-    return carry(carry(t[..16]))
+    return carry(h)
+}
+
+// a times a small number.
+func mul_small(anon a: [int64], anon n: int64) -> [int64] {
+    return carry([x * n for x in a])
 }
 
 func square(anon a: [int64]) -> [int64] {
@@ -71,7 +93,7 @@ func cswap(anon p: [int64], anon q: [int64], anon swap: int64) -> ([int64], [int
     let mask = 0 - swap
     mut x = p
     mut y = q
-    for i in 0..16 {
+    for i in 0..10 {
         let t = mask & (x[i] ^ y[i])
         x[i] = x[i] ^ t
         y[i] = y[i] ^ t
@@ -79,32 +101,49 @@ func cswap(anon p: [int64], anon q: [int64], anon swap: int64) -> ([int64], [int
     return (x, y)
 }
 
+// The 255 low bits of the little-endian `b` as limbs.
 func unpack(anon b: bytes) -> [int64] {
-    mut o = [b[2 * i] | (b[2 * i + 1] << 8) for i in 0..16]
-    o[15] = o[15] & 0x7fff
-    return o
+    mut out = [0] * 10
+    mut start = 0
+    for i in 0..10 {
+        let w = width(i)
+        mut v = 0
+        for k in 0..w {
+            let bit = start + k
+            if bit < 255 {
+                v = v | (((b[bit >> 3] >> (bit & 7)) & 1) << k)
+            }
+        }
+        out[i] = v
+        start += w
+    }
+    return out
 }
 
-// The 32 bytes of `n` reduced below p.
+// The 32 little-endian bytes of `n` reduced below p (ref10's fe_tobytes).
 func pack(anon n: [int64]) -> bytes {
-    mut t = carry(carry(carry(n)))
-    for _pass in 0..2 {
-        // m = t - p; keep it unless that borrowed.
-        mut m = [0] * 16
-        m[0] = t[0] - 0xffed
-        for i in 1..15 {
-            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1)
-            m[i - 1] = m[i - 1] & 0xffff
-        }
-        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1)
-        let borrow = (m[15] >> 16) & 1
-        m[14] = m[14] & 0xffff
-        let (kept, _rest) = cswap(t, m, 1 - borrow)
-        t = kept
+    mut h = carry(carry(n))
+    // q is 1 when h is p or more, else 0.
+    mut q = asr(19 * h[9] + (1 << 24), 25)
+    for i in 0..10 {
+        q = asr(h[i] + q, width(i))
     }
-    mut out: [int64] = []
-    for limb in t {
-        out += [limb & 255, (limb >> 8) & 255]
+    h[0] += 19 * q
+    for i in 0..9 {
+        let c = asr(h[i], width(i))
+        h[i + 1] += c
+        h[i] -= c << width(i)
+    }
+    h[9] = h[9] & ((1 << 25) - 1)
+    mut out = [0] * 32
+    mut start = 0
+    for i in 0..10 {
+        let w = width(i)
+        for k in 0..w {
+            let bit = start + k
+            out[bit >> 3] = out[bit >> 3] | (((h[i] >> k) & 1) << (bit & 7))
+        }
+        start += w
     }
     return kod_bytes_from_array(out)
 }
@@ -123,13 +162,12 @@ func scalar_mult(anon scalar: bytes, anon point: bytes) -> bytes {
     z[31] = (z[31] & 127) | 64
     z[0] = z[0] & 248
     let x = unpack(point)
-    mut a = [0] * 16
+    mut a = [0] * 10
     mut b = x
-    mut c = [0] * 16
-    mut d = [0] * 16
+    mut c = [0] * 10
+    mut d = [0] * 10
     a[0] = 1
     d[0] = 1
-    let k121665 = [0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     for i in 254..=0 step -1 {
         let r = (z[i >> 3] >> (i & 7)) & 1
         (a, b) = cswap(a, b, r)
@@ -146,7 +184,7 @@ func scalar_mult(anon scalar: bytes, anon point: bytes) -> bytes {
         a = sub(a, c)
         b = square(a)
         c = sub(d, f)
-        a = mul(c, k121665)
+        a = mul_small(c, 121665)
         a = add(a, d)
         c = mul(c, a)
         a = mul(d, f)
