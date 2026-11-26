@@ -283,6 +283,8 @@ string.
 "a,b,,c".split(",")                    // ["a", "b", "", "c"]
 "".split(",")                          // [""]
 "abc".split("")                        // ["abc"]
+"a\r\nb\n".lines()                      // ["a", "b"]
+" 1  2\t3\n".split_whitespace()          // ["1", "2", "3"]
 "  hi\r\n".trim()                     // "hi"
 "  hi ".trim_start()                   // "hi "
 "  hi ".trim_end()                     // "  hi"
@@ -293,7 +295,10 @@ string.
 
 `split` always returns at least one element and keeps empty pieces, so
 `sep.join(s.split(sep)) == s` for a non-empty `sep`. An empty separator
-doesn't split. `trim` removes space, tab, `\n`, `\r` from the ends. `replace`
+doesn't split. `lines` splits at each `\n` and drops a `\r` before it; a newline at
+the end makes no empty line after it, so `"".lines()` is `[]`. `split_whitespace`
+gives the pieces between runs of space, tab, `\n` and `\r`, with no empty ones.
+`trim` removes space, tab, `\n`, `\r` from the ends. `replace`
 replaces every non-overlapping match from the left; an empty `old` replaces
 nothing. `repeat` with a count of 0 or less gives `""`.
 
