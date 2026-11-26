@@ -778,6 +778,25 @@ void *kod_arr_unique(void **place, int64_t width) {
     return c;
 }
 
+// `xs = xs[..end]`: the array at `*place` keeps the elements before `end` (a
+// negative `end` counts from the end) and lets go of the rest, in place when the
+// place is its only holder.
+void kod_arr_truncate_at(void **place, int64_t end, int64_t width) {
+    KodArray *a = (KodArray *)*place;
+    int64_t start = 0;
+    int64_t keep = clamp_slice(a->len, &start, end);
+    if (keep == a->len) return;
+    if (!(rc_arr_counted(a) && ((uint32_t *)a)[-2] == 1)) {
+        *place = kod_arr_slice(a, 0, keep, width);
+        rc_release_c(a);
+        return;
+    }
+    if (rc_arr_refs(a)) {
+        for (int64_t i = keep; i < a->len; i++) rc_release_c(((void **)a->ptr)[i]);
+    }
+    a->len = keep;
+}
+
 // `xs += [x]` and `xs += ys` on the array at `*place`, made its own first.
 void kod_arr_push_at(void **place, int64_t value, int64_t refs, int64_t width) {
     kod_arr_push(kod_arr_unique(place, width), value, refs, width);

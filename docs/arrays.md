@@ -293,6 +293,10 @@ places hold the array. Before changing an array, generated code checks that
 the count is 1; if it isn't, `_kod_arr_unique` copies the header and the
 elements, stores the copy where the array was, and lets go of the original.
 
+`xs = xs[..n]`, which keeps the first elements of the array in `xs`, drops
+the rest where the array is, through `_kod_arr_truncate_at`, rather than making
+a copy; `arrays.pop` uses it.
+
 Appending (`+=`) goes through `_kod_arr_concat` in the runtime, which
 writes into the existing buffer and reallocates it with doubled capacity
 only when `cap` runs out. `+` goes through `_kod_arr_concat_new`, which
@@ -318,6 +322,7 @@ take is an error (see [Generic functions](functions.md#checking)).
 | `sum(xs)`, `sum_floats(xs)` | what `int64`s, or `float64`s, come to; 0 for none |
 | `min(xs)`, `max(xs)` | the first of the smallest, or largest, elements by `<`; a `T?`, `none` when there are none |
 | `any(xs)`, `all(xs)` | whether one of some `bool`s, or all of them, are true |
+| `pop(mut xs)` | the last element, taken off `xs`; a `T?`, `none` when there are none |
 
 With a comprehension, these are over anything:
 
@@ -360,4 +365,19 @@ let people = [Person(name: "ann", age: 41), Person(name: "bo", age: 29)]
 sort.sorted_by(people, less: func(a: Person, b: Person) -> bool {
     return a.age < b.age
 })
+```
+
+`sorted_by_key` orders by what a function gives for each element, by `<`, and
+calls it once per element:
+
+<!-- kod:
+import "sort"
+type Person = struct {
+    name: str
+    age: int64
+}
+let people = [Person(name: "ann", age: 41), Person(name: "bo", age: 29)]
+-->
+```kod
+sort.sorted_by_key(people, key: func(anon p: Person) -> int64 { return p.age })
 ```
