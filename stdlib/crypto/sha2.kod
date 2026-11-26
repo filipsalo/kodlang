@@ -1,0 +1,296 @@
+// SHA-256, SHA-384 and SHA-512 (FIPS 180-4). See docs/crypto.md.
+//
+// SHA-256 keeps its 32-bit words in int64s and masks them; the sums of a few
+// such words never overflow. SHA-512's words are the int64s themselves, so it
+// adds with wrapping_add and `>>` (which shifts in zeros) to treat them as
+// unsigned.
+
+type Algo = enum {
+    Sha256
+    Sha384
+    Sha512
+
+    // The digest's length in bytes.
+    func size(self) -> int64 {
+        return match self {
+            .Sha256 -> 32
+            .Sha384 -> 48
+            .Sha512 -> 64
+        }
+    }
+
+    // The length of the blocks it hashes, which HMAC pads its key to.
+    func block_size(self) -> int64 {
+        return match self {
+            .Sha256 -> 64
+            else -> 128
+        }
+    }
+}
+
+let MASK32: int64 = 0xffffffff
+
+let K256: [int64] = [
+    1116352408, 1899447441, 3049323471, 3921009573,
+    961987163, 1508970993, 2453635748, 2870763221,
+    3624381080, 310598401, 607225278, 1426881987,
+    1925078388, 2162078206, 2614888103, 3248222580,
+    3835390401, 4022224774, 264347078, 604807628,
+    770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671,
+    3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291,
+    1695183700, 1986661051, 2177026350, 2456956037,
+    2730485921, 2820302411, 3259730800, 3345764771,
+    3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877,
+    958139571, 1322822218, 1537002063, 1747873779,
+    1955562222, 2024104815, 2227730452, 2361852424,
+    2428436474, 2756734187, 3204031479, 3329325298,
+]
+
+let H256: [int64] = [
+    1779033703, 3144134277, 1013904242, 2773480762,
+    1359893119, 2600822924, 528734635, 1541459225,
+]
+
+let K512: [int64] = [
+    4794697086780616226, 8158064640168781261, -5349999486874862801, -1606136188198331460,
+    4131703408338449720, 6480981068601479193, -7908458776815382629, -6116909921290321640,
+    -2880145864133508542, 1334009975649890238, 2608012711638119052, 6128411473006802146,
+    8268148722764581231, -9160688886553864527, -7215885187991268811, -4495734319001033068,
+    -1973867731355612462, -1171420211273849373, 1135362057144423861, 2597628984639134821,
+    3308224258029322869, 5365058923640841347, 6679025012923562964, 8573033837759648693,
+    -7476448914759557205, -6327057829258317296, -5763719355590565569, -4658551843659510044,
+    -4116276920077217854, -3051310485924567259, 489312712824947311, 1452737877330783856,
+    2861767655752347644, 3322285676063803686, 5560940570517711597, 5996557281743188959,
+    7280758554555802590, 8532644243296465576, -9096487096722542874, -7894198246740708037,
+    -6719396339535248540, -6333637450476146687, -4446306890439682159, -4076793802049405392,
+    -3345356375505022440, -2983346525034927856, -860691631967231958, 1182934255886127544,
+    1847814050463011016, 2177327727835720531, 2830643537854262169, 3796741975233480872,
+    4115178125766777443, 5681478168544905931, 6601373596472566643, 7507060721942968483,
+    8399075790359081724, 8693463985226723168, -8878714635349349518, -8302665154208450068,
+    -8016688836872298968, -6606660893046293015, -4685533653050689259, -4147400797238176981,
+    -3880063495543823972, -3348786107499101689, -1523767162380948706, -757361751448694408,
+    500013540394364858, 748580250866718886, 1242879168328830382, 1977374033974150939,
+    2944078676154940804, 3659926193048069267, 4368137639120453308, 4836135668995329356,
+    5532061633213252278, 6448918945643986474, 6902733635092675308, 7801388544844847127,
+]
+
+let H384: [int64] = [
+    -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257,
+    7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076,
+]
+
+let H512: [int64] = [
+    7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935,
+    5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809,
+]
+
+// Takes data in pieces; `finish` gives the digest of what it has seen so far.
+type Hasher = struct {
+    algo: Algo
+    h: [int64]
+    // The bytes of a block not yet full.
+    pending: bytes
+    total: int64
+
+    func init(anon algo: Algo) -> Hasher {
+        let h = match algo {
+            .Sha256 -> H256
+            .Sha384 -> H384
+            .Sha512 -> H512
+        }
+        return Hasher(algo: algo, h: h, pending: b"", total: 0)
+    }
+
+    func update(mut self, anon data: bytes) -> none {
+        let n = len(data)
+        let block = self.algo.block_size()
+        self.total += n
+        mut at = 0
+        if len(self.pending) > 0 {
+            at = min(block - len(self.pending), n)
+            self.pending = self.pending + data[..at]
+            if len(self.pending) < block {
+                return
+            }
+            self.compress(self.pending, at: 0)
+            self.pending = b""
+        }
+        for at + block <= n {
+            self.compress(data, at: at)
+            at += block
+        }
+        if at < n {
+            self.pending = data[at..]
+        }
+    }
+
+    func compress(mut self, anon data: bytes, at: int64) -> none {
+        if self.algo is .Sha256 {
+            self.h = compress256(self.h, data, at: at)
+        } else {
+            self.h = compress512(self.h, data, at: at)
+        }
+    }
+
+    // The digest of everything given to `update`; the hasher can go on.
+    func finish(self) -> bytes {
+        mut h = self
+        let block = self.algo.block_size()
+        // A 1 bit, zeros, and the length in bits, to end on a block boundary.
+        let length_size = if block == 64 { 8 } else { 16 }
+        mut pad = [0x80]
+        for (len(self.pending) + len(pad) + length_size) % block != 0 {
+            pad += [0]
+        }
+        let bits = self.total * 8
+        for i in 0..length_size {
+            let shift = (length_size - 1 - i) * 8
+            pad += [if shift < 64 { (bits >> shift) & 255 } else { 0 }]
+        }
+        h.update(kod_bytes_from_array(pad))
+        mut out: [int64] = []
+        if self.algo is .Sha256 {
+            for w in h.h {
+                out += [w >> 24, (w >> 16) & 255, (w >> 8) & 255, w & 255]
+            }
+        } else {
+            for w in h.h {
+                for shift in 56..=0 step -8 {
+                    out += [(w >> shift) & 255]
+                }
+            }
+        }
+        return kod_bytes_from_array(out[..self.algo.size()])
+    }
+}
+
+func digest(anon algo: Algo, anon data: bytes) -> bytes {
+    mut h = Hasher(algo)
+    h.update(data)
+    return h.finish()
+}
+
+func sha256(anon data: bytes) -> bytes {
+    return digest(.Sha256, data)
+}
+
+func sha384(anon data: bytes) -> bytes {
+    return digest(.Sha384, data)
+}
+
+func sha512(anon data: bytes) -> bytes {
+    return digest(.Sha512, data)
+}
+
+func rotr32(anon x: int64, anon n: int64) -> int64 {
+    return ((x >> n) | (x << (32 - n))) & MASK32
+}
+
+func rotr64(anon x: int64, anon n: int64) -> int64 {
+    return (x >> n) | (x << (64 - n))
+}
+
+// The state after one 64-byte block of `data`, from `at`.
+func compress256(anon state: [int64], anon data: bytes, at: int64) -> [int64] {
+    mut h = state
+    mut w = [0] * 64
+    for i in 0..16 {
+        let j = at + i * 4
+        w[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]
+    }
+    for i in 16..64 {
+        let x = w[i - 15]
+        let y = w[i - 2]
+        let s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3)
+        let s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ (y >> 10)
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK32
+    }
+    mut a = h[0]
+    mut b = h[1]
+    mut c = h[2]
+    mut d = h[3]
+    mut e = h[4]
+    mut f = h[5]
+    mut g = h[6]
+    mut hh = h[7]
+    for i in 0..64 {
+        let s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch = (e & f) ^ ((e ^ MASK32) & g)
+        let t1 = (hh + s1 + ch + K256[i] + w[i]) & MASK32
+        let s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        hh = g
+        g = f
+        f = e
+        e = (d + t1) & MASK32
+        d = c
+        c = b
+        b = a
+        a = (t1 + s0 + maj) & MASK32
+    }
+    h[0] = (h[0] + a) & MASK32
+    h[1] = (h[1] + b) & MASK32
+    h[2] = (h[2] + c) & MASK32
+    h[3] = (h[3] + d) & MASK32
+    h[4] = (h[4] + e) & MASK32
+    h[5] = (h[5] + f) & MASK32
+    h[6] = (h[6] + g) & MASK32
+    h[7] = (h[7] + hh) & MASK32
+    return h
+}
+
+// The state after one 128-byte block of `data`, from `at`.
+func compress512(anon state: [int64], anon data: bytes, at: int64) -> [int64] {
+    mut h = state
+    mut w = [0] * 80
+    for i in 0..16 {
+        let j = at + i * 8
+        mut word = 0
+        for k in 0..8 {
+            word = (word << 8) | data[j + k]
+        }
+        w[i] = word
+    }
+    for i in 16..80 {
+        let x = w[i - 15]
+        let y = w[i - 2]
+        let s0 = rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7)
+        let s1 = rotr64(y, 19) ^ rotr64(y, 61) ^ (y >> 6)
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1)
+    }
+    mut a = h[0]
+    mut b = h[1]
+    mut c = h[2]
+    mut d = h[3]
+    mut e = h[4]
+    mut f = h[5]
+    mut g = h[6]
+    mut hh = h[7]
+    for i in 0..80 {
+        let s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+        let ch = (e & f) ^ ((e ^ -1) & g)
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i])
+        let s0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        hh = g
+        g = f
+        f = e
+        e = d.wrapping_add(t1)
+        d = c
+        c = b
+        b = a
+        a = t1.wrapping_add(s0).wrapping_add(maj)
+    }
+    h[0] = h[0].wrapping_add(a)
+    h[1] = h[1].wrapping_add(b)
+    h[2] = h[2].wrapping_add(c)
+    h[3] = h[3].wrapping_add(d)
+    h[4] = h[4].wrapping_add(e)
+    h[5] = h[5].wrapping_add(f)
+    h[6] = h[6].wrapping_add(g)
+    h[7] = h[7].wrapping_add(hh)
+    return h
+}

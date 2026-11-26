@@ -1,0 +1,226 @@
+// ChaCha20, Poly1305 and the AEAD made of them (RFC 8439). See docs/crypto.md.
+//
+// Words are 32 bits held in int64s and masked after each sum. Nothing
+// branches on, or indexes by, the key or the data.
+import "crypto/hmac"
+
+let MASK32: int64 = 0xffffffff
+let MASK26: int64 = 0x3ffffff
+
+// The 4 bytes of `b` from `at`, the first lowest.
+func le32(anon b: bytes, anon at: int64) -> int64 {
+    return b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)
+}
+
+func rotl(anon x: int64, anon n: int64) -> int64 {
+    return ((x << n) | (x >> (32 - n))) & MASK32
+}
+
+func quarter(anon mut x: [int64], anon a: int64, anon b: int64, anon c: int64, anon d: int64) -> none {
+    x[a] = (x[a] + x[b]) & MASK32
+    x[d] = rotl(x[d] ^ x[a], 16)
+    x[c] = (x[c] + x[d]) & MASK32
+    x[b] = rotl(x[b] ^ x[c], 12)
+    x[a] = (x[a] + x[b]) & MASK32
+    x[d] = rotl(x[d] ^ x[a], 8)
+    x[c] = (x[c] + x[d]) & MASK32
+    x[b] = rotl(x[b] ^ x[c], 7)
+}
+
+// The 16 words of key stream block `counter`.
+func block(anon key: bytes, anon nonce: bytes, anon counter: int64) -> [int64] {
+    mut state = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+    for i in 0..8 {
+        state += [le32(key, i * 4)]
+    }
+    state += [counter & MASK32, le32(nonce, 0), le32(nonce, 4), le32(nonce, 8)]
+    mut x = state
+    for _round in 0..10 {
+        quarter(mut x, 0, 4, 8, 12)
+        quarter(mut x, 1, 5, 9, 13)
+        quarter(mut x, 2, 6, 10, 14)
+        quarter(mut x, 3, 7, 11, 15)
+        quarter(mut x, 0, 5, 10, 15)
+        quarter(mut x, 1, 6, 11, 12)
+        quarter(mut x, 2, 7, 8, 13)
+        quarter(mut x, 3, 4, 9, 14)
+    }
+    for i in 0..16 {
+        x[i] = (x[i] + state[i]) & MASK32
+    }
+    return x
+}
+
+func check_sizes(anon key: bytes, anon nonce: bytes) -> none {
+    if len(key) != 32 {
+        panic(f"chacha20: the key is {len(key)} bytes, not 32")
+    }
+    if len(nonce) != 12 {
+        panic(f"chacha20: the nonce is {len(nonce)} bytes, not 12")
+    }
+}
+
+// `data` XORed with the key stream from block `counter` on.
+func chacha20(anon data: bytes, key: bytes, nonce: bytes, counter: int64) -> bytes {
+    check_sizes(key, nonce)
+    let n = len(data)
+    if counter < 0 or counter + (n + 63) / 64 > 0x100000000 {
+        panic("chacha20: the block counter would pass 2^32")
+    }
+    mut out = [0] * n
+    mut at = 0
+    mut c = counter
+    for at < n {
+        let ks = block(key, nonce, c)
+        let end = min(at + 64, n)
+        for i in at..end {
+            let j = i - at
+            out[i] = data[i] ^ ((ks[j >> 2] >> ((j & 3) * 8)) & 255)
+        }
+        at = end
+        c += 1
+    }
+    return kod_bytes_from_array(out)
+}
+
+// The Poly1305 tag of `data` under the one-time 32-byte `key`.
+func poly1305(anon data: bytes, key: bytes) -> bytes {
+    if len(key) != 32 {
+        panic(f"poly1305: the key is {len(key)} bytes, not 32")
+    }
+    // r, clamped, in 26-bit limbs; s5..s8 are r1..r4 times 5, for the
+    // reduction 2^130 = 5 (mod 2^130 - 5).
+    let r0 = le32(key, 0) & 0x3ffffff
+    let r1 = (le32(key, 3) >> 2) & 0x3ffff03
+    let r2 = (le32(key, 6) >> 4) & 0x3ffc0ff
+    let r3 = (le32(key, 9) >> 6) & 0x3f03fff
+    let r4 = (le32(key, 12) >> 8) & 0x00fffff
+    let s1 = r1 * 5
+    let s2 = r2 * 5
+    let s3 = r3 * 5
+    let s4 = r4 * 5
+    mut h0 = 0
+    mut h1 = 0
+    mut h2 = 0
+    mut h3 = 0
+    mut h4 = 0
+    let n = len(data)
+    mut at = 0
+    for at < n {
+        // A whole block has a 1 bit after its 128; a short one has its 1
+        // byte after the data, then zeros.
+        mut m = data
+        mut at_m = at
+        mut hibit = 1 << 24
+        if n - at < 16 {
+            mut last = [0] * 16
+            for i in at..n {
+                last[i - at] = data[i]
+            }
+            last[n - at] = 1
+            m = kod_bytes_from_array(last)
+            at_m = 0
+            hibit = 0
+        }
+        h0 += le32(m, at_m) & MASK26
+        h1 += (le32(m, at_m + 3) >> 2) & MASK26
+        h2 += (le32(m, at_m + 6) >> 4) & MASK26
+        h3 += (le32(m, at_m + 9) >> 6) & MASK26
+        h4 += (le32(m, at_m + 12) >> 8) | hibit
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        mut d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        mut d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        h0 = d0 & MASK26
+        d1 += d0 >> 26
+        h1 = d1 & MASK26
+        d2 += d1 >> 26
+        h2 = d2 & MASK26
+        d3 += d2 >> 26
+        h3 = d3 & MASK26
+        d4 += d3 >> 26
+        h4 = d4 & MASK26
+        h0 += (d4 >> 26) * 5
+        h1 += h0 >> 26
+        h0 = h0 & MASK26
+        at += 16
+    }
+    // Carry fully, then take h - p when that doesn't go below 0.
+    h2 += h1 >> 26
+    h1 = h1 & MASK26
+    h3 += h2 >> 26
+    h2 = h2 & MASK26
+    h4 += h3 >> 26
+    h3 = h3 & MASK26
+    h0 += (h4 >> 26) * 5
+    h4 = h4 & MASK26
+    h1 += h0 >> 26
+    h0 = h0 & MASK26
+    mut g0 = h0 + 5
+    mut g1 = h1 + (g0 >> 26)
+    g0 = g0 & MASK26
+    mut g2 = h2 + (g1 >> 26)
+    g1 = g1 & MASK26
+    mut g3 = h3 + (g2 >> 26)
+    g2 = g2 & MASK26
+    let g4 = h4 + (g3 >> 26) - (1 << 26)
+    g3 = g3 & MASK26
+    // All ones when g4 >= 0 (keep g), else 0 (keep h).
+    let keep_g = (g4 >> 63) - 1
+    let keep_h = keep_g ^ -1
+    h0 = (h0 & keep_h) | (g0 & keep_g)
+    h1 = (h1 & keep_h) | (g1 & keep_g)
+    h2 = (h2 & keep_h) | (g2 & keep_g)
+    h3 = (h3 & keep_h) | (g3 & keep_g)
+    h4 = (h4 & keep_h) | (g4 & keep_g & MASK26)
+    // h + s, mod 2^128, as four 32-bit words.
+    let w0 = (h0 | (h1 << 26)) & MASK32
+    let w1 = ((h1 >> 6) | (h2 << 20)) & MASK32
+    let w2 = ((h2 >> 12) | (h3 << 14)) & MASK32
+    let w3 = ((h3 >> 18) | (h4 << 8)) & MASK32
+    mut out: [int64] = []
+    mut carry = 0
+    for i, w in [w0, w1, w2, w3] {
+        let f = w + le32(key, 16 + i * 4) + carry
+        out += [f & 255, (f >> 8) & 255, (f >> 16) & 255, (f >> 24) & 255]
+        carry = f >> 32
+    }
+    return kod_bytes_from_array(out)
+}
+
+// `n` as 8 bytes, the lowest first.
+func le64(anon n: int64) -> bytes {
+    return kod_bytes_from_array([(n >> (i * 8)) & 255 for i in 0..8])
+}
+
+func pad16(anon n: int64) -> bytes {
+    return kod_bytes_from_array([0] * ((16 - n % 16) % 16))
+}
+
+func tag(anon key: bytes, anon nonce: bytes, anon ciphertext: bytes, anon aad: bytes) -> bytes {
+    let one_time = chacha20(kod_bytes_from_array([0] * 32), key: key, nonce: nonce, counter: 0)
+    let text = aad + pad16(len(aad)) + ciphertext + pad16(len(ciphertext)) + le64(len(aad)) + le64(len(ciphertext))
+    return poly1305(text, key: one_time)
+}
+
+// The ciphertext of `plaintext`, then the 16-byte tag over it and `aad`.
+func seal(anon plaintext: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes {
+    check_sizes(key, nonce)
+    let ciphertext = chacha20(plaintext, key: key, nonce: nonce, counter: 1)
+    return ciphertext + tag(key, nonce, ciphertext, aad)
+}
+
+// The plaintext `seal` was given, or none when `sealed` or `aad` isn't what it
+// sealed under this key and nonce.
+func open(anon sealed: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes? {
+    check_sizes(key, nonce)
+    if len(sealed) < 16 {
+        return none
+    }
+    let ciphertext = sealed[..len(sealed) - 16]
+    if not hmac.equal(tag(key, nonce, ciphertext, aad), sealed[len(sealed) - 16..]) {
+        return none
+    }
+    return chacha20(ciphertext, key: key, nonce: nonce, counter: 1)
+}

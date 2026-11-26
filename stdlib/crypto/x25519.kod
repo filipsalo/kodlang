@@ -1,0 +1,179 @@
+// X25519 (RFC 7748). See docs/crypto.md.
+//
+// A field element mod p = 2^255 - 19 is 16 limbs of 16 bits, lowest first,
+// as in TweetNaCl: a product of two limbs is at most 32 bits, so a whole
+// multiplication's sums stay far inside an int64. Limbs may go negative
+// between carries. The ladder swaps with masks, so nothing branches on, or
+// indexes by, the private key.
+
+// `x >> n` with the sign kept (Kod's `>>` shifts in zeros).
+func asr(anon x: int64, anon n: int64) -> int64 {
+    return (x >> n) | ((0 - (x >> 63)) << (64 - n))
+}
+
+// Each limb back to 16 bits, the carry out of the top one coming back in
+// at the bottom times 38 (2^256 = 38 mod p).
+func carry(anon a: [int64]) -> [int64] {
+    mut o = a
+    for i in 0..16 {
+        o[i] += 1 << 16
+        let c = asr(o[i], 16)
+        if i < 15 {
+            o[i + 1] += c - 1
+        } else {
+            o[0] += 38 * (c - 1)
+        }
+        o[i] -= c << 16
+    }
+    return o
+}
+
+func add(anon a: [int64], anon b: [int64]) -> [int64] {
+    return [a[i] + b[i] for i in 0..16]
+}
+
+func sub(anon a: [int64], anon b: [int64]) -> [int64] {
+    return [a[i] - b[i] for i in 0..16]
+}
+
+func mul(anon a: [int64], anon b: [int64]) -> [int64] {
+    mut t = [0] * 31
+    for i in 0..16 {
+        let ai = a[i]
+        for j in 0..16 {
+            t[i + j] += ai * b[j]
+        }
+    }
+    for i in 0..15 {
+        t[i] += 38 * t[i + 16]
+    }
+    return carry(carry(t[..16]))
+}
+
+func square(anon a: [int64]) -> [int64] {
+    return mul(a, a)
+}
+
+// a^(p - 2), which is 1 / a; the exponent is public, so its bits may steer.
+func invert(anon a: [int64]) -> [int64] {
+    mut c = a
+    for bit in 253..=0 step -1 {
+        c = square(c)
+        if bit != 2 and bit != 4 {
+            c = mul(c, a)
+        }
+    }
+    return c
+}
+
+// `p` and `q` swapped when `swap` is 1, as they were when it is 0.
+func cswap(anon p: [int64], anon q: [int64], anon swap: int64) -> ([int64], [int64]) {
+    let mask = 0 - swap
+    mut x = p
+    mut y = q
+    for i in 0..16 {
+        let t = mask & (x[i] ^ y[i])
+        x[i] = x[i] ^ t
+        y[i] = y[i] ^ t
+    }
+    return (x, y)
+}
+
+func unpack(anon b: bytes) -> [int64] {
+    mut o = [b[2 * i] | (b[2 * i + 1] << 8) for i in 0..16]
+    o[15] = o[15] & 0x7fff
+    return o
+}
+
+// The 32 bytes of `n` reduced below p.
+func pack(anon n: [int64]) -> bytes {
+    mut t = carry(carry(carry(n)))
+    for _pass in 0..2 {
+        // m = t - p; keep it unless that borrowed.
+        mut m = [0] * 16
+        m[0] = t[0] - 0xffed
+        for i in 1..15 {
+            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1)
+            m[i - 1] = m[i - 1] & 0xffff
+        }
+        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1)
+        let borrow = (m[15] >> 16) & 1
+        m[14] = m[14] & 0xffff
+        let (kept, _rest) = cswap(t, m, 1 - borrow)
+        t = kept
+    }
+    mut out: [int64] = []
+    for limb in t {
+        out += [limb & 255, (limb >> 8) & 255]
+    }
+    return kod_bytes_from_array(out)
+}
+
+func check_size(anon what: str, anon b: bytes) -> none {
+    if len(b) != 32 {
+        panic(f"x25519: the {what} is {len(b)} bytes, not 32")
+    }
+}
+
+// The u coordinate of `scalar` times the point with u coordinate `point`.
+func scalar_mult(anon scalar: bytes, anon point: bytes) -> bytes {
+    check_size("scalar", scalar)
+    check_size("point", point)
+    mut z = [b for b in scalar]
+    z[31] = (z[31] & 127) | 64
+    z[0] = z[0] & 248
+    let x = unpack(point)
+    mut a = [0] * 16
+    mut b = x
+    mut c = [0] * 16
+    mut d = [0] * 16
+    a[0] = 1
+    d[0] = 1
+    let k121665 = [0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for i in 254..=0 step -1 {
+        let r = (z[i >> 3] >> (i & 7)) & 1
+        (a, b) = cswap(a, b, r)
+        (c, d) = cswap(c, d, r)
+        mut e = add(a, c)
+        a = sub(a, c)
+        c = add(b, d)
+        b = sub(b, d)
+        d = square(e)
+        let f = square(a)
+        a = mul(c, a)
+        c = mul(b, e)
+        e = add(a, c)
+        a = sub(a, c)
+        b = square(a)
+        c = sub(d, f)
+        a = mul(c, k121665)
+        a = add(a, d)
+        c = mul(c, a)
+        a = mul(d, f)
+        d = mul(b, x)
+        b = square(e)
+        (a, b) = cswap(a, b, r)
+        (c, d) = cswap(c, d, r)
+    }
+    return pack(mul(a, invert(c)))
+}
+
+func public_key(anon private: bytes) -> bytes {
+    mut base = [0] * 32
+    base[0] = 9
+    return scalar_mult(private, kod_bytes_from_array(base))
+}
+
+// The shared secret of our `private` key and the `peer`'s public key, or none
+// when it comes out all zeros: the peer sent a point of small order.
+func shared(anon private: bytes, anon peer: bytes) -> bytes? {
+    let s = scalar_mult(private, peer)
+    mut any = 0
+    for b in s {
+        any = any | b
+    }
+    if any == 0 {
+        return none
+    }
+    return s
+}
