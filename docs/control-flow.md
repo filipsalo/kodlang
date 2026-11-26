@@ -149,7 +149,9 @@ for i in 3..=0 step -1 {
 ```
 
 The step is evaluated once too, and must be an `int64`. A step of 0 is an error
-when it is a literal and a panic (`a range's step is 0`) when it isn't. These
+when it is a literal and a panic (`a range's step is 0`) when it isn't. A range
+may end at the largest or smallest `int64`: the loop stops there instead of
+stepping past it. These
 forms work in a comprehension's `for` as well. `arrays.reversed(xs)` gives an
 array's elements last first.
 
