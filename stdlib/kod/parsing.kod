@@ -552,6 +552,9 @@ type Parser = shared struct {
     local_fn_calls: Map[int64, int64] = Map[int64, int64]()
     // Whether the file declares a local function: only then are calls looked up.
     has_local_fns: bool = false
+    // `and` chains with an `is` that binds, not yet taken as an `if` or `for`
+    // condition: after the statement they become `match`es (value_chain).
+    value_chains: [int64] = []
     // Match expressions parsed so far, so a FuncDecl can tell whether its body has one.
     binding_exprs: int64 = 0
     // Whether the parameter list parse_param_list read last ended in `...`.
@@ -1307,6 +1310,10 @@ type Parser = shared struct {
 
     // `a and b and c` as its operands, left to right.
     func and_operands(self, anon expr_id: int64) -> [int64] {
+        // A condition takes its chain over.
+        if len(self.value_chains) > 0 and self.value_chains[-1] == expr_id {
+            self.value_chains = self.value_chains[..-1]
+        }
         if self.exprs[expr_id] is .Binary(lhs, op, rhs) and op is .And {
             mut ops: [int64] = self.and_operands(lhs)
             ops += self.and_operands(rhs)
@@ -3208,7 +3215,52 @@ type Parser = shared struct {
     }
 
     func parse_expr(self) -> int64 {
-        return self.parse_expr_prec(1)
+        let e = self.parse_expr_prec(1)
+        if self.exprs[e] is .Binary(_l, op, _r) and op is .And {
+            for o in self.and_operands(e) {
+                if self.binds_names(o) {
+                    self.value_chains += [e]
+                    break
+                }
+            }
+        }
+        return e
+    }
+
+    // The `and` chains no condition took, each rewritten in place: `a and x is
+    // P(b) and c` as `a and match x { P(b) -> c, else -> false }`, so `b` reaches
+    // the rest of the chain wherever it is.
+    func flush_value_chains(self) -> none {
+        let chains = self.value_chains
+        self.value_chains = []
+        for e in chains {
+            let ops = self.and_operands(e)
+            let span = self.expr_spans[e]
+            let whole = self.value_chain(ops, from: 0, :span)
+            self.exprs[e] = self.exprs[whole]
+        }
+    }
+
+    func value_chain(self, anon ops: [int64], from: int64, span: ast.Span) -> int64 {
+        if from >= len(ops) {
+            return self.alloc_expr(ast.Expr.BoolLit(value: true), :span)
+        }
+        let op = ops[from]
+        if self.binds_names(op) and self.exprs[op] is .Binary(subject, _is, rhs) {
+            let pat = self.pattern_of_expr(rhs)
+            if pat >= 0 {
+                self.binding_exprs += 1
+                let arms = [
+                    self.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, body: self.value_chain(ops, from: from + 1, :span))),
+                    self.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.alloc_pattern(ast.Pattern.Wildcard), body: self.alloc_expr(ast.Expr.BoolLit(value: false), :span))),
+                ]
+                return self.alloc_expr(ast.Expr.MatchExpr(:subject, :arms), :span)
+            }
+        }
+        if from + 1 == len(ops) {
+            return op
+        }
+        return self.alloc_expr(ast.Expr.Binary(lhs: op, op: .And, rhs: self.value_chain(ops, from: from + 1, :span)), :span)
     }
 
     // `is` shares the comparisons' precedence but doesn't chain.
@@ -3307,6 +3359,7 @@ type Parser = shared struct {
             last_at = start
             self.guard_arm = -1
             let stmt_id = self.parse_stmt()
+            self.flush_value_chains()
             stmts += [stmt_id]
             stmts += self.more_stmts
             self.more_stmts = []
@@ -3692,6 +3745,7 @@ type Parser = shared struct {
     // What a statement stands for: itself, and those that come with it.
     func parse_stmts(self) -> [int64] {
         let first = self.parse_stmt()
+        self.flush_value_chains()
         let all = [first] + self.more_stmts
         self.more_stmts = []
         return all
@@ -4159,6 +4213,7 @@ type Parser = shared struct {
     }
 
     func leave_function(self, anon outer: SavedFunction) -> none {
+        self.flush_value_chains()
         self.yields = outer.yields
         self.yield_values = outer.yield_values
         self.value_returns = outer.value_returns

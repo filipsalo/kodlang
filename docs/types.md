@@ -416,9 +416,12 @@ not* match.
 
 `is` and `is not` bind like comparisons, tighter than `and` and `or`, so
 `if ready and x is none` reads as `ready and (x is none)`. A pattern that
-binds a name, like `Some(v)`, only works when the `is` is the whole `if`
-condition: `if a and x is Some(v)` is an error, since `v` would be unset
-when `a` is false. `Some(_)` or `Some(_v)` binds nothing and works anywhere.
+binds a name, like `Some(v)`, works in an `if` or `for` condition and in an
+`and` chain, where `v` is in scope for the operands after it:
+`x is Some(v) and v > 0` (see
+[`if X is …`](pattern-matching.md#if-x-is-variantbindings--)). Under `or` or
+`not` it is an error, since `v` could be unset. `Some(_)` or `Some(_v)` binds
+nothing and works anywhere.
 
 Or peel off the `Some` with `let .Some(v) = y else { ... }`:
 

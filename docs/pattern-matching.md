@@ -687,9 +687,26 @@ if a is .Some(x) and b is .Some(y) and x == y {
 
 The `else` block runs when any operand fails, and sees none of the
 bindings. A `for` condition can bind the same way (see
-[`for`](control-flow.md#for-while-style)). Elsewhere a pattern can't bind: not
-under `or` or `not`, not with `is not` inside an `and` chain, not in a `let`
-value. There the `is` is only a test, and `.Circle(r)` is an error.
+[`for`](control-flow.md#for-while-style)).
+
+An `and` chain anywhere else, as a `let` value, an argument or what a function
+returns, binds the same way for the operands after the `is`: it is `false` when
+the pattern doesn't match, and the rest when it does.
+
+<!-- kod:
+type Tok = enum {
+    Num(n: int64)
+    Word(text: str)
+}
+let tok: Tok = .Num(n: 7)
+-->
+```kod
+let small = tok is .Num(n) and n < 10       // true
+```
+
+Elsewhere a pattern can't bind: not under `or` or `not`, not with `is not`
+inside an `and` chain, and not in an `is` on its own outside a condition. There
+the `is` is only a test, and `.Circle(r)` is an error.
 
 <!-- kod: let v: int64? = 3 -->
 ```kod
