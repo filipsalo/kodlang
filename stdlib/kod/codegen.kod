@@ -1603,6 +1603,8 @@ type Codegen = shared struct {
     // What the literal being compiled captures, if it's one.
     lit_env: LitEnv? = none
     lit_let_name: str = ""
+    // Enums whose payloads equatable_kind or is_hashable is checking.
+    eq_visiting: [int64] = []
     in_captures: [str] = []
     // By module path, 1 if the module has module-level variables (see has_module_vars).
     var_modules: FuncIdx = FuncIdx()
@@ -2455,8 +2457,9 @@ type Codegen = shared struct {
         }
         match kind {
             .KInt64 | .KStr | .KBytes | .KBool | .KFloat64 -> return true
-            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0
+            .KEnum(idx) -> return self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0 or len(self.payload_without_eq(idx)) == 0
             .KStruct(idx, _args) -> return self.structs[idx].method_idx.contains("op_eq") or (self.by_fields(idx) and len(self.odd_field(idx, need: 0)) == 0)
+            .KOptional(inner) -> return self.equatable_kind(inner)
             else return false
         }
     }
@@ -2922,36 +2925,138 @@ type Codegen = shared struct {
         return self.structs[idx].method_idx.contains("contains")
     }
 
+    // The first payload field of enum `idx` that has no `==`, as `.V`'s `x`, or "".
+    // An enum being checked counts as having one, so a recursive payload ends.
+    func payload_without_eq(self, anon idx: int64) -> str {
+        if arrays.contains(self.eq_visiting, idx) {
+            return ""
+        }
+        self.eq_visiting += [idx]
+        mut found = ""
+        for v in self.enums[idx].variants {
+            for i, kind in v.field_kinds {
+                if len(found) == 0 and not self.equatable_kind(kind) {
+                    found = f"`.{v.name}`'s `{v.field_names[i]}`, a `{self.kind_display(kind)}`,"
+                }
+            }
+        }
+        self.eq_visiting = self.eq_visiting[..-1]
+        return found
+    }
+
+    // `a == b` on two values of enum `idx` that has payloads: the same variant
+    // and each field `==`. A unit variant on either side keeps the plain
+    // comparison of variants.
+    func compares_payloads(self, anon idx: int64, lhs: int64, rhs: int64, rhs_kind: TypeKind) -> bool {
+        if self.enums[idx].is_union or not self.enum_has_payload(idx) or self.enum_method(idx, name: "op_eq") >= 0 {
+            return false
+        }
+        if len(self.payload_without_eq(idx)) > 0 {
+            return false
+        }
+        for side in [lhs, rhs] {
+            let vi = self.ctor_variant_idx(side, enum_idx: idx)
+            if vi >= 0 and len(self.enums[idx].variants[vi].field_names) == 0 {
+                return false
+            }
+        }
+        if rhs_kind is .KEnum(rhs_idx) {
+            return self.enums_compatible(idx, a_idx: rhs_idx)
+        }
+        return self.ctor_variant_idx(rhs, enum_idx: idx) >= 0
+    }
+
+    // A `match` on each side, computed first, left to right: the same variant
+    // and each field `==`, as a struct's fields are.
+    func compile_enum_eq(self, anon lhs: int64, op: ast.Op, rhs: int64, idx: int64) -> Val {
+        let kind: TypeKind = .KEnum(:idx)
+        let span = self.p.expr_spans[lhs]
+        let l = self.stash_operand_as(lhs, :kind)
+        let r = self.stash_operand_as(rhs, :kind)
+        let differ = self.p.alloc_expr(.BoolLit(value: false), :span)
+        mut arms: [int64] = []
+        for v in self.enums[idx].variants {
+            mut lhs_names: [str] = []
+            mut rhs_names: [str] = []
+            mut all = -1
+            for fkind in v.field_kinds {
+                let a = self.fresh("__eq_l")
+                self.alloc_var(name: a, kind: fkind)
+                let b = self.fresh("__eq_r")
+                self.alloc_var(name: b, kind: fkind)
+                lhs_names += [a]
+                rhs_names += [b]
+                let same = self.p.alloc_expr(.Binary(lhs: self.p.alloc_expr(.Ident(name: a), :span), op: .Eq, rhs: self.p.alloc_expr(.Ident(name: b), :span)), :span)
+                if all < 0 {
+                    all = same
+                } else {
+                    all = self.p.alloc_expr(.Binary(lhs: all, op: .And, rhs: same), :span)
+                }
+            }
+            if all < 0 {
+                all = self.p.alloc_expr(.BoolLit(value: true), :span)
+            }
+            let inner_arms: [int64] = [
+                self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: rhs_names)), body: all)),
+                self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(ast.Pattern.Wildcard), body: differ)),
+            ]
+            let inner = self.p.alloc_expr(.MatchExpr(subject: r, arms: inner_arms), :span)
+            arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: lhs_names)), body: inner))]
+        }
+        mut eq = self.p.alloc_expr(.MatchExpr(subject: l, :arms), :span)
+        if op is .Ne {
+            eq = self.p.alloc_expr(.Binary(lhs: eq, op: .Eq, rhs: self.p.alloc_expr(.BoolLit(value: false), :span)), :span)
+        }
+        return self.compile_expr(eq)
+    }
+
+    // `a == b` where one side is a `T?` and the other a `T?` or a `T` of a type
+    // with `==`, and neither is `none`: `_opt_eq(a, b)`.
+    func compares_optionals(self, anon lhs_kind: TypeKind, anon rhs_kind: TypeKind) -> bool {
+        if self.is_none_kind(lhs_kind) or self.is_none_kind(rhs_kind) or self.either_unknown(lhs_kind, rhs_kind) {
+            return false
+        }
+        mut l = lhs_kind
+        mut r = rhs_kind
+        mut optional = false
+        if lhs_kind is .KOptional(inner) {
+            l = inner
+            optional = true
+        }
+        if rhs_kind is .KOptional(inner) {
+            r = inner
+            optional = true
+        }
+        return optional and self.same_kind(l, r) and self.equatable_kind(l)
+    }
+
+    func compile_opt_eq(self, anon lhs: int64, op: ast.Op, rhs: int64) -> Val {
+        let span = self.p.expr_spans[lhs]
+        mut call = self.array_helper_call("_opt_eq", args: [lhs, rhs], :span)
+        if op is .Ne {
+            call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: self.p.alloc_expr(.BoolLit(value: false), :span)), :span)
+        }
+        return self.compile_expr(call)
+    }
+
     // Only the variant is compared, so a payload could only be ignored.
     func check_enum_equality(self, lhs_id: int64, rhs_id: int64, enum_idx: int64) -> none {
-        let info = self.enums[enum_idx]
         if not self.enum_has_payload(enum_idx) {
             return
         }
-        mut unit_side = false
+        let field = self.payload_without_eq(enum_idx)
+        if len(field) == 0 {
+            return
+        }
+        // Against a unit variant only the variants are compared.
         for side in [lhs_id, rhs_id] {
             let vi = self.ctor_variant_idx(side, :enum_idx)
-            if vi >= 0 {
-                let variant = info.variants[vi]
-                if len(variant.field_names) > 0 {
-                    mut fields = ""
-                    for name in variant.field_names {
-                        if len(fields) > 0 {
-                            fields = fields + ", "
-                        }
-                        fields = fields + name
-                    }
-                    let pattern = f".{variant.name}({fields})"
-                    self.report_error(f"error: cannot compare with `.{variant.name}(...)`, which has a payload; test it with `is {pattern}`", span: self.p.expr_spans[side])
-                    return
-                }
-                unit_side = true
+            if vi >= 0 and len(self.enums[enum_idx].variants[vi].field_names) == 0 {
+                return
             }
         }
-        if not unit_side {
-            let shown = self.enum_display_name(enum_idx)
-            self.report_error(f"error: cannot compare two `{shown}` values; some of its variants have payloads, so test the variant with `is` or `match`", span: self.p.expr_spans[lhs_id])
-        }
+        let shown = self.enum_display_name(enum_idx)
+        self.report_error(f"error: cannot compare two `{shown}` values: {field} has no `==`; test the variant with `is` or `match`", span: self.p.expr_spans[lhs_id])
     }
 
     func enum_has_payload(self, anon enum_idx: int64) -> bool {
@@ -2974,8 +3079,13 @@ type Codegen = shared struct {
                 if self.enums[idx].is_union {
                     return len(self.unhashable_member(idx)) == 0
                 }
-                return not self.enum_has_payload(idx)
+                if not self.enum_has_payload(idx) {
+                    return true
+                }
+                // `hash` agrees with the generated `==`, not with an `op_eq`.
+                return self.enum_method(idx, name: "op_eq") < 0 and self.payloads_hashable(idx)
             }
+            .KOptional(inner) -> return self.is_hashable(inner)
             .KStruct(idx, _args) -> {
                 if not self.equatable_kind(kind) {
                     return false
@@ -2987,6 +3097,45 @@ type Codegen = shared struct {
             }
             else return kind.is_array() and self.is_hashable(kind.array_elem())
         }
+    }
+
+    // Whether each payload field of enum `idx` can be hashed; one being checked can.
+    func payloads_hashable(self, anon idx: int64) -> bool {
+        if arrays.contains(self.eq_visiting, idx) {
+            return true
+        }
+        self.eq_visiting += [idx]
+        mut ok = true
+        for v in self.enums[idx].variants {
+            for kind in v.field_kinds {
+                if ok and not self.is_hashable(kind) {
+                    ok = false
+                }
+            }
+        }
+        self.eq_visiting = self.eq_visiting[..-1]
+        return ok
+    }
+
+    // `match v { A(x, y) -> _mix(_mix(1, hash(x)), hash(y)), B -> 2, ... }`: the
+    // hash of the payload of the variant `v` is, mixed with which variant it is.
+    func enum_hash(self, anon value_id: int64, enum_idx: int64) -> int64 {
+        let span = self.p.expr_spans[value_id]
+        mut arms: [int64] = []
+        for j, v in self.enums[enum_idx].variants {
+            mut names: [str] = []
+            mut all = self.p.alloc_expr(.IntLit(value: j + 1), :span)
+            for fkind in v.field_kinds {
+                let name = self.fresh("__field")
+                self.alloc_var(:name, kind: fkind)
+                names += [name]
+                let hashed = self.array_helper_call("hash", args: [self.p.alloc_expr(.Ident(:name), :span)], :span)
+                all = self.array_helper_call("_mix", args: [all, hashed], :span)
+            }
+            let pat = self.p.alloc_pattern(.ImplicitEnumPat(variant_name: v.name, bindings: names))
+            arms += [self.p.alloc_match_expr_arm(ast.MatchExprArm(pattern: pat, body: all))]
+        }
+        return self.p.alloc_expr(.MatchExpr(subject: value_id, :arms), :span)
     }
 
     // Whether the struct declares `hash(self) -> int64`.
@@ -3014,8 +3163,18 @@ type Codegen = shared struct {
             }
             return f"; its member `{member}` can't be hashed"
         }
-        if kind is .KEnum(_idx) {
-            return "; some of its variants have payloads"
+        if kind is .KEnum(idx) {
+            if self.enum_method(idx, name: "op_eq") >= 0 {
+                return "; it declares `op_eq`, which a hash can't follow"
+            }
+            for v in self.enums[idx].variants {
+                for i, fkind in v.field_kinds {
+                    if not self.is_hashable(fkind) {
+                        return f"; `.{v.name}`'s `{v.field_names[i]}`, a `{self.kind_display(fkind)}`, can't be hashed"
+                    }
+                }
+            }
+            return ""
         }
         if kind is .KStruct(idx, _args) {
             if len(self.hashed_arg_noun(self.structs[idx].template_idx)) > 0 {
@@ -3088,7 +3247,7 @@ type Codegen = shared struct {
                 }
                 i += 1
             }
-            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool`, enums without payloads, and arrays, structs and unions of those{suffix}", span: site)
+            self.report_message(f"error: `{self.kind_display(key)}` can't be a `{self.structs[template_idx].name}` {noun}{where}{self.unhashable_note(key)}; {noun}s are `int64`, `str`, `bytes`, `bool`, and enums, optionals, arrays, structs and unions of those{suffix}", span: site)
         }
         let none_pending: [int64] = []
         self.pending_bad_keys = none_pending
@@ -11923,6 +12082,12 @@ type Codegen = shared struct {
                         if lhs_kind is .KStruct(_idx, _args) and self.compares_by_fields(lhs_kind, rhs_kind) {
                             return self.compile_struct_eq(lhs, :op, :rhs)
                         }
+                        if self.compares_optionals(lhs_kind, rhs_kind) {
+                            return self.compile_opt_eq(lhs, :op, :rhs)
+                        }
+                        if lhs_kind is .KEnum(eidx) and self.compares_payloads(eidx, :lhs, :rhs, :rhs_kind) {
+                            return self.compile_enum_eq(lhs, :op, :rhs, idx: eidx)
+                        }
                     } else {
                         let order = self.tuple_order(op, lhs_kind, rhs_kind)
                         if len(order) > 0 {
@@ -15612,7 +15777,7 @@ type Codegen = shared struct {
                     if not self.is_hashable(arg_kind) {
                         self.compile_discard(args[0].value)
                         if not self.kind_has_unknown(arg_kind) and self.report_attempts == self.stmt_error_mark {
-                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool`, enums without payloads, and arrays, structs and unions of those", span: self.p.expr_spans[args[0].value])
+                            self.report_error(f"error: cannot hash a value of type `{self.kind_display(arg_kind)}`{self.unhashable_note(arg_kind)}; hashable values are `int64`, `str`, `bytes`, `bool`, and enums, optionals, arrays, structs and unions of those", span: self.p.expr_spans[args[0].value])
                         }
                         return .VImm(value: 0)
                     }
@@ -15633,6 +15798,12 @@ type Codegen = shared struct {
                     }
                     if arg_kind is .KEnum(union_idx) and self.enums[union_idx].is_union {
                         return self.compile_expr(self.union_hash(args[0].value, union_idx: union_idx))
+                    }
+                    if arg_kind is .KEnum(payload_idx) and self.enum_has_payload(payload_idx) {
+                        return self.compile_expr(self.enum_hash(args[0].value, enum_idx: payload_idx))
+                    }
+                    if arg_kind is .KOptional(_inner) {
+                        return self.compile_expr(self.array_helper_call("_opt_hash", args: [args[0].value], span: self.p.expr_spans[args[0].value]))
                     }
                     if arg_kind is .KEnum(_enum_idx) {
                         let val = self.compile_expr(args[0].value)

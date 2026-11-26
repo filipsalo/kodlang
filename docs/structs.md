@@ -480,7 +480,7 @@ assert (steps[Place(x: 1, y: 2)]? or 0) == 1
 - **`==` and `!=`** compare two values of the same struct: they are equal when each
   field of one is `==` to the other's. Two optional fields are equal when both are
   `none` or what they hold is. A struct with a field that has no `==` (a function, an
-  interface value, an enum with payloads, a `Map`) has none either, which the error
+  interface value, a `Map`) has none either, which the error
   names.
 - **As text**, in an f-string, `str(x)` or `print(x)`, it is its name and its fields,
   each as an f-string shows it, with `none` for an optional that holds nothing. Every

@@ -326,7 +326,7 @@ and of the same type:
 | `%` | two `int64` | `int64` |
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `float64`, two `str` or two `bytes` | `bool` |
-| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum or of a plain struct, an enum value and a unit variant, two arrays of one type, an optional and `none`, or a [union](#union-types) and a value that goes into it | `bool` |
+| `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of an enum or of a plain struct, an enum value and a variant, two arrays of one type, an optional and `none`, a `T?` and a `T?` or `T`, or a [union](#union-types) and a value that goes into it, where what they hold has an `==` | `bool` |
 | `in` `not in` | a value and an array of its type, two `str`, or a value and a type with a `contains` method that takes it, such as `Map` and `Set` | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
@@ -465,10 +465,12 @@ unwrap stays a boolean operator: `x? or 1` substitutes 1 for none, but
 `(must x) or some_bool` is a boolean-or on the unwrapped value (and a type
 error unless `T` is `bool`).
 
-Operators don't look inside an optional. With `n: int64?`, `n == 3`,
-`n < 4` and `n + 1` are errors, and so is comparing a `bool?` such as
-`m.get(key)` with `true`; unwrap first, as in `must n == 3` or
-`(n? or 0) + 1`. Only `== none` and `!= none` compare the optional itself.
+`==` and `!=` compare an optional with `none`, with another optional of its type,
+or with a value of its type: with `n: int64?`, `n == 3` holds when `n` has 3,
+`n == none` when it has nothing, and two optionals are equal when both are
+`none` or both hold equal values. That needs a `T` that has an `==`. Other
+operators don't look inside an optional: `n < 4` and `n + 1` are errors; unwrap
+first, as in `(n? or 0) + 1`.
 
 ### Optional chaining
 

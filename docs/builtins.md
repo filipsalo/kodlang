@@ -108,17 +108,18 @@ let g: int64 = 99.hash()
 Used internally by `Map[K, V]`.
 
 The `hash(x)` builtin takes a hashable value: an `int64`, `str`, `bytes` or
-`bool`, a value of an enum whose variants have no payloads, which hashes
-by variant, an array of hashable elements, a plain struct whose fields are hashable
+`bool`, a value of an enum whose payloads' fields are hashable, an optional of a
+hashable type, an array of hashable elements, a plain struct whose fields are hashable
 (see [Structs are values](structs.md#structs-are-values)), or a value of a union whose
 members are all hashable, such as `int64 | str`. Hashing anything else, such as a
-`float64`, an optional or an enum with payload variants, is an error
+`float64` or an enum with a `float64` in a payload, is an error
 (`` cannot hash a value of type `float64` ``), as is hashing a union with a
 member that can't be hashed, which the error names
 (`` cannot hash a value of type `float64 | int64`; its member `float64` can't be hashed ``).
 It gives what the methods above give, a `bytes` value hashes like the `str`
-with the same bytes, an enum value hashes to its variant's position, counting
-from 1, and a union value hashes the member it holds, mixed with which member
+with the same bytes, an enum value without a payload hashes to its variant's
+position, counting from 1, one with a payload mixes that with its fields'
+hashes, an optional hashes what it holds, and a union value hashes the member it holds, mixed with which member
 that is, so the `int64` 0 and the `bool` false don't collide. An array's hash is made
 of its elements', in order, and a struct's of its fields' unless it has a `hash` method.
 
@@ -165,14 +166,15 @@ last. `for k in m` and `for k, v in m` go over them in that order (see
 
 A lookup finds the entry whose key is `==` to the one it's given, so key
 equality depends on the key type: `str` and `bytes` keys match by
-content, `int64` and `bool` keys by value, enum keys by variant, array keys by their
+content, `int64` and `bool` keys by value, enum keys by variant and payload, optional
+keys by what they hold, array keys by their
 elements, struct keys by their fields (or their `op_eq`), and union
 keys when they hold the same member and those are equal, so in a
 `Map[int64 | str, V]` the keys `1` and `"1"` are two keys.
 
 The key type must be hashable, as for `hash(x)`: `int64`, `str`, `bytes`,
-`bool`, an enum without payload variants, or an array, a plain struct or a union of those.
-Any other key type, such as `Map[float64, int64]`, `Map[int64?, str]` or a
+`bool`, or an enum, an optional, an array, a plain struct or a union of those.
+Any other key type, such as `Map[float64, int64]` or a
 `shared struct`, is an error at the type argument that names it, in whichever module it's
 written (`` `float64` can't be a `Map` key ``), reported once per key type. A key
 that comes from another generic type's parameter is reported at the

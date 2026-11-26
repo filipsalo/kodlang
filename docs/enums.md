@@ -318,22 +318,20 @@ Total size: 8 (discriminant) + 16 (max payload) = **24 bytes**.
 
 ## Equality
 
-Two enum values are equal if and only if they are the same variant. Payload contents are not compared. An enum that declares `op_eq` is compared by that method instead (see [Methods](#methods)).
+Two enum values are equal if and only if they are the same variant and their payloads' fields are `==`, in order, as a struct's fields are. An enum that declares `op_eq` is compared by that method instead (see [Methods](#methods)).
 
 ```kod
 Direction.North == Direction.North  // true
 Direction.North == Direction.South  // false
 ```
 
-In the compiler this is a single integer comparison on the discriminant.
-
-Since payloads aren't compared, an enum with payload variants only compares
-with a variant that has none: with `m: Message`, `m == .Quit` and
-`m != Message.Quit` are fine, but `m == .Text(content: "hi")` is an error
-that suggests `m is .Text(content)` instead, and so is comparing two
-`Message` values (`a == b`); test them with `is` or `match`. Comparing
-values of two different enums is an error, and so is a `.Variant` that the
-other side's enum doesn't declare.
+For an enum without payloads, or against a variant without one, as in
+`m == .Quit`, this is a single integer comparison on the discriminant. Otherwise
+`m == .Text(content: "hi")` and `a == b` compare the variant, then each field.
+A field with no `==`, such as a `shared struct`, makes that an error that names
+it (`` cannot compare two `Box` values: `.Of`'s `p`, a `Pt`, has no `==` ``); test
+those with `is` or `match`. Comparing values of two different enums is an error,
+and so is a `.Variant` that the other side's enum doesn't declare.
 
 ## `match` as an expression
 
