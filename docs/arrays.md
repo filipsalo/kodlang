@@ -237,7 +237,9 @@ the same place in the other.
 
 The elements must have an `==` of their own, so an array of interface values,
 functions or `shared struct`s without `op_eq` doesn't compare (see
-[Operators](types.md)).
+[Operators](types.md)). An array literal compared with an array of optionals or
+of a union is built as that type, so with `opts: [int64?]`, `opts == [1, none]`
+compares the two.
 
 ## As text
 
