@@ -1,0 +1,223 @@
+// AES-128 and AES-256 in GCM (NIST SP 800-38D), with the CPU's AES and
+// carry-less multiply instructions (see arm64_intrinsic). See docs/crypto.md.
+//
+// GHASH works on 128-bit polynomials over GF(2) as two int64s, the
+// coefficient of x^i in bit i: GCM's own order has x^0 in the top bit of
+// the first byte, so a block becomes that form by reversing the bits of
+// each byte of its two little-endian words.
+import "crypto/hmac"
+import "unsafe"
+
+extern func kod_aes128_encrypt(anon keys: int64, anon block: int64) -> none
+extern func kod_aes256_encrypt(anon keys: int64, anon block: int64) -> none
+extern func kod_aes_subword(anon w: int64) -> int64
+extern func kod_clmul_lo(anon a: int64, anon b: int64) -> int64
+extern func kod_clmul_hi(anon a: int64, anon b: int64) -> int64
+extern func kod_bitrev_bytes(anon x: int64) -> int64
+
+// The round keys of a 16- or 32-byte AES key, one after another, each 16
+// bytes as the instructions read them (FIPS 197 5.2).
+func expand_key(anon key: bytes) -> bytes {
+    let nk = len(key) / 4
+    let rounds = nk + 6
+    mut w = [key[4 * i] | (key[4 * i + 1] << 8) | (key[4 * i + 2] << 16) | (key[4 * i + 3] << 24) for i in 0..nk]
+    mut rcon = 1
+    for i in nk..4 * (rounds + 1) {
+        mut t = w[i - 1]
+        if i % nk == 0 {
+            // RotWord moves the first byte, the lowest here, to the end.
+            t = kod_aes_subword((t >> 8) | ((t & 255) << 24)) ^ rcon
+            rcon = rcon << 1
+            if rcon > 255 {
+                rcon = rcon ^ 0x11b
+            }
+        } else if nk > 6 and i % nk == 4 {
+            t = kod_aes_subword(t)
+        }
+        w += [w[i - nk] ^ t]
+    }
+    mut out: [int64] = []
+    for word in w {
+        out += [word & 255, (word >> 8) & 255, (word >> 16) & 255, (word >> 24) & 255]
+    }
+    return kod_bytes_from_array(out)
+}
+
+// A + B as polynomials is A ^ B; A * B reduced by x^128 + x^7 + x^2 + x + 1.
+func gf_mul(anon a0: int64, anon a1: int64, anon b0: int64, anon b1: int64) -> (int64, int64) {
+    let r0 = kod_clmul_lo(a0, b0)
+    mut r1 = kod_clmul_hi(a0, b0) ^ kod_clmul_lo(a0, b1) ^ kod_clmul_lo(a1, b0)
+    mut r2 = kod_clmul_hi(a0, b1) ^ kod_clmul_hi(a1, b0) ^ kod_clmul_lo(a1, b1)
+    let r3 = kod_clmul_hi(a1, b1)
+    // x^128 is x^7 + x^2 + x + 1 (0x87) modulo the polynomial: fold the top
+    // word down by 64 bits, then the next.
+    r1 = r1 ^ kod_clmul_lo(r3, 0x87)
+    r2 = r2 ^ kod_clmul_hi(r3, 0x87)
+    return (r0 ^ kod_clmul_lo(r2, 0x87), r1 ^ kod_clmul_hi(r2, 0x87))
+}
+
+// A GCM key: the AES round keys and the hash key H.
+type Key = struct {
+    _round_keys: bytes
+    _rounds: int64
+    _h0: int64
+    _h1: int64
+
+    func init(anon key: bytes) -> Key {
+        if len(key) != 16 and len(key) != 32 {
+            panic(f"aesgcm: the key is {len(key)} bytes, not 16 or 32")
+        }
+        let round_keys = expand_key(key)
+        mut k = Key(_round_keys: round_keys, _rounds: len(key) / 4 + 6, _h0: 0, _h1: 0)
+        let block = unsafe.alloc(16)
+        k.encrypt(block)
+        k._h0 = kod_bitrev_bytes(unsafe.load64(block))
+        k._h1 = kod_bitrev_bytes(unsafe.load64(block + 8))
+        unsafe.free(block)
+        return k
+    }
+
+    // The 16 bytes at `addr` encrypted in place.
+    func encrypt(self, anon addr: int64) -> none {
+        let keys = unsafe.data(self._round_keys)
+        if self._rounds == 10 {
+            kod_aes128_encrypt(keys, addr)
+        } else {
+            kod_aes256_encrypt(keys, addr)
+        }
+    }
+
+    // `data` XORed with the key stream of counter blocks from `nonce`'s
+    // block 2 on, and the encrypted block 1 (for the tag), as `bytes`.
+    func ctr(self, anon data: bytes, nonce: bytes) -> (bytes, bytes) {
+        let n = len(data)
+        let blocks = (n + 15) / 16 + 1
+        let buf = unsafe.alloc(blocks * 16)
+        let iv0 = nonce[0] | (nonce[1] << 8) | (nonce[2] << 16) | (nonce[3] << 24) | (nonce[4] << 32) | (nonce[5] << 40) | (nonce[6] << 48) | (nonce[7] << 56)
+        let iv1 = nonce[8] | (nonce[9] << 8) | (nonce[10] << 16) | (nonce[11] << 24)
+        for b in 0..blocks {
+            // The counter is the block's last 4 bytes, big-endian, from 1.
+            let c = b + 1
+            let counter = ((c >> 24) & 255) | (((c >> 16) & 255) << 8) | (((c >> 8) & 255) << 16) | ((c & 255) << 24)
+            unsafe.store64(buf + b * 16, iv0)
+            unsafe.store64(buf + b * 16 + 8, iv1 | (counter << 32))
+            self.encrypt(buf + b * 16)
+        }
+        let first = unsafe.copy_out(buf, 16)
+        let stream = buf + 16
+        // XOR in place, eight bytes at a time while there are eight.
+        mut at = 0
+        for at + 8 <= n {
+            unsafe.store64(stream + at, unsafe.load64(stream + at) ^ kod_bytes_le64(data, at))
+            at += 8
+        }
+        for at < n {
+            unsafe.store8(stream + at, unsafe.load8(stream + at) ^ data[at])
+            at += 1
+        }
+        let out = unsafe.copy_out(stream, n)
+        unsafe.free(buf)
+        return (out, first)
+    }
+
+    // GHASH of `aad` and `ciphertext`, each padded to a block, then their
+    // lengths in bits, as the two words of the polynomial.
+    func ghash(self, anon aad: bytes, anon ciphertext: bytes) -> (int64, int64) {
+        mut y0 = 0
+        mut y1 = 0
+        for part in [aad, ciphertext] {
+            let n = len(part)
+            mut at = 0
+            for at < n {
+                mut x0 = 0
+                mut x1 = 0
+                if at + 16 <= n {
+                    x0 = kod_bytes_le64(part, at)
+                    x1 = kod_bytes_le64(part, at + 8)
+                } else {
+                    for i in at..n {
+                        let byte = part[i] << (((i - at) % 8) * 8)
+                        if i - at < 8 {
+                            x0 = x0 | byte
+                        } else {
+                            x1 = x1 | byte
+                        }
+                    }
+                }
+                (y0, y1) = gf_mul(y0 ^ kod_bitrev_bytes(x0), y1 ^ kod_bitrev_bytes(x1), self._h0, self._h1)
+                at += 16
+            }
+        }
+        // The lengths block: two big-endian 64-bit bit counts.
+        let a_bits = byte_swap(len(aad) * 8)
+        let c_bits = byte_swap(len(ciphertext) * 8)
+        return gf_mul(y0 ^ kod_bitrev_bytes(a_bits), y1 ^ kod_bitrev_bytes(c_bits), self._h0, self._h1)
+    }
+
+    func tag(self, anon first: bytes, anon aad: bytes, anon ciphertext: bytes) -> bytes {
+        let (s0, s1) = self.ghash(aad, ciphertext)
+        let t0 = kod_bitrev_bytes(s0) ^ kod_bytes_le64(first, 0)
+        let t1 = kod_bitrev_bytes(s1) ^ kod_bytes_le64(first, 8)
+        return kod_bytes_from_array([(t0 >> (8 * i)) & 255 for i in 0..8] + [(t1 >> (8 * i)) & 255 for i in 0..8])
+    }
+
+    // The ciphertext of `plaintext`, then the 16-byte tag over it and `aad`.
+    func seal(self, anon plaintext: bytes, nonce: bytes, aad: bytes) -> bytes {
+        check_nonce(nonce)
+        let (ciphertext, first) = self.ctr(plaintext, nonce: nonce)
+        return ciphertext + self.tag(first, aad, ciphertext)
+    }
+
+    // The plaintext `seal` was given, or none when `sealed` or `aad` isn't
+    // what it sealed under this key and nonce.
+    func open(self, anon sealed: bytes, nonce: bytes, aad: bytes) -> bytes? {
+        check_nonce(nonce)
+        if len(sealed) < 16 {
+            return none
+        }
+        let ciphertext = sealed[..len(sealed) - 16]
+        let (plaintext, first) = self.ctr(ciphertext, nonce: nonce)
+        if not hmac.equal(self.tag(first, aad, ciphertext), sealed[len(sealed) - 16..]) {
+            return none
+        }
+        return plaintext
+    }
+}
+
+// `n`'s 8 bytes in the other order.
+func byte_swap(anon n: int64) -> int64 {
+    mut out = 0
+    for i in 0..8 {
+        out = out | (((n >> (8 * i)) & 255) << (8 * (7 - i)))
+    }
+    return out
+}
+
+func check_nonce(anon nonce: bytes) -> none {
+    if len(nonce) != 12 {
+        panic(f"aesgcm: the nonce is {len(nonce)} bytes, not 12")
+    }
+}
+
+func seal(anon plaintext: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes {
+    return Key(key).seal(plaintext, nonce: nonce, aad: aad)
+}
+
+func open(anon sealed: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes? {
+    return Key(key).open(sealed, nonce: nonce, aad: aad)
+}
+
+// One block encrypted with AES under a 16- or 32-byte key.
+func encrypt_block(anon block: bytes, key: bytes) -> bytes {
+    if len(block) != 16 {
+        panic(f"aesgcm: a block is 16 bytes, not {len(block)}")
+    }
+    let k = Key(key)
+    let buf = unsafe.alloc(16)
+    unsafe.store64(buf, kod_bytes_le64(block, 0))
+    unsafe.store64(buf + 8, kod_bytes_le64(block, 8))
+    k.encrypt(buf)
+    let out = unsafe.copy_out(buf, 16)
+    unsafe.free(buf)
+    return out
+}

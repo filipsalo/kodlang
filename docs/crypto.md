@@ -5,7 +5,7 @@ icon: lucide/lock
 # Cryptography
 
 The modules under `stdlib/crypto/` are the pieces TLS 1.3 is built from,
-written in Kod: hashes, HMAC and HKDF, an AEAD cipher, a key exchange and the
+written in Kod: hashes, HMAC and HKDF, two AEAD ciphers, a key exchange and the
 operating system's random numbers. Each is checked against the test vectors
 of the standard that defines it.
 
@@ -104,6 +104,35 @@ others. TLS counts records for it.
 The two halves are there on their own too: `chacha20(data, key:, nonce:,
 counter:)` XORs `data` with the key stream from block `counter`, and
 `poly1305(data, key:)` is the one-time MAC under a 32-byte key.
+
+## AES-GCM: `crypto/aesgcm`
+
+AES-128 and AES-256 in Galois/Counter Mode (NIST SP 800-38D), the AEAD every
+TLS 1.3 server has. It works as ChaCha20-Poly1305 does, with a key of 16 or 32
+bytes and a nonce of 12:
+
+<!-- kod:
+import "crypto/random"
+let nonce = random.secure_bytes(12)
+-->
+```kod
+import "crypto/aesgcm"
+import "crypto/random"
+
+let key = aesgcm.Key(random.secure_bytes(16))
+let sealed = key.seal(b"attack at dawn", nonce: nonce, aad: b"header")
+let opened = key.open(sealed, nonce: nonce, aad: b"header")   // bytes?
+```
+
+A `Key` holds the expanded key, so a connection makes it once and seals each
+record with it; `aesgcm.seal(plaintext, key:, nonce:, aad:)` and
+`aesgcm.open(sealed, key:, nonce:, aad:)` make one for a single message.
+`encrypt_block(block, key:)` is AES itself, on one 16-byte block.
+
+The AES rounds and GHASH's multiplications are the CPU's own instructions
+(`aese`, `aesmc` and `pmull`, which every 64-bit Apple CPU has), so they take
+the same time whatever the key and data are, and AES-GCM is about seven times
+as fast as ChaCha20-Poly1305 here.
 
 ## X25519: `crypto/x25519`
 
