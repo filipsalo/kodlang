@@ -2709,12 +2709,65 @@ type Codegen = shared struct {
     // `a == b` and `a != b` on a struct that compares by its fields.
     func compile_struct_eq(self, anon lhs: int64, op: ast.Op, rhs: int64) -> Val {
         let span = self.p.expr_spans[lhs]
+        // A small struct of scalars between two places compares field by field
+        // where it is, without a call or holding an element for one.
+        if self.infer_kind(lhs) is .KStruct(idx, _args) and self.inline_eq_fields(idx) and self.pure_place(lhs) and self.pure_place(rhs) {
+            mut same = self.fields_eq_expr(idx, lhs, rhs)
+            if op is .Ne {
+                same = self.p.alloc_expr(.Binary(lhs: same, op: .Eq, rhs: self.p.alloc_expr(.BoolLit(value: false), :span)), :span)
+            }
+            return self.compile_expr(same)
+        }
         mut call = self.array_helper_call("_struct_eq", args: [lhs, rhs], :span)
         if op is .Ne {
             let no = self.p.alloc_expr(.BoolLit(value: false), :span)
             call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: no), :span)
         }
         return self.compile_expr(call)
+    }
+
+    // Whether struct `idx` has at most four public fields, each a number, a `bool`
+    // or an enum without payloads, so comparing it inline is a few loads and
+    // compares that any code may write.
+    func inline_eq_fields(self, anon idx: int64) -> bool {
+        let fields = self.structs[idx].fields
+        if len(fields) == 0 or len(fields) > 4 {
+            return false
+        }
+        for f in fields {
+            if f.name.starts_with("_") {
+                return false
+            }
+            match f.kind {
+                .KInt64 | .KBool | .KFloat64 -> none
+                .KEnum(e) -> {
+                    if self.enums[e].is_union or self.enum_has_payload(e) {
+                        return false
+                    }
+                }
+                else return false
+            }
+        }
+        return true
+    }
+
+    // A local, a field of one, or an element of one at a local or literal index:
+    // something read twice reads the same and runs no code but bounds checks.
+    func pure_place(self, anon e: int64) -> bool {
+        match self.p.exprs[e] {
+            .Ident(name) -> return self.var_declared(name) and self.var_signature(e) is none
+            .Binary(base, op, rhs) -> {
+                if op is .Dot {
+                    return self.p.exprs[rhs] is .Ident(_f) and self.pure_place(base) and self.infer_kind(base) is .KStruct(_i, _a)
+                }
+                if op is .Index and self.infer_kind(base).is_array() {
+                    let simple = self.p.exprs[rhs] is .IntLit(_v) or (self.p.exprs[rhs] is .Ident(_n) and self.pure_place(rhs))
+                    return simple and self.pure_place(base)
+                }
+                return false
+            }
+            else return false
+        }
     }
 
     // Whether `lhs_kind == rhs_kind` is two values of a struct that compares by its fields.
@@ -16092,6 +16145,9 @@ type Codegen = shared struct {
                     if arg_kind is .KStruct(hashed_idx, _type_args) {
                         if self.hash_method(hashed_idx) {
                             return self.compile_expr(self.method_call_expr(args[0].value, method: "hash"))
+                        }
+                        if self.inline_eq_fields(hashed_idx) and self.pure_place(args[0].value) {
+                            return self.compile_expr(self.fields_hash_expr(hashed_idx, args[0].value))
                         }
                         return self.compile_expr(self.array_helper_call("_struct_hash", args: [args[0].value], span: self.p.expr_spans[args[0].value]))
                     }
