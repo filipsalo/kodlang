@@ -446,6 +446,7 @@ type SavedFunction = struct {
     value_returns: [lexing.Token]
     value_return_stmts: [int64]
     loops: int64
+    labels: [str] = []
 }
 
 type Parser = shared struct {
@@ -555,6 +556,13 @@ type Parser = shared struct {
     // `and` chains with an `is` that binds, not yet taken as an `if` or `for`
     // condition: after the statement they become `match`es (value_chain).
     value_chains: [int64] = []
+    // `name: for ...`: each loop statement's label, and each `break name` or
+    // `continue name` statement's. `open_labels` has one entry per loop being
+    // parsed ("" for none); `pending_label` waits for the next loop's body.
+    loop_labels: Map[int64, str] = Map[int64, str]()
+    jump_labels: Map[int64, str] = Map[int64, str]()
+    open_labels: [str] = []
+    pending_label: str = ""
     // Match expressions parsed so far, so a FuncDecl can tell whether its body has one.
     binding_exprs: int64 = 0
     // Whether the parameter list parse_param_list read last ended in `...`.
@@ -4074,12 +4082,32 @@ type Parser = shared struct {
             return self.alloc_stmt(ast.Stmt.ExprStmt(expr: self.unreachable_value()))
         }
         if self.try_consume(.KwBreak) {
+            let stmt = self.alloc_stmt(ast.Stmt.Break)
+            self.jump_label(stmt, what: "break")
             self.skip_newlines()
-            return self.alloc_stmt(ast.Stmt.Break)
+            return stmt
         }
         if self.try_consume(.KwContinue) {
+            let stmt = self.alloc_stmt(ast.Stmt.Continue)
+            self.jump_label(stmt, what: "continue")
             self.skip_newlines()
-            return self.alloc_stmt(ast.Stmt.Continue)
+            return stmt
+        }
+        // `name: for ...`: a labelled loop.
+        if self.at(.Identifier) and self.peek_kind_at(1) == .Colon and self.peek_kind_at(2) == .KwFor {
+            let label_tok = self.advance()
+            self.advance()
+            if arrays.contains(self.open_labels, label_tok.value) {
+                self.record_error(f"error: a loop around this one is already labelled `{label_tok.value}`; give this one another name", got: label_tok)
+            }
+            self.pending_label = label_tok.value
+            let stmt = self.parse_stmt()
+            self.pending_label = ""
+            let loop_id = self.loop_of(stmt)
+            if loop_id >= 0 {
+                self.loop_labels[loop_id] = label_tok.value
+            }
+            return stmt
         }
 
         // match statement
@@ -4203,8 +4231,10 @@ type Parser = shared struct {
     // Starts a function's body: the outer one's yields and returns, for
     // leave_function.
     func enter_function(self) -> SavedFunction {
-        let outer = SavedFunction(yields: self.yields, yield_values: self.yield_values, value_returns: self.value_returns, value_return_stmts: self.value_return_stmts, loops: self.loops)
+        let outer = SavedFunction(yields: self.yields, yield_values: self.yield_values, value_returns: self.value_returns, value_return_stmts: self.value_return_stmts, loops: self.loops, labels: self.open_labels)
         self.loops = 0
+        self.open_labels = []
+        self.pending_label = ""
         self.yields = []
         self.yield_values = []
         self.value_returns = []
@@ -4219,12 +4249,45 @@ type Parser = shared struct {
         self.value_returns = outer.value_returns
         self.value_return_stmts = outer.value_return_stmts
         self.loops = outer.loops
+        self.open_labels = outer.labels
+    }
+
+    // `break name` or `continue name`: the loop it names, which must be around it.
+    func jump_label(self, anon stmt: int64, what: str) -> none {
+        if not self.at(.Identifier) {
+            return
+        }
+        let tok = self.advance()
+        if not arrays.contains(self.open_labels, tok.value) {
+            self.record_error(f"error: no loop labelled `{tok.value}` around this `{what}`", got: tok)
+            return
+        }
+        self.jump_labels[stmt] = tok.value
+    }
+
+    // The loop statement a `for` parsed into: itself, or the last statement of
+    // the hidden block around it (for_range, for_numbered).
+    func loop_of(self, anon stmt: int64) -> int64 {
+        match self.stmts[stmt] {
+            .For(_c, _b) -> return stmt
+            .ForEach(_n, _i, _b) -> return stmt
+            .If(_c, then_body, _e) -> {
+                if len(then_body) == 0 {
+                    return -1
+                }
+                return self.loop_of(then_body[-1])
+            }
+            else return -1
+        }
     }
 
     // The block a `for` runs.
     func parse_loop_block(self) -> [int64] {
         self.loops += 1
+        self.open_labels += [self.pending_label]
+        self.pending_label = ""
         let body = self.parse_block()
+        self.open_labels = self.open_labels[..-1]
         self.loops -= 1
         return body
     }

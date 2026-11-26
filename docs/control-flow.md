@@ -219,6 +219,29 @@ for x in items {
 }
 ```
 
+Both act on the innermost loop. To leave or go on with an outer one, give it a
+label, a name and a colon before its `for`, and name it after `break` or
+`continue`:
+
+<!-- kod: let grid = [[1, 2], [3, -1], [5, 6]] -->
+```kod
+mut found = -1
+rows: for i, row in grid {
+    for x in row {
+        if x < 0 {
+            found = i
+            break rows
+        }
+    }
+}
+// found is 1
+```
+
+`continue rows` goes on with the next pass of the labelled loop. A label names the
+loop it's on and the loops inside it can use it, so `break name` for a loop that
+isn't around it is an error (`` no loop labelled `rows` around this `break` ``), and
+so is a label that a loop around it already has.
+
 ## `match`
 
 Pattern matching on enums, integers, and strings. See [Pattern matching](pattern-matching.md).

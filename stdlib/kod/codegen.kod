@@ -576,6 +576,8 @@ type LoopLbl = shared struct {
     sp_slot: int64 = 0
     // Where in `out_buf` the loop starts, to add the code that fills sp_slot.
     entry_mark: int64 = 0
+    // `name: for ...`, or "".
+    label: str = ""
 }
 
 // A single compiler diagnostic. `path`/`line`/`col`/`message` is the
@@ -1702,6 +1704,8 @@ type Codegen = shared struct {
     last_marked_line: int64 = 0
 
     loop_stack: [LoopLbl] = []
+    // The label of the loop statement about to be compiled, taken as it starts.
+    loop_label_next: str = ""
     // The register evictions open at this point of the code, innermost last.
     evictions: [regalloc.PoolState] = []
     // The match-expression arms open at this point of the code.
@@ -9108,6 +9112,48 @@ type Codegen = shared struct {
         return flow
     }
 
+    // Whether a `break label` is somewhere in `stmts`, in loops inside them too.
+    func breaks_to(self, anon stmts: [int64], label: str) -> bool {
+        for stmt_id in stmts {
+            match self.p.stmts[stmt_id] {
+                .Break -> {
+                    if self.p.jump_labels.get(stmt_id) is Some(l) and l == label {
+                        return true
+                    }
+                }
+                .If(_c, then_body, else_body) -> {
+                    if self.breaks_to(then_body, :label) or self.breaks_to(else_body, :label) {
+                        return true
+                    }
+                }
+                .For(_c, body) -> {
+                    if self.breaks_to(body, :label) {
+                        return true
+                    }
+                }
+                .ForEach(_n, _i, body) -> {
+                    if self.breaks_to(body, :label) {
+                        return true
+                    }
+                }
+                .LetElse(_p, _v, else_body) -> {
+                    if self.breaks_to(else_body, :label) {
+                        return true
+                    }
+                }
+                .MatchStmt(_s, arms) -> {
+                    for arm_id in arms {
+                        if self.breaks_to(self.p.match_arms[arm_id].body, :label) {
+                            return true
+                        }
+                    }
+                }
+                else none
+            }
+        }
+        return false
+    }
+
     // `breaks` is for a `break` that leaves the enclosing loop, not one nested here.
     func stmt_flow(self, anon stmt_id: int64) -> Flow {
         match self.p.stmts[stmt_id] {
@@ -9152,7 +9198,11 @@ type Codegen = shared struct {
                         forever = value
                     }
                 }
-                return Flow(completes: not forever or self.block_flow(body).breaks, breaks: false)
+                mut leaves = not forever or self.block_flow(body).breaks
+                if not leaves and self.p.loop_labels.get(stmt_id) is Some(label) {
+                    leaves = self.breaks_to(body, :label)
+                }
+                return Flow(completes: leaves, breaks: false)
             }
             .LetElse(_pattern, _value, else_body) -> return Flow(completes: true, breaks: self.block_flow(else_body).breaks)
             else return Flow(completes: true, breaks: false)
@@ -11762,8 +11812,7 @@ type Codegen = shared struct {
     // it is nested in. Only a block arm of a match expression puts a jump
     // inside an expression, where a call's arguments or a saved operand may
     // be on the stack, so only a loop with such a jump keeps its `sp`.
-    func prepare_loop_jump(self) -> none {
-        let lp = self.loop_stack[-1]
+    func prepare_loop_jump(self, anon lp: LoopLbl) -> none {
         self.reload_evicted_since(lp.evictions)
         if self.value_arms > lp.value_arms {
             if lp.sp_slot == 0 {
@@ -18090,6 +18139,7 @@ type Codegen = shared struct {
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
             .For(cond, body) -> {
                 let safe = self.push_safe_index(cond, :body)
+                self.loop_label_next = self.p.loop_labels.get(stmt_id)? or ""
                 self.compile_for(body, cond_id: cond)
                 if safe {
                     self.safe_index_names = self.safe_index_names[0..len(self.safe_index_names) - 1]
@@ -18098,11 +18148,12 @@ type Codegen = shared struct {
             }
             .ForEach(name, iter, body) -> {
                 let share = self.share_begin(iter)
+                self.loop_label_next = self.p.loop_labels.get(stmt_id)? or ""
                 self.compile_foreach(body, :name, iter_id: iter)
                 self.share_end(share)
             }
-            .Break -> self.compile_break()
-            .Continue -> self.compile_continue()
+            .Break -> self.compile_break(stmt_id)
+            .Continue -> self.compile_continue(stmt_id)
             .ExprStmt(expr) -> {
                 let result_kind = self.infer_kind(expr)
                 if self.is_fallible_kind(result_kind) {
@@ -22588,12 +22639,14 @@ type Codegen = shared struct {
     }
 
     func compile_for(self, anon body: [int64], cond_id: int64) -> none {
+        let label = self.loop_label_next
+        self.loop_label_next = ""
         let lbl = self.fresh("Lfor")
         let start_lbl = f"{lbl}_start"
         let end_lbl = f"{lbl}_end"
         // `continue` lands here — re-check the loop condition. Previously
         // pointed at end_lbl, which made `continue` behave as `break`.
-        self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len())]
+        self.loop_stack += [LoopLbl(:start_lbl, :end_lbl, incr_lbl: start_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len(), :label)]
         // Cold blocks from before the loop wait until after it, so the loop's
         // back edge lays out only its own.
         self.cold_stack += [self.cold]
@@ -22657,19 +22710,25 @@ type Codegen = shared struct {
     }
 
     func compile_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
+        let label = self.loop_label_next
+        self.loop_label_next = ""
         // A Map or Set goes over a snapshot of its keys or elements, an array.
         if self.infer_kind(iter_id) is .KStruct(idx, _type_args) and self.structs[idx].template_idx >= 0 {
             let noun = self.hashed_arg_noun(self.structs[idx].template_idx)
+            // The loop these make takes the label.
             if noun == "key" {
+                self.loop_label_next = label
                 self.compile_map_foreach(body, :name, :iter_id)
                 return
             }
             if noun == "element" {
+                self.loop_label_next = label
                 self.compile_foreach(body, :name, iter_id: self.method_call_expr(iter_id, method: "values"))
                 return
             }
             let t = self.structs[self.structs[idx].template_idx]
             if t.name == "Channel" and t.def_path == CHANNEL_MODULE_PATH {
+                self.loop_label_next = label
                 self.compile_channel_foreach(body, :name, :iter_id)
                 return
             }
@@ -22712,7 +22771,7 @@ type Codegen = shared struct {
         let start_lbl = f"{lbl}_start"
         let incr_lbl = f"{lbl}_incr"
         let end_lbl = f"{lbl}_end"
-        self.loop_stack += [LoopLbl(start_lbl: incr_lbl, :end_lbl, :incr_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len())]
+        self.loop_stack += [LoopLbl(start_lbl: incr_lbl, :end_lbl, :incr_lbl, evictions: len(self.evictions), value_arms: self.value_arms, entry_mark: self.out_buf.len(), :label)]
         // Cold blocks from before the loop wait until after it, so the loop's
         // back edge lays out only its own.
         self.cold_stack += [self.cold]
@@ -22895,14 +22954,31 @@ type Codegen = shared struct {
         return msg
     }
 
-    func compile_break(self) -> none {
-        self.prepare_loop_jump()
-        self.emit_jump(self.loop_stack[-1].end_lbl)
+    func compile_break(self, anon stmt_id: int64) -> none {
+        let lp = self.jump_target(stmt_id)
+        self.prepare_loop_jump(lp)
+        self.emit_jump(lp.end_lbl)
     }
 
-    func compile_continue(self) -> none {
-        self.prepare_loop_jump()
-        self.emit_jump(self.loop_stack[-1].incr_lbl)
+    func compile_continue(self, anon stmt_id: int64) -> none {
+        let lp = self.jump_target(stmt_id)
+        self.prepare_loop_jump(lp)
+        self.emit_jump(lp.incr_lbl)
+    }
+
+    // The loop a `break` or `continue` leaves: the innermost, or the one its label names.
+    func jump_target(self, anon stmt_id: int64) -> LoopLbl {
+        if self.p.jump_labels.get(stmt_id) is Some(label) {
+            mut i = len(self.loop_stack) - 1
+            for i >= 0 {
+                if self.loop_stack[i].label == label {
+                    return self.loop_stack[i]
+                }
+                i -= 1
+            }
+            self.report_error(f"internal error: no loop labelled `{label}` is being compiled", span: ast.Span(start: 0))
+        }
+        return self.loop_stack[-1]
     }
 
     // `T?` is a nullable cell, not an Option enum cell: `.Some`/`.None` on it mean SomePat/NonePat.
