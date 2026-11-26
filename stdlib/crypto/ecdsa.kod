@@ -251,7 +251,8 @@ func der_integer(anon der: bytes, anon at: int64) -> (bytes, int64)? {
 // steps whatever they are: bignum's Modulus arithmetic, the complete
 // addition formulas of Renes, Costello and Batina (2016, algorithm 4, for a =
 // -3) in homogeneous coordinates (x / z, y / z), which have no special cases,
-// and a ladder that adds at every bit and keeps the sum or not by a mask.
+// and a multiplication by the nonce that adds one precomputed multiple of the
+// generator per 4 bits, picked by masks from all 16.
 
 // p + q, for any two points (equal ones, or the point at infinity (0, 1, 0)).
 func complete_add(anon c: CurveData, anon p1: Point, anon p2: Point) -> Point {
@@ -303,17 +304,52 @@ func complete_add(anon c: CurveData, anon p1: Point, anon p2: Point) -> Point {
     return Point(x: x3, y: y3, z: z3)
 }
 
-// k times the generator, k an ordinary number below n, as affine (x, y),
-// both ordinary numbers.
-func base_mult(anon c: CurveData, anon k: [int64]) -> ([int64], [int64]) {
+// j 16^i g for each 4-bit digit position i and j from 0 to 15, made once
+// for a curve the program signs with.
+func base_table(anon c: CurveData) -> [[Point]] {
     let f = c.p
     let zero = [0] * f.k
+    let infinity = Point(x: zero, y: f.one(), z: zero)
+    mut table: [[Point]] = []
+    mut base = c.g
+    for _i in 0..c.size * 2 {
+        mut row = [infinity]
+        mut p = infinity
+        for _j in 1..16 {
+            p = complete_add(c, p, base)
+            row += [p]
+        }
+        table += [row]
+        // The next row's base is 16 times this one's.
+        base = complete_add(c, p, base)
+    }
+    return table
+}
+
+mut P256_TABLE: [[Point]] = base_table(P256_DATA)
+mut P384_TABLE: [[Point]] = base_table(P384_DATA)
+
+// k times the generator, k an ordinary number below n, as affine (x, y),
+// both ordinary numbers: one addition per 4 bits of k, of the table's entry
+// for the digit, which every entry is looked at to pick.
+func base_mult(anon c: CurveData, anon k: [int64]) -> ([int64], [int64]) {
+    let f = c.p
+    let table = if c.size == 32 { P256_TABLE } else { P384_TABLE }
+    let zero = [0] * f.k
     mut r = Point(x: zero, y: f.one(), z: zero)
-    for i in c.size * 8 - 1..=0 step -1 {
-        r = complete_add(c, r, r)
-        let sum = complete_add(c, r, c.g)
-        let bit = bignum.bit(k, i)
-        r = Point(x: bignum.choose(bit, sum.x, r.x), y: bignum.choose(bit, sum.y, r.y), z: bignum.choose(bit, sum.z, r.z))
+    for i in 0..c.size * 2 {
+        let digit = (bignum.bit(k, 4 * i)) | (bignum.bit(k, 4 * i + 1) << 1) | (bignum.bit(k, 4 * i + 2) << 2) | (bignum.bit(k, 4 * i + 3) << 3)
+        mut x = zero
+        mut y = zero
+        mut z = zero
+        for j, entry in table[i] {
+            // 1 when digit == j: (digit ^ j) - 1 is negative only for 0.
+            let same = ((digit ^ j) - 1) >> 63
+            x = bignum.choose(same, entry.x, x)
+            y = bignum.choose(same, entry.y, y)
+            z = bignum.choose(same, entry.z, z)
+        }
+        r = complete_add(c, r, Point(x: x, y: y, z: z))
     }
     let zinv = f.inverse(r.z)
     return (f.from_mont(f.mul(r.x, zinv)), f.from_mont(f.mul(r.y, zinv)))

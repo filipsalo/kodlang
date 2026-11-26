@@ -198,9 +198,11 @@ and the curve's size (32 or 48 bytes), above 0 and below the curve's order:
 The nonce is RFC 6979's, made from the key and the message, so the same
 message always gets the same signature and no random number can be bad
 enough to give the key away. Signing does the same steps whatever the key and
-nonce are: the multiplication by the nonce adds at every bit and keeps the sum
-or not by a mask, with formulas that have no special cases (Renes, Costello and
-Batina, 2016). It takes about 11 ms on P-256.
+nonce are: the multiplication by the nonce adds one precomputed multiple of
+the generator for every 4 bits, picked by looking at all 16 and keeping one by
+masks, with formulas that have no special cases (Renes, Costello and Batina,
+2016). It takes about 1.3 ms on P-256, after a table that the first signature
+on a curve makes (about 18 ms).
 
 A signature must be strict DER: a length in long form, an integer with a 0 byte
 it doesn't need, a negative one, or bytes after the end is refused, so that a
