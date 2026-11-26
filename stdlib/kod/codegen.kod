@@ -563,6 +563,12 @@ type Val = enum {
 
 // ── Loop label stack entry ────────────────────────────────────────────────────
 
+// A loop condition's `name < e` (dir 1) or `name > e` (dir -1).
+type LoopBound = struct {
+    name: str
+    dir: int64
+}
+
 type LoopLbl = shared struct {
     start_lbl: str
     end_lbl: str
@@ -1706,6 +1712,9 @@ type Codegen = shared struct {
     loop_stack: [LoopLbl] = []
     // The label of the loop statement about to be compiled, taken as it starts.
     loop_label_next: str = ""
+    // `i += 1` and `i -= 1` statements whose loop's condition keeps them in range,
+    // compiled without an overflow check (note_bounded_steps).
+    bounded_steps: [int64] = []
     // The register evictions open at this point of the code, innermost last.
     evictions: [regalloc.PoolState] = []
     // The match-expression arms open at this point of the code.
@@ -9110,6 +9119,229 @@ type Codegen = shared struct {
         self.unbind_to(mark)
         self.drop_walk_kinds(kinds_mark)
         return flow
+    }
+
+    // `for ... i < e ... { ... i += 1 ... }`: when the condition has `i < e` (or
+    // `i > e`) as an `and` operand or in a chain, and the body's one write to `i`
+    // is a single `i += 1` (or `i -= 1`) outside any loop within it, `i` is below
+    // `e` until that step, so the step can't overflow and needs no check.
+    func note_bounded_steps(self, anon cond: int64, body: [int64]) -> none {
+        if cond == 0 or len(body) == 0 {
+            return
+        }
+        for bound in self.loop_bounds(cond) {
+            let writes = self.name_writes(body, name: bound.name, looped: false)
+            if len(writes) != 1 or writes[0] < 0 {
+                continue
+            }
+            let w = writes[0]
+            if self.step_of(w) == bound.dir and not arrays.contains(self.bounded_steps, w) {
+                self.bounded_steps += [w]
+            }
+        }
+    }
+
+    // The `i < e` (dir 1) and `i > e` (dir -1) tests that hold whenever `cond` does,
+    // on an `int64` local `i`.
+    func loop_bounds(self, anon cond: int64) -> [LoopBound] {
+        mut out: [LoopBound] = []
+        match self.p.exprs[cond] {
+            .Binary(lhs, op, rhs) -> {
+                if op is .And {
+                    out += self.loop_bounds(lhs)
+                    out += self.loop_bounds(rhs)
+                } else {
+                    out += self.bound_of(lhs, :op, rhs: rhs)
+                }
+            }
+            .Chain(exprs, ops) -> {
+                for k, op in ops {
+                    out += self.bound_of(exprs[k], :op, rhs: exprs[k + 1])
+                }
+            }
+            else none
+        }
+        return out
+    }
+
+    func bound_of(self, anon lhs: int64, op: ast.Op, rhs: int64) -> [LoopBound] {
+        let none_found: [LoopBound] = []
+        let .Ident(name) = self.p.exprs[lhs] else { return none_found }
+        if not self.var_declared(name) or not (self.find_var_kind(name) is .KInt64) or not (self.infer_kind(rhs) is .KInt64) {
+            return none_found
+        }
+        if op is .Lt {
+            return [LoopBound(:name, dir: 1)]
+        }
+        if op is .Gt {
+            return [LoopBound(:name, dir: -1)]
+        }
+        return none_found
+    }
+
+    // 1 for `i += 1`, -1 for `i -= 1` or `i += -1`, else 0.
+    func step_of(self, anon stmt_id: int64) -> int64 {
+        match self.p.stmts[stmt_id] {
+            .PlusAssign(_lhs, rhs) -> {
+                if self.p.exprs[rhs] is .IntLit(one) and one == 1 {
+                    return 1
+                }
+                if self.p.exprs[rhs] is .Binary(zero, op, one) and op is .Sub and self.p.exprs[zero] is .IntLit(z) and z == 0 and self.p.exprs[one] is .IntLit(o) and o == 1 {
+                    return -1
+                }
+                return 0
+            }
+            .OpAssign(_lhs, rhs, op) -> {
+                if op is .Sub and self.p.exprs[rhs] is .IntLit(one) and one == 1 {
+                    return -1
+                }
+                return 0
+            }
+            else return 0
+        }
+    }
+
+    // The statements in `stmts` that assign `name`, with -1 for a write this can't
+    // vouch for: in a loop inside them, as a `mut` argument, by a new binding, or in
+    // a statement it doesn't know.
+    func name_writes(self, anon stmts: [int64], name: str, looped: bool) -> [int64] {
+        mut out: [int64] = []
+        for stmt_id in stmts {
+            match self.p.stmts[stmt_id] {
+                .Let(n, _typ, value, _m) -> {
+                    out += self.expr_writes(value, :name, :looped)
+                    if n == name {
+                        out += [-1]
+                    }
+                }
+                .Assign(lhs, rhs) -> out += self.write_of(stmt_id, lhs, rhs, :name, :looped)
+                .PlusAssign(lhs, rhs) -> out += self.write_of(stmt_id, lhs, rhs, :name, :looped)
+                .OpAssign(lhs, rhs, _op) -> out += self.write_of(stmt_id, lhs, rhs, :name, :looped)
+                .Return(value) -> out += self.expr_writes(value, :name, :looped)
+                .Throw(value) -> out += self.expr_writes(value, :name, :looped)
+                .ExprStmt(expr) -> out += self.expr_writes(expr, :name, :looped)
+                .Assert(expr, _text, _span) -> out += self.expr_writes(expr, :name, :looped)
+                .If(cond, then_body, else_body) -> {
+                    out += self.expr_writes(cond, :name, :looped)
+                    out += self.name_writes(then_body, :name, :looped)
+                    out += self.name_writes(else_body, :name, :looped)
+                }
+                .For(cond, body) -> {
+                    out += self.expr_writes(cond, :name, looped: true)
+                    out += self.name_writes(body, :name, looped: true)
+                }
+                .ForEach(n, iter, body) -> {
+                    out += self.expr_writes(iter, :name, :looped)
+                    if n == name {
+                        out += [-1]
+                    }
+                    out += self.name_writes(body, :name, looped: true)
+                }
+                .MatchStmt(subject, arms) -> {
+                    out += self.expr_writes(subject, :name, :looped)
+                    for arm_id in arms {
+                        let arm = self.p.match_arms[arm_id]
+                        out += self.expr_writes(arm.guard, :name, :looped)
+                        out += self.name_writes(arm.body, :name, :looped)
+                    }
+                }
+                .LetElse(_pattern, value, else_body) -> {
+                    out += self.expr_writes(value, :name, :looped)
+                    out += self.name_writes(else_body, :name, :looped)
+                }
+                .Break -> none
+                .Continue -> none
+                else out += [-1]
+            }
+        }
+        return out
+    }
+
+    func write_of(self, anon stmt_id: int64, anon lhs: int64, anon rhs: int64, name: str, looped: bool) -> [int64] {
+        mut out = self.expr_writes(rhs, :name, :looped)
+        if self.p.exprs[lhs] is .Ident(n) {
+            if n == name {
+                if looped {
+                    out += [-1]
+                } else {
+                    out += [stmt_id]
+                }
+            }
+        } else {
+            out += self.expr_writes(lhs, :name, :looped)
+        }
+        return out
+    }
+
+    // -1 for each way `e` may change `name`: a `mut name` argument, or a write in
+    // a block of a match expression or comprehension that name_writes finds.
+    func expr_writes(self, anon e: int64, name: str, looped: bool) -> [int64] {
+        mut out: [int64] = []
+        if e == 0 {
+            return out
+        }
+        match self.p.exprs[e] {
+            .Binary(lhs, _op, rhs) -> {
+                out += self.expr_writes(lhs, :name, :looped)
+                out += self.expr_writes(rhs, :name, :looped)
+            }
+            .Chain(exprs, _ops) -> {
+                for x in exprs {
+                    out += self.expr_writes(x, :name, :looped)
+                }
+            }
+            .Call(callee, args) -> {
+                out += self.expr_writes(callee, :name, :looped)
+                out += self.args_writes(args, :name, :looped)
+            }
+            .OptionalMethodCall(value, _m, args) -> {
+                out += self.expr_writes(value, :name, :looped)
+                out += self.args_writes(args, :name, :looped)
+            }
+            .ArrayLit(elements) -> {
+                for x in elements {
+                    out += self.expr_writes(x, :name, :looped)
+                }
+            }
+            .MatchExpr(subject, arms) -> {
+                out += self.expr_writes(subject, :name, :looped)
+                for arm_id in arms {
+                    let arm = self.p.match_expr_arms[arm_id]
+                    out += self.expr_writes(arm.guard, :name, :looped)
+                    for w in self.name_writes(arm.pre, :name, looped: looped or arm.is_comp) {
+                        out += [-1]
+                    }
+                    out += self.expr_writes(arm.body, :name, :looped)
+                }
+            }
+            .Slice(x, lo, hi) -> {
+                out += self.expr_writes(x, :name, :looped)
+                out += self.expr_writes(lo, :name, :looped)
+                out += self.expr_writes(hi, :name, :looped)
+            }
+            .Try(inner) -> out += self.expr_writes(inner, :name, :looped)
+            .Must(inner) -> out += self.expr_writes(inner, :name, :looped)
+            .AsOptional(inner) -> out += self.expr_writes(inner, :name, :looped)
+            .UnwrapOpt(value, default) -> {
+                out += self.expr_writes(value, :name, :looped)
+                out += self.expr_writes(default, :name, :looped)
+            }
+            .OptionalDot(value, _f) -> out += self.expr_writes(value, :name, :looped)
+            .Spawn(call, _d, _s, _n, _det) -> out += self.expr_writes(call, :name, :looped)
+            else none
+        }
+        return out
+    }
+
+    func args_writes(self, anon args: [ast.CallArg], name: str, looped: bool) -> [int64] {
+        mut out: [int64] = []
+        for arg in args {
+            if arg.by_ref and self.p.exprs[arg.value] is .Ident(n) and n == name {
+                out += [-1]
+            }
+            out += self.expr_writes(arg.value, :name, :looped)
+        }
+        return out
     }
 
     // Whether a `break label` is somewhere in `stmts`, in loops inside them too.
@@ -18148,11 +18380,24 @@ type Codegen = shared struct {
                 }
             }
             .Assign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: none)
-            .PlusAssign(lhs, rhs) -> self.compile_update(lhs, :rhs, op: .Add)
-            .OpAssign(lhs, rhs, op) -> self.compile_update(lhs, :rhs, :op)
+            .PlusAssign(lhs, rhs) -> {
+                if arrays.contains(self.bounded_steps, stmt_id) {
+                    self.compile_assign(lhs_id: lhs, rhs_id: self.method_call_expr(lhs, method: "wrapping_add", args: [ast.CallArg(label: "", label_span: self.p.expr_spans[rhs], value: rhs)]))
+                } else {
+                    self.compile_update(lhs, :rhs, op: .Add)
+                }
+            }
+            .OpAssign(lhs, rhs, op) -> {
+                if arrays.contains(self.bounded_steps, stmt_id) {
+                    self.compile_assign(lhs_id: lhs, rhs_id: self.method_call_expr(lhs, method: "wrapping_sub", args: [ast.CallArg(label: "", label_span: self.p.expr_spans[rhs], value: rhs)]))
+                } else {
+                    self.compile_update(lhs, :rhs, :op)
+                }
+            }
             .Return(value) -> self.compile_return(value)
             .If(cond, then_body, else_body) -> self.compile_if(cond_id: cond, :then_body, :else_body)
             .For(cond, body) -> {
+                self.note_bounded_steps(cond, :body)
                 let safe = self.push_safe_index(cond, :body)
                 self.loop_label_next = self.p.loop_labels.get(stmt_id)? or ""
                 self.compile_for(body, cond_id: cond)
@@ -23760,6 +24005,7 @@ type Codegen = shared struct {
         self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
+        self.bounded_steps = []
         self.evictions = []
         self.value_arms = 0
         self.func_lines_labels = []

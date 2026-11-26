@@ -259,6 +259,13 @@ print(big.wrapping_add(1))              // -9223372036854775808
 print(big + 1)                          // panic: integer overflow
 ```
 
+A loop counter needs no check when the loop's condition bounds it: in a `for`
+whose condition has `i < e` (or `i > e`), alone, joined by `and` or in a chain,
+a body whose only write to `i` is one `i += 1` (or `i -= 1`), not inside a loop
+within the body, can't take `i` past `e`. `for i in a..b` counts that way. With
+`..=` or another step it still checks, so `for i in n..=MAX` panics after its
+last pass, when the counter steps past `MAX`.
+
 `>>` shifts in zeros, so it treats an `int64` as 64 bits rather than a signed
 number, and so do the counting methods here. Each method is a few instructions at most:
 
