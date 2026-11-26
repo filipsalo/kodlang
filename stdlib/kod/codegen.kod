@@ -1366,7 +1366,7 @@ func inline_body(anon p: parsing.Parser, anon expr_id: int64, params: [str]) -> 
         .Binary(lhs, op, rhs) -> {
             match op {
                 .Dot -> return p.exprs[rhs] is .Ident(_field) and inline_body(p, lhs, :params)
-                .Index | .Is | .IsNot | .PlusEq -> return false
+                .Index | .Is | .IsNot | .PlusEq | .In | .NotIn -> return false
                 else return inline_body(p, lhs, :params) and inline_body(p, rhs, :params)
             }
         }
@@ -1472,7 +1472,7 @@ func inline_expr_size(anon p: parsing.Parser, anon id: int64) -> int64 {
     match p.exprs[id] {
         .Binary(lhs, op, rhs) -> {
             match op {
-                .Is | .IsNot -> return -1
+                .Is | .IsNot | .In | .NotIn -> return -1
                 else return inline_size_sum(1, inline_size_sum(inline_expr_size(p, lhs), inline_expr_size(p, rhs)))
             }
         }
@@ -2885,6 +2885,41 @@ type Codegen = shared struct {
             call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: no), :span)
         }
         return self.compile_expr(call)
+    }
+
+    // `x in c`: an array's `_array_contains(c, x)`, else `c.contains(x)`, which `str`,
+    // `Map` and `Set` have.
+    func compile_in(self, anon value: int64, container: int64, negate: bool) -> Val {
+        let span = self.p.expr_spans[value]
+        let kind = self.infer_kind(container)
+        mut call = -1
+        if kind.is_array() {
+            call = self.array_helper_call("_array_contains", args: [container, value], :span)
+        } else if kind is .KStr or self.has_contains(kind) {
+            let method = self.p.alloc_expr(.Ident(name: "contains"), :span)
+            let callee = self.p.alloc_expr(.Binary(lhs: container, op: .Dot, rhs: method), :span)
+            call = self.p.alloc_expr(.Call(:callee, args: [ast.CallArg(label: "", label_span: span, :value)]), :span)
+        } else {
+            if not (kind is .KUnknown) {
+                self.report_error(f"error: `in` looks in an array, a `str` or a type with a `contains` method such as `Map` and `Set`; this is `{self.kind_display(kind)}`", span: self.p.expr_spans[container])
+            } else {
+                self.report_cannot_infer(container, what: "this expression")
+            }
+            self.compile_discard(value)
+            self.compile_discard(container)
+            return .VImm(value: 0)
+        }
+        if negate {
+            let no = self.p.alloc_expr(.BoolLit(value: false), :span)
+            call = self.p.alloc_expr(.Binary(lhs: call, op: .Eq, rhs: no), :span)
+        }
+        return self.compile_expr(call)
+    }
+
+    // A struct with a `contains` method, as `Map` and `Set` have: `in` calls it.
+    func has_contains(self, anon kind: TypeKind) -> bool {
+        let .KStruct(idx, _args) = kind else { return false }
+        return self.structs[idx].method_idx.contains("contains")
     }
 
     // Only the variant is compared, so a payload could only be ignored.
@@ -11861,6 +11896,8 @@ type Codegen = shared struct {
             .Or -> return self.compile_or(:lhs, :rhs)
             .Is -> return self.compile_is(:lhs, :rhs, negate: false)
             .IsNot -> return self.compile_is(:lhs, :rhs, negate: true)
+            .In -> return self.compile_in(lhs, container: rhs, negate: false)
+            .NotIn -> return self.compile_in(lhs, container: rhs, negate: true)
             else {
                 if self.disturbed(lhs, [rhs]) {
                     let mark = len(self.holds)
@@ -17564,6 +17601,8 @@ type Codegen = shared struct {
                     .Or -> return .KBool
                     .Is -> return .KBool
                     .IsNot -> return .KBool
+                    .In -> return .KBool
+                    .NotIn -> return .KBool
                     .Index -> {
                         if self.index_chain_fn(expr_id) is Some(fn_ref) and self.is_generic_sig(fn_ref.sig) {
                             let no_args: [ast.CallArg] = []

@@ -327,6 +327,7 @@ and of the same type:
 | `&` `\|` `^` `<<` `>>` | two `int64` | `int64` |
 | `<` `<=` `>` `>=` | two `int64`, two `float64`, two `str` or two `bytes` | `bool` |
 | `==` `!=` | two `int64`, two `float64`, `bool`, `str` or `bytes`, two values of a payload-free enum or of a plain struct, an enum value and a unit variant, two arrays of one type, an optional and `none`, or a [union](#union-types) and a value that goes into it | `bool` |
+| `in` `not in` | a value and an array of its type, two `str`, or a value and a type with a `contains` method that takes it, such as `Map` and `Set` | `bool` |
 | `and` `or` | two `bool` | `bool` |
 
 So `"n = " + 5` is an error (`` cannot add `str` and `int64` ``); write
@@ -347,6 +348,23 @@ comparing two interface values, function values or `shared struct`s without an `
 is an error.
 Comparing values of two different types, like an `int64` with a `str` or
 values of two different enums, is an error too.
+
+`x in c` says whether `c` has `x`: an array an element `==` to it, a `str` the
+substring `x`, and anything else what `c.contains(x)` gives, so a
+`Map` the key `x` and a `Set` the element `x`. `x not in c` is its negation.
+`in` binds like the comparisons, and doesn't chain with them, so
+`not x in c` is `not (x in c)`:
+
+<!-- kod:
+import "sets" { Set }
+mut seen = Set[str]()
+seen.add("b")
+-->
+```kod
+assert 2 in [1, 2, 3]
+assert "ell" in "hello"
+assert "a" not in seen
+```
 
 ## `none`
 
