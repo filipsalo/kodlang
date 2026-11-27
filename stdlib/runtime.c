@@ -30,18 +30,13 @@
 extern void kod_inspect_print_backtrace_from(int64_t fp)
     __asm__("$kod$inspect$print_backtrace_from");
 
-// The polling page (docs/tasks.md#preemption): each loop iteration loads from
-// it, and while it is unreadable the load faults, which makes the task give
-// way. A page of its own, so that making it unreadable touches nothing else.
-__attribute__((aligned(16384), section("__DATA,__kod_poll"))) char kod_poll_page[16384];
-
-// The loop check as compiled now (codegen.kod, emit_poll) loads kod_poll_flag
-// and, when it is set, calls kod_poll_stub, which counts kod_poll_budget down
-// and at 0 calls kod_poll_hook (stdlib/tasks.kod, _poll_due). Every 10 ms a
-// thread sets the flag (tasks.c), and the hook clears it and gives way; a
-// simulation (stdlib/sim.kod) keeps it set, so that the countdown, which the
-// seed sets, counts every check, and a task gives way at the same check each
-// time. The polling page above is for code compiled before, the snapshot's.
+// Preemption (docs/tasks.md#preemption): each loop iteration and function
+// call loads kod_poll_flag (codegen.kod, emit_poll) and, when it is set, calls
+// kod_poll_stub, which counts kod_poll_budget down and at 0 calls
+// kod_poll_hook (stdlib/tasks.kod, _poll_due). Every 10 ms a thread sets the
+// flag (tasks.c), and the hook clears it and gives way; a simulation
+// (stdlib/sim.kod) keeps it set, so that the countdown, which the seed sets,
+// counts every check, and a task gives way at the same check each time.
 int64_t kod_poll_flag = 0;
 int64_t kod_poll_budget = 1;
 void (*kod_poll_hook)(void) = 0;
@@ -79,8 +74,10 @@ void kod_poll_slow(void) {
 
 // Called by a loop's check while kod_poll_flag is set. It changes x16, x17
 // and lr only (regalloc.kod, keeps_regs): the countdown in those, and when it
-// is out, a frame that keeps everything else (as tasks.c's kod_preempt_stub)
-// around kod_poll_slow.
+// is out, a frame that keeps everything else around kod_poll_slow: x0-x17,
+// the flags, all of q0-q31 and the FP status, below the caller's red zone,
+// with a frame record whose return address is the caller's, so that a
+// backtrace from inside reads as the loop's.
 __attribute__((naked)) void kod_poll_stub(void) {
     __asm__(
         "adrp x16, _kod_poll_budget@PAGE\n"
@@ -278,7 +275,7 @@ KodCatch *kod_catch_top = 0;
 static int kod_err_keep = 0;
 static char *kod_err_text;
 static size_t kod_err_len, kod_err_cap;
-// A preempted task would print into it, so tasks.c doesn't preempt meanwhile.
+// A preempted task would print into it, so none is meanwhile (kod_poll_slow).
 int kod_no_preempt = 0;
 // The next panic ends the program even under a catch (kod_panic_uncaught).
 static int kod_uncaught = 0;

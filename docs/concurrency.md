@@ -363,9 +363,8 @@ takes 20 ms a seed on average against 13 ms without preemption; a seed that
 preempts every few checks switches tasks hundreds of thousands of times, so
 a preemption looks for I/O that has come (a system call per descriptor) only
 one time in 16.
-Modules the compiler is made of are built by the snapshot, which still
-loads from the page, so the page and its fault handler stay until a snapshot
-built with the flag replaces it.
+Once the snapshot that builds the compiler's own modules had the flag too,
+the page and its fault handler went.
 
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does
