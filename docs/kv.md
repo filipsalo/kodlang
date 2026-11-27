@@ -116,3 +116,31 @@ the store, 8. Of the
 mistakes shared syncs invite, 26 seeds find a task that returns once any sync
 has run, even one that began before its change was written, and 23 a
 `compact` that empties the log before syncing what is in it.
+
+## A service
+
+`examples/kv_service/` serves a store over HTTP: `service.kod` has the
+routes, `kv_service.kod` the program.
+
+```
+kod run examples/kv_service/kv_service.kod data 8080
+curl -X PUT --data blue http://127.0.0.1:8080/keys/colour
+curl http://127.0.0.1:8080/keys/colour
+```
+
+| Request | Answer |
+|---------|--------|
+| `GET /keys` | the keys, one a line |
+| `GET /keys/{key}` | the value, or `404` |
+| `PUT /keys/{key}` | sets it to the body: `200` once it is on the disk |
+| `DELETE /keys/{key}` | removes it: `200` once that is on the disk |
+
+A full disk is a `507`, and a store stopped by a failing disk a `503`; a
+change answered either may or may not have been kept.
+
+`service_test.kod` runs it under a simulation: the service and three clients
+over the simulated network, a crash and disk faults as the seed picks, then a
+restart that checks every change a client was answered `200` for. None of 200
+seeds fails. A service that answered `200` whatever the store said fails under
+60 of them, and one that answered before the change was synced (doing the
+`put` in a task of its own) under 64.

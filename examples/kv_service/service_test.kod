@@ -1,0 +1,145 @@
+// The key-value service (service.kod): over the network, and under a
+// simulation that crashes the machine and fails its disk, with every change
+// a client was answered 200 for still there after the restart.
+import "kv"
+import "net/http"
+import "net/http" { Server }
+import "net/tcp"
+import "panics"
+import "posix"
+import "sim"
+import "tasks"
+import "./service"
+
+func fresh(anon dir: str) -> str {
+    for file in posix.list_dir(dir)? or [] {
+        let _ = posix.remove(f"{dir}/{file}")
+    }
+    let _ = posix.remove_dir(dir)
+    return dir
+}
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func serve(anon s: Server, anon l: tcp.Listener) -> str {
+    if s.serve(l) is Err(e) {
+        return e.to_str()
+    }
+    return "ok"
+}
+
+test "put, get, list and delete over HTTP, kept across a restart" {
+    let dir = fresh("build/kv_service_test")
+    let db = must kv.open(dir)
+    let server = Server(routes: service.routes(db))
+    let l = must tcp.listen("127.0.0.1", port: 0)
+    let serving = spawn serve(server, l)
+    let base = f"http://127.0.0.1:{l.port()}/keys"
+    assert (must http.get(f"{base}/colour")).status == 404
+    assert (must http.put(f"{base}/colour", b("blue"), content_type: "text/plain")).status == 200
+    assert (must http.put(f"{base}/size", b("large"), content_type: "text/plain")).status == 200
+    assert (must http.get(f"{base}/colour")).text() == "blue"
+    assert (must http.get(base)).text() == "colour\nsize\n"
+    assert (must http.delete(f"{base}/size")).status == 200
+    assert (must http.get(base)).text() == "colour\n"
+    server.stop()
+    assert serving.wait() == "ok"
+    must l.close()
+    must db.close()
+    let again = must kv.open(dir)
+    assert again.get("colour") == b("blue")
+    assert again.get("size") is none
+    must again.close()
+}
+
+// What one client was answered 200 for, and the change it was waiting on an
+// answer for, if any: that one may or may not be kept.
+type Client = shared struct {
+    kept: Map[str, str]
+    doing_key: str = ""
+    doing_value: str = ""
+    doing: bool = false
+}
+
+func new_client() -> Client {
+    return Client(kept: Map[str, str]())
+}
+
+// Changes keys of its own (`name` and a digit) the seed picks, until the
+// service stops answering.
+func client(anon c: Client, anon base: str, anon name: str, anon seed: int64) -> int64 {
+    mut state = seed * 31 + len(name)
+    for i in 0..30 {
+        state = (state * 1103515245 + 12345) % 2147483648
+        let key = f"{name}{state % 4}"
+        mut value = f"{name}{i}"
+        if state % 6 == 0 {
+            value = ""
+        }
+        c.doing_key = key
+        c.doing_value = value
+        c.doing = true
+        let answer = if value == "" { http.delete(f"{base}/{key}") } else { http.put(f"{base}/{key}", b(value), content_type: "text/plain") }
+        let Ok(resp) = answer else { return i }
+        if resp.status == 507 {
+            // A full disk keeps nothing of it: the store undid it.
+            c.doing = false
+            continue
+        }
+        if resp.status != 200 {
+            return i
+        }
+        c.kept[key] = value
+        c.doing = false
+    }
+    return 30
+}
+
+// After the restart: each key holds what its client was answered 200 for, or
+// the change it was waiting on.
+func check(anon db: kv.Store, anon c: Client) -> none {
+    for key in c.kept.keys() {
+        let got = str(db.get(key)? or b(""))
+        if got != (c.kept.get(key)? or "") {
+            assert c.doing and c.doing_key == key and got == c.doing_value
+        }
+    }
+}
+
+type Clients = shared struct {
+    each: [Client] = []
+    up: bool = false
+}
+
+test "every change a client was answered 200 for outlives a crash and a failing disk" {
+    let cs = Clients()
+    sim.run(count: 100, body: func() {
+        cs.each = [new_client(), new_client(), new_client()]
+        cs.up = false
+        let db = must kv.open("data")
+        cs.up = true
+        let server = Server(routes: service.routes(db))
+        let l = must tcp.listen("127.0.0.1", port: 8080)
+        let serving = spawn serve(server, l)
+        mut running: [tasks.Task[int64]] = []
+        for k, name in ["a", "b", "c"] {
+            running += [spawn client(cs.each[k], "http://127.0.0.1:8080/keys", name, sim.seed())]
+        }
+        for r in running {
+            let _ = r.wait()
+        }
+        server.stop()
+        let _ = serving.wait()
+        must l.close()
+    }, restart: func() {
+        if not cs.up {
+            return
+        }
+        let db = must kv.open("data")
+        for c in cs.each {
+            check(db, c)
+        }
+    }, disk_faults: true)
+}
