@@ -12,7 +12,8 @@
 // or tuples here.
 
 // One function: its first instruction's label and the label after its last;
-// its name, file and line; and a label and a line for each statement.
+// its name, file and line; a label and a line for each statement; and the
+// variables a debugger can show.
 type Function = struct {
     start: str
     end: str
@@ -21,6 +22,45 @@ type Function = struct {
     line: int64
     rows: [str]
     lines: [int64]
+    vars: [Variable] = []
+}
+
+// A parameter or local in a frame slot, `offset` bytes from the frame
+// pointer, and the name of its type (a Type of the unit).
+type Variable = struct {
+    name: str
+    type_name: str
+    offset: int64
+    param: bool
+}
+
+// A type of a unit, by the name Kod gives it, and how it is laid out (a
+// SHAPE_): an int64, a bool, a float64; a str (or bytes), an array or a
+// struct, each a pointer to what it holds; or anything else, which a
+// debugger shows as an address. An array has its element's type, `elem`
+// (an int64, bool, float64 or str), and a struct its fields: their names,
+// offsets and types' names.
+type Type = struct {
+    name: str
+    shape: int64
+    elem: str = ""
+    field_names: [str] = []
+    field_offsets: [int64] = []
+    field_types: [str] = []
+    size: int64 = 8
+}
+
+let SHAPE_INT: int64 = 0
+let SHAPE_BOOL: int64 = 1
+let SHAPE_FLOAT: int64 = 2
+let SHAPE_STR: int64 = 3
+let SHAPE_ARRAY: int64 = 4
+let SHAPE_STRUCT: int64 = 5
+let SHAPE_OTHER: int64 = 6
+
+// Whether a value of `t` is a pointer to what a debugger shows of it.
+func points(anon t: Type) -> bool {
+    return t.shape == SHAPE_STR or t.shape == SHAPE_ARRAY or t.shape == SHAPE_STRUCT
 }
 
 // Bytes for a section, with labels whose 8-byte addresses go between them.
@@ -152,6 +192,31 @@ let FORM_DATA4: int64 = 0x06
 let FORM_STRING: int64 = 0x08
 let FORM_SEC_OFFSET: int64 = 0x17
 let FORM_FLAG_PRESENT: int64 = 0x19
+let FORM_DATA1: int64 = 0x0b
+let FORM_REF4: int64 = 0x13
+let FORM_EXPRLOC: int64 = 0x18
+let TAG_FORMAL_PARAMETER: int64 = 0x05
+let TAG_MEMBER: int64 = 0x0d
+let TAG_POINTER_TYPE: int64 = 0x0f
+let TAG_STRUCTURE_TYPE: int64 = 0x13
+let TAG_TYPEDEF: int64 = 0x16
+let TAG_BASE_TYPE: int64 = 0x24
+let TAG_VARIABLE: int64 = 0x34
+let AT_LOCATION: int64 = 0x02
+let AT_BYTE_SIZE: int64 = 0x0b
+let AT_DATA_MEMBER_LOCATION: int64 = 0x38
+let AT_ENCODING: int64 = 0x3e
+let AT_FRAME_BASE: int64 = 0x40
+let AT_TYPE: int64 = 0x49
+let ATE_ADDRESS: int64 = 0x01
+let ATE_BOOLEAN: int64 = 0x02
+let ATE_FLOAT: int64 = 0x04
+let ATE_SIGNED: int64 = 0x05
+let ATE_SIGNED_CHAR: int64 = 0x06
+// The frame pointer, x29, as a location; an offset from the frame base.
+let OP_REG29: int64 = 0x6d
+let OP_FBREG: int64 = 0x91
+let OP_DEREF: int64 = 0x06
 // DW_LANG_C: Kod has no number of its own, and a debugger treats C kindly.
 let LANG_C: int64 = 0x0002
 let LNS_COPY: int64 = 1
@@ -162,7 +227,7 @@ let LNE_SET_ADDRESS: int64 = 2
 
 // The __DWARF sections for `functions`, the object's main file `path`
 // (its compile unit's name) and the directory paths are relative to.
-func sections(anon functions: [Function], path: str, comp_dir: str) -> [str] {
+func sections(anon functions: [Function], types: [Type], path: str, comp_dir: str) -> [str] {
     // The files, in the order functions name them; numbered from 1.
     mut files: [str] = []
     for f in functions {
@@ -174,7 +239,7 @@ func sections(anon functions: [Function], path: str, comp_dir: str) -> [str] {
     out += ["\t.section __DWARF,__debug_abbrev,regular,debug"]
     out += abbrevs()
     out += ["\t.section __DWARF,__debug_info,regular,debug"]
-    out += info(functions, files: files, path: path, comp_dir: comp_dir)
+    out += info(functions, types: types, files: files, path: path, comp_dir: comp_dir)
     out += ["\t.section __DWARF,__debug_line,regular,debug"]
     out += line_table(functions, files: files)
     out += ["\t.section __DWARF,__debug_ranges,regular,debug"]
@@ -200,21 +265,182 @@ func file_number(anon files: [str], anon file: str) -> int64 {
     return 1
 }
 
-// Abbreviation 1, the compile unit, and 2, a function.
+// The abbreviations: 1 the compile unit, 2 a function (its variables its
+// children), 3 a parameter, 4 a local, then the types: 5 a base type, 6 a
+// pointer, 7 a struct (its members its children), 8 a member, 9 a typedef.
+let ABBREV_UNIT: int64 = 1
+let ABBREV_FUNCTION: int64 = 2
+let ABBREV_PARAMETER: int64 = 3
+let ABBREV_VARIABLE: int64 = 4
+let ABBREV_BASE: int64 = 5
+let ABBREV_POINTER: int64 = 6
+let ABBREV_STRUCT: int64 = 7
+let ABBREV_MEMBER: int64 = 8
+let ABBREV_TYPEDEF: int64 = 9
+
 func abbrevs() -> [str] {
     let s = Section()
-    s.bytes([1, TAG_COMPILE_UNIT, 1])
+    s.bytes([ABBREV_UNIT, TAG_COMPILE_UNIT, 1])
     s.bytes([AT_PRODUCER, FORM_STRING, AT_LANGUAGE, FORM_DATA2, AT_NAME, FORM_STRING, AT_COMP_DIR, FORM_STRING])
     s.bytes([AT_STMT_LIST, FORM_SEC_OFFSET, AT_LOW_PC, FORM_ADDR, AT_RANGES, FORM_SEC_OFFSET, 0, 0])
-    s.bytes([2, TAG_SUBPROGRAM, 0])
+    s.bytes([ABBREV_FUNCTION, TAG_SUBPROGRAM, 1])
     s.bytes([AT_NAME, FORM_STRING, AT_DECL_FILE, FORM_DATA2, AT_DECL_LINE, FORM_DATA4])
-    s.bytes([AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_ADDR, AT_EXTERNAL, FORM_FLAG_PRESENT, 0, 0])
+    s.bytes([AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_ADDR, AT_FRAME_BASE, FORM_EXPRLOC, AT_EXTERNAL, FORM_FLAG_PRESENT, 0, 0])
+    s.bytes([ABBREV_PARAMETER, TAG_FORMAL_PARAMETER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_EXPRLOC, 0, 0])
+    s.bytes([ABBREV_VARIABLE, TAG_VARIABLE, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_EXPRLOC, 0, 0])
+    s.bytes([ABBREV_BASE, TAG_BASE_TYPE, 0, AT_NAME, FORM_STRING, AT_ENCODING, FORM_DATA1, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_POINTER, TAG_POINTER_TYPE, 0, AT_TYPE, FORM_REF4, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_STRUCT, TAG_STRUCTURE_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_MEMBER, TAG_MEMBER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_DATA_MEMBER_LOCATION, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_TYPEDEF, TAG_TYPEDEF, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, 0, 0])
     s.byte(0)
     s.flush()
     return s.out
 }
 
-func info(anon functions: [Function], files: [str], path: str, comp_dir: str) -> [str] {
+// The type entries of a unit, each made once: `keys` name them, `offsets`
+// are where they are from the unit's start, which a reference gives.
+type Types = shared struct {
+    s: Section
+    keys: [str] = []
+    offsets: [int64] = []
+
+    func find(self, anon key: str) -> int64 {
+        for k, have in self.keys {
+            if have == key {
+                return self.offsets[k]
+            }
+        }
+        return -1
+    }
+
+    // Where the next entry starts: the unit's 4-byte length comes before `s`.
+    func here(self, anon key: str) -> int64 {
+        let at = 4 + self.s.size
+        self.keys += [key]
+        self.offsets += [at]
+        return at
+    }
+
+    func base(self, anon name: str, encoding: int64, size: int64) -> int64 {
+        let key = f"base {name}"
+        let found = self.find(key)
+        if found >= 0 {
+            return found
+        }
+        let at = self.here(key)
+        self.s.byte(ABBREV_BASE)
+        self.s.bytes(cstr(name))
+        self.s.bytes([encoding, size])
+        return at
+    }
+
+    func pointer(self, anon to: int64) -> int64 {
+        let key = f"pointer {to}"
+        let found = self.find(key)
+        if found >= 0 {
+            return found
+        }
+        let at = self.here(key)
+        self.s.byte(ABBREV_POINTER)
+        self.s.bytes(u32(to))
+        self.s.byte(8)
+        return at
+    }
+
+    func typedef(self, anon name: str, to: int64) -> int64 {
+        let key = f"typedef {name}"
+        let found = self.find(key)
+        if found >= 0 {
+            return found
+        }
+        let at = self.here(key)
+        self.s.byte(ABBREV_TYPEDEF)
+        self.s.bytes(cstr(name))
+        self.s.bytes(u32(to))
+        return at
+    }
+
+    // A struct `size` bytes long, its members named and of the types at their offsets.
+    func record(self, anon name: str, size: int64, members: [str], offsets: [int64], types: [int64]) -> int64 {
+        let key = f"struct {name}"
+        let found = self.find(key)
+        if found >= 0 {
+            return found
+        }
+        let at = self.here(key)
+        self.s.byte(ABBREV_STRUCT)
+        self.s.bytes(cstr(name))
+        self.s.bytes(uleb(size))
+        for k, m in members {
+            self.s.byte(ABBREV_MEMBER)
+            self.s.bytes(cstr(m))
+            self.s.bytes(u32(types[k]))
+            self.s.bytes(uleb(offsets[k]))
+        }
+        self.s.byte(0)
+        return at
+    }
+
+    func integer(self) -> int64 {
+        return self.base("int64", encoding: ATE_SIGNED, size: 8)
+    }
+
+    // The entry for the type named `name` of `all`: for one that points, the
+    // struct it points to. What it refers to is made first; a struct that
+    // (through its fields) holds itself refers to an address there.
+    func of(self, anon name: str, all: [Type], depth: int64 = 0) -> int64 {
+        mut t = Type(name: name, shape: SHAPE_OTHER)
+        for have in all {
+            if have.name == name {
+                t = have
+            }
+        }
+        if t.shape == SHAPE_INT {
+            return self.integer()
+        }
+        if t.shape == SHAPE_BOOL {
+            return self.base("bool", encoding: ATE_BOOLEAN, size: 1)
+        }
+        if t.shape == SHAPE_FLOAT {
+            return self.base("float64", encoding: ATE_FLOAT, size: 8)
+        }
+        let made = self.find(f"struct {name}")
+        if made >= 0 {
+            return made
+        }
+        if t.shape == SHAPE_OTHER or depth > 4 {
+            return self.typedef(name, to: self.base("address", encoding: ATE_ADDRESS, size: 8))
+        }
+        if t.shape == SHAPE_STR {
+            let chars = self.pointer(self.base("char", encoding: ATE_SIGNED_CHAR, size: 1))
+            return self.record(name, size: 16, members: ["buf", "len"], offsets: [0, 8], types: [chars, self.integer()])
+        }
+        if t.shape == SHAPE_ARRAY {
+            let elem = self.member(t.elem, all: all, depth: depth + 1)
+            return self.record(name, size: 24, members: ["ptr", "len", "cap"], offsets: [0, 8, 16], types: [self.pointer(elem), self.integer(), self.integer()])
+        }
+        mut types: [int64] = []
+        for f in t.field_types {
+            types += [self.member(f, all: all, depth: depth + 1)]
+        }
+        return self.record(name, size: t.size, members: t.field_names, offsets: t.field_offsets, types: types)
+    }
+
+    // The entry for a value of the type named `name` where it is held, in a
+    // field or an element: a pointer to the struct for one that points.
+    func member(self, anon name: str, all: [Type], depth: int64) -> int64 {
+        let entry = self.of(name, all: all, depth: depth)
+        for t in all {
+            if t.name == name and points(t) and depth <= 4 {
+                return self.pointer(entry)
+            }
+        }
+        return entry
+    }
+}
+
+func info(anon functions: [Function], types: [Type], files: [str], path: str, comp_dir: str) -> [str] {
     let s = Section()
     // Version 4, abbreviations at offset 0, 8-byte addresses.
     s.bytes(u16(4))
@@ -229,13 +455,43 @@ func info(anon functions: [Function], files: [str], path: str, comp_dir: str) ->
     // Base address 0, and the ranges at the start of __debug_ranges.
     s.bytes([0, 0, 0, 0, 0, 0, 0, 0])
     s.bytes(u32(0))
+    // The variables' types, before the functions that refer to them.
+    let made = Types(:s)
+    mut refs: [[int64]] = []
     for f in functions {
-        s.byte(2)
+        mut these: [int64] = []
+        for v in f.vars {
+            these += [made.of(v.type_name, all: types)]
+        }
+        refs += [these]
+    }
+    for i, f in functions {
+        s.byte(ABBREV_FUNCTION)
         s.bytes(cstr(f.name))
         s.bytes(u16(file_number(files, f.file)))
         s.bytes(u32(f.line))
         s.address(f.start)
         s.address(f.end)
+        s.bytes([1, OP_REG29])
+        for k, v in f.vars {
+            mut abbrev = ABBREV_VARIABLE
+            if v.param {
+                abbrev = ABBREV_PARAMETER
+            }
+            s.byte(abbrev)
+            s.bytes(cstr(v.name))
+            s.bytes(u32(refs[i][k]))
+            // The slot; for a value that points, what the slot points to.
+            mut where = [OP_FBREG] + sleb(v.offset)
+            for t in types {
+                if t.name == v.type_name and points(t) {
+                    where += [OP_DEREF]
+                }
+            }
+            s.bytes(uleb(len(where)))
+            s.bytes(where)
+        }
+        s.byte(0)
     }
     // The end of the unit's children.
     s.byte(0)

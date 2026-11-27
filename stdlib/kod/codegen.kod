@@ -549,6 +549,8 @@ type VarSlot = shared struct {
     seen: bool = false
     // Declared `func name(...)` in a body: errors call it a declaration, not a `let`.
     local_fn: bool = false
+    // Made while an inlined body was compiled: the callee's, not this function's.
+    inlined: bool = false
 }
 
 // ── Expression result (what compile_expr returns) ─────────────────────────────
@@ -1721,8 +1723,12 @@ type Codegen = shared struct {
     func_lines_labels: [str] = []
     func_lines_values: [int64] = []
     last_marked_line: int64 = 0
-    // The functions compiled so far, for the object's DWARF (emit_dwarf).
+    // The functions compiled so far, for the object's DWARF (emit_dwarf), and
+    // the variables of the one about to be recorded (emit_symtab_entry).
     dwarf_functions: [dwarf.Function] = []
+    dwarf_vars: [dwarf.Variable] = []
+    // The types those variables have, and their fields' (debug_type).
+    dwarf_types: [dwarf.Type] = []
 
     loop_stack: [LoopLbl] = []
     // The label of the loop statement about to be compiled, taken as it starts.
@@ -3659,7 +3665,7 @@ type Codegen = shared struct {
         }
         let mark = len(self.vars)
         for i, name in names {
-            self.vars += [VarSlot(:name, offset: offsets[i], kind: kinds[i], mutable: false, bound: true, seen: true)]
+            self.vars += [VarSlot(:name, offset: offsets[i], kind: kinds[i], mutable: false, bound: true, seen: true, inlined: self.inline_depth > 0)]
         }
         let errors = len(self.errors)
         let saved_ctx = self.enter(sig.src_p, names: [], args: [])
@@ -5359,8 +5365,9 @@ type Codegen = shared struct {
         let end_lbl = self.fresh("Lfunc_end")
         self.emit_label(end_lbl)
         if line > 0 {
-            self.dwarf_functions += [dwarf.Function(start: func_lbl, end: end_lbl, :name, :file, :line, rows: self.func_lines_labels, lines: self.func_lines_values)]
+            self.dwarf_functions += [dwarf.Function(start: func_lbl, end: end_lbl, :name, :file, :line, rows: self.func_lines_labels, lines: self.func_lines_values, vars: self.dwarf_vars)]
         }
+        self.dwarf_vars = []
         let name_lbl: str = self.fresh("Lkodsym")
         let file_lbl: str = self.fresh("Lkodsym")
         let lines_start: str = self.fresh("Lkodlines_start")
@@ -5633,7 +5640,7 @@ type Codegen = shared struct {
     func alloc_var(self, name: str, kind: TypeKind) -> int64 {
         self.frame_slots = self.frame_slots + 1
         mut offset = 0 - self.frame_slots * 8
-        self.vars += [VarSlot(:name, :offset, :kind)]
+        self.vars += [VarSlot(:name, :offset, :kind, inlined: self.inline_depth > 0)]
         return offset
     }
 
@@ -10207,7 +10214,7 @@ type Codegen = shared struct {
         let slot = self.hold_reg(reg)
         self.pool.free_reg(reg)
         let name = self.fresh("__held")
-        self.vars += [VarSlot(:name, offset: slot, :kind, mutable: false, bound: true, seen: true)]
+        self.vars += [VarSlot(:name, offset: slot, :kind, mutable: false, bound: true, seen: true, inlined: self.inline_depth > 0)]
         return self.p.alloc_expr(ast.Expr.Ident(:name), span: self.p.expr_spans[expr_id])
     }
 
@@ -24834,6 +24841,7 @@ type Codegen = shared struct {
         } else {
             self.emit_op(.Return)
         }
+        self.dwarf_vars = self.debug_vars(func_decl, body: allocated)
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)
         // Its registers are final, and nothing edits what is out_buf now.
         if self.func_depth == 0 {
@@ -25130,16 +25138,85 @@ type Codegen = shared struct {
         self.flush_out()
     }
 
+    // The parameters and locals of the function just compiled that a debugger
+    // can find: those whose frame slot `body` (allocated) still reads or
+    // writes. Those moved into registers aren't described yet, nor the
+    // compiler's own slots (named `__…`).
+    func debug_vars(self, anon decl: ast.FuncDecl, body: regalloc.InsnBuf) -> [dwarf.Variable] {
+        if self.dry_run {
+            return []
+        }
+        let in_memory = memory_slots(body)
+        mut out: [dwarf.Variable] = []
+        for i, v in self.vars {
+            if v.inlined or v.offset >= 0 or v.name.starts_with("__") or v.name.starts_with("$") or not arrays.contains(in_memory, v.offset) {
+                continue
+            }
+            mut param = false
+            for p in decl.params {
+                if p.name == v.name {
+                    param = true
+                }
+            }
+            let kind = self.slot_kind(i)
+            out += [dwarf.Variable(name: v.name, type_name: self.debug_type(kind), offset: v.offset, :param)]
+        }
+        return out
+    }
+
+    // The name of `kind` as the object's DWARF has it, described there once
+    // (and its fields' and elements' types with it).
+    func debug_type(self, anon kind: TypeKind) -> str {
+        let name = self.kind_display(kind)
+        for t in self.dwarf_types {
+            if t.name == name {
+                return name
+            }
+        }
+        match kind {
+            .KInt64 -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_INT)]
+            .KBool -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_BOOL)]
+            .KFloat64 -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_FLOAT)]
+            .KStr | .KBytes -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_STR)]
+            .KArray -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_ARRAY, elem: self.debug_type(.KInt64))]
+            .KArrayBool -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_ARRAY, elem: self.debug_type(.KBool))]
+            .KArrayFloat64 -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_ARRAY, elem: self.debug_type(.KFloat64))]
+            .KArrayStr -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_ARRAY, elem: self.debug_type(.KStr))]
+            .KStruct(idx, _args) -> {
+                let info = self.structs[idx]
+                // Listed before its fields, so a struct that holds itself ends.
+                self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
+                mut names: [str] = []
+                mut offsets: [int64] = []
+                mut types: [str] = []
+                for f in info.fields {
+                    names += [f.name]
+                    offsets += [f.offset]
+                    types += [self.debug_type(f.kind)]
+                }
+                let described = dwarf.Type(:name, shape: dwarf.SHAPE_STRUCT, field_names: names, field_offsets: offsets, field_types: types, size: info.data_width)
+                for k, t in self.dwarf_types {
+                    if t.name == name {
+                        self.dwarf_types[k] = described
+                    }
+                }
+            }
+            else -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
+        }
+        return name
+    }
+
     // The object's __DWARF sections (stdlib/kod/dwarf.kod), so a debugger finds
     // Kod's functions, files and lines (docs/debugging.md).
     func emit_dwarf(self) -> none {
         if self.dry_run or len(self.dwarf_functions) == 0 {
             return
         }
-        for line in dwarf.sections(self.dwarf_functions, path: self.p.path, comp_dir: working_dir()) {
+        for line in dwarf.sections(self.dwarf_functions, types: self.dwarf_types, path: self.p.path, comp_dir: working_dir()) {
             self.println(line)
         }
         self.dwarf_functions = []
+        self.dwarf_types = []
     }
 
     // Emit one row per registered (struct, interface) pair. Methods are
@@ -25511,5 +25588,24 @@ func working_dir() -> str {
         out = unsafe.str_at(buf)
     }
     unsafe.free(buf)
+    return out
+}
+
+// The frame slots `body` loads or stores, as offsets from fp.
+func memory_slots(anon body: regalloc.InsnBuf) -> [int64] {
+    mut out: [int64] = []
+    for i in 0..body.n {
+        let tag = body.tags[i]
+        let variant = tag & 255
+        mut off: int64 = 0
+        if variant == regalloc.INSN_SLOT and body.fb[i] < 0 {
+            off = body.fb[i]
+        } else if variant == regalloc.INSN_MEM and ((tag >> 9) & 3) == regalloc.AT_OFFSET and body.fb[i] == regalloc.FP and body.fc[i] < 0 {
+            off = body.fc[i]
+        }
+        if off < 0 and not arrays.contains(out, off) {
+            out += [off]
+        }
+    }
     return out
 }

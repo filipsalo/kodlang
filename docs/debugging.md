@@ -31,12 +31,45 @@ Each object the compiler writes carries DWARF, the format debuggers read:
 - a line table: for each statement, where its instructions start, and its
   file and line;
 - for each function, its name, file and line, and where its instructions
-  start and end.
+  start and end;
+- its parameters and locals that live in the function's frame, with their
+  types.
 
-So `b file.kod:N`, `bt`, `next`, `step` and `finish` work, and a crash under
-the debugger stops at its Kod line. Variables are not described yet:
-`frame variable` shows nothing, and `register read` and `memory read` are the
-way to look at values. A line inside a function that was inlined into its
+So `b file.kod:N`, `bt`, `next`, `step` and `finish` work, a crash under the
+debugger stops at its Kod line, and `frame variable` shows values:
+
+```
+(lldb) frame variable
+(str) name = (buf = "kod", len = 3)
+([int64]) xs = {
+  ptr = 0x0000300000000058
+  len = 4
+  cap = 6
+}
+(Pet) pet = {
+  name = 0x0000000100035780
+  age = 3
+  tags = 0x0000300000000018
+  owner = 0x0000300000000008
+  happy = true
+}
+(lldb) p xs.ptr[3]
+(long) 42
+(lldb) p *pet.owner
+(Counter)  (n = 9)
+```
+
+An `int64`, `bool` or `float64` shows as a number. A `str` (and `bytes`)
+shows as its buffer and length, an array as its elements' pointer, length and
+room, and a struct as its fields; a field or element that is one of those
+holds a pointer to it, which `*` follows. Other types (enums, optionals,
+maps, functions, ...) show as an address, under their Kod name.
+
+What isn't shown yet: a local the compiler keeps in a register rather than in
+the frame, which is most small ones (`register read` finds those), and the
+locals of a function inlined into the one stopped in. A value whose last use
+is past may already be released: a `str`, array or struct then reads as 0, or
+as memory lldb can't read. A line inside a function that was inlined into its
 caller has no instructions of its own; a breakpoint there lands on the call.
 
 The debug information stays in the objects, under `build/`; the executable
