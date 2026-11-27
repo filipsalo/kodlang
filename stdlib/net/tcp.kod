@@ -4,6 +4,7 @@
 import "libc"
 import "posix" { Fd }
 import "stream" { IoError, IoKind, os_error }
+import "tasks"
 import "time" { Duration }
 import "unsafe"
 
@@ -11,6 +12,8 @@ import "unsafe"
 let AF_UNSPEC: int64 = 0
 let AF_INET: int64 = 2
 let AF_INET6: int64 = 30
+let AF_UNIX: int64 = 1
+let EADDRINUSE: int64 = 48
 let SOCK_STREAM: int64 = 1
 let AI_PASSIVE: int64 = 1
 let EAI_SYSTEM: int64 = 11
@@ -195,6 +198,9 @@ func connect(anon host: str, port: int64, timeout: Duration = Duration(seconds: 
     if port < 0 or port > 65535 {
         throw bad_input(op, "port out of range")
     }
+    if tasks.simulating() {
+        return try sim_connect(host, :port, :op)
+    }
     let list = try resolve(host, :port, family: AF_UNSPEC, passive: false, :op, resolving: f"resolve {host}")
     mut last = ECONNREFUSED
     mut ai = list
@@ -245,6 +251,11 @@ func peer(anon f: Fd) -> str {
     if unsafe.c_int(libc.getpeername(f.fd, addr, addr + 128)) == 0 {
         // The family is the second byte; the port and the address come after.
         let family = unsafe.load8(addr + 1)
+        // A simulation's connection (a Unix-domain socket): a port of its own.
+        if family == AF_UNIX {
+            unsafe.free(addr)
+            return f"127.0.0.1:{SIM_PEER_PORTS + f.fd}"
+        }
         let port = unsafe.load8(addr + 2) * 256 + unsafe.load8(addr + 3)
         mut from = addr + 4
         if family == AF_INET6 {
@@ -324,10 +335,14 @@ type Listener = shared struct {
         libc.fcntl(c, F_SETFD, FD_CLOEXEC)
         set_flag(c, level: SOL_SOCKET, option: SO_NOSIGPIPE)
         set_flag(c, level: IPPROTO_TCP, option: TCP_NODELAY)
+        tasks.sim_note_fd(c)
         return Fd(fd: c, :nonblocking)
     }
 
     func port(self) -> int64 {
+        if tasks.simulating() {
+            return sim_net().port_of(self.fd)
+        }
         // A struct sockaddr_storage, then its socklen_t size. The port is
         // the big-endian 2 bytes at offset 2, for IPv4 and IPv6 alike.
         let addr = unsafe.alloc(136)
@@ -342,6 +357,9 @@ type Listener = shared struct {
 
     // A task that waits to accept gives up.
     func close(self) -> none or Error {
+        if tasks.simulating() {
+            sim_net().forget(self.fd)
+        }
         let n = self.fd
         self.fd = -1
         kod_closing(n)
@@ -355,6 +373,9 @@ func listen(anon host: str, port: int64, backlog: int64 = 128) -> Listener or Er
     let op = f"listen {host}:{port}"
     if port < 0 or port > 65535 {
         throw bad_input(op, "port out of range")
+    }
+    if tasks.simulating() {
+        return try sim_listen(host, :port, :backlog, :op)
     }
     // No host: every IPv4 interface.
     mut family = AF_UNSPEC
@@ -382,4 +403,153 @@ func listen(anon host: str, port: int64, backlog: int64 = 128) -> Listener or Er
     }
     libc.freeaddrinfo(list)
     throw os_error(op, errno: last)
+}
+
+// ---- under a simulation (docs/simulation.md) ----
+
+// A simulation's listeners are Unix-domain sockets, bound at a path of their
+// own; its connections, connections to them. The kernel moves the bytes, so
+// reads, writes, timeouts and shutdown are as for TCP; the simulation decides
+// which task goes on when (stdlib/tasks.kod).
+
+// The ports a simulation's connections give as the other end's.
+let SIM_PEER_PORTS: int64 = 50000
+
+// The listeners of the simulation under way: each one's port, path and descriptor.
+type SimNet = shared struct {
+    gen: int64
+    ports: [int64] = []
+    paths: [str] = []
+    fds: [int64] = []
+    next_port: int64 = 49152
+
+    func port_of(self, anon fd: int64) -> int64 {
+        for k, have in self.fds {
+            if have == fd {
+                return self.ports[k]
+            }
+        }
+        return -1
+    }
+
+    func path_of(self, anon port: int64) -> str? {
+        for k, have in self.ports {
+            if have == port {
+                return self.paths[k]
+            }
+        }
+        return none
+    }
+
+    // The listener `fd` is closed: its path goes.
+    func forget(self, anon fd: int64) -> none {
+        for k, have in self.fds {
+            if have == fd {
+                libc.unlink(unsafe.c_str(self.paths[k]))
+                self.fds[k] = -1
+                self.ports[k] = -1
+            }
+        }
+    }
+}
+
+mut _sim_net: SimNet? = none
+
+// The simulation's listeners; those of an earlier one have their paths removed.
+func sim_net() -> SimNet {
+    let gen = tasks.sim_generation()
+    if _sim_net is SimNet(n) {
+        if n.gen == gen {
+            return n
+        }
+        for k, path in n.paths {
+            if n.fds[k] >= 0 {
+                libc.unlink(unsafe.c_str(path))
+            }
+        }
+    }
+    let fresh = SimNet(:gen)
+    _sim_net = fresh
+    return fresh
+}
+
+func sim_local(anon host: str) -> bool {
+    return host == "" or host == "127.0.0.1" or host == "localhost" or host == "::1"
+}
+
+// A struct sockaddr_un for `path`: its length, the family, the path and a NUL.
+func sim_address(anon path: str) -> int64 {
+    let a = unsafe.alloc(106)
+    for k in 0..106 {
+        unsafe.store8(a + k, 0)
+    }
+    unsafe.store8(a, 106)
+    unsafe.store8(a + 1, AF_UNIX)
+    for k in 0..len(path) {
+        unsafe.store8(a + 2 + k, path[k])
+    }
+    return a
+}
+
+func sim_listen(anon host: str, port: int64, backlog: int64, op: str) -> Listener or Error {
+    if not sim_local(host) {
+        throw bad_input(op, "a simulation listens on 127.0.0.1 or localhost only")
+    }
+    let net = sim_net()
+    mut p = port
+    if p == 0 {
+        for net.path_of(net.next_port) is str {
+            net.next_port += 1
+        }
+        p = net.next_port
+        net.next_port += 1
+    }
+    if net.path_of(p) is str {
+        throw os_error(op, errno: EADDRINUSE)
+    }
+    let path = f"/tmp/kodsim.{libc.getpid()}.{net.gen}.{p}"
+    libc.unlink(unsafe.c_str(path))
+    let fd = unsafe.c_int(libc.socket(AF_UNIX, SOCK_STREAM, 0))
+    if fd < 0 {
+        throw os_error(op, errno: unsafe.errno())
+    }
+    let addr = sim_address(path)
+    let bound = unsafe.c_int(libc.bind(fd, addr, 106)) == 0 and unsafe.c_int(libc.listen(fd, backlog)) == 0
+    let err = unsafe.errno()
+    unsafe.free(addr)
+    if not bound {
+        libc.close(fd)
+        throw os_error(op, errno: err)
+    }
+    libc.fcntl(fd, F_SETFL, O_NONBLOCK)
+    libc.fcntl(fd, F_SETFD, FD_CLOEXEC)
+    net.ports += [p]
+    net.paths += [path]
+    net.fds += [fd]
+    tasks.sim_note_path(path)
+    tasks.sim_note_fd(fd)
+    return Listener(:fd)
+}
+
+func sim_connect(anon host: str, port: int64, op: str) -> Fd or Error {
+    if not sim_local(host) {
+        throw IoError(kind: .HostNotFound, :op, errno: 0, detail: "a simulation has only 127.0.0.1")
+    }
+    let Some(path) = sim_net().path_of(port) else { throw os_error(op, errno: ECONNREFUSED) }
+    let fd = unsafe.c_int(libc.socket(AF_UNIX, SOCK_STREAM, 0))
+    if fd < 0 {
+        throw os_error(op, errno: unsafe.errno())
+    }
+    let addr = sim_address(path)
+    let connected = unsafe.c_int(libc.connect(fd, addr, 106)) == 0
+    let err = unsafe.errno()
+    unsafe.free(addr)
+    if not connected {
+        libc.close(fd)
+        throw os_error(op, errno: err)
+    }
+    libc.fcntl(fd, F_SETFD, FD_CLOEXEC)
+    set_flag(fd, level: SOL_SOCKET, option: SO_NOSIGPIPE)
+    tasks.sim_note_fd(fd)
+    return Fd(:fd)
 }

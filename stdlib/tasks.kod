@@ -5,9 +5,11 @@
 // task runs next is decided here.
 
 import "kod/inspect"
+import "libc"
 import "panics"
 import "stream" { IoError }
 import "time" { Duration }
+import "unsafe"
 
 extern func kod_task_stack_new() -> int64
 extern func kod_task_stack_free(anon base: int64) -> none
@@ -27,6 +29,8 @@ extern func kod_task_hook() -> none
 extern func kod_task_set_now(anon stack: int64) -> none
 extern func kod_panic_uncaught(anon msg: str) -> none
 extern func kod_eprint(anon s: str) -> none
+extern func kod_sim_set_clock(anon ns: int64) -> none
+extern func kod_sim_set_epoch(anon ns: int64) -> none
 extern func _inspect_caller_fp() -> int64
 extern func _inspect_read_i64(anon addr: int64) -> int64
 
@@ -454,6 +458,13 @@ func _take_next() -> Fiber {
             }
             _poll(true)
         }
+        // A simulation picks one of the ready tasks by its seed.
+        if _sim is _Sim and len(_ready) - _head > 1 {
+            let k = _head + _sim_rand(len(_ready) - _head)
+            let t = _ready[_head]
+            _ready[_head] = _ready[k]
+            _ready[k] = t
+        }
         let next = _ready[_head]
         next.queued = false
         _head += 1
@@ -554,7 +565,8 @@ func _preempt() -> none {
     // In the scheduler (_take_next, _poll) a turn given away would run the
     // scheduler inside itself: a second _poll overwrites the events the first
     // is still handing out, and the tasks they were for never wake.
-    if _scheduling > 0 {
+    // A simulation decides itself where tasks give way.
+    if _scheduling > 0 or _sim is _Sim {
         return
     }
     give_way()
@@ -737,7 +749,14 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     if me.cancelled {
         return 2
     }
-    if _live <= 1 or filter == 0 {
+    if filter == 0 {
+        // Under a simulation, a write that doesn't wait may let another task in.
+        if _sim is _Sim and _sim_rand(2) == 0 {
+            give_way()
+        }
+        return 0
+    }
+    if _live <= 1 and _sim is none {
         return 0
     }
     mut limit: int64 = 0
@@ -748,7 +767,7 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     }
     _io_next += 1
     let key = _io_next
-    if kod_task_kq_add(ident, filter, event_data, key) != 0 {
+    if _add_event(ident, filter, event_data, key) != 0 {
         return 0
     }
     // A limit is a timer of its own, whose event wakes the task as the other
@@ -757,7 +776,7 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     if limit > 0 {
         _io_next += 1
         timer_key = _io_next
-        if kod_task_kq_add(0, EVFILT_TIMER, limit, timer_key) == 0 {
+        if _add_event(0, EVFILT_TIMER, limit, timer_key) == 0 {
             _io[timer_key] = me
         } else {
             timer_key = 0
@@ -800,6 +819,19 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
 // The descriptor is about to be closed (runtime.c, kod_closing): the tasks that wait
 // for it give up.
 func _closing(anon fd: int64) -> none {
+    if _sim is _Sim(sim) {
+        for k, have in sim.open {
+            if have == fd {
+                sim.open[k] = -1
+            }
+        }
+        for k, waited in sim.fds {
+            if waited == fd and _io.remove(sim.fd_keys[k]) is Fiber(fiber) {
+                fiber.io_closed = true
+                _make_ready(fiber)
+            }
+        }
+    }
     for writes in 0..2 {
         if _io.remove(kod_task_fd_key(fd, writes)) is Fiber(fiber) {
             fiber.io_closed = true
@@ -811,6 +843,11 @@ func _closing(anon fd: int64) -> none {
 // Makes ready the tasks whose events have come, waiting for one when `block`.
 func _poll(anon block: bool) -> none {
     _scheduling += 1
+    if _sim is _Sim(sim) {
+        _sim_poll(sim, :block)
+        _scheduling -= 1
+        return
+    }
     mut wait: int64 = 0
     if block {
         wait = 1
@@ -849,7 +886,7 @@ func _wait_until_done(anon fiber: Fiber, ns: int64) -> bool {
     let me = _running()
     _io_next += 1
     let key = _io_next
-    if kod_task_kq_add(0, EVFILT_TIMER, ns, key) != 0 {
+    if _add_event(0, EVFILT_TIMER, ns, key) != 0 {
         _wait_for(fiber)
         return true
     }
@@ -1256,7 +1293,7 @@ type Selector = shared struct {
                 if timer_arm >= 0 {
                     _io_next += 1
                     timer_key = _io_next
-                    if kod_task_kq_add(0, EVFILT_TIMER, self.waits[timer_arm], timer_key) != 0 {
+                    if _add_event(0, EVFILT_TIMER, self.waits[timer_arm], timer_key) != 0 {
                         return timer_arm
                     }
                     _io[timer_key] = me
@@ -1312,7 +1349,9 @@ type Selector = shared struct {
 // Forgets a timer, taking it from kevent too if it has yet to come.
 func _forget(anon key: int64) -> none {
     if key != 0 and _io.remove(key) is Fiber(_waiting) {
-        kod_task_kq_drop_timer(key)
+        if _sim is none {
+            kod_task_kq_drop_timer(key)
+        }
     }
 }
 
@@ -1322,4 +1361,236 @@ mut _seed: int64 = 12345
 func _random(anon n: int64) -> int64 {
     _seed = (_seed * 1103515245 + 12345) % 2147483648
     return (_seed / 65536) % n
+}
+
+// ---- simulation (stdlib/sim.kod, docs/simulation.md) ----
+
+// A run under a seed: the generator its choices come from, a number that
+// stands for them all, and the simulated clock. What tasks wait for is
+// noted here instead of in the kqueue: for a descriptor, its number, 1 for
+// room to write (0 for something to read) and the event's key; for a time,
+// when it is due and the key.
+type _Sim = shared struct {
+    seed: int64
+    state: int64
+    digest: int64 = 0
+    now: int64 = 0
+    fds: [int64] = []
+    writes: [int64] = []
+    fd_keys: [int64] = []
+    due: [int64] = []
+    timer_keys: [int64] = []
+    // What the simulation's network made, for its end to tidy up: socket
+    // paths, and the descriptors not closed yet.
+    paths: [str] = []
+    open: [int64] = []
+}
+
+mut _sim: _Sim? = none
+// One more for each simulation, so that what a module keeps for one (as
+// net/tcp its listeners) is known to be from an earlier one.
+mut _sim_gen: int64 = 0
+
+let _POLLIN: int64 = 1
+let _POLLOUT: int64 = 4
+
+func simulating() -> bool {
+    return _sim is _Sim
+}
+
+func sim_generation() -> int64 {
+    return _sim_gen
+}
+
+func sim_seed() -> int64 {
+    if _sim is _Sim(sim) {
+        return sim.seed
+    }
+    return -1
+}
+
+// Starts a simulation under `seed`, its calendar at `epoch_ns` (since 1970);
+// the running task is the only one.
+func sim_begin(anon seed: int64, epoch_ns: int64) -> none {
+    if _sim is _Sim {
+        panic("sim: a simulation is under way already")
+    }
+    if _live > 1 {
+        panic("sim: a simulation starts with no other task running")
+    }
+    if not _hooked {
+        kod_task_hook()
+        _hooked = true
+    }
+    _sim_gen += 1
+    _sim = _Sim(:seed, state: seed.wrapping_mul(-7046029254386353131).wrapping_add(1))
+    kod_sim_set_epoch(epoch_ns)
+    kod_sim_set_clock(0)
+}
+
+// A socket path the simulation's network made (net/tcp), removed at its end.
+func sim_note_path(anon path: str) -> none {
+    if _sim is _Sim(sim) {
+        sim.paths += [path]
+    }
+}
+
+// A descriptor the simulation's network made, closed at its end if a run that
+// failed left it open.
+func sim_note_fd(anon fd: int64) -> none {
+    if _sim is _Sim(sim) {
+        sim.open += [fd]
+    }
+}
+
+// Ends the simulation: the number that stands for its choices.
+func sim_end() -> int64 {
+    mut digest = 0
+    if _sim is _Sim(sim) {
+        digest = sim.digest
+        for fd in sim.open {
+            if fd >= 0 {
+                libc.close(fd)
+            }
+        }
+        for path in sim.paths {
+            libc.unlink(unsafe.c_str(path))
+        }
+        // What a run that failed left waiting.
+        for key in sim.fd_keys {
+            let _gone = _io.remove(key)
+        }
+        for key in sim.timer_keys {
+            let _gone = _io.remove(key)
+        }
+    }
+    _sim = none
+    _scheduling = 0
+    kod_sim_set_clock(-1)
+    return digest
+}
+
+// A number from 0 to n - 1, by the seed (splitmix64), counted in the digest.
+func _sim_rand(anon n: int64) -> int64 {
+    let Some(sim) = _sim else { return 0 }
+    sim.state = sim.state.wrapping_add(-7046029254386353131)
+    mut z = sim.state
+    z = (z ^ (z >> 30)).wrapping_mul(-4658895280553007687)
+    z = (z ^ (z >> 27)).wrapping_mul(-7723592293110705685)
+    z = z ^ (z >> 31)
+    let r = (z >> 1) % n
+    sim.digest = (sim.digest ^ r ^ (n << 20)).wrapping_mul(1099511628211)
+    return r
+}
+
+// kod_task_kq_add, or under a simulation a wait it notes: 0, or -1 for one
+// it can't make (for a child process, say), which the caller then waits for
+// without other tasks running.
+func _add_event(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64 {
+    let Some(sim) = _sim else { return kod_task_kq_add(ident, filter, data, key) }
+    if filter == EVFILT_READ or filter == EVFILT_WRITE {
+        sim.fds += [ident]
+        sim.writes += [if filter == EVFILT_WRITE { 1 } else { 0 }]
+        sim.fd_keys += [key]
+        return 0
+    }
+    if filter == EVFILT_TIMER {
+        sim.due += [sim.now + data]
+        sim.timer_keys += [key]
+        return 0
+    }
+    return -1
+}
+
+// Whether `fd` has something to read (or, `writes`, room to write) now, or
+// is at its end or broken, which the read or write then finds.
+func _sim_fd_ready(anon fd: int64, anon writes: int64) -> bool {
+    let p = unsafe.alloc(8)
+    unsafe.store32(p, fd)
+    unsafe.store32(p + 4, if writes == 1 { _POLLOUT } else { _POLLIN })
+    let n = unsafe.c_int(libc.poll(p, 1, 0))
+    let revents = (unsafe.load32(p + 4) >> 16) & 0xffff
+    unsafe.free(p)
+    return n > 0 and revents != 0
+}
+
+// _poll under a simulation: the tasks whose descriptor can go on now wake,
+// in an order the seed picks; when none can and `block`, the clock moves to
+// the earliest time a task waits for, and those wake. With nothing to wait
+// for, every task waits for another: the run fails.
+func _sim_poll(anon sim: _Sim, block: bool) -> none {
+    mut fds: [int64] = []
+    mut writes: [int64] = []
+    mut keys: [int64] = []
+    mut ready: [int64] = []
+    for k, key in sim.fd_keys {
+        if not _io.contains(key) {
+            continue
+        }
+        if _sim_fd_ready(sim.fds[k], sim.writes[k]) {
+            ready += [k]
+        } else {
+            fds += [sim.fds[k]]
+            writes += [sim.writes[k]]
+            keys += [key]
+        }
+    }
+    // The ready ones, shuffled.
+    for i in len(ready) - 1..=1 step -1 {
+        let j = _sim_rand(i + 1)
+        let t = ready[i]
+        ready[i] = ready[j]
+        ready[j] = t
+    }
+    for k in ready {
+        if _io.remove(sim.fd_keys[k]) is Fiber(fiber) {
+            // Room for a write of a size the seed picks.
+            fiber.io_data = 256 + _sim_rand(769)
+            fiber.io_failed = false
+            _make_ready(fiber)
+        }
+    }
+    sim.fds = fds
+    sim.writes = writes
+    sim.fd_keys = keys
+    if len(ready) > 0 or not block {
+        return
+    }
+    // The timers still waited for, and the earliest.
+    mut due: [int64] = []
+    mut timer_keys: [int64] = []
+    mut next = -1
+    for k, key in sim.timer_keys {
+        if _io.contains(key) {
+            due += [sim.due[k]]
+            timer_keys += [key]
+            if next < 0 or sim.due[k] < next {
+                next = sim.due[k]
+            }
+        }
+    }
+    if next < 0 {
+        sim.timer_keys = timer_keys
+        sim.due = due
+        _scheduling = 0
+        panic("simulation: every task waits, and nothing can wake one")
+    }
+    if next > sim.now {
+        sim.now = next
+        kod_sim_set_clock(next)
+    }
+    mut left_due: [int64] = []
+    mut left_keys: [int64] = []
+    for k, key in timer_keys {
+        if due[k] <= sim.now {
+            if _io.remove(key) is Fiber(fiber) {
+                _make_ready(fiber)
+            }
+        } else {
+            left_due += [due[k]]
+            left_keys += [key]
+        }
+    }
+    sim.due = left_due
+    sim.timer_keys = left_keys
 }

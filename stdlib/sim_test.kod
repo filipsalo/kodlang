@@ -1,0 +1,203 @@
+// stdlib/sim.kod (docs/simulation.md): runs repeat under a seed, time is
+// virtual, connections stay in the program, and a race or a deadlock is found
+// and named by its seed.
+import "net/tcp"
+import "panics"
+import "posix" { Fd }
+import "sim"
+import "stream" { IoError }
+import "time"
+import "time" { Duration, monotonic_ns }
+
+func echo(anon l: tcp.Listener) -> none {
+    let conn = must l.accept()
+    let got = must conn.read(100)
+    must conn.write_all(got)
+    must conn.close()
+}
+
+test "an echo server, simulated" {
+    assert not sim.simulating()
+    sim.run(count: 100, body: func() {
+        assert sim.simulating()
+        let l = must tcp.listen("127.0.0.1", port: 7000)
+        spawn echo(l)
+        let c = must tcp.connect("127.0.0.1", port: 7000)
+        must c.write_str("hi")
+        assert kod_bytes_to_str(must c.read(100)) == "hi"
+        must c.close()
+        must l.close()
+    })
+    assert not sim.simulating()
+}
+
+// Two tasks pass a large amount through one connection each way, so that the
+// small buffers make them wait for each other many times.
+func pump(anon l: tcp.Listener) -> int64 {
+    let conn = must l.accept()
+    mut n = 0
+    for true {
+        let got = must conn.read(65536)
+        if len(got) == 0 {
+            break
+        }
+        n += len(got)
+        must conn.write_all(got)
+    }
+    must conn.close()
+    return n
+}
+
+func drain(anon conn: Fd, anon want: int64) -> int64 {
+    mut n = 0
+    for n < want {
+        n += len(must conn.read(65536))
+    }
+    return n
+}
+
+test "the same seed, the same run; another seed, another" {
+    let body = func() {
+        let l = must tcp.listen("localhost", port: 8080)
+        let serving = spawn pump(l)
+        let c = must tcp.connect("localhost", port: 8080)
+        let piece = kod_str_to_bytes("".join(["0123456789abcdef"] * 2048))
+        let reading = spawn drain(c, 4 * len(piece))
+        for _i in 0..4 {
+            must c.write_all(piece)
+        }
+        assert reading.wait() == 4 * len(piece)
+        must c.close()
+        assert serving.wait() == 4 * len(piece)
+        must l.close()
+    }
+    sim.replay(7, body: body)
+    let first = sim.digest()
+    sim.replay(7, body: body)
+    assert sim.digest() == first
+    mut others: [int64] = []
+    for seed in 0..10 {
+        sim.replay(seed, body: body)
+        if not (sim.digest() in others) {
+            others += [sim.digest()]
+        }
+    }
+    assert len(others) >= 5
+}
+
+test "time is the simulation's, and jumps to the next thing due" {
+    let real = monotonic_ns()
+    sim.run(count: 5, body: func() {
+        let t0 = monotonic_ns()
+        time.sleep(Duration(seconds: 30))
+        assert monotonic_ns() - t0 == 30000000000
+        // A read that times out, after 2 simulated seconds.
+        let l = must tcp.listen("127.0.0.1", port: 9000)
+        let c = must tcp.connect("127.0.0.1", port: 9000)
+        must tcp.set_timeout(c, timeout: Duration(seconds: 2))
+        let t1 = monotonic_ns()
+        let got = c.read(10)
+        assert got is Err(_)
+        if got is Err(e) and e is IoError(io) {
+            assert io.kind is .TimedOut
+        }
+        assert monotonic_ns() - t1 == 2000000000
+        must c.close()
+        must l.close()
+        // The calendar starts at 2026-01-01.
+        assert time.now().to_str().starts_with("2026-01-01")
+    })
+    // Or where it is told to.
+    let when = must time.parse("2031-05-06T07:08:09Z")
+    sim.replay(3, start: when, body: func() {
+        assert time.now().to_str().starts_with("2031-05-06T07:08:09")
+    })
+    // Thirty-odd simulated seconds, five times over, in well under one.
+    assert monotonic_ns() - real < 1000000000
+}
+
+// The seed in a failure's message, `simulation: seed N failed: ...`.
+func failing_seed(anon p: panics.Panic) -> int64 {
+    let after = p.message[len("simulation: seed ")..]
+    let Some(end) = after.find(" ") else { return -1 }
+    return after[..end].parse_int()? or -1
+}
+
+type Counter = shared struct {
+    n: int64 = 0
+}
+
+// Reads the count, lets another task in (by waiting on a connection), and
+// writes it back one more: two at once can lose an update.
+func bump(anon c: Counter, anon conn: Fd) -> int64 {
+    let seen = c.n
+    must conn.write_str("x")
+    c.n = seen + 1
+    return seen
+}
+
+func race() -> none {
+    let l = must tcp.listen("127.0.0.1", port: 6000)
+    let a = must tcp.connect("127.0.0.1", port: 6000)
+    let b = must tcp.connect("127.0.0.1", port: 6000)
+    let count = Counter()
+    let first = spawn bump(count, a)
+    let second = spawn bump(count, b)
+    let _ = first.wait()
+    let _ = second.wait()
+    assert count.n == 2
+    must a.close()
+    must b.close()
+    must l.close()
+}
+
+test "a race shows up under some seed, and its seed shows it again" {
+    let Some(p) = panics.run(func() { sim.run(count: 200, body: race) }) else {
+        fail("no seed lost an update")
+        return
+    }
+    assert p.message.starts_with("simulation: seed ")
+    assert p.message.contains("assertion failed")
+    let seed = failing_seed(p)
+    assert seed >= 0
+    // The seed alone fails the same way, again and again.
+    for _i in 0..3 {
+        assert panics.run(func() { sim.replay(seed, body: race) }) is panics.Panic
+    }
+}
+
+func wait_forever(anon conn: Fd) -> int64 {
+    let _ = conn.read(10)
+    return 0
+}
+
+test "a deadlock fails the run instead of hanging" {
+    let p = panics.run(func() {
+        sim.run(count: 3, body: func() {
+            let l = must tcp.listen("127.0.0.1", port: 5000)
+            let c = must tcp.connect("127.0.0.1", port: 5000)
+            let server = must l.accept()
+            // Each end reads; neither writes.
+            let waiting = spawn wait_forever(server)
+            let _ = c.read(10)
+            let _ = waiting.wait()
+        })
+    })
+    assert p is panics.Panic and (must p).message.contains("every task waits, and nothing can wake one")
+}
+
+test "connections within the program only" {
+    sim.run(count: 3, body: func() {
+        let refused = tcp.connect("127.0.0.1", port: 4444)
+        assert refused is Err(e) and e is IoError(io) and io.kind is .ConnectionRefused
+        assert tcp.connect("example.com", port: 80) is Err(_)
+        let l = must tcp.listen("127.0.0.1", port: 0)
+        assert l.port() > 0
+        let c = must tcp.connect("127.0.0.1", port: l.port())
+        let s = must l.accept()
+        assert tcp.peer(s).starts_with("127.0.0.1:")
+        must c.close()
+        must s.close()
+        must l.close()
+    })
+}

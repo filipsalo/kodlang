@@ -871,6 +871,30 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * is a socket without a limit. A filter of 0 only asks whether the task is cancelled. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
+/* A simulation's clock (stdlib/tasks.kod, docs/simulation.md): the
+ * nanoseconds since it began, which time.monotonic_ns gives instead of the
+ * real clock's; -1 when none is under way. */
+static int64_t kod_sim_clock_ns = -1;
+
+void kod_sim_set_clock(int64_t ns) {
+    kod_sim_clock_ns = ns;
+}
+
+int64_t kod_sim_clock(void) {
+    return kod_sim_clock_ns;
+}
+
+/* Where a simulation's calendar starts, in nanoseconds since 1970. */
+static int64_t kod_sim_epoch_ns = 0;
+
+void kod_sim_set_epoch(int64_t ns) {
+    kod_sim_epoch_ns = ns;
+}
+
+int64_t kod_sim_epoch(void) {
+    return kod_sim_epoch_ns;
+}
+
 // After kod_wait_event gave 1 for a write: how many bytes the descriptor has
 // room for, so that a write of no more doesn't wait; 0 when that isn't known.
 int64_t kod_room = 0;
