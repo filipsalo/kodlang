@@ -1243,6 +1243,11 @@ int64_t kod_wait_room(void) {
     return kod_room;
 }
 
+// What kod_wait_room answers, for the task that goes on (stdlib/tasks.kod).
+void kod_task_set_room(int64_t room) {
+    kod_room = room;
+}
+
 /* Told of a descriptor about to be closed, so that no task waits for it for
  * good: kevent says nothing of it then (stdlib/tasks.c sets the hook). */
 void (*kod_close_hook)(int64_t fd) = 0;
@@ -1252,8 +1257,9 @@ void kod_closing(int64_t fd) {
 }
 
 /* Whether the descriptor kod_wait_event was last called for is a file's, which
- * is always ready: kevent says nothing of one read to its end (tasks.c). */
-int kod_wait_file = 0;
+ * is always ready: kevent says nothing of one read to its end (tasks.kod,
+ * _kq_add). */
+int64_t kod_wait_file = 0;
 
 int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
     if (!kod_wait_hook) return 0;

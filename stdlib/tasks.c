@@ -1,57 +1,16 @@
-/* The stacks and switches behind stdlib/tasks.kod (docs/tasks.md): each task
- * runs on a stack of its own, and a switch saves the registers a call keeps
- * and loads another task's. Which task runs next is the Kod side's choice. */
+/* The switches behind stdlib/tasks.kod (docs/tasks.md): each task runs on a
+ * stack of its own (mapped there), and a switch saves the registers a call
+ * keeps and loads another task's; and the ticker thread that has a busy task
+ * give way. What the scheduler waits on, and which task runs next, is the
+ * Kod side's. */
 
-#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/event.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-
-/* A task's stack: as much as the first thread has, reserved as address space,
- * with a guard page below it that an overflow faults on. */
-#define KOD_TASK_STACK (8 * 1024 * 1024)
 
 /* Saved registers: x19..x28, fp, lr, sp, d8..d15; and the innermost catch. */
 #define KOD_TASK_CTX_WORDS 22
-
-/* Stacks of tasks that have ended, kept for the next ones: mapping a stack and
- * touching its first pages costs more than the rest of starting a task. */
-#define KOD_TASK_STACKS_KEPT 64
-#define KOD_TASK_STACK_HOT (256 * 1024)
-static int64_t kod_stacks_kept[KOD_TASK_STACKS_KEPT];
-static int kod_stacks_kept_n = 0;
-
-/* The base of a new stack (its guard page), or 0 when there is no room. */
-int64_t kod_task_stack_new(void) {
-    if (kod_stacks_kept_n > 0) return kod_stacks_kept[--kod_stacks_kept_n];
-    size_t page = (size_t)getpagesize();
-    void *base = mmap(NULL, KOD_TASK_STACK + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED) return 0;
-    mprotect(base, page, PROT_NONE);
-    return (int64_t)base;
-}
-
-void kod_task_stack_free(int64_t base) {
-    if (base == 0) return;
-    if (kod_stacks_kept_n < KOD_TASK_STACKS_KEPT) {
-        /* Its top pages are what most tasks use. When the task went deeper (the
-         * page below them is in memory), the memory of the rest goes back to the
-         * system. */
-        size_t page = (size_t)getpagesize();
-        char *below = (char *)base + page + KOD_TASK_STACK - KOD_TASK_STACK_HOT - page;
-        char resident = 0;
-        if (mincore(below, page, &resident) == 0 && (resident & MINCORE_INCORE)) {
-            madvise((void *)(base + (int64_t)page), KOD_TASK_STACK - KOD_TASK_STACK_HOT, MADV_FREE);
-        }
-        kod_stacks_kept[kod_stacks_kept_n++] = base;
-        return;
-    }
-    munmap((void *)base, KOD_TASK_STACK + (size_t)getpagesize());
-}
 
 int64_t kod_task_ctx_new(void) {
     return (int64_t)calloc(KOD_TASK_CTX_WORDS, 8);
@@ -73,12 +32,12 @@ __attribute__((naked)) static void kod_task_entry(void) {
         "brk #1\n");
 }
 
-/* Makes `ctx` start kod_task_entry on the stack at `base`. */
-void kod_task_ctx_init(int64_t ctx, int64_t base) {
+/* Makes `ctx` start kod_task_entry on a stack whose top is `top`. */
+void kod_task_ctx_init(int64_t ctx, int64_t top) {
     uint64_t *c = (uint64_t *)ctx;
     c[10] = 0;
     c[11] = (uint64_t)kod_task_entry;
-    c[12] = (uint64_t)base + (uint64_t)getpagesize() + KOD_TASK_STACK;
+    c[12] = (uint64_t)top;
 }
 
 /* Saves this task's registers (and its innermost catch, runtime.c) in `from`
@@ -117,131 +76,6 @@ __attribute__((naked)) void kod_task_switch(int64_t from, int64_t to) {
         "ldp d12, d13, [x1, #136]\n"
         "ldp d14, d15, [x1, #152]\n"
         "ret\n");
-}
-
-/* Waiting for events: one kqueue for the program, each registration one-shot,
- * its udata the key the scheduler finds the waiting task by. */
-static int kod_kq = -1;
-static struct kevent kod_events[64];
-/* Registrations of descriptors that go along with the next wait, so that most cost
- * no call of their own. One that kevent doesn't take comes back as an event. */
-static struct kevent kod_changes[64];
-static int kod_changes_n = 0;
-
-extern int kod_wait_file;
-
-/* The keys last registered for each descriptor, to read it and to write to it:
- * who may wait for it. */
-static int64_t *kod_fd_keys = NULL;
-static int64_t kod_fd_keys_n = 0;
-
-/* The key for reading (0) or writing (1) the descriptor, which is forgotten, as is
- * a registration still to be made; 0 for none. */
-int64_t kod_task_fd_key(int64_t fd, int64_t writes) {
-    int kept = 0;
-    for (int i = 0; i < kod_changes_n; i++) {
-        struct kevent *ev = &kod_changes[i];
-        if ((int64_t)ev->ident == fd && ev->filter == (writes ? EVFILT_WRITE : EVFILT_READ)) continue;
-        kod_changes[kept++] = *ev;
-    }
-    kod_changes_n = kept;
-    int64_t at = 2 * fd + writes;
-    if (fd < 0 || at >= kod_fd_keys_n) return 0;
-    int64_t key = kod_fd_keys[at];
-    kod_fd_keys[at] = 0;
-    return key;
-}
-
-static void kod_fd_keys_set(int64_t fd, int64_t writes, int64_t key) {
-    int64_t at = 2 * fd + writes;
-    if (fd < 0) return;
-    if (at >= kod_fd_keys_n) {
-        int64_t n = 2 * at + 128;
-        int64_t *grown = realloc(kod_fd_keys, (size_t)n * sizeof *grown);
-        if (!grown) return;
-        for (int64_t i = kod_fd_keys_n; i < n; i++) grown[i] = 0;
-        kod_fd_keys = grown;
-        kod_fd_keys_n = n;
-    }
-    kod_fd_keys[at] = key;
-}
-
-/* Registers `filter` on `ident` (a timer is named by `key`, as its ident is
- * free); -1 when it can't come, as for a child that has already exited or a
- * file. Whether a descriptor's can is only known at the next wait
- * (kod_task_kq_failed). */
-int64_t kod_task_kq_add(int64_t ident, int64_t filter, int64_t data, int64_t key) {
-    if ((filter == EVFILT_READ || filter == EVFILT_WRITE) && kod_wait_file) return -1;
-    if (kod_kq < 0) kod_kq = kqueue();
-    if (kod_kq < 0) return -1;
-    uint32_t fflags = 0;
-    if (filter == EVFILT_PROC) fflags = NOTE_EXIT;
-    if (filter == EVFILT_TIMER) {
-        fflags = NOTE_NSECONDS;
-        ident = key;
-    }
-    struct kevent ev, out;
-    EV_SET(&ev, (uintptr_t)ident, (int16_t)filter, EV_ADD | EV_ONESHOT | EV_RECEIPT, fflags, data, (void *)key);
-    if (filter == EVFILT_READ || filter == EVFILT_WRITE) {
-        /* In place of one that a cancelled task left: made later, that would undo this. */
-        int at = 0;
-        while (at < kod_changes_n && (kod_changes[at].ident != ev.ident || kod_changes[at].filter != ev.filter)) at++;
-        if (at < 64) {
-            kod_changes[at] = ev;
-            kod_changes[at].flags = EV_ADD | EV_ONESHOT;
-            if (at == kod_changes_n) kod_changes_n++;
-            kod_fd_keys_set(ident, filter == EVFILT_WRITE, key);
-            return 0;
-        }
-    }
-    int n;
-    do {
-        n = kevent(kod_kq, &ev, 1, &out, 1, NULL);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) return -1;
-    if (n == 1 && (out.flags & EV_ERROR) && out.data != 0) return -1;
-    if (filter == EVFILT_READ || filter == EVFILT_WRITE) kod_fd_keys_set(ident, filter == EVFILT_WRITE, key);
-    return 0;
-}
-
-/* Takes back a timer that has yet to come. */
-void kod_task_kq_drop_timer(int64_t key) {
-    struct kevent ev;
-    EV_SET(&ev, (uintptr_t)key, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-    kevent(kod_kq, &ev, 1, NULL, 0, NULL);
-}
-
-/* Waits for events, until one comes when `block`, else not at all: how many
- * came; kod_task_kq_key gives each one's key. */
-int64_t kod_task_kq_wait(int64_t block) {
-    if (kod_kq < 0) return 0;
-    struct timespec zero = {0, 0};
-    int n;
-    do {
-        n = kevent(kod_kq, kod_changes, kod_changes_n, kod_events, 64, block ? NULL : &zero);
-        /* Whatever it returns, it has been through them all. */
-        kod_changes_n = 0;
-    } while (n < 0 && errno == EINTR);
-    return n < 0 ? 0 : n;
-}
-
-int64_t kod_task_kq_key(int64_t i) {
-    return (int64_t)kod_events[i].udata;
-}
-
-/* Whether event `i` says that its registration wasn't taken. */
-int64_t kod_task_kq_failed(int64_t i) {
-    return (kod_events[i].flags & EV_ERROR) != 0;
-}
-
-int64_t kod_task_kq_data(int64_t i) {
-    return (int64_t)kod_events[i].data;
-}
-
-/* What kod_wait_room answers (runtime.c), for the task that goes on. */
-extern int64_t kod_room;
-void kod_task_set_room(int64_t room) {
-    kod_room = room;
 }
 
 /* The task scheduler's wait (stdlib/tasks.kod), which kod_wait_event calls

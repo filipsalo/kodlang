@@ -1,8 +1,9 @@
 // kod:cc tasks.c
 
 // Tasks: calls that run on stacks of their own and take turns on the one
-// thread (docs/tasks.md). The stacks and the switch are in tasks.c; which
-// task runs next is decided here.
+// thread (docs/tasks.md). The switch between them and the ticker thread are in
+// tasks.c; the stacks, the kqueue they wait on, and which task runs next are
+// here.
 
 import "kod/inspect"
 import "libc"
@@ -11,19 +12,13 @@ import "stream" { IoError }
 import "time" { Duration }
 import "unsafe"
 
-extern func kod_task_stack_new() -> int64
-extern func kod_task_stack_free(anon base: int64) -> none
 extern func kod_task_ctx_new() -> int64
 extern func kod_task_ctx_free(anon ctx: int64) -> none
 extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
 extern func kod_task_switch(anon from: int64, anon to: int64) -> none
-extern func kod_task_kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64
-extern func kod_task_fd_key(anon fd: int64, anon writes: int64) -> int64
-extern func kod_task_kq_drop_timer(anon key: int64) -> none
-extern func kod_task_kq_wait(anon block: int64) -> int64
-extern func kod_task_kq_key(anon i: int64) -> int64
-extern func kod_task_kq_failed(anon i: int64) -> int64
-extern func kod_task_kq_data(anon i: int64) -> int64
+// Whether the descriptor kod_wait_event was last called for is a file's
+// (stdlib/runtime.c), which is always ready.
+extern let kod_wait_file: int64
 extern func kod_task_set_room(anon room: int64) -> none
 extern func kod_task_hook() -> none
 extern func kod_task_set_now(anon stack: int64) -> none
@@ -388,12 +383,12 @@ func _new_fiber() -> Fiber {
         _hooked = true
     }
     _live += 1
-    let stack = kod_task_stack_new()
+    let stack = _stack_new()
     if stack == 0 {
         panic("tasks: no room for another task's stack")
     }
     let fiber = Fiber(ctx: kod_task_ctx_new(), :stack, spawned_at: _spawn_trace())
-    kod_task_ctx_init(fiber.ctx, stack)
+    kod_task_ctx_init(fiber.ctx, stack + libc.getpagesize() + _STACK)
     if _sim is _Sim(sim) and sim.first is Fiber(_first) {
         sim.fibers += [fiber]
     }
@@ -562,7 +557,7 @@ func _reap() -> none {
         return
     }
     for fiber in _dead {
-        kod_task_stack_free(fiber.stack)
+        _stack_free(fiber.stack)
         kod_task_ctx_free(fiber.ctx)
     }
     _dead = []
@@ -927,7 +922,7 @@ func _closing(anon fd: int64) -> none {
         }
     }
     for writes in 0..2 {
-        if _io.remove(kod_task_fd_key(fd, writes)) is Fiber(fiber) {
+        if _io.remove(_fd_key(fd, writes)) is Fiber(fiber) {
             fiber.io_closed = true
             _make_ready(fiber)
         }
@@ -942,17 +937,22 @@ func _poll(anon block: bool) -> none {
         _scheduling -= 1
         return
     }
-    mut wait: int64 = 0
-    if block {
-        wait = 1
+    let q = _kqueue
+    if q == 0 {
+        _scheduling -= 1
+        return
     }
-    let n = kod_task_kq_wait(wait)
-    for i in 0..n {
-        if _io.remove(kod_task_kq_key(i)) is Fiber(fiber) {
-            fiber.io_data = kod_task_kq_data(i)
-            fiber.io_failed = kod_task_kq_failed(i) != 0
+    let n = _kq_wait(q, block)
+    let events = q + _KQ_EVENTS
+    let end = events + n * _KEVENT
+    mut ev = events
+    for ev < end {
+        if _io.remove(unsafe.load64(ev + 24)) is Fiber(fiber) {
+            fiber.io_data = unsafe.load64(ev + 16)
+            fiber.io_failed = (unsafe.load32(ev + 8) & (_EV_ERROR << 16)) != 0
             _make_ready(fiber)
         }
+        ev += _KEVENT
     }
     _scheduling -= 1
 }
@@ -1444,7 +1444,7 @@ type Selector = shared struct {
 func _forget(anon key: int64) -> none {
     if key != 0 and _io.remove(key) is Fiber(_waiting) {
         if _sim is none {
-            kod_task_kq_drop_timer(key)
+            _kq_drop_timer(key)
         }
     }
 }
@@ -1691,7 +1691,7 @@ func _sim_rand(anon n: int64) -> int64 {
 // it can't make (for a child process, say), which the caller then waits for
 // without other tasks running.
 func _add_event(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64 {
-    let Some(sim) = _sim else { return kod_task_kq_add(ident, filter, data, key) }
+    let Some(sim) = _sim else { return _kq_add(ident, filter, data, key) }
     if filter == EVFILT_READ or filter == EVFILT_WRITE {
         sim.fds += [ident]
         sim.writes += [if filter == EVFILT_WRITE { 1 } else { 0 }]
@@ -1810,4 +1810,290 @@ func _sim_poll(anon sim: _Sim, block: bool) -> none {
     }
     sim.due = left_due
     sim.timer_keys = left_keys
+}
+
+// ---- stacks ----
+
+// A task's stack: as much as the first thread has, reserved as address space,
+// with a guard page below it that an overflow faults on.
+let _STACK: int64 = 8 * 1024 * 1024
+// Stacks of tasks that have ended, kept for the next ones: mapping a stack and
+// touching its first pages costs more than the rest of starting a task.
+let _STACKS_KEPT: int64 = 64
+let _STACK_HOT: int64 = 256 * 1024
+let _PROT_NONE: int64 = 0
+let _PROT_READ_WRITE: int64 = 3
+let _MAP_PRIVATE_ANON: int64 = 0x1002
+let _MADV_FREE: int64 = 5
+let _MINCORE_INCORE: int64 = 1
+
+// How many are kept, then their bases: raw memory, as an array's slice or
+// push would allocate for each task.
+mut _stacks_kept: int64 = 0
+
+// The base of a new stack (its guard page), or 0 when there is no room.
+func _stack_new() -> int64 {
+    mut kept = _stacks_kept
+    if kept == 0 {
+        kept = unsafe.alloc(8 * (_STACKS_KEPT + 1))
+        _stacks_kept = kept
+    }
+    let n = unsafe.load64(kept)
+    if n > 0 {
+        unsafe.store64(kept, n - 1)
+        return unsafe.load64(kept + 8 * n)
+    }
+    let page = libc.getpagesize()
+    let base = libc.mmap(0, _STACK + page, _PROT_READ_WRITE, _MAP_PRIVATE_ANON, -1, 0)
+    if base == -1 {
+        return 0
+    }
+    libc.mprotect(base, page, _PROT_NONE)
+    return base
+}
+
+func _stack_free(anon base: int64) -> none {
+    if base == 0 {
+        return
+    }
+    let page = libc.getpagesize()
+    let kept = _stacks_kept
+    let n = unsafe.load64(kept)
+    if n < _STACKS_KEPT {
+        // Its top pages are what most tasks use. When the task went deeper
+        // (the page below them is in memory), the memory of the rest goes back
+        // to the system.
+        let below = base + _STACK - _STACK_HOT
+        let resident = unsafe.alloc(8)
+        if unsafe.c_int(libc.mincore(below, page, resident)) == 0 and (unsafe.load8(resident) & _MINCORE_INCORE) != 0 {
+            libc.madvise(base + page, _STACK - _STACK_HOT, _MADV_FREE)
+        }
+        unsafe.free(resident)
+        unsafe.store64(kept, n + 1)
+        unsafe.store64(kept + 8 * (n + 1), base)
+        return
+    }
+    libc.munmap(base, _STACK + page)
+}
+
+// ---- waiting for events ----
+
+// One kqueue for the program, each registration one-shot, its udata the key
+// the scheduler finds the waiting task by. A struct kevent: ident (8 bytes),
+// filter (2), flags (2), fflags (4), data (8), udata (8).
+let _KEVENT: int64 = 32
+let _KQ_MAX: int64 = 64
+let _EV_ADD: int64 = 1
+let _EV_DELETE: int64 = 2
+let _EV_ONESHOT: int64 = 16
+let _EV_RECEIPT: int64 = 64
+let _EV_ERROR: int64 = 16384
+let _EVFILT_PROC: int64 = -5
+let _NOTE_EXIT: int64 = 0x80000000
+let _NOTE_NSECONDS: int64 = 4
+let _EINTR: int64 = 4
+
+// The kqueue's state, in raw memory, as each wait goes through here: words
+// for the kqueue, how many registrations wait to go with the next kevent, and
+// the size of the key table; then the key table's address; then room for
+// _KQ_MAX events that came, for as many registrations of descriptors that go
+// along with the next wait (so that most cost no call of their own; one that
+// kevent doesn't take comes back as an event), and for one registration made
+// at once, its receipt and a zero timeout. The key table holds the keys last
+// registered for each descriptor, to read it (2 * fd) and to write to it
+// (2 * fd + 1): who may wait for it. 0 until the first registration.
+mut _kqueue: int64 = 0
+
+let _KQ_FD: int64 = 0
+let _KQ_CHANGES_N: int64 = 8
+let _KQ_KEYS_N: int64 = 16
+let _KQ_KEYS: int64 = 24
+let _KQ_EVENTS: int64 = 32
+let _KQ_CHANGES: int64 = 32 + 64 * 32
+let _KQ_ONE: int64 = 32 + 128 * 32
+let _KQ_SIZE: int64 = 32 + 131 * 32
+
+// The kqueue's state, made at first use; 0 if it can't be.
+func _kq_open() -> int64 {
+    let q = _kqueue
+    if q != 0 {
+        return q
+    }
+    let kq = unsafe.c_int(libc.kqueue())
+    if kq < 0 {
+        return 0
+    }
+    let made = unsafe.alloc(_KQ_SIZE)
+    unsafe.store64(made + _KQ_FD, kq)
+    _kqueue = made
+    return made
+}
+
+func _kevent_set(anon ev: int64, ident: int64, filter: int64, flags: int64, fflags: int64, data: int64, udata: int64) -> none {
+    unsafe.store64(ev, ident)
+    unsafe.store32(ev + 8, (filter & 0xffff) | (flags << 16))
+    unsafe.store32(ev + 12, fflags)
+    unsafe.store64(ev + 16, data)
+    unsafe.store64(ev + 24, udata)
+}
+
+func _kevent_flags(anon ev: int64) -> int64 {
+    return (unsafe.load32(ev + 8) >> 16) & 0xffff
+}
+
+// The key for reading (0) or writing (1) the descriptor, which is forgotten,
+// as is a registration still to be made; 0 for none.
+func _fd_key(anon fd: int64, anon writes: int64) -> int64 {
+    let q = _kqueue
+    if q == 0 {
+        return 0
+    }
+    let raw = (if writes == 1 { EVFILT_WRITE } else { EVFILT_READ }) & 0xffff
+    let first = q + _KQ_CHANGES
+    let end = first + unsafe.load64(q + _KQ_CHANGES_N) * _KEVENT
+    mut ev = first
+    mut to = first
+    for ev < end {
+        if not (unsafe.load64(ev) == fd and (unsafe.load32(ev + 8) & 0xffff) == raw) {
+            if to != ev {
+                libc.memmove(to, ev, _KEVENT)
+            }
+            to += _KEVENT
+        }
+        ev += _KEVENT
+    }
+    unsafe.store64(q + _KQ_CHANGES_N, (to - first) / _KEVENT)
+    let at = 2 * fd + writes
+    if fd < 0 or at >= unsafe.load64(q + _KQ_KEYS_N) {
+        return 0
+    }
+    let slot = unsafe.load64(q + _KQ_KEYS) + 8 * at
+    let key = unsafe.load64(slot)
+    unsafe.store64(slot, 0)
+    return key
+}
+
+func _fd_keys_set(anon q: int64, anon fd: int64, anon writes: int64, anon key: int64) -> none {
+    let at = 2 * fd + writes
+    if fd < 0 {
+        return
+    }
+    let n = unsafe.load64(q + _KQ_KEYS_N)
+    if at >= n {
+        let more = 2 * at + 128
+        let grown = unsafe.alloc(8 * more)
+        let old = unsafe.load64(q + _KQ_KEYS)
+        if old != 0 {
+            libc.memmove(grown, old, 8 * n)
+            unsafe.free(old)
+        }
+        unsafe.store64(q + _KQ_KEYS, grown)
+        unsafe.store64(q + _KQ_KEYS_N, more)
+    }
+    unsafe.store64(unsafe.load64(q + _KQ_KEYS) + 8 * at, key)
+}
+
+// Registers `filter` on `ident` (a timer is named by `key`, as its ident is
+// free): 0, or -1 when it can't come, as for a child that has already exited
+// or a file. Whether a descriptor's can is only known at the next wait (its
+// event comes back with EV_ERROR).
+func _kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64 {
+    let fd_filter = filter == EVFILT_READ or filter == EVFILT_WRITE
+    if fd_filter and kod_wait_file != 0 {
+        return -1
+    }
+    let q = _kq_open()
+    if q == 0 {
+        return -1
+    }
+    mut fflags = 0
+    mut id = ident
+    if filter == _EVFILT_PROC {
+        fflags = _NOTE_EXIT
+    }
+    if filter == EVFILT_TIMER {
+        fflags = _NOTE_NSECONDS
+        id = key
+    }
+    let writes = if filter == EVFILT_WRITE { 1 } else { 0 }
+    if fd_filter {
+        // In place of one that a cancelled task left: made later, that would
+        // undo this.
+        // A pointer stepped along, and the filter's 16 bits as they are
+        // stored: no arithmetic to check for overflow in the loop.
+        let raw = filter & 0xffff
+        let first = q + _KQ_CHANGES
+        let n = unsafe.load64(q + _KQ_CHANGES_N)
+        let end = first + n * _KEVENT
+        mut ev = first
+        for ev < end {
+            if unsafe.load64(ev) == id and (unsafe.load32(ev + 8) & 0xffff) == raw {
+                break
+            }
+            ev += _KEVENT
+        }
+        let at = (ev - first) / _KEVENT
+        if at < _KQ_MAX {
+            _kevent_set(ev, ident: id, :filter, flags: _EV_ADD | _EV_ONESHOT, :fflags, :data, udata: key)
+            if at == n {
+                unsafe.store64(q + _KQ_CHANGES_N, n + 1)
+            }
+            _fd_keys_set(q, id, writes, key)
+            return 0
+        }
+    }
+    let one = q + _KQ_ONE
+    let out = one + _KEVENT
+    _kevent_set(one, ident: id, :filter, flags: _EV_ADD | _EV_ONESHOT | _EV_RECEIPT, :fflags, :data, udata: key)
+    let kq = unsafe.load64(q + _KQ_FD)
+    mut n = -1
+    for true {
+        n = unsafe.c_int(libc.kevent(kq, one, 1, out, 1, 0))
+        if n >= 0 or unsafe.errno() != _EINTR {
+            break
+        }
+    }
+    if n < 0 {
+        return -1
+    }
+    if n == 1 and (_kevent_flags(out) & _EV_ERROR) != 0 and unsafe.load64(out + 16) != 0 {
+        return -1
+    }
+    if fd_filter {
+        _fd_keys_set(q, id, writes, key)
+    }
+    return 0
+}
+
+// Takes back a timer that has yet to come.
+func _kq_drop_timer(anon key: int64) -> none {
+    let q = _kqueue
+    if q == 0 {
+        return
+    }
+    _kevent_set(q + _KQ_ONE, ident: key, filter: EVFILT_TIMER, flags: _EV_DELETE, fflags: 0, data: 0, udata: 0)
+    libc.kevent(unsafe.load64(q + _KQ_FD), q + _KQ_ONE, 1, 0, 0, 0)
+}
+
+// Waits for events, until one comes when `block`, else not at all: how many
+// came, from q + _KQ_EVENTS on.
+func _kq_wait(anon q: int64, anon block: bool) -> int64 {
+    // The third slot after _KQ_ONE is zeros: a timeout of none.
+    mut timeout = q + _KQ_ONE + 2 * _KEVENT
+    if block {
+        timeout = 0
+    }
+    let kq = unsafe.load64(q + _KQ_FD)
+    for true {
+        let n = unsafe.c_int(libc.kevent(kq, q + _KQ_CHANGES, unsafe.load64(q + _KQ_CHANGES_N), q + _KQ_EVENTS, _KQ_MAX, timeout))
+        // Whatever it returns, it has been through them all.
+        unsafe.store64(q + _KQ_CHANGES_N, 0)
+        if n >= 0 {
+            return n
+        }
+        if unsafe.errno() != _EINTR {
+            return 0
+        }
+    }
+    return 0
 }
