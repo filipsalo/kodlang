@@ -349,8 +349,8 @@ and RSA-PSS signatures from the server. It doesn't resume sessions or send early
 data; a server that asks for a client certificate gets none. `s.session` is
 the `tls13.Session`, whose `client` holds what the handshake found, such as
 the server's `certificates` and the cipher `suite`. A handshake costs
-about 1 to 8 ms of CPU: 0.3 ms for X25519 and the rest checking signatures,
-0.1 to 0.25 ms each for RSA, 1.7 ms on P-256 and 3.6 ms on P-384. The first in
+about 0.5 to 7 ms of CPU: 0.3 ms for X25519 and the rest checking signatures,
+0.1 to 0.25 ms each for RSA, 0.6 ms on P-256 and 3 ms on P-384. The first in
 a program also reads the system's roots, another 75 ms.
 
 The server's side is `accept`, on a connection that [`net/tcp`](#tcp) accepted:
@@ -386,10 +386,10 @@ exchange, is sent an alert (`protocol_version` or `handshake_failure`) and
 2018. `s.session.server` holds what a handshake found, such as the
 `server_name` the client asked for. The client isn't asked for a certificate.
 
-A server handshake costs about 0.9 ms of CPU with a P-256 key (0.55 ms for the
+A server handshake costs about 0.6 ms of CPU with a P-256 key (0.25 ms for the
 signature, 0.3 ms for X25519) and about 4 ms with an RSA key of 2048 bits. With
 an EC key the first handshake in a program also makes a table of multiples of
-the curve's generator, about 5 ms, which the signatures after it use.
+the curve's generator, about 2 ms, which the signatures after it use.
 
 Several tasks can use streams at the same time, and one may read a stream while another
 writes to it; two writing to one stream at the same time isn't supported.

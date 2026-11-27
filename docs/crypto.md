@@ -220,8 +220,8 @@ enough to give the key away. Signing does the same steps whatever the key and
 nonce are: the multiplication by the nonce adds one precomputed multiple of
 the generator for every 4 bits, picked by looking at all 16 and keeping one by
 masks, with formulas that have no special cases (Renes, Costello and Batina,
-2016). It takes about 0.55 ms on P-256 and 1.2 ms on P-384, after a table
-that the first signature on a curve makes (about 5 ms on P-256).
+2016). It takes about 0.25 ms on P-256 and 1 ms on P-384, after a table
+that the first signature on a curve makes (about 2 ms on P-256).
 
 A signature must be strict DER: a length in long form, an integer with a 0 byte
 it doesn't need, a negative one, or bytes after the end is refused, so that a
@@ -229,7 +229,7 @@ signature has one encoding.
 
 Both modules are checked against Wycheproof's test vectors, which aim at the
 mistakes signature checks are known for. Checking takes about 0.11 ms for an
-RSA signature of 2048 bits and 0.24 ms for 3072, 1.7 ms for P-256 and 3.6 ms
+RSA signature of 2048 bits and 0.24 ms for 3072, 0.6 ms for P-256 and 3 ms
 for P-384.
 
 ## Certificates: `crypto/x509`
