@@ -1209,60 +1209,13 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * EVFILT_TIMER for nanoseconds; EVFILT_PROC on a child); 1 means the task
  * waited for the event while others ran, 0 that the caller should just block,
  * as it does without tasks, 2 that the task is cancelled, 3 that the time
- * ran out first, and 4 that another task has closed the descriptor. A socket's own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the
- * limit for a descriptor given 0, as it is for a read that blocks; one given -1
- * is a socket without a limit. A filter of 0 only asks whether the task is cancelled. */
+ * ran out first, and 4 that another task has closed the descriptor. A socket's
+ * own timeout (SO_RCVTIMEO, SO_SNDTIMEO) is the limit for a descriptor given 0,
+ * as it is for a read that blocks (tasks.kod, _wait_limit); one given -1 is a
+ * socket without a limit. A filter of 0 only asks whether the task is
+ * cancelled. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
 
-/* Under a simulation, crypto/random's bytes come from its seed (splitmix64),
- * so that a run repeats: kod_sim_random fills `buf` and gives 1, or gives 0
- * when no simulation is under way. */
-static int kod_sim_random_on = 0;
-static uint64_t kod_sim_random_state = 0;
-
-void kod_sim_set_random(int64_t on, int64_t seed) {
-    kod_sim_random_on = (int)on;
-    kod_sim_random_state = (uint64_t)seed ^ 0x5eed5eed5eed5eedULL;
-}
-
-int64_t kod_sim_random(uint8_t *buf, int64_t n) {
-    if (!kod_sim_random_on) return 0;
-    for (int64_t i = 0; i < n; i++) {
-        if (i % 8 == 0) {
-            kod_sim_random_state += 0x9e3779b97f4a7c15ULL;
-        }
-        uint64_t z = kod_sim_random_state;
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        z ^= z >> 31;
-        buf[i] = (uint8_t)(z >> (8 * (i % 8)));
-    }
-    return 1;
-}
-
-/* A simulation's clock (stdlib/tasks.kod, docs/simulation.md): the
- * nanoseconds since it began, which time.monotonic_ns gives instead of the
- * real clock's; -1 when none is under way. */
-static int64_t kod_sim_clock_ns = -1;
-
-void kod_sim_set_clock(int64_t ns) {
-    kod_sim_clock_ns = ns;
-}
-
-int64_t kod_sim_clock(void) {
-    return kod_sim_clock_ns;
-}
-
-/* Where a simulation's calendar starts, in nanoseconds since 1970. */
-static int64_t kod_sim_epoch_ns = 0;
-
-void kod_sim_set_epoch(int64_t ns) {
-    kod_sim_epoch_ns = ns;
-}
-
-int64_t kod_sim_epoch(void) {
-    return kod_sim_epoch_ns;
-}
 
 // After kod_wait_event gave 1 for a write: how many bytes the descriptor has
 // room for, so that a write of no more doesn't wait; 0 when that isn't known.
@@ -1284,24 +1237,6 @@ void kod_closing(int64_t fd) {
     if (kod_close_hook) kod_close_hook(fd);
 }
 
-/* Whether the descriptor kod_wait_event was last called for is a file's, which
- * is always ready: kevent says nothing of one read to its end (tasks.kod,
- * _kq_add). */
-int64_t kod_wait_file = 0;
-
 int64_t kod_wait_event(int64_t ident, int64_t filter, int64_t data) {
-    if (!kod_wait_hook) return 0;
-    kod_wait_file = 0;
-    if ((filter == -1 || filter == -2) && data == 0) {
-        struct timeval tv = {0, 0};
-        socklen_t size = sizeof tv;
-        int option = filter == -1 ? SO_RCVTIMEO : SO_SNDTIMEO;
-        if (getsockopt((int)ident, SOL_SOCKET, option, &tv, &size) == 0) {
-            data = (int64_t)tv.tv_sec * 1000000000 + (int64_t)tv.tv_usec * 1000;
-        } else {
-            struct stat st;
-            kod_wait_file = fstat((int)ident, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode));
-        }
-    }
-    return kod_wait_hook(ident, filter, data);
+    return kod_wait_hook ? kod_wait_hook(ident, filter, data) : 0;
 }

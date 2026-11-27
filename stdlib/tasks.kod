@@ -5,10 +5,12 @@
 // tasks.c; the stacks, the kqueue they wait on, and which task runs next are
 // here.
 
+import "crypto/random"
 import "kod/inspect"
 import "libc"
 import "panics"
 import "stream" { IoError }
+import "time"
 import "time" { Duration }
 import "unsafe"
 
@@ -16,21 +18,15 @@ extern func kod_task_ctx_new() -> int64
 extern func kod_task_ctx_free(anon ctx: int64) -> none
 extern func kod_task_ctx_init(anon ctx: int64, anon base: int64) -> none
 extern func kod_task_switch(anon from: int64, anon to: int64) -> none
-// Whether the descriptor kod_wait_event was last called for is a file's
-// (stdlib/runtime.c), which is always ready.
-extern let kod_wait_file: int64
 extern func kod_task_set_room(anon room: int64) -> none
 extern func kod_task_hook() -> none
 extern func kod_task_set_now(anon stack: int64) -> none
 extern func kod_panic_uncaught(anon msg: str) -> none
 extern func kod_eprint(anon s: str) -> none
-extern func kod_sim_set_clock(anon ns: int64) -> none
-extern func kod_sim_set_epoch(anon ns: int64) -> none
 extern func kod_poll_set(anon flag: int64, anon budget: int64, anon store_budget: int64) -> none
 extern func kod_poll_simulate(anon on: int64) -> none
 extern func kod_poll_after_store() -> int64
 extern func kod_sim_reach(anon job: Job) -> none
-extern func kod_sim_set_random(anon on: int64, anon seed: int64) -> none
 extern func _inspect_caller_fp() -> int64
 extern func _inspect_read_i64(anon addr: int64) -> int64
 
@@ -833,7 +829,8 @@ func _park() -> none {
 // task is cancelled, and the caller gives up with `.Cancelled`; or 3 when the
 // descriptor's limit of `data` nanoseconds passed first, and the caller gives
 // up with `.TimedOut`; or 4 when another task has closed the descriptor.
-func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int64 {
+func _wait_event(anon ident: int64, anon filter: int64, anon data_given: int64) -> int64 {
+    let data = _wait_limit(ident, :filter, data: data_given)
     let me = _running()
     if me.cancelled {
         return 2
@@ -903,6 +900,47 @@ func _wait_event(anon ident: int64, anon filter: int64, anon data: int64) -> int
     }
     kod_task_set_room(me.io_data)
     return 1
+}
+
+// Whether the descriptor _wait_event was last called for is a file's, which
+// is always ready: kevent says nothing of one read to its end (_kq_add).
+mut _waiting_file: bool = false
+// Room for a struct timeval and its size, or a struct stat (_wait_limit).
+mut _wait_scratch: int64 = 0
+
+let _SOL_SOCKET: int64 = 0xffff
+let _SO_SNDTIMEO: int64 = 0x1005
+let _SO_RCVTIMEO: int64 = 0x1006
+let _STAT_SIZE: int64 = 144
+let _S_IFMT: int64 = 0xf000
+let _S_IFREG: int64 = 0x8000
+let _S_IFDIR: int64 = 0x4000
+
+// A descriptor's limit for a wait given 0: a socket's own timeout
+// (SO_RCVTIMEO, SO_SNDTIMEO), as for a read that blocks, in nanoseconds, or
+// 0 for none. A descriptor that isn't a socket has none; a file's is noted.
+func _wait_limit(anon ident: int64, filter: int64, data: int64) -> int64 {
+    _waiting_file = false
+    if not ((filter == EVFILT_READ or filter == EVFILT_WRITE) and data == 0) {
+        return data
+    }
+    mut scratch = _wait_scratch
+    if scratch == 0 {
+        scratch = unsafe.alloc(_STAT_SIZE)
+        _wait_scratch = scratch
+    }
+    let option = if filter == EVFILT_READ { _SO_RCVTIMEO } else { _SO_SNDTIMEO }
+    unsafe.store64(scratch, 0)
+    unsafe.store64(scratch + 8, 0)
+    unsafe.store32(scratch + 16, 16)
+    if unsafe.c_int(libc.getsockopt(ident, _SOL_SOCKET, option, scratch, scratch + 16)) == 0 {
+        return unsafe.load64(scratch) * 1000000000 + unsafe.c_int(unsafe.load32(scratch + 8)) * 1000
+    }
+    if unsafe.c_int(libc.fstat(ident, scratch)) == 0 {
+        let kind = unsafe.load32(scratch + 4) & _S_IFMT
+        _waiting_file = kind == _S_IFREG or kind == _S_IFDIR
+    }
+    return 0
 }
 
 // The descriptor is about to be closed (runtime.c, kod_closing): the tasks that wait
@@ -1534,8 +1572,8 @@ func sim_begin(anon seed: int64, epoch_ns: int64) -> none {
     _sim_gen += 1
     let sim = _Sim(:seed, state: seed.wrapping_mul(-7046029254386353131).wrapping_add(1))
     _sim = sim
-    kod_sim_set_epoch(epoch_ns)
-    kod_sim_set_clock(0)
+    time.sim_set_epoch(epoch_ns)
+    time.sim_set_clock(0)
     // The longest a task runs before it is preempted: 32 checks under some
     // seeds, some hundred thousand under others.
     sim.rate = 4 + _sim_rand(14)
@@ -1550,7 +1588,7 @@ func sim_begin(anon seed: int64, epoch_ns: int64) -> none {
     }
     // The running task's priority is from an earlier run, if any.
     _running().prio = 0
-    kod_sim_set_random(1, seed)
+    random.sim_seed(on: true, :seed)
     kod_poll_simulate(1)
     kod_poll_set(1, _sim_budget(sim), _sim_store_budget(sim))
 }
@@ -1604,10 +1642,11 @@ func sim_end() -> int64 {
     }
     _sim = none
     _scheduling = 0
-    kod_sim_set_random(0, 0)
     kod_poll_simulate(0)
     kod_poll_set(0, 1, _NEVER)
-    kod_sim_set_clock(-1)
+    // Kod with checks of its own: once the simulation's preemption is off.
+    random.sim_seed(on: false, seed: 0)
+    time.sim_set_clock(-1)
     return digest
 }
 
@@ -1794,7 +1833,7 @@ func _sim_poll(anon sim: _Sim, block: bool) -> none {
     }
     if next > sim.now {
         sim.now = next
-        kod_sim_set_clock(next)
+        time.sim_set_clock(next)
     }
     mut left_due: [int64] = []
     mut left_keys: [int64] = []
@@ -1999,7 +2038,7 @@ func _fd_keys_set(anon q: int64, anon fd: int64, anon writes: int64, anon key: i
 // event comes back with EV_ERROR).
 func _kq_add(anon ident: int64, anon filter: int64, anon data: int64, anon key: int64) -> int64 {
     let fd_filter = filter == EVFILT_READ or filter == EVFILT_WRITE
-    if fd_filter and kod_wait_file != 0 {
+    if fd_filter and _waiting_file {
         return -1
     }
     let q = _kq_open()

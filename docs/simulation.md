@@ -69,7 +69,7 @@ a longer hunt now and then.
   reachable from such a value. A struct a task made and kept to itself
   doesn't count, and only the last store before a check is looked at (with
   eight marks, one per store site in turn, instead of one, the seeds that
-  find the TLS bug below were the same 52). So a race between two tasks that
+  find the TLS bug below were the same 52 when measured). So a race between two tasks that
   read and write the same data without waiting in between shows up under
   some seed too, and that
   seed preempts at the same places again. The store itself is never cut in
@@ -271,7 +271,7 @@ ends, as at any function's end.
 
 With a bug fixed on 2026-11-27 put back (a TLS reader that sent records a
 writer had queued but not yet sent, while the writer had been preempted
-between the two), 52 of 200 seeds of a connection writing and reading at
+between the two), 55 of 200 seeds of a connection writing and reading at
 once deadlock. The window is a few checks among hundreds of thousands: none
 of 200 seeds found it without the preemption after stores, nor without
 priorities, and 32 did while stores to every shared struct counted.

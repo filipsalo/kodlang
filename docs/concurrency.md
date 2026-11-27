@@ -369,7 +369,7 @@ the page and its fault handler went.
 Counting alone rarely finds a race whose window is a few checks among
 hundreds of thousands, such as a writer preempted between queueing records
 and sending them (a TLS bug, put back on purpose: 0 of 200 seeds). Three
-things find it, in 52 of 200 seeds (54 before the simulated disk moved where seeds preempt):
+things find it, in 55 of 200 seeds (the count moves a little as code changes where seeds preempt):
 
 - A store to a `shared struct`'s field or a module-level variable sets a
   word to the struct's address (`adrp`, `str`: no branch; for a variable,
