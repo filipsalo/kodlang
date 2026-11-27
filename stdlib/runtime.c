@@ -103,7 +103,9 @@ void kod_sim_reach(void *p) {
         void *o = stack[--n];
         if (!kod_is_counted(o)) continue;
         uint8_t *mark = kod_reach_map + (((uint64_t)o & 0xfffffffffULL) >> 4);
-        if (*mark) continue;
+        // The root is looked into even when marked: it may be new, in the
+        // memory of a marked object that has been freed (marks stay).
+        if (*mark && seen > 0) continue;
         *mark = 1;
         seen++;
         uint32_t info = ((uint32_t *)o)[-1];

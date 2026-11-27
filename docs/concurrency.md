@@ -369,7 +369,7 @@ the page and its fault handler went.
 Counting alone rarely finds a race whose window is a few checks among
 hundreds of thousands, such as a writer preempted between queueing records
 and sending them (a TLS bug, put back on purpose: 0 of 200 seeds). Three
-things find it, in 54 of 200 seeds:
+things find it, in 52 of 200 seeds (54 before the simulated disk moved where seeds preempt):
 
 - A store to a `shared struct`'s field or a module-level variable sets a
   word to the struct's address (`adrp`, `str`: no branch; for a variable,
@@ -379,7 +379,9 @@ things find it, in 54 of 200 seeds:
   tasks reach is known only at run time: under a simulation, `spawn` marks
   what the new task's body refers to, and all it refers to in turn, in a
   byte map beside the counted heap (one byte for 16 bytes, address space
-  reserved per run). The preemption is at the check, never between the store and the
+  reserved per run), and so does a channel's send for the value sent. Marks
+  stay when an object is freed, so the walk always looks into the object
+  it starts from, which may be new in a marked one's memory. The preemption is at the check, never between the store and the
   next one, so the simulation interleaves only as a real run could.
 - Under half the seeds tasks run by priority (PCT): the highest ready one,
   a preempted one dropping below the rest, so that a writer can run on while
