@@ -1,12 +1,31 @@
 // The DWARF the compiler writes (docs/debugging.md), as macOS's own tools read
 // it: lldb resolving breakpoints and dwarfdump checking the sections, and,
 // where Developer Mode lets lldb run the program, the values it shows.
+import "io"
 import "process"
 
 let KOD: str = "build/apps/kod/kod"
 let SOURCE: str = "tests/support/debug_target.kod"
 let PROGRAM: str = "build/apps/debug_target/debug_target"
 let OBJECT: str = "build/apps/debug_target/debug_target.obj/tests/support/debug_target.kod.o"
+
+// The line of the target that holds `text`, found so that the tests don't
+// break when the target grows.
+func line_of(anon text: str) -> int64 {
+    let source = must io.read_file(SOURCE)
+    for k, line in source.lines() {
+        if line.contains(text) {
+            return k + 1
+        }
+    }
+    fail(f"no line holds `{text}`")
+    return 0
+}
+
+// `debug_target.kod:N` for the line that holds `text`.
+func at(anon text: str) -> str {
+    return f"debug_target.kod:{line_of(text)}"
+}
 
 func build() -> none {
     let made = must process.output([KOD, "build", SOURCE])
@@ -34,15 +53,18 @@ test "the object's DWARF verifies" {
 
 test "breakpoints on Kod lines and functions" {
     build()
-    let out = lldb(["b debug_target.kod:19", "b debug_target.kod:20", "b debug_target.kod:8"])
-    assert out.contains("at debug_target.kod:19")
-    assert out.contains("at debug_target.kod:20")
-    assert out.contains("at debug_target.kod:8")
+    let bump_call = at("c.bump(by: triple(2))")
+    let print_n = at("print(f\"{c.n}\")")
+    let bump_body = at("self.n += by")
+    let out = lldb([f"b {bump_call}", f"b {print_n}", f"b {bump_body}"])
+    assert out.contains(f"at {bump_call}")
+    assert out.contains(f"at {print_n}")
+    assert out.contains(f"at {bump_body}")
     // By name, at the function's first statement; a method by its type's
     // name and its own.
     let named = lldb(["b triple", "b Counter.bump"])
-    assert named.contains("triple + ") and named.contains("at debug_target.kod:13")
-    assert named.contains("Counter.bump + ") and named.contains("at debug_target.kod:8")
+    assert named.contains("triple + ") and named.contains(f"at {at("let y = x * 3")}")
+    assert named.contains("Counter.bump + ") and named.contains(f"at {bump_body}")
 }
 
 test "a line for every statement, in the right file" {
@@ -50,7 +72,7 @@ test "a line for every statement, in the right file" {
     let dumped = must process.output(["/usr/bin/dwarfdump", "--debug-line", OBJECT])
     let table = dumped.stdout
     assert table.contains("debug_target.kod")
-    for line in [8, 18, 19, 20, 21] {
+    for line in [line_of("self.n += by"), line_of("mut c = Counter(n: 1)"), line_of("c.bump(by: triple(2))"), line_of("print(f\"{c.n}\")"), line_of("print(kinds(2))")] {
         mut found = false
         for row in table.lines() {
             let cols = row.split_whitespace()
@@ -86,19 +108,24 @@ test "under lldb: the stack, stepping and the variables' values" {
         return
     }
     build()
-    let out = lldb(["b debug_target.kod:8", "b debug_target.kod:35", "b debug_target.kod:50", "run", "bt", "frame variable", "next", "continue", "frame variable", "p xs.ptr[3]", "p *words.ptr[1]", "continue", "frame variable", "p *pet.tags->ptr[1]", "p *pet.owner", "kill"])
+    let bump_body = at("self.n += by")
+    let kinds_print = at("print(f\"{count} {flag}")
+    let pets_print = at("print(f\"{pet.name}")
+    let out = lldb([f"b {bump_body}", f"b {kinds_print}", f"b {pets_print}", "run", "bt", "frame variable", "next", "continue", "frame variable", "p xs.ptr[3]", "p *words.ptr[1]", "continue", "frame variable", "p *pet.tags->ptr[1]", "p *pet.owner", "kill"])
     // In Counter.bump, called from main, with self holding n = 1 before the bump.
-    assert out.contains("Counter.bump(self=") and out.contains("at debug_target.kod:8")
-    assert out.contains("main at debug_target.kod:19")
+    assert out.contains("Counter.bump(self=") and out.contains(f"at {bump_body}")
+    assert out.contains(f"main at {at("c.bump(by: triple(2))")}")
     assert out.contains("(Counter) self = (n = 1)")
     // `by` is kept in a register: still shown, while the register holds it.
     assert out.contains("(long) by = 6")
     // `next` goes back to main's next line.
-    assert out.contains("main at debug_target.kod:20")
+    assert out.contains(f"main at {at("print(f\"{c.n}\")")}")
     // In kinds: numbers in registers, a str, an [int64] and a [str]; `n`,
     // whose last use is behind, is no longer anywhere.
     assert out.contains("(long) count = 42") and out.contains("(bool) flag = true") and out.contains("(double) ratio = 2.5")
     assert out.contains("(long) n = <variable not available>")
+    // `total` was summed into one register and copied into its own later.
+    assert out.contains("(long) total = 9")
     assert out.contains("(str) name = (buf = \"kod\", len = 3)")
     assert out.contains("len = 4") and out.contains("(long) 42")
     assert out.contains("(buf = \"bc\", len = 2)")
@@ -124,4 +151,19 @@ test "under lldb: a panic stops the program where it happened" {
     // Without a debugger it ends as ever.
     let alone = must process.output(["build/apps/debug_panic/debug_panic"])
     assert alone.status == 1 and alone.stderr.contains("panic: index 7")
+}
+
+test "under lldb: optionals and enums" {
+    if not can_run() {
+        print("  (Developer Mode is off: lldb can't run the program, so nothing is checked)")
+        return
+    }
+    build()
+    let out = lldb([f"b {at("print(f\"{f? or 0.0}")}", "run", "frame variable f none_yet s t", "kill"])
+    // An optional shows what it holds; none, nothing.
+    assert out.contains("(float64?) f = (value = 1.5)")
+    assert out.contains("(int64?) none_yet = (value = <parent is NULL>)")
+    // An enum, its variant by name and that variant's fields.
+    assert out.contains("tag = Circle") and out.contains("Circle = (radius = 7)")
+    assert out.contains("tag = Rect") and out.contains("w = 2")
 }

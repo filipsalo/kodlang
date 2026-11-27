@@ -42,24 +42,29 @@ type Function = struct {
 
 // A parameter or local in a frame slot, `offset` bytes from the frame
 // pointer, and the name of its type (a Type of the unit). One the compiler
-// keeps in a register instead is in register `reg` (its DWARF number) from
-// the label `from` to the label `to`, and nowhere a debugger can see outside.
+// keeps in registers instead is in register `regs[k]` (its DWARF number)
+// from the label `froms[k]` to the label `tos[k]`, and nowhere a debugger can
+// see outside those.
 type Variable = struct {
     name: str
     type_name: str
     offset: int64
     param: bool
-    reg: int64 = -1
-    from: str = ""
-    to: str = ""
+    regs: [int64] = []
+    froms: [str] = []
+    tos: [str] = []
 }
 
 // A type of a unit, by the name Kod gives it, and how it is laid out (a
-// SHAPE_): an int64, a bool, a float64; a str (or bytes), an array or a
-// struct, each a pointer to what it holds; or anything else, which a
-// debugger shows as an address. An array has its element's type, `elem`
-// (an int64, bool, float64 or str), and a struct its fields: their names,
-// offsets and types' names.
+// SHAPE_): an int64, a bool, a float64; a str (or bytes), an array, a
+// struct, an optional or an enum, each a pointer to what it holds; or
+// anything else, which a debugger shows as an address. An array has its
+// element's type, `elem` (an int64, bool, float64 or str), and an optional
+// the type of what it holds, as its cell's first word; a struct has its
+// fields: their names, offsets and types' names. An enum's cell is its
+// variant's number and then that variant's fields: for each variant, its
+// name, number, and its fields' names, offsets from the fields' start and
+// types.
 type Type = struct {
     name: str
     shape: int64
@@ -68,6 +73,11 @@ type Type = struct {
     field_offsets: [int64] = []
     field_types: [str] = []
     size: int64 = 8
+    variants: [str] = []
+    numbers: [int64] = []
+    variant_fields: [[str]] = []
+    variant_offsets: [[int64]] = []
+    variant_types: [[str]] = []
 }
 
 let SHAPE_INT: int64 = 0
@@ -77,10 +87,12 @@ let SHAPE_STR: int64 = 3
 let SHAPE_ARRAY: int64 = 4
 let SHAPE_STRUCT: int64 = 5
 let SHAPE_OTHER: int64 = 6
+let SHAPE_OPTIONAL: int64 = 7
+let SHAPE_ENUM: int64 = 8
 
 // Whether a value of `t` is a pointer to what a debugger shows of it.
 func points(anon t: Type) -> bool {
-    return t.shape == SHAPE_STR or t.shape == SHAPE_ARRAY or t.shape == SHAPE_STRUCT
+    return t.shape == SHAPE_STR or t.shape == SHAPE_ARRAY or t.shape == SHAPE_STRUCT or t.shape == SHAPE_OPTIONAL or t.shape == SHAPE_ENUM
 }
 
 // A section's bytes, and the labels whose 8-byte addresses are among them:
@@ -255,6 +267,8 @@ let FORM_FLAG_PRESENT: int64 = 0x19
 let FORM_DATA1: int64 = 0x0b
 let FORM_REF4: int64 = 0x13
 let FORM_EXPRLOC: int64 = 0x18
+let FORM_SDATA: int64 = 0x0d
+let FORM_UDATA: int64 = 0x0f
 let TAG_FORMAL_PARAMETER: int64 = 0x05
 let TAG_MEMBER: int64 = 0x0d
 let TAG_POINTER_TYPE: int64 = 0x0f
@@ -262,6 +276,10 @@ let TAG_STRUCTURE_TYPE: int64 = 0x13
 let TAG_TYPEDEF: int64 = 0x16
 let TAG_BASE_TYPE: int64 = 0x24
 let TAG_VARIABLE: int64 = 0x34
+let TAG_ENUMERATION_TYPE: int64 = 0x04
+let TAG_UNION_TYPE: int64 = 0x17
+let TAG_ENUMERATOR: int64 = 0x28
+let AT_CONST_VALUE: int64 = 0x1c
 let AT_LOCATION: int64 = 0x02
 let AT_BYTE_SIZE: int64 = 0x0b
 let AT_DATA_MEMBER_LOCATION: int64 = 0x38
@@ -342,6 +360,11 @@ let ABBREV_TYPEDEF: int64 = 9
 // A parameter and a local whose location is a list in __debug_loc.
 let ABBREV_PARAMETER_LIST: int64 = 10
 let ABBREV_VARIABLE_LIST: int64 = 11
+// An enumeration (its enumerators its children), an enumerator, a union (its
+// members its children).
+let ABBREV_ENUMERATION: int64 = 12
+let ABBREV_ENUMERATOR: int64 = 13
+let ABBREV_UNION: int64 = 14
 
 func abbrevs() -> Section {
     let s = Section()
@@ -355,11 +378,14 @@ func abbrevs() -> Section {
     s.bytes([ABBREV_VARIABLE, TAG_VARIABLE, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_EXPRLOC, 0, 0])
     s.bytes([ABBREV_BASE, TAG_BASE_TYPE, 0, AT_NAME, FORM_STRING, AT_ENCODING, FORM_DATA1, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
     s.bytes([ABBREV_POINTER, TAG_POINTER_TYPE, 0, AT_TYPE, FORM_REF4, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
-    s.bytes([ABBREV_STRUCT, TAG_STRUCTURE_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
-    s.bytes([ABBREV_MEMBER, TAG_MEMBER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_DATA_MEMBER_LOCATION, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_STRUCT, TAG_STRUCTURE_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_UDATA, 0, 0])
+    s.bytes([ABBREV_MEMBER, TAG_MEMBER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_DATA_MEMBER_LOCATION, FORM_UDATA, 0, 0])
     s.bytes([ABBREV_TYPEDEF, TAG_TYPEDEF, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, 0, 0])
     s.bytes([ABBREV_PARAMETER_LIST, TAG_FORMAL_PARAMETER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
     s.bytes([ABBREV_VARIABLE_LIST, TAG_VARIABLE, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
+    s.bytes([ABBREV_ENUMERATION, TAG_ENUMERATION_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
+    s.bytes([ABBREV_ENUMERATOR, TAG_ENUMERATOR, 0, AT_NAME, FORM_STRING, AT_CONST_VALUE, FORM_SDATA, 0, 0])
+    s.bytes([ABBREV_UNION, TAG_UNION_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_UDATA, 0, 0])
     s.byte(0)
     return s
 }
@@ -434,14 +460,18 @@ type Types = shared struct {
     }
 
     // A struct `size` bytes long, its members named and of the types at their offsets.
-    func record(self, anon name: str, size: int64, members: [str], offsets: [int64], types: [int64]) -> int64 {
+    func record(self, anon name: str, size: int64, members: [str], offsets: [int64], types: [int64], union: bool = false) -> int64 {
         let key = f"struct {name}"
         let found = self.find(key)
         if found >= 0 {
             return found
         }
         let at = self.here(key)
-        self.s.byte(ABBREV_STRUCT)
+        mut abbrev = ABBREV_STRUCT
+        if union {
+            abbrev = ABBREV_UNION
+        }
+        self.s.byte(abbrev)
         self.s.bytes(cstr(name))
         self.s.bytes(uleb(size))
         for k, m in members {
@@ -449,6 +479,26 @@ type Types = shared struct {
             self.s.bytes(cstr(m))
             self.s.bytes(u32(types[k]))
             self.s.bytes(uleb(offsets[k]))
+        }
+        self.s.byte(0)
+        return at
+    }
+
+    // An enumeration of 8 bytes: each name stands for its number.
+    func enumeration(self, anon name: str, names: [str], numbers: [int64]) -> int64 {
+        let key = f"enum {name}"
+        let found = self.find(key)
+        if found >= 0 {
+            return found
+        }
+        let at = self.here(key)
+        self.s.byte(ABBREV_ENUMERATION)
+        self.s.bytes(cstr(name))
+        self.s.byte(8)
+        for k, n in names {
+            self.s.byte(ABBREV_ENUMERATOR)
+            self.s.bytes(cstr(n))
+            self.s.bytes(sleb(numbers[k]))
         }
         self.s.byte(0)
         return at
@@ -486,6 +536,41 @@ type Types = shared struct {
         if t.shape == SHAPE_ARRAY {
             let elem = self.member(t.elem, all: all, depth: depth + 1)
             return self.record(name, size: 24, members: ["ptr", "len", "cap"], offsets: [0, 8, 16], types: [self.pointer(elem), self.integer(), self.integer()])
+        }
+        if t.shape == SHAPE_OPTIONAL {
+            return self.record(name, size: 8, members: ["value"], offsets: [0], types: [self.member(t.elem, all: all, depth: depth + 1)])
+        }
+        if t.shape == SHAPE_ENUM {
+            // `tag`, the variant, by name; then the variants' fields, each
+            // variant's a struct of them, which `payload` holds one of.
+            let tag = self.enumeration(f"{name}.tag", names: t.variants, numbers: t.numbers)
+            mut cases: [str] = []
+            mut case_types: [int64] = []
+            mut widest = 0
+            for k, v in t.variants {
+                if len(t.variant_fields[k]) == 0 {
+                    continue
+                }
+                mut field_types: [int64] = []
+                for f in t.variant_types[k] {
+                    field_types += [self.member(f, all: all, depth: depth + 1)]
+                }
+                let size = 8 * len(t.variant_fields[k])
+                if size > widest {
+                    widest = size
+                }
+                cases += [v]
+                case_types += [self.record(f"{name}.{v}", :size, members: t.variant_fields[k], offsets: t.variant_offsets[k], types: field_types)]
+            }
+            if len(cases) == 0 {
+                return self.record(name, size: 8, members: ["tag"], offsets: [0], types: [tag])
+            }
+            mut offsets: [int64] = []
+            for _c in cases {
+                offsets += [0]
+            }
+            let payload = self.record(f"{name}.payload", size: widest, members: cases, :offsets, types: case_types, union: true)
+            return self.record(name, size: 8 + widest, members: ["tag", "payload"], offsets: [0, 8], types: [tag, payload])
         }
         mut types: [int64] = []
         for f in t.field_types {
@@ -541,7 +626,7 @@ func info(anon functions: [Function], types: [Type], files: [str], path: str, co
         for k, v in f.vars {
             let pointing = points(made.lookup(v.type_name, all: types))
             mut abbrev = ABBREV_VARIABLE
-            if v.reg >= 0 {
+            if len(v.regs) > 0 {
                 abbrev = ABBREV_VARIABLE_LIST
                 if v.param {
                     abbrev = ABBREV_PARAMETER_LIST
@@ -552,18 +637,20 @@ func info(anon functions: [Function], types: [Type], files: [str], path: str, co
             s.byte(abbrev)
             s.bytes(cstr(v.name))
             s.bytes(u32(refs[i][k]))
-            if v.reg >= 0 {
-                // In the register: the value itself, or for a value that
-                // points, the address it holds.
-                mut where = [OP_REG0 + v.reg]
-                if pointing {
-                    where = [OP_BREG0 + v.reg, 0]
-                }
+            if len(v.regs) > 0 {
                 s.bytes(u32(loc.size))
-                loc.address(v.from)
-                loc.address(v.to)
-                loc.bytes(u16(len(where)))
-                loc.bytes(where)
+                for r, reg in v.regs {
+                    // In the register: the value itself, or for a value
+                    // that points, the address it holds.
+                    mut where = [OP_REG0 + reg]
+                    if pointing {
+                        where = [OP_BREG0 + reg, 0]
+                    }
+                    loc.address(v.froms[r])
+                    loc.address(v.tos[r])
+                    loc.bytes(u16(len(where)))
+                    loc.bytes(where)
+                }
                 loc.bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
                 continue
             }

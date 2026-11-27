@@ -82,8 +82,26 @@ Stopped in a function, `frame variable` shows its parameters and locals:
 An `int64`, `bool` or `float64` shows as a number. A `str` (and `bytes`)
 shows as its buffer and length, an array as its elements' pointer, length and
 room, and a struct as its fields; a field or element that is one of those
-holds a pointer to it, which `*` follows. Other types (enums, optionals,
-maps, functions, ...) show as an address, under their Kod name.
+holds a pointer to it, which `*` follows. An optional shows what it holds as
+`value` (`<parent is NULL>` for `none`). An enum shows its variant by name,
+as `tag`, and in `payload` its fields as each variant would read them, of
+which the one `tag` names is the value's:
+
+```
+(Shape) t = {
+  tag = Circle
+  payload = {
+    Circle = (radius = 7)
+    Rect = {
+      w = 7
+      h = NULL
+    }
+  }
+}
+```
+
+Other types (maps, interfaces, functions, ...) show as an address, under their
+Kod name.
 
 A local the compiler keeps in a register rather than in the frame, which is
 most small ones, is shown while the register holds it: from where it is set

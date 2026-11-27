@@ -25178,10 +25178,15 @@ type Codegen = shared struct {
             if id < 0 or id >= len(lv.def_line) {
                 continue
             }
-            let from_line = lv.def_line[id]
+            let def_line = lv.def_line[id]
             let to_line = lv.last_use[id]
             let number = dwarf_reg(self.pool.vreg_phys[vreg_start + id])
-            if from_line < 0 or to_line < from_line or to_line >= body.n or number < 0 {
+            if def_line < 0 or to_line < def_line or to_line >= body.n or number < 0 {
+                continue
+            }
+            // Set by its first line, it is there after that line.
+            let from_line = holds_after(body, def_line, reg: self.promoted_vregs[k])
+            if from_line > to_line {
                 continue
             }
             let from = self.fresh("Lvar_from")
@@ -25192,6 +25197,29 @@ type Codegen = shared struct {
             self.reg_var_regs += [number]
             self.reg_var_from += [from]
             self.reg_var_to += [to]
+            // Set by a copy of another vreg, which copy forwarding may have
+            // moved down to the first read: until the copy, it is in that
+            // vreg's register, from where that is set.
+            if body.tags[def_line] == regalloc.INSN_MOV and body.fa[def_line] == self.promoted_vregs[k] {
+                let src = regalloc.reg_vreg(body.fb[def_line]) - vreg_start
+                mut src_def = -1
+                if src >= 0 and src < len(lv.def_line) {
+                    src_def = lv.def_line[src]
+                }
+                if src_def >= 0 and src_def < def_line {
+                    let src_number = dwarf_reg(self.pool.vreg_phys[vreg_start + src])
+                    let src_from = holds_after(body, src_def, reg: body.fb[def_line])
+                    if src_number >= 0 and src_from <= def_line {
+                        let before = self.fresh("Lvar_from")
+                        at += [src_from]
+                        names += [before]
+                        self.reg_var_offs += [off]
+                        self.reg_var_regs += [src_number]
+                        self.reg_var_from += [before]
+                        self.reg_var_to += [from]
+                    }
+                }
+            }
         }
         if len(at) == 0 {
             return body
@@ -25237,13 +25265,13 @@ type Codegen = shared struct {
             if v.inlined or v.offset >= 0 or v.name.starts_with("__") or v.name.starts_with("$") {
                 continue
             }
-            mut held = -1
+            mut held: [int64] = []
             for k, off in self.reg_var_offs {
                 if off == v.offset {
-                    held = k
+                    held += [k]
                 }
             }
-            if held < 0 and not arrays.contains(in_memory, v.offset) {
+            if len(held) == 0 and not arrays.contains(in_memory, v.offset) {
                 continue
             }
             mut param = false
@@ -25254,10 +25282,10 @@ type Codegen = shared struct {
             }
             let kind = self.slot_kind(i)
             mut variable = dwarf.Variable(name: v.name, type_name: self.debug_type(kind), offset: v.offset, :param)
-            if held >= 0 {
-                variable.reg = self.reg_var_regs[held]
-                variable.from = self.reg_var_from[held]
-                variable.to = self.reg_var_to[held]
+            for k in held {
+                variable.regs += [self.reg_var_regs[k]]
+                variable.froms += [self.reg_var_from[k]]
+                variable.tos += [self.reg_var_to[k]]
             }
             out += [variable]
         }
@@ -25295,6 +25323,38 @@ type Codegen = shared struct {
                     types += [self.debug_type(f.kind)]
                 }
                 self.dwarf_types[at] = dwarf.Type(:name, shape: dwarf.SHAPE_STRUCT, field_names: names, field_offsets: offsets, field_types: types, size: info.data_width)
+            }
+            .KOptional(inner) -> {
+                let at = len(self.dwarf_types)
+                self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
+                self.dwarf_types[at] = dwarf.Type(:name, shape: dwarf.SHAPE_OPTIONAL, elem: self.debug_type(inner))
+            }
+            .KEnum(idx) -> {
+                let info = self.enums[idx]
+                let at = len(self.dwarf_types)
+                self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
+                mut variants: [str] = []
+                mut numbers: [int64] = []
+                mut fields: [[str]] = []
+                mut offsets: [[int64]] = []
+                mut types: [[str]] = []
+                for v in info.variants {
+                    // A union's members are named `=T` inside.
+                    mut variant = v.name
+                    if variant.starts_with("=") {
+                        variant = variant[1..]
+                    }
+                    variants += [variant]
+                    numbers += [v.discriminant]
+                    fields += [v.field_names]
+                    offsets += [v.field_offsets]
+                    mut these: [str] = []
+                    for k in v.field_kinds {
+                        these += [self.debug_type(k)]
+                    }
+                    types += [these]
+                }
+                self.dwarf_types[at] = dwarf.Type(:name, shape: dwarf.SHAPE_ENUM, :variants, :numbers, variant_fields: fields, variant_offsets: offsets, variant_types: types)
             }
             else -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
         }
@@ -25727,4 +25787,21 @@ func dwarf_reg(anon reg: regalloc.Reg) -> int64 {
         return -1
     }
     return n
+}
+
+// Where `reg` holds its value from, as its first line `i` leaves it: after
+// that line when the line writes it, at it when the line reads it (a value
+// from the time before round a loop).
+func holds_after(anon body: regalloc.InsnBuf, anon i: int64, reg: regalloc.Reg) -> int64 {
+    let tag = body.tags[i]
+    let variant = tag & 255
+    let sub = tag >> 8
+    if body.fa[i] != reg {
+        return i
+    }
+    let writes = variant == regalloc.INSN_MOV or variant == regalloc.INSN_LOAD_CONST or (variant == regalloc.INSN_OP and regalloc.writes_first_op_number(sub)) or (variant == regalloc.INSN_SLOT and sub == 0) or (variant == regalloc.INSN_MEM and (sub & 1) == 1)
+    if writes {
+        return i + 1
+    }
+    return i
 }
