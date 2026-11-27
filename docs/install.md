@@ -38,7 +38,36 @@ make kod
 ./kod check hello.kod   # parse + codegen; report errors but emit nothing
 ```
 
-Started through `./kod`, it runs `make stage1 kod` first when something is out of date, so edits to the compiler, the C runtime, the always-linked stdlib modules or the tool itself are picked up automatically (see [CLI reference](cli.md#kod-build-file)). Run `kod` from the repository root.
+Started through `./kod`, it runs `make stage1 kod` first when something is out of date, so edits to the compiler, the C runtime, the always-linked stdlib modules or the tool itself are picked up automatically (see [CLI reference](cli.md#kod-build-file)).
+
+## Using kod in other projects
+
+The checkout is the installation: put a link to its `kod` on your `PATH`.
+
+```shell
+ln -s ~/src/kod/kod ~/.local/bin/kod
+```
+
+Started through that link, or any other way but its own path
+`build/apps/kod/kod`, `kod` brings the toolchain up to date first, as `./kod`
+does: it finds the checkout by following the links to its own executable.
+That costs a `make -q`, some 20 ms, and a rebuild only when something changed.
+So a `git pull` in the checkout is all it takes to have the latest: the next
+`kod` command anywhere builds it.
+
+Outside the checkout, `kod build`, `run`, `test` and `check` work on the
+project in the working directory:
+
+- **Sources** are the project's: the file named, and the modules it imports
+  with `import "./name"`, relative to the file that imports them. `import
+  "net/http"` and the other standard modules come from the checkout's
+  `stdlib/`.
+- **What is built** goes to the project's own `build/`: `kod build main.kod`
+  writes `build/apps/main/main`. Compiled modules are cached in the
+  checkout's `build/cache/`, shared by every project.
+- **A program** that `kod run` or `kod test` starts runs in the project's
+  directory, so the paths it opens are the project's.
+- **Errors** name the project's files by their full paths.
 
 ## Linking
 

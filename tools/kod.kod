@@ -1,8 +1,10 @@
 // Native `kod` driver: `kod build|run|test|check`.
 // The only build orchestrator. People start it as `./kod`, a link at the
-// repository root to `build/apps/kod/kod`: started that way it first
-// brings the toolchain up to date with `make` (`refresh_toolchain`). Started
-// by its own path, as the tests and the test runner do, it doesn't.
+// repository root to `build/apps/kod/kod`, or through a link on PATH:
+// started either way it first brings the toolchain up to date with `make`
+// (`refresh_toolchain`). Started by its own path, as the tests and the test
+// runner do, it doesn't. Outside a checkout it works on the project in the
+// working directory, with its own checkout's toolchain (`enter_checkout`).
 //
 // Pipeline:
 //   1. Parse the entry, walk its imports transitively. Read what each
@@ -17,9 +19,9 @@
 //      last.
 //
 // link.cfg (and link.local.cfg, which overrides single names on one
-// machine) is read from the working directory: the Makefile includes the same
-// file, so the compiler and every program are linked the same way. It also
-// names the always-linked C files and Kod modules.
+// machine) is read from the checkout: the Makefile includes the same file, so
+// the compiler and every program are linked the same way. It also names the
+// always-linked C files and Kod modules.
 //
 // `run` and `test` end by replacing this process with the program
 // (`become`), so it has the terminal, its output streams as it is
@@ -82,7 +84,7 @@ func main(argv: [str]) -> int64 {
     if cmd == "fmt" {
         return run_fmt(argv[2..len(argv)])
     }
-    if require_repo_root() != 0 {
+    let Some(argv) = enter_checkout(argv) else {
         return 1
     }
     let cfg: build.LinkVars = build.LinkVars(items: [])
@@ -116,9 +118,96 @@ func main(argv: [str]) -> int64 {
     return run_check_cmd(argv[2], stage0: stage0_modules(cfg), :cfg)
 }
 
+extern func _NSGetExecutablePath(anon buf: int64, anon size: int64) -> int64
+extern func realpath(anon path: int64, anon resolved: int64) -> int64
+extern func chdir(anon path: int64) -> int64
+
+// Outside a checkout, the project the working directory was (an absolute
+// path), and where what is built goes: its `build/`. In a checkout, "" and
+// the checkout's `build`.
+mut _project: str = ""
+mut _out: str = "build"
+
+// The commands read `link.cfg` and `stdlib/`, and run `build/stage1/sh_kodc`,
+// all relative to the checkout. Run in one (a built tree's root), they are
+// there. Run anywhere else, the working directory is a project
+// (docs/install.md, "Using kod in other projects"): the file named becomes an
+// absolute path into it, what is built goes to its `build/`, and the tool
+// works in its own checkout, found by its executable's real path. The
+// arguments to go on with, or none after saying why it can't.
+func enter_checkout(anon argv: [str]) -> [str]? {
+    if io.is_file("link.cfg") {
+        if require_repo_root() != 0 {
+            return none
+        }
+        return argv
+    }
+    let root = tool_root()
+    if len(root) == 0 {
+        kod_eprint("kod: cannot find the checkout this tool was built in; run it from there")
+        return none
+    }
+    let here = current_dir()
+    if len(here) == 0 {
+        kod_eprint("kod: cannot tell what the working directory is")
+        return none
+    }
+    _project = here
+    _out = f"{here}/build"
+    mut args = argv
+    if len(args) > 2 and not args[2].starts_with("/") {
+        args[2] = build.normalize_path(f"{here}/{args[2]}")
+    }
+    if unsafe.c_int(chdir(unsafe.c_str(root))) != 0 {
+        kod_eprint(f"kod: cannot change to {root}")
+        return none
+    }
+    if require_repo_root() != 0 {
+        return none
+    }
+    return args
+}
+
+// The working directory, or "".
+func current_dir() -> str {
+    let buf = unsafe.alloc(4096)
+    mut out = ""
+    if libc.getcwd(buf, 4096) != 0 {
+        out = unsafe.str_at(buf)
+    }
+    unsafe.free(buf)
+    return out
+}
+
+// The checkout this tool was built in: its executable, with every link
+// followed, is `<root>/build/apps/kod/kod`. "" when it isn't.
+func tool_root() -> str {
+    let buf = unsafe.alloc(4096)
+    let size = unsafe.alloc(4)
+    unsafe.store32(size, 4096)
+    mut root = ""
+    if unsafe.c_int(_NSGetExecutablePath(buf, size)) == 0 {
+        let real = realpath(buf, 0)
+        if real != 0 {
+            let path = unsafe.str_at(real)
+            unsafe.free(real)
+            let tail = "/build/apps/kod/kod"
+            if path.ends_with(tail) {
+                let dir = path[..len(path) - len(tail)]
+                if io.is_file(f"{dir}/Makefile") and io.is_file(f"{dir}/kodc.kod") {
+                    root = dir
+                }
+            }
+        }
+    }
+    unsafe.free(buf)
+    unsafe.free(size)
+    return root
+}
+
 // The commands read `link.cfg` and run `build/stage1/sh_kodc`, both relative
-// to the working directory: say so, rather than fail later with a tool that
-// could not be run. Returns 0 in the repository root of a built tree.
+// to the working directory, a checkout by now: say so, rather than fail later
+// with a tool that could not be run. Returns 0 in the root of a built tree.
 func require_repo_root() -> int64 {
     if not io.is_file("link.cfg") {
         kod_eprint("kod: link.cfg not found; run kod from the repository root")
@@ -141,11 +230,25 @@ let EINTR: int64 = 4
 // programs it runs don't see it.
 let FRESH_MARK: str = "KOD_TOOLCHAIN_FRESH"
 
-// The repository root, the directory that holds `Makefile` and `kodc.kod`,
-// when this process was started through the link `kod` there (`argv0` is
-// `./kod` or another path to it); "" when it wasn't, as when started as
-// `build/apps/kod/kod`, or through PATH (no `/`).
+// The checkout to bring up to date: the directory that holds `Makefile` and
+// `kodc.kod`, when this process was started through the link `kod` there
+// (`argv0` is `./kod` or another path to it), or through any other link to
+// the tool, as on PATH (the checkout its executable is in). "" when it was
+// started by its own path, `.../build/apps/kod/kod`, as the tests and `make`
+// start it.
 func launch_root(anon argv0: str) -> str {
+    let root = link_root(argv0)
+    if len(root) > 0 {
+        return root
+    }
+    if argv0.ends_with("build/apps/kod/kod") {
+        return ""
+    }
+    return tool_root()
+}
+
+// The directory of `argv0` when it is a checkout's root, else "".
+func link_root(anon argv0: str) -> str {
     mut slash: int64 = -1
     for i in 0..len(argv0) {
         if argv0[i] == '/' {
@@ -308,6 +411,10 @@ func stage0_modules(anon cfg: build.LinkVars) -> [str] {
 // or signal becomes the one the caller sees. Returns only if it can't be
 // executed (127, as a shell says).
 func become(anon argv: [str]) -> int64 {
+    // A project's program runs in the project.
+    if len(_project) > 0 {
+        chdir(unsafe.c_str(_project))
+    }
     process.exec(argv)
     kod_eprint(f"kod: cannot execute {argv[0]}")
     return 127
@@ -489,8 +596,17 @@ func run_dir_tests(anon dir: str, cfg: build.LinkVars) -> int64 {
         kod_eprint(f"kod test: no `*_test.kod` files under {dir}")
         return 1
     }
-    // One program for all of them, so no temporary module is needed.
-    let stem: str = tests_stem(dir)
+    // One program for all of them, so no temporary module is needed. A
+    // project's directory is named as it was given.
+    mut shown = dir
+    if len(_project) > 0 {
+        if dir == _project {
+            shown = basename_no_ext(_project)
+        } else if dir.starts_with(_project + "/") {
+            shown = dir[len(_project) + 1..]
+        }
+    }
+    let stem: str = tests_stem(shown)
     let exe: str = build_program(entries: test_files, app: stem, exe_name: f"{stem}_test", emit_main_cmd: "_emit-test-runtime-main", shim_kind: "testmain", :cfg)
     if len(exe) == 0 {
         return 1
@@ -821,7 +937,7 @@ type ObjectKeys = shared struct {
     // path, as a test's scratch file has, which would only fill the cache), or
     // one that loads a missing module (its compile says so).
     func key(self, anon path: str) -> str {
-        if path.starts_with("/") {
+        if path.starts_with("/") and not (len(_project) > 0 and path.starts_with(_project + "/")) {
             return ""
         }
         mut seen: [str] = [path]
@@ -890,7 +1006,7 @@ func build_program(entries: [str], app: str, exe_name: str, emit_main_cmd: str, 
         runner = ["stdlib/testing.kod"]
     }
     let program_entries: [str] = entries + runner
-    let app_dir: str = f"build/apps/{app}"
+    let app_dir: str = f"{_out}/apps/{app}"
     let obj_root: str = f"{app_dir}/{app}.obj"
     let exe_path: str = f"{app_dir}/{exe_name}"
     let sh_kodc: str = "build/stage1/sh_kodc"
@@ -1187,7 +1303,7 @@ func same_file(anon a: str, anon b: str) -> bool {
 // the tool up to date. It would if `app` is its name, or another name for
 // its directory.
 func names_tool(app: str, tool: str) -> bool {
-    return app == tool or same_file(f"build/apps/{app}", f"build/apps/{tool}")
+    return (len(_project) == 0 and app == tool) or same_file(f"{_out}/apps/{app}", f"build/apps/{tool}")
 }
 
 // An entry that would write its executable over the tool `kod` or `lsp` is
