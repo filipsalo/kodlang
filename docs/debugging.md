@@ -35,8 +35,27 @@ Each object the compiler writes carries DWARF, the format debuggers read:
 - its parameters and locals that live in the function's frame, with their
   types.
 
-So `b file.kod:N`, `bt`, `next`, `step` and `finish` work, a crash under the
-debugger stops at its Kod line, and `frame variable` shows values:
+So `b file.kod:N`, `bt`, `next`, `step` and `finish` work, and `frame
+variable` shows values (below). A panic that would end the program stops it
+under the debugger first, after printing its message, with its stack: the
+first frames are the runtime's, then the Kod function that panicked and its
+callers, which `frame select` (or `up`) gets to. `continue` lets it end.
+
+```
+(lldb) run
+panic: index 7 out of bounds for array of length 3
+...
+* thread #1, stop reason = EXC_BREAKPOINT
+(lldb) bt
+  * frame #0: ... kod_stop_for_debugger + 116
+    frame #1: ... kod_panic_text + 256
+    frame #2: ... kod_index_oob + 56
+    frame #3: ... pick at boom.kod:5
+    frame #4: ... main at boom.kod:11
+(lldb) frame select 3
+```
+
+Stopped in a function, `frame variable` shows its parameters and locals:
 
 ```
 (lldb) frame variable

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -217,6 +218,18 @@ __attribute__((noreturn)) static void kod_unwind(KodCatch *to, uint64_t *fp) {
     _longjmp(to->back, 1);
 }
 
+// Under a debugger, a panic that ends the program stops it first, where it
+// happened, with its stack (docs/debugging.md); `continue` lets it end.
+static void kod_stop_for_debugger(void) {
+    struct kinfo_proc info;
+    size_t size = sizeof info;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    info.kp_proc.p_flag = 0;
+    if (sysctl(mib, 4, &info, &size, NULL, 0) == 0 && (info.kp_proc.p_flag & P_TRACED)) {
+        __builtin_debugtrap();
+    }
+}
+
 // Prints the panic and ends the program, or under a catch goes back to it,
 // releasing `owned`, which may be what holds the message.
 __attribute__((noreturn)) static void kod_panic_text(const char *msg, size_t len, KodStr *owned, uint64_t *fp) {
@@ -245,6 +258,7 @@ __attribute__((noreturn)) static void kod_panic_text(const char *msg, size_t len
     fputc('\n', stderr);
     kod_inspect_print_backtrace_from((int64_t)fp);
     if (kod_backtrace_hook) kod_backtrace_hook();
+    kod_stop_for_debugger();
     exit(1);
 }
 
@@ -274,6 +288,7 @@ void kod_panic_again(KodStr *msg, KodStr *backtrace, int64_t target) {
         fwrite(msg->buf, 1, (size_t)msg->len, stderr);
         fputc('\n', stderr);
         fwrite(backtrace->buf, 1, (size_t)backtrace->len, stderr);
+        kod_stop_for_debugger();
         exit(1);
     }
     to->message = kod_str_from_bytes(msg->buf, msg->len);
