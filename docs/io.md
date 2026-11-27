@@ -301,16 +301,11 @@ doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
 
 ## TLS
 
-`stdlib/net/tls.kod` runs TLS over a TCP connection. A client speaks TLS 1.3
-with Kod's own implementation (`stdlib/net/tls13.kod`, on the modules of
-[Cryptography](crypto.md)), and checks the server's certificates against the
-system's roots (`/etc/ssl/cert.pem`). A server, with an RSA key or an EC key on
-P-256 or P-384, speaks TLS 1.3 with it too. For a peer that can't speak TLS 1.3
-as Kod does, it falls back to the system's SecureTransport (the Security
-framework); Kod calls it through
-[`unsafe`](unsafe.md), its I/O callbacks included. A program that imports
-`net/tls` links `-framework Security -framework CoreFoundation`; no other
-program does.
+`stdlib/net/tls.kod` runs TLS 1.3 over a TCP connection, both sides, with
+Kod's own implementation (`stdlib/net/tls13.kod`, on the modules of
+[Cryptography](crypto.md)). No system library is involved: a client checks the
+server's certificates against the system's roots (`/etc/ssl/cert.pem`) itself.
+A peer that can't speak TLS 1.3 (one that has only TLS 1.2, say) is refused.
 
 ```kod
 import "net/tls" { connect }
@@ -331,38 +326,31 @@ as on a plain connection.
 
 | Function | Meaning |
 |----------|---------|
-| `connect(host, port, trust_file = "", timeout = Duration(seconds: 10), engine = .Auto)` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
+| `connect(host, port, trust_file = "", timeout = Duration(seconds: 10))` | open a TCP connection with [`net/tcp`](#tcp) and run the TLS handshake; `TlsStream or Error` |
 | `s.read(max)`, `s.write(data)` | as for any stream |
 | `s.set_timeout(timeout)` | as `net/tcp.set_timeout`: a read or write fails with `TimedOut` after a `Duration` without progress |
 | `s.close()` | send a close notice, then close the connection; `none or Error` |
 
 The server's certificate must be valid for `host`, chain to a trusted root and
 be in date; otherwise `connect` throws an `IoError` of kind `Tls` whose
-`detail` says why, and the connection is closed. `timeout` limits the TCP
-connect and, separately, the handshake. What is checked is in
-[Certificates](crypto.md#certificates-cryptox509).
+`detail` says why, and the connection is closed. A server that can't do TLS 1.3
+as the client does is a `Tls` error too, such as `the server doesn't speak TLS
+1.3`. `timeout` limits the TCP connect and, separately, the handshake. What is
+checked is in [Certificates](crypto.md#certificates-cryptox509).
 
 `trust_file` is the path of a PEM file of certificates. When it isn't empty,
 those certificates are the only trusted roots, in place of the system's: use it
 for a private CA or a self-signed server. The host name is still checked.
 
-`engine` is a `tls.Engine`:
-
-| `Engine` | Meaning |
-|---|---|
-| `.Auto` | Kod's TLS 1.3, and the system's on a new connection when the server refuses TLS 1.3, asks for a key exchange other than x25519 or answers with an older version; a certificate that doesn't verify never falls back |
-| `.Kod` | only Kod's TLS 1.3; a server that can't speak it is an `IoError` of kind `Protocol` |
-| `.System` | only SecureTransport, which speaks TLS 1.2 (and not 1.3) |
-
-Kod's client offers the x25519 key exchange and the TLS 1.3 cipher suites with
+The client offers the x25519 key exchange and the TLS 1.3 cipher suites with
 AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, and takes ECDSA (P-256 and P-384)
 and RSA-PSS signatures from the server. It doesn't resume sessions or send early
-data; a server that asks for a client certificate gets none. `s.kod` is its
-session (`tls13.Session?`), whose `client` holds what the handshake found, such
-as the server's `certificates` and the cipher `suite`. Its handshake costs
-about 5 to 15 ms of CPU, against a millisecond or two for the system's: 2 ms
-for X25519 and the rest checking signatures, 2 ms each on P-256 and 6 ms on
-P-384. The first in a program also reads the system's roots, another 80 ms.
+data; a server that asks for a client certificate gets none. `s.session` is
+the `tls13.Session`, whose `client` holds what the handshake found, such as
+the server's `certificates` and the cipher `suite`. A handshake costs
+about 5 to 15 ms of CPU: 2 ms for X25519 and the rest checking signatures,
+1 to 1.5 ms each for RSA, 2 ms on P-256 and 6 ms on P-384. The first in a
+program also reads the system's roots, another 80 ms.
 
 The server's side is `accept`, on a connection that [`net/tcp`](#tcp) accepted:
 
@@ -381,30 +369,26 @@ func main() -> none or Error {
 
 | Function | Meaning |
 |----------|---------|
-| `load_identity(cert_file, key_file)` | a certificate and its private key, from PEM files; `Identity or Error`. `cert_file` holds the server's certificate first and then those it was signed by, up to the root (which can be left out); `key_file` an RSA or EC key that isn't encrypted (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`). They are kept in memory: no keychain is used |
-| `identity.close()` | frees it; connections made with it go on |
+| `load_identity(cert_file, key_file)` | a certificate and its private key, from PEM files; `Identity or Error`. `cert_file` holds the server's certificate first and then those it was signed by, up to the root (which can be left out); `key_file` an RSA key, or an EC key on P-256 or P-384, that isn't encrypted (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`) |
+| `identity.close()` | `accept` takes it no more; connections made with it go on |
 | `accept(fd, identity)` | run the handshake as the server; `TlsStream or Error`. The connection is the stream's from then on, which closes it; on an error it is closed at once. How long the handshake may take is `fd`'s `tcp.set_timeout`, which a `nonblocking` one has not |
 
-A key that isn't the certificate's is a `Tls` error, and so is an EC key whose curve
-the certificate gives by its parameters rather than by name (which SecureTransport
-can't take).
+A key that isn't the certificate's is a `Tls` error, and so is a key on another
+curve, or an EC key whose curve the certificate gives by its parameters rather
+than by name.
 
-With an RSA key, or an EC key on P-256 or P-384, `accept` runs Kod's TLS 1.3 server:
-x25519 (asking a client that sent another key share for an x25519 one), the three
-TLS 1.3 cipher suites, and the key's signature, ECDSA or RSA-PSS. A client that offers no TLS 1.3, or can't
-take that key or key exchange, is handed, with what it has sent so far, to
-SecureTransport, which then shakes hands with it as if from the start. `s.kod`
-says which ran: a Kod session's `server` holds what its handshake found, such as
-the `server_name` the client asked for. A key of another kind leaves every
-handshake to SecureTransport, which speaks TLS 1.2 with forward secrecy and
-authenticated encryption (ECDHE with AES-GCM or ChaCha20-Poly1305), which clients since
-about 2014 do. The client isn't asked for a certificate.
+The server speaks x25519 (asking a client that sent another key share for an
+x25519 one), the three TLS 1.3 cipher suites, and the key's signature, ECDSA or
+RSA-PSS. A client that offers no TLS 1.3, or can't take that key or key
+exchange, is sent an alert (`protocol_version` or `handshake_failure`) and
+`accept` fails with a `Tls` error. Clients have spoken TLS 1.3 since about
+2018. `s.session.server` holds what a handshake found, such as the
+`server_name` the client asked for. The client isn't asked for a certificate.
 
-A Kod server handshake costs about 3.5 ms of CPU with a P-256 key (1.3 ms for the
-signature, 2 ms for X25519) and about 14 ms with an RSA key of 2048 bits, against
-about 1 ms for SecureTransport's. With an EC key the first handshake in a program
-also makes a table of multiples of the curve's generator, about 18 ms, which the
-signatures after it use.
+A server handshake costs about 3.5 ms of CPU with a P-256 key (1.3 ms for the
+signature, 2 ms for X25519) and about 14 ms with an RSA key of 2048 bits. With
+an EC key the first handshake in a program also makes a table of multiples of
+the curve's generator, about 18 ms, which the signatures after it use.
 
 Several tasks can use streams at the same time, and one may read a stream while another
 writes to it; two writing to one stream at the same time isn't supported.

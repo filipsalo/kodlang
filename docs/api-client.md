@@ -139,8 +139,7 @@ let response = try post(
   ([Connection reuse](http.md#connection-reuse)).
 - `timeout` applies to the connect, the TLS handshake and each read or write.
   Set `deadline` to bound a request as a whole ([Deadlines](http.md#deadlines)).
-- TLS is Kod's own TLS 1.3, falling back to the system's TLS 1.2 for a server
-  without it ([TLS](io.md#tls)).
+- TLS is Kod's own TLS 1.3; a server without it is refused ([TLS](io.md#tls)).
 - Numbers with a fraction or an exponent come back as `Decimal` text:
   `as_int()` is `none` for them, `as_number_text()` gives the digits, and
   `.parse_float()` on those turns them into a [`float64`](floats.md).

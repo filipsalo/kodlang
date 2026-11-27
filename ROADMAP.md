@@ -27,10 +27,9 @@ Grow the stdlib far enough to talk to HTTP services and handle real JSON. In ord
    C shim and Kod wrapper in `stdlib/net/tcp.{kod,c}`, linked only into the programs that
    import them (see Link inputs in `docs/modules.md`). Errors come back as `T or Error`,
    not panics.
-2. **TLS** — done: `stdlib/net/tls.{kod,c}` runs a client TLS session over a TCP
-   connection with the system's SecureTransport (no extra install; TLS 1.2 at most), named
-   in its leading `// kod:` lines so only programs that import it link the Security
-   framework. A `TlsStream` is a `Reader` and a `Writer`, like a plain connection.
+2. **TLS** — done: `stdlib/net/tls.kod` runs TLS 1.3, client and server, written in Kod
+   (`stdlib/net/tls13.kod` on `stdlib/crypto`), with no system library. A `TlsStream` is a
+   `Reader` and a `Writer`, like a plain connection.
 3. **HTTP/1.1 client** — done: `stdlib/net/http.kod` (URLs, headers, request writing and
    response parsing with `Content-Length`, chunked and read-to-close bodies and size limits,
    and `get`, `post`, `fetch` over TCP or TLS, with redirects). See `docs/http.md`.
@@ -60,6 +59,5 @@ codegen bugs that this kind of code is most likely to hit.
 - Reference cycles: a cycle collector, or weak references.
 - More runtime pieces in C can move to Kod now that modules have variables, as the test
   runner has (compiler sources and primitives can use them after a snapshot refresh).
-- Fewer C pieces: TLS. SecureTransport is deprecated
-  and stops at TLS 1.2; the options are Network.framework from C, or TLS 1.3 written in
-  Kod (hashes, AES-GCM, X25519, X.509), a much larger job.
+- TLS 1.2 in Kod, for peers without TLS 1.3 (ECDHE with AES-GCM or ChaCha20-Poly1305
+  only), which `net/tls` refuses for now.

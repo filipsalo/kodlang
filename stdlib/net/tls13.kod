@@ -8,8 +8,7 @@
 // It offers x25519 for the key exchange and TLS_AES_128_GCM_SHA256,
 // TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, and accepts ECDSA
 // (P-256, P-384) and RSA-PSS signatures from the server. A server that wants
-// something else, or another version, is told apart by an IoError of kind
-// Protocol, which net/tls takes as a reason to use the system's TLS instead.
+// something else, or another version, is an IoError of kind Tls that says so.
 import "crypto/aesgcm"
 import "crypto/chacha20poly1305"
 import "crypto/ecdsa"
@@ -61,10 +60,12 @@ func failed(anon op: str, anon detail: str) -> IoError {
     return IoError(kind: .Tls, op: op, errno: 0, detail: detail)
 }
 
-// The server can't do TLS 1.3 as this client does.
-func unsupported(anon op: str, anon detail: str) -> IoError {
-    return IoError(kind: .Protocol, op: op, errno: 0, detail: detail)
-}
+// Alerts this side sends: the other side wants a version or an algorithm
+// this one lacks, or sent what can't be read.
+let PROTOCOL_VERSION: int64 = 70
+let HANDSHAKE_FAILURE: int64 = 40
+let DECODE_ERROR: int64 = 50
+let UNEXPECTED_MESSAGE: int64 = 10
 
 func u8(anon n: int64) -> bytes {
     return kod_bytes_from_array([n & 255])
@@ -316,10 +317,13 @@ type Client = shared struct {
             self.closed = true
             return
         }
-        // protocol_version, handshake_failure, insufficient_security: the
-        // server wants what this client doesn't offer.
-        if self.wait is .ServerHello and (description == 70 or description == 40 or description == 71) {
-            throw unsupported(self.op, f"the server refused the handshake (alert {description})")
+        if self.wait is .ServerHello and description == PROTOCOL_VERSION {
+            throw failed(self.op, "the server doesn't speak TLS 1.3 (alert protocol_version)")
+        }
+        // handshake_failure, insufficient_security: the server wants what
+        // this client doesn't offer.
+        if self.wait is .ServerHello and (description == HANDSHAKE_FAILURE or description == 71) {
+            throw failed(self.op, f"the server refused the handshake (alert {description})")
         }
         throw failed(self.op, f"the server sent alert {description}")
     }
@@ -428,10 +432,10 @@ type Client = shared struct {
             }
         }
         if version != 0x0304 {
-            throw unsupported(self.op, "the server doesn't speak TLS 1.3")
+            throw failed(self.op, "the server doesn't speak TLS 1.3")
         }
         if server_random == must_hex(RETRY_RANDOM) {
-            throw unsupported(self.op, "the server wants a key exchange this client doesn't offer (HelloRetryRequest)")
+            throw failed(self.op, "the server wants a key exchange this client doesn't offer (HelloRetryRequest)")
         }
         if body[35..35 + sid_len] != self.session_id or compression != 0 {
             throw failed(self.op, "the ServerHello doesn't echo the ClientHello")
@@ -439,7 +443,7 @@ type Client = shared struct {
         if not (suite in self.suites) {
             throw failed(self.op, f"the server chose cipher suite {suite:#06x}, which wasn't offered")
         }
-        let Some(ks) = share else { throw unsupported(self.op, "the ServerHello has no key share") }
+        let Some(ks) = share else { throw failed(self.op, "the ServerHello has no key share") }
         if len(ks) != 36 or get16(ks, 0) != X25519 or get16(ks, 2) != 32 {
             throw failed(self.op, "the server's key share isn't x25519")
         }
@@ -727,9 +731,8 @@ type Server = shared struct {
     algo: Algo = .Sha256
     transcript: Hasher = Hasher(.Sha256)
     pending: bytes = b""
-    // The records received before any keys, header and body, for the
-    // system's TLS to take over when the client can't do TLS 1.3 this way.
-    seen: bytes = b""
+    // The alert to send for the handshake's failure, or 0.
+    refusal: int64 = 0
     session_id: bytes = b""
     // The first ClientHello, when a HelloRetryRequest followed it.
     first_hello: bytes = b""
@@ -758,13 +761,12 @@ type Server = shared struct {
             return
         }
         let Some(keys) = self.read else {
-            self.seen = self.seen + header + body
             if kind == ALERT {
                 try self.alert(body)
                 return
             }
             if kind != HANDSHAKE {
-                throw unsupported(self.op, f"a record of type {kind} before the handshake")
+                throw self.refuse(UNEXPECTED_MESSAGE, f"a record of type {kind} before the handshake")
             }
             try self.handshake_bytes(body)
             return
@@ -805,6 +807,12 @@ type Server = shared struct {
         throw failed(self.op, f"the client sent alert {body[1]}")
     }
 
+    // The error for a client this server can't serve, which is sent `alert`.
+    func refuse(self, anon alert: int64, anon detail: str) -> IoError {
+        self.refusal = alert
+        return failed(self.op, detail)
+    }
+
     func handshake_bytes(self, anon b: bytes) -> none or Error {
         self.pending = self.pending + b
         for len(self.pending) >= 4 {
@@ -825,7 +833,7 @@ type Server = shared struct {
         match self.wait {
             .ClientHello | .ClientHello2 -> {
                 if kind != CLIENT_HELLO {
-                    throw unsupported(self.op, f"expected a ClientHello, got handshake message {kind}")
+                    throw self.refuse(UNEXPECTED_MESSAGE, f"expected a ClientHello, got handshake message {kind}")
                 }
                 if len(self.pending) > 0 {
                     throw failed(self.op, "handshake data after the ClientHello")
@@ -895,28 +903,28 @@ type Server = shared struct {
 
     func client_hello(self, anon body: bytes, anon whole: bytes) -> none or Error {
         if len(body) < 35 {
-            throw unsupported(self.op, "a short ClientHello")
+            throw self.refuse(DECODE_ERROR, "a short ClientHello")
         }
         let sid_len = body[34]
         mut at = 35 + sid_len
         if sid_len > 32 or at + 2 > len(body) {
-            throw unsupported(self.op, "a malformed ClientHello")
+            throw self.refuse(DECODE_ERROR, "a malformed ClientHello")
         }
         let session_id = body[35..at]
         let suites_len = get16(body, at)
         at += 2
         if suites_len % 2 != 0 or at + suites_len + 1 > len(body) {
-            throw unsupported(self.op, "a malformed ClientHello")
+            throw self.refuse(DECODE_ERROR, "a malformed ClientHello")
         }
         let suites = [get16(body, at + 2 * i) for i in 0..suites_len / 2]
         at += suites_len
         let comp_len = body[at]
         if at + 1 + comp_len > len(body) {
-            throw unsupported(self.op, "a malformed ClientHello")
+            throw self.refuse(DECODE_ERROR, "a malformed ClientHello")
         }
         let compression = body[at + 1..at + 1 + comp_len]
         at += 1 + comp_len
-        let Some(exts) = extensions(body, at) else { throw unsupported(self.op, "malformed ClientHello extensions") }
+        let Some(exts) = extensions(body, at) else { throw self.refuse(DECODE_ERROR, "malformed ClientHello extensions") }
         mut versions: [int64] = []
         mut groups: [int64] = []
         mut schemes: [int64] = []
@@ -945,7 +953,7 @@ type Server = shared struct {
             }
         }
         if not (0x0304 in versions) {
-            throw unsupported(self.op, "the client doesn't offer TLS 1.3")
+            throw self.refuse(PROTOCOL_VERSION, "the client doesn't offer TLS 1.3")
         }
         if compression != b"\x00" {
             throw failed(self.op, "a TLS 1.3 ClientHello with compression")
@@ -957,11 +965,11 @@ type Server = shared struct {
             }
         }
         if suite == 0 {
-            throw unsupported(self.op, "the client offers no cipher suite in common")
+            throw self.refuse(HANDSHAKE_FAILURE, "the client offers no cipher suite in common")
         }
         self.scheme = self.pick_scheme(schemes)
         if self.scheme == 0 {
-            throw unsupported(self.op, "the client doesn't accept the key's signature scheme")
+            throw self.refuse(HANDSHAKE_FAILURE, "the client doesn't accept the key's signature scheme")
         }
         if self.wait is .ClientHello2 and suite != self.suite {
             throw failed(self.op, "the second ClientHello changed the cipher suite")
@@ -974,7 +982,7 @@ type Server = shared struct {
                 self.retry(whole)
                 return
             }
-            throw unsupported(self.op, "the client offers no x25519 key share")
+            throw self.refuse(HANDSHAKE_FAILURE, "the client offers no x25519 key share")
         }
         let Some(shared) = x25519.shared(self.private_key, client_key) else {
             throw failed(self.op, "the client's x25519 key is of small order")
@@ -1189,11 +1197,21 @@ type Session = shared struct {
     }
 
     func handshake(self, anon op: str) -> none or Error {
+        let Err(e) = self.shake(op) else { return }
+        // A server tells a client it refuses why, in the clear: it has no
+        // keys yet.
+        if self.server is Server(sv) and sv.refusal != 0 and not self.flushing {
+            let _ = self.conn.write_all(b"\x15\x03\x03\x00\x02\x02" + u8(sv.refusal))
+        }
+        throw e
+    }
+
+    func shake(self, anon op: str) -> none or Error {
         try self.flush(op)
         for not self.peer.done() {
             if not try self.next_record(op) {
                 if self.peer.first_flight() {
-                    throw unsupported(op, "the other side closed the connection at the start of the handshake")
+                    throw failed(op, "the other side closed the connection at the start of the handshake")
                 }
                 throw failed(op, "the other side closed the connection during the handshake")
             }
@@ -1253,10 +1271,7 @@ func connect(anon conn: Fd, host: str, roots: [Certificate], now: int64, op: str
 }
 
 // The server's session on an accepted `conn`, with the certificate `chain`
-// (DER, its own first) and `key`, before its handshake. When `handshake`
-// fails with an error of kind Protocol, the client can't do TLS 1.3 this way;
-// what it has sent so far is `server.seen` and then `incoming`, for another
-// TLS to take over.
+// (DER, its own first) and `key`, before its handshake.
 func server_session(anon conn: Fd, chain: [bytes], key: SigningKey, op: str) -> Session {
     let server = Server(op: op, chain: chain, key: key, private_key: random.secure_bytes(32))
     return Session(conn: conn, peer: server, server: server)

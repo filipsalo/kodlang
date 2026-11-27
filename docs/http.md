@@ -480,8 +480,8 @@ let identity = try tls.load_identity("cert.pem", "key.pem")
 try http.Server(host: "", port: 443, :routes, :identity).run()
 ```
 
-The handshake is part of what `header_timeout` limits; a client that fails it is closed
-without a word. Everything else is as over plain HTTP. `req.secure` says which it was. Setting
+The handshake is part of what `header_timeout` limits; a client that fails it is closed,
+after an alert when it can't speak TLS 1.3 (see [TLS](io.md#tls)). Everything else is as over plain HTTP. `req.secure` says which it was. Setting
 `server.identity` to a newly loaded one, as when a certificate is renewed, is for
 connections from then on.
 

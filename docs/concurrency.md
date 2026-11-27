@@ -281,9 +281,9 @@ These are also where cancellation reaches a task.
 
 A task that runs long without waiting is preempted (below).
 Waiting works the same through every layer, because the stack is the task's
-own: when SecureTransport, in C, calls Kod's read callback and the socket has
-nothing yet, the callback gives way with the C frames still on the task's
-stack, and carries on when data comes. Stackless designs (`async`/`await`)
+own: when C code calls back into Kod and the callback has to wait, it gives
+way with the C frames still on the task's stack, and carries on when what it
+waits for comes. Stackless designs (`async`/`await`)
 cannot do that, and would also split every function into the kinds that may
 wait and those that may not.
 

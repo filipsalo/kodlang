@@ -1,7 +1,7 @@
 // A scripted HTTP server for stdlib/net/http_client_test.kod.
 //
 // Usage: http_fixture PORT [CERT KEY]. It answers on 127.0.0.1:PORT, one raw
-// response per path (see `route`), over TLS 1.2 when a certificate and key
+// response per path (see `route`), over TLS when a certificate and key
 // are given, and exits by itself after two minutes. A connection stays open
 // for the next request unless the request or the route says otherwise.
 //
@@ -11,17 +11,17 @@
 // connection ends, and stops waiting for the next request once the server
 // has ended. Compressed bodies come from the system's zlib, the library
 // Python's zlib module wraps, so they are the bytes the Python version sent.
-// For TLS the certificate and key go through `openssl pkcs12` once, and each
-// child loads the result into memory (not into a keychain) for
-// SecureTransport's server side.
-// kod:link -framework Security -framework CoreFoundation -lz
+// For TLS the certificate and key are loaded once, and each child runs the
+// server's side of net/tls on its connection.
+// kod:link -lz
 
 import "io"
 import "libc"
 import "net/tcp"
+import "net/tls"
+import "net/tls" { Identity, TlsStream }
 import "posix"
-import "posix" { Fd, open_read }
-import "process"
+import "posix" { Fd }
 import "strbuilder" { StrBuilder }
 import "stream" { BufReader, IoError, Reader, Writer }
 import "time"
@@ -32,32 +32,12 @@ extern func _exit(anon status: int64) -> none
 extern func shutdown(anon fd: int64, anon how: int64) -> int64
 extern func mmap(anon addr: int64, anon len: int64, anon prot: int64, anon flags: int64, anon fd: int64, anon offset: int64) -> int64
 extern func OSAtomicAdd64Barrier(anon amount: int64, anon addr: int64) -> int64
-extern func dlsym(anon handle: int64, anon name: int64) -> int64
 // zlib.
 extern func zlibVersion() -> int64
 extern func deflateInit2_(anon strm: int64, anon level: int64, anon method: int64, anon wbits: int64, anon mem_level: int64, anon strategy: int64, anon version: int64, anon size: int64) -> int64
 extern func deflateBound(anon strm: int64, anon n: int64) -> int64
 extern func deflate(anon strm: int64, anon flush: int64) -> int64
 extern func deflateEnd(anon strm: int64) -> int64
-// SecureTransport and the CoreFoundation calls it needs.
-extern func SecPKCS12Import(anon data: int64, anon options: int64, anon items: int64) -> int64
-extern func CFDataCreate(anon alloc: int64, anon data: int64, anon len: int64) -> int64
-extern func CFStringCreateWithCString(anon alloc: int64, anon s: int64, anon encoding: int64) -> int64
-extern func CFDictionaryCreate(anon alloc: int64, anon keys: int64, anon values: int64, anon n: int64, anon key_callbacks: int64, anon value_callbacks: int64) -> int64
-extern func CFDictionaryGetValue(anon dict: int64, anon key: int64) -> int64
-extern func CFArrayCreate(anon alloc: int64, anon values: int64, anon n: int64, anon callbacks: int64) -> int64
-extern func CFArrayGetCount(anon array: int64) -> int64
-extern func CFArrayGetValueAtIndex(anon array: int64, anon i: int64) -> int64
-extern func SSLCreateContext(anon alloc: int64, anon side: int64, anon kind: int64) -> int64
-extern func SSLSetIOFuncs(anon ctx: int64, anon read: int64, anon write: int64) -> int64
-extern func SSLSetConnection(anon ctx: int64, anon conn: int64) -> int64
-extern func SSLSetProtocolVersionMin(anon ctx: int64, anon version: int64) -> int64
-extern func SSLSetProtocolVersionMax(anon ctx: int64, anon version: int64) -> int64
-extern func SSLSetCertificate(anon ctx: int64, anon certs: int64) -> int64
-extern func SSLHandshake(anon ctx: int64) -> int64
-extern func SSLRead(anon ctx: int64, anon data: int64, anon len: int64, anon processed: int64) -> int64
-extern func SSLGetBufferedReadSize(anon ctx: int64, anon size: int64) -> int64
-extern func SSLWrite(anon ctx: int64, anon data: int64, anon len: int64, anon processed: int64) -> int64
 
 let LIFETIME_MS: int64 = 120000
 // The macOS values of the C constants used here.
@@ -65,19 +45,8 @@ let SHUT_WR: int64 = 1
 let PROT_READ_WRITE: int64 = 3
 let MAP_SHARED_ANON: int64 = 4097
 let WNOHANG: int64 = 1
-let EINTR: int64 = 4
-let RTLD_DEFAULT: int64 = -2
 let Z_FINISH: int64 = 4
 let Z_STREAM_SIZE: int64 = 112
-let SERVER_SIDE: int64 = 0
-let STREAM_TYPE: int64 = 0
-let TLS_1_2: int64 = 8
-let CLOSED_GRACEFUL: int64 = -9805
-let CLOSED_ABORT: int64 = -9806
-let CLOSED_NO_NOTIFY: int64 = -9816
-let SEC_IO: int64 = -36
-let UTF8: int64 = 134217984
-let P12_PASSWORD: str = "kod"
 // The counters the children share, at these offsets.
 let CONNECTIONS: int64 = 0
 let DROPS: int64 = 8
@@ -285,169 +254,6 @@ func encoded(anon method: str, anon path: str) -> bytes {
     return reply("200 OK", body, :headers)
 }
 
-// ---- TLS ----
-
-// SecureTransport's read callback: `*len_at` bytes from the descriptor
-// `fd` into `data`. It leaves in `*len_at` how many it got.
-func _read_cb(anon fd: int64, anon data: int64, anon len_at: int64) -> int64 {
-    let want = unsafe.load64(len_at)
-    mut got = 0
-    for got < want {
-        let n = libc.read(fd, data + got, want - got)
-        if n > 0 {
-            got += n
-        } else if n == 0 or unsafe.errno() != EINTR {
-            unsafe.store64(len_at, got)
-            if n == 0 {
-                return CLOSED_GRACEFUL
-            }
-            return SEC_IO
-        }
-    }
-    unsafe.store64(len_at, got)
-    return 0
-}
-
-// SecureTransport's write callback, the same way round.
-func _write_cb(anon fd: int64, anon data: int64, anon len_at: int64) -> int64 {
-    let want = unsafe.load64(len_at)
-    mut put = 0
-    for put < want {
-        let n = libc.write(fd, data + put, want - put)
-        if n > 0 {
-            put += n
-        } else if n == 0 or unsafe.errno() != EINTR {
-            unsafe.store64(len_at, put)
-            return SEC_IO
-        }
-    }
-    unsafe.store64(len_at, put)
-    return 0
-}
-
-func tls_error(anon op: str, anon status: int64) -> IoError {
-    return IoError(kind: .Tls, op: op, errno: 0, detail: f"OSStatus {status}")
-}
-
-// The value of the C global `name`, a pointer.
-func global(anon name: str) -> int64 {
-    return unsafe.load64(dlsym(RTLD_DEFAULT, unsafe.c_str(name)))
-}
-
-// The identity in the PKCS#12 data `p12`, in a CFArray for SSLSetCertificate,
-// imported into memory only.
-func identity(anon p12: bytes) -> int64 or Error {
-    let data = CFDataCreate(0, unsafe.data(p12), len(p12))
-    // Two keys, then their two values, then the import's result.
-    let slots = unsafe.alloc(40)
-    unsafe.store64(slots, global("kSecImportExportPassphrase"))
-    unsafe.store64(slots + 8, global("kSecImportToMemoryOnly"))
-    unsafe.store64(slots + 16, CFStringCreateWithCString(0, unsafe.c_str(P12_PASSWORD), UTF8))
-    unsafe.store64(slots + 24, global("kCFBooleanTrue"))
-    let callbacks = dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeDictionaryKeyCallBacks"))
-    let values = dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeDictionaryValueCallBacks"))
-    let options = CFDictionaryCreate(0, slots, slots + 16, 2, callbacks, values)
-    let status = unsafe.c_int(SecPKCS12Import(data, options, slots + 32))
-    let items = unsafe.load64(slots + 32)
-    if status != 0 or items == 0 or CFArrayGetCount(items) == 0 {
-        throw tls_error("import the certificate and key", status)
-    }
-    unsafe.store64(slots, CFDictionaryGetValue(CFArrayGetValueAtIndex(items, 0), global("kSecImportItemIdentity")))
-    return CFArrayCreate(0, slots, 1, dlsym(RTLD_DEFAULT, unsafe.c_str("kCFTypeArrayCallBacks")))
-}
-
-// The server's side of a TLS 1.2 session on `fd`.
-type TlsConn = shared struct {
-    fd: int64
-    ctx: int64
-
-    // What has been decrypted and not yet read.
-    func buffered(self) -> int64 {
-        let size = unsafe.alloc(8)
-        SSLGetBufferedReadSize(self.ctx, size)
-        let n = unsafe.load64(size)
-        unsafe.free(size)
-        return n
-    }
-
-    // As soon as one byte is in, that and whatever else is decrypted, at
-    // most `max` bytes; empty at the end of the stream, however it ended.
-    func read(self, anon max: int64) -> bytes or Error {
-        let buf = unsafe.alloc(max + 1)
-        let done = unsafe.alloc(8)
-        let status = unsafe.c_int(SSLRead(self.ctx, buf, 1, done))
-        mut got = unsafe.load64(done)
-        let more = self.buffered()
-        if got > 0 and more > 0 and max > 1 {
-            unsafe.store64(done, 0)
-            mut ask = max - 1
-            if more < ask {
-                ask = more
-            }
-            SSLRead(self.ctx, buf + 1, ask, done)
-            got += unsafe.load64(done)
-        }
-        let data = unsafe.copy_out(buf, got)
-        unsafe.free(buf)
-        unsafe.free(done)
-        if got == 0 and status != CLOSED_GRACEFUL and status != CLOSED_NO_NOTIFY and status != CLOSED_ABORT {
-            throw tls_error("read", status)
-        }
-        return data
-    }
-
-    func write(self, anon data: bytes) -> int64 or Error {
-        let done = unsafe.alloc(8)
-        let status = unsafe.c_int(SSLWrite(self.ctx, unsafe.data(data), len(data), done))
-        let n = unsafe.load64(done)
-        unsafe.free(done)
-        if status != 0 {
-            throw tls_error("write", status)
-        }
-        return n
-    }
-}
-
-func accept_tls(anon fd: int64, p12: bytes) -> TlsConn or Error {
-    let certs = try identity(p12)
-    let ctx = SSLCreateContext(0, SERVER_SIDE, STREAM_TYPE)
-    mut status = unsafe.c_int(SSLSetIOFuncs(ctx, unsafe.c_function(_read_cb), unsafe.c_function(_write_cb)))
-    if status == 0 {
-        status = unsafe.c_int(SSLSetConnection(ctx, fd))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetProtocolVersionMin(ctx, TLS_1_2))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetProtocolVersionMax(ctx, TLS_1_2))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLSetCertificate(ctx, certs))
-    }
-    if status == 0 {
-        status = unsafe.c_int(SSLHandshake(ctx))
-    }
-    if status != 0 {
-        throw tls_error("handshake", status)
-    }
-    return TlsConn(:fd, :ctx)
-}
-
-// The certificate and key as PKCS#12 data, from `openssl pkcs12`.
-func pkcs12(anon cert: str, anon key: str) -> bytes or Error {
-    let made = try process.output(["mktemp", "-t", "http_fixture"])
-    let path = made.stdout.trim()
-    let ran = try process.output(["/usr/bin/openssl", "pkcs12", "-export", "-in", cert, "-inkey", key, "-passout", f"pass:{P12_PASSWORD}", "-out", path])
-    let file = try open_read(path)
-    let data = file.read_all()
-    try file.close()
-    libc.unlink(unsafe.c_str(path))
-    if ran.status != 0 {
-        throw IoError(kind: .Other, op: "openssl pkcs12", errno: 0, detail: ran.stderr.trim())
-    }
-    return try data
-}
-
 // ---- a connection ----
 
 type Handler = shared struct {
@@ -457,7 +263,7 @@ type Handler = shared struct {
     input: BufReader
     out: Writer
     // The TLS session, if there is one.
-    tls: TlsConn?
+    tls: TlsStream?
     // Readable once the server has ended.
     server_gone: int64
     conn_id: int64 = 0
@@ -583,8 +389,8 @@ type Handler = shared struct {
         if self.input.pos < len(self.input.buf) {
             return true
         }
-        if self.tls is TlsConn(t) {
-            if t.buffered() > 0 {
+        if self.tls is TlsStream(t) {
+            if t.buffered() {
                 return true
             }
         }
@@ -785,22 +591,22 @@ func framed(anon method: str, anon response: bytes) -> bool {
 }
 
 // Serve the connection `fd` in this child process, then end it.
-func serve(anon fd: int64, port: int64, state: int64, server_gone: int64, p12: bytes?) -> none {
+func serve(anon fd: int64, port: int64, state: int64, server_gone: int64, identity: Identity?) -> none {
     mut input: Reader = Fd(:fd)
     mut out: Writer = Fd(:fd)
-    mut tls: TlsConn? = none
-    if p12 is bytes(data) {
-        let shaken = accept_tls(fd, p12: data)
+    mut secured: TlsStream? = none
+    if identity is Identity(id) {
+        let shaken = tls.accept(Fd(:fd), id)
         if shaken is Err(e) {
             io.write_stderr(f"http_fixture: {e.to_str()}\n")
             _exit(1)
         }
-        let t = shaken? or TlsConn(fd: -1, ctx: 0)
+        let t = must shaken
         input = t
         out = t
-        tls = t
+        secured = t
     }
-    let h = Handler(:port, :state, input: BufReader(inner: input, limit: 4611686018427387904), :out, :tls, :server_gone)
+    let h = Handler(:port, :state, input: BufReader(inner: input, limit: 4611686018427387904), :out, tls: secured, :server_gone)
     let _ = h.handle(fd)
     // As Python's socketserver ends a connection: no TLS close notice.
     shutdown(fd, SHUT_WR)
@@ -814,14 +620,14 @@ func main(argv: [str]) -> int64 {
         return 2
     }
     let port = argv[1].parse_int()? or 0
-    mut p12: bytes? = none
+    mut identity: Identity? = none
     if len(argv) == 4 {
-        let made = pkcs12(argv[2], argv[3])
+        let made = tls.load_identity(argv[2], argv[3])
         if made is Err(e) {
             io.write_stderr(f"http_fixture: {e.to_str()}\n")
             return 1
         }
-        p12 = made
+        identity = made
     }
     let listener = tcp.listen("127.0.0.1", :port)
     if listener is Err(e) {
@@ -858,7 +664,7 @@ func main(argv: [str]) -> int64 {
             if pid == 0 {
                 libc.close(listener.fd)
                 libc.close(alive)
-                serve(conn.fd, :port, :state, :server_gone, :p12)
+                serve(conn.fd, :port, :state, :server_gone, :identity)
             }
             libc.close(conn.fd)
         }
