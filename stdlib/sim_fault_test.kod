@@ -1,0 +1,190 @@
+// Disk faults under a simulation (docs/simulation.md#disk-faults): with
+// `disk_faults: true` the seed fills the disk, or fails one write, sync or
+// read.
+import "panics"
+import "posix"
+import "posix" { Fd }
+import "sim"
+import "stream" { IoError }
+
+type Seen = shared struct {
+    what: [str] = []
+    faulted: int64 = 0
+    runs: int64 = 0
+}
+
+// What went wrong with `r`: "full", "eio" or "other".
+func what_failed(anon e: Error) -> str {
+    if e is IoError(io) {
+        if io.kind is .StorageFull {
+            return "full"
+        }
+        if io.errno == 5 {
+            return "eio"
+        }
+    }
+    return "other"
+}
+
+func note(anon seen: Seen, anon what: str) -> none {
+    if not (what in seen.what) {
+        seen.what += [what]
+    }
+}
+
+test "the seed fills the disk, or fails one write, sync or read" {
+    let seen = Seen()
+    sim.run(count: 200, body: func() {
+        seen.runs += 1
+        let f = must posix.open_rw("data")
+        mut failed = false
+        for i in 0..40 {
+            if f.write_str(f"piece {i};".repeat(10)) is Err(e) {
+                note(seen, "write " + what_failed(e))
+                failed = true
+            }
+            if f.sync() is Err(e) {
+                note(seen, "sync " + what_failed(e))
+                failed = true
+            }
+        }
+        must f.seek(0)
+        for _i in 0..40 {
+            if f.read(100) is Err(e) {
+                note(seen, "read " + what_failed(e))
+                failed = true
+            }
+        }
+        assert failed == sim.faulted()
+        if failed {
+            seen.faulted += 1
+        }
+    }, disk_faults: true)
+    for what in ["write full", "write eio", "sync eio", "read eio"] {
+        assert what in seen.what
+    }
+    assert len(seen.what) == 4
+    // About a quarter of the seeds have no fault.
+    assert 100 < seen.faulted < 190
+}
+
+test "without disk_faults the disk doesn't fail" {
+    sim.run(count: 50, body: func() {
+        let f = must posix.open_rw("data")
+        for i in 0..40 {
+            must f.write_str(f"piece {i};".repeat(10))
+            must f.sync()
+        }
+        assert not sim.faulted()
+    })
+}
+
+test "a full disk has room again once a file is removed" {
+    let seen = Seen()
+    sim.run(count: 200, body: func() {
+        let spare = must posix.create("spare")
+        if spare.write_str("x".repeat(1000)) is Err(_) {
+            return
+        }
+        must spare.close()
+        let f = must posix.create("grow")
+        for _i in 0..100 {
+            if f.write_str("y".repeat(100)) is Err(e) {
+                if what_failed(e) != "full" {
+                    continue
+                }
+                must posix.remove("spare")
+                must f.write_str("y".repeat(100))
+                note(seen, "made room")
+                break
+            }
+        }
+    }, disk_faults: true)
+    assert "made room" in seen.what
+}
+
+type Kept = shared struct {
+    lines: [str] = []
+}
+
+// Appends lines, syncing each; `retry` tries a sync that failed again and
+// takes its success as the line's, which a failed sync makes wrong.
+func logger(anon kept: Kept, retry: bool) -> func() -> none {
+    return func() {
+        kept.lines = []
+        let f = must posix.create("log")
+        must f.sync()
+        must posix.sync_dir(".")
+        for i in 0..20 {
+            if f.write_str(f"line {i}\n") is Err(_) {
+                continue
+            }
+            if f.sync() is Err(e) {
+                if not retry {
+                    panic(f"the log can't be kept: {e.to_str()}")
+                }
+                must f.sync()
+            }
+            kept.lines += [f"line {i}"]
+        }
+    }
+}
+
+func log_checker(anon kept: Kept) -> func() -> none {
+    return func() {
+        if len(kept.lines) == 0 {
+            return
+        }
+        let text = kod_bytes_to_str(must (must posix.open_read("log")).read_all())
+        for line in kept.lines {
+            assert text.contains(line + "\n")
+        }
+    }
+}
+
+test "a sync that fails loses what it was to write, even if the next succeeds" {
+    let kept = Kept()
+    // Stopping at the failure: every seed keeps every line it said it kept,
+    // the body's panic counting as its crash.
+    sim.run(count: 200, body: logger(kept, retry: false), restart: log_checker(kept), disk_faults: true)
+    let Some(p) = panics.run(func() { sim.run(count: 200, body: logger(kept, retry: true), restart: log_checker(kept), disk_faults: true) }) else {
+        fail("no seed lost a line whose sync was tried again")
+        return
+    }
+    assert p.message.contains("assertion failed")
+}
+
+test "without restart, a body that stops at a fault fails the run" {
+    let p = panics.run(func() {
+        sim.run(count: 100, body: func() {
+            let f = must posix.create("x")
+            for _i in 0..50 {
+                must f.write_str("data")
+                must f.sync()
+            }
+        }, disk_faults: true)
+    })
+    assert p is panics.Panic
+}
+
+test "a seed fails the same call each time" {
+    let seen = Seen()
+    let body = func() {
+        seen.what = []
+        let f = must posix.open_rw("data")
+        for i in 0..40 {
+            if f.write_str(f"{i}".repeat(50)) is Err(e) {
+                note(seen, f"write {i} " + what_failed(e))
+            }
+            if f.sync() is Err(e) {
+                note(seen, f"sync {i} " + what_failed(e))
+            }
+        }
+    }
+    for seed in 0..20 {
+        sim.replay(seed, body: body, disk_faults: true)
+        let first = seen.what
+        sim.replay(seed, body: body, disk_faults: true)
+        assert seen.what == first
+    }
+}

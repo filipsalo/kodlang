@@ -37,9 +37,10 @@ test "an echo server, simulated" {
 
 | Function | Does |
 |----------|------|
-| `sim.run(count: 100, from: 0, start: none, body: f, restart: none)` | runs `f`, a `func() -> none`, under the seeds `from` to `from + count - 1`, one after another; when one fails it panics, saying the seed and the panic it had. With `restart:`, a second `func() -> none`, each run [crashes](#crashes) and `restart` runs after |
-| `sim.replay(seed, start: none, body: f, restart: none)` | runs `f` under `seed` alone, letting its panic through as it is: for looking at a failure `run` found |
+| `sim.run(count: 100, from: 0, start: none, body: f, restart: none, disk_faults: false)` | runs `f`, a `func() -> none`, under the seeds `from` to `from + count - 1`, one after another; when one fails it panics, saying the seed and the panic it had. With `restart:`, a second `func() -> none`, each run [crashes](#crashes) and `restart` runs after; with `disk_faults: true`, the disk [fails](#disk-faults) under some seeds |
+| `sim.replay(seed, start: none, body: f, restart: none, disk_faults: false)` | runs `f` under `seed` alone, letting its panic through as it is: for looking at a failure `run` found |
 | `sim.crashed()` | in `restart`: whether the crash stopped the body before it ended |
+| `sim.faulted()` | whether the disk has failed a call in this run |
 | `sim.simulating()` | whether code runs under a simulation |
 | `sim.seed()` | the seed of the run under way |
 | `sim.digest()` | a number standing for every choice the last run made; two runs with one seed give the same |
@@ -176,13 +177,92 @@ failed for it, so how it ended doesn't matter: `restart` runs either way.
 Under a simulation, renaming a directory that is on the real disk fails with
 `InvalidInput`.
 
+## Disk faults
+
+With `disk_faults: true`, under three seeds in four the disk fails once, or
+fills up, at a point the seed picks:
+
+- **A full disk.** From one of the body's writes on, the disk has no more
+  room than its files then take: a write that would make them longer
+  writes what fits and fails with `StorageFull` once nothing does, and so
+  does a `truncate` that lengthens a file. Removing or cutting short a file
+  makes room again.
+- **A write that fails.** One write fails with an I/O error (`EIO`, kind
+  `Other`), having written nothing.
+- **A sync that fails.** One `f.sync()` fails with an I/O error, and what
+  was written to the file since its last sync never reaches the disk: the
+  program still reads it back, but the next `sync` doesn't write it and a
+  crash loses it, as on Linux, where a sync that failed has given up on the
+  pages it was to write. A program that tries the sync again and takes its
+  success as the data's is wrong; one that stops, or writes it all again,
+  is right.
+- **A read that fails.** One read fails with an I/O error.
+
+Which call fails is counted among those of its kind: one of the first few
+under some seeds, one of the first hundreds under others, in the body; a
+fault the body doesn't come to doesn't come in `restart`, though a disk the
+body filled is still full there.
+
+A program may well stop when its disk fails, as a database should when a
+sync fails. With `restart:`, a body that ends with a panic after a fault
+isn't a failure: the power is cut there, as if it had crashed, and
+`restart` checks what is left. Without `restart:` it is, and the body has to
+cope with the error itself.
+
+```kod
+import "posix"
+import "posix" { Fd }
+import "sim"
+
+type Kept = shared struct {
+    lines: [str] = []
+}
+
+// Appends `line`, and is done once it is on the disk; a sync that fails
+// stops the program, since what it was to write may be gone.
+func log(anon f: Fd, anon line: str) -> none or Error {
+    try f.write_all(kod_str_to_bytes(line + "\n"))
+    if f.sync() is Err(e) {
+        panic(f"the log can't be kept: {e.to_str()}")
+    }
+}
+
+test "a log keeps what it said it kept, whatever the disk does" {
+    let kept = Kept()
+    sim.run(count: 100, body: func() {
+        kept.lines = []
+        let f = must posix.create("log")
+        must f.sync()
+        must posix.sync_dir(".")
+        for i in 0..20 {
+            // A full disk or a write that fails: the line isn't kept.
+            if log(f, f"line {i}") is Ok(_) {
+                kept.lines += [f"line {i}"]
+            }
+        }
+    }, restart: func() {
+        if len(kept.lines) == 0 {
+            return
+        }
+        let text = kod_bytes_to_str(must (must posix.open_read("log")).read_all())
+        for line in kept.lines {
+            assert text.contains(line + "\n")
+        }
+    }, disk_faults: true)
+}
+```
+
+Had `log` tried the sync again, a seed whose sync fails would find a line
+missing that the body was told was kept: 13 seeds of 200 do (a quarter of
+the faults are syncs, and the failing one has to be among the log's 21).
+
 ## What isn't
 
 Child processes, `posix.poll` and the standard streams are the real ones,
 and so is a file opened only for reading that the run hasn't changed; a body
 that waits for those, or for another program, isn't repeatable. The
-simulated disk never fails a call that would succeed on a healthy one: it is
-never full, and has no read or write errors.
+simulated disk fails a call only as [Disk faults](#disk-faults) says: one
+fault a run, and never a slow disk or a sync that silently does nothing.
 Tasks must not outlive the body: those it spawned are waited for when it
 ends, as at any function's end.
 

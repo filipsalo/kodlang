@@ -47,6 +47,7 @@ type IoKind = enum {
     Tls
     Protocol
     Cancelled
+    StorageFull     // no room left on the disk (ENOSPC)
 }
 
 type IoError = struct {

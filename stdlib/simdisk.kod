@@ -5,12 +5,15 @@
 // still the real one, read only.
 import "io"
 import "posix"
+import "sets" { Set }
 import "stream" { os_error }
 import "tasks"
 
 let SECTOR: int64 = 512
 let EPERM: int64 = 1
 let ENOENT: int64 = 2
+let EIO: int64 = 5
+let ENOSPC: int64 = 28
 let EBADF: int64 = 9
 let EEXIST: int64 = 17
 let ENOTDIR: int64 = 20
@@ -30,6 +33,7 @@ type Change = struct {
 // the disk for sure, `changes` taking it to `data`. `real`: a directory that
 // was on the real disk, whose entries the run hasn't changed are still there.
 type Node = shared struct {
+    id: int64
     dir: bool
     data: bytes
     synced: bytes
@@ -70,6 +74,14 @@ type Disk = shared struct {
     // What a crash keeps of what wasn't synced: each piece with a chance of
     // `keep` in 4.
     keep: int64 = 0
+    // The fault the seed picked (docs/simulation.md#disk-faults): none, a
+    // full disk, a write, a sync or a read that fails, FULL to READ; how many
+    // more calls of its kind until it comes, the last of them failing; and
+    // whether it has. A full disk then holds no more than `room` bytes.
+    fault: int64 = NO_FAULT
+    fault_in: int64 = -1
+    faulted: bool = false
+    room: int64 = -1
 
     func has(self, anon path: str) -> bool {
         return self.names.contains(clean(path))
@@ -110,6 +122,9 @@ type Disk = shared struct {
         if not f.reads {
             throw os_error("read", errno: EBADF)
         }
+        if self._fault_due(READ_FAILS) {
+            throw os_error("read", errno: EIO)
+        }
         let data = f.node.data
         if f.pos >= len(data) {
             return kod_str_to_bytes("")
@@ -129,15 +144,35 @@ type Disk = shared struct {
             throw os_error("write", errno: EBADF)
         }
         self._step()
+        if self._fault_due(WRITE_FAILS) {
+            throw os_error("write", errno: EIO)
+        }
         let node = f.node
         mut at = f.pos
         if f.appends {
             at = len(node.data)
         }
-        node.data = put(node.data, at, data)
-        node.changes += [Change(:at, :data)]
-        f.pos = at + len(data)
-        return len(data)
+        // What fits, on a full disk.
+        mut piece = data
+        let growth = at + len(data) - len(node.data)
+        if growth > 0 {
+            if self.room < 0 and self._fault_due(FULL) {
+                self.room = self._used()
+            }
+            if self.room >= 0 {
+                let over = growth - (self.room - self._used())
+                if over >= len(data) {
+                    throw os_error("write", errno: ENOSPC)
+                }
+                if over > 0 {
+                    piece = data[..len(data) - over]
+                }
+            }
+        }
+        node.data = put(node.data, at, piece)
+        node.changes += [Change(:at, data: piece)]
+        f.pos = at + len(piece)
+        return len(piece)
     }
 
     func seek(self, anon fd: int64, anon pos: int64) -> none or Error {
@@ -157,7 +192,13 @@ type Disk = shared struct {
     func sync(self, anon fd: int64) -> none or Error {
         let f = try self._file(fd, "sync")
         self._step()
-        f.node.synced = f.node.data
+        // A sync that fails gives up on what it was to write: it is never
+        // on the disk, though the program reads it back.
+        if self._fault_due(SYNC_FAILS) {
+            f.node.changes = []
+            throw os_error("sync", errno: EIO)
+        }
+        f.node.synced = self._settled(f.node, all: true)
         f.node.changes = []
     }
 
@@ -167,6 +208,9 @@ type Disk = shared struct {
             throw os_error("truncate", errno: EINVAL)
         }
         self._step()
+        if self.room >= 0 and size - len(f.node.data) > self.room - self._used() {
+            throw os_error("truncate", errno: ENOSPC)
+        }
         f.node.data = resized(f.node.data, size)
         f.node.changes += [Change(at: size, data: kod_str_to_bytes(""), cut: true)]
     }
@@ -337,7 +381,7 @@ type Disk = shared struct {
         let id = self.next_node
         self.next_node += 1
         let empty = kod_str_to_bytes("")
-        self.nodes[id] = Node(:dir, data: empty, synced: empty)
+        self.nodes[id] = Node(:id, :dir, data: empty, synced: empty)
         return id
     }
 
@@ -399,6 +443,8 @@ type Disk = shared struct {
             kept = tasks.sim_rand(kept + 1)
         }
         self.crash_in = -1
+        // A fault the body didn't come to doesn't come in the restart.
+        self.fault_in = -1
         for change in self.name_changes[..kept] {
             self._keep(change)
         }
@@ -406,33 +452,85 @@ type Disk = shared struct {
         self.names = self.kept_names
         for id in self.nodes.keys() {
             let node = must self.nodes.get(id)
-            mut out = node.synced
-            for c in node.changes {
-                if c.cut {
-                    if self._coin() {
-                        out = resized(out, c.at)
-                    }
-                    continue
-                }
-                // In pieces that end where the file's sectors do.
-                mut k = 0
-                for k < len(c.data) {
-                    let at = c.at + k
-                    mut end = k + SECTOR - at % SECTOR
-                    if end > len(c.data) {
-                        end = len(c.data)
-                    }
-                    if self._coin() {
-                        out = put(out, at, c.data[k..end])
-                    }
-                    k = end
-                }
-            }
+            let out = self._settled(node, all: false)
             node.synced = out
             node.data = out
             node.changes = []
         }
         self.files = Map[int64, OpenFile]()
+    }
+
+    // What is on the disk of `node` once its changes have been written: all
+    // of them, or (not `all`) the pieces the seed keeps.
+    func _settled(self, anon node: Node, all: bool) -> bytes {
+        mut out = node.synced
+        for c in node.changes {
+            if c.cut {
+                if all or self._coin() {
+                    out = resized(out, c.at)
+                }
+                continue
+            }
+            if all {
+                out = put(out, c.at, c.data)
+                continue
+            }
+            // In pieces that end where the file's sectors do.
+            mut k = 0
+            for k < len(c.data) {
+                let at = c.at + k
+                mut end = k + SECTOR - at % SECTOR
+                if end > len(c.data) {
+                    end = len(c.data)
+                }
+                if self._coin() {
+                    out = put(out, at, c.data[k..end])
+                }
+                k = end
+            }
+        }
+        return out
+    }
+
+    // How many bytes the files take: those with a name, and those open.
+    func _used(self) -> int64 {
+        mut seen = Set[int64]()
+        mut total = 0
+        for id in self.names.values() {
+            if id != 0 and not seen.contains(id) {
+                seen.add(id)
+                total += len((must self.nodes.get(id)).data)
+            }
+        }
+        for f in self.files.values() {
+            if not seen.contains(f.node.id) {
+                seen.add(f.node.id)
+                total += len(f.node.data)
+            }
+        }
+        return total
+    }
+
+    // The seed picks a fault, under three seeds in four, and when it comes.
+    func plan_faults(self) -> none {
+        if tasks.sim_rand(4) != 0 {
+            self.fault = 1 + tasks.sim_rand(4)
+            self.fault_in = 1 + tasks.sim_rand(2 << tasks.sim_rand(8))
+        }
+    }
+
+    // A call of kind `kind` is made: whether it is the one to fail.
+    func _fault_due(self, anon kind: int64) -> bool {
+        if self.fault != kind or self.fault_in < 0 {
+            return false
+        }
+        self.fault_in -= 1
+        if self.fault_in > 0 {
+            return false
+        }
+        self.fault_in = -1
+        self.faulted = true
+        return true
     }
 
     // The seed picks when the power is cut, and what that loses.
@@ -456,6 +554,13 @@ type Disk = shared struct {
     }
 }
 
+// The faults a disk can have (Disk.fault).
+let NO_FAULT: int64 = 0
+let FULL: int64 = 1
+let WRITE_FAILS: int64 = 2
+let SYNC_FAILS: int64 = 3
+let READ_FAILS: int64 = 4
+
 mut _disk: Disk? = none
 
 // A new, empty disk, for a simulation about to begin.
@@ -469,6 +574,14 @@ func begin() -> Disk {
 func end() -> none {
     _disk = none
     posix.set_sim_files(none)
+}
+
+// Whether the disk has failed a call in this run.
+func faulted() -> bool {
+    if _disk is Disk(d) {
+        return d.faulted
+    }
+    return false
 }
 
 // In the restart: whether the crash came before the body ended.
