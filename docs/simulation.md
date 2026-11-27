@@ -95,9 +95,9 @@ ends, as at any function's end.
 
 With a bug fixed on 2026-11-27 put back (a TLS reader that sent records a
 writer had queued but not yet sent, while the writer had been preempted
-between the two), 67 of 200 seeds of a connection writing and reading at
+between the two), 32 of 200 seeds of a connection writing and reading at
 once deadlock. The window is a few checks among hundreds of thousands: none
-of 200 seeds found it without the preemption after stores, 11 without
+of 200 seeds found it without the preemption after stores, nor without
 priorities.
 
 A seed gives the same run whether `run` comes to it after other seeds or

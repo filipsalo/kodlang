@@ -369,7 +369,7 @@ the page and its fault handler went.
 Counting alone rarely finds a race whose window is a few checks among
 hundreds of thousands, such as a writer preempted between queueing records
 and sending them (a TLS bug, put back on purpose: 0 of 200 seeds). Three
-things find it, in 67 of 200 seeds:
+things find it, in 32 of 200 seeds:
 
 - A store to what other tasks can reach, a `shared struct`'s field or a
   module-level variable, sets a word (`adrp`, `str`: no branch); the next
@@ -382,11 +382,13 @@ things find it, in 67 of 200 seeds:
 - Every switch looks for I/O that has come (one `poll(2)` for all of a run's
   descriptors), as the kernel would have woken those tasks meanwhile.
 
-Without the store bias, none of the 200 seeds found it; without priorities,
-11. Outside a simulation the store's word costs nothing measurable: the
+Without the store bias, or without priorities, none of the 200 seeds found
+it. (Before the snapshot marked its own modules' stores too, 67 did: stores to
+structs no other task sees, such as a byte buffer's, dilute the bias.)
+Outside a simulation the store's word costs nothing measurable: the
 compiler, with 1,979 of them, 373 ms against 374, and a loop storing to a
 shared struct's fields 200 million times, 443 ms against 446. A TLS hunt
-takes 6.5 s for 200 seeds, against 4.2 s before.
+takes 8.2 s for 200 seeds, against 4.2 s before.
 
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does
