@@ -58,9 +58,10 @@ assert h.finish() == sha2.sha384(b"hello, world")
 has seen so far and go on; a copy (`let saved = h`) goes on from the same point
 separately. TLS uses both to hash the handshake as it goes.
 
-SHA-256 runs on the CPU's SHA-256 instructions (`sha256h` and its kin, which
-every 64-bit Apple CPU has), at about 2 GB/s (OpenSSL's, 3 GB/s). SHA-384 and
-SHA-512 are plain Kod, at about 180 MB/s.
+The blocks go to the CPU's SHA-256 and SHA-512 instructions (`sha256h`,
+`sha512h` and their kin, which every Apple CPU since the M1 has): SHA-256 runs
+at about 2 GB/s and SHA-384 and SHA-512 at about 1.4 GB/s (OpenSSL's, 3 and
+1.8 GB/s).
 
 ## HMAC: `crypto/hmac`
 

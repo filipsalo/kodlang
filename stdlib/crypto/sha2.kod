@@ -1,16 +1,18 @@
 // SHA-256, SHA-384 and SHA-512 (FIPS 180-4). See docs/crypto.md.
+//
+// The blocks go to the CPU's SHA-256 and SHA-512 instructions
+// (`kod_sha256_block` and `kod_sha512_block`, arm64 intrinsics), a run of
+// them at a time. SHA-256's state is kept as 32-bit words in int64s,
+// SHA-512's as the int64s themselves.
 
 import "unsafe"
 
 // One 64-byte block at `block` into the state at `ctx`: eight 32-bit words
 // and then the 64 round constants (arm64.kod's sha256_lines).
 extern func kod_sha256_block(anon ctx: int64, anon block: int64) -> none
-//
-// SHA-256 runs on the CPU's SHA-256 instructions (`kod_sha256_block`, an
-// arm64 intrinsic), a run of blocks at a time; its state is kept as 32-bit
-// words in int64s. SHA-512's words are the int64s themselves, so it
-// adds with wrapping_add and `>>` (which shifts in zeros) to treat them as
-// unsigned.
+// One 128-byte block, the same way: eight 64-bit words, then the 80 round
+// constants (sha512_lines).
+extern func kod_sha512_block(anon ctx: int64, anon block: int64) -> none
 
 type Algo = enum {
     Sha256
@@ -139,10 +141,8 @@ type Hasher = struct {
     func compress(mut self, anon data: bytes, at: int64, blocks: int64) -> none {
         if self.algo is .Sha256 {
             self.h = compress256(self.h, data, at: at, blocks: blocks)
-            return
-        }
-        for b in 0..blocks {
-            self.h = compress512(self.h, data, at: at + b * 128)
+        } else {
+            self.h = compress512(self.h, data, at: at, blocks: blocks)
         }
     }
 
@@ -196,10 +196,6 @@ func sha512(anon data: bytes) -> bytes {
     return digest(.Sha512, data)
 }
 
-func rotr64(anon x: int64, anon n: int64) -> int64 {
-    return (x >> n) | (x << (64 - n))
-}
-
 // K256 as 32-bit little-endian words, made once.
 mut K256_WORDS: bytes = k256_words()
 
@@ -227,55 +223,31 @@ func compress256(anon state: [int64], anon data: bytes, at: int64, blocks: int64
     return out
 }
 
-// The state after one 128-byte block of `data`, from `at`.
-func compress512(anon state: [int64], anon data: bytes, at: int64) -> [int64] {
-    mut h = state
-    mut w = [0] * 80
-    for i in 0..16 {
-        let j = at + i * 8
-        mut word = 0
-        for k in 0..8 {
-            word = (word << 8) | data[j + k]
+// K512 as 64-bit little-endian words, made once.
+mut K512_WORDS: bytes = k512_words()
+
+func k512_words() -> bytes {
+    mut out: [int64] = []
+    for k in K512 {
+        for shift in 0..8 {
+            out += [(k >> (8 * shift)) & 255]
         }
-        w[i] = word
     }
-    for i in 16..80 {
-        let x = w[i - 15]
-        let y = w[i - 2]
-        let s0 = rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7)
-        let s1 = rotr64(y, 19) ^ rotr64(y, 61) ^ (y >> 6)
-        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1)
+    return kod_bytes_from_array(out)
+}
+
+// The state after `blocks` 128-byte blocks of `data`, from `at`.
+func compress512(anon state: [int64], anon data: bytes, at: int64, blocks: int64) -> [int64] {
+    let ctx = unsafe.alloc(64 + 640)
+    for i in 0..8 {
+        unsafe.store64(ctx + 8 * i, state[i])
     }
-    mut a = h[0]
-    mut b = h[1]
-    mut c = h[2]
-    mut d = h[3]
-    mut e = h[4]
-    mut f = h[5]
-    mut g = h[6]
-    mut hh = h[7]
-    for i in 0..80 {
-        let s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
-        let ch = (e & f) ^ ((e ^ -1) & g)
-        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i])
-        let s0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
-        let maj = (a & b) ^ (a & c) ^ (b & c)
-        hh = g
-        g = f
-        f = e
-        e = d.wrapping_add(t1)
-        d = c
-        c = b
-        b = a
-        a = t1.wrapping_add(s0).wrapping_add(maj)
+    unsafe.copy_in(ctx + 64, K512_WORDS)
+    let start = unsafe.data(data) + at
+    for b in 0..blocks {
+        kod_sha512_block(ctx, start + 128 * b)
     }
-    h[0] = h[0].wrapping_add(a)
-    h[1] = h[1].wrapping_add(b)
-    h[2] = h[2].wrapping_add(c)
-    h[3] = h[3].wrapping_add(d)
-    h[4] = h[4].wrapping_add(e)
-    h[5] = h[5].wrapping_add(f)
-    h[6] = h[6].wrapping_add(g)
-    h[7] = h[7].wrapping_add(hh)
-    return h
+    let out = [unsafe.load64(ctx + 8 * i) for i in 0..8]
+    unsafe.free(ctx)
+    return out
 }
