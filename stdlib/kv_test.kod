@@ -5,6 +5,7 @@ import "kv"
 import "posix"
 import "sim"
 import "stream" { IoError }
+import "tasks"
 
 func b(anon s: str) -> bytes {
     return kod_str_to_bytes(s)
@@ -102,6 +103,49 @@ func writer(anon db: kv.Store, anon name: str) -> int64 {
     return 20
 }
 
+test "tasks that put at once share syncs" {
+    let dir = fresh("group")
+    let db = must kv.open(dir)
+    let before = db.syncs
+    mut writing: [tasks.Task[int64]] = []
+    for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        writing += [spawn writer(db, name)]
+    }
+    for w in writing {
+        assert w.wait() == 20
+    }
+    // 160 puts; one sync each would be 160.
+    assert db.syncs - before <= 40
+    assert db.len() == 160
+    must db.close()
+    let again = must kv.open(dir)
+    assert again.len() == 160
+    assert again.get("h19") == b("h")
+    must again.close()
+}
+
+func put_one(anon db: kv.Store, anon key: str) -> int64 {
+    must db.put(key, b("set"))
+    return 1
+}
+
+func remove_one(anon db: kv.Store, anon key: str) -> int64 {
+    must db.remove(key)
+    return 1
+}
+
+test "a removal right after another task's put, not yet synced, removes it" {
+    let dir = fresh("pending")
+    let db = must kv.open(dir)
+    // The put's task syncs for both: it lets the remover in first.
+    let putting = spawn put_one(db, "k")
+    let removing = spawn remove_one(db, "k")
+    assert putting.wait() + removing.wait() == 2
+    assert db.get("k") is none
+    must db.close()
+    assert (must kv.open(dir)).get("k") is none
+}
+
 test "tasks share a store" {
     let dir = fresh("tasks")
     let db = must kv.open(dir)
@@ -181,30 +225,33 @@ func check(anon db: kv.Store, anon m: Model) -> none {
 }
 
 type Models = shared struct {
-    a: Model
-    b: Model
+    each: [Model] = []
     opened: bool = false
 }
 
 test "every change that returned outlives a crash and a failing disk" {
-    let ms = Models(a: new_model(), b: new_model())
+    let ms = Models()
     sim.run(count: 200, body: func() {
-        ms.a = new_model()
-        ms.b = new_model()
+        ms.each = [new_model(), new_model(), new_model(), new_model()]
         ms.opened = false
         let db = must kv.open("store")
         ms.opened = true
-        let one = spawn churn(db, ms.a, "a", sim.seed())
-        let two = spawn churn(db, ms.b, "b", sim.seed())
-        let _ = one.wait()
-        let _ = two.wait()
+        // Four writers, so that changes share syncs.
+        mut running: [tasks.Task[int64]] = []
+        for k, prefix in ["a", "b", "c", "d"] {
+            running += [spawn churn(db, ms.each[k], prefix, sim.seed())]
+        }
+        for r in running {
+            let _ = r.wait()
+        }
     }, restart: func() {
         if not ms.opened {
             return
         }
         let db = must kv.open("store")
-        check(db, ms.a)
-        check(db, ms.b)
+        for m in ms.each {
+            check(db, m)
+        }
         // And it takes changes again, unless the disk is still full.
         if db.put("after", b("crash")) is Ok(_) {
             assert db.get("after") == b("crash")

@@ -21,6 +21,15 @@ let FIXED: int64 = 5
 let GROWTH: int64 = 4
 let COMPACT_AT: int64 = 1048576
 
+// A change written to the log and not synced yet: what it does, and where in
+// all the store has ever written (Store.total) its record ends.
+type Pending = struct {
+    upto: int64
+    kind: int64
+    key: str
+    value: bytes
+}
+
 type Store = shared struct {
     dir: str
     values: Map[str, bytes]
@@ -29,6 +38,18 @@ type Store = shared struct {
     // store holds would be.
     end: int64 = 0
     live: int64 = 0
+    // How much the store has ever written to its logs, and how much of that is
+    // synced: positions that go on across compactions. The changes written
+    // after `synced`, in order, are made to `values` once a sync covers them.
+    total: int64 = 0
+    synced: int64 = 0
+    pending: [Pending] = []
+    // A task is syncing for the others (_wait_synced), who wait for `round`
+    // to close.
+    syncing: bool = false
+    round: tasks.Channel[int64] = tasks.Channel[int64]()
+    // How many times the log has been synced.
+    syncs: int64 = 0
     // The error that stopped it, after which nothing changes it.
     broken: Error? = none
     changing: tasks.Mutex = tasks.Mutex()
@@ -47,30 +68,20 @@ type Store = shared struct {
 
     // Sets `key` to `value`, once that is on the disk.
     func put(self, anon key: str, anon value: bytes) -> none or Error {
-        self.changing.lock()
-        let done = self._change(PUT, key, value)
-        self.changing.unlock()
-        if done is Err(e) {
-            throw e
-        }
+        try self._change(PUT, key, value)
     }
 
     // Removes `key`, if it is there, once that is on the disk.
     func remove(self, anon key: str) -> none or Error {
-        self.changing.lock()
-        mut done: none or Error = none
-        if self.values.contains(key) {
-            done = self._change(REMOVE, key, kod_str_to_bytes(""))
-        }
-        self.changing.unlock()
-        if done is Err(e) {
-            throw e
-        }
+        try self._change(REMOVE, key, kod_str_to_bytes(""))
     }
 
     func compact(self) -> none or Error {
         self.changing.lock()
-        let done = self._compact()
+        mut done = self._sync_all()
+        if done is Ok(_) {
+            done = self._compact()
+        }
         self.changing.unlock()
         if done is Err(e) {
             throw e
@@ -81,28 +92,41 @@ type Store = shared struct {
         try self.log.close()
     }
 
+    // Writes the change's record, then waits until a sync covers it.
     func _change(self, anon kind: int64, anon key: str, anon value: bytes) -> none or Error {
-        if self.broken is Error(e) {
+        self.changing.lock()
+        let wrote = self._write(kind, key, value)
+        self.changing.unlock()
+        if wrote is Err(e) {
             throw e
         }
-        try self._append(record(kind, key, value))
-        if self.values.get(key) is bytes(old) {
-            self.live -= HEADER + FIXED + len(key) + len(old)
-        }
-        if kind == PUT {
-            self.values[key] = value
-            self.live += HEADER + FIXED + len(key) + len(value)
-        } else {
-            let _ = self.values.remove(key)
-        }
-        if self.end >= COMPACT_AT and self.end > GROWTH * self.live {
-            try self._compact()
+        if wrote is int64(target) and target > 0 {
+            try self._wait_synced(target)
         }
     }
 
-    // Writes `rec` at the end of the log and syncs it. A full disk undoes it;
-    // any other failure stops the store.
-    func _append(self, anon rec: bytes) -> none or Error {
+    // Whether `key` is there once the pending changes are made.
+    func _has(self, anon key: str) -> bool {
+        for i in len(self.pending) - 1..=0 step -1 {
+            let p = self.pending[i]
+            if p.key == key {
+                return p.kind == PUT
+            }
+        }
+        return self.values.contains(key)
+    }
+
+    // Writes the change's record at the end of the log, unsynced: where in
+    // `total` it ends, or 0 for a removal of what isn't there. A full disk
+    // undoes the write; any other failure stops the store.
+    func _write(self, anon kind: int64, anon key: str, anon value: bytes) -> int64 or Error {
+        if self.broken is Error(e) {
+            throw e
+        }
+        if kind == REMOVE and not self._has(key) {
+            return 0
+        }
+        let rec = record(kind, key, value)
         let wrote = self._write_at_end(rec)
         if wrote is Err(e) {
             if is_full(e) and self.log.truncate(self.end) is Ok(_) {
@@ -111,11 +135,74 @@ type Store = shared struct {
             self.broken = e
             throw e
         }
+        self.end += len(rec)
+        self.total += len(rec)
+        self.pending += [Pending(upto: self.total, :kind, :key, :value)]
+        return self.total
+    }
+
+    // Waits until the log is synced up to `target`. The first task to need a
+    // sync makes it for all: it lets the other tasks that are ready write
+    // their changes first, then syncs once; the others wait for that, and look
+    // again (a sync that began before their change doesn't cover it).
+    func _wait_synced(self, anon target: int64) -> none or Error {
+        for self.synced < target {
+            if self.broken is Error(e) {
+                throw e
+            }
+            if tasks.cancelled() {
+                throw IoError(kind: .Cancelled, op: "kv", errno: 0, detail: "cancelled before the change was synced; it may be kept or not")
+            }
+            if self.syncing {
+                let round = self.round
+                let _ = round.receive()
+                continue
+            }
+            self.syncing = true
+            tasks.give_way()
+            self.changing.lock()
+            let done = self._sync_all()
+            self.changing.unlock()
+            self.syncing = false
+            let round = self.round
+            self.round = tasks.Channel[int64]()
+            round.close()
+            if done is Err(e) {
+                throw e
+            }
+        }
+    }
+
+    // Syncs what has been written, and makes the changes that covers; then
+    // compacts, if the log has grown enough. `changing` is held.
+    func _sync_all(self) -> none or Error {
+        if self.broken is Error(e) {
+            throw e
+        }
+        if self.synced == self.total {
+            return
+        }
         if self.log.sync() is Err(e) {
             self.broken = e
             throw e
         }
-        self.end += len(rec)
+        self.syncs += 1
+        for p in self.pending {
+            if self.values.get(p.key) is bytes(old) {
+                self.live -= HEADER + FIXED + len(p.key) + len(old)
+            }
+            if p.kind == PUT {
+                self.values[p.key] = p.value
+                self.live += HEADER + FIXED + len(p.key) + len(p.value)
+            } else {
+                let _ = self.values.remove(p.key)
+            }
+        }
+        self.pending = []
+        self.synced = self.total
+        if self.end >= COMPACT_AT and self.end > GROWTH * self.live {
+            try self._compact()
+        }
     }
 
     func _write_at_end(self, anon rec: bytes) -> none or Error {
@@ -124,7 +211,7 @@ type Store = shared struct {
     }
 
     // The snapshot, written whole and renamed into place; then the log,
-    // emptied.
+    // emptied. Nothing is pending: `changing` is held, and _sync_all has run.
     func _compact(self) -> none or Error {
         if self.broken is Error(e) {
             throw e

@@ -33,6 +33,7 @@ func main() -> int64 or Error {
 | `db.len()` | how many keys there are |
 | `db.compact()` | writes what the store holds afresh, dropping the changes that led to it; `none or Error` |
 | `db.close()` | closes its files; `none or Error` |
+| `db.syncs` | how many times the store has synced its log, for measuring |
 
 Everything the store holds is in memory as well: `get` doesn't read the disk.
 It is for what fits in memory many times over, such as settings, sessions or
@@ -55,8 +56,27 @@ an index, not for a large data set.
   the exception: the change is undone, nothing else is lost, and the store
   goes on, so that a program can make room and try again.
 
-Tasks can share a store: changes are made one at a time, in the order they
-were asked for, and `get` sees each once its `put` has returned.
+Tasks can share a store: changes go to the log in the order they were asked
+for, and `get` sees each once its `put` has returned (not before: until then
+it may not be on the disk).
+
+## Many writers
+
+A sync takes milliseconds (on a Mac's SSD, about 4), and the program waits for
+it, every task included, so one sync for each change would hold a store to a
+few hundred changes a second however many tasks make them. Instead, changes
+that tasks make at the same time share a sync: a task whose change needs one
+lets the others that are ready write theirs to the log first, then syncs once
+for them all, and each of them returns once the sync has covered its own
+change. One task alone syncs once for each change, as before.
+
+512 puts to a store in `build/`, on a Mac's SSD:
+
+| Tasks putting | One sync per change | Shared syncs |
+|---------------|--------------------|--------------|
+| 1 | 248 a second | 245 a second |
+| 8 | 236 | 1,706 |
+| 64 | 249 | 10,039 |
 
 ## On the disk
 
@@ -86,9 +106,13 @@ what the store holds, and to at least a megabyte.
 ## Tested by crashing it
 
 `stdlib/kv_test.kod` runs a store under a [simulation](simulation.md) with
-crashes and disk faults: two tasks make changes the seed picks, noting each
+crashes and disk faults: four tasks make changes the seed picks, noting each
 that returned, while compaction runs now and then; after the crash, the
 store has to hold every change that returned, and at most the one that
-hadn't. Over 500 seeds, none fails; with the sync after each record left out,
-169 do; with the directory's sync after the snapshot's rename left out, 96;
-and with a failed sync tried again instead of stopping the store, 6.
+hadn't (each task's one in the middle). Over 500 seeds, none fails; with the
+log's sync left out, 150 do; with the directory's sync after the snapshot's
+rename left out, 109; and with a failed sync tried again instead of stopping
+the store, 8. Of the
+mistakes shared syncs invite, 26 seeds find a task that returns once any sync
+has run, even one that began before its change was written, and 23 a
+`compact` that empties the log before syncing what is in it.
