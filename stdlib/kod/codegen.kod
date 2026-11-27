@@ -21460,9 +21460,7 @@ type Codegen = shared struct {
     // `target = rhs`, or with `op` `target op= rhs`.
     func compile_update(self, anon target: int64, rhs: int64, op: ast.Op?) -> none {
         self.compile_update_only(target, :rhs, :op)
-        if self.reachable_target(target) {
-            self.emit_store_mark()
-        }
+        self.emit_store_mark(target)
     }
 
     func compile_update_only(self, anon target: int64, rhs: int64, op: ast.Op?) -> none {
@@ -23534,23 +23532,33 @@ type Codegen = shared struct {
         return not (path.ends_with(CHANNEL_MODULE_PATH) or path.ends_with("stdlib/builtins.kod") or path.ends_with("stdlib/kod/inspect.kod") or path.ends_with("stdlib/panics.kod") or path.ends_with("stdlib/unsafe.kod") or path.ends_with("stdlib/net/tls.kod"))
     }
 
-    // After a store to what other tasks can reach: kod_poll_stored is set
-    // (stdlib/runtime.c) to anything but 0, its own page's address. Under a
-    // simulation the next check then preempts sooner.
-    func emit_store_mark(self) -> none {
-        if not self.checks_here() or not self.can_push() {
+    // After a store to a shared struct's field or a module variable:
+    // kod_poll_stored is set (stdlib/runtime.c) to the struct, when a local
+    // holds it, else to anything but 0 and outside the counted heap, its own
+    // page's address. Under a simulation the next check then preempts sooner,
+    // if another task can reach the struct.
+    func emit_store_mark(self, anon target: int64) -> none {
+        let base = self.store_mark_base(target)
+        if base == NO_MARK or not self.checks_here() or not self.can_push() {
             return
         }
         let x16 = regalloc.reg_of("x16")
         self.emit_op(.AddressPage, a: "x16", b: "_kod_poll_stored@PAGE")
+        if base >= 0 and self.p.exprs[base] is .Ident(name) and self.var_index(name) >= 0 {
+            let v = self.pool.alloc_reg()
+            self.emit_ldr(self.vars[self.var_index(name)].offset, reg: v)
+            self.out_buf.push(.Mem(load: false, width: 8, reg: regalloc.reg_of(v), base: x16, at: .Symbol(name: "_kod_poll_stored", got: false)))
+            self.pool.free_reg(v)
+            return
+        }
         self.out_buf.push(.Mem(load: false, width: 8, reg: x16, base: x16, at: .Symbol(name: "_kod_poll_stored", got: false)))
     }
 
-    // Whether a store to `target` changes what other tasks can read: a shared
-    // struct's field on its path, or a module-level variable at its root.
-    func reachable_target(self, anon target: int64) -> bool {
+    // For a store to `target`: the expression of the shared struct whose field
+    // it changes, MODULE_MARK for a module-level variable, or NO_MARK.
+    func store_mark_base(self, anon target: int64) -> int64 {
         if self.var_signature(self.store_root(target)) is Some(_) {
-            return true
+            return MODULE_MARK
         }
         mut node = target
         for true {
@@ -23559,11 +23567,11 @@ type Codegen = shared struct {
                 break
             }
             if op is .Dot and self.infer_kind(base) is .KStruct(idx, _a) and idx >= 0 and idx < len(self.structs) and self.structs[idx].shared {
-                return true
+                return base
             }
             node = base
         }
-        return false
+        return NO_MARK
     }
 
     // The calls emit_poll's checks make when the flag is set, after the
@@ -25835,6 +25843,11 @@ func either_flow(anon a: Flow, anon b: Flow) -> Flow {
 let SET_MODULE_PATH: str = "stdlib/sets.kod"
 // Where `tasks.Channel` is declared, which `for v in ch` goes over.
 let CHANNEL_MODULE_PATH: str = "stdlib/tasks.kod"
+
+// What store_mark_base gives for a module-level variable, and for a store
+// that needs no mark.
+let MODULE_MARK: int64 = -2
+let NO_MARK: int64 = -1
 
 func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     return Codegen(:p, :path_prefix)

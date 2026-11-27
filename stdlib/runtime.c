@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -62,11 +63,91 @@ void kod_poll_set(int64_t flag, int64_t budget, int64_t store_budget) {
     kod_poll_store_budget = store_budget;
 }
 
+// Under a simulation, which counted objects other tasks can reach: a byte for
+// each 16 bytes of the counted heap (stdlib/rc.c), set by kod_sim_reach. Address
+// space only; pages are touched as objects are marked, and each run starts
+// with none.
+#define KOD_RC_BASE 0x300000000000ULL
+#define KOD_REACH_BYTES (1ULL << 32)
+uint8_t *kod_reach_map = 0;
+
 void kod_poll_simulate(int64_t on) {
     kod_poll_sim = on;
     kod_poll_held = 0;
     // What was stored before doesn't count in the run.
     kod_poll_stored = 0;
+    if (kod_reach_map) {
+        munmap(kod_reach_map, KOD_REACH_BYTES);
+        kod_reach_map = 0;
+    }
+    if (on) {
+        void *m = mmap(0, KOD_REACH_BYTES, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+        kod_reach_map = m == MAP_FAILED ? 0 : (uint8_t *)m;
+    }
+}
+
+static inline int kod_is_counted(const void *p) {
+    return ((uint64_t)p >> 36) == (KOD_RC_BASE >> 36);
+}
+
+// `p`, and every counted object it refers to, can be reached by another task
+// (`spawn` hands it over): stores to them count as the simulation's (see
+// kod_poll_stored). The references are the ones rc.c follows when it frees an
+// object: the header's mask, an array's elements, a big object's descriptor.
+void kod_sim_reach(void *p) {
+    if (!kod_reach_map) return;
+    int64_t cap = 1024, n = 0, seen = 0;
+    void **stack = malloc((size_t)cap * sizeof(void *));
+    stack[n++] = p;
+    while (n > 0 && seen < 1000000) {
+        void *o = stack[--n];
+        if (!kod_is_counted(o)) continue;
+        uint8_t *mark = kod_reach_map + (((uint64_t)o & 0xfffffffffULL) >> 4);
+        if (*mark) continue;
+        *mark = 1;
+        seen++;
+        uint32_t info = ((uint32_t *)o)[-1];
+        uint32_t mask = info >> 8;
+        void **slots = (void **)o;
+        void *found[64];
+        int64_t k = 0;
+        if ((mask & (1u << 22)) && !(mask & (1u << 23))) {
+            void **buf = (void **)slots[0];
+            if ((mask & (1u << 21)) && buf) {
+                int64_t len = (int64_t)slots[1];
+                for (int64_t i = 0; i < len; i++) {
+                    if (n + 1 >= cap) {
+                        cap *= 2;
+                        stack = realloc(stack, (size_t)cap * sizeof(void *));
+                    }
+                    stack[n++] = buf[i];
+                }
+            }
+        } else if (mask & (1u << 23)) {
+            int cls = (int)(info & 0x7fu);
+            int64_t size = cls < 64 ? (int64_t)(cls + 1) * 16 : (int64_t)2048 << (cls - 64);
+            const int64_t *desc = *(const int64_t **)((char *)o - 8 + size - 8);
+            for (int64_t w = 0; w < desc[0]; w++) {
+                for (uint64_t bits = (uint64_t)desc[w + 1]; bits; bits &= bits - 1) {
+                    if (n + 1 >= cap) {
+                        cap *= 2;
+                        stack = realloc(stack, (size_t)cap * sizeof(void *));
+                    }
+                    stack[n++] = slots[w * 64 + __builtin_ctzll(bits)];
+                }
+            }
+        } else {
+            for (; mask; mask &= mask - 1) found[k++] = slots[__builtin_ctz(mask)];
+        }
+        for (int64_t i = 0; i < k; i++) {
+            if (n + 1 >= cap) {
+                cap *= 2;
+                stack = realloc(stack, (size_t)cap * sizeof(void *));
+            }
+            stack[n++] = found[i];
+        }
+    }
+    free(stack);
 }
 
 // While a panic's backtrace is kept, nothing gives way (tasks.c).
@@ -106,6 +187,19 @@ __attribute__((naked)) void kod_poll_stub(void) {
         "ldr x17, [x16, _kod_poll_stored@PAGEOFF]\n"
         "cbz x17, 2f\n"
         "str xzr, [x16, _kod_poll_stored@PAGEOFF]\n"
+        // A counted object counts only when another task can reach it; a
+        // module variable's mark (an address outside the counted heap) always.
+        "lsr x16, x17, #36\n"
+        "cmp x16, #0x300\n"
+        "b.ne 3f\n"
+        "adrp x16, _kod_reach_map@PAGE\n"
+        "ldr x16, [x16, _kod_reach_map@PAGEOFF]\n"
+        "cbz x16, 2f\n"
+        "and x17, x17, #0xfffffffff\n"
+        "lsr x17, x17, #4\n"
+        "ldrb w17, [x16, x17]\n"
+        "cbz x17, 2f\n"
+        "3:\n"
         "adrp x16, _kod_poll_store_budget@PAGE\n"
         "ldr x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
         "sub x17, x17, #1\n"

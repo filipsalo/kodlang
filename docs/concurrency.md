@@ -369,12 +369,17 @@ the page and its fault handler went.
 Counting alone rarely finds a race whose window is a few checks among
 hundreds of thousands, such as a writer preempted between queueing records
 and sending them (a TLS bug, put back on purpose: 0 of 200 seeds). Three
-things find it, in 32 of 200 seeds:
+things find it, in 54 of 200 seeds:
 
-- A store to what other tasks can reach, a `shared struct`'s field or a
-  module-level variable, sets a word (`adrp`, `str`: no branch); the next
-  check that finds it set clears it and counts a second, short countdown
-  down. The preemption is at the check, never between the store and the
+- A store to a `shared struct`'s field or a module-level variable sets a
+  word to the struct's address (`adrp`, `str`: no branch; for a variable,
+  an address outside the counted heap); the next check that finds it set
+  clears it and, if another task can reach the struct, counts a second,
+  short countdown down. Modules are compiled apart, so which structs other
+  tasks reach is known only at run time: under a simulation, `spawn` marks
+  what the new task's body refers to, and all it refers to in turn, in a
+  byte map beside the counted heap (one byte for 16 bytes, address space
+  reserved per run). The preemption is at the check, never between the store and the
   next one, so the simulation interleaves only as a real run could.
 - Under half the seeds tasks run by priority (PCT): the highest ready one,
   a preempted one dropping below the rest, so that a writer can run on while
@@ -383,12 +388,17 @@ things find it, in 32 of 200 seeds:
   descriptors), as the kernel would have woken those tasks meanwhile.
 
 Without the store bias, or without priorities, none of the 200 seeds found
-it. (Before the snapshot marked its own modules' stores too, 67 did: stores to
-structs no other task sees, such as a byte buffer's, dilute the bias.)
-Outside a simulation the store's word costs nothing measurable: the
-compiler, with 1,979 of them, 373 ms against 374, and a loop storing to a
-shared struct's fields 200 million times, 443 ms against 446. A TLS hunt
-takes 8.2 s for 200 seeds, against 4.2 s before.
+it. While every shared struct's stores counted, 32 did: stores to ones no
+other task sees, such as a byte buffer's, diluted the bias, half of a run's
+stores. A mark stays on a freed object's bytes until the run ends, so a new
+object there counts too; clearing it on reuse, a branch in every
+allocation, found 56 seeds instead of 54, so it isn't done.
+
+Outside a simulation the store's word costs little: with the address of
+the struct, which takes a load when it isn't in a register, the compiler
+takes 367 ms against 365 with a constant, and a loop storing to a shared
+struct's fields 200 million times is within the noise. A TLS hunt takes
+6.3 s for 200 seeds, against 4.2 s before any of this.
 
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does

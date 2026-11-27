@@ -60,9 +60,12 @@ a longer hunt now and then.
   ([Preemption](tasks.md#preemption)), but after a number of those that the
   seed draws each time, as likely a handful as thousands, rather than every
   10 ms. A check that comes right after a store to what other tasks can
-  reach (a field of a `shared struct`, a module-level variable) preempts
-  sooner: under some seeds the first such check, under others one of the
-  next hundred. So a race between two tasks that read and write the same
+  reach preempts sooner: under some seeds the first such check, under others
+  one of the next hundred. What counts is a module-level variable, and a
+  field of a `shared struct` that was handed to another task: passed to a
+  function `spawn` runs, or captured by one, or reachable from such a value.
+  A struct a task made and kept to itself doesn't count, nor one a channel
+  carried; and only the last store before a check is looked at. So a race between two tasks that read and write the same
   data without waiting in between shows up under some seed too, and that
   seed preempts at the same places again. The store itself is never cut in
   two, and nothing is preempted where it couldn't be outside a simulation.
@@ -95,10 +98,10 @@ ends, as at any function's end.
 
 With a bug fixed on 2026-11-27 put back (a TLS reader that sent records a
 writer had queued but not yet sent, while the writer had been preempted
-between the two), 32 of 200 seeds of a connection writing and reading at
+between the two), 54 of 200 seeds of a connection writing and reading at
 once deadlock. The window is a few checks among hundreds of thousands: none
 of 200 seeds found it without the preemption after stores, nor without
-priorities.
+priorities, and 32 did while stores to every shared struct counted.
 
 A seed gives the same run whether `run` comes to it after other seeds or
 `replay` runs it alone, as long as the body doesn't depend on what earlier
