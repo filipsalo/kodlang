@@ -1,11 +1,13 @@
 // stdlib/sim.kod (docs/simulation.md): runs repeat under a seed, time is
 // virtual, connections stay in the program, and a race or a deadlock is found
 // and named by its seed.
+import "crypto/random"
 import "net/tcp"
 import "panics"
 import "posix" { Fd }
 import "sim"
 import "stream" { IoError }
+import "tasks"
 import "time"
 import "time" { Duration, monotonic_ns }
 
@@ -164,6 +166,105 @@ test "a race shows up under some seed, and its seed shows it again" {
     for _i in 0..3 {
         assert panics.run(func() { sim.replay(seed, body: race) }) is panics.Panic
     }
+}
+
+// Reads the count, works a while without waiting, and writes it back one
+// more: only preemption can come between, at one of the loop's checks.
+func bump_busy(anon c: Counter) -> int64 {
+    let seen = c.n
+    mut k = 0
+    for i in 0..20 {
+        k += i
+    }
+    c.n = seen + 1
+    return k
+}
+
+func busy_race() -> none {
+    let count = Counter()
+    let first = spawn bump_busy(count)
+    let second = spawn bump_busy(count)
+    let _ = first.wait()
+    let _ = second.wait()
+    assert count.n == 2
+}
+
+test "a race with no wait in it shows up under some seed, by preemption" {
+    let Some(p) = panics.run(func() { sim.run(count: 300, body: busy_race) }) else {
+        fail("no seed preempted a task between its read and its write")
+        return
+    }
+    assert p.message.contains("assertion failed")
+    let seed = failing_seed(p)
+    for _i in 0..3 {
+        assert panics.run(func() { sim.replay(seed, body: busy_race) }) is panics.Panic
+    }
+}
+
+type Flag = shared struct {
+    up: bool = false
+}
+
+// Counts until the flag is up, never waiting: the task that puts it up runs
+// only when this one is preempted.
+func spin(anon flag: Flag) -> int64 {
+    mut n = 0
+    for not flag.up {
+        n += 1
+    }
+    return n
+}
+
+// Worked out at its first use, with loops of its own.
+mut squares_table: [int64] = squares()
+
+func squares() -> [int64] {
+    mut out: [int64] = []
+    for i in 0..1000 {
+        out += [i * i]
+    }
+    return out
+}
+
+type Spins = shared struct {
+    n: int64 = 0
+}
+
+test "a task that never waits is preempted, at the same check for a seed" {
+    let got = Spins()
+    let body = func() {
+        // The first run works squares_table out, which mustn't move where the
+        // seed preempts.
+        assert squares_table[3] == 9
+        let flag = Flag()
+        let spinning = spawn spin(flag)
+        tasks.give_way()
+        flag.up = true
+        got.n = spinning.wait()
+    }
+    mut seen: [int64] = []
+    for seed in 0..10 {
+        sim.replay(seed, body: body)
+        let n = got.n
+        let digest = sim.digest()
+        sim.replay(seed, body: body)
+        assert got.n == n and sim.digest() == digest
+        if not (n in seen) {
+            seen += [n]
+        }
+    }
+    assert len(seen) >= 5
+}
+
+test "random bytes come from the seed" {
+    mut one = b""
+    sim.replay(3, body: func() { one = random.secure_bytes(40) })
+    mut again = b""
+    sim.replay(3, body: func() { again = random.secure_bytes(40) })
+    mut other = b""
+    sim.replay(4, body: func() { other = random.secure_bytes(40) })
+    assert len(one) == 40 and one == again and one != other
+    assert random.secure_bytes(40) != random.secure_bytes(40)
 }
 
 func wait_forever(anon conn: Fd) -> int64 {

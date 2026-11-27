@@ -289,4 +289,6 @@ messages. `crypto/der` is the DER reader underneath.
 ## Random bytes: `crypto/random`
 
 `random.secure_bytes(n)` gives `n` bytes from the operating system's
-cryptographic generator (`getentropy`), for keys and nonces.
+cryptographic generator (`getentropy`), for keys and nonces. Under a
+[simulation](simulation.md) they come from its seed instead, so that a run
+repeats; they are then anything but secret.

@@ -31,6 +31,9 @@ extern func kod_panic_uncaught(anon msg: str) -> none
 extern func kod_eprint(anon s: str) -> none
 extern func kod_sim_set_clock(anon ns: int64) -> none
 extern func kod_sim_set_epoch(anon ns: int64) -> none
+extern func kod_poll_set(anon flag: int64, anon budget: int64) -> none
+extern func kod_poll_simulate(anon on: int64) -> none
+extern func kod_sim_set_random(anon on: int64, anon seed: int64) -> none
 extern func _inspect_caller_fp() -> int64
 extern func _inspect_read_i64(anon addr: int64) -> int64
 
@@ -559,7 +562,8 @@ func _finish() -> none {
     _leave_to = next.ctx
 }
 
-// The polling page faulted (tasks.c): the running task has run for a while
+// The flag was set (_poll_due), or in code compiled before the flag the
+// polling page faulted (tasks.c): the running task has run for a while
 // without waiting, and lets those that are ready run.
 func _preempt() -> none {
     // In the scheduler (_take_next, _poll) a turn given away would run the
@@ -570,6 +574,33 @@ func _preempt() -> none {
         return
     }
     give_way()
+}
+
+// A loop's check found the flag set and the countdown out (runtime.c,
+// kod_poll_stub): every 10 ms, the running task gives way; under a
+// simulation, after as many checks as the seed says, counting on.
+func _poll_due() -> none {
+    if _sim is _Sim(sim) {
+        kod_poll_set(1, _sim_budget(sim))
+        if _scheduling > 0 {
+            return
+        }
+        // Looking for what I/O has come takes system calls, which a seed
+        // that preempts every few checks would make most of the run: done
+        // one time in 16, so a task waiting for I/O wakes a little later.
+        if _io.len() > 0 and _sim_rand(16) == 0 {
+            _poll(false)
+        }
+        if _head == len(_ready) {
+            return
+        }
+        let me = _running()
+        _make_ready(me)
+        _switch_from(me)
+        return
+    }
+    kod_poll_set(0, 1)
+    _preempt()
 }
 
 // How deep the running code is in the scheduler's own loops, which no
@@ -1384,6 +1415,9 @@ type _Sim = shared struct {
     // paths, and the descriptors not closed yet.
     paths: [str] = []
     open: [int64] = []
+    // How long tasks run before they are preempted: each time after 1 to
+    // 2^(b + 1) loop checks, b from 0 to `rate`.
+    rate: int64 = 0
 }
 
 mut _sim: _Sim? = none
@@ -1423,9 +1457,22 @@ func sim_begin(anon seed: int64, epoch_ns: int64) -> none {
         _hooked = true
     }
     _sim_gen += 1
-    _sim = _Sim(:seed, state: seed.wrapping_mul(-7046029254386353131).wrapping_add(1))
+    let sim = _Sim(:seed, state: seed.wrapping_mul(-7046029254386353131).wrapping_add(1))
+    _sim = sim
     kod_sim_set_epoch(epoch_ns)
     kod_sim_set_clock(0)
+    // The longest a task runs before it is preempted: 32 checks under some
+    // seeds, some hundred thousand under others.
+    sim.rate = 4 + _sim_rand(14)
+    kod_sim_set_random(1, seed)
+    kod_poll_simulate(1)
+    kod_poll_set(1, _sim_budget(sim))
+}
+
+// How many loop checks until the running task is next preempted: as likely
+// a few as some thousands.
+func _sim_budget(anon sim: _Sim) -> int64 {
+    return 1 + _sim_rand(2 << _sim_rand(sim.rate + 1))
 }
 
 // A socket path the simulation's network made (net/tcp), removed at its end.
@@ -1466,6 +1513,9 @@ func sim_end() -> int64 {
     }
     _sim = none
     _scheduling = 0
+    kod_sim_set_random(0, 0)
+    kod_poll_simulate(0)
+    kod_poll_set(0, 1)
     kod_sim_set_clock(-1)
     return digest
 }

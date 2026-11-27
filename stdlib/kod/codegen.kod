@@ -882,6 +882,25 @@ func loop_calls_ok(anon body: regalloc.InsnBuf, top: int64, back: int64, label_a
     return true
 }
 
+// `body`, too long for a conditional branch to reach its end, with each
+// preemption check's call in line, jumped over while the flag is clear, in
+// place of a branch to it after the `ret` (emit_poll).
+func inline_polls(anon body: regalloc.InsnBuf) -> regalloc.InsnBuf {
+    let out = body.derived()
+    for i in 0..body.n {
+        if (body.tags[i] & 255) == regalloc.INSN_DATA {
+            let text = body.strs[body.fa[i]]
+            if text.starts_with("\tcbnz x16, Lpoll") and text.ends_with("_due") {
+                out.push_data(f"\tcbz x16, {text[len("\tcbnz x16, ")..len(text) - 4]}")
+                out.push_data("\tbl _kod_poll_stub")
+                continue
+            }
+        }
+        out.copy_from(body, :i)
+    }
+    return out
+}
+
 // Whether the loop from `top` to `back` has a preemption check (emit_poll).
 func has_poll(anon body: regalloc.InsnBuf, top: int64, back: int64) -> bool {
     for k in top + 1..back {
@@ -1601,6 +1620,8 @@ type Codegen = shared struct {
     // emit_index_check's slow paths, waiting for an unconditional jump, and
     // those of the code around each loop being compiled.
     cold: [regalloc.Insn] = []
+    // Lines for after the function's `ret` (emit_poll).
+    poll_cold: [str] = []
     cold_stack: [[regalloc.Insn]] = []
     // rc_hold's slots: those holding a call's receiver or arguments, and free ones.
     holds: [int64] = []
@@ -21270,8 +21291,11 @@ type Codegen = shared struct {
         self.emit_op(.Add, a: "x17", b: "x17", c: "_kod_task_now@PAGEOFF")
         self.emit_load("x17", base: "x17")
         self.emit_store("x17", base: "x16", off: 8)
-        // The initializer's reference becomes the cell's.
+        // The initializer's reference becomes the cell's. Under a simulation
+        // the loop checks it makes aren't counted (stdlib/runtime.c).
+        self.emit_call("_kod_poll_hold")
         self.emit_call(init)
+        self.emit_call("_kod_poll_unhold")
         self.emit_op(.AddressPage, a: "x16", b: f"{cell}@PAGE")
         self.emit_op(.Add, a: "x16", b: "x16", c: f"{cell}@PAGEOFF")
         self.emit_load("x1", base: "x16")
@@ -23485,9 +23509,27 @@ type Codegen = shared struct {
             return
         }
         // As text, which the passes take as changing anything in memory: once
-        // another task has run, what was loaded before may have changed.
-        self.out_buf.push_data("\tadrp x16, _kod_poll_page@PAGE")
-        self.out_buf.push_data("\tldr wzr, [x16]")
+        // another task has run, what was loaded before may have changed. They
+        // see neither branch, which kod_poll_stub (stdlib/runtime.c) makes as
+        // if it weren't taken: it keeps every register but x16 and x17.
+        let lbl = self.fresh("Lpoll")
+        self.out_buf.push_data("\tadrp x16, _kod_poll_flag@PAGE")
+        self.out_buf.push_data("\tldr x16, [x16, _kod_poll_flag@PAGEOFF]")
+        self.out_buf.push_data(f"\tcbnz x16, {lbl}_due")
+        self.out_buf.push_data(f"{lbl}:")
+        if not self.dry_run {
+            self.poll_cold += [f"{lbl}_due:", "\tbl _kod_poll_stub", f"\tb {lbl}"]
+        }
+    }
+
+    // The calls emit_poll's checks make when the flag is set, after the
+    // function's `ret` and before its unwind row's end (in a body too long for
+    // a conditional branch to reach there, inline_polls).
+    func flush_poll_cold(self) -> none {
+        for line in self.poll_cold {
+            self.out_buf.push_data(line)
+        }
+        self.poll_cold = []
     }
 
     func compile_foreach(self, anon body: [int64], name: str, iter_id: int64) -> none {
@@ -24484,6 +24526,7 @@ type Codegen = shared struct {
         self.hold_free = []
         self.cold = []
         self.cold_stack = []
+        self.poll_cold = []
         self.borrow_marks = []
         self.pool.reset()
         self.loop_stack = []
@@ -24836,6 +24879,8 @@ type Codegen = shared struct {
         self.frame_base = 0
         if arm64.line_count(body_buf) > LONG_BODY_INSNS {
             body_buf = self.long_branches(body_buf)
+            body_buf = inline_polls(body_buf)
+            self.poll_cold = []
         }
         // Nothing reads the body again: at depth 0 it goes out as it is.
         if self.func_depth == 0 {
@@ -24853,6 +24898,10 @@ type Codegen = shared struct {
         }
         if len(self.rc_slots) > 0 {
             let last_lbl = self.fresh("Lunwind")
+            if len(self.poll_cold) > 0 {
+                self.emit_op(.Return)
+                self.flush_poll_cold()
+            }
             self.emit_label(last_lbl)
             self.emit_op(.Return)
             mut by_ref_slots: [int64] = []
@@ -24862,6 +24911,7 @@ type Codegen = shared struct {
             self.emit_unwind_row(func_lbl, :last_lbl, :by_ref_slots, :by_ref_offs)
         } else {
             self.emit_op(.Return)
+            self.flush_poll_cold()
         }
         self.dwarf_vars = self.debug_vars(func_decl, body: allocated)
         self.emit_symtab_entry(func_lbl, name: display_name, file: self.p.path, line: decl_line)

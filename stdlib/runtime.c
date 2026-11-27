@@ -35,6 +35,175 @@ extern void kod_inspect_print_backtrace_from(int64_t fp)
 // way. A page of its own, so that making it unreadable touches nothing else.
 __attribute__((aligned(16384), section("__DATA,__kod_poll"))) char kod_poll_page[16384];
 
+// The loop check as compiled now (codegen.kod, emit_poll) loads kod_poll_flag
+// and, when it is set, calls kod_poll_stub, which counts kod_poll_budget down
+// and at 0 calls kod_poll_hook (stdlib/tasks.kod, _poll_due). Every 10 ms a
+// thread sets the flag (tasks.c), and the hook clears it and gives way; a
+// simulation (stdlib/sim.kod) keeps it set, so that the countdown, which the
+// seed sets, counts every check, and a task gives way at the same check each
+// time. The polling page above is for code compiled before, the snapshot's.
+int64_t kod_poll_flag = 0;
+int64_t kod_poll_budget = 1;
+void (*kod_poll_hook)(void) = 0;
+// Under a simulation: what a module variable's initializer runs isn't counted
+// (kod_poll_hold), so that a seed preempts at the same checks whether or not an
+// earlier run worked the variable out. How many initializers are under way, and
+// the countdown the outermost one put aside.
+int64_t kod_poll_sim = 0;
+int64_t kod_poll_held = 0;
+int64_t kod_poll_kept = 0;
+
+void kod_poll_set(int64_t flag, int64_t budget) {
+    kod_poll_flag = flag;
+    kod_poll_budget = budget;
+}
+
+void kod_poll_simulate(int64_t on) {
+    kod_poll_sim = on;
+    kod_poll_held = 0;
+}
+
+// While a panic's backtrace is kept, nothing gives way (tasks.c).
+extern int kod_no_preempt;
+
+// The countdown is out: what follows in the hook isn't counted until it sets
+// another.
+void kod_poll_slow(void) {
+    kod_poll_budget = (int64_t)1 << 62;
+    if (kod_no_preempt || !kod_poll_hook) {
+        kod_poll_budget = 1;
+        return;
+    }
+    kod_poll_hook();
+}
+
+// Called by a loop's check while kod_poll_flag is set. It changes x16, x17
+// and lr only (regalloc.kod, keeps_regs): the countdown in those, and when it
+// is out, a frame that keeps everything else (as tasks.c's kod_preempt_stub)
+// around kod_poll_slow.
+__attribute__((naked)) void kod_poll_stub(void) {
+    __asm__(
+        "adrp x16, _kod_poll_budget@PAGE\n"
+        "ldr x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "sub x17, x17, #1\n"
+        "str x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "cbz x17, 1f\n"
+        "tbnz x17, #63, 1f\n"
+        "ret\n"
+        "1:\n"
+        "sub sp, sp, #144\n"
+        "str x30, [sp]\n"
+        "sub sp, sp, #688\n"
+        "stp x0, x1, [sp, #0]\n"
+        "stp x2, x3, [sp, #16]\n"
+        "stp x4, x5, [sp, #32]\n"
+        "stp x6, x7, [sp, #48]\n"
+        "stp x8, x9, [sp, #64]\n"
+        "stp x10, x11, [sp, #80]\n"
+        "stp x12, x13, [sp, #96]\n"
+        "stp x14, x15, [sp, #112]\n"
+        "str x17, [sp, #128]\n"
+        "mrs x9, nzcv\n"
+        "mrs x10, fpsr\n"
+        "stp x9, x10, [sp, #136]\n"
+        "str x30, [sp, #152]\n"
+        "stp q0, q1, [sp, #160]\n"
+        "stp q2, q3, [sp, #192]\n"
+        "stp q4, q5, [sp, #224]\n"
+        "stp q6, q7, [sp, #256]\n"
+        "stp q8, q9, [sp, #288]\n"
+        "stp q10, q11, [sp, #320]\n"
+        "stp q12, q13, [sp, #352]\n"
+        "stp q14, q15, [sp, #384]\n"
+        "stp q16, q17, [sp, #416]\n"
+        "stp q18, q19, [sp, #448]\n"
+        "stp q20, q21, [sp, #480]\n"
+        "stp q22, q23, [sp, #512]\n"
+        "stp q24, q25, [sp, #544]\n"
+        "stp q26, q27, [sp, #576]\n"
+        "stp q28, q29, [sp, #608]\n"
+        "stp q30, q31, [sp, #640]\n"
+        // The frame record: the caller's fp, and where it goes on.
+        "ldr x9, [sp, #688]\n"
+        "add x10, sp, #672\n"
+        "stp x29, x9, [x10]\n"
+        "mov x29, x10\n"
+        "bl _kod_poll_slow\n"
+        "ldr x29, [sp, #672]\n"
+        "ldp q30, q31, [sp, #640]\n"
+        "ldp q28, q29, [sp, #608]\n"
+        "ldp q26, q27, [sp, #576]\n"
+        "ldp q24, q25, [sp, #544]\n"
+        "ldp q22, q23, [sp, #512]\n"
+        "ldp q20, q21, [sp, #480]\n"
+        "ldp q18, q19, [sp, #448]\n"
+        "ldp q16, q17, [sp, #416]\n"
+        "ldp q14, q15, [sp, #384]\n"
+        "ldp q12, q13, [sp, #352]\n"
+        "ldp q10, q11, [sp, #320]\n"
+        "ldp q8, q9, [sp, #288]\n"
+        "ldp q6, q7, [sp, #256]\n"
+        "ldp q4, q5, [sp, #224]\n"
+        "ldp q2, q3, [sp, #192]\n"
+        "ldp q0, q1, [sp, #160]\n"
+        "ldr x30, [sp, #152]\n"
+        "ldp x9, x10, [sp, #136]\n"
+        "msr nzcv, x9\n"
+        "msr fpsr, x10\n"
+        "ldr x17, [sp, #128]\n"
+        "ldp x14, x15, [sp, #112]\n"
+        "ldp x12, x13, [sp, #96]\n"
+        "ldp x10, x11, [sp, #80]\n"
+        "ldp x8, x9, [sp, #64]\n"
+        "ldp x6, x7, [sp, #48]\n"
+        "ldp x4, x5, [sp, #32]\n"
+        "ldp x2, x3, [sp, #16]\n"
+        "ldp x0, x1, [sp, #0]\n"
+        "add sp, sp, #832\n"
+        "ret\n");
+}
+
+// Around a module variable's initializer (codegen.kod, emit_cached_getter),
+// under a simulation: the countdown is put aside, and taken up again after.
+// They change x16 and x17 only.
+__attribute__((naked)) void kod_poll_hold(void) {
+    __asm__(
+        "adrp x16, _kod_poll_sim@PAGE\n"
+        "ldr x17, [x16, _kod_poll_sim@PAGEOFF]\n"
+        "cbz x17, 1f\n"
+        "adrp x16, _kod_poll_held@PAGE\n"
+        "ldr x17, [x16, _kod_poll_held@PAGEOFF]\n"
+        "add x17, x17, #1\n"
+        "str x17, [x16, _kod_poll_held@PAGEOFF]\n"
+        "sub x17, x17, #1\n"
+        "cbnz x17, 1f\n"
+        "adrp x16, _kod_poll_budget@PAGE\n"
+        "ldr x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "adrp x16, _kod_poll_kept@PAGE\n"
+        "str x17, [x16, _kod_poll_kept@PAGEOFF]\n"
+        "adrp x16, _kod_poll_budget@PAGE\n"
+        "mov x17, #0x4000000000000000\n"
+        "str x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "1:\n"
+        "ret\n");
+}
+
+__attribute__((naked)) void kod_poll_unhold(void) {
+    __asm__(
+        "adrp x16, _kod_poll_held@PAGE\n"
+        "ldr x17, [x16, _kod_poll_held@PAGEOFF]\n"
+        "cbz x17, 1f\n"
+        "sub x17, x17, #1\n"
+        "str x17, [x16, _kod_poll_held@PAGEOFF]\n"
+        "cbnz x17, 1f\n"
+        "adrp x16, _kod_poll_kept@PAGE\n"
+        "ldr x17, [x16, _kod_poll_kept@PAGEOFF]\n"
+        "adrp x16, _kod_poll_budget@PAGE\n"
+        "str x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "1:\n"
+        "ret\n");
+}
+
 // Set by stdlib/tasks.c once a task has been started: prints, after a panic's
 // backtrace, where the running task was spawned.
 void (*kod_backtrace_hook)(void) = 0;
@@ -168,6 +337,8 @@ static void kod_unwind_frame(uint64_t *fp, uint64_t pc) {
         if (state == 2 || state == 3) {
             cell[0] = 0;
             cell[1] = 0;
+            // What kod_poll_hold put aside for it.
+            if (kod_poll_held > 0 && --kod_poll_held == 0) kod_poll_budget = kod_poll_kept;
             if (state == 3) kod_var_wake(cell);
         }
         return;
@@ -870,6 +1041,32 @@ void *kod_arr_concat_new(void *lhs_raw, void *rhs_raw, int64_t width) {
  * limit for a descriptor given 0, as it is for a read that blocks; one given -1
  * is a socket without a limit. A filter of 0 only asks whether the task is cancelled. */
 int64_t (*kod_wait_hook)(int64_t ident, int64_t filter, int64_t data) = 0;
+
+/* Under a simulation, crypto/random's bytes come from its seed (splitmix64),
+ * so that a run repeats: kod_sim_random fills `buf` and gives 1, or gives 0
+ * when no simulation is under way. */
+static int kod_sim_random_on = 0;
+static uint64_t kod_sim_random_state = 0;
+
+void kod_sim_set_random(int64_t on, int64_t seed) {
+    kod_sim_random_on = (int)on;
+    kod_sim_random_state = (uint64_t)seed ^ 0x5eed5eed5eed5eedULL;
+}
+
+int64_t kod_sim_random(uint8_t *buf, int64_t n) {
+    if (!kod_sim_random_on) return 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i % 8 == 0) {
+            kod_sim_random_state += 0x9e3779b97f4a7c15ULL;
+        }
+        uint64_t z = kod_sim_random_state;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z ^= z >> 31;
+        buf[i] = (uint8_t)(z >> (8 * (i % 8)));
+    }
+    return 1;
+}
 
 /* A simulation's clock (stdlib/tasks.kod, docs/simulation.md): the
  * nanoseconds since it began, which time.monotonic_ns gives instead of the

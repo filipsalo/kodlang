@@ -49,9 +49,14 @@ a longer hunt now and then.
 ## What is simulated
 
 - **Which task runs.** When several tasks are ready, the seed picks one; a task
-  that reads or writes a connection may give way to another first. Tasks
-  aren't preempted in the middle of a loop under a simulation, so a task runs
-  until it waits or gives way.
+  that reads or writes a connection may give way to another first.
+- **Where a task is preempted.** As outside a simulation, a task that runs
+  without waiting gives way at the top of a loop iteration or a function call
+  ([Preemption](tasks.md#preemption)), but after a number of those that the
+  seed draws each time, as likely a handful as thousands, rather than every
+  10 ms. So a race between two tasks that read and write the same data
+  without waiting in between shows up under some seed too, and that seed
+  preempts at the same places again.
 - **Time.** `time.monotonic_ns()`, `time.unix_ns()` and `time.now()` read a
   clock that stands still while tasks run, its calendar starting at `start`
   (a `time.Time`), or 2026-01-01 00:00:00 UTC. A test that checks a
@@ -65,6 +70,9 @@ a longer hunt now and then.
   buffers, so a write of a few kilobytes waits for the other end to read; a
   write goes in pieces of a size the seed picks. Connecting to a port nothing
   listens on is `ConnectionRefused`; to another host, an error.
+- **Randomness.** `crypto/random` gives bytes that come from the seed, so the
+  keys and nonces a run makes, and the work done with them, are the same
+  each time.
 - **Deadlock.** When every task waits and nothing it waits for can come, the
   run fails with `simulation: every task waits, and nothing can wake one`,
   where outside a simulation the program would hang.
@@ -72,7 +80,20 @@ a longer hunt now and then.
 ## What isn't
 
 Files, child processes, `posix.poll` and the standard streams are the real
-ones, and so is what `crypto/random` gives; a body that waits for those, or
-for another program, isn't repeatable. A task that loops without waiting is
-never stopped. Tasks must not outlive the body: those it spawned are waited
-for when it ends, as at any function's end.
+ones; a body that waits for those, or for another program, isn't repeatable.
+Tasks must not outlive the body: those it spawned are waited for when it
+ends, as at any function's end.
+
+Preempting at checks the seed draws finds a race whose window spans a fair
+share of a task's checks. One that needs a task preempted at one of a few
+checks among hundreds of thousands, and another task then to run on for
+thousands, is found only by luck: with a bug fixed on 2026-11-27 put back
+(a TLS reader that sent a writer's records), 200 seeds of a connection
+writing and reading at once found nothing.
+
+A seed gives the same run whether `run` comes to it after other seeds or
+`replay` runs it alone, as long as the body doesn't depend on what earlier
+runs left behind: a cache the program fills, say, makes the run that fills it
+do more work, so it is preempted at other places. A module-level variable is
+the exception: the work its initializer does isn't counted, so it doesn't
+matter which run worked it out.

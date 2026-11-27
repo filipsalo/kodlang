@@ -272,8 +272,14 @@ extern void kod_tasks_closing(int64_t fd) __asm__("$tasks$_closing");
 
 static void kod_preempt_start(void);
 
+/* A loop's check found it time to give way (runtime.c, kod_poll_stub). */
+extern void (*kod_poll_hook)(void);
+extern void kod_tasks_poll_due(void) __asm__("$tasks$_poll_due");
+static void kod_poll_due(void);
+
 void kod_task_hook(void) {
     kod_preempt_start();
+    kod_poll_hook = kod_poll_due;
     kod_unwind_group_hook = kod_tasks_unwind_group;
     kod_wait_hook = kod_tasks_wait_event;
     kod_close_hook = kod_tasks_closing;
@@ -287,11 +293,12 @@ void kod_task_set_now(int64_t stack) {
     kod_task_now = stack;
 }
 
-/* Preemption (docs/tasks.md#preemption). Each loop iteration loads from the
- * polling page (runtime.c); every 10 ms a ticker thread makes it unreadable,
- * so that the running task's next iteration faults. The fault handler makes
- * it readable again and has the task go on in kod_preempt_stub, past the
- * load, which keeps every register while the task gives way. */
+/* Preemption (docs/tasks.md#preemption). Every 10 ms a ticker thread sets
+ * kod_poll_flag, which each loop iteration checks (runtime.c, kod_poll_stub).
+ * Code compiled before that check, the snapshot's, loads from the polling page
+ * instead, which the ticker makes unreadable: the fault handler makes it
+ * readable again and has the task go on in kod_preempt_stub, past the load,
+ * which keeps every register while the task gives way. */
 #define KOD_POLL_PAGE 16384
 #define KOD_PREEMPT_US 10000
 /* Where the task goes on once it has given way: set by the fault handler,
@@ -299,6 +306,8 @@ void kod_task_set_now(int64_t stack) {
 uint64_t kod_preempt_resume = 0;
 
 extern char kod_poll_page[KOD_POLL_PAGE];
+extern int64_t kod_poll_flag;
+extern int64_t kod_poll_sim;
 /* Set while a panic's backtrace is being kept (runtime.c). */
 extern int kod_no_preempt;
 static struct sigaction kod_old_segv, kod_old_bus;
@@ -307,7 +316,10 @@ static void *kod_ticker(void *arg) {
     (void)arg;
     for (;;) {
         usleep(KOD_PREEMPT_US);
+        /* The page first: a task that sees the flag makes the page readable
+         * again (kod_poll_due), which must not come before this. */
         mprotect(kod_poll_page, KOD_POLL_PAGE, PROT_NONE);
+        kod_poll_flag = 1;
     }
     return NULL;
 }
@@ -400,12 +412,22 @@ __attribute__((naked)) static void kod_preempt_stub(void) {
         "br x16\n");
 }
 
+/* The ticker's flag has had a task give way: the page it made unreadable
+ * at the same time is readable again, or the next check of code compiled
+ * before the flag (the snapshot's) would have the task give way again at
+ * once. Likewise a fault on the page clears the flag. */
+static void kod_poll_due(void) {
+    if (!kod_poll_sim) mprotect(kod_poll_page, KOD_POLL_PAGE, PROT_READ | PROT_WRITE);
+    kod_tasks_poll_due();
+}
+
 /* A fault on the polling page sends the task into kod_preempt_stub; any
  * other goes to what was there before, by default ending the program. */
 static void kod_poll_fault(int sig, siginfo_t *info, void *context) {
     char *at = (char *)info->si_addr;
     if (at >= kod_poll_page && at < kod_poll_page + KOD_POLL_PAGE) {
         mprotect(kod_poll_page, KOD_POLL_PAGE, PROT_READ | PROT_WRITE);
+        if (!kod_poll_sim) kod_poll_flag = 0;
         if (kod_no_preempt) return;
         /* The signal's frame is below the task's sp: nothing is written there. */
         _STRUCT_ARM_THREAD_STATE64 *ts = &((ucontext_t *)context)->uc_mcontext->__ss;
@@ -419,6 +441,7 @@ static void kod_poll_fault(int sig, siginfo_t *info, void *context) {
 
 /* A child made by fork has no ticker: its loops go on undisturbed. */
 static void kod_preempt_forked(void) {
+    if (!kod_poll_sim) kod_poll_flag = 0;
     mprotect(kod_poll_page, KOD_POLL_PAGE, PROT_READ | PROT_WRITE);
 }
 

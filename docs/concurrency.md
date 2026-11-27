@@ -332,11 +332,40 @@ slower, within the noise. Loads, unlike the copy-on-write check, aren't told
 apart by where they come from: a slot may hold a shared struct as well as an
 array, and the passes that would reuse or hoist them see no types.
 
-As built, every 10 ms a thread makes the page unreadable once a program has
-started a task; the fault handler makes it readable again and sends the task
-to a stub that saves every register a call may change, calls `give_way`, and
-goes on past the load. No check is put in the scheduler (`tasks`), the
-builtins it uses, or the backtrace printer, which a switch mustn't land in.
+As built until 2026-11-27, every 10 ms a thread made the page unreadable once
+a program had started a task; the fault handler made it readable again and
+sent the task to a stub that saves every register a call may change, calls
+`give_way`, and goes on past the load. No check is put in the scheduler
+(`tasks`), the builtins it uses, or the backtrace printer, which a switch
+mustn't land in.
+
+A [simulation](simulation.md) needs more: to preempt a task at a check the
+seed picks, the same one each time, it must count the checks, which a fault
+on each would make take microseconds apiece. So the check became a flag
+after all: a load, and a branch to a call out of line, after the function's
+`ret`, which isn't taken until the flag is set. The call goes to a stub that
+changes nothing a value may be in, so the passes see the check as before:
+text that may change memory and names no register. The thread sets the flag
+every 10 ms, and the stub counts a countdown down, 1 outside a simulation,
+and at 0 has the task give way and clears the flag; a simulation keeps the
+flag set and the countdown at what the seed says, so that every check calls
+the stub, a few instructions until the countdown is out. Measured against the
+page (best of 7 runs, 2026-11-27):
+
+| check at each loop iteration | qsort | sieve | loop |
+|---|---|---|---|
+| load a flag, branch out of line if set | 0% | +1.5% | +1% |
+
+The branch, measured at +11% to +17% on 2026-11-23, was then in the loop's
+straight line; out of line, the branch not taken costs next to nothing.
+Under a simulation, a TLS connection writing and reading 300 KB at once
+takes 20 ms a seed on average against 13 ms without preemption; a seed that
+preempts every few checks switches tasks hundreds of thousands of times, so
+a preemption looks for I/O that has come (a system call per descriptor) only
+one time in 16.
+Modules the compiler is made of are built by the snapshot, which still
+loads from the page, so the page and its fault handler stay until a snapshot
+built with the flag replaces it.
 
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does

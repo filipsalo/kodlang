@@ -357,10 +357,12 @@ have changed since. Nothing else is interrupted: only those two are places
 where a task is preempted, so no reference count or array is left half
 changed.
 
-Every loop and function has the check, a load from a page the program makes unreadable
-when it is time ([Concurrency (design)](concurrency.md#preemption)); it costs
-a few percent in
-the tightest loops, and a program that never starts a task pays that too.
+Every loop and function has the check, a load of a flag the program sets
+when it is time, and a branch, not taken until then, to a call
+([Concurrency (design)](concurrency.md#preemption)); it costs a percent or
+two in the tightest loops, and a program that never starts a task pays that
+too. Under a [simulation](simulation.md) the same checks are counted, and the
+seed says at which one a task gives way.
 A child process made by `fork` (as `testing.run` does) isn't preempted.
 
 Waiting that can't end, because every task is waiting (for a task, a channel
