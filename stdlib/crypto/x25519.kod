@@ -1,91 +1,221 @@
 // X25519 (RFC 7748). See docs/crypto.md.
 //
-// A field element mod p = 2^255 - 19 is 10 limbs of 26 and 25 bits in turn,
-// lowest first, as in ref10: a multiplication's sums of products stay below
-// 2^62. Limbs may go negative between carries. The ladder swaps with masks,
-// so nothing branches on, or indexes by, the private key.
+// A field element mod p = 2^255 - 19 is 5 limbs of 51 bits, lowest first,
+// none negative. After a multiplication each is below 2^52, and the sums and
+// differences of those that go into the next stay below 2^53, which keeps
+// every sum of products in a multiplication below 2^63: `+` would panic
+// rather than wrap if that ever failed. Products of limbs are 128 bits, with
+// wrapping_mul and mul_high. The ladder swaps with masks, so nothing branches
+// on, or indexes by, the private key.
 
-// `x >> n` with the sign kept (Kod's `>>` shifts in zeros).
-func asr(anon x: int64, anon n: int64) -> int64 {
-    return (x >> n) | ((0 - (x >> 63)) << (64 - n))
-}
+let MASK: int64 = (1 << 51) - 1
 
-// The width of limb i: 26 bits for an even one, 25 for an odd one, so that
-// limb i starts at bit ceil(25.5 i).
-func width(anon i: int64) -> int64 {
-    return 26 - (i & 1)
-}
-
-// Each limb back to its width (rounding, so limbs may be negative), the
-// carry out of the top one coming back in at the bottom times 19 (2^255 =
-// 19 mod p), in ref10's order.
-func carry(anon a: [int64]) -> [int64] {
-    mut h = a
-    for i in [0, 4, 1, 5, 2, 6, 3, 7, 4, 8, 9, 0] {
-        let w = width(i)
-        let c = asr(h[i] + (1 << (w - 1)), w)
-        h[i] -= c << w
-        if i == 9 {
-            h[0] += 19 * c
-        } else {
-            h[i + 1] += c
-        }
-    }
-    return h
+// The places t0..t4, and t5 above them, each back below 2^51, t5 coming back
+// at the bottom times 19 (t1 may be a little over).
+func settle(anon t0: int64, anon t1: int64, anon t2: int64, anon t3: int64, anon t4: int64, anon t5: int64) -> [int64] {
+    let mask = MASK
+    let u1 = t1 + (t0 >> 51)
+    let u2 = t2 + (u1 >> 51)
+    let u3 = t3 + (u2 >> 51)
+    let u4 = t4 + (u3 >> 51)
+    let u5 = t5 + (u4 >> 51)
+    let u0 = (t0 & mask) + 19 * u5
+    return [u0 & mask, (u1 & mask) + (u0 >> 51), u2 & mask, u3 & mask, u4 & mask]
 }
 
 func add(anon a: [int64], anon b: [int64]) -> [int64] {
-    return [a[i] + b[i] for i in 0..10]
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]]
 }
+
+// 2p's limbs, which keep a - b from going negative for b's limbs below 2^52.
+let TWO_P0: int64 = (1 << 52) - 38
+let TWO_P: int64 = (1 << 52) - 2
 
 func sub(anon a: [int64], anon b: [int64]) -> [int64] {
-    return [a[i] - b[i] for i in 0..10]
+    return [a[0] + TWO_P0 - b[0], a[1] + TWO_P - b[1], a[2] + TWO_P - b[2], a[3] + TWO_P - b[3], a[4] + TWO_P - b[4]]
 }
 
-// a b mod p: limb i of a times limb j of b lands at limb i + j, times 2 when
-// both are odd (their offsets add up to half a bit more), and above limb 9
-// it comes back at i + j - 10 times 19. With limbs of 27 bits at most, each
-// sum stays below 2^62.
+// a b mod p. Each product of two limbs is split at bit 51: its low part
+// stays at its place, its high part (below 2^61 for limbs below 2^53) goes
+// one place up, and a place past the top comes back at the bottom times 19
+// (2^255 = 19 mod p), as do the products that land there, through b's limbs
+// times 19. The sums stay below 2^63.
 func mul(anon a: [int64], anon b: [int64]) -> [int64] {
-    mut b19 = [0] * 10
-    for j in 0..10 {
-        b19[j] = 19 * b[j]
-    }
-    mut h = [0] * 10
-    for i in 0..10 {
-        let ai = a[i]
-        let ai2 = ai * (1 + (i & 1))
-        for j in 0..10 - i {
-            let x = if (i & j & 1) == 1 { ai2 } else { ai }
-            h[i + j] += x * b[j]
-        }
-        for j in 10 - i..10 {
-            let x = if (i & j & 1) == 1 { ai2 } else { ai }
-            h[i + j - 10] += x * b19[j]
-        }
-    }
-    return carry(h)
+    let mask = MASK
+    let a0 = a[0]
+    let a1 = a[1]
+    let a2 = a[2]
+    let a3 = a[3]
+    let a4 = a[4]
+    let b0 = b[0]
+    let b1 = b[1]
+    let b2 = b[2]
+    let b3 = b[3]
+    let b4 = b[4]
+    let c1 = b1.wrapping_mul(19)
+    let c2 = b2.wrapping_mul(19)
+    let c3 = b3.wrapping_mul(19)
+    let c4 = b4.wrapping_mul(19)
+    let l00 = a0.wrapping_mul(b0)
+    let h00 = a0.mul_high(b0)
+    let l14 = a1.wrapping_mul(c4)
+    let h14 = a1.mul_high(c4)
+    let l23 = a2.wrapping_mul(c3)
+    let h23 = a2.mul_high(c3)
+    let l32 = a3.wrapping_mul(c2)
+    let h32 = a3.mul_high(c2)
+    let l41 = a4.wrapping_mul(c1)
+    let h41 = a4.mul_high(c1)
+    let t0 = (l00 & mask) + (l14 & mask) + (l23 & mask) + (l32 & mask) + (l41 & mask)
+    let up0 = ((l00 >> 51) | (h00 << 13)) + ((l14 >> 51) | (h14 << 13)) + ((l23 >> 51) | (h23 << 13)) + ((l32 >> 51) | (h32 << 13)) + ((l41 >> 51) | (h41 << 13))
+    let l01 = a0.wrapping_mul(b1)
+    let h01 = a0.mul_high(b1)
+    let l10 = a1.wrapping_mul(b0)
+    let h10 = a1.mul_high(b0)
+    let l24 = a2.wrapping_mul(c4)
+    let h24 = a2.mul_high(c4)
+    let l33 = a3.wrapping_mul(c3)
+    let h33 = a3.mul_high(c3)
+    let l42 = a4.wrapping_mul(c2)
+    let h42 = a4.mul_high(c2)
+    let t1 = (l01 & mask) + (l10 & mask) + (l24 & mask) + (l33 & mask) + (l42 & mask) + up0
+    let up1 = ((l01 >> 51) | (h01 << 13)) + ((l10 >> 51) | (h10 << 13)) + ((l24 >> 51) | (h24 << 13)) + ((l33 >> 51) | (h33 << 13)) + ((l42 >> 51) | (h42 << 13))
+    let l02 = a0.wrapping_mul(b2)
+    let h02 = a0.mul_high(b2)
+    let l11 = a1.wrapping_mul(b1)
+    let h11 = a1.mul_high(b1)
+    let l20 = a2.wrapping_mul(b0)
+    let h20 = a2.mul_high(b0)
+    let l34 = a3.wrapping_mul(c4)
+    let h34 = a3.mul_high(c4)
+    let l43 = a4.wrapping_mul(c3)
+    let h43 = a4.mul_high(c3)
+    let t2 = (l02 & mask) + (l11 & mask) + (l20 & mask) + (l34 & mask) + (l43 & mask) + up1
+    let up2 = ((l02 >> 51) | (h02 << 13)) + ((l11 >> 51) | (h11 << 13)) + ((l20 >> 51) | (h20 << 13)) + ((l34 >> 51) | (h34 << 13)) + ((l43 >> 51) | (h43 << 13))
+    let l03 = a0.wrapping_mul(b3)
+    let h03 = a0.mul_high(b3)
+    let l12 = a1.wrapping_mul(b2)
+    let h12 = a1.mul_high(b2)
+    let l21 = a2.wrapping_mul(b1)
+    let h21 = a2.mul_high(b1)
+    let l30 = a3.wrapping_mul(b0)
+    let h30 = a3.mul_high(b0)
+    let l44 = a4.wrapping_mul(c4)
+    let h44 = a4.mul_high(c4)
+    let t3 = (l03 & mask) + (l12 & mask) + (l21 & mask) + (l30 & mask) + (l44 & mask) + up2
+    let up3 = ((l03 >> 51) | (h03 << 13)) + ((l12 >> 51) | (h12 << 13)) + ((l21 >> 51) | (h21 << 13)) + ((l30 >> 51) | (h30 << 13)) + ((l44 >> 51) | (h44 << 13))
+    let l04 = a0.wrapping_mul(b4)
+    let h04 = a0.mul_high(b4)
+    let l13 = a1.wrapping_mul(b3)
+    let h13 = a1.mul_high(b3)
+    let l22 = a2.wrapping_mul(b2)
+    let h22 = a2.mul_high(b2)
+    let l31 = a3.wrapping_mul(b1)
+    let h31 = a3.mul_high(b1)
+    let l40 = a4.wrapping_mul(b0)
+    let h40 = a4.mul_high(b0)
+    let t4 = (l04 & mask) + (l13 & mask) + (l22 & mask) + (l31 & mask) + (l40 & mask) + up3
+    let up4 = ((l04 >> 51) | (h04 << 13)) + ((l13 >> 51) | (h13 << 13)) + ((l22 >> 51) | (h22 << 13)) + ((l31 >> 51) | (h31 << 13)) + ((l40 >> 51) | (h40 << 13))
+    return settle(t0, t1, t2, t3, t4, up4)
 }
 
-// a times a small number.
-func mul_small(anon a: [int64], anon n: int64) -> [int64] {
-    return carry([x * n for x in a])
-}
-
+// a a mod p, as `mul` works, with each product of two different limbs once
+// and doubled.
 func square(anon a: [int64]) -> [int64] {
-    return mul(a, a)
+    let mask = MASK
+    let a0 = a[0]
+    let a1 = a[1]
+    let a2 = a[2]
+    let a3 = a[3]
+    let a4 = a[4]
+    let d0 = a0 + a0
+    let d1 = a1 + a1
+    let d2 = a2 + a2
+    let d3 = a3 + a3
+    let e1 = a1.wrapping_mul(19)
+    let e2 = a2.wrapping_mul(19)
+    let e3 = a3.wrapping_mul(19)
+    let e4 = a4.wrapping_mul(19)
+    let l00 = a0.wrapping_mul(a0)
+    let h00 = a0.mul_high(a0)
+    let l14 = d1.wrapping_mul(e4)
+    let h14 = d1.mul_high(e4)
+    let l23 = d2.wrapping_mul(e3)
+    let h23 = d2.mul_high(e3)
+    let t0 = (l00 & mask) + (l14 & mask) + (l23 & mask)
+    let up0 = ((l00 >> 51) | (h00 << 13)) + ((l14 >> 51) | (h14 << 13)) + ((l23 >> 51) | (h23 << 13))
+    let l01 = d0.wrapping_mul(a1)
+    let h01 = d0.mul_high(a1)
+    let l24 = d2.wrapping_mul(e4)
+    let h24 = d2.mul_high(e4)
+    let l33 = a3.wrapping_mul(e3)
+    let h33 = a3.mul_high(e3)
+    let t1 = (l01 & mask) + (l24 & mask) + (l33 & mask) + up0
+    let up1 = ((l01 >> 51) | (h01 << 13)) + ((l24 >> 51) | (h24 << 13)) + ((l33 >> 51) | (h33 << 13))
+    let l02 = d0.wrapping_mul(a2)
+    let h02 = d0.mul_high(a2)
+    let l11 = a1.wrapping_mul(a1)
+    let h11 = a1.mul_high(a1)
+    let l34 = d3.wrapping_mul(e4)
+    let h34 = d3.mul_high(e4)
+    let t2 = (l02 & mask) + (l11 & mask) + (l34 & mask) + up1
+    let up2 = ((l02 >> 51) | (h02 << 13)) + ((l11 >> 51) | (h11 << 13)) + ((l34 >> 51) | (h34 << 13))
+    let l03 = d0.wrapping_mul(a3)
+    let h03 = d0.mul_high(a3)
+    let l12 = d1.wrapping_mul(a2)
+    let h12 = d1.mul_high(a2)
+    let l44 = a4.wrapping_mul(e4)
+    let h44 = a4.mul_high(e4)
+    let t3 = (l03 & mask) + (l12 & mask) + (l44 & mask) + up2
+    let up3 = ((l03 >> 51) | (h03 << 13)) + ((l12 >> 51) | (h12 << 13)) + ((l44 >> 51) | (h44 << 13))
+    let l04 = d0.wrapping_mul(a4)
+    let h04 = d0.mul_high(a4)
+    let l13 = d1.wrapping_mul(a3)
+    let h13 = d1.mul_high(a3)
+    let l22 = a2.wrapping_mul(a2)
+    let h22 = a2.mul_high(a2)
+    let t4 = (l04 & mask) + (l13 & mask) + (l22 & mask) + up3
+    let up4 = ((l04 >> 51) | (h04 << 13)) + ((l13 >> 51) | (h13 << 13)) + ((l22 >> 51) | (h22 << 13))
+    return settle(t0, t1, t2, t3, t4, up4)
 }
 
-// a^(p - 2), which is 1 / a; the exponent is public, so its bits may steer.
-func invert(anon a: [int64]) -> [int64] {
-    mut c = a
-    for bit in 253..=0 step -1 {
-        c = square(c)
-        if bit != 2 and bit != 4 {
-            c = mul(c, a)
-        }
+// a times n, for n below 2^17.
+func mul_small(anon a: [int64], anon n: int64) -> [int64] {
+    mut low = [0] * 5
+    mut high = [0] * 5
+    for i in 0..5 {
+        let x = a[i]
+        let l = x.wrapping_mul(n)
+        low[i] = l & MASK
+        high[i] = (l >> 51) | (x.mul_high(n) << 13)
     }
-    return c
+    return settle(low[0], low[1] + high[0], low[2] + high[1], low[3] + high[2], low[4] + high[3], high[4])
+}
+
+// a squared n times.
+func square_times(anon a: [int64], anon n: int64) -> [int64] {
+    mut x = a
+    for _i in 0..n {
+        x = square(x)
+    }
+    return x
+}
+
+// a^(p - 2), which is 1 / a, by ref10's chain: 254 squarings and 11
+// multiplications.
+func invert(anon z: [int64]) -> [int64] {
+    let z2 = square(z)
+    let z9 = mul(square_times(z2, 2), z)
+    let z11 = mul(z9, z2)
+    let z_5_0 = mul(square(z11), z9)
+    let z_10_0 = mul(square_times(z_5_0, 5), z_5_0)
+    let z_20_0 = mul(square_times(z_10_0, 10), z_10_0)
+    let z_40_0 = mul(square_times(z_20_0, 20), z_20_0)
+    let z_50_0 = mul(square_times(z_40_0, 10), z_10_0)
+    let z_100_0 = mul(square_times(z_50_0, 50), z_50_0)
+    let z_200_0 = mul(square_times(z_100_0, 100), z_100_0)
+    let z_250_0 = mul(square_times(z_200_0, 50), z_50_0)
+    return mul(square_times(z_250_0, 5), z11)
 }
 
 // `p` and `q` swapped when `swap` is 1, as they were when it is 0.
@@ -93,7 +223,7 @@ func cswap(anon p: [int64], anon q: [int64], anon swap: int64) -> ([int64], [int
     let mask = 0 - swap
     mut x = p
     mut y = q
-    for i in 0..10 {
+    for i in 0..5 {
         let t = mask & (x[i] ^ y[i])
         x[i] = x[i] ^ t
         y[i] = y[i] ^ t
@@ -103,47 +233,32 @@ func cswap(anon p: [int64], anon q: [int64], anon swap: int64) -> ([int64], [int
 
 // The 255 low bits of the little-endian `b` as limbs.
 func unpack(anon b: bytes) -> [int64] {
-    mut out = [0] * 10
-    mut start = 0
-    for i in 0..10 {
-        let w = width(i)
-        mut v = 0
-        for k in 0..w {
-            let bit = start + k
-            if bit < 255 {
-                v = v | (((b[bit >> 3] >> (bit & 7)) & 1) << k)
-            }
-        }
-        out[i] = v
-        start += w
+    mut out = [0] * 5
+    for bit in 0..255 {
+        out[bit / 51] = out[bit / 51] | (((b[bit >> 3] >> (bit & 7)) & 1) << (bit % 51))
     }
     return out
 }
 
-// The 32 little-endian bytes of `n` reduced below p (ref10's fe_tobytes).
+// The 32 little-endian bytes of `n` reduced below p.
 func pack(anon n: [int64]) -> bytes {
-    mut h = carry(carry(n))
-    // q is 1 when h is p or more, else 0.
-    mut q = asr(19 * h[9] + (1 << 24), 25)
-    for i in 0..10 {
-        q = asr(h[i] + q, width(i))
+    let mask = MASK
+    let h = settle(n[0], n[1], n[2], n[3], n[4], 0)
+    // q is 1 when h is p or more, else 0: whether h + 19 reaches 2^255.
+    mut q = (h[0] + 19) >> 51
+    for i in 1..5 {
+        q = (h[i] + q) >> 51
     }
-    h[0] += 19 * q
-    for i in 0..9 {
-        let c = asr(h[i], width(i))
-        h[i + 1] += c
-        h[i] -= c << width(i)
-    }
-    h[9] = h[9] & ((1 << 25) - 1)
+    // h + 19 q, less 2^255 q.
+    let h0 = h[0] + 19 * q
+    let h1 = h[1] + (h0 >> 51)
+    let h2 = h[2] + (h1 >> 51)
+    let h3 = h[3] + (h2 >> 51)
+    let h4 = h[4] + (h3 >> 51)
+    let limbs = [h0 & mask, h1 & mask, h2 & mask, h3 & mask, h4 & mask]
     mut out = [0] * 32
-    mut start = 0
-    for i in 0..10 {
-        let w = width(i)
-        for k in 0..w {
-            let bit = start + k
-            out[bit >> 3] = out[bit >> 3] | (((h[i] >> k) & 1) << (bit & 7))
-        }
-        start += w
+    for bit in 0..255 {
+        out[bit >> 3] = out[bit >> 3] | (((limbs[bit / 51] >> (bit % 51)) & 1) << (bit & 7))
     }
     return kod_bytes_from_array(out)
 }
@@ -162,10 +277,10 @@ func scalar_mult(anon scalar: bytes, anon point: bytes) -> bytes {
     z[31] = (z[31] & 127) | 64
     z[0] = z[0] & 248
     let x = unpack(point)
-    mut a = [0] * 10
+    mut a = [0] * 5
     mut b = x
-    mut c = [0] * 10
-    mut d = [0] * 10
+    mut c = [0] * 5
+    mut d = [0] * 5
     a[0] = 1
     d[0] = 1
     for i in 254..=0 step -1 {
