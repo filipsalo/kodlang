@@ -1,0 +1,286 @@
+// A key-value store kept in a directory, through crashes (docs/kv.md): what
+// it holds is in memory, and each change goes to the end of a log, synced
+// before the call that made it returns; `compact` writes it all to a
+// snapshot instead.
+import "bytebuffer" { ByteBuffer }
+import "hash/crc32"
+import "io"
+import "posix"
+import "posix" { Fd }
+import "stream" { IoError }
+import "tasks"
+
+let PUT: int64 = 1
+let REMOVE: int64 = 2
+// A record's length and checksum come before it.
+let HEADER: int64 = 8
+// Kind and key length, after the header.
+let FIXED: int64 = 5
+// The log is compacted once it is this many times what the store holds, and
+// at least this long.
+let GROWTH: int64 = 4
+let COMPACT_AT: int64 = 1048576
+
+type Store = shared struct {
+    dir: str
+    values: Map[str, bytes]
+    log: Fd
+    // Where the log's next record goes, and how long the records of what the
+    // store holds would be.
+    end: int64 = 0
+    live: int64 = 0
+    // The error that stopped it, after which nothing changes it.
+    broken: Error? = none
+    changing: tasks.Mutex = tasks.Mutex()
+
+    func get(self, anon key: str) -> bytes? {
+        return self.values.get(key)
+    }
+
+    func keys(self) -> [str] {
+        return posix.sort_names(self.values.keys())
+    }
+
+    func len(self) -> int64 {
+        return self.values.len()
+    }
+
+    // Sets `key` to `value`, once that is on the disk.
+    func put(self, anon key: str, anon value: bytes) -> none or Error {
+        self.changing.lock()
+        let done = self._change(PUT, key, value)
+        self.changing.unlock()
+        if done is Err(e) {
+            throw e
+        }
+    }
+
+    // Removes `key`, if it is there, once that is on the disk.
+    func remove(self, anon key: str) -> none or Error {
+        self.changing.lock()
+        mut done: none or Error = none
+        if self.values.contains(key) {
+            done = self._change(REMOVE, key, kod_str_to_bytes(""))
+        }
+        self.changing.unlock()
+        if done is Err(e) {
+            throw e
+        }
+    }
+
+    func compact(self) -> none or Error {
+        self.changing.lock()
+        let done = self._compact()
+        self.changing.unlock()
+        if done is Err(e) {
+            throw e
+        }
+    }
+
+    func close(self) -> none or Error {
+        try self.log.close()
+    }
+
+    func _change(self, anon kind: int64, anon key: str, anon value: bytes) -> none or Error {
+        if self.broken is Error(e) {
+            throw e
+        }
+        try self._append(record(kind, key, value))
+        if self.values.get(key) is bytes(old) {
+            self.live -= HEADER + FIXED + len(key) + len(old)
+        }
+        if kind == PUT {
+            self.values[key] = value
+            self.live += HEADER + FIXED + len(key) + len(value)
+        } else {
+            let _ = self.values.remove(key)
+        }
+        if self.end >= COMPACT_AT and self.end > GROWTH * self.live {
+            try self._compact()
+        }
+    }
+
+    // Writes `rec` at the end of the log and syncs it. A full disk undoes it;
+    // any other failure stops the store.
+    func _append(self, anon rec: bytes) -> none or Error {
+        let wrote = self._write_at_end(rec)
+        if wrote is Err(e) {
+            if is_full(e) and self.log.truncate(self.end) is Ok(_) {
+                throw e
+            }
+            self.broken = e
+            throw e
+        }
+        if self.log.sync() is Err(e) {
+            self.broken = e
+            throw e
+        }
+        self.end += len(rec)
+    }
+
+    func _write_at_end(self, anon rec: bytes) -> none or Error {
+        try self.log.seek(self.end)
+        try self.log.write_all(rec)
+    }
+
+    // The snapshot, written whole and renamed into place; then the log,
+    // emptied.
+    func _compact(self) -> none or Error {
+        if self.broken is Error(e) {
+            throw e
+        }
+        let fresh = f"{self.dir}/snapshot.new"
+        let written = self._write_snapshot(fresh)
+        if written is Err(e) {
+            if is_full(e) {
+                let _ = posix.remove(fresh)
+            } else {
+                self.broken = e
+            }
+            throw e
+        }
+        let moved = self._replace_snapshot(fresh)
+        if moved is Err(e) {
+            self.broken = e
+            throw e
+        }
+        self.end = 0
+    }
+
+    func _write_snapshot(self, anon path: str) -> none or Error {
+        let f = try posix.create(path)
+        let out = ByteBuffer()
+        for key in self.keys() {
+            out.push_bytes(record(PUT, key, must self.values.get(key)))
+        }
+        let wrote = f.write_all(out.to_bytes())
+        mut synced: none or Error = none
+        if wrote is Ok(_) {
+            synced = f.sync()
+        }
+        let closed = f.close()
+        try wrote
+        try synced
+        try closed
+    }
+
+    func _replace_snapshot(self, anon fresh: str) -> none or Error {
+        try posix.rename(fresh, f"{self.dir}/snapshot")
+        try posix.sync_dir(self.dir)
+        // Not synced: the next record's sync does that. A crash before it may
+        // leave the old log's records after the new one, which is unsynced;
+        // reading any tail of the old log after the snapshot gives the
+        // snapshot again, since each key's last record there is what it holds.
+        try self.log.truncate(0)
+    }
+}
+
+// Opens the store in `dir`, making the directory if it isn't there.
+func open(anon dir: str) -> Store or Error {
+    if io.file_info(dir) is none {
+        try posix.make_dir(dir)
+        try posix.sync_dir(parent(dir))
+    }
+    mut values = Map[str, bytes]()
+    let snapshot = f"{dir}/snapshot"
+    if io.is_file(snapshot) {
+        let data = kod_str_to_bytes(try io.read_file(snapshot))
+        let (read, good) = apply_records(values, data)
+        values = read
+        if good != len(data) {
+            throw IoError(kind: .Other, op: f"open {snapshot}", errno: 0, detail: "the snapshot is damaged")
+        }
+    }
+    // What a compaction that didn't finish left.
+    if io.is_file(f"{dir}/snapshot.new") {
+        try posix.remove(f"{dir}/snapshot.new")
+    }
+    let log = try posix.open_rw(f"{dir}/log")
+    let data = try log.read_all()
+    let (read, good) = apply_records(values, data)
+    values = read
+    // A record cut short by a crash goes, so the file ends where the records
+    // do (new ones would be written over it anyway).
+    if good < len(data) {
+        try log.truncate(good)
+        try log.sync()
+    }
+    try posix.sync_dir(dir)
+    let db = Store(:dir, :values, :log, end: good)
+    for key in values.keys() {
+        db.live += HEADER + FIXED + len(key) + len(must values.get(key))
+    }
+    return db
+}
+
+// A record: its length and checksum, the kind, the key's length, the key and
+// the value.
+func record(anon kind: int64, anon key: str, anon value: bytes) -> bytes {
+    let body = ByteBuffer()
+    body.push(kind)
+    body.push_le(len(key), size: 4)
+    body.push_bytes(kod_str_to_bytes(key))
+    body.push_bytes(value)
+    let rest = body.to_bytes()
+    let out = ByteBuffer()
+    out.push_le(len(rest), size: 4)
+    out.push_le(crc32.compute(rest), size: 4)
+    out.push_bytes(rest)
+    return out.to_bytes()
+}
+
+// `start` with the changes the records in `data` say made, in order, up to the
+// first that is cut short or damaged; and where that one starts, or the end.
+func apply_records(anon start: Map[str, bytes], anon data: bytes) -> (Map[str, bytes], int64) {
+    mut values = start
+    mut at = 0
+    for at + HEADER <= len(data) {
+        let n = le32(data, at)
+        if n < FIXED or at + HEADER + n > len(data) {
+            break
+        }
+        let rest = data[at + HEADER..at + HEADER + n]
+        if crc32.compute(rest) != le32(data, at + 4) {
+            break
+        }
+        let key_len = le32(rest, 1)
+        if FIXED + key_len > n {
+            break
+        }
+        let key = str(rest[FIXED..FIXED + key_len])
+        if rest[0] == PUT {
+            values[key] = rest[FIXED + key_len..]
+        } else if rest[0] == REMOVE {
+            let _ = values.remove(key)
+        } else {
+            break
+        }
+        at += HEADER + n
+    }
+    return (values, at)
+}
+
+func le32(anon data: bytes, anon at: int64) -> int64 {
+    return data[at] | (data[at + 1] << 8) | (data[at + 2] << 16) | (data[at + 3] << 24)
+}
+
+func is_full(anon e: Error) -> bool {
+    return e is IoError(err) and err.kind is .StorageFull
+}
+
+// The directory `path` is in.
+func parent(anon path: str) -> str {
+    mut at = -1
+    for i in 0..len(path) {
+        if path[i..i + 1] == "/" {
+            at = i
+        }
+    }
+    if at < 0 {
+        return "."
+    }
+    if at == 0 {
+        return "/"
+    }
+    return path[..at]
+}

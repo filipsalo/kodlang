@@ -1,0 +1,213 @@
+// stdlib/kv.kod (docs/kv.md): a key-value store that keeps what it said it
+// kept, through crashes and a failing disk.
+import "io"
+import "kv"
+import "posix"
+import "sim"
+import "stream" { IoError }
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+// An empty directory under build/ for a test's store.
+func fresh(anon name: str) -> str {
+    let dir = f"build/kv_test_{name}"
+    for file in posix.list_dir(dir)? or [] {
+        let _ = posix.remove(f"{dir}/{file}")
+    }
+    let _ = posix.remove_dir(dir)
+    return dir
+}
+
+test "put, get, remove and keys, kept across opening it again" {
+    let dir = fresh("basics")
+    let db = must kv.open(dir)
+    assert db.get("a") is none
+    must db.put("b", b("2"))
+    must db.put("a", b("1"))
+    must db.put("c", b("3"))
+    must db.put("a", b("one"))
+    must db.remove("c")
+    must db.remove("missing")
+    assert db.get("a") == b("one")
+    assert db.keys() == ["a", "b"]
+    assert db.len() == 2
+    must db.close()
+    let again = must kv.open(dir)
+    assert again.keys() == ["a", "b"]
+    assert again.get("a") == b("one")
+    assert again.get("b") == b("2")
+    must again.close()
+}
+
+test "compact keeps what the store holds and empties the log" {
+    let dir = fresh("compact")
+    let db = must kv.open(dir)
+    for i in 0..50 {
+        must db.put(f"k{i % 5}", b(f"v{i}"))
+    }
+    must db.remove("k0")
+    must db.compact()
+    assert io.file_size(f"{dir}/log") == 0
+    must db.put("k9", b("after"))
+    must db.close()
+    let again = must kv.open(dir)
+    assert again.keys() == ["k1", "k2", "k3", "k4", "k9"]
+    assert again.get("k4") == b("v49")
+    assert again.get("k9") == b("after")
+    must again.close()
+}
+
+test "a record cut short at the end of the log is dropped, and written over" {
+    let dir = fresh("torn")
+    let db = must kv.open(dir)
+    must db.put("a", b("1"))
+    must db.put("b", b("2"))
+    must db.close()
+    // The last record, less its last byte, as a crash can leave it.
+    let size = io.file_size(f"{dir}/log")? or 0
+    let log = must posix.open_rw(f"{dir}/log")
+    must log.truncate(size - 1)
+    must log.close()
+    let again = must kv.open(dir)
+    assert again.keys() == ["a"]
+    must again.put("c", b("3"))
+    must again.close()
+    let third = must kv.open(dir)
+    assert third.keys() == ["a", "c"]
+    must third.close()
+}
+
+test "a record whose checksum is wrong ends what is read" {
+    let dir = fresh("crc")
+    let db = must kv.open(dir)
+    must db.put("a", b("1"))
+    must db.put("b", b("2"))
+    must db.close()
+    let size = io.file_size(f"{dir}/log")? or 0
+    let log = must posix.open_rw(f"{dir}/log")
+    must log.seek(size - 1)
+    must log.write(b("X"))
+    must log.close()
+    let again = must kv.open(dir)
+    assert again.keys() == ["a"]
+    must again.close()
+}
+
+func writer(anon db: kv.Store, anon name: str) -> int64 {
+    for i in 0..20 {
+        must db.put(f"{name}{i}", b(name))
+    }
+    return 20
+}
+
+test "tasks share a store" {
+    let dir = fresh("tasks")
+    let db = must kv.open(dir)
+    let one = spawn writer(db, "x")
+    let two = spawn writer(db, "y")
+    assert one.wait() + two.wait() == 40
+    assert db.len() == 40
+    must db.close()
+    assert (must kv.open(dir)).len() == 40
+}
+
+// What a writer has been told was kept, and the one change it was making
+// when the crash or a fault came, if any, which may or may not be kept.
+type Model = shared struct {
+    kept: Map[str, str]
+    doing_key: str = ""
+    doing_value: str = ""
+    doing: bool = false
+}
+
+func new_model() -> Model {
+    return Model(kept: Map[str, str]())
+}
+
+// Changes the seed's keys (`prefix` and a digit) at random, compacting now
+// and then; stops when the store does. "" stands for a removal.
+func churn(anon db: kv.Store, anon m: Model, anon prefix: str, anon seed: int64) -> int64 {
+    mut state = seed * 7919 + len(prefix)
+    for i in 0..60 {
+        state = (state * 1103515245 + 12345) % 2147483648
+        let key = f"{prefix}{state % 6}"
+        mut value = f"{prefix}{i}"
+        if state % 5 == 0 {
+            value = ""
+        }
+        m.doing_key = key
+        m.doing_value = value
+        m.doing = true
+        mut done: none or Error = none
+        if value == "" {
+            done = db.remove(key)
+        } else {
+            done = db.put(key, b(value))
+        }
+        if done is Err(e) {
+            // A full disk undoes the change; another error leaves it in doubt,
+            // and the store stopped.
+            if e is IoError(err) and err.kind is .StorageFull {
+                m.doing = false
+                continue
+            }
+            return i
+        }
+        // Noted before it is done: a crash in between leaves both, which
+        // check allows.
+        m.kept[key] = value
+        m.doing = false
+        if i % 15 == 14 and db.compact() is Err(e) {
+            if not (e is IoError(err) and err.kind is .StorageFull) {
+                return i
+            }
+        }
+    }
+    return 60
+}
+
+// After the crash: each key holds what its writer was told, or what it was
+// in the middle of writing.
+func check(anon db: kv.Store, anon m: Model) -> none {
+    for key in m.kept.keys() {
+        let got = str(db.get(key)? or b(""))
+        let want = m.kept.get(key)? or ""
+        if got != want {
+            assert m.doing and m.doing_key == key and got == m.doing_value
+        }
+    }
+}
+
+type Models = shared struct {
+    a: Model
+    b: Model
+    opened: bool = false
+}
+
+test "every change that returned outlives a crash and a failing disk" {
+    let ms = Models(a: new_model(), b: new_model())
+    sim.run(count: 200, body: func() {
+        ms.a = new_model()
+        ms.b = new_model()
+        ms.opened = false
+        let db = must kv.open("store")
+        ms.opened = true
+        let one = spawn churn(db, ms.a, "a", sim.seed())
+        let two = spawn churn(db, ms.b, "b", sim.seed())
+        let _ = one.wait()
+        let _ = two.wait()
+    }, restart: func() {
+        if not ms.opened {
+            return
+        }
+        let db = must kv.open("store")
+        check(db, ms.a)
+        check(db, ms.b)
+        // And it takes changes again, unless the disk is still full.
+        if db.put("after", b("crash")) is Ok(_) {
+            assert db.get("after") == b("crash")
+        }
+    }, disk_faults: true)
+}
