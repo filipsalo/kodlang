@@ -2,12 +2,15 @@ import "arrays"
 import "io" { write_stdout }
 import "kod/arm64"
 import "kod/ast"
+import "kod/dwarf"
 import "kod/lexing"
 import "kod/macho"
 import "kod/parsing"
 import "kod/regalloc"
+import "libc"
 import "primitives/format"
 import "strbuilder" { StrBuilder }
+import "unsafe"
 
 // Concrete instantiation of the builtin Map used for string interning.
 // Declared here so resolve_type registers the monomorphised entry early,
@@ -1718,6 +1721,8 @@ type Codegen = shared struct {
     func_lines_labels: [str] = []
     func_lines_values: [int64] = []
     last_marked_line: int64 = 0
+    // The functions compiled so far, for the object's DWARF (emit_dwarf).
+    dwarf_functions: [dwarf.Function] = []
 
     loop_stack: [LoopLbl] = []
     // The label of the loop statement about to be compiled, taken as it starts.
@@ -5349,6 +5354,12 @@ type Codegen = shared struct {
             self.func_lines_labels = []
             self.func_lines_values = []
             return none
+        }
+        // Right after the function's last instruction, for the debugger.
+        let end_lbl = self.fresh("Lfunc_end")
+        self.emit_label(end_lbl)
+        if line > 0 {
+            self.dwarf_functions += [dwarf.Function(start: func_lbl, end: end_lbl, :name, :file, :line, rows: self.func_lines_labels, lines: self.func_lines_values)]
         }
         let name_lbl: str = self.fresh("Lkodsym")
         let file_lbl: str = self.fresh("Lkodsym")
@@ -25110,12 +25121,25 @@ type Codegen = shared struct {
             }
             self.emit_vtables()
         }
+        self.emit_dwarf()
         // Tell the Mach-O linker that each labelled definition is its own
         // subsection — `ld -dead_strip` then drops any function/vtable
         // nothing reachable refers to. Without this directive, every .o
         // contributes its entire __text/__data wholesale.
         self.println(".subsections_via_symbols")
         self.flush_out()
+    }
+
+    // The object's __DWARF sections (stdlib/kod/dwarf.kod), so a debugger finds
+    // Kod's functions, files and lines (docs/debugging.md).
+    func emit_dwarf(self) -> none {
+        if self.dry_run or len(self.dwarf_functions) == 0 {
+            return
+        }
+        for line in dwarf.sections(self.dwarf_functions, path: self.p.path, comp_dir: working_dir()) {
+            self.println(line)
+        }
+        self.dwarf_functions = []
     }
 
     // Emit one row per registered (struct, interface) pair. Methods are
@@ -25477,4 +25501,15 @@ let CHANNEL_MODULE_PATH: str = "stdlib/tasks.kod"
 
 func make_codegen(p: parsing.Parser, path_prefix: str) -> Codegen {
     return Codegen(:p, :path_prefix)
+}
+
+// The directory the compiler runs in, which the paths it is given start from.
+func working_dir() -> str {
+    let buf = unsafe.alloc(4096)
+    mut out = "."
+    if libc.getcwd(buf, 4096) != 0 {
+        out = unsafe.str_at(buf)
+    }
+    unsafe.free(buf)
+    return out
 }

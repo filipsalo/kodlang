@@ -1,0 +1,309 @@
+// DWARF for a debugger (docs/debugging.md): the assembler lines of an object's
+// __DWARF sections, from the functions codegen compiled into it.
+//
+// Version 4: a compile unit for the object, whose address ranges are its
+// functions', holding one subprogram per function (its name, file, line, and
+// first and last address), and a line table with a sequence per function. Each address is a `.quad` of a label,
+// which the assembler relocates, so no distance between two labels is needed:
+// a row sets its address outright. Sections refer to each other by offsets
+// from their start, as in any Mach-O object, without relocations.
+//
+// Compiler source: what the bootstrap snapshot parses, so no comprehensions
+// or tuples here.
+
+// One function: its first instruction's label and the label after its last;
+// its name, file and line; and a label and a line for each statement.
+type Function = struct {
+    start: str
+    end: str
+    name: str
+    file: str
+    line: int64
+    rows: [str]
+    lines: [int64]
+}
+
+// Bytes for a section, with labels whose 8-byte addresses go between them.
+type Section = shared struct {
+    out: [str] = []
+    pending: [int64] = []
+    size: int64 = 0
+
+    func bytes(self, anon bs: [int64]) -> none {
+        for b in bs {
+            self.pending += [b]
+        }
+        self.size += len(bs)
+    }
+
+    func byte(self, anon b: int64) -> none {
+        self.pending += [b]
+        self.size += 1
+    }
+
+    func address(self, anon label: str) -> none {
+        self.flush()
+        self.out += [f"\t.quad {label}"]
+        self.size += 8
+    }
+
+    // The bytes so far as `.byte` lines of up to 32.
+    func flush(self) -> none {
+        mut at = 0
+        for at < len(self.pending) {
+            mut end = at + 32
+            if end > len(self.pending) {
+                end = len(self.pending)
+            }
+            mut line = "\t.byte "
+            for k in at..end {
+                if k > at {
+                    line += ", "
+                }
+                line += f"{self.pending[k]}"
+            }
+            self.out += [line]
+            at = end
+        }
+        self.pending = []
+    }
+
+    // `self` after a 4-byte length of it, as the start of a unit.
+    func with_length(self) -> [str] {
+        self.flush()
+        let head = Section()
+        head.bytes(u32(self.size))
+        head.flush()
+        mut out = head.out
+        for line in self.out {
+            out += [line]
+        }
+        return out
+    }
+}
+
+func u16(anon n: int64) -> [int64] {
+    return [n & 255, (n >> 8) & 255]
+}
+
+func u32(anon n: int64) -> [int64] {
+    return [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255]
+}
+
+func uleb(anon n: int64) -> [int64] {
+    mut out: [int64] = []
+    mut v = n
+    for true {
+        let b = v & 127
+        v = v >> 7
+        if v == 0 {
+            out += [b]
+            return out
+        }
+        out += [b | 128]
+    }
+    return out
+}
+
+func sleb(anon n: int64) -> [int64] {
+    mut out: [int64] = []
+    mut v = n
+    for true {
+        let b = v & 127
+        // An arithmetic shift: Kod's `>>` brings in zeros.
+        let next = if v < 0 { (v >> 7) | (-1 << 57) } else { v >> 7 }
+        let done = (next == 0 and (b & 64) == 0) or (next == -1 and (b & 64) != 0)
+        if done {
+            out += [b]
+            return out
+        }
+        out += [b | 128]
+        v = next
+    }
+    return out
+}
+
+func cstr(anon s: str) -> [int64] {
+    mut out: [int64] = []
+    for k in 0..len(s) {
+        out += [s[k]]
+    }
+    out += [0]
+    return out
+}
+
+// Attribute names, forms, tags and opcodes used.
+let TAG_COMPILE_UNIT: int64 = 0x11
+let TAG_SUBPROGRAM: int64 = 0x2e
+let AT_NAME: int64 = 0x03
+let AT_STMT_LIST: int64 = 0x10
+let AT_LOW_PC: int64 = 0x11
+let AT_HIGH_PC: int64 = 0x12
+let AT_RANGES: int64 = 0x55
+let AT_LANGUAGE: int64 = 0x13
+let AT_COMP_DIR: int64 = 0x1b
+let AT_PRODUCER: int64 = 0x25
+let AT_DECL_FILE: int64 = 0x3a
+let AT_DECL_LINE: int64 = 0x3b
+let AT_EXTERNAL: int64 = 0x3f
+let FORM_ADDR: int64 = 0x01
+let FORM_DATA2: int64 = 0x05
+let FORM_DATA4: int64 = 0x06
+let FORM_STRING: int64 = 0x08
+let FORM_SEC_OFFSET: int64 = 0x17
+let FORM_FLAG_PRESENT: int64 = 0x19
+// DW_LANG_C: Kod has no number of its own, and a debugger treats C kindly.
+let LANG_C: int64 = 0x0002
+let LNS_COPY: int64 = 1
+let LNS_ADVANCE_LINE: int64 = 3
+let LNS_SET_FILE: int64 = 4
+let LNE_END_SEQUENCE: int64 = 1
+let LNE_SET_ADDRESS: int64 = 2
+
+// The __DWARF sections for `functions`, the object's main file `path`
+// (its compile unit's name) and the directory paths are relative to.
+func sections(anon functions: [Function], path: str, comp_dir: str) -> [str] {
+    // The files, in the order functions name them; numbered from 1.
+    mut files: [str] = []
+    for f in functions {
+        if not file_listed(files, f.file) {
+            files += [f.file]
+        }
+    }
+    mut out: [str] = []
+    out += ["\t.section __DWARF,__debug_abbrev,regular,debug"]
+    out += abbrevs()
+    out += ["\t.section __DWARF,__debug_info,regular,debug"]
+    out += info(functions, files: files, path: path, comp_dir: comp_dir)
+    out += ["\t.section __DWARF,__debug_line,regular,debug"]
+    out += line_table(functions, files: files)
+    out += ["\t.section __DWARF,__debug_ranges,regular,debug"]
+    out += ranges(functions)
+    return out
+}
+
+func file_listed(anon files: [str], anon file: str) -> bool {
+    for f in files {
+        if f == file {
+            return true
+        }
+    }
+    return false
+}
+
+func file_number(anon files: [str], anon file: str) -> int64 {
+    for k, f in files {
+        if f == file {
+            return k + 1
+        }
+    }
+    return 1
+}
+
+// Abbreviation 1, the compile unit, and 2, a function.
+func abbrevs() -> [str] {
+    let s = Section()
+    s.bytes([1, TAG_COMPILE_UNIT, 1])
+    s.bytes([AT_PRODUCER, FORM_STRING, AT_LANGUAGE, FORM_DATA2, AT_NAME, FORM_STRING, AT_COMP_DIR, FORM_STRING])
+    s.bytes([AT_STMT_LIST, FORM_SEC_OFFSET, AT_LOW_PC, FORM_ADDR, AT_RANGES, FORM_SEC_OFFSET, 0, 0])
+    s.bytes([2, TAG_SUBPROGRAM, 0])
+    s.bytes([AT_NAME, FORM_STRING, AT_DECL_FILE, FORM_DATA2, AT_DECL_LINE, FORM_DATA4])
+    s.bytes([AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_ADDR, AT_EXTERNAL, FORM_FLAG_PRESENT, 0, 0])
+    s.byte(0)
+    s.flush()
+    return s.out
+}
+
+func info(anon functions: [Function], files: [str], path: str, comp_dir: str) -> [str] {
+    let s = Section()
+    // Version 4, abbreviations at offset 0, 8-byte addresses.
+    s.bytes(u16(4))
+    s.bytes(u32(0))
+    s.byte(8)
+    s.byte(1)
+    s.bytes(cstr("kod"))
+    s.bytes(u16(LANG_C))
+    s.bytes(cstr(path))
+    s.bytes(cstr(comp_dir))
+    s.bytes(u32(0))
+    // Base address 0, and the ranges at the start of __debug_ranges.
+    s.bytes([0, 0, 0, 0, 0, 0, 0, 0])
+    s.bytes(u32(0))
+    for f in functions {
+        s.byte(2)
+        s.bytes(cstr(f.name))
+        s.bytes(u16(file_number(files, f.file)))
+        s.bytes(u32(f.line))
+        s.address(f.start)
+        s.address(f.end)
+    }
+    // The end of the unit's children.
+    s.byte(0)
+    return s.with_length()
+}
+
+// The unit's addresses: each function's, which a debugger finds the unit of
+// an address by. A pair of zeros ends the list.
+func ranges(anon functions: [Function]) -> [str] {
+    let s = Section()
+    for f in functions {
+        s.address(f.start)
+        s.address(f.end)
+    }
+    s.bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    s.flush()
+    return s.out
+}
+
+func set_address(anon s: Section, anon label: str) -> none {
+    s.bytes([0, 9, LNE_SET_ADDRESS])
+    s.address(label)
+}
+
+func line_table(anon functions: [Function], files: [str]) -> [str] {
+    // The header after its own length: minimum instruction length 4, one
+    // operation per instruction, rows are statements, line_base -5,
+    // line_range 14, opcode_base 13 and the standard opcodes' operand counts;
+    // no directories (all are the compile directory's) and the files.
+    let header = Section()
+    header.bytes([4, 1, 1, 251, 14, 13, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])
+    header.byte(0)
+    for f in files {
+        header.bytes(cstr(f))
+        header.bytes([0, 0, 0])
+    }
+    header.byte(0)
+    let program = Section()
+    for f in functions {
+        program.byte(LNS_SET_FILE)
+        program.bytes(uleb(file_number(files, f.file)))
+        // From the first instruction, the function's own line; then each
+        // statement's. A sequence starts at line 1.
+        set_address(program, f.start)
+        program.byte(LNS_ADVANCE_LINE)
+        program.bytes(sleb(f.line - 1))
+        program.byte(LNS_COPY)
+        mut line = f.line
+        for k, label in f.rows {
+            set_address(program, label)
+            program.byte(LNS_ADVANCE_LINE)
+            program.bytes(sleb(f.lines[k] - line))
+            program.byte(LNS_COPY)
+            line = f.lines[k]
+        }
+        set_address(program, f.end)
+        program.bytes([0, 1, LNE_END_SEQUENCE])
+    }
+    // Version 4, then the header's length, the header and the program.
+    let unit = Section()
+    unit.bytes(u16(4))
+    unit.bytes(u32(header.size))
+    unit.bytes(header.pending)
+    program.flush()
+    unit.flush()
+    for line in program.out {
+        unit.out += [line]
+    }
+    unit.size += program.size
+    return unit.with_length()
+}

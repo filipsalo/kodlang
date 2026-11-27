@@ -108,6 +108,11 @@ KOD_DEPS := $(KODC_DEP) $(STAGE0_KOD)
 # and `make kod` (the native kod driver). Compiled into build/stage0/
 # so anyone linking against the Kod compiler library reuses the same
 # objects instead of rebuilding per app.
+# The compilers are linked without the debug map that points a debugger at
+# their objects (docs/debugging.md): it names the objects' paths and times, so
+# two builds of one compiler would differ, and the snapshot would carry them.
+COMPILER_LINK_FLAGS := -Wl,-S
+
 COMPILER_LIB_OBJS := \
     $(STAGE0)/_ast.o \
     $(STAGE0)/_lexing.o \
@@ -115,6 +120,7 @@ COMPILER_LIB_OBJS := \
     $(STAGE0)/_regalloc.o \
     $(STAGE0)/_arm64.o \
     $(STAGE0)/_macho.o \
+    $(STAGE0)/_dwarf.o \
     $(STAGE0)/_codegen.o \
     $(STAGE0)/_build.o \
     $(STAGE0)/_formatting.o
@@ -126,6 +132,7 @@ COMPILER_KOD := \
     stdlib/kod/regalloc.kod \
     stdlib/kod/arm64.kod \
     stdlib/kod/macho.kod \
+    stdlib/kod/dwarf.kod \
     stdlib/kod/codegen.kod \
     stdlib/kod/build.kod \
     stdlib/kod/formatting.kod \
@@ -160,7 +167,7 @@ kod: $(KOD_APP)/kod
 
 $(KOD_APP)/kod: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o $(LINK_CFG)
 	mkdir -p $(KOD_APP)
-	$(LINK) -o $@ \
+	$(LINK) $(COMPILER_LINK_FLAGS) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(KOD_APP)/_kod.o $(KOD_APP)/runtime_main.o
 
 $(KOD_APP)/_kod.s: tools/kod.kod $(COMPILER_KOD)
@@ -230,6 +237,10 @@ $(STAGE0)/_macho.s: stdlib/kod/macho.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
 
+$(STAGE0)/_dwarf.s: stdlib/kod/dwarf.kod $(COMPILER_KOD)
+	mkdir -p $(STAGE0)
+	$(KODC) $< > $@
+
 $(STAGE0)/_codegen.s: stdlib/kod/codegen.kod $(COMPILER_KOD)
 	mkdir -p $(STAGE0)
 	$(KODC) $< > $@
@@ -256,7 +267,7 @@ stage1: $(STAGE1)/sh_kodc
 $(STAGE1)/sh_kodc: $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS) $(LINK_CFG)
 	mkdir -p $(STAGE1)
 	$(if $(filter build/stage1,$(STAGE1)),rm -rf build/cache)
-	$(LINK) -o $@ \
+	$(LINK) $(COMPILER_LINK_FLAGS) -o $@ \
 	    $(STAGE0_OBJS) $(COMPILER_LIB_OBJS) $(STAGE1_OBJS)
 
 # kodc.kod is the only compiler source that's stage1-only — the
