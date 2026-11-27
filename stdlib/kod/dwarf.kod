@@ -1,12 +1,14 @@
-// DWARF for a debugger (docs/debugging.md): the assembler lines of an object's
-// __DWARF sections, from the functions codegen compiled into it.
+// DWARF for a debugger (docs/debugging.md): an object's __DWARF sections, from
+// the functions codegen compiled into it, as bytes with labels' addresses
+// among them, which go to the assembler as they are or as assembler lines.
 //
 // Version 4: a compile unit for the object, whose address ranges are its
-// functions', holding one subprogram per function (its name, file, line, and
-// first and last address), and a line table with a sequence per function. Each address is a `.quad` of a label,
-// which the assembler relocates, so no distance between two labels is needed:
-// a row sets its address outright. Sections refer to each other by offsets
-// from their start, as in any Mach-O object, without relocations.
+// functions', holding one subprogram per function (its name, file, line,
+// first and last address, and variables), the types of those, and a line
+// table with a sequence per function. Each address is a label's, which the
+// assembler relocates, so no distance between two labels is needed: a row
+// sets its address outright. Sections refer to each other by offsets from
+// their start, as in any Mach-O object, without relocations.
 //
 // Compiler source: what the bootstrap snapshot parses, so no comprehensions
 // or tuples here.
@@ -81,38 +83,68 @@ func points(anon t: Type) -> bool {
     return t.shape == SHAPE_STR or t.shape == SHAPE_ARRAY or t.shape == SHAPE_STRUCT
 }
 
-// Bytes for a section, with labels whose 8-byte addresses go between them.
+// A section's bytes, and the labels whose 8-byte addresses are among them:
+// `labels[k]`'s at `quads[k]`, where the bytes hold zeros.
 type Section = shared struct {
-    out: [str] = []
-    pending: [int64] = []
+    data: [int64] = []
+    quads: [int64] = []
+    labels: [str] = []
     size: int64 = 0
 
     func bytes(self, anon bs: [int64]) -> none {
         for b in bs {
-            self.pending += [b]
+            self.data += [b]
         }
         self.size += len(bs)
     }
 
     func byte(self, anon b: int64) -> none {
-        self.pending += [b]
+        self.data += [b]
         self.size += 1
     }
 
     func address(self, anon label: str) -> none {
-        self.flush()
-        self.out += [f"\t.quad {label}"]
-        self.size += 8
+        self.quads += [self.size]
+        self.labels += [label]
+        self.bytes([0, 0, 0, 0, 0, 0, 0, 0])
     }
 
-    // The bytes so far as `.byte` lines of up to 32.
-    func flush(self) -> none {
+    // `other` after what `self` has.
+    func append(self, anon other: Section) -> none {
+        for k, at in other.quads {
+            self.quads += [self.size + at]
+            self.labels += [other.labels[k]]
+        }
+        self.bytes(other.data)
+    }
+
+    // A unit: a 4-byte length of `self`, then `self`.
+    func with_length(self) -> Section {
+        let out = Section()
+        out.bytes(u32(self.size))
+        out.append(self)
+        return out
+    }
+
+    // As assembler lines: `.byte`s of up to 32, and a `.quad` for each label.
+    func lines(self) -> [str] {
         let texts = BYTE_TEXT
+        mut out: [str] = []
         mut at = 0
-        for at < len(self.pending) {
+        mut q = 0
+        for at < self.size {
+            if q < len(self.quads) and self.quads[q] == at {
+                out += [f"\t.quad {self.labels[q]}"]
+                at += 8
+                q += 1
+                continue
+            }
             mut end = at + 32
-            if end > len(self.pending) {
-                end = len(self.pending)
+            if end > self.size {
+                end = self.size
+            }
+            if q < len(self.quads) and self.quads[q] < end {
+                end = self.quads[q]
             }
             let line = StrBuilder()
             line.append("\t.byte ")
@@ -120,26 +152,34 @@ type Section = shared struct {
                 if k > at {
                     line.append(", ")
                 }
-                line.append(texts[self.pending[k] & 255])
+                line.append(texts[self.data[k] & 255])
             }
-            self.out += [line.to_str()]
+            out += [line.to_str()]
             at = end
-        }
-        self.pending = []
-    }
-
-    // `self` after a 4-byte length of it, as the start of a unit.
-    func with_length(self) -> [str] {
-        self.flush()
-        let head = Section()
-        head.bytes(u32(self.size))
-        head.flush()
-        mut out = head.out
-        for line in self.out {
-            out += [line]
         }
         return out
     }
+}
+
+// One of an object's __DWARF sections: its name and what it holds.
+type Part = struct {
+    name: str
+    section: Section
+}
+
+// The flags of a __DWARF section: regular, and debug (S_ATTR_DEBUG).
+let DEBUG_FLAGS: int64 = 0x02000000
+
+// `parts` as assembler lines.
+func lines(anon parts: [Part]) -> [str] {
+    mut out: [str] = []
+    for p in parts {
+        out += [f"\t.section __DWARF,{p.name},regular,debug"]
+        for line in p.section.lines() {
+            out += [line]
+        }
+    }
+    return out
 }
 
 func u16(anon n: int64) -> [int64] {
@@ -250,7 +290,7 @@ let LNE_SET_ADDRESS: int64 = 2
 
 // The __DWARF sections for `functions`, the object's main file `path`
 // (its compile unit's name) and the directory paths are relative to.
-func sections(anon functions: [Function], types: [Type], path: str, comp_dir: str) -> [str] {
+func sections(anon functions: [Function], types: [Type], path: str, comp_dir: str) -> [Part] {
     // The files, in the order functions name them; numbered from 1.
     mut files: [str] = []
     for f in functions {
@@ -258,20 +298,13 @@ func sections(anon functions: [Function], types: [Type], path: str, comp_dir: st
             files += [f.file]
         }
     }
-    mut out: [str] = []
-    out += ["\t.section __DWARF,__debug_abbrev,regular,debug"]
-    out += abbrevs()
-    out += ["\t.section __DWARF,__debug_info,regular,debug"]
     let loc = Section()
-    out += info(functions, types: types, files: files, path: path, comp_dir: comp_dir, :loc)
-    out += ["\t.section __DWARF,__debug_line,regular,debug"]
-    out += line_table(functions, files: files)
-    out += ["\t.section __DWARF,__debug_ranges,regular,debug"]
-    out += ranges(functions)
+    mut out = [Part(name: "__debug_abbrev", section: abbrevs())]
+    out += [Part(name: "__debug_info", section: info(functions, types: types, files: files, path: path, comp_dir: comp_dir, :loc))]
+    out += [Part(name: "__debug_line", section: line_table(functions, files: files))]
+    out += [Part(name: "__debug_ranges", section: ranges(functions))]
     if loc.size > 0 {
-        loc.flush()
-        out += ["\t.section __DWARF,__debug_loc,regular,debug"]
-        out += loc.out
+        out += [Part(name: "__debug_loc", section: loc)]
     }
     return out
 }
@@ -310,7 +343,7 @@ let ABBREV_TYPEDEF: int64 = 9
 let ABBREV_PARAMETER_LIST: int64 = 10
 let ABBREV_VARIABLE_LIST: int64 = 11
 
-func abbrevs() -> [str] {
+func abbrevs() -> Section {
     let s = Section()
     s.bytes([ABBREV_UNIT, TAG_COMPILE_UNIT, 1])
     s.bytes([AT_PRODUCER, FORM_STRING, AT_LANGUAGE, FORM_DATA2, AT_NAME, FORM_STRING, AT_COMP_DIR, FORM_STRING])
@@ -328,8 +361,7 @@ func abbrevs() -> [str] {
     s.bytes([ABBREV_PARAMETER_LIST, TAG_FORMAL_PARAMETER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
     s.bytes([ABBREV_VARIABLE_LIST, TAG_VARIABLE, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
     s.byte(0)
-    s.flush()
-    return s.out
+    return s
 }
 
 // The type entries of a unit, each made once: `keys` name them, `offsets`
@@ -473,7 +505,7 @@ type Types = shared struct {
     }
 }
 
-func info(anon functions: [Function], types: [Type], files: [str], path: str, comp_dir: str, loc: Section) -> [str] {
+func info(anon functions: [Function], types: [Type], files: [str], path: str, comp_dir: str, loc: Section) -> Section {
     let s = Section()
     // Version 4, abbreviations at offset 0, 8-byte addresses.
     s.bytes(u16(4))
@@ -552,15 +584,14 @@ func info(anon functions: [Function], types: [Type], files: [str], path: str, co
 
 // The unit's addresses: each function's, which a debugger finds the unit of
 // an address by. A pair of zeros ends the list.
-func ranges(anon functions: [Function]) -> [str] {
+func ranges(anon functions: [Function]) -> Section {
     let s = Section()
     for f in functions {
         s.address(f.start)
         s.address(f.end)
     }
     s.bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-    s.flush()
-    return s.out
+    return s
 }
 
 func set_address(anon s: Section, anon label: str) -> none {
@@ -568,7 +599,7 @@ func set_address(anon s: Section, anon label: str) -> none {
     s.address(label)
 }
 
-func line_table(anon functions: [Function], files: [str]) -> [str] {
+func line_table(anon functions: [Function], files: [str]) -> Section {
     // The header after its own length: minimum instruction length 4, one
     // operation per instruction, rows are statements, line_base -5,
     // line_range 14, opcode_base 13 and the standard opcodes' operand counts;
@@ -606,12 +637,7 @@ func line_table(anon functions: [Function], files: [str]) -> [str] {
     let unit = Section()
     unit.bytes(u16(4))
     unit.bytes(u32(header.size))
-    unit.bytes(header.pending)
-    program.flush()
-    unit.flush()
-    for line in program.out {
-        unit.out += [line]
-    }
-    unit.size += program.size
+    unit.append(header)
+    unit.append(program)
     return unit.with_length()
 }
