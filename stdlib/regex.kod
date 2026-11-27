@@ -1,0 +1,1269 @@
+// Regular expressions with RE2's syntax, matched in linear time by a Pike VM.
+// See docs/regex.md.
+//
+// A pattern is parsed into a `Node` tree, which compiles to a program of
+// instructions; matching runs every thread of the program in step over the
+// text, one character at a time, each instruction at most once per
+// character, the threads in the order a backtracking engine would try them,
+// so the first to match is the match it would find (leftmost-first).
+//
+// Text is UTF-8: a character is a code point, and a byte that doesn't start a
+// valid UTF-8 sequence is a character of its own, INVALID plus the byte,
+// which only `.` and negated classes match.
+
+// ---- errors ----
+
+type RegexError = shared struct {
+    message: str
+    offset: int64
+
+    func to_str(self) -> str {
+        return f"regex: {self.message} at offset {self.offset}"
+    }
+}
+
+// ---- characters ----
+
+let INVALID: int64 = 0x110000
+let MAX_CHAR: int64 = 0x10ffff
+let MAX_REPEAT: int64 = 1000
+
+// The character that starts at byte `i` of `s` (i < len(s)).
+func char_at(anon s: str, anon i: int64) -> int64 {
+    let b = s[i]
+    if b < 0x80 {
+        return b
+    }
+    let n = len(s)
+    if b >= 0xc2 and b < 0xe0 and i + 1 < n and (s[i + 1] & 0xc0) == 0x80 {
+        return ((b & 0x1f) << 6) | (s[i + 1] & 0x3f)
+    }
+    if b >= 0xe0 and b < 0xf0 and i + 2 < n and (s[i + 1] & 0xc0) == 0x80 and (s[i + 2] & 0xc0) == 0x80 {
+        let c = ((b & 0x0f) << 12) | ((s[i + 1] & 0x3f) << 6) | (s[i + 2] & 0x3f)
+        // Not overlong, not a surrogate.
+        if c >= 0x800 and (c < 0xd800 or c > 0xdfff) {
+            return c
+        }
+    }
+    if b >= 0xf0 and b < 0xf5 and i + 3 < n and (s[i + 1] & 0xc0) == 0x80 and (s[i + 2] & 0xc0) == 0x80 and (s[i + 3] & 0xc0) == 0x80 {
+        let c = ((b & 0x07) << 18) | ((s[i + 1] & 0x3f) << 12) | ((s[i + 2] & 0x3f) << 6) | (s[i + 3] & 0x3f)
+        if c >= 0x10000 and c <= MAX_CHAR {
+            return c
+        }
+    }
+    return INVALID + b
+}
+
+// How many bytes the character `c` (as char_at gives it) takes.
+func width(anon c: int64) -> int64 {
+    if c < 0x80 or c >= INVALID {
+        return 1
+    }
+    if c < 0x800 {
+        return 2
+    }
+    if c < 0x10000 {
+        return 3
+    }
+    return 4
+}
+
+// `c` as UTF-8.
+func encode(anon c: int64) -> str {
+    if c < 0x80 {
+        return kod_bytes_to_str(kod_bytes_from_array([c]))
+    }
+    if c < 0x800 {
+        return kod_bytes_to_str(kod_bytes_from_array([0xc0 | (c >> 6), 0x80 | (c & 0x3f)]))
+    }
+    if c < 0x10000 {
+        return kod_bytes_to_str(kod_bytes_from_array([0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)]))
+    }
+    return kod_bytes_to_str(kod_bytes_from_array([0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)]))
+}
+
+func is_word_byte(anon b: int64) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_'
+}
+
+// ---- classes: sorted, merged inclusive ranges, two numbers each ----
+
+func digit_ranges() -> [int64] {
+    return ['0', '9']
+}
+
+func word_ranges() -> [int64] {
+    return ['0', '9', 'A', 'Z', '_', '_', 'a', 'z']
+}
+
+func space_ranges() -> [int64] {
+    return ['\t', '\r', ' ', ' ']
+}
+
+// `ranges` sorted by start and with overlapping or touching ones merged.
+func normalized(anon ranges: [int64]) -> [int64] {
+    mut pairs = ranges
+    let n = len(pairs) / 2
+    // Insertion sort by start: classes are small.
+    for a in 1..n {
+        mut b = a
+        for b > 0 and pairs[2 * (b - 1)] > pairs[2 * b] {
+            let lo = pairs[2 * b]
+            let hi = pairs[2 * b + 1]
+            pairs[2 * b] = pairs[2 * (b - 1)]
+            pairs[2 * b + 1] = pairs[2 * (b - 1) + 1]
+            pairs[2 * (b - 1)] = lo
+            pairs[2 * (b - 1) + 1] = hi
+            b -= 1
+        }
+    }
+    mut out: [int64] = []
+    for k in 0..n {
+        let lo = pairs[2 * k]
+        let hi = pairs[2 * k + 1]
+        let m = len(out)
+        if m > 0 and lo <= out[m - 1] + 1 {
+            if hi > out[m - 1] {
+                out[m - 1] = hi
+            }
+        } else {
+            out += [lo, hi]
+        }
+    }
+    return out
+}
+
+// The characters (up to MAX_CHAR) not in `ranges` (normalized).
+func complement(anon ranges: [int64]) -> [int64] {
+    mut out: [int64] = []
+    mut next = 0
+    for k in 0..len(ranges) / 2 {
+        if ranges[2 * k] > next {
+            out += [next, ranges[2 * k] - 1]
+        }
+        next = ranges[2 * k + 1] + 1
+    }
+    if next <= MAX_CHAR {
+        out += [next, MAX_CHAR]
+    }
+    return out
+}
+
+// `ranges` with the other case of each ASCII letter in them.
+func folded(anon ranges: [int64]) -> [int64] {
+    mut out = ranges
+    for k in 0..len(ranges) / 2 {
+        let lo = ranges[2 * k]
+        let hi = ranges[2 * k + 1]
+        // The part in a-z, as A-Z, and the part in A-Z, as a-z.
+        let a = max(lo, 'a')
+        let z = min(hi, 'z')
+        if a <= z {
+            out += [a - 32, z - 32]
+        }
+        let big_a = max(lo, 'A')
+        let big_z = min(hi, 'Z')
+        if big_a <= big_z {
+            out += [big_a + 32, big_z + 32]
+        }
+    }
+    return normalized(out)
+}
+
+func in_ranges(anon ranges: [int64], anon c: int64) -> bool {
+    mut k = 0
+    let n = len(ranges)
+    for k < n {
+        if c < ranges[k] {
+            return false
+        }
+        if c <= ranges[k + 1] {
+            return true
+        }
+        k += 2
+    }
+    return false
+}
+
+// ---- the tree ----
+
+// Assertions, which look at the characters around a place.
+let AT_LINE_START: int64 = 1
+let AT_LINE_END: int64 = 2
+let AT_TEXT_START: int64 = 3
+let AT_TEXT_END: int64 = 4
+let AT_WORD_BOUNDARY: int64 = 5
+let AT_NOT_WORD_BOUNDARY: int64 = 6
+
+type Node = enum {
+    Empty
+    // One character, or one of a class (`negated`: one not in it).
+    Char(c: int64)
+    Class(ranges: [int64], negated: bool)
+    // `.`: any character, `\n` only when `newline`.
+    Any(newline: bool)
+    Assert(kind: int64)
+    // Capture group `index` (from 1).
+    Group(index: int64, sub: Node)
+    Concat(items: [Node])
+    Alt(items: [Node])
+    // `max` -1: no upper bound.
+    Repeat(sub: Node, min: int64, max: int64, greedy: bool)
+}
+
+// ---- parsing ----
+
+type Parser = shared struct {
+    p: str
+    pos: int64 = 0
+    // The flags in force: i, m, s.
+    fold: bool = false
+    multi: bool = false
+    dot_nl: bool = false
+    groups: int64 = 0
+    names: [str] = [""]
+    error: RegexError? = none
+
+    func fail(self, anon message: str, at: int64) -> Node {
+        if self.error is none {
+            self.error = RegexError(:message, offset: at)
+        }
+        return .Empty
+    }
+
+    func more(self) -> bool {
+        return self.pos < len(self.p) and self.error is none
+    }
+
+    func peek(self) -> int64 {
+        return self.p[self.pos]
+    }
+
+    // The character at the parse position, taken.
+    func take(self) -> int64 {
+        let c = char_at(self.p, self.pos)
+        self.pos += width(c)
+        return c
+    }
+
+    func alternation(self) -> Node {
+        let saved_fold = self.fold
+        let saved_multi = self.multi
+        let saved_dot = self.dot_nl
+        mut items = [self.concat()]
+        for self.more() and self.peek() == '|' {
+            self.pos += 1
+            items += [self.concat()]
+        }
+        // Flags set in a group end with it.
+        self.fold = saved_fold
+        self.multi = saved_multi
+        self.dot_nl = saved_dot
+        if len(items) == 1 {
+            return items[0]
+        }
+        return .Alt(:items)
+    }
+
+    func concat(self) -> Node {
+        mut items: [Node] = []
+        for self.more() and self.peek() != '|' and self.peek() != ')' {
+            let start = self.pos
+            let atom = self.atom()
+            if self.error is not none {
+                return .Empty
+            }
+            if atom is .Empty and self.pos > start + 1 and self.p[start] == '(' and self.p[start + 1] == '?' and self.flags_only(start) {
+                // `(?i)`: nothing to repeat or add.
+                continue
+            }
+            items += [self.repeats(atom)]
+        }
+        if len(items) == 0 {
+            return .Empty
+        }
+        if len(items) == 1 {
+            return items[0]
+        }
+        return .Concat(:items)
+    }
+
+    // Whether the group at `start` was a `(?flags)`, which sets flags only.
+    func flags_only(self, anon start: int64) -> bool {
+        mut k = start + 2
+        for k < len(self.p) and self.p[k] != ')' and self.p[k] != ':' {
+            k += 1
+        }
+        return k < len(self.p) and self.p[k] == ')'
+    }
+
+    // `atom` with the repetition operators after it.
+    func repeats(self, anon atom: Node) -> Node {
+        mut node = atom
+        mut repeated = false
+        for self.more() {
+            let op_at = self.pos
+            let c = self.peek()
+            mut min = 0
+            mut max = -1
+            if c == '*' {
+                self.pos += 1
+            } else if c == '+' {
+                min = 1
+                self.pos += 1
+            } else if c == '?' {
+                max = 1
+                self.pos += 1
+            } else if c == '{' {
+                let Some((lo, hi, end)) = self.bounds(self.pos) else { break }
+                min = lo
+                max = hi
+                self.pos = end
+            } else {
+                break
+            }
+            if atom is .Empty {
+                return self.fail("nothing to repeat before the repetition operator", at: op_at)
+            }
+            if repeated {
+                return self.fail("a repetition operator right after another", at: op_at)
+            }
+            if min > MAX_REPEAT or max > MAX_REPEAT {
+                return self.fail("a repeat count over 1000", at: op_at)
+            }
+            if max >= 0 and max < min {
+                return self.fail("a repeat count whose maximum is below its minimum", at: op_at)
+            }
+            mut greedy = true
+            if self.more() and self.peek() == '?' {
+                greedy = false
+                self.pos += 1
+            }
+            node = .Repeat(sub: node, :min, :max, :greedy)
+            repeated = true
+        }
+        return node
+    }
+
+    // `{n}`, `{n,}` or `{n,m}` at `at`: its bounds (-1: none) and where it
+    // ends, or none when it isn't one (and `{` is a character).
+    func bounds(self, anon at: int64) -> (int64, int64, int64)? {
+        mut k = at + 1
+        let Some((lo, after_lo)) = self.number(k) else { return none }
+        k = after_lo
+        if k >= len(self.p) {
+            return none
+        }
+        if self.p[k] == '}' {
+            return (lo, lo, k + 1)
+        }
+        if self.p[k] != ',' {
+            return none
+        }
+        k += 1
+        if k < len(self.p) and self.p[k] == '}' {
+            return (lo, -1, k + 1)
+        }
+        let Some((hi, after_hi)) = self.number(k) else { return none }
+        if after_hi >= len(self.p) or self.p[after_hi] != '}' {
+            return none
+        }
+        return (lo, hi, after_hi + 1)
+    }
+
+    // A decimal number at `at` and where it ends, or none.
+    func number(self, anon at: int64) -> (int64, int64)? {
+        mut k = at
+        mut n = 0
+        for k < len(self.p) and self.p[k] >= '0' and self.p[k] <= '9' {
+            // Beyond any limit already: kept from overflowing.
+            if n < 100000 {
+                n = n * 10 + (self.p[k] - '0')
+            }
+            k += 1
+        }
+        if k == at {
+            return none
+        }
+        return (n, k)
+    }
+
+    func atom(self) -> Node {
+        let start = self.pos
+        let c = self.peek()
+        if c == '(' {
+            return self.group()
+        }
+        if c == '[' {
+            return self.class()
+        }
+        if c == '*' or c == '+' or c == '?' {
+            return self.fail("nothing to repeat before the repetition operator", at: start)
+        }
+        if c == '{' and self.bounds(start) is Some(_) {
+            return self.fail("nothing to repeat before the repetition operator", at: start)
+        }
+        self.pos += 1
+        if c == '.' {
+            return .Any(newline: self.dot_nl)
+        }
+        if c == '^' {
+            return .Assert(kind: if self.multi { AT_LINE_START } else { AT_TEXT_START })
+        }
+        if c == '$' {
+            return .Assert(kind: if self.multi { AT_LINE_END } else { AT_TEXT_END })
+        }
+        if c == '\\' {
+            return self.escape(start)
+        }
+        self.pos = start
+        return self.char_node(self.take())
+    }
+
+    // A character, as a class of both cases under the `i` flag.
+    func char_node(self, anon c: int64) -> Node {
+        if self.fold and ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')) {
+            return .Class(ranges: folded([c, c]), negated: false)
+        }
+        return .Char(:c)
+    }
+
+    func group(self) -> Node {
+        let start = self.pos
+        self.pos += 1
+        // Flags a group sets end with it, `(?flags:x)`'s with x.
+        let saved_fold = self.fold
+        let saved_multi = self.multi
+        let saved_dot = self.dot_nl
+        mut capture = true
+        mut name = ""
+        if self.more() and self.peek() == '?' {
+            self.pos += 1
+            if self.more() and (self.peek() == 'P' or self.peek() == '<') {
+                if self.peek() == 'P' {
+                    self.pos += 1
+                }
+                if not self.more() or self.peek() != '<' {
+                    return self.fail("a group name that doesn't start with <", at: start)
+                }
+                self.pos += 1
+                let name_start = self.pos
+                for self.more() and self.peek() != '>' {
+                    let b = self.peek()
+                    if not is_word_byte(b) {
+                        return self.fail("a group name that isn't letters, digits and _", at: start)
+                    }
+                    self.pos += 1
+                }
+                if not self.more() {
+                    return self.fail("a group name without its >", at: start)
+                }
+                name = self.p[name_start..self.pos]
+                self.pos += 1
+                if len(name) == 0 or (name[0] >= '0' and name[0] <= '9') {
+                    return self.fail("a group name that is empty or starts with a digit", at: start)
+                }
+            } else {
+                // Flags: `(?flags)` for the rest of the group, `(?flags:x)` for x.
+                mut on = true
+                mut any = false
+                for true {
+                    if not self.more() {
+                        return self.fail("a flag group without its )", at: start)
+                    }
+                    let f = self.peek()
+                    self.pos += 1
+                    if f == 'i' {
+                        self.fold = on
+                    } else if f == 'm' {
+                        self.multi = on
+                    } else if f == 's' {
+                        self.dot_nl = on
+                    } else if f == '-' and on {
+                        on = false
+                        any = false
+                        continue
+                    } else if f == ')' and any {
+                        return .Empty
+                    } else if f == ':' and (any or on) {
+                        capture = false
+                        break
+                    } else {
+                        return self.fail("an unknown or misplaced flag", at: self.pos - 1)
+                    }
+                    any = true
+                }
+            }
+        }
+        mut index = 0
+        if capture {
+            self.groups += 1
+            index = self.groups
+            self.names += [name]
+        }
+        let sub = self.alternation()
+        self.fold = saved_fold
+        self.multi = saved_multi
+        self.dot_nl = saved_dot
+        if self.error is not none {
+            return .Empty
+        }
+        if not self.more() or self.peek() != ')' {
+            return self.fail("a group without its )", at: start)
+        }
+        self.pos += 1
+        if capture {
+            return .Group(:index, :sub)
+        }
+        // `(?:)`: empty, but something a repetition can follow.
+        if sub is .Empty {
+            return .Concat(items: [])
+        }
+        return sub
+    }
+
+    // After a `\` at `start`.
+    func escape(self, anon start: int64) -> Node {
+        if not self.more() {
+            return self.fail("a \\ at the end of the pattern", at: start)
+        }
+        let c = self.peek()
+        if c == 'A' {
+            self.pos += 1
+            return .Assert(kind: AT_TEXT_START)
+        }
+        if c == 'z' {
+            self.pos += 1
+            return .Assert(kind: AT_TEXT_END)
+        }
+        if c == 'b' {
+            self.pos += 1
+            return .Assert(kind: AT_WORD_BOUNDARY)
+        }
+        if c == 'B' {
+            self.pos += 1
+            return .Assert(kind: AT_NOT_WORD_BOUNDARY)
+        }
+        let Some(ranges) = self.escape_class() else {
+            let Some(ch) = self.escape_char(start) else { return .Empty }
+            return self.char_node(ch)
+        }
+        return .Class(:ranges, negated: false)
+    }
+
+    // `\d` and the like, at the position after the `\`, taken: their ranges.
+    func escape_class(self) -> [int64]? {
+        let c = self.peek()
+        mut ranges: [int64] = []
+        if c == 'd' or c == 'D' {
+            ranges = digit_ranges()
+        } else if c == 'w' or c == 'W' {
+            ranges = word_ranges()
+        } else if c == 's' or c == 'S' {
+            ranges = space_ranges()
+        } else {
+            return none
+        }
+        self.pos += 1
+        if c == 'D' or c == 'W' or c == 'S' {
+            return complement(ranges)
+        }
+        return ranges
+    }
+
+    // A character escape after the `\` at `start`, taken; none on an error.
+    func escape_char(self, anon start: int64) -> int64? {
+        let c = self.take()
+        if c == 'n' {
+            return '\n'
+        }
+        if c == 't' {
+            return '\t'
+        }
+        if c == 'r' {
+            return '\r'
+        }
+        if c == 'f' {
+            return 12
+        }
+        if c == 'v' {
+            return 11
+        }
+        if c == 'a' {
+            return 7
+        }
+        if c == 'x' {
+            return self.hex(start)
+        }
+        if c < 0x80 and not is_word_byte(c) {
+            return c
+        }
+        self.fail(f"an unknown escape \\{encode(c)}", at: start)
+        return none
+    }
+
+    // `\x41` or `\x{263a}`, after the `x`.
+    func hex(self, anon start: int64) -> int64? {
+        mut digits = ""
+        if self.more() and self.peek() == '{' {
+            self.pos += 1
+            let from = self.pos
+            for self.more() and self.peek() != '}' {
+                self.pos += 1
+            }
+            if not self.more() {
+                self.fail("a \\x{ without its }", at: start)
+                return none
+            }
+            digits = self.p[from..self.pos]
+            self.pos += 1
+        } else {
+            if self.pos + 2 > len(self.p) {
+                self.fail("a \\x without two hex digits", at: start)
+                return none
+            }
+            digits = self.p[self.pos..self.pos + 2]
+            self.pos += 2
+        }
+        mut v = 0
+        for k in 0..len(digits) {
+            let d = digits[k]
+            mut x = -1
+            if d >= '0' and d <= '9' {
+                x = d - '0'
+            } else if d >= 'a' and d <= 'f' {
+                x = d - 'a' + 10
+            } else if d >= 'A' and d <= 'F' {
+                x = d - 'A' + 10
+            }
+            if x < 0 or v > MAX_CHAR {
+                self.fail("a \\x that isn't a hex number of a character", at: start)
+                return none
+            }
+            v = v * 16 + x
+        }
+        if len(digits) == 0 or v > MAX_CHAR {
+            self.fail("a \\x that isn't a hex number of a character", at: start)
+            return none
+        }
+        return v
+    }
+
+    // `[...]`.
+    func class(self) -> Node {
+        let start = self.pos
+        self.pos += 1
+        mut negated = false
+        if self.more() and self.peek() == '^' {
+            negated = true
+            self.pos += 1
+        }
+        mut ranges: [int64] = []
+        mut first = true
+        for true {
+            if not self.more() {
+                if self.error is none {
+                    return self.fail("a class without its ]", at: start)
+                }
+                return .Empty
+            }
+            let c = self.peek()
+            // A `]` first is a character.
+            if c == ']' and not first {
+                self.pos += 1
+                break
+            }
+            first = false
+            if c == '[' and self.pos + 1 < len(self.p) and self.p[self.pos + 1] == ':' {
+                return self.fail("a POSIX class [:name:], which isn't supported", at: self.pos)
+            }
+            let item_at = self.pos
+            mut lo = 0
+            if c == '\\' {
+                self.pos += 1
+                if not self.more() {
+                    return self.fail("a \\ at the end of the pattern", at: item_at)
+                }
+                if self.escape_class() is Some(more) {
+                    ranges += more
+                    continue
+                }
+                let Some(ch) = self.escape_char(item_at) else { return .Empty }
+                lo = ch
+            } else {
+                lo = self.take()
+            }
+            mut hi = lo
+            // `a-z`; a `-` last, or before `]`, is a character.
+            if self.more() and self.peek() == '-' and self.pos + 1 < len(self.p) and self.p[self.pos + 1] != ']' {
+                self.pos += 1
+                let hi_at = self.pos
+                if self.peek() == '\\' {
+                    self.pos += 1
+                    if not self.more() {
+                        return self.fail("a \\ at the end of the pattern", at: hi_at)
+                    }
+                    if self.escape_class() is Some(_) {
+                        return self.fail("a range that ends in a class", at: hi_at)
+                    }
+                    let Some(ch) = self.escape_char(hi_at) else { return .Empty }
+                    hi = ch
+                } else {
+                    hi = self.take()
+                }
+                if hi < lo {
+                    return self.fail("a range whose end is before its start", at: item_at)
+                }
+            }
+            ranges += [lo, hi]
+        }
+        mut set = normalized(ranges)
+        if self.fold {
+            set = folded(set)
+        }
+        return .Class(ranges: set, :negated)
+    }
+}
+
+// ---- the program ----
+
+let OP_CHAR: int64 = 1
+let OP_CLASS: int64 = 2
+let OP_NOT_CLASS: int64 = 3
+let OP_ANY: int64 = 4
+let OP_ANY_NOT_NL: int64 = 5
+let OP_SPLIT: int64 = 6
+let OP_JUMP: int64 = 7
+let OP_SAVE: int64 = 8
+let OP_ASSERT: int64 = 9
+let OP_MATCH: int64 = 10
+
+// Instruction k: ops[k] with a[k] and b[k]: CHAR its character in a, a class
+// its ranges at classes[a], SPLIT the place to try first in a and the other
+// in b, JUMP its place in a, SAVE its slot in a, ASSERT its kind in a.
+type Program = shared struct {
+    ops: [int64] = []
+    a: [int64] = []
+    b: [int64] = []
+    classes: [[int64]] = []
+
+    func emit(self, anon op: int64, a: int64 = 0, b: int64 = 0) -> int64 {
+        self.ops += [op]
+        self.a += [a]
+        self.b += [b]
+        return len(self.ops) - 1
+    }
+
+    func patch(self, anon at: int64, a: int64, b: int64) -> none {
+        self.a[at] = a
+        self.b[at] = b
+    }
+
+    func node(self, anon n: Node) -> none {
+        match n {
+            .Empty -> none
+            .Char(c) -> {
+                let _ = self.emit(OP_CHAR, a: c)
+            }
+            .Class(ranges, negated) -> {
+                self.classes += [ranges]
+                let op = if negated { OP_NOT_CLASS } else { OP_CLASS }
+                let _ = self.emit(op, a: len(self.classes) - 1)
+            }
+            .Any(newline) -> {
+                let _ = self.emit(if newline { OP_ANY } else { OP_ANY_NOT_NL })
+            }
+            .Assert(kind) -> {
+                let _ = self.emit(OP_ASSERT, a: kind)
+            }
+            .Group(index, sub) -> {
+                let _ = self.emit(OP_SAVE, a: 2 * index)
+                self.node(sub)
+                let _ = self.emit(OP_SAVE, a: 2 * index + 1)
+            }
+            .Concat(items) -> {
+                for item in items {
+                    self.node(item)
+                }
+            }
+            .Alt(items) -> {
+                // split L1, next; L1: x; jump end; next: split L2, ...
+                mut jumps: [int64] = []
+                for k, item in items {
+                    if k < len(items) - 1 {
+                        let split = self.emit(OP_SPLIT)
+                        self.node(item)
+                        jumps += [self.emit(OP_JUMP)]
+                        self.patch(split, a: split + 1, b: len(self.ops))
+                    } else {
+                        self.node(item)
+                    }
+                }
+                for j in jumps {
+                    self.patch(j, a: len(self.ops), b: 0)
+                }
+            }
+            .Repeat(sub, min, max, greedy) -> self.repeat(sub, :min, :max, :greedy)
+        }
+    }
+
+    // A split preferring `first` (or, not greedy, `second`).
+    func split(self, anon at: int64, first: int64, second: int64, greedy: bool) -> none {
+        if greedy {
+            self.patch(at, a: first, b: second)
+        } else {
+            self.patch(at, a: second, b: first)
+        }
+    }
+
+    func repeat(self, anon sub: Node, min: int64, max: int64, greedy: bool) -> none {
+        if max < 0 and min > 0 {
+            // x{n,}: n - 1 copies, then x+ as one copy, L: body; split L,
+            // end, as Go has it: a second copy would let x start over empty.
+            for _k in 0..min - 1 {
+                self.node(sub)
+            }
+            let top = len(self.ops)
+            self.node(sub)
+            let again = self.emit(OP_SPLIT)
+            self.split(again, first: top, second: len(self.ops), :greedy)
+            return
+        }
+        for _k in 0..min {
+            self.node(sub)
+        }
+        if max < 0 {
+            // x* as (x+)?: split body, end; L: body; split L, end. As
+            // `L: split body, end; body; jump L` it would lose what x
+            // captures when it matches empty: back at L the thread is one
+            // the step has already had, and stops.
+            let skip = self.emit(OP_SPLIT)
+            let top = len(self.ops)
+            self.node(sub)
+            let again = self.emit(OP_SPLIT)
+            self.split(again, first: top, second: len(self.ops), :greedy)
+            self.split(skip, first: top, second: len(self.ops), :greedy)
+            return
+        }
+        // x{0,k} as nested options: (x(x(x)?)?)?, each split skipping to the end.
+        mut splits: [int64] = []
+        for _k in min..max {
+            splits += [self.emit(OP_SPLIT)]
+            self.node(sub)
+        }
+        for at in splits {
+            self.split(at, first: at + 1, second: len(self.ops), :greedy)
+        }
+    }
+}
+
+// ---- compiled patterns ----
+
+type Regex = shared struct {
+    pattern: str
+    prog: Program
+    groups: int64
+    names: [str]
+    // The text every match starts with, for skipping ahead, or "".
+    prefix: str
+    // Whether a match can start only at the start of the text.
+    anchored: bool
+
+    func group_count(self) -> int64 {
+        return self.groups
+    }
+
+    func group_names(self) -> [str] {
+        return self.names
+    }
+
+    func matches(self, anon s: str) -> bool {
+        return self.run(s, from: 0, full: false) is Some(_)
+    }
+
+    func find(self, anon s: str, from: int64 = 0) -> Match? {
+        let Some(caps) = self.run(s, :from, full: false) else { return none }
+        return self.made(s, caps)
+    }
+
+    func full_match(self, anon s: str) -> Match? {
+        let Some(caps) = self.run(s, from: 0, full: true) else { return none }
+        return self.made(s, caps)
+    }
+
+    func made(self, anon s: str, anon caps: [int64]) -> Match {
+        return Match(text_of: s, start: caps[0], end: caps[1], caps: caps, names: self.names)
+    }
+
+    // Every match, as Go's FindAll gives them: after an empty match the search
+    // goes on a character later, and an empty match right after the previous
+    // match is skipped.
+    func find_all(self, anon s: str) -> [Match] {
+        mut out: [Match] = []
+        mut pos = 0
+        mut prev_end = -1
+        for pos <= len(s) {
+            let Some(caps) = self.run(s, from: pos, full: false) else { break }
+            mut accept = true
+            if caps[1] == pos {
+                // Empty, here: the next search starts a character on.
+                if caps[0] == prev_end {
+                    accept = false
+                }
+                if pos < len(s) {
+                    pos += width(char_at(s, pos))
+                } else {
+                    pos += 1
+                }
+            } else {
+                pos = caps[1]
+            }
+            prev_end = caps[1]
+            if accept {
+                out += [self.made(s, caps)]
+            }
+        }
+        return out
+    }
+
+    func replace_all(self, anon s: str, with: str) -> str {
+        mut out = ""
+        mut last = 0
+        for m in self.find_all(s) {
+            out += s[last..m.start] + expand(with, m)
+            last = m.end
+        }
+        return out + s[last..]
+    }
+
+    func replace_with(self, anon s: str, anon f: func(Match) -> str) -> str {
+        mut out = ""
+        mut last = 0
+        for m in self.find_all(s) {
+            out += s[last..m.start] + f(m)
+            last = m.end
+        }
+        return out + s[last..]
+    }
+
+    // As Go's Split(s, -1).
+    func split(self, anon s: str) -> [str] {
+        if len(s) == 0 and len(self.pattern) > 0 {
+            return [""]
+        }
+        mut out: [str] = []
+        mut beg = 0
+        mut end = 0
+        for m in self.find_all(s) {
+            end = m.start
+            if m.end != 0 {
+                out += [s[beg..end]]
+            }
+            beg = m.end
+        }
+        if end != len(s) {
+            out += [s[beg..]]
+        }
+        return out
+    }
+
+    // The slots of the match the program finds in `s` at or after `from`
+    // (`full`: of all of `s`, from its start), or none: 2 per group, group 0
+    // the whole match, -1 for a group that took no part.
+    func run(self, anon s: str, from: int64, full: bool) -> [int64]? {
+        let prog = self.prog
+        let n_ops = len(prog.ops)
+        let slots = 2 * (self.groups + 1)
+        let n = len(s)
+        let empty_caps = [-1] * slots
+        let current = Threads(pcs: [0] * n_ops, caps: [empty_caps] * n_ops, seen: [-1] * n_ops)
+        let next = Threads(pcs: [0] * n_ops, caps: [empty_caps] * n_ops, seen: [-1] * n_ops)
+        let only_at_start = full or self.anchored
+        mut found: [int64]? = none
+        mut pos = from
+        mut step = 0
+        mut clist = current
+        mut nlist = next
+        clist.gen = step
+        for true {
+            if found is none and (pos == from or not only_at_start) {
+                if clist.n == 0 and len(self.prefix) > 0 and not only_at_start {
+                    // Nothing under way: skip to where the prefix is.
+                    let Some(at) = s.find(self.prefix, from: pos) else { break }
+                    if at != pos {
+                        pos = at
+                        step += 1
+                        clist.gen = step
+                    }
+                }
+                self.add(clist, 0, empty_caps, :pos, :s)
+            }
+            if clist.n == 0 {
+                // Nothing under way: done, unless a later start may match.
+                if found is not none or only_at_start or pos >= n {
+                    break
+                }
+                pos += width(char_at(s, pos))
+                // A new place: what was added at the last is not added here.
+                step += 1
+                clist.gen = step
+                continue
+            }
+            mut c = -1
+            mut w = 1
+            if pos < n {
+                c = char_at(s, pos)
+                w = width(c)
+            }
+            step += 1
+            nlist.n = 0
+            nlist.gen = step
+            for k in 0..clist.n {
+                let pc = clist.pcs[k]
+                let op = prog.ops[pc]
+                if op == OP_MATCH {
+                    if full and pos != n {
+                        continue
+                    }
+                    found = clist.caps[k]
+                    // Those after it come second to it.
+                    break
+                }
+                if c < 0 {
+                    continue
+                }
+                mut ok = false
+                if op == OP_CHAR {
+                    ok = c == prog.a[pc]
+                } else if op == OP_CLASS {
+                    ok = in_ranges(prog.classes[prog.a[pc]], c)
+                } else if op == OP_NOT_CLASS {
+                    ok = not in_ranges(prog.classes[prog.a[pc]], c)
+                } else if op == OP_ANY {
+                    ok = true
+                } else if op == OP_ANY_NOT_NL {
+                    ok = c != '\n'
+                }
+                if ok {
+                    self.add(nlist, pc + 1, clist.caps[k], pos: pos + w, :s)
+                }
+            }
+            if pos >= n {
+                break
+            }
+            pos += w
+            let t = clist
+            clist = nlist
+            nlist = t
+        }
+        return found
+    }
+
+    // Thread `pc` with `caps` at `pos` into `list`, and what it reaches
+    // without reading a character, in the order they'd be tried.
+    func add(self, anon list: Threads, anon pc: int64, anon caps: [int64], pos: int64, s: str) -> none {
+        if list.seen[pc] == list.gen {
+            return
+        }
+        list.seen[pc] = list.gen
+        let prog = self.prog
+        let op = prog.ops[pc]
+        if op == OP_JUMP {
+            self.add(list, prog.a[pc], caps, :pos, :s)
+        } else if op == OP_SPLIT {
+            self.add(list, prog.a[pc], caps, :pos, :s)
+            self.add(list, prog.b[pc], caps, :pos, :s)
+        } else if op == OP_SAVE {
+            mut saved = caps
+            saved[prog.a[pc]] = pos
+            self.add(list, pc + 1, saved, :pos, :s)
+        } else if op == OP_ASSERT {
+            if holds(prog.a[pc], s, pos) {
+                self.add(list, pc + 1, caps, :pos, :s)
+            }
+        } else {
+            list.pcs[list.n] = pc
+            list.caps[list.n] = caps
+            list.n += 1
+        }
+    }
+}
+
+// The threads of one step: `n` of them, each a place in the program and its
+// slots; `seen[pc]` is `gen` once `pc` has been added this step.
+type Threads = shared struct {
+    pcs: [int64]
+    caps: [[int64]]
+    seen: [int64]
+    n: int64 = 0
+    gen: int64 = 0
+}
+
+// Whether the assertion `kind` holds at `pos` of `s`.
+func holds(anon kind: int64, anon s: str, anon pos: int64) -> bool {
+    let n = len(s)
+    if kind == AT_TEXT_START {
+        return pos == 0
+    }
+    if kind == AT_TEXT_END {
+        return pos == n
+    }
+    if kind == AT_LINE_START {
+        return pos == 0 or s[pos - 1] == '\n'
+    }
+    if kind == AT_LINE_END {
+        return pos == n or s[pos] == '\n'
+    }
+    let before = pos > 0 and is_word_byte(s[pos - 1])
+    let after = pos < n and is_word_byte(s[pos])
+    if kind == AT_WORD_BOUNDARY {
+        return before != after
+    }
+    return before == after
+}
+
+// ---- matches ----
+
+type Match = struct {
+    text_of: str
+    start: int64
+    end: int64
+    caps: [int64]
+    names: [str]
+
+    func text(self) -> str {
+        return self.text_of[self.start..self.end]
+    }
+
+    func span(self, anon i: int64) -> (int64, int64)? {
+        if i < 0 or 2 * i + 1 >= len(self.caps) or self.caps[2 * i] < 0 or self.caps[2 * i + 1] < 0 {
+            return none
+        }
+        return (self.caps[2 * i], self.caps[2 * i + 1])
+    }
+
+    func group(self, anon i: int64) -> str? {
+        let Some((a, b)) = self.span(i) else { return none }
+        return self.text_of[a..b]
+    }
+
+    func named(self, anon name: str) -> str? {
+        for k, have in self.names {
+            if k > 0 and have == name {
+                return self.group(k)
+            }
+        }
+        return none
+    }
+}
+
+// The replacement template `t` for `m`, as Go's Expand: `$name` or `${name}`,
+// a name being letters, digits and `_` (so `$1x` is group `1x`), `$$` a `$`.
+func expand(anon t: str, anon m: Match) -> str {
+    mut out = ""
+    mut k = 0
+    let n = len(t)
+    for k < n {
+        let at = t.find("$", from: k)? or -1
+        if at < 0 {
+            out += t[k..]
+            break
+        }
+        out += t[k..at]
+        k = at + 1
+        if k < n and t[k] == '$' {
+            out += "$"
+            k += 1
+            continue
+        }
+        mut name = ""
+        if k < n and t[k] == '{' {
+            let close = t.find("}", from: k)? or -1
+            if close < 0 {
+                // Not a variable: as it is.
+                out += "$"
+                continue
+            }
+            name = t[k + 1..close]
+            mut good = len(name) > 0
+            for j in 0..len(name) {
+                if not is_word_byte(name[j]) {
+                    good = false
+                }
+            }
+            if not good {
+                out += "$"
+                continue
+            }
+            k = close + 1
+        } else {
+            let begin = k
+            for k < n and is_word_byte(t[k]) {
+                k += 1
+            }
+            name = t[begin..k]
+            if len(name) == 0 {
+                out += "$"
+                continue
+            }
+        }
+        out += group_text(m, name)
+    }
+    return out
+}
+
+// The text of group `name` of `m`: a number, or a group's name; "" when there
+// is no such group or it took no part.
+func group_text(anon m: Match, anon name: str) -> str {
+    mut all_digits = true
+    for j in 0..len(name) {
+        if name[j] < '0' or name[j] > '9' {
+            all_digits = false
+        }
+    }
+    if all_digits {
+        // Too big to be a group: none.
+        if len(name) > 6 {
+            return ""
+        }
+        return m.group(name.parse_int()? or -1)? or ""
+    }
+    return m.named(name)? or ""
+}
+
+// ---- compiling ----
+
+func compile(anon pattern: str) -> Regex or Error {
+    let p = Parser(p: pattern)
+    let tree = p.alternation()
+    if p.error is RegexError(e) {
+        throw e
+    }
+    if p.pos < len(pattern) {
+        // Only a `)` stops the top level early.
+        throw RegexError(message: "a ) without its (", offset: p.pos)
+    }
+    let prog = Program()
+    let _ = prog.emit(OP_SAVE, a: 0)
+    prog.node(tree)
+    let _ = prog.emit(OP_SAVE, a: 1)
+    let _ = prog.emit(OP_MATCH)
+    return Regex(pattern: pattern, :prog, groups: p.groups, names: p.names, prefix: literal_prefix(prog), anchored: starts_anchored(prog))
+}
+
+// The characters every match starts with: the program's first instructions,
+// after the whole match's SAVE, while they are single characters.
+func literal_prefix(anon prog: Program) -> str {
+    mut out = ""
+    mut pc = 1
+    for pc < len(prog.ops) and prog.ops[pc] == OP_CHAR {
+        out += encode(prog.a[pc])
+        pc += 1
+    }
+    return out
+}
+
+// Whether the program starts with `^` (not multi-line) or `\A`.
+func starts_anchored(anon prog: Program) -> bool {
+    return len(prog.ops) > 1 and prog.ops[1] == OP_ASSERT and prog.a[1] == AT_TEXT_START
+}

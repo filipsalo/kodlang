@@ -1,0 +1,157 @@
+// stdlib/regex.kod against Go's regexp (testdata/regex_cases.jsonl, which
+// testdata/regex_cases.go writes), and its API (docs/regex.md).
+import "io"
+import "json"
+import "regex"
+import "regex" { Match, Regex, RegexError }
+import "time"
+
+func re(anon p: str) -> Regex {
+    return must regex.compile(p)
+}
+
+// Each match's group spans, -1 for a group that took no part.
+func spans(anon r: Regex, anon t: str) -> [[int64]] {
+    mut out: [[int64]] = []
+    for m in r.find_all(t) {
+        mut row: [int64] = []
+        for i in 0..r.group_count() + 1 {
+            if m.span(i) is Some((a, b)) {
+                row += [a, b]
+            } else {
+                row += [-1, -1]
+            }
+        }
+        out += [row]
+    }
+    return out
+}
+
+func ints(anon v: json.Value) -> [int64] {
+    mut out: [int64] = []
+    for x in v.as_array()? or [] {
+        out += [x.as_int()? or 0]
+    }
+    return out
+}
+
+test "every case as Go's regexp has it" {
+    let text = must io.read_file("stdlib/testdata/regex_cases.jsonl")
+    mut checked = 0
+    for line in text.lines() {
+        let v = must json.parse(line)
+        let p = v.get("p").as_str()? or ""
+        let t = v.get("t").as_str()? or ""
+        let compiled = regex.compile(p)
+        if v.get("err").as_bool()? or false {
+            if compiled is Ok(_) {
+                fail(f"`{p}` compiled; Go rejects it")
+            }
+            continue
+        }
+        let Ok(r) = compiled else {
+            fail(f"`{p}` didn't compile; Go takes it")
+            continue
+        }
+        mut want: [[int64]] = []
+        for m in v.get("m").as_array()? or [] {
+            want += [ints(m)]
+        }
+        mut want_split: [str] = []
+        for x in v.get("s").as_array()? or [] {
+            want_split += [x.as_str()? or ""]
+        }
+        if spans(r, t) != want or r.replace_all(t, with: "<$1|${0}>") != (v.get("r").as_str()? or "") or r.split(t) != want_split {
+            fail(f"`{p}` on `{t}`: {spans(r, t)}, Go {want}")
+        }
+        checked += 1
+    }
+    assert checked > 1000
+}
+
+test "the example in docs/regex.md" {
+    let date = re("(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})")
+    let m = must date.find("due 2026-11-27, paid later")
+    assert m.text() == "2026-11-27" and m.start == 4 and m.end == 14
+    assert m.named("month") == "11" and m.group(3) == "27" and m.group(0) == "2026-11-27"
+    assert date.replace_all("2026-11-27", with: "$day/$month/$year") == "27/11/2026"
+    assert date.group_count() == 3 and date.group_names() == ["", "year", "month", "day"]
+}
+
+test "finding: from, full_match, groups that take no part" {
+    let r = re("o+")
+    assert (must r.find("foo boo")).start == 1
+    assert (must r.find("foo boo", from: 3)).start == 5
+    assert r.find("foo boo", from: 7) is none
+    assert r.matches("xo") and not r.matches("xyz")
+    assert (must re("a|ab").full_match("ab")).text() == "ab"
+    assert re("a|ab").full_match("abc") is none
+    assert (must re("a|ab").find("ab")).text() == "a"
+    let m = must re("(a)|(b)").find("b")
+    assert m.group(1) is none and m.group(2) == "b" and m.span(1) is none and m.span(2) == (0, 1)
+    assert m.group(3) is none and m.named("x") is none
+}
+
+test "replacing and splitting" {
+    let r = re("(\\w+)@(\\w+)")
+    let s = "bob@ex, amy@why"
+    assert r.replace_all(s, with: "$2:$1") == "ex:bob, why:amy"
+    // `$1x` is the group named 1x, which there isn't; `${1}x` is group 1 and x.
+    assert r.replace_all(s, with: "$1x") == ", "
+    assert r.replace_all(s, with: "${1}x") == "bobx, amyx"
+    assert r.replace_all(s, with: "$$ $0 $9 ${bad") == "$ bob@ex  ${bad, $ amy@why  ${bad"
+    assert r.replace_with(s, func(anon m: Match) -> str { return (m.group(1)? or "").upper() }) == "BOB, AMY"
+    assert re(",\\s*").split("a, b,c,  d") == ["a", "b", "c", "d"]
+    assert re("x*").split("axbc") == ["a", "b", "c"]
+    assert re("a").split("") == [""]
+    assert re("").split("") == []
+}
+
+func error_of(anon p: str) -> str {
+    let compiled = regex.compile(p)
+    if compiled is Err(e) {
+        if e is RegexError(re) {
+            return f"{re.offset}: {re.message}"
+        }
+    }
+    return "compiled"
+}
+
+test "patterns that aren't, and where they go wrong" {
+    assert error_of("(ab") == "0: a group without its )"
+    assert error_of("ab)") == "2: a ) without its ("
+    assert error_of("a**") == "2: a repetition operator right after another"
+    assert error_of("*a") == "0: nothing to repeat before the repetition operator"
+    assert error_of("[b-a]") == "1: a range whose end is before its start"
+    assert error_of("[ab") == "0: a class without its ]"
+    assert error_of("a{1001}") == "1: a repeat count over 1000"
+    assert error_of("\\q") == "0: an unknown escape \\q"
+    assert error_of("x\\") == "1: a \\ at the end of the pattern"
+    assert error_of("(?z)") == "2: an unknown or misplaced flag"
+    assert error_of("[[:alpha:]]") == "1: a POSIX class [:name:], which isn't supported"
+    // `{` that doesn't start a count is a character.
+    assert error_of("a{,2}") == "compiled" and (must re("a{,2}").find("a{,2}")).text() == "a{,2}"
+    assert (regex.compile("(") is Err(e)) and e.to_str() == "regex: a group without its ) at offset 0"
+}
+
+test "UTF-8: characters, offsets, and bytes that aren't" {
+    let m = must re("é.").find("café!")
+    assert m.start == 3 and m.end == 6 and m.text() == "é!"
+    assert len(re(".").find_all("日本")) == 2
+    // A byte that isn't UTF-8: `.` and a negated class match it, nothing else.
+    let odd = kod_bytes_to_str(b"a\xffb")
+    assert spans(re("a.b"), odd) == [[0, 3]]
+    assert spans(re("a[^x]b"), odd) == [[0, 3]]
+    assert re("a\\x{ff}b").find(odd) is none
+    // `i` folds ASCII only.
+    assert re("(?i)abc").matches("ABC") and not re("(?i)é").matches("É")
+}
+
+test "linear time, where backtracking would take forever" {
+    // (a|aa)*b on 40 a's: a backtracking engine tries some 10^8 ways.
+    let text = "".join(["a"] * 40)
+    let t0 = time.monotonic_ns()
+    assert re("(a|aa)*b").find(text) is none
+    assert re("(a*)*b").find(text) is none
+    assert (time.monotonic_ns() - t0) / 1000000 < 500
+}
