@@ -40,6 +40,13 @@ extern void kod_inspect_print_backtrace_from(int64_t fp)
 int64_t kod_poll_flag = 0;
 int64_t kod_poll_budget = 1;
 void (*kod_poll_hook)(void) = 0;
+// A store to what other tasks can reach (a shared struct's field, a module
+// variable) sets kod_poll_stored (codegen.kod, emit_store_mark); the next check
+// that finds it set clears it and counts kod_poll_store_budget down as well,
+// so that under a simulation a task is preempted more often right after it
+// changed what another may read. Outside one that countdown never runs out.
+int64_t kod_poll_stored = 0;
+int64_t kod_poll_store_budget = (int64_t)1 << 62;
 // Under a simulation: what a module variable's initializer runs isn't counted
 // (kod_poll_hold), so that a seed preempts at the same checks whether or not an
 // earlier run worked the variable out. How many initializers are under way, and
@@ -47,15 +54,19 @@ void (*kod_poll_hook)(void) = 0;
 int64_t kod_poll_sim = 0;
 int64_t kod_poll_held = 0;
 int64_t kod_poll_kept = 0;
+int64_t kod_poll_store_kept = 0;
 
-void kod_poll_set(int64_t flag, int64_t budget) {
+void kod_poll_set(int64_t flag, int64_t budget, int64_t store_budget) {
     kod_poll_flag = flag;
     kod_poll_budget = budget;
+    kod_poll_store_budget = store_budget;
 }
 
 void kod_poll_simulate(int64_t on) {
     kod_poll_sim = on;
     kod_poll_held = 0;
+    // What was stored before doesn't count in the run.
+    kod_poll_stored = 0;
 }
 
 // While a panic's backtrace is kept, nothing gives way (tasks.c).
@@ -63,10 +74,21 @@ extern int kod_no_preempt;
 
 // The countdown is out: what follows in the hook isn't counted until it sets
 // another.
+// Whether the countdown that ran out was the one after a store.
+int64_t kod_poll_by_store = 0;
+
+int64_t kod_poll_after_store(void) {
+    return kod_poll_by_store;
+}
+
 void kod_poll_slow(void) {
+    int64_t store_budget = kod_poll_store_budget;
+    kod_poll_by_store = store_budget <= 0;
     kod_poll_budget = (int64_t)1 << 62;
+    kod_poll_store_budget = (int64_t)1 << 62;
     if (kod_no_preempt || !kod_poll_hook) {
         kod_poll_budget = 1;
+        kod_poll_store_budget = store_budget > 0 ? store_budget : 1;
         return;
     }
     kod_poll_hook();
@@ -80,6 +102,17 @@ void kod_poll_slow(void) {
 // backtrace from inside reads as the loop's.
 __attribute__((naked)) void kod_poll_stub(void) {
     __asm__(
+        "adrp x16, _kod_poll_stored@PAGE\n"
+        "ldr x17, [x16, _kod_poll_stored@PAGEOFF]\n"
+        "cbz x17, 2f\n"
+        "str xzr, [x16, _kod_poll_stored@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_budget@PAGE\n"
+        "ldr x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
+        "sub x17, x17, #1\n"
+        "str x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
+        "cbz x17, 1f\n"
+        "tbnz x17, #63, 1f\n"
+        "2:\n"
         "adrp x16, _kod_poll_budget@PAGE\n"
         "ldr x17, [x16, _kod_poll_budget@PAGEOFF]\n"
         "sub x17, x17, #1\n"
@@ -181,6 +214,13 @@ __attribute__((naked)) void kod_poll_hold(void) {
         "adrp x16, _kod_poll_budget@PAGE\n"
         "mov x17, #0x4000000000000000\n"
         "str x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_budget@PAGE\n"
+        "ldr x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_kept@PAGE\n"
+        "str x17, [x16, _kod_poll_store_kept@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_budget@PAGE\n"
+        "mov x17, #0x4000000000000000\n"
+        "str x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
         "1:\n"
         "ret\n");
 }
@@ -197,6 +237,13 @@ __attribute__((naked)) void kod_poll_unhold(void) {
         "ldr x17, [x16, _kod_poll_kept@PAGEOFF]\n"
         "adrp x16, _kod_poll_budget@PAGE\n"
         "str x17, [x16, _kod_poll_budget@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_kept@PAGE\n"
+        "ldr x17, [x16, _kod_poll_store_kept@PAGEOFF]\n"
+        "adrp x16, _kod_poll_store_budget@PAGE\n"
+        "str x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
+        // What the initializer stored doesn't count either.
+        "adrp x16, _kod_poll_stored@PAGE\n"
+        "str xzr, [x16, _kod_poll_stored@PAGEOFF]\n"
         "1:\n"
         "ret\n");
 }
@@ -335,7 +382,11 @@ static void kod_unwind_frame(uint64_t *fp, uint64_t pc) {
             cell[0] = 0;
             cell[1] = 0;
             // What kod_poll_hold put aside for it.
-            if (kod_poll_held > 0 && --kod_poll_held == 0) kod_poll_budget = kod_poll_kept;
+            if (kod_poll_held > 0 && --kod_poll_held == 0) {
+                kod_poll_budget = kod_poll_kept;
+                kod_poll_store_budget = kod_poll_store_kept;
+                kod_poll_stored = 0;
+            }
             if (state == 3) kod_var_wake(cell);
         }
         return;

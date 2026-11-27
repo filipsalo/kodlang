@@ -366,6 +366,28 @@ one time in 16.
 Once the snapshot that builds the compiler's own modules had the flag too,
 the page and its fault handler went.
 
+Counting alone rarely finds a race whose window is a few checks among
+hundreds of thousands, such as a writer preempted between queueing records
+and sending them (a TLS bug, put back on purpose: 0 of 200 seeds). Three
+things find it, in 67 of 200 seeds:
+
+- A store to what other tasks can reach, a `shared struct`'s field or a
+  module-level variable, sets a word (`adrp`, `str`: no branch); the next
+  check that finds it set clears it and counts a second, short countdown
+  down. The preemption is at the check, never between the store and the
+  next one, so the simulation interleaves only as a real run could.
+- Under half the seeds tasks run by priority (PCT): the highest ready one,
+  a preempted one dropping below the rest, so that a writer can run on while
+  a reader that is ready waits, as on a busy machine.
+- Every switch looks for I/O that has come (one `poll(2)` for all of a run's
+  descriptors), as the kernel would have woken those tasks meanwhile.
+
+Without the store bias, none of the 200 seeds found it; without priorities,
+11. Outside a simulation the store's word costs nothing measurable: the
+compiler, with 1,979 of them, 373 ms against 374, and a loop storing to a
+shared struct's fields 200 million times, 443 ms against 446. A TLS hunt
+takes 6.5 s for 200 seeds, against 4.2 s before.
+
 The check is in every loop of every program, since a module is compiled
 without knowing whether the program starts tasks; a program that never does
 pays for it too, and it is the one thing step 1 costs such a program. Code

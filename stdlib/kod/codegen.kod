@@ -21459,6 +21459,13 @@ type Codegen = shared struct {
     // when the target is or is in a struct's entry, `s[k]` or `s[k, default: d]`.
     // `target = rhs`, or with `op` `target op= rhs`.
     func compile_update(self, anon target: int64, rhs: int64, op: ast.Op?) -> none {
+        self.compile_update_only(target, :rhs, :op)
+        if self.reachable_target(target) {
+            self.emit_store_mark()
+        }
+    }
+
+    func compile_update_only(self, anon target: int64, rhs: int64, op: ast.Op?) -> none {
         if self.compile_entry_update(target, :rhs, :op) {
             return
         }
@@ -23504,8 +23511,7 @@ type Codegen = shared struct {
     // nor in the backtraces a panic prints, nor between a read into memory tasks
     // share and the copy out of it (unsafe), nor in what a C library calls (TLS).
     func emit_poll(self) -> none {
-        let path = self.p.path
-        if path.ends_with(CHANNEL_MODULE_PATH) or path.ends_with("stdlib/builtins.kod") or path.ends_with("stdlib/kod/inspect.kod") or path.ends_with("stdlib/panics.kod") or path.ends_with("stdlib/unsafe.kod") or path.ends_with("stdlib/net/tls.kod") {
+        if not self.checks_here() {
             return
         }
         // As text, which the passes take as changing anything in memory: once
@@ -23520,6 +23526,44 @@ type Codegen = shared struct {
         if not self.dry_run {
             self.poll_cold += [f"{lbl}_due:", "\tbl _kod_poll_stub", f"\tb {lbl}"]
         }
+    }
+
+    // Whether this module has preemption checks (emit_poll).
+    func checks_here(self) -> bool {
+        let path = self.p.path
+        return not (path.ends_with(CHANNEL_MODULE_PATH) or path.ends_with("stdlib/builtins.kod") or path.ends_with("stdlib/kod/inspect.kod") or path.ends_with("stdlib/panics.kod") or path.ends_with("stdlib/unsafe.kod") or path.ends_with("stdlib/net/tls.kod"))
+    }
+
+    // After a store to what other tasks can reach: kod_poll_stored is set
+    // (stdlib/runtime.c) to anything but 0, its own page's address. Under a
+    // simulation the next check then preempts sooner.
+    func emit_store_mark(self) -> none {
+        if not self.checks_here() or not self.can_push() {
+            return
+        }
+        let x16 = regalloc.reg_of("x16")
+        self.emit_op(.AddressPage, a: "x16", b: "_kod_poll_stored@PAGE")
+        self.out_buf.push(.Mem(load: false, width: 8, reg: x16, base: x16, at: .Symbol(name: "_kod_poll_stored", got: false)))
+    }
+
+    // Whether a store to `target` changes what other tasks can read: a shared
+    // struct's field on its path, or a module-level variable at its root.
+    func reachable_target(self, anon target: int64) -> bool {
+        if self.var_signature(self.store_root(target)) is Some(_) {
+            return true
+        }
+        mut node = target
+        for true {
+            let .Binary(base, op, _r) = self.p.exprs[node] else { break }
+            if not (op is .Index or op is .Dot) {
+                break
+            }
+            if op is .Dot and self.infer_kind(base) is .KStruct(idx, _a) and idx >= 0 and idx < len(self.structs) and self.structs[idx].shared {
+                return true
+            }
+            node = base
+        }
+        return false
     }
 
     // The calls emit_poll's checks make when the flag is set, after the

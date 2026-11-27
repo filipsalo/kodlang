@@ -31,8 +31,9 @@ extern func kod_panic_uncaught(anon msg: str) -> none
 extern func kod_eprint(anon s: str) -> none
 extern func kod_sim_set_clock(anon ns: int64) -> none
 extern func kod_sim_set_epoch(anon ns: int64) -> none
-extern func kod_poll_set(anon flag: int64, anon budget: int64) -> none
+extern func kod_poll_set(anon flag: int64, anon budget: int64, anon store_budget: int64) -> none
 extern func kod_poll_simulate(anon on: int64) -> none
+extern func kod_poll_after_store() -> int64
 extern func kod_sim_set_random(anon on: int64, anon seed: int64) -> none
 extern func _inspect_caller_fp() -> int64
 extern func _inspect_read_i64(anon addr: int64) -> int64
@@ -70,6 +71,9 @@ type Fiber = shared struct {
     io_failed: bool = false
     // What the event that came said: for a write, how much there is room for.
     io_data: int64 = 0
+    // Under a simulation that schedules by priority, its priority: drawn when
+    // it is first ready, lowered below every other when it is preempted.
+    prio: int64 = 0
     // Where it was spawned (_spawn_trace).
     spawned_at: [int64] = []
     // The panic that ended it, and the group that takes it, when the function it
@@ -461,9 +465,27 @@ func _take_next() -> Fiber {
             }
             _poll(true)
         }
-        // A simulation picks one of the ready tasks by its seed.
-        if _sim is _Sim and len(_ready) - _head > 1 {
-            let k = _head + _sim_rand(len(_ready) - _head)
+        // A simulation looks for I/O that has come at every switch, as the
+        // kernel would have woken those tasks meanwhile, and picks one of the
+        // ready tasks by its seed, or the one with the highest priority.
+        if _sim is _Sim and _io.len() > 0 {
+            _poll(false)
+        }
+        if _sim is _Sim(sim) and len(_ready) - _head > 1 {
+            mut k = _head
+            if sim.by_priority {
+                for i in _head.._head + len(_ready) - _head {
+                    let f = _ready[i]
+                    if f.prio == 0 {
+                        f.prio = 1 + _sim_rand(1 << 40)
+                    }
+                    if f.prio > _ready[k].prio {
+                        k = i
+                    }
+                }
+            } else {
+                k = _head + _sim_rand(len(_ready) - _head)
+            }
             let t = _ready[_head]
             _ready[_head] = _ready[k]
             _ready[k] = t
@@ -580,27 +602,37 @@ func _preempt() -> none {
 // simulation, after as many checks as the seed says, counting on.
 func _poll_due() -> none {
     if _sim is _Sim(sim) {
-        kod_poll_set(1, _sim_budget(sim))
+        kod_poll_set(1, _sim_budget(sim), _sim_store_budget(sim))
         if _scheduling > 0 {
             return
         }
         // Looking for what I/O has come takes system calls, which a seed
         // that preempts every few checks would make most of the run: done
-        // one time in 16, so a task waiting for I/O wakes a little later.
-        if _io.len() > 0 and _sim_rand(16) == 0 {
+        // one time in 16, so a task waiting for I/O wakes a little later, but
+        // always right after a store, where another task is most likely to
+        // see what this one is in the middle of.
+        let after_store = kod_poll_after_store() != 0
+        if _io.len() > 0 and (after_store or _sim_rand(16) == 0) {
             _poll(false)
         }
         if _head == len(_ready) {
             return
         }
         let me = _running()
+        if sim.by_priority {
+            sim.lowest -= 1
+            me.prio = sim.lowest
+        }
         _make_ready(me)
         _switch_from(me)
         return
     }
-    kod_poll_set(0, 1)
+    kod_poll_set(0, 1, _NEVER)
     _preempt()
 }
+
+// A countdown that doesn't run out.
+let _NEVER: int64 = 1 << 62
 
 // How deep the running code is in the scheduler's own loops, which no
 // preemption may interrupt (_preempt).
@@ -1415,8 +1447,16 @@ type _Sim = shared struct {
     paths: [str] = []
     open: [int64] = []
     // How long tasks run before they are preempted: each time after 1 to
-    // 2^(b + 1) loop checks, b from 0 to `rate`.
+    // 2^(b + 1) loop checks, b from 0 to `rate`; and how many checks that
+    // come right after a store to what other tasks can reach, the same way
+    // with `store_rate`.
     rate: int64 = 0
+    store_rate: int64 = 0
+    // Ready tasks are picked by priority (PCT: probabilistic concurrency
+    // testing), a preempted task's dropping below the others, instead of
+    // at random; and the lowest priority given so far.
+    by_priority: bool = false
+    lowest: int64 = 0
 }
 
 mut _sim: _Sim? = none
@@ -1463,9 +1503,25 @@ func sim_begin(anon seed: int64, epoch_ns: int64) -> none {
     // The longest a task runs before it is preempted: 32 checks under some
     // seeds, some hundred thousand under others.
     sim.rate = 4 + _sim_rand(14)
+    // Right after such a store: under some seeds at the next check, under
+    // others after a hundred or so.
+    sim.store_rate = _sim_rand(7)
+    sim.by_priority = _sim_rand(2) == 0
+    // By priority a task runs long, preempted mostly right after its stores,
+    // which is what lets another fall behind, ready, as on a busy machine.
+    if sim.by_priority {
+        sim.rate = 14 + _sim_rand(5)
+    }
+    // The running task's priority is from an earlier run, if any.
+    _running().prio = 0
     kod_sim_set_random(1, seed)
     kod_poll_simulate(1)
-    kod_poll_set(1, _sim_budget(sim))
+    kod_poll_set(1, _sim_budget(sim), _sim_store_budget(sim))
+}
+
+// How many checks right after a store until the running task is preempted.
+func _sim_store_budget(anon sim: _Sim) -> int64 {
+    return 1 + _sim_rand(1 << _sim_rand(sim.store_rate + 1))
 }
 
 // How many loop checks until the running task is next preempted: as likely
@@ -1514,7 +1570,7 @@ func sim_end() -> int64 {
     _scheduling = 0
     kod_sim_set_random(0, 0)
     kod_poll_simulate(0)
-    kod_poll_set(0, 1)
+    kod_poll_set(0, 1, _NEVER)
     kod_sim_set_clock(-1)
     return digest
 }
@@ -1553,14 +1609,26 @@ func _add_event(anon ident: int64, anon filter: int64, anon data: int64, anon ke
 
 // Whether `fd` has something to read (or, `writes`, room to write) now, or
 // is at its end or broken, which the read or write then finds.
-func _sim_fd_ready(anon fd: int64, anon writes: int64) -> bool {
-    let p = unsafe.alloc(8)
-    unsafe.store32(p, fd)
-    unsafe.store32(p + 4, if writes == 1 { _POLLOUT } else { _POLLIN })
-    let n = unsafe.c_int(libc.poll(p, 1, 0))
-    let revents = (unsafe.load32(p + 4) >> 16) & 0xffff
+// Which of the descriptors `fds` (for writing where `writes` says 1, else
+// reading) can go on now: one poll(2) for them all.
+func _sim_fds_ready(anon fds: [int64], anon writes: [int64]) -> [bool] {
+    mut out = [false] * len(fds)
+    if len(fds) == 0 {
+        return out
+    }
+    let p = unsafe.alloc(8 * len(fds))
+    for k, fd in fds {
+        unsafe.store32(p + 8 * k, fd)
+        unsafe.store32(p + 8 * k + 4, if writes[k] == 1 { _POLLOUT } else { _POLLIN })
+    }
+    let n = unsafe.c_int(libc.poll(p, len(fds), 0))
+    if n > 0 {
+        for k in 0..len(fds) {
+            out[k] = ((unsafe.load32(p + 8 * k + 4) >> 16) & 0xffff) != 0
+        }
+    }
     unsafe.free(p)
-    return n > 0 and revents != 0
+    return out
 }
 
 // _poll under a simulation: the tasks whose descriptor can go on now wake,
@@ -1572,11 +1640,12 @@ func _sim_poll(anon sim: _Sim, block: bool) -> none {
     mut writes: [int64] = []
     mut keys: [int64] = []
     mut ready: [int64] = []
+    let can = _sim_fds_ready(sim.fds, sim.writes)
     for k, key in sim.fd_keys {
         if not _io.contains(key) {
             continue
         }
-        if _sim_fd_ready(sim.fds[k], sim.writes[k]) {
+        if can[k] {
             ready += [k]
         } else {
             fds += [sim.fds[k]]

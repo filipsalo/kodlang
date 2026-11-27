@@ -49,14 +49,23 @@ a longer hunt now and then.
 ## What is simulated
 
 - **Which task runs.** When several tasks are ready, the seed picks one; a task
-  that reads or writes a connection may give way to another first.
+  that reads or writes a connection may give way to another first. Under half
+  the seeds the pick goes by priority instead, as in PCT (probabilistic
+  concurrency testing): each task has one the seed draws, the highest ready
+  one runs, and a task that is preempted drops below all the others. So one
+  task can run on while another, ready, waits its turn, as on a busy
+  machine.
 - **Where a task is preempted.** As outside a simulation, a task that runs
   without waiting gives way at the top of a loop iteration or a function call
   ([Preemption](tasks.md#preemption)), but after a number of those that the
   seed draws each time, as likely a handful as thousands, rather than every
-  10 ms. So a race between two tasks that read and write the same data
-  without waiting in between shows up under some seed too, and that seed
-  preempts at the same places again.
+  10 ms. A check that comes right after a store to what other tasks can
+  reach (a field of a `shared struct`, a module-level variable) preempts
+  sooner: under some seeds the first such check, under others one of the
+  next hundred. So a race between two tasks that read and write the same
+  data without waiting in between shows up under some seed too, and that
+  seed preempts at the same places again. The store itself is never cut in
+  two, and nothing is preempted where it couldn't be outside a simulation.
 - **Time.** `time.monotonic_ns()`, `time.unix_ns()` and `time.now()` read a
   clock that stands still while tasks run, its calendar starting at `start`
   (a `time.Time`), or 2026-01-01 00:00:00 UTC. A test that checks a
@@ -84,12 +93,12 @@ ones; a body that waits for those, or for another program, isn't repeatable.
 Tasks must not outlive the body: those it spawned are waited for when it
 ends, as at any function's end.
 
-Preempting at checks the seed draws finds a race whose window spans a fair
-share of a task's checks. One that needs a task preempted at one of a few
-checks among hundreds of thousands, and another task then to run on for
-thousands, is found only by luck: with a bug fixed on 2026-11-27 put back
-(a TLS reader that sent a writer's records), 200 seeds of a connection
-writing and reading at once found nothing.
+With a bug fixed on 2026-11-27 put back (a TLS reader that sent records a
+writer had queued but not yet sent, while the writer had been preempted
+between the two), 67 of 200 seeds of a connection writing and reading at
+once deadlock. The window is a few checks among hundreds of thousands: none
+of 200 seeds found it without the preemption after stores, 11 without
+priorities.
 
 A seed gives the same run whether `run` comes to it after other seeds or
 `replay` runs it alone, as long as the body doesn't depend on what earlier
