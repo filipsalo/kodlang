@@ -23,6 +23,7 @@ Supported escape sequences:
 | `\\` | backslash |
 | `\"` | double quote |
 | `\'` | single quote |
+| `\{`, `\}` | a brace: in an f-string, one that doesn't start or end an interpolation, as in `f"\{\"n\": {n}\}"` |
 | `\xHH` | the byte `HH`, two hex digits (`00` to `FF`) |
 | `\u{H...}` | a Unicode character, 1 to 6 hex digits, written as UTF-8 |
 
@@ -33,9 +34,25 @@ Supported escape sequences:
 
 A malformed `\x` or `\u` is an error: a `\x` without two hex digits, a `\u` without
 braces, an empty or unterminated `\u{}`, more than six digits, or a value that isn't a
-scalar value. For any other escape the backslash and the character after it are both
-dropped, so `"\q"` is `""`. Non-ASCII UTF-8 can also be written directly in the source.
-Character literals (`'a'`) take the simple escapes only.
+scalar value. So is any other escape, such as `"\d"`: a backslash that stands for
+itself is written `\\`, or the string is written raw (below). Non-ASCII UTF-8 can also
+be written directly in the source. Character literals (`'a'`) take the simple escapes
+only.
+
+### Raw strings
+
+`r"..."` is a string whose text is taken as it is written: a backslash is a
+backslash, and nothing is an escape. It ends at the next `"`, so it can't hold one;
+`r"""..."""` can, and is dedented as a `"""` string is. Raw strings suit text full of
+backslashes, such as [regular expressions](regex.md) and Windows paths:
+
+```kod
+let digits = r"\d+(\.\d+)?"            // the same as "\\d+(\\.\\d+)?"
+let path = r"C:\Users\kod"
+let quoted = r"""
+    say "\n" for a newline
+    """                                  // say "\n" for a newline, and a newline
+```
 
 Byte literals (`b"..."`) and f-strings take the same escapes. In an f-string, the braces of
 `\u{...}` are part of the escape, not an interpolation: `f"\u{e9}{n}"` is `é` followed by

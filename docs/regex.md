@@ -13,7 +13,7 @@ it slow, and so no backreferences or lookaround, which need backtracking.
 import "regex"
 
 func main() -> int64 or Error {
-    let date = try regex.compile("(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})")
+    let date = try regex.compile(r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})")
     let Some(m) = date.find("due 2026-11-27, paid later") else { return 1 }
     print(m.text())                     // 2026-11-27
     print(m.named("month")? or "")      // 11
@@ -22,8 +22,9 @@ func main() -> int64 or Error {
 }
 ```
 
-A Kod string drops a backslash it doesn't know (`"\d"` is `""`), so a pattern
-writes each backslash twice: `"\\d+"` is the pattern `\d+`.
+Write a pattern as a raw string, `r"\d+"`, whose backslashes are its own (see
+[Raw strings](strings.md#raw-strings)); in an ordinary string each is doubled,
+`"\\d+"`, and `"\d+"` is an error, as `\d` isn't a string escape.
 
 ## Compiling
 
