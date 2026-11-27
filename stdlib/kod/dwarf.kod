@@ -11,6 +11,19 @@
 // Compiler source: what the bootstrap snapshot parses, so no comprehensions
 // or tuples here.
 
+import "strbuilder" { StrBuilder }
+
+// The text of each byte's value, made once: a .byte line is made of them.
+mut BYTE_TEXT: [str] = byte_texts()
+
+func byte_texts() -> [str] {
+    mut out: [str] = []
+    for b in 0..256 {
+        out += [f"{b}"]
+    }
+    return out
+}
+
 // One function: its first instruction's label and the label after its last;
 // its name, file and line; a label and a line for each statement; and the
 // variables a debugger can show.
@@ -26,12 +39,17 @@ type Function = struct {
 }
 
 // A parameter or local in a frame slot, `offset` bytes from the frame
-// pointer, and the name of its type (a Type of the unit).
+// pointer, and the name of its type (a Type of the unit). One the compiler
+// keeps in a register instead is in register `reg` (its DWARF number) from
+// the label `from` to the label `to`, and nowhere a debugger can see outside.
 type Variable = struct {
     name: str
     type_name: str
     offset: int64
     param: bool
+    reg: int64 = -1
+    from: str = ""
+    to: str = ""
 }
 
 // A type of a unit, by the name Kod gives it, and how it is laid out (a
@@ -89,20 +107,22 @@ type Section = shared struct {
 
     // The bytes so far as `.byte` lines of up to 32.
     func flush(self) -> none {
+        let texts = BYTE_TEXT
         mut at = 0
         for at < len(self.pending) {
             mut end = at + 32
             if end > len(self.pending) {
                 end = len(self.pending)
             }
-            mut line = "\t.byte "
+            let line = StrBuilder()
+            line.append("\t.byte ")
             for k in at..end {
                 if k > at {
-                    line += ", "
+                    line.append(", ")
                 }
-                line += f"{self.pending[k]}"
+                line.append(texts[self.pending[k] & 255])
             }
-            self.out += [line]
+            self.out += [line.to_str()]
             at = end
         }
         self.pending = []
@@ -217,6 +237,9 @@ let ATE_SIGNED_CHAR: int64 = 0x06
 let OP_REG29: int64 = 0x6d
 let OP_FBREG: int64 = 0x91
 let OP_DEREF: int64 = 0x06
+// Register N as a location, and register N's value plus an offset.
+let OP_REG0: int64 = 0x50
+let OP_BREG0: int64 = 0x70
 // DW_LANG_C: Kod has no number of its own, and a debugger treats C kindly.
 let LANG_C: int64 = 0x0002
 let LNS_COPY: int64 = 1
@@ -239,11 +262,17 @@ func sections(anon functions: [Function], types: [Type], path: str, comp_dir: st
     out += ["\t.section __DWARF,__debug_abbrev,regular,debug"]
     out += abbrevs()
     out += ["\t.section __DWARF,__debug_info,regular,debug"]
-    out += info(functions, types: types, files: files, path: path, comp_dir: comp_dir)
+    let loc = Section()
+    out += info(functions, types: types, files: files, path: path, comp_dir: comp_dir, :loc)
     out += ["\t.section __DWARF,__debug_line,regular,debug"]
     out += line_table(functions, files: files)
     out += ["\t.section __DWARF,__debug_ranges,regular,debug"]
     out += ranges(functions)
+    if loc.size > 0 {
+        loc.flush()
+        out += ["\t.section __DWARF,__debug_loc,regular,debug"]
+        out += loc.out
+    }
     return out
 }
 
@@ -277,6 +306,9 @@ let ABBREV_POINTER: int64 = 6
 let ABBREV_STRUCT: int64 = 7
 let ABBREV_MEMBER: int64 = 8
 let ABBREV_TYPEDEF: int64 = 9
+// A parameter and a local whose location is a list in __debug_loc.
+let ABBREV_PARAMETER_LIST: int64 = 10
+let ABBREV_VARIABLE_LIST: int64 = 11
 
 func abbrevs() -> [str] {
     let s = Section()
@@ -293,6 +325,8 @@ func abbrevs() -> [str] {
     s.bytes([ABBREV_STRUCT, TAG_STRUCTURE_TYPE, 1, AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_DATA1, 0, 0])
     s.bytes([ABBREV_MEMBER, TAG_MEMBER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_DATA_MEMBER_LOCATION, FORM_DATA1, 0, 0])
     s.bytes([ABBREV_TYPEDEF, TAG_TYPEDEF, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, 0, 0])
+    s.bytes([ABBREV_PARAMETER_LIST, TAG_FORMAL_PARAMETER, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
+    s.bytes([ABBREV_VARIABLE_LIST, TAG_VARIABLE, 0, AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_SEC_OFFSET, 0, 0])
     s.byte(0)
     s.flush()
     return s.out
@@ -302,24 +336,30 @@ func abbrevs() -> [str] {
 // are where they are from the unit's start, which a reference gives.
 type Types = shared struct {
     s: Section
-    keys: [str] = []
-    offsets: [int64] = []
+    offsets: Map[str, int64] = Map[str, int64]()
+    // The unit's types by name: their place in `all` of `of`.
+    index: Map[str, int64] = Map[str, int64]()
 
     func find(self, anon key: str) -> int64 {
-        for k, have in self.keys {
-            if have == key {
-                return self.offsets[k]
-            }
-        }
-        return -1
+        return self.offsets.get(key)? or -1
     }
 
     // Where the next entry starts: the unit's 4-byte length comes before `s`.
     func here(self, anon key: str) -> int64 {
         let at = 4 + self.s.size
-        self.keys += [key]
-        self.offsets += [at]
+        self.offsets[key] = at
         return at
+    }
+
+    // The type named `name` of `all`, or an unknown one, shown as an address.
+    func lookup(self, anon name: str, all: [Type]) -> Type {
+        if len(self.index) == 0 {
+            for k, t in all {
+                self.index[t.name] = k
+            }
+        }
+        let Some(k) = self.index.get(name) else { return Type(:name, shape: SHAPE_OTHER) }
+        return all[k]
     }
 
     func base(self, anon name: str, encoding: int64, size: int64) -> int64 {
@@ -390,12 +430,7 @@ type Types = shared struct {
     // struct it points to. What it refers to is made first; a struct that
     // (through its fields) holds itself refers to an address there.
     func of(self, anon name: str, all: [Type], depth: int64 = 0) -> int64 {
-        mut t = Type(name: name, shape: SHAPE_OTHER)
-        for have in all {
-            if have.name == name {
-                t = have
-            }
-        }
+        let t = self.lookup(name, all: all)
         if t.shape == SHAPE_INT {
             return self.integer()
         }
@@ -431,16 +466,14 @@ type Types = shared struct {
     // field or an element: a pointer to the struct for one that points.
     func member(self, anon name: str, all: [Type], depth: int64) -> int64 {
         let entry = self.of(name, all: all, depth: depth)
-        for t in all {
-            if t.name == name and points(t) and depth <= 4 {
-                return self.pointer(entry)
-            }
+        if points(self.lookup(name, all: all)) and depth <= 4 {
+            return self.pointer(entry)
         }
         return entry
     }
 }
 
-func info(anon functions: [Function], types: [Type], files: [str], path: str, comp_dir: str) -> [str] {
+func info(anon functions: [Function], types: [Type], files: [str], path: str, comp_dir: str, loc: Section) -> [str] {
     let s = Section()
     // Version 4, abbreviations at offset 0, 8-byte addresses.
     s.bytes(u16(4))
@@ -474,19 +507,38 @@ func info(anon functions: [Function], types: [Type], files: [str], path: str, co
         s.address(f.end)
         s.bytes([1, OP_REG29])
         for k, v in f.vars {
+            let pointing = points(made.lookup(v.type_name, all: types))
             mut abbrev = ABBREV_VARIABLE
-            if v.param {
+            if v.reg >= 0 {
+                abbrev = ABBREV_VARIABLE_LIST
+                if v.param {
+                    abbrev = ABBREV_PARAMETER_LIST
+                }
+            } else if v.param {
                 abbrev = ABBREV_PARAMETER
             }
             s.byte(abbrev)
             s.bytes(cstr(v.name))
             s.bytes(u32(refs[i][k]))
+            if v.reg >= 0 {
+                // In the register: the value itself, or for a value that
+                // points, the address it holds.
+                mut where = [OP_REG0 + v.reg]
+                if pointing {
+                    where = [OP_BREG0 + v.reg, 0]
+                }
+                s.bytes(u32(loc.size))
+                loc.address(v.from)
+                loc.address(v.to)
+                loc.bytes(u16(len(where)))
+                loc.bytes(where)
+                loc.bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                continue
+            }
             // The slot; for a value that points, what the slot points to.
             mut where = [OP_FBREG] + sleb(v.offset)
-            for t in types {
-                if t.name == v.type_name and points(t) {
-                    where += [OP_DEREF]
-                }
+            if pointing {
+                where += [OP_DEREF]
             }
             s.bytes(uleb(len(where)))
             s.bytes(where)

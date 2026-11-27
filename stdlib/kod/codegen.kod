@@ -1729,6 +1729,17 @@ type Codegen = shared struct {
     dwarf_vars: [dwarf.Variable] = []
     // The types those variables have, and their fields' (debug_type).
     dwarf_types: [dwarf.Type] = []
+    // Their names, and each one's place in dwarf_types.
+    dwarf_type_at: Map[str, int64] = Map[str, int64]()
+    // The frame slots promote_locals moved into registers, and their vregs.
+    promoted_offs: [int64] = []
+    promoted_vregs: [regalloc.Reg] = []
+    // Where each promoted local is in its register, between two labels, by
+    // its slot: the register's DWARF number (debug_vars).
+    reg_var_offs: [int64] = []
+    reg_var_regs: [int64] = []
+    reg_var_from: [str] = []
+    reg_var_to: [str] = []
 
     loop_stack: [LoopLbl] = []
     // The label of the loop statement about to be compiled, taken as it starts.
@@ -23155,6 +23166,8 @@ type Codegen = shared struct {
             let out = rewritten
             let first_promoted = saved_len - vreg_start
             if regalloc.run(body_buf: out, pool: self.pool, :vreg_start, strict: true, droppable: first_promoted) {
+                self.promoted_offs = chosen
+                self.promoted_vregs = vregs
                 return out
             }
             self.pool.vreg_phys = self.pool.vreg_phys[0..saved_len]
@@ -24725,6 +24738,12 @@ type Codegen = shared struct {
             excluded += [off]
         }
         mut promoted: regalloc.InsnBuf? = none
+        self.promoted_offs = []
+        self.promoted_vregs = []
+        self.reg_var_offs = []
+        self.reg_var_regs = []
+        self.reg_var_from = []
+        self.reg_var_to = []
         // Loads made once live longer too: used only when promoting succeeds.
         mut before_reuse = checked
         if self.loads_hoisted {
@@ -24753,6 +24772,9 @@ type Codegen = shared struct {
         }
         mut body_buf = allocated
         self.pool.cs_high_water = regalloc.pack(pool: self.pool, :vreg_start)
+        if promoted is Some(_) {
+            body_buf = self.mark_reg_vars(body_buf, :vreg_start)
+        }
 
         // Round the callee-saved count up to an even number of registers
         // (stp/ldp move pairs); the pad is the next register in the save
@@ -25138,6 +25160,69 @@ type Codegen = shared struct {
         self.flush_out()
     }
 
+    // `body`, allocated with promoted locals, with a label before each such
+    // local's first line in its register and one after its last, which the
+    // register holds it between; noted for debug_vars. Labels only: the code
+    // is the same.
+    func mark_reg_vars(self, anon body: regalloc.InsnBuf, vreg_start: int64) -> regalloc.InsnBuf {
+        let Some(lv) = self.pool.liveness else { return body }
+        if self.dry_run or len(self.promoted_offs) == 0 {
+            return body
+        }
+        // The labels to put in, each before the line at its position (the
+        // body's length: after the last).
+        mut at: [int64] = []
+        mut names: [str] = []
+        for k, off in self.promoted_offs {
+            let id = regalloc.reg_vreg(self.promoted_vregs[k]) - vreg_start
+            if id < 0 or id >= len(lv.def_line) {
+                continue
+            }
+            let from_line = lv.def_line[id]
+            let to_line = lv.last_use[id]
+            let number = dwarf_reg(self.pool.vreg_phys[vreg_start + id])
+            if from_line < 0 or to_line < from_line or to_line >= body.n or number < 0 {
+                continue
+            }
+            let from = self.fresh("Lvar_from")
+            let to = self.fresh("Lvar_to")
+            at += [from_line, to_line + 1]
+            names += [from, to]
+            self.reg_var_offs += [off]
+            self.reg_var_regs += [number]
+            self.reg_var_from += [from]
+            self.reg_var_to += [to]
+        }
+        if len(at) == 0 {
+            return body
+        }
+        // By position: few, so an insertion sort.
+        for a in 1..len(at) {
+            mut b = a
+            for b > 0 and at[b - 1] > at[b] {
+                let t = at[b]
+                at[b] = at[b - 1]
+                at[b - 1] = t
+                let tn = names[b]
+                names[b] = names[b - 1]
+                names[b - 1] = tn
+                b -= 1
+            }
+        }
+        let out = regalloc.InsnBuf()
+        mut next = 0
+        for i in 0..body.n + 1 {
+            for next < len(at) and at[next] == i {
+                out.push_label(names[next])
+                next += 1
+            }
+            if i < body.n {
+                out.push_from(body, :i)
+            }
+        }
+        return out
+    }
+
     // The parameters and locals of the function just compiled that a debugger
     // can find: those whose frame slot `body` (allocated) still reads or
     // writes. Those moved into registers aren't described yet, nor the
@@ -25149,7 +25234,16 @@ type Codegen = shared struct {
         let in_memory = memory_slots(body)
         mut out: [dwarf.Variable] = []
         for i, v in self.vars {
-            if v.inlined or v.offset >= 0 or v.name.starts_with("__") or v.name.starts_with("$") or not arrays.contains(in_memory, v.offset) {
+            if v.inlined or v.offset >= 0 or v.name.starts_with("__") or v.name.starts_with("$") {
+                continue
+            }
+            mut held = -1
+            for k, off in self.reg_var_offs {
+                if off == v.offset {
+                    held = k
+                }
+            }
+            if held < 0 and not arrays.contains(in_memory, v.offset) {
                 continue
             }
             mut param = false
@@ -25159,7 +25253,13 @@ type Codegen = shared struct {
                 }
             }
             let kind = self.slot_kind(i)
-            out += [dwarf.Variable(name: v.name, type_name: self.debug_type(kind), offset: v.offset, :param)]
+            mut variable = dwarf.Variable(name: v.name, type_name: self.debug_type(kind), offset: v.offset, :param)
+            if held >= 0 {
+                variable.reg = self.reg_var_regs[held]
+                variable.from = self.reg_var_from[held]
+                variable.to = self.reg_var_to[held]
+            }
+            out += [variable]
         }
         return out
     }
@@ -25168,11 +25268,11 @@ type Codegen = shared struct {
     // (and its fields' and elements' types with it).
     func debug_type(self, anon kind: TypeKind) -> str {
         let name = self.kind_display(kind)
-        for t in self.dwarf_types {
-            if t.name == name {
-                return name
-            }
+        if self.dwarf_type_at.get(name) is Some(_) {
+            return name
         }
+        // Noted before its fields are, so a struct that holds itself ends.
+        self.dwarf_type_at[name] = len(self.dwarf_types)
         match kind {
             .KInt64 -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_INT)]
             .KBool -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_BOOL)]
@@ -25184,7 +25284,7 @@ type Codegen = shared struct {
             .KArrayStr -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_ARRAY, elem: self.debug_type(.KStr))]
             .KStruct(idx, _args) -> {
                 let info = self.structs[idx]
-                // Listed before its fields, so a struct that holds itself ends.
+                let at = len(self.dwarf_types)
                 self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
                 mut names: [str] = []
                 mut offsets: [int64] = []
@@ -25194,12 +25294,7 @@ type Codegen = shared struct {
                     offsets += [f.offset]
                     types += [self.debug_type(f.kind)]
                 }
-                let described = dwarf.Type(:name, shape: dwarf.SHAPE_STRUCT, field_names: names, field_offsets: offsets, field_types: types, size: info.data_width)
-                for k, t in self.dwarf_types {
-                    if t.name == name {
-                        self.dwarf_types[k] = described
-                    }
-                }
+                self.dwarf_types[at] = dwarf.Type(:name, shape: dwarf.SHAPE_STRUCT, field_names: names, field_offsets: offsets, field_types: types, size: info.data_width)
             }
             else -> self.dwarf_types += [dwarf.Type(:name, shape: dwarf.SHAPE_OTHER)]
         }
@@ -25217,6 +25312,7 @@ type Codegen = shared struct {
         }
         self.dwarf_functions = []
         self.dwarf_types = []
+        self.dwarf_type_at = Map[str, int64]()
     }
 
     // Emit one row per registered (struct, interface) pair. Methods are
@@ -25608,4 +25704,17 @@ func memory_slots(anon body: regalloc.InsnBuf) -> [int64] {
         }
     }
     return out
+}
+
+// The DWARF number of a physical register (x0 to x30 are 0 to 30), or -1.
+func dwarf_reg(anon reg: regalloc.Reg) -> int64 {
+    let text = regalloc.reg_text(reg)
+    if len(text) < 2 or text[0] != 'x' {
+        return -1
+    }
+    let Some(n) = text[1..].parse_int() else { return -1 }
+    if n < 0 or n > 30 {
+        return -1
+    }
+    return n
 }

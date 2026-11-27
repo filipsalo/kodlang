@@ -32,8 +32,9 @@ Each object the compiler writes carries DWARF, the format debuggers read:
   file and line;
 - for each function, its name, file and line, and where its instructions
   start and end;
-- its parameters and locals that live in the function's frame, with their
-  types.
+- its parameters and locals, with their types, and where each is: its slot
+  in the function's frame, or the register that holds it, and from where to
+  where.
 
 So `b file.kod:N`, `bt`, `next`, `step` and `finish` work, and `frame
 variable` shows values (below). A panic that would end the program stops it
@@ -84,9 +85,12 @@ room, and a struct as its fields; a field or element that is one of those
 holds a pointer to it, which `*` follows. Other types (enums, optionals,
 maps, functions, ...) show as an address, under their Kod name.
 
-What isn't shown yet: a local the compiler keeps in a register rather than in
-the frame, which is most small ones (`register read` finds those), and the
-locals of a function inlined into the one stopped in. A value whose last use
+A local the compiler keeps in a register rather than in the frame, which is
+most small ones, is shown while the register holds it: from where it is set
+to its last use. Elsewhere, before it is set or once nothing reads it any
+more, it is `<variable not available>`, as is one whose value the compiler
+moved on into another register; never a value that isn't its own. The locals
+of a function inlined into the one stopped in aren't shown. A value whose last use
 is past may already be released: a `str`, array or struct then reads as 0, or
 as memory lldb can't read. A line inside a function that was inlined into its
 caller has no instructions of its own; a breakpoint there lands on the call.
