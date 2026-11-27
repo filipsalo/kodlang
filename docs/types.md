@@ -168,7 +168,8 @@ the program uses the variable (reads it or assigns it), so a variable nothing us
 nothing, and the order in which modules are declared or imported doesn't matter. A value
 that needs its own variable to be worked out first, directly or through a function it
 calls, stops the program with ``panic: `calls` is used while its value is being worked
-out``.
+out``. Once it is worked out, a read is a few instructions and no call: a look at
+whether it is, and a load.
 
 Another module reads a variable the way it reads a constant (`import "stats" { calls }`
 or `stats.calls`), but only the declaring module assigns it: `` `calls` can only be

@@ -177,6 +177,81 @@ void kod_poll_slow(void) {
     kod_poll_hook();
 }
 
+// Around a call from a stub that must keep every register (kod_poll_stub,
+// kod_var_first): x0-x17 but x16, the flags, all of q0-q31 and the FP status,
+// below the caller's red zone, with a frame record (the caller's fp, and where
+// it goes on) whose return address is the caller's, so that a backtrace from
+// inside reads as the caller's. x17 is at sp + 128 in between.
+#define KOD_SAVE_ALL \
+    "sub sp, sp, #144\n" \
+    "str x30, [sp]\n" \
+    "sub sp, sp, #688\n" \
+    "stp x0, x1, [sp, #0]\n" \
+    "stp x2, x3, [sp, #16]\n" \
+    "stp x4, x5, [sp, #32]\n" \
+    "stp x6, x7, [sp, #48]\n" \
+    "stp x8, x9, [sp, #64]\n" \
+    "stp x10, x11, [sp, #80]\n" \
+    "stp x12, x13, [sp, #96]\n" \
+    "stp x14, x15, [sp, #112]\n" \
+    "str x17, [sp, #128]\n" \
+    "mrs x9, nzcv\n" \
+    "mrs x10, fpsr\n" \
+    "stp x9, x10, [sp, #136]\n" \
+    "str x30, [sp, #152]\n" \
+    "stp q0, q1, [sp, #160]\n" \
+    "stp q2, q3, [sp, #192]\n" \
+    "stp q4, q5, [sp, #224]\n" \
+    "stp q6, q7, [sp, #256]\n" \
+    "stp q8, q9, [sp, #288]\n" \
+    "stp q10, q11, [sp, #320]\n" \
+    "stp q12, q13, [sp, #352]\n" \
+    "stp q14, q15, [sp, #384]\n" \
+    "stp q16, q17, [sp, #416]\n" \
+    "stp q18, q19, [sp, #448]\n" \
+    "stp q20, q21, [sp, #480]\n" \
+    "stp q22, q23, [sp, #512]\n" \
+    "stp q24, q25, [sp, #544]\n" \
+    "stp q26, q27, [sp, #576]\n" \
+    "stp q28, q29, [sp, #608]\n" \
+    "stp q30, q31, [sp, #640]\n" \
+    "ldr x9, [sp, #688]\n" \
+    "add x10, sp, #672\n" \
+    "stp x29, x9, [x10]\n" \
+    "mov x29, x10\n"
+#define KOD_RESTORE_ALL \
+    "ldr x29, [sp, #672]\n" \
+    "ldp q30, q31, [sp, #640]\n" \
+    "ldp q28, q29, [sp, #608]\n" \
+    "ldp q26, q27, [sp, #576]\n" \
+    "ldp q24, q25, [sp, #544]\n" \
+    "ldp q22, q23, [sp, #512]\n" \
+    "ldp q20, q21, [sp, #480]\n" \
+    "ldp q18, q19, [sp, #448]\n" \
+    "ldp q16, q17, [sp, #416]\n" \
+    "ldp q14, q15, [sp, #384]\n" \
+    "ldp q12, q13, [sp, #352]\n" \
+    "ldp q10, q11, [sp, #320]\n" \
+    "ldp q8, q9, [sp, #288]\n" \
+    "ldp q6, q7, [sp, #256]\n" \
+    "ldp q4, q5, [sp, #224]\n" \
+    "ldp q2, q3, [sp, #192]\n" \
+    "ldp q0, q1, [sp, #160]\n" \
+    "ldr x30, [sp, #152]\n" \
+    "ldp x9, x10, [sp, #136]\n" \
+    "msr nzcv, x9\n" \
+    "msr fpsr, x10\n" \
+    "ldr x17, [sp, #128]\n" \
+    "ldp x14, x15, [sp, #112]\n" \
+    "ldp x12, x13, [sp, #96]\n" \
+    "ldp x10, x11, [sp, #80]\n" \
+    "ldp x8, x9, [sp, #64]\n" \
+    "ldp x6, x7, [sp, #48]\n" \
+    "ldp x4, x5, [sp, #32]\n" \
+    "ldp x2, x3, [sp, #16]\n" \
+    "ldp x0, x1, [sp, #0]\n" \
+    "add sp, sp, #832\n"
+
 // Called by a loop's check while kod_poll_flag is set. It changes x16, x17
 // and lr only (regalloc.kod, keeps_regs): the countdown in those, and when it
 // is out, a frame that keeps everything else around kod_poll_slow: x0-x17,
@@ -217,75 +292,9 @@ __attribute__((naked)) void kod_poll_stub(void) {
         "tbnz x17, #63, 1f\n"
         "ret\n"
         "1:\n"
-        "sub sp, sp, #144\n"
-        "str x30, [sp]\n"
-        "sub sp, sp, #688\n"
-        "stp x0, x1, [sp, #0]\n"
-        "stp x2, x3, [sp, #16]\n"
-        "stp x4, x5, [sp, #32]\n"
-        "stp x6, x7, [sp, #48]\n"
-        "stp x8, x9, [sp, #64]\n"
-        "stp x10, x11, [sp, #80]\n"
-        "stp x12, x13, [sp, #96]\n"
-        "stp x14, x15, [sp, #112]\n"
-        "str x17, [sp, #128]\n"
-        "mrs x9, nzcv\n"
-        "mrs x10, fpsr\n"
-        "stp x9, x10, [sp, #136]\n"
-        "str x30, [sp, #152]\n"
-        "stp q0, q1, [sp, #160]\n"
-        "stp q2, q3, [sp, #192]\n"
-        "stp q4, q5, [sp, #224]\n"
-        "stp q6, q7, [sp, #256]\n"
-        "stp q8, q9, [sp, #288]\n"
-        "stp q10, q11, [sp, #320]\n"
-        "stp q12, q13, [sp, #352]\n"
-        "stp q14, q15, [sp, #384]\n"
-        "stp q16, q17, [sp, #416]\n"
-        "stp q18, q19, [sp, #448]\n"
-        "stp q20, q21, [sp, #480]\n"
-        "stp q22, q23, [sp, #512]\n"
-        "stp q24, q25, [sp, #544]\n"
-        "stp q26, q27, [sp, #576]\n"
-        "stp q28, q29, [sp, #608]\n"
-        "stp q30, q31, [sp, #640]\n"
-        // The frame record: the caller's fp, and where it goes on.
-        "ldr x9, [sp, #688]\n"
-        "add x10, sp, #672\n"
-        "stp x29, x9, [x10]\n"
-        "mov x29, x10\n"
+        KOD_SAVE_ALL
         "bl _kod_poll_slow\n"
-        "ldr x29, [sp, #672]\n"
-        "ldp q30, q31, [sp, #640]\n"
-        "ldp q28, q29, [sp, #608]\n"
-        "ldp q26, q27, [sp, #576]\n"
-        "ldp q24, q25, [sp, #544]\n"
-        "ldp q22, q23, [sp, #512]\n"
-        "ldp q20, q21, [sp, #480]\n"
-        "ldp q18, q19, [sp, #448]\n"
-        "ldp q16, q17, [sp, #416]\n"
-        "ldp q14, q15, [sp, #384]\n"
-        "ldp q12, q13, [sp, #352]\n"
-        "ldp q10, q11, [sp, #320]\n"
-        "ldp q8, q9, [sp, #288]\n"
-        "ldp q6, q7, [sp, #256]\n"
-        "ldp q4, q5, [sp, #224]\n"
-        "ldp q2, q3, [sp, #192]\n"
-        "ldp q0, q1, [sp, #160]\n"
-        "ldr x30, [sp, #152]\n"
-        "ldp x9, x10, [sp, #136]\n"
-        "msr nzcv, x9\n"
-        "msr fpsr, x10\n"
-        "ldr x17, [sp, #128]\n"
-        "ldp x14, x15, [sp, #112]\n"
-        "ldp x12, x13, [sp, #96]\n"
-        "ldp x10, x11, [sp, #80]\n"
-        "ldp x8, x9, [sp, #64]\n"
-        "ldp x6, x7, [sp, #48]\n"
-        "ldp x4, x5, [sp, #32]\n"
-        "ldp x2, x3, [sp, #16]\n"
-        "ldp x0, x1, [sp, #0]\n"
-        "add sp, sp, #832\n"
+        KOD_RESTORE_ALL
         "ret\n");
 }
 
@@ -318,6 +327,25 @@ __attribute__((naked)) void kod_poll_hold(void) {
         "mov x17, #0x4000000000000000\n"
         "str x17, [x16, _kod_poll_store_budget@PAGEOFF]\n"
         "1:\n"
+        "ret\n");
+}
+
+// A module variable's first read (codegen.kod, emit_var_read): its getter,
+// in x16, runs the initializer; with x17 set, the reference it gives back goes,
+// the variable's cell keeping one. Every register is kept, so the read can be
+// in the middle of an expression; the read then looks at the cell again.
+void kod_var_first_slow(int64_t (*getter)(void), int64_t counted) {
+    int64_t v = getter();
+    if (counted) rc_release_c((void *)v);
+}
+
+__attribute__((naked)) void kod_var_first(void) {
+    __asm__(
+        KOD_SAVE_ALL
+        "mov x0, x16\n"
+        "ldr x1, [sp, #128]\n"
+        "bl _kod_var_first_slow\n"
+        KOD_RESTORE_ALL
         "ret\n");
 }
 

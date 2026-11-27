@@ -895,8 +895,34 @@ func inline_polls(anon body: regalloc.InsnBuf) -> regalloc.InsnBuf {
                 out.push_data("\tbl _kod_poll_stub")
                 continue
             }
+            // A module variable's first read stays cold: an unconditional
+            // branch reaches it.
+            if text.starts_with("\tcbnz x17, Lvar") and text.ends_with("_first") {
+                let first = text[len("\tcbnz x17, ")..]
+                let ok = f"{first[..len(first) - len("_first")]}_ok"
+                out.push_data(f"\tcbz x17, {ok}")
+                out.push_data(f"\tb {first}")
+                out.push_data(f"{ok}:")
+                continue
+            }
         }
         out.copy_from(body, :i)
+    }
+    return out
+}
+
+// Of the cold blocks after a function, those of module variables' first
+// reads (emit_var_read): a long body's checks inline_polls makes inline.
+func var_cold_only(anon cold: [str]) -> [str] {
+    mut out: [str] = []
+    mut keep = false
+    for line in cold {
+        if not line.starts_with("\t") {
+            keep = line.starts_with("Lvar")
+        }
+        if keep {
+            out += [line]
+        }
     }
     return out
 }
@@ -3510,12 +3536,45 @@ type Codegen = shared struct {
                 return self.read_shared_const(self.const_label(expr_id))
             }
         }
+        if self.sig_is_var(sig) {
+            let lbl = self.const_label(expr_id)
+            if len(lbl) > 0 {
+                return self.emit_var_read(lbl, kind: sig.return_kind)
+            }
+        }
         let no_args: [ast.CallArg] = []
         self.reading_const = true
         let val = self.compile_call(no_args, callee_id: expr_id)
         self.reading_const = false
         // The value is the caller's, like any call's.
         return self.rc_temp_val(val, kind: sig.return_kind)
+    }
+
+    // A module variable's value, read from its cell (compile_var) with no
+    // call: the cell's state is looked at as text the passes don't see, which
+    // branches, when it isn't 1 (worked out), to cold code after the function
+    // that calls the getter by way of kod_var_first (stdlib/runtime.c),
+    // keeping every register but x16 and x17, and looks again. Then the value
+    // is loaded, as a new reference, as the getter would give it.
+    func emit_var_read(self, anon lbl: str, kind: TypeKind) -> Val {
+        let cell = f"{lbl}$cell"
+        let at = self.fresh("Lvar")
+        self.out_buf.push_data(f"{at}:")
+        self.out_buf.push_data(f"\tadrp x16, {cell}@PAGE")
+        self.out_buf.push_data(f"\tadd x16, x16, {cell}@PAGEOFF")
+        self.out_buf.push_data("\tldr x17, [x16]")
+        self.out_buf.push_data("\tsub x17, x17, #1")
+        self.out_buf.push_data(f"\tcbnz x17, {at}_first")
+        if not self.dry_run {
+            let counted = if self.rc_heap_kind(kind) { 1 } else { 0 }
+            self.poll_cold += [f"{at}_first:", f"\tadrp x16, {lbl}@PAGE", f"\tadd x16, x16, {lbl}@PAGEOFF", f"\tmov x17, #{counted}", "\tbl _kod_var_first", f"\tb {at}"]
+        }
+        let reg = self.pool.alloc_reg()
+        self.emit_op(.AddressPage, a: reg, b: f"{cell}@PAGE")
+        self.emit_op(.Add, a: reg, b: reg, c: f"{cell}@PAGEOFF")
+        self.emit_load(reg, base: reg, off: 8)
+        self.rc_retain_kind(reg, :kind)
+        return self.rc_temp_val(.VReg(name: reg), :kind)
     }
 
     // The value of the C variable `symbol` (an `extern let`), through the GOT,
@@ -24932,7 +24991,7 @@ type Codegen = shared struct {
         if arm64.line_count(body_buf) > LONG_BODY_INSNS {
             body_buf = self.long_branches(body_buf)
             body_buf = inline_polls(body_buf)
-            self.poll_cold = []
+            self.poll_cold = var_cold_only(self.poll_cold)
         }
         // Nothing reads the body again: at depth 0 it goes out as it is.
         if self.func_depth == 0 {
