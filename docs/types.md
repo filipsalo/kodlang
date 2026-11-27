@@ -278,12 +278,16 @@ number, and so do the counting methods here. Each method is a few instructions a
 | `n.abs()` | `n` without its sign; panics for the smallest `int64`, whose positive twin doesn't fit |
 | `n.wrapping_add(m)` `n.wrapping_sub(m)` `n.wrapping_mul(m)` | `n + m`, `n - m` and `n * m` wrapped around to 64 bits, where the operators panic |
 | `n.mul_high(m)` | the top 64 bits of the 128-bit product of `n` and `m` as unsigned numbers; `n.wrapping_mul(m)` is the bottom 64 |
+| `n.carry_add(m)` | `1` when `n + m` doesn't fit in 64 bits as unsigned numbers, so `n.wrapping_add(m)` lost a carry, else `0`; with no branch |
+| `n.borrow_sub(m)` | `1` when `n` is below `m` as unsigned numbers, so `n.wrapping_sub(m)` borrowed, else `0`; with no branch |
 
 ```kod
 print(1.leading_zeros())                // 63
 print(40.trailing_zeros())              // 3
 print(0xff.count_ones())                // 8
 print((1 << 62).mul_high(8))            // 2
+print((-1).carry_add(1))                // 1: 2^64 - 1 plus 1
+print(1.borrow_sub(-1))                 // 1: 1 is below 2^64 - 1
 ```
 
 ## Boolean literals
