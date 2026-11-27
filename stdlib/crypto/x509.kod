@@ -8,6 +8,7 @@ import "crypto/rsa"
 import "crypto/sha2" { Algo }
 import "encoding/base64"
 import "io"
+import "posix" { open_read }
 import "stream" { IoError }
 
 // A certificate's public key.
@@ -430,13 +431,90 @@ func load_roots(anon path: str) -> [Certificate] or Error {
     return roots
 }
 
+// The record type of a keychain's certificates, CSSM_DL_DB_RECORD_X509_CERTIFICATE.
+let KEYCHAIN_CERTIFICATES: int64 = 0x80001000
+
+// The certificates in a macOS keychain file, DER, in the order it holds them.
+//
+// The file is a header ("kych", a version, its size, where the schema is),
+// then the schema: its size, how many tables, and where each is from it. A
+// table is its size, its record type, how many records, where they are, where
+// its indexes are, its free list, and how many record slots, each where the
+// record is from the table or (odd, or 0) free. A record is its size,
+// number, two versions, the size of its data and a word more, then where each
+// of its attributes is, then the data: for a certificate, its DER.
+func keychain_certificates(anon data: bytes) -> [bytes] or Error {
+    func word(anon at: int64) -> int64? {
+        if at < 0 or at + 4 > len(data) {
+            return none
+        }
+        return data[at] << 24 | data[at + 1] << 16 | data[at + 2] << 8 | data[at + 3]
+    }
+    if len(data) < 16 or data[..4] != b"kych" {
+        throw bad("not a keychain")
+    }
+    let schema = word(12)? or -1
+    let Some(tables) = word(schema + 4) else { throw bad("a keychain without its schema") }
+    mut out: [bytes] = []
+    for t in 0..min(tables, 4096) {
+        let Some(at) = word(schema + 8 + 4 * t) else { throw bad("a keychain cut short") }
+        let table = schema + at
+        if word(table + 4) != KEYCHAIN_CERTIFICATES {
+            continue
+        }
+        let slots = word(table + 24)? or 0
+        for r in 0..min(slots, len(data) / 4) {
+            let Some(offset) = word(table + 28 + 4 * r) else { break }
+            if offset == 0 or offset & 1 == 1 {
+                continue
+            }
+            let record = table + offset
+            let Some(size) = word(record + 16) else { continue }
+            // The attributes before the data are as many as the table has;
+            // the data is the one DER element of its size after them.
+            for k in 0..32 {
+                let from = record + 24 + 4 * k
+                if size < 4 or from + size > len(data) {
+                    break
+                }
+                if data[from] == 0x30 and data[from + 1] == 0x82 and (data[from + 2] << 8 | data[from + 3]) + 4 == size {
+                    out += [data[from..from + size]]
+                    break
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The certificates of the keychain at `path` that this module can read.
+func load_keychain(anon path: str) -> [Certificate] or Error {
+    let file = try open_read(path)
+    let data = file.read_all()
+    try file.close()
+    mut roots: [Certificate] = []
+    for d in try keychain_certificates(try data) {
+        if parse(d) is Certificate(c) {
+            roots += [c]
+        }
+    }
+    return roots
+}
+
 mut SYSTEM_ROOTS: [Certificate]? = none
 
-// The operating system's trusted roots, read once.
+// The operating system's trusted roots, read once: macOS's root keychain, or
+// a PEM bundle.
 func system_roots() -> [Certificate] or Error {
     if SYSTEM_ROOTS is none {
         mut found: [Certificate] = []
+        if load_keychain("/System/Library/Keychains/SystemRootCertificates.keychain") is Ok(roots) {
+            found = roots
+        }
         for path in ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"] {
+            if len(found) > 0 {
+                break
+            }
             let loaded = load_roots(path)
             if loaded is Error {
                 continue

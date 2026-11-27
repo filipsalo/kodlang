@@ -270,8 +270,10 @@ The certificates may come in any order after the first, with extra ones; it
 tries each that could be next. A root is trusted as it is, so only its validity
 and signature over the certificate below it count. Revocation isn't checked.
 
-`system_roots()` reads the operating system's bundle of trusted roots once
-(`/etc/ssl/cert.pem` on macOS, the usual paths on Linux), and
+`system_roots()` reads the operating system's trusted roots once: on macOS
+those in `/System/Library/Keychains/SystemRootCertificates.keychain`, which
+`keychain_certificates(data)` takes out of the keychain file as DER (the
+`/etc/ssl/cert.pem` there has fewer), and elsewhere the usual PEM bundles.
 `load_roots(path)` reads another PEM file; a certificate in it that can't be read
 (an unusual key, say) is left out. A `Certificate` has its fields as read
 (`dns_names`, `not_after`, `is_ca`, `key`, ...) and `common_name()` for

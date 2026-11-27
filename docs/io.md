@@ -304,7 +304,8 @@ doesn't kill the program with `SIGPIPE`. A connection has `TCP_NODELAY` set.
 `stdlib/net/tls.kod` runs TLS 1.3 over a TCP connection, both sides, with
 Kod's own implementation (`stdlib/net/tls13.kod`, on the modules of
 [Cryptography](crypto.md)). No system library is involved: a client checks the
-server's certificates against the system's roots (`/etc/ssl/cert.pem`) itself.
+server's certificates against the system's roots (on macOS, those of its root
+keychain) itself.
 A peer that can't speak TLS 1.3 (one that has only TLS 1.2, say) is refused.
 
 ```kod
