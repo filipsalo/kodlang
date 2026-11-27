@@ -1,40 +1,50 @@
-// Arithmetic on big non-negative numbers modulo an odd modulus, for checking
-// RSA and ECDSA signatures (crypto/rsa, crypto/ecdsa).
+// Arithmetic on big non-negative numbers modulo an odd modulus, for RSA and
+// ECDSA (crypto/rsa, crypto/ecdsa).
 //
-// A number is an array of 30-bit limbs, the lowest first, as long as its
-// modulus's: a product of two limbs and a couple of carries stays below
-// 2^61. Multiplication is Montgomery's.
+// A number is an array of 64-bit limbs, the lowest first, as long as its
+// modulus's. A limb is an int64 holding the word's bits: the arithmetic is
+// unsigned, with wrapping_add and wrapping_mul, mul_high for the top half of
+// a product, and carries and borrows worked out from the sign bits.
+// Multiplication is Montgomery's.
 //
 // `from_bytes`, `to_bytes` and the arithmetic of a `Modulus` (mul, add, sub,
-// and pow with a public exponent) do the same steps whatever the numbers are,
-// so ECDSA signing can use them on a private key; `compare`, `is_zero`,
-// `bit_length` and `number` look at the values, and are for public ones.
+// pow_secret, and pow with a public exponent) do the same steps whatever the
+// numbers are, so signing can use them on a private key; `compare`,
+// `is_zero`, `bit_length` and `number` look at the values, and are for public
+// ones.
 
-let BITS: int64 = 30
-let MASK: int64 = (1 << 30) - 1
+let BITS: int64 = 64
+let TOP: int64 = 1 << 63
+
+// The limbs a number of `size` bytes takes.
+func limbs(anon size: int64) -> int64 {
+    return (size + 7) / 8
+}
+
+// The carry out of s = a + b (wrapping): 1 or 0.
+func carry_of(anon a: int64, anon b: int64, anon s: int64) -> int64 {
+    return ((a & b) | ((a | b) & (s ^ -1))) >> 63
+}
+
+// The borrow out of d = a - b (wrapping): 1 or 0.
+func borrow_of(anon a: int64, anon b: int64, anon d: int64) -> int64 {
+    let na = a ^ -1
+    return ((na & b) | ((na | b) & d)) >> 63
+}
 
 // The number `b` holds, big-endian, in `k` limbs, or none when it needs more.
 func from_bytes(anon b: bytes, k: int64) -> [int64]? {
     mut out = [0] * k
-    // The bits that would go above the top limb.
+    // The bytes that would go above the top limb.
     mut over = 0
-    mut bit = 0
-    for i in len(b) - 1..=0 step -1 {
-        let byte = b[i]
-        let limb = bit / BITS
-        let shift = bit % BITS
+    for i in 0..len(b) {
+        let at = len(b) - 1 - i
+        let limb = i / 8
         if limb < k {
-            out[limb] = out[limb] | ((byte << shift) & MASK)
-            let high = byte >> (BITS - shift)
-            if limb + 1 < k {
-                out[limb + 1] = out[limb + 1] | high
-            } else {
-                over = over | high
-            }
+            out[limb] = out[limb] | (b[at] << (8 * (i % 8)))
         } else {
-            over = over | byte
+            over = over | b[at]
         }
-        bit += 8
     }
     if over != 0 {
         return none
@@ -46,17 +56,10 @@ func from_bytes(anon b: bytes, k: int64) -> [int64]? {
 func to_bytes(anon x: [int64], size: int64) -> bytes {
     mut out = [0] * size
     for i in 0..size {
-        let bit = i * 8
-        let limb = bit / BITS
-        let shift = bit % BITS
-        mut v = 0
+        let limb = i / 8
         if limb < len(x) {
-            v = x[limb] >> shift
-            if shift > BITS - 8 and limb + 1 < len(x) {
-                v = v | (x[limb + 1] << (BITS - shift))
-            }
+            out[size - 1 - i] = (x[limb] >> (8 * (i % 8))) & 255
         }
-        out[size - 1 - i] = v & 255
     }
     return kod_bytes_from_array(out)
 }
@@ -65,7 +68,7 @@ func to_bytes(anon x: [int64], size: int64) -> bytes {
 func compare(anon a: [int64], anon b: [int64]) -> int64 {
     for i in len(a) - 1..=0 step -1 {
         if a[i] != b[i] {
-            return if a[i] < b[i] { -1 } else { 1 }
+            return if (a[i] ^ TOP) < (b[i] ^ TOP) { -1 } else { 1 }
         }
     }
     return 0
@@ -86,15 +89,16 @@ func sub(anon a: [int64], anon b: [int64]) -> [int64] {
     return out
 }
 
-// a - b mod 2^(30 k), and 1 when that borrowed (a < b), else 0.
+// a - b mod 2^(64 k), and 1 when that borrowed (a < b), else 0.
 func sub_borrow(anon a: [int64], anon b: [int64]) -> ([int64], int64) {
     mut out = a
     mut borrow = 0
     for i in 0..len(a) {
-        let t = a[i] - b[i] - borrow
-        // The sign bit: 1 when t went below 0.
-        borrow = t >> 63
-        out[i] = t + (borrow << BITS)
+        let x = a[i]
+        let d = x.wrapping_sub(b[i])
+        let d2 = d.wrapping_sub(borrow)
+        borrow = borrow_of(x, b[i], d) | borrow_of(d, borrow, d2)
+        out[i] = d2
     }
     return (out, borrow)
 }
@@ -115,9 +119,11 @@ func add_carry(anon a: [int64], anon b: [int64]) -> ([int64], int64) {
     mut out = a
     mut carry = 0
     for i in 0..len(a) {
-        let t = a[i] + b[i] + carry
-        out[i] = t & MASK
-        carry = t >> BITS
+        let x = a[i]
+        let s = x.wrapping_add(b[i])
+        let s2 = s.wrapping_add(carry)
+        carry = carry_of(x, b[i], s) | carry_of(s, carry, s2)
+        out[i] = s2
     }
     return (out, carry)
 }
@@ -137,45 +143,44 @@ func bit(anon a: [int64], anon i: int64) -> int64 {
 }
 
 // An odd modulus and what Montgomery multiplication by it needs. Numbers
-// "in the Montgomery form" are x * R mod m, R = 2^(30 k).
+// "in the Montgomery form" are x * R mod m, R = 2^(64 k).
 type Modulus = struct {
     m: [int64]
     k: int64
-    // -1 / m mod 2^30.
+    // -1 / m mod 2^64.
     m_inv: int64
     // R^2 mod m, to bring a number into the form.
     r2: [int64]
 
     func init(anon m: bytes) -> Modulus {
-        let k = (len(m) * 8 + BITS - 1) / BITS
-        let limbs = must from_bytes(m, k: k)
-        if limbs[0] & 1 == 0 {
+        let k = limbs(len(m))
+        let ms = must from_bytes(m, k: k)
+        if ms[0] & 1 == 0 {
             panic("bignum: the modulus is even")
         }
         // Newton's iteration doubles the bits that are right each time.
         mut inv = 1
-        for _i in 0..5 {
-            inv = (inv * ((2 - limbs[0] * inv) & MASK)) & MASK
+        for _i in 0..6 {
+            inv = inv.wrapping_mul(2.wrapping_sub(ms[0].wrapping_mul(inv)))
         }
         // R mod m, which is 1 in the form: 2^L - m for m of L bits, then
-        // doubled up to 2^(30 k).
-        let size = bit_length(limbs)
+        // doubled up to 2^(64 k).
+        let size = bit_length(ms)
         mut top = [0] * k
         mut one = top
         if size < BITS * k {
             top[size / BITS] = 1 << (size % BITS)
-            one = sub(top, limbs)
+            one = sub(top, ms)
         } else {
-            // 2^(30 k) - m, taken as its two's complement within k limbs.
-            one = sub([MASK] * k, limbs)
-            let (plus, _c) = add_carry(one, [1] + [0] * (k - 1))
-            one = plus
+            // 2^(64 k) - m, taken as its two's complement within k limbs.
+            let (minus, _b) = sub_borrow(top, ms)
+            one = minus
         }
-        let base = Modulus(m: limbs, k: k, m_inv: (0 - inv) & MASK, r2: [])
+        let base = Modulus(m: ms, k: k, m_inv: 0 - inv, r2: [])
         for _i in size..BITS * k {
             one = base.add(one, one)
         }
-        // R^2 is R in the form: 2 in the form, raised to 30 k.
+        // R^2 is R in the form: 2 in the form, raised to 64 k.
         let two = base.add(one, one)
         mut r = one
         let e = BITS * k
@@ -185,36 +190,61 @@ type Modulus = struct {
                 r = base.mul(r, two)
             }
         }
-        return Modulus(m: limbs, k: k, m_inv: (0 - inv) & MASK, r2: r)
+        return Modulus(m: ms, k: k, m_inv: 0 - inv, r2: r)
     }
 
     // a * b / R mod m, for a and b below m.
     func mul(self, anon a: [int64], anon b: [int64]) -> [int64] {
         let k = self.k
         let m = self.m
+        let m_inv = self.m_inv
+        // All ones, for the carries: kept in a register rather than made each time.
+        let ones = -1
         mut t = [0] * (k + 2)
         for i in 0..k {
             let bi = b[i]
+            // t += a bi.
             mut carry = 0
             for j in 0..k {
-                let x = t[j] + a[j] * bi + carry
-                t[j] = x & MASK
-                carry = x >> BITS
+                let aj = a[j]
+                let lo = aj.wrapping_mul(bi)
+                let hi = aj.mul_high(bi)
+                let tj = t[j]
+                let s = tj.wrapping_add(lo)
+                let s2 = s.wrapping_add(carry)
+                // Both carries can be 1, when `carry` is large.
+                // Both carries can be 1, when the one coming in is large.
+                let c = (((tj & lo) | ((tj | lo) & (s ^ ones))) >> 63) + (((s & carry) | ((s | carry) & (s2 ^ ones))) >> 63)
+                t[j] = s2
+                carry = hi.wrapping_add(c)
             }
-            let top = t[k] + carry
-            t[k] = top & MASK
-            t[k + 1] = top >> BITS
-            // Add u * m, which makes the lowest limb 0, and shift it out.
-            let u = (t[0] * self.m_inv) & MASK
-            carry = (t[0] + u * m[0]) >> BITS
+            let tk = t[k]
+            let top = tk.wrapping_add(carry)
+            t[k] = top
+            t[k + 1] = ((tk & carry) | ((tk | carry) & (top ^ ones))) >> 63
+            // Add u m, which makes the lowest limb 0, and shift it out.
+            let u = t[0].wrapping_mul(m_inv)
+            let t0 = t[0]
+            let lo0 = u.wrapping_mul(m[0])
+            let s0 = t0.wrapping_add(lo0)
+            carry = u.mul_high(m[0]).wrapping_add(((t0 & lo0) | ((t0 | lo0) & (s0 ^ ones))) >> 63)
             for j in 1..k {
-                let x = t[j] + u * m[j] + carry
-                t[j - 1] = x & MASK
-                carry = x >> BITS
+                let mj = m[j]
+                let lo = u.wrapping_mul(mj)
+                let hi = u.mul_high(mj)
+                let tj = t[j]
+                let s = tj.wrapping_add(lo)
+                let s2 = s.wrapping_add(carry)
+                // Both carries can be 1, when `carry` is large.
+                // Both carries can be 1, when the one coming in is large.
+                let c = (((tj & lo) | ((tj | lo) & (s ^ ones))) >> 63) + (((s & carry) | ((s | carry) & (s2 ^ ones))) >> 63)
+                t[j - 1] = s2
+                carry = hi.wrapping_add(c)
             }
-            let last = t[k] + carry
-            t[k - 1] = last & MASK
-            t[k] = t[k + 1] + (last >> BITS)
+            let tk2 = t[k]
+            let last = tk2.wrapping_add(carry)
+            t[k - 1] = last
+            t[k] = t[k + 1] + (((tk2 & carry) | ((tk2 | carry) & (last ^ ones))) >> 63)
         }
         // Below 2m: take m off unless that borrows (and nothing is above).
         let out = t[..k]
@@ -247,7 +277,7 @@ type Modulus = struct {
 
     func sub(self, anon a: [int64], anon b: [int64]) -> [int64] {
         let (diff, borrow) = sub_borrow(a, b)
-        // Below 0 it wrapped by 2^(30 k); adding m and wrapping again gives a - b + m.
+        // Below 0 it wrapped by 2^(64 k); adding m and wrapping again gives a - b + m.
         let (plus, _carry) = add_carry(diff, self.m)
         return choose(borrow, plus, diff)
     }
@@ -340,13 +370,18 @@ type Modulus = struct {
 func mul_plain(anon a: [int64], anon b: [int64]) -> [int64] {
     mut out = [0] * (len(a) + len(b))
     for i in 0..len(a) {
+        let ai = a[i]
         mut carry = 0
         for j in 0..len(b) {
-            let t = out[i + j] + a[i] * b[j] + carry
-            out[i + j] = t & MASK
-            carry = t >> BITS
+            let lo = ai.wrapping_mul(b[j])
+            let hi = ai.mul_high(b[j])
+            let o = out[i + j]
+            let s = o.wrapping_add(lo)
+            let s2 = s.wrapping_add(carry)
+            out[i + j] = s2
+            carry = hi.wrapping_add(carry_of(o, lo, s) + carry_of(s, carry, s2))
         }
-        out[i + len(b)] += carry
+        out[i + len(b)] = carry
     }
     return out
 }
@@ -359,9 +394,10 @@ func add_plain(anon a: [int64], anon b: [int64]) -> [int64] {
     for i in 0..n {
         let x = if i < len(a) { a[i] } else { 0 }
         let y = if i < len(b) { b[i] } else { 0 }
-        let t = x + y + carry
-        out[i] = t & MASK
-        carry = t >> BITS
+        let s = x.wrapping_add(y)
+        let s2 = s.wrapping_add(carry)
+        out[i] = s2
+        carry = carry_of(x, y, s) | carry_of(s, carry, s2)
     }
     return out
 }
