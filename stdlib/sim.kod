@@ -1,8 +1,10 @@
 // Running code under a deterministic simulation (docs/simulation.md): the
 // scheduler, clock and network it uses are in stdlib/tasks.kod and
-// stdlib/net/tcp.kod; this is where a test asks for one.
+// stdlib/net/tcp.kod, the disk in stdlib/simdisk.kod; this is where a test
+// asks for one.
 import "env"
 import "panics"
+import "simdisk"
 import "tasks"
 import "time" { Time }
 
@@ -25,36 +27,61 @@ func digest() -> int64 {
     return _last_digest
 }
 
+// In `restart`: whether the crash stopped the body before it ended.
+func crashed() -> bool {
+    return simdisk.crashed()
+}
+
 // Runs `body` under the seeds from `from`, `count` of them (KOD_SIM_SEEDS, when
 // set, instead), one after another, the calendar at `start`; the first that
-// fails ends it with a panic that names its seed.
-func run(count: int64 = 100, from: int64 = 0, start: Time? = none, body: func() -> none) -> none {
+// fails ends it with a panic that names its seed. With `restart`, each run
+// crashes, and `restart` runs after.
+func run(count: int64 = 100, from: int64 = 0, start: Time? = none, body: func() -> none, restart: (func() -> none)? = none) -> none {
     mut n = count
     if env.get("KOD_SIM_SEEDS") is str(text) {
         n = text.parse_int()? or count
     }
     for s in from..from + n {
-        if one(s, body, :start) is panics.Panic(p) {
+        if one(s, body, :start, :restart) is panics.Panic(p) {
             panic(f"simulation: seed {s} failed: {p.message}\n{p.backtrace}")
         }
     }
 }
 
 // Runs `body` under `seed` alone; a panic in it goes on as it was.
-func replay(anon seed: int64, start: Time? = none, body: func() -> none) -> none {
-    if one(seed, body, :start) is panics.Panic(p) {
+func replay(anon seed: int64, start: Time? = none, body: func() -> none, restart: (func() -> none)? = none) -> none {
+    if one(seed, body, :start, :restart) is panics.Panic(p) {
         panics.again(p)
     }
 }
 
 // `body` under `seed`: the panic that stopped it, or none.
-func one(anon seed: int64, anon body: func() -> none, start: Time?) -> panics.Panic? {
+func one(anon seed: int64, anon body: func() -> none, start: Time?, restart: (func() -> none)?) -> panics.Panic? {
     mut epoch = DEFAULT_START_NS
     if start is Time(t) {
         epoch = t.seconds * 1000000000 + t.nanos
     }
+    // Before the simulation's preemption starts: the stores here don't count.
+    let disk = simdisk.begin()
     tasks.sim_begin(seed, epoch_ns: epoch)
-    let failed = panics.run(body)
+    mut failed: panics.Panic? = none
+    if restart is none {
+        failed = panics.run(body)
+    } else {
+        let again = restart
+        disk.plan_crash()
+        failed = tasks.sim_crashable(body)
+        // A body the crash stopped may have failed for it.
+        if disk.crashed {
+            failed = none
+        }
+        if failed is none {
+            disk.cut_power()
+            tasks.sim_reboot()
+            failed = panics.run(again)
+        }
+    }
     _last_digest = tasks.sim_end()
+    simdisk.end()
     return failed
 }

@@ -1,0 +1,557 @@
+// The disk of a simulation (docs/simulation.md#crashes): files and
+// directories in memory, each change noted until it is synced, so that a
+// crash can lose what a real disk might. stdlib/posix.kod sends here every
+// file a run has made, changed or removed (SimFiles); a path it hasn't is
+// still the real one, read only.
+import "io"
+import "posix"
+import "stream" { os_error }
+import "tasks"
+
+let SECTOR: int64 = 512
+let EPERM: int64 = 1
+let ENOENT: int64 = 2
+let EBADF: int64 = 9
+let EEXIST: int64 = 17
+let ENOTDIR: int64 = 20
+let EISDIR: int64 = 21
+let EINVAL: int64 = 22
+let ENOTEMPTY: int64 = 66
+
+// A change to a file since it was last synced: `data` written at `at`, or,
+// `cut`, its length set to `at`.
+type Change = struct {
+    at: int64
+    data: bytes
+    cut: bool = false
+}
+
+// A file or directory. `data` is what the program sees; `synced`, what is on
+// the disk for sure, `changes` taking it to `data`. `real`: a directory that
+// was on the real disk, whose entries the run hasn't changed are still there.
+type Node = shared struct {
+    dir: bool
+    data: bytes
+    synced: bytes
+    changes: [Change] = []
+    real: bool = false
+}
+
+// A change to names, made at once: each of `paths` now names the node of the
+// same index in `nodes`, 0 for none.
+type NameChange = struct {
+    paths: [str]
+    nodes: [int64]
+}
+
+type OpenFile = shared struct {
+    node: Node
+    pos: int64 = 0
+    appends: bool = false
+    reads: bool = false
+    writes: bool = false
+}
+
+type Disk = shared struct {
+    nodes: Map[int64, Node]
+    // Each path the run has made, changed or removed, and its node, 0 for
+    // none: as the program sees it, and as of the last sync_dir, with the
+    // changes since in order.
+    names: Map[str, int64]
+    kept_names: Map[str, int64]
+    name_changes: [NameChange] = []
+    files: Map[int64, OpenFile]
+    next_node: int64 = 1
+    next_fd: int64 = 0
+    // How many more changes until the crash, the last of them not made:
+    // none while it is -1.
+    crash_in: int64 = -1
+    crashed: bool = false
+    // What a crash keeps of what wasn't synced: each piece with a chance of
+    // `keep` in 4.
+    keep: int64 = 0
+
+    func has(self, anon path: str) -> bool {
+        return self.names.contains(clean(path))
+    }
+
+    func open(self, anon path: str, anon mode: int64) -> int64 or Error {
+        let p = clean(path)
+        mut id = self._take(p)
+        if id == 0 {
+            if mode == 0 {
+                throw os_error(f"open {path}", errno: ENOENT)
+            }
+            try self._in_dir(p, f"open {path}")
+            self._step()
+            id = self._new_node(false)
+            self._rename([p], [id])
+        }
+        let node = must self.nodes.get(id)
+        if node.dir and mode != 0 {
+            throw os_error(f"open {path}", errno: EISDIR)
+        }
+        if mode == 1 and len(node.data) > 0 {
+            self._step()
+            node.data = kod_str_to_bytes("")
+            node.changes += [Change(at: 0, data: node.data, cut: true)]
+        }
+        let fd = posix.SIM_FD_BASE + self.next_fd
+        self.next_fd += 1
+        self.files[fd] = OpenFile(:node, appends: mode == 2, reads: mode == 0 or mode == 3, writes: mode != 0)
+        return fd
+    }
+
+    func read(self, anon fd: int64, anon max: int64) -> bytes or Error {
+        let f = try self._file(fd, "read")
+        if f.node.dir {
+            throw os_error("read", errno: EISDIR)
+        }
+        if not f.reads {
+            throw os_error("read", errno: EBADF)
+        }
+        let data = f.node.data
+        if f.pos >= len(data) {
+            return kod_str_to_bytes("")
+        }
+        mut end = f.pos + max
+        if end > len(data) {
+            end = len(data)
+        }
+        let got = data[f.pos..end]
+        f.pos = end
+        return got
+    }
+
+    func write(self, anon fd: int64, anon data: bytes) -> int64 or Error {
+        let f = try self._file(fd, "write")
+        if not f.writes {
+            throw os_error("write", errno: EBADF)
+        }
+        self._step()
+        let node = f.node
+        mut at = f.pos
+        if f.appends {
+            at = len(node.data)
+        }
+        node.data = put(node.data, at, data)
+        node.changes += [Change(:at, :data)]
+        f.pos = at + len(data)
+        return len(data)
+    }
+
+    func seek(self, anon fd: int64, anon pos: int64) -> none or Error {
+        let f = try self._file(fd, "seek")
+        if pos < 0 {
+            throw os_error("seek", errno: EINVAL)
+        }
+        f.pos = pos
+    }
+
+    func close(self, anon fd: int64) -> none or Error {
+        if self.files.remove(fd) is none {
+            throw os_error("close", errno: EBADF)
+        }
+    }
+
+    func sync(self, anon fd: int64) -> none or Error {
+        let f = try self._file(fd, "sync")
+        self._step()
+        f.node.synced = f.node.data
+        f.node.changes = []
+    }
+
+    func truncate(self, anon fd: int64, anon size: int64) -> none or Error {
+        let f = try self._file(fd, "truncate")
+        if not f.writes or size < 0 {
+            throw os_error("truncate", errno: EINVAL)
+        }
+        self._step()
+        f.node.data = resized(f.node.data, size)
+        f.node.changes += [Change(at: size, data: kod_str_to_bytes(""), cut: true)]
+    }
+
+    func size(self, anon fd: int64) -> int64 or Error {
+        let f = try self._file(fd, "size")
+        return len(f.node.data)
+    }
+
+    func rename(self, anon from: str, anon to: str) -> none or Error {
+        let op = f"rename {from} to {to}"
+        let a = clean(from)
+        let t = clean(to)
+        let id = self._take(a)
+        if id == 0 {
+            throw os_error(op, errno: ENOENT)
+        }
+        try self._in_dir(t, op)
+        let there = self._take(t)
+        if a == t {
+            return
+        }
+        let node = must self.nodes.get(id)
+        if there != 0 {
+            let old = must self.nodes.get(there)
+            if old.dir != node.dir {
+                throw os_error(op, errno: if node.dir { ENOTDIR } else { EISDIR })
+            }
+            if old.dir and len(try self.list_dir(t, real: none)) > 0 {
+                throw os_error(op, errno: ENOTEMPTY)
+            }
+        }
+        mut paths = [a, t]
+        mut nodes = [0, id]
+        if node.dir {
+            if node.real or t.starts_with(a + "/") {
+                throw os_error(op, errno: EINVAL)
+            }
+            // What is in it moves with it.
+            for name in self.names.keys() {
+                if name.starts_with(a + "/") {
+                    let moved = t + name[len(a)..]
+                    let _ = self._take(moved)
+                    paths += [name, moved]
+                    nodes += [0, self.names.get(name)? or 0]
+                }
+            }
+        }
+        self._step()
+        self._rename(paths, nodes)
+    }
+
+    func remove(self, anon path: str, dir: bool) -> none or Error {
+        let op = if dir { f"remove_dir {path}" } else { f"remove {path}" }
+        let p = clean(path)
+        let id = self._take(p)
+        if id == 0 {
+            throw os_error(op, errno: ENOENT)
+        }
+        let node = must self.nodes.get(id)
+        if node.dir != dir {
+            throw os_error(op, errno: if dir { ENOTDIR } else { EPERM })
+        }
+        if dir and len(try self.list_dir(p, real: none)) > 0 {
+            throw os_error(op, errno: ENOTEMPTY)
+        }
+        self._step()
+        self._rename([p], [0])
+    }
+
+    func make_dir(self, anon path: str) -> none or Error {
+        let op = f"make_dir {path}"
+        let p = clean(path)
+        if self._take(p) != 0 {
+            throw os_error(op, errno: EEXIST)
+        }
+        try self._in_dir(p, op)
+        self._step()
+        self._rename([p], [self._new_node(true)])
+    }
+
+    // What is in the directory: what the real one has (`real`, or for a
+    // directory the run has made, looked up here), less what the run has
+    // removed, and what it has made.
+    func list_dir(self, anon path: str, real: [str]?) -> [str] or Error {
+        let p = clean(path)
+        let op = f"list_dir {path}"
+        mut on_disk = real? or []
+        if self.names.get(p) is int64(id) {
+            if id == 0 {
+                throw os_error(op, errno: ENOENT)
+            }
+            let node = must self.nodes.get(id)
+            if not node.dir {
+                throw os_error(op, errno: ENOTDIR)
+            }
+            if not node.real {
+                on_disk = []
+            } else if real is none {
+                on_disk = posix.list_dir_on_disk(p)? or []
+            }
+        } else if real is none {
+            throw os_error(op, errno: ENOENT)
+        }
+        mut out: [str] = []
+        for name in on_disk {
+            if not self.names.contains(join(p, name)) {
+                out += [name]
+            }
+        }
+        for name in self.names.keys() {
+            if parent(name) == p and (self.names.get(name)? or 0) != 0 {
+                out += [base(name)]
+            }
+        }
+        return posix.sort_names(out)
+    }
+
+    func sync_dir(self, anon path: str) -> none or Error {
+        let p = clean(path)
+        if not self._is_dir(p) {
+            throw os_error(f"sync_dir {path}", errno: ENOENT)
+        }
+        self._step()
+        for change in self.name_changes {
+            self._keep(change)
+        }
+        self.name_changes = []
+    }
+
+    func stat(self, anon path: str) -> int64 {
+        let Some(id) = self.names.get(clean(path)) else { return -1 }
+        if id == 0 {
+            return -1
+        }
+        let node = must self.nodes.get(id)
+        if node.dir {
+            return -2
+        }
+        return len(node.data)
+    }
+
+    // The node at `p`, 0 for none, from now on the run's: what the real disk
+    // has there, if the run hasn't had it yet, taken in as synced.
+    func _take(self, anon p: str) -> int64 {
+        if self.names.get(p) is int64(id) {
+            return id
+        }
+        mut id = 0
+        if io.file_info(p) is io.FileInfo(info) {
+            if info.is_dir {
+                id = self._new_node(true)
+                let node = must self.nodes.get(id)
+                node.real = true
+            } else if info.is_file {
+                id = self._new_node(false)
+                let node = must self.nodes.get(id)
+                node.data = kod_str_to_bytes(io.read_file(p)? or "")
+                node.synced = node.data
+            }
+        }
+        self.names[p] = id
+        self.kept_names[p] = id
+        return id
+    }
+
+    func _new_node(self, anon dir: bool) -> int64 {
+        let id = self.next_node
+        self.next_node += 1
+        let empty = kod_str_to_bytes("")
+        self.nodes[id] = Node(:dir, data: empty, synced: empty)
+        return id
+    }
+
+    func _is_dir(self, anon p: str) -> bool {
+        if p == "." or p == "/" {
+            return true
+        }
+        if self.names.get(p) is int64(id) {
+            return id != 0 and (must self.nodes.get(id)).dir
+        }
+        let Some(info) = io.file_info(p) else { return false }
+        return info.is_dir
+    }
+
+    // Fails unless the directory `p` is to be in is there.
+    func _in_dir(self, anon p: str, anon op: str) -> none or Error {
+        if not self._is_dir(parent(p)) {
+            throw os_error(op, errno: ENOENT)
+        }
+    }
+
+    func _rename(self, anon paths: [str], anon nodes: [int64]) -> none {
+        for k, path in paths {
+            self.names[path] = nodes[k]
+        }
+        self.name_changes += [NameChange(:paths, :nodes)]
+    }
+
+    // A change to names is on the disk.
+    func _keep(self, anon change: NameChange) -> none {
+        for k, path in change.paths {
+            self.kept_names[path] = change.nodes[k]
+        }
+    }
+
+    func _file(self, anon fd: int64, anon op: str) -> OpenFile or Error {
+        let Some(f) = self.files.get(fd) else { throw os_error(op, errno: EBADF) }
+        return f
+    }
+
+    // A change to the disk is about to be made: unless the power is cut first.
+    func _step(self) -> none {
+        if self.crash_in < 0 {
+            return
+        }
+        self.crash_in -= 1
+        if self.crash_in == 0 {
+            self.crash_in = -1
+            self.crashed = true
+            tasks.sim_crash()
+        }
+    }
+
+    // The power is cut: what wasn't synced is lost, or kept, as the seed
+    // says (docs/simulation.md#crashes). Open files are gone.
+    func cut_power(self) -> none {
+        mut kept = len(self.name_changes)
+        if self.keep < 4 {
+            kept = tasks.sim_rand(kept + 1)
+        }
+        self.crash_in = -1
+        for change in self.name_changes[..kept] {
+            self._keep(change)
+        }
+        self.name_changes = []
+        self.names = self.kept_names
+        for id in self.nodes.keys() {
+            let node = must self.nodes.get(id)
+            mut out = node.synced
+            for c in node.changes {
+                if c.cut {
+                    if self._coin() {
+                        out = resized(out, c.at)
+                    }
+                    continue
+                }
+                // In pieces that end where the file's sectors do.
+                mut k = 0
+                for k < len(c.data) {
+                    let at = c.at + k
+                    mut end = k + SECTOR - at % SECTOR
+                    if end > len(c.data) {
+                        end = len(c.data)
+                    }
+                    if self._coin() {
+                        out = put(out, at, c.data[k..end])
+                    }
+                    k = end
+                }
+            }
+            node.synced = out
+            node.data = out
+            node.changes = []
+        }
+        self.files = Map[int64, OpenFile]()
+    }
+
+    // The seed picks when the power is cut, and what that loses.
+    func plan_crash(self) -> none {
+        // Under a quarter of the seeds the body ends first; under the rest,
+        // before one of the first 2 to 2048 changes.
+        if tasks.sim_rand(4) != 0 {
+            self.crash_in = 1 + tasks.sim_rand(2 << tasks.sim_rand(11))
+        }
+        self.keep = tasks.sim_rand(5)
+    }
+
+    func _coin(self) -> bool {
+        if self.keep == 0 {
+            return false
+        }
+        if self.keep == 4 {
+            return true
+        }
+        return tasks.sim_rand(4) < self.keep
+    }
+}
+
+mut _disk: Disk? = none
+
+// A new, empty disk, for a simulation about to begin.
+func begin() -> Disk {
+    let disk = Disk(nodes: Map[int64, Node](), names: Map[str, int64](), kept_names: Map[str, int64](), files: Map[int64, OpenFile]())
+    _disk = disk
+    posix.set_sim_files(disk)
+    return disk
+}
+
+func end() -> none {
+    _disk = none
+    posix.set_sim_files(none)
+}
+
+// In the restart: whether the crash came before the body ended.
+func crashed() -> bool {
+    if _disk is Disk(d) {
+        return d.crashed
+    }
+    return false
+}
+
+// `path` without "." parts, doubled slashes or a slash at the end.
+func clean(anon path: str) -> str {
+    mut parts: [str] = []
+    for part in path.split("/") {
+        if part != "" and part != "." {
+            parts += [part]
+        }
+    }
+    let joined = "/".join(parts)
+    if path.starts_with("/") {
+        return "/" + joined
+    }
+    if joined == "" {
+        return "."
+    }
+    return joined
+}
+
+// The directory `p` (a cleaned path) is in.
+func parent(anon p: str) -> str {
+    let at = last_slash(p)
+    if at < 0 {
+        return "."
+    }
+    if at == 0 {
+        return "/"
+    }
+    return p[..at]
+}
+
+// Where the last "/" in `p` is, -1 for none.
+func last_slash(anon p: str) -> int64 {
+    for i in len(p) - 1..=0 step -1 {
+        if p[i..i + 1] == "/" {
+            return i
+        }
+    }
+    return -1
+}
+
+// The last part of `p`, a cleaned path.
+func base(anon p: str) -> str {
+    let at = last_slash(p)
+    return p[at + 1..]
+}
+
+func join(anon dir: str, anon name: str) -> str {
+    if dir == "." {
+        return name
+    }
+    if dir == "/" {
+        return "/" + name
+    }
+    return dir + "/" + name
+}
+
+// `data` with `piece` written at `at`, zeros before it past the end.
+func put(anon data: bytes, anon at: int64, anon piece: bytes) -> bytes {
+    mut out = data
+    if at > len(out) {
+        out = out + kod_str_to_bytes("\0".repeat(at - len(out)))
+    }
+    let end = at + len(piece)
+    if end >= len(out) {
+        return out[..at] + piece
+    }
+    return out[..at] + piece + out[end..]
+}
+
+// `data` cut to `size` bytes, or lengthened with zeros.
+func resized(anon data: bytes, anon size: int64) -> bytes {
+    if size <= len(data) {
+        return data[..size]
+    }
+    return data + kod_str_to_bytes("\0".repeat(size - len(data)))
+}

@@ -8,6 +8,7 @@ let EINTR: int64 = 4
 let EAGAIN: int64 = 35
 let O_RDONLY: int64 = 0
 let O_WRONLY: int64 = 1
+let O_RDWR: int64 = 2
 let O_APPEND: int64 = 8
 let O_CREAT: int64 = 512
 let O_TRUNC: int64 = 1024
@@ -18,6 +19,58 @@ let POLLIN: int64 = 1
 let POLLOUT: int64 = 4
 // The most one `read` takes in.
 let READ_MAX: int64 = 65536
+// rwxr-xr-x, for a directory make_dir makes.
+let NEW_DIR_MODE: int64 = 493
+// fcntl's F_FULLFSYNC: fsync, and the drive's cache emptied too.
+let F_FULLFSYNC: int64 = 51
+// Where st_size sits in a macOS struct stat, and the struct's size; where
+// d_name sits in a struct dirent.
+let STAT_LENGTH: int64 = 96
+let STAT_SIZE: int64 = 144
+let DIRENT_NAME: int64 = 21
+// Descriptors from here on are the simulated disk's (SimFiles).
+let SIM_FD_BASE: int64 = 1 << 30
+
+// The files of a simulation (stdlib/simdisk.kod, docs/simulation.md): while
+// one runs, every file it has made, changed or removed (`has`), and every
+// change to a file, goes here instead of to the disk. Descriptors are
+// SIM_FD_BASE and up; `stat` gives -1 for nothing there, -2 for a directory,
+// else a file's length.
+interface SimFiles {
+    func has(self, anon path: str) -> bool
+    func open(self, anon path: str, anon mode: int64) -> int64 or Error
+    func read(self, anon fd: int64, anon max: int64) -> bytes or Error
+    func write(self, anon fd: int64, anon data: bytes) -> int64 or Error
+    func seek(self, anon fd: int64, anon pos: int64) -> none or Error
+    func close(self, anon fd: int64) -> none or Error
+    func sync(self, anon fd: int64) -> none or Error
+    func truncate(self, anon fd: int64, anon size: int64) -> none or Error
+    func size(self, anon fd: int64) -> int64 or Error
+    func rename(self, anon from: str, anon to: str) -> none or Error
+    func remove(self, anon path: str, dir: bool) -> none or Error
+    func make_dir(self, anon path: str) -> none or Error
+    func list_dir(self, anon path: str, real: [str]?) -> [str] or Error
+    func sync_dir(self, anon path: str) -> none or Error
+    func stat(self, anon path: str) -> int64
+}
+
+mut _sim_files: SimFiles? = none
+
+func set_sim_files(anon files: SimFiles?) -> none {
+    _sim_files = files
+}
+
+func sim_files() -> SimFiles? {
+    return _sim_files
+}
+
+// The simulation's files, when `fd` is one of theirs.
+func _sim_of(anon fd: int64) -> SimFiles or Error {
+    if _sim_files is SimFiles(s) {
+        return s
+    }
+    throw os_error("file", errno: 9)
+}
 
 // Where every `read` lands before it is copied out: allocated once, on the
 // first read, and kept.
@@ -34,6 +87,9 @@ type Fd = shared struct {
     func read(self, anon max: int64) -> bytes or Error {
         if max <= 0 {
             return kod_str_to_bytes("")
+        }
+        if self.fd >= SIM_FD_BASE {
+            return try (try _sim_of(self.fd)).read(self.fd, max)
         }
         mut want = max
         if want > READ_MAX {
@@ -64,6 +120,9 @@ type Fd = shared struct {
     func write(self, anon data: bytes) -> int64 or Error {
         if len(data) == 0 {
             return 0
+        }
+        if self.fd >= SIM_FD_BASE {
+            return try (try _sim_of(self.fd)).write(self.fd, data)
         }
         for true {
             mut most = len(data)
@@ -135,6 +194,10 @@ type Fd = shared struct {
     func close(self) -> none or Error {
         let n = self.fd
         self.fd = -1
+        if n >= SIM_FD_BASE {
+            try (try _sim_of(n)).close(n)
+            return
+        }
         kod_closing(n)
         if unsafe.c_int(libc.close(n)) < 0 {
             throw os_error("close", errno: unsafe.errno())
@@ -143,9 +206,50 @@ type Fd = shared struct {
 
     // Goes on reading or writing `pos` bytes from the start of a file.
     func seek(self, anon pos: int64) -> none or Error {
+        if self.fd >= SIM_FD_BASE {
+            try (try _sim_of(self.fd)).seek(self.fd, pos)
+            return
+        }
         if libc.lseek(self.fd, pos, 0) < 0 {
             throw os_error("seek", errno: unsafe.errno())
         }
+    }
+
+    // Waits until what was written to the file, and its length, is on the
+    // disk, the drive's own cache included.
+    func sync(self) -> none or Error {
+        if self.fd >= SIM_FD_BASE {
+            try (try _sim_of(self.fd)).sync(self.fd)
+            return
+        }
+        try _sync_fd(self.fd, "sync")
+    }
+
+    // Cuts the file to `size` bytes, or lengthens it with zeros.
+    func truncate(self, anon size: int64) -> none or Error {
+        if self.fd >= SIM_FD_BASE {
+            try (try _sim_of(self.fd)).truncate(self.fd, size)
+            return
+        }
+        if unsafe.c_int(libc.ftruncate(self.fd, size)) < 0 {
+            throw os_error("truncate", errno: unsafe.errno())
+        }
+    }
+
+    // How long the file is.
+    func size(self) -> int64 or Error {
+        if self.fd >= SIM_FD_BASE {
+            return try (try _sim_of(self.fd)).size(self.fd)
+        }
+        let st = unsafe.alloc(STAT_SIZE)
+        if unsafe.c_int(libc.fstat(self.fd, st)) < 0 {
+            let err = unsafe.errno()
+            unsafe.free(st)
+            throw os_error("size", errno: err)
+        }
+        let n = unsafe.load64(st + STAT_LENGTH)
+        unsafe.free(st)
+        return n
     }
 
     // Whether it is a terminal, rather than a file or a pipe.
@@ -154,13 +258,30 @@ type Fd = shared struct {
     }
 }
 
-// mode: 0 read, 1 create or truncate for writing, 2 create or append.
+// F_FULLFSYNC, or fsync where that isn't supported (not every file system
+// has it).
+func _sync_fd(anon fd: int64, anon op: str) -> none or Error {
+    if unsafe.c_int(libc.fcntl(fd, F_FULLFSYNC)) == 0 {
+        return
+    }
+    if unsafe.c_int(libc.fsync(fd)) < 0 {
+        throw os_error(op, errno: unsafe.errno())
+    }
+}
+
+// mode: 0 read, 1 create or truncate for writing, 2 create or append, 3 read
+// and write, created if missing.
 func open_with(anon path: str, anon mode: int64) -> Fd or Error {
+    if _sim_files is SimFiles(s) and (mode != 0 or s.has(path)) {
+        return Fd(fd: try s.open(path, mode))
+    }
     mut flags = O_RDONLY
     if mode == 1 {
         flags = O_WRONLY | O_CREAT | O_TRUNC
     } else if mode == 2 {
         flags = O_WRONLY | O_CREAT | O_APPEND
+    } else if mode == 3 {
+        flags = O_RDWR | O_CREAT
     }
     for true {
         let fd = unsafe.c_int(libc.open(unsafe.c_str(path), flags | O_CLOEXEC, NEW_FILE_MODE))
@@ -185,6 +306,120 @@ func create(anon path: str) -> Fd or Error {
 
 func append(anon path: str) -> Fd or Error {
     return try open_with(path, 2)
+}
+
+func open_rw(anon path: str) -> Fd or Error {
+    return try open_with(path, 3)
+}
+
+// Renames a file or directory, replacing a file at `to`.
+func rename(anon from: str, anon to: str) -> none or Error {
+    if _sim_files is SimFiles(s) {
+        try s.rename(from, to)
+        return
+    }
+    if unsafe.c_int(libc.rename(unsafe.c_str(from), unsafe.c_str(to))) < 0 {
+        throw os_error(f"rename {from} to {to}", errno: unsafe.errno())
+    }
+}
+
+// Removes a file.
+func remove(anon path: str) -> none or Error {
+    if _sim_files is SimFiles(s) {
+        try s.remove(path, dir: false)
+        return
+    }
+    if unsafe.c_int(libc.unlink(unsafe.c_str(path))) < 0 {
+        throw os_error(f"remove {path}", errno: unsafe.errno())
+    }
+}
+
+// Makes a directory, in one that exists.
+func make_dir(anon path: str) -> none or Error {
+    if _sim_files is SimFiles(s) {
+        try s.make_dir(path)
+        return
+    }
+    if unsafe.c_int(libc.mkdir(unsafe.c_str(path), NEW_DIR_MODE)) < 0 {
+        throw os_error(f"make_dir {path}", errno: unsafe.errno())
+    }
+}
+
+// Removes an empty directory.
+func remove_dir(anon path: str) -> none or Error {
+    if _sim_files is SimFiles(s) {
+        try s.remove(path, dir: true)
+        return
+    }
+    if unsafe.c_int(libc.rmdir(unsafe.c_str(path))) < 0 {
+        throw os_error(f"remove_dir {path}", errno: unsafe.errno())
+    }
+}
+
+// The names in a directory, sorted, without "." and "..".
+func list_dir(anon path: str) -> [str] or Error {
+    if _sim_files is SimFiles(s) {
+        mut real: [str]? = none
+        if list_dir_on_disk(path) is Ok(names) {
+            real = names
+        }
+        return try s.list_dir(path, :real)
+    }
+    return try list_dir_on_disk(path)
+}
+
+// list_dir on the real disk, simulation or not.
+func list_dir_on_disk(anon path: str) -> [str] or Error {
+    let dir = libc.opendir(unsafe.c_str(path))
+    if dir == 0 {
+        throw os_error(f"list_dir {path}", errno: unsafe.errno())
+    }
+    mut names: [str] = []
+    for true {
+        let entry = libc.readdir(dir)
+        if entry == 0 {
+            break
+        }
+        let name = unsafe.str_at(entry + DIRENT_NAME)
+        if name != "." and name != ".." {
+            names += [name]
+        }
+    }
+    libc.closedir(dir)
+    return sort_names(names)
+}
+
+// `names` in order (a directory has few enough for an insertion sort).
+func sort_names(anon names: [str]) -> [str] {
+    mut out = names
+    for i in 1..len(out) {
+        let name = out[i]
+        mut j = i
+        for j > 0 and out[j - 1] > name {
+            out[j] = out[j - 1]
+            j -= 1
+        }
+        out[j] = name
+    }
+    return out
+}
+
+// Waits until the directory's changes (files made, renamed or removed in it)
+// are on the disk.
+func sync_dir(anon path: str) -> none or Error {
+    if _sim_files is SimFiles(s) {
+        try s.sync_dir(path)
+        return
+    }
+    let fd = unsafe.c_int(libc.open(unsafe.c_str(path), O_RDONLY | O_CLOEXEC))
+    if fd < 0 {
+        throw os_error(f"sync_dir {path}", errno: unsafe.errno())
+    }
+    let synced = _sync_fd(fd, f"sync_dir {path}")
+    libc.close(fd)
+    if synced is Err(e) {
+        throw e
+    }
 }
 
 func stdin() -> Fd {

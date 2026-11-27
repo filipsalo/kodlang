@@ -37,8 +37,9 @@ test "an echo server, simulated" {
 
 | Function | Does |
 |----------|------|
-| `sim.run(count: 100, from: 0, start: none, body: f)` | runs `f`, a `func() -> none`, under the seeds `from` to `from + count - 1`, one after another; when one fails it panics, saying the seed and the panic it had |
-| `sim.replay(seed, start: none, body: f)` | runs `f` under `seed` alone, letting its panic through as it is: for looking at a failure `run` found |
+| `sim.run(count: 100, from: 0, start: none, body: f, restart: none)` | runs `f`, a `func() -> none`, under the seeds `from` to `from + count - 1`, one after another; when one fails it panics, saying the seed and the panic it had. With `restart:`, a second `func() -> none`, each run [crashes](#crashes) and `restart` runs after |
+| `sim.replay(seed, start: none, body: f, restart: none)` | runs `f` under `seed` alone, letting its panic through as it is: for looking at a failure `run` found |
+| `sim.crashed()` | in `restart`: whether the crash stopped the body before it ended |
 | `sim.simulating()` | whether code runs under a simulation |
 | `sim.seed()` | the seed of the run under way |
 | `sim.digest()` | a number standing for every choice the last run made; two runs with one seed give the same |
@@ -82,6 +83,12 @@ a longer hunt now and then.
   buffers, so a write of a few kilobytes waits for the other end to read; a
   write goes in pieces of a size the seed picks. Connecting to a port nothing
   listens on is `ConnectionRefused`; to another host, an error.
+- **The disk.** Files and directories a run makes, writes, renames or removes
+  are the simulation's, in memory, and gone when the run ends; a path the
+  run hasn't changed is read from the real disk, so a test can read its
+  certificates and data files. What `posix` and `io` do with files is
+  simulated: opening, reading, writing, syncing, renaming, listing, `stat`.
+  Without `restart:` nothing is lost; with it, see [Crashes](#crashes).
 - **Randomness.** `crypto/random` gives bytes that come from the seed, so the
   keys and nonces a run makes, and the work done with them, are the same
   each time.
@@ -89,10 +96,93 @@ a longer hunt now and then.
   run fails with `simulation: every task waits, and nothing can wake one`,
   where outside a simulation the program would hang.
 
+## Crashes
+
+With `restart:`, the seed picks a point where the machine loses its power:
+before one of the body's changes to the disk (a write, a sync, a new file, a
+rename, a removal), under some seeds one of the first few, under others one
+of the first thousands, and under a quarter of them none, so that the body
+ends first. Every task stops there, never to run again, and the disk loses
+what wasn't on it yet:
+
+- **Data.** What was written to a file since its last `sync` is lost, or
+  kept, in pieces of 512 bytes: under some seeds all of it is lost, under
+  others none of it (the program crashed, not the machine), and under the
+  rest some pieces and not others, whatever order they were written in. A
+  piece kept past the file's synced end leaves zeros before it where a piece
+  was lost. A `truncate` since the sync is kept or lost as a piece is.
+- **Names.** Files and directories made, renamed and removed since the last
+  `sync_dir` are kept in the order they were made: all of those up to a
+  point the seed picks, and none after. A `sync_dir` keeps every change made
+  before it, in any directory, as a journaling file system does. `f.sync()`
+  keeps a new file's contents but not its name.
+
+Then `restart` runs, as the program would when the machine came back: what
+the crash left on the disk, a new network with no connection open, and the
+clock where it was. Values in memory, such as one the body and `restart`
+both capture, are kept, which is how a test says what the body was told was
+kept; what a module-level variable holds, the program's own included, is too,
+which a real restart wouldn't keep.
+
+```kod
+import "posix"
+import "posix" { Fd }
+import "sim"
+
+// Appends `line`, and is done once it is on the disk.
+func log(anon f: Fd, anon line: str) -> none or Error {
+    try f.write_all(kod_str_to_bytes(line + "\n"))
+    try f.sync()
+}
+
+type Kept = shared struct {
+    lines: [str] = []
+}
+
+test "a log keeps what it said it kept" {
+    let kept = Kept()
+    sim.run(count: 100, body: func() {
+        kept.lines = []
+        must posix.make_dir("db")
+        must posix.sync_dir(".")
+        let f = must posix.open_rw("db/log")
+        must posix.sync_dir("db")
+        for i in 0..20 {
+            must log(f, f"line {i}")
+            kept.lines += [f"line {i}"]
+        }
+    }, restart: func() {
+        // Before its first line, the log may not be there at all.
+        if len(kept.lines) == 0 {
+            return
+        }
+        let text = kod_bytes_to_str(must (must posix.open_rw("db/log")).read_all())
+        for line in kept.lines {
+            assert text.contains(line + "\n")
+        }
+    })
+}
+```
+
+Without the `f.sync()`, or without either `sync_dir`, some seeds lose a line
+the body was told was kept, and the run fails, naming its seed. Of 200
+seeds, 115 find a missing `f.sync()` there and 72 the missing `sync_dir`s;
+replacing a file by a rename, 77 find a missing sync of the new file and 98
+a missing `sync_dir` after the rename.
+
+The tasks a crash stops never let go of what they held: a few kilobytes a
+run stay allocated until the program ends. A body the crash stops may have
+failed for it, so how it ended doesn't matter: `restart` runs either way.
+Under a simulation, renaming a directory that is on the real disk fails with
+`InvalidInput`.
+
 ## What isn't
 
-Files, child processes, `posix.poll` and the standard streams are the real
-ones; a body that waits for those, or for another program, isn't repeatable.
+Child processes, `posix.poll` and the standard streams are the real ones,
+and so is a file opened only for reading that the run hasn't changed; a body
+that waits for those, or for another program, isn't repeatable. The
+simulated disk never fails a call that would succeed on a healthy one: it is
+never full, and has no read or write errors.
 Tasks must not outlive the body: those it spawned are waited for when it
 ends, as at any function's end.
 

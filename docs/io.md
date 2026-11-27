@@ -184,6 +184,35 @@ A `BufReader` doesn't close its inner stream.
 | `f.is_terminal()` | whether it is a terminal, rather than a file or a pipe |
 | `signal(pid, sig)` | send the signal numbered `sig` to the process `pid`, as C's `kill`; `none or Error` (for a child of this program, `process.Child.kill` is the easier way) |
 
+### Files that must survive a crash
+
+A write is in the operating system's memory when it returns, and reaches the
+disk some time later. A crash or a power cut in between loses it, or part of
+it, and so can a rename or a new file whose directory hasn't been written
+out. A program that must not lose what it has said it kept, such as a
+database, uses these:
+
+| Function | Meaning |
+|----------|---------|
+| `open_rw(path)` | a file for reading and writing, created (mode `0644`) if missing, not truncated, at its start |
+| `f.sync()` | waits until what was written to the file, and its length, is on the disk (`F_FULLFSYNC`, which also empties the drive's own cache); `none or Error` |
+| `f.truncate(size)` | cuts the file to `size` bytes, or lengthens it with zeros; `none or Error` |
+| `f.size()` | how long the file is; `int64 or Error` |
+| `rename(from, to)` | renames a file or directory, replacing a file at `to` in one step: a crash leaves the old one or the new, never neither; `none or Error` |
+| `remove(path)` | removes a file; `none or Error` |
+| `make_dir(path)` | makes a directory (mode `0755`) in one that exists; `none or Error` |
+| `remove_dir(path)` | removes an empty directory; `none or Error` |
+| `list_dir(path)` | the names in a directory, sorted, without `.` and `..`; `[str] or Error` |
+| `sync_dir(path)` | waits until the directory's changes (files made, renamed or removed in it) are on the disk; `none or Error` |
+
+`f.sync()` keeps the file's contents, not its name: a new file, or a rename,
+also needs `sync_dir` of the directory it is in. The usual way to replace a
+file whole is to write a new one, `sync` it, `rename` it over the old one and
+`sync_dir` the directory.
+
+A [simulation](simulation.md#crashes) checks that a program does this: it
+crashes the disk at a point its seed picks, losing what wasn't synced.
+
 ### Waiting on several descriptors
 
 `poll(read:, write:, timeout:)` waits until at least one of the descriptors

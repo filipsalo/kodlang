@@ -379,6 +379,9 @@ func _new_fiber() -> Fiber {
     }
     let fiber = Fiber(ctx: kod_task_ctx_new(), :stack, spawned_at: _spawn_trace())
     kod_task_ctx_init(fiber.ctx, stack)
+    if _sim is _Sim(sim) and sim.first is Fiber(_first) {
+        sim.fibers += [fiber]
+    }
     return fiber
 }
 
@@ -1469,6 +1472,10 @@ type _Sim = shared struct {
     // at random; and the lowest priority given so far.
     by_priority: bool = false
     lowest: int64 = 0
+    // While a body that may crash runs (sim_crashable), the task that waits
+    // for it, and every task started since: those a crash stops.
+    first: Fiber? = none
+    fibers: [Fiber] = []
 }
 
 mut _sim: _Sim? = none
@@ -1585,6 +1592,69 @@ func sim_end() -> int64 {
     kod_poll_set(0, 1, _NEVER)
     kod_sim_set_clock(-1)
     return digest
+}
+
+// Runs `body` as a task, which a crash (sim_crash) may stop where it is: the
+// panic it ended with, or none.
+func sim_crashable(anon body: func() -> none) -> panics.Panic? {
+    let sim = must _sim
+    sim.first = _running()
+    mut failed: panics.Panic? = none
+    let task = start_none(func() { failed = panics.run(body) })
+    _wait_for(task.fiber)
+    sim.first = none
+    sim.fibers = []
+    return failed
+}
+
+// The power is cut (stdlib/simdisk.kod): every task sim_crashable started,
+// and those they started, stops where it is, never to run again, and the
+// task that waits for them goes on. What they hold isn't let go of.
+func sim_crash() -> none {
+    let sim = must _sim
+    let first = must sim.first
+    let me = _running()
+    for fiber in sim.fibers {
+        if fiber.done {
+            continue
+        }
+        fiber.done = true
+        fiber.cancelled = true
+        fiber.queued = false
+        fiber.waiters = []
+        _live -= 1
+        _dead += [fiber]
+    }
+    sim.fibers = []
+    _ready = []
+    _head = 0
+    _io = Map[int64, Fiber]()
+    _var_waiters = Map[int64, [Fiber]]()
+    sim.fds = []
+    sim.writes = []
+    sim.fd_keys = []
+    sim.due = []
+    sim.timer_keys = []
+    _scheduling = 0
+    sim_reboot()
+    // As a task that ends (_finish): its stack is freed once the switch is
+    // made.
+    _current = first
+    kod_task_set_now(first.stack)
+    _leave_from = me.ctx
+    _leave_to = first.ctx
+    kod_task_switch(_leave_from, _leave_to)
+}
+
+// After a crash: what a module keeps for the simulation's network is from
+// before (net/tcp), its listeners gone.
+func sim_reboot() -> none {
+    _sim_gen += 1
+}
+
+// A number from 0 to n - 1, by the seed, counted in the digest.
+func sim_rand(anon n: int64) -> int64 {
+    return _sim_rand(n)
 }
 
 // A number from 0 to n - 1, by the seed (splitmix64), counted in the digest.

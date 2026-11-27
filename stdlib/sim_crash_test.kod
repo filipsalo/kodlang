@@ -1,0 +1,273 @@
+// The simulated disk, and crashes (docs/simulation.md#crashes): what a run
+// writes stays in memory, and with `restart:` the seed cuts the power at a
+// point it picks, losing what wasn't synced.
+import "io"
+import "net/tcp"
+import "panics"
+import "posix"
+import "posix" { Fd }
+import "sim"
+import "tasks"
+
+func b(anon s: str) -> bytes {
+    return kod_str_to_bytes(s)
+}
+
+func text_of(anon path: str) -> str {
+    return io.read_file(path)? or "<missing>"
+}
+
+// The seed in a failure's message, `simulation: seed N failed: ...`.
+func failing_seed(anon p: panics.Panic) -> int64 {
+    let after = p.message[len("simulation: seed ")..]
+    let Some(end) = after.find(" ") else { return -1 }
+    return after[..end].parse_int()? or -1
+}
+
+test "files a simulation writes are its own; others are read from the disk" {
+    let p = "build/sim_crash_test_mine.tmp"
+    let _ = posix.remove(p)
+    sim.run(count: 5, body: func() {
+        assert not io.is_file(p)
+        let f = must posix.create(p)
+        must f.write_str("simulated")
+        must f.close()
+        assert text_of(p) == "simulated"
+        assert io.file_size(p) == 9
+        // A file the run hasn't changed is the real one.
+        assert text_of("stdlib/sim_crash_test.kod").starts_with("// The simulated disk")
+        // Listing a real directory shows the simulation's files too.
+        assert "sim_crash_test_mine.tmp" in must posix.list_dir("build")
+        must posix.remove("stdlib/sim_crash_test.kod")
+        assert not io.is_file("stdlib/sim_crash_test.kod")
+        assert not ("sim_crash_test.kod" in must posix.list_dir("stdlib"))
+    })
+    assert not io.is_file(p)
+    assert io.is_file("stdlib/sim_crash_test.kod")
+}
+
+test "without restart, nothing is lost, and a seed gives the same run" {
+    let body = func() {
+        must posix.make_dir("data")
+        let f = must posix.open_rw("data/a")
+        for i in 0..50 {
+            must f.write_str(f"{i},")
+        }
+        must posix.rename("data/a", "data/b")
+        assert (must posix.list_dir("data")) == ["b"]
+        assert text_of("data/b").starts_with("0,1,2,")
+        must f.close()
+    }
+    sim.replay(5, body: body)
+    let first = sim.digest()
+    sim.replay(5, body: body)
+    assert sim.digest() == first
+}
+
+type Kept = shared struct {
+    lines: [str] = []
+    crashed: int64 = 0
+    whole: int64 = 0
+}
+
+// Appends lines to a log, `syncing` each, and notes each once it is kept.
+func logger(anon kept: Kept, syncing: bool) -> func() -> none {
+    return func() {
+        kept.lines = []
+        must posix.make_dir("db")
+        must posix.sync_dir(".")
+        let f = must posix.open_rw("db/log")
+        must posix.sync_dir("db")
+        for i in 0..20 {
+            must f.write_str(f"line {i}\n")
+            if syncing {
+                must f.sync()
+            }
+            kept.lines += [f"line {i}"]
+        }
+    }
+}
+
+func log_checker(anon kept: Kept) -> func() -> none {
+    return func() {
+        if sim.crashed() {
+            kept.crashed += 1
+        } else {
+            kept.whole += 1
+        }
+        if len(kept.lines) == 0 {
+            return
+        }
+        let text = text_of("db/log")
+        for line in kept.lines {
+            assert text.contains(line + "\n")
+        }
+    }
+}
+
+test "a log that syncs keeps every line; crashes come early, late and not at all" {
+    let kept = Kept()
+    sim.run(count: 200, body: logger(kept, syncing: true), restart: log_checker(kept))
+    // Some seeds cut the body short, others let it end.
+    assert kept.whole >= 30 and kept.crashed >= 30
+}
+
+test "a log that doesn't sync loses a line under some seed, and that seed again" {
+    let kept = Kept()
+    let Some(p) = panics.run(func() { sim.run(count: 200, body: logger(kept, syncing: false), restart: log_checker(kept)) }) else {
+        fail("no seed lost a line")
+        return
+    }
+    assert p.message.contains("assertion failed")
+    let seed = failing_seed(p)
+    for _i in 0..3 {
+        assert panics.run(func() { sim.replay(seed, body: logger(kept, syncing: false), restart: log_checker(kept)) }) is panics.Panic
+    }
+}
+
+type Saved = shared struct {
+    value: str = ""
+}
+
+// Replaces "state" whole, by way of a new file renamed over it: `careful`
+// syncs the new file before the rename and the directory after.
+func replacer(anon saved: Saved, careful: bool) -> func() -> none {
+    return func() {
+        saved.value = ""
+        must posix.make_dir("st")
+        must posix.sync_dir(".")
+        for i in 0..10 {
+            let f = must posix.create("st/new")
+            must f.write_str(f"version {i}")
+            if careful {
+                must f.sync()
+            }
+            must f.close()
+            must posix.rename("st/new", "st/state")
+            if careful {
+                must posix.sync_dir("st")
+            }
+            saved.value = f"version {i}"
+        }
+    }
+}
+
+// After a crash, "state" holds what was last saved or something newer, never
+// less.
+func state_checker(anon saved: Saved) -> func() -> none {
+    return func() {
+        if saved.value == "" {
+            return
+        }
+        let got = text_of("st/state")
+        assert got.starts_with("version ")
+        assert (got[8..].parse_int()? or -1) >= (saved.value[8..].parse_int()? or 0)
+    }
+}
+
+test "replacing a file by a rename needs a sync before and a sync_dir after" {
+    let saved = Saved()
+    sim.run(count: 200, body: replacer(saved, careful: true), restart: state_checker(saved))
+    let p = panics.run(func() { sim.run(count: 200, body: replacer(saved, careful: false), restart: state_checker(saved)) })
+    assert p is panics.Panic
+}
+
+test "a file synced in a directory that isn't is lost with it" {
+    let saved = Saved()
+    let p = panics.run(func() {
+        sim.run(count: 200, body: func() {
+            saved.value = ""
+            must posix.make_dir("lost")
+            let f = must posix.create("lost/file")
+            must f.write_str("kept?")
+            must f.sync()
+            saved.value = "kept?"
+        }, restart: func() {
+            if saved.value != "" {
+                assert text_of("lost/file") == saved.value
+            }
+        })
+    })
+    assert p is panics.Panic
+}
+
+type Pieces = shared struct {
+    seen: [str] = []
+}
+
+test "an unsynced write is kept whole, lost whole, or kept in pieces" {
+    let got = Pieces()
+    sim.run(count: 100, body: func() {
+        let f = must posix.create("torn")
+        must f.sync()
+        must posix.sync_dir(".")
+        // Four 512-byte pieces: a, b, c and d.
+        must f.write_str("a".repeat(512) + "b".repeat(512) + "c".repeat(512) + "d".repeat(512))
+    }, restart: func() {
+        let text = text_of("torn")
+        mut shape = ""
+        for k in 0..len(text) / 512 {
+            shape += text[k * 512..k * 512 + 1]
+        }
+        if text == "" {
+            shape = "-"
+        }
+        if not (shape in got.seen) {
+            got.seen += [shape]
+        }
+    })
+    // Nothing, all of it, and some with a lost piece (a zero) before a kept one.
+    assert "-" in got.seen
+    assert "abcd" in got.seen
+    mut torn = false
+    for shape in got.seen {
+        if shape.contains("\0") {
+            torn = true
+        }
+    }
+    assert torn
+}
+
+type Flag = shared struct {
+    up: bool = false
+}
+
+func spin(anon flag: Flag) -> int64 {
+    mut n = 0
+    for not flag.up {
+        n += 1
+    }
+    return n
+}
+
+func read_once(anon conn: Fd) -> int64 {
+    return len(must conn.read(10))
+}
+
+test "a crash stops every task; restart has a new network" {
+    let kept = Kept()
+    sim.run(count: 100, body: func() {
+        let l = must tcp.listen("127.0.0.1", port: 7100)
+        let c = must tcp.connect("127.0.0.1", port: 7100)
+        let s = must l.accept()
+        let flag = Flag()
+        spawn read_once(s)
+        spawn spin(flag)
+        tasks.give_way()
+        let f = must posix.create("many")
+        for _i in 0..3000 {
+            must f.write_str("x")
+        }
+        flag.up = true
+        must c.close()
+        must l.close()
+    }, restart: func() {
+        if sim.crashed() {
+            kept.crashed += 1
+        }
+        // The listener the body had is gone with it.
+        let l = must tcp.listen("127.0.0.1", port: 7100)
+        must l.close()
+    })
+    assert kept.crashed >= 30
+}
