@@ -62,9 +62,11 @@ project in the working directory:
   with `import "./name"`, relative to the file that imports them. `import
   "net/http"` and the other standard modules come from the checkout's
   `stdlib/`.
-- **What is built** goes to the project's own `build/`: `kod build main.kod`
-  writes `build/apps/main/main`. Compiled modules are cached in the
-  checkout's `build/cache/`, shared by every project.
+- **What is built**: `kod build main.kod` writes the program to `./main`, as
+  `go build` does, or wherever `-o PATH` says. Objects and the programs `kod
+  run` and `kod test` make go to the project's hidden `.kod-build/`, so a
+  `.gitignore` needs that and the programs. Compiled modules are cached in
+  the checkout's `build/cache/`, shared by every project.
 - **A program** that `kod run` or `kod test` starts runs in the project's
   directory, so the paths it opens are the project's.
 - **Errors** name the project's files by their full paths.

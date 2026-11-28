@@ -8,7 +8,7 @@ The CLI is `kod`, the native tool `build/apps/kod/kod` (built from `tools/kod.ko
 
 ## Public commands
 
-### `kod build <file>`
+### `kod build [-o PATH] <file>`
 
 Compile a Kod source file to a native ARM64 binary.
 
@@ -16,6 +16,13 @@ Compile a Kod source file to a native ARM64 binary.
 ./kod build hello.kod
 ./build/apps/hello/hello
 ```
+
+In a project outside the checkout the program is also written to the
+working directory, named after the file: `kod build cmd/server.kod` writes
+`./server`. `-o PATH` writes it to `PATH` instead (relative to the working
+directory), in the checkout too. The program is written beside `PATH` and
+renamed into place, so one that is running is replaced whole; its directory
+is made if it is missing. A directory at `PATH` is an error.
 
 Build pipeline:
 
@@ -135,6 +142,10 @@ Formatting a formatted file changes nothing.
 | `build/apps/<stem>/<stem>.obj/` | The program's objects, in a tree that mirrors the source tree: each module's `.o` (`lib/json.kod` is `<stem>.obj/lib/json.kod.o`), with its `.s` beside it only when `KOD_ASM_TEXT` is set or link.cfg's `AS` is another assembler and the module was compiled rather than taken from the cache, the object of each C file a module names (`<stem>.obj/lib/json.c.o`) and the `_main` shim (`<entry>.main.{s,o}`, or `<first entry>.testmain.{s,o}` for tests). So `json` and `./json`, or `a/util` and `b/util`, are different objects. |
 
 | `build/cache/` | Module objects by key (step 3), `<sha256>.o`. Rebuilding `sh_kodc` empties it, since every key names the compiler. |
+
+In a project outside the checkout, what is under `build/apps/` above goes to
+the project's `.kod-build/apps/` instead, and `kod build` copies the program
+to the working directory (or `-o PATH`); the cache is the checkout's.
 
 `make clean-apps` (which also empties `build/cache/`), `make clean-stage1`, `make clean` give scoped cleanup.
 
